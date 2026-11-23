@@ -145,6 +145,12 @@ def load_policy() -> Policy | None:
     return policy
 
 
+def config_digest(cfg: config.Config, policy_sha: str) -> str:
+    if cfg.zte_repo == cfg.arete_repo:
+        return policy_sha
+    return orchestration.digest({"policy": policy_sha, "zte_repo": cfg.zte_repo})
+
+
 def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.RepoLayer, str]:
     from .orchestration import policy_fingerprint
 
@@ -177,7 +183,7 @@ def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.Re
                   and limits.max_workers == 1 and 0 < limits.max_decisions <= 16 and 0 < limits.max_actions <= 64
                   and 0 < layer.max_run_minutes <= 40 and 0 < layer.max_verify_minutes <= 15
                   and 0 <= layer.max_repair_cycles <= 1, "ZTE requires the bounded subscription-only PR layer")
-    return repo, layer, policy_fingerprint(cfg, layer, ())
+    return repo, layer, config_digest(cfg, policy_fingerprint(cfg, layer, ()))
 
 
 def active(delivery: store.Delivery, *, engine: str = "") -> Policy:
@@ -272,7 +278,9 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     pilot.require(delivery and (delivery.repo, delivery.data.get("run")) == (repo.name, run_id)
                   and delivery.phase in phases, "the ZTE run lost its delivery grant")
     policy = active(delivery)
-    current, _, digest = settings(config.load(), policy)
+    cfg = config.load()
+    pilot.require(cfg.zte_repo == delivery.repo, "the admitted ZTE config changed")
+    current, _, digest = settings(cfg, policy)
     pilot.require(current == repo and delivery.data["config"] == digest, "the admitted ZTE config changed")
     run = pilot.scheduled_run(repo.name, tid)
     pilot.require(run and run["id"] == run_id, "the ZTE run is not the original scheduled attempt")
@@ -313,7 +321,8 @@ def prepare_candidate(run, job, evidence: dict) -> store.Delivery:
     tree = pilot.git(where, "write-tree").strip()
     pilot.require_exact_tree(where, signal, tree, expected)
     pilot.require_evidence(evidence, checkout.github, tree, job.layer.checks)
-    pilot.require(evidence.get("policy_sha") == delivery.data["config"], "the candidate evidence has a different policy")
+    pilot.require(config_digest(job.cfg, evidence.get("policy_sha", "")) == delivery.data["config"],
+                  "the candidate evidence has a different policy")
     util.git_as_owner(["-c", "core.hooksPath=/dev/null", "commit", "-qm",
                        f"{pilot.TASK_TITLE}\n\nArete-Run: {run.id}"], where)
     head = pilot.git(where, "rev-parse", "HEAD").strip()
@@ -427,9 +436,10 @@ def finder(cfg: config.Config) -> None:
                     if policy.allow_same_day_recovery:
                         data["allow_same_day_recovery"] = True
                 client.time_left()
+                legacy_repo = cfg.arete_repo if repo.name != cfg.arete_repo else None
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,
-                                  signal.task(), data)
+                                  signal.task(), data, legacy_repo=legacy_repo)
 
 
 def status(args) -> int:

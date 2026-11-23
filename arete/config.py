@@ -5,7 +5,7 @@ import math
 import re
 import shlex
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import InitVar, asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -337,7 +337,7 @@ class Config:
     alert_repo: str = ""
     global_repo: str = "ai"
     arete_repo: str = "arete"
-    zte_repo: str = field(default="", kw_only=True)
+    zte_repo: InitVar[str] = field(default="", kw_only=True)
     models: dict[str, str] = field(default_factory=dict)
     repos: list[Repo] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
@@ -381,9 +381,8 @@ class Config:
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not self.zte_repo:
-            self.zte_repo = self.arete_repo
+    def __post_init__(self, zte_repo: str) -> None:
+        self.zte_repo = zte_repo or self.arete_repo
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -393,9 +392,14 @@ class Config:
 
     def repo_for_path(self, p: str | Path) -> Repo | None:
         p = Path(p).resolve()
+        arete_path = None
+        if self.zte_repo != self.arete_repo:
+            arete_path = next((r.path.resolve() for r in self.repos if r.name == self.arete_repo), None)
         best = None
         for r in self.repos:
             rp = r.path.resolve()
+            if r.name == self.zte_repo and rp == arete_path:
+                continue
             holds_path = p == rp or rp in p.parents
             if holds_path and (best is None or len(str(rp)) > len(str(best.path.resolve()))):
                 best = r
@@ -424,8 +428,6 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
-    if isinstance(value, Config) and value.zte_repo == value.arete_repo:
-        data.pop("zte_repo", None)
     routing = data.pop("routing", {})
     if sparse and isinstance(value, Config):
         if value.routing.payment_modes == PAYMENT_MODES:

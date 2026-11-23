@@ -34,6 +34,8 @@ from arete import (
     gh,
     jira,
     launch_lease,
+    loop_run,
+    loops,
     orchestration,
     outcomes,
     paths,
@@ -57,8 +59,11 @@ from arete import (
     vault,
     workspace,
     zte,
+    zte_issue,
+    zte_release,
 )
 from arete.agent import Result, Session
+from arete.lab import workflows
 from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROMPTS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
@@ -67,7 +72,7 @@ from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
 from arete.store import zte as zte_store
-from arete.zte_github import Identity
+from arete.zte_github import Identity, IssueApp
 from tests.harness import set_task_body
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -135,6 +140,8 @@ class Isolated(unittest.TestCase):
 
 
 class ZteRepoTests(Isolated):
+    delivery_day = datetime(2026, 1, 3, 12, tzinfo=UTC)
+
     def setUp(self):
         super().setUp()
         self.ordinary_layer = self.root / "ordinary"
@@ -144,7 +151,7 @@ class ZteRepoTests(Isolated):
         identity = Identity("owner/fixture", 1, "repo", 2, 3, 4, "a" * 40, 5, 6)
         self.policy = zte.Policy(identity, "## Before", "## After", True, True, "", True)
 
-    def write_layer(self, directory, *, workers, minutes, repairs):
+    def write_layer(self, directory, *, workers, minutes, repairs, payment_mode="subscription"):
         directory.mkdir(exist_ok=True)
         (directory / "config.toml").write_text(f'''\
 [factory]
@@ -164,7 +171,7 @@ imports = "true"
 web = "true"
 behavior = "true"
 [routing]
-payment_modes = ["subscription"]
+payment_modes = [{json.dumps(payment_mode)}]
 fallback = false
 [steps.orchestrate]
 runner = "pi"
@@ -175,16 +182,18 @@ runner = "pi"
 [verify]
 ''')
 
-    def write_config(self, *, zte_repo="arete-zte", tracker="local", path=None, github="owner/fixture"):
+    def write_config(self, *, zte_repo="arete-zte", tracker="local", path=None, github="owner/fixture",
+                     alias_first=False):
         selection = "" if zte_repo is None else f"zte_repo = {json.dumps(zte_repo)}\n"
-        paths.CONFIG_FILE.write_text(f'''\
-{selection}arete_repo = "arete"
+        ordinary = f'''\
 [[repo]]
 name = "arete"
 path = {json.dumps(str(self.repo.path))}
 github = "owner/fixture"
 layer = {json.dumps(str(self.ordinary_layer))}
 pipeline = true
+'''
+        alias = f'''\
 [[repo]]
 name = "arete-zte"
 path = {json.dumps(str(path or self.repo.path))}
@@ -192,7 +201,9 @@ github = {json.dumps(github)}
 layer = {json.dumps(str(self.zte_layer))}
 tracker = {json.dumps(tracker)}
 pipeline = true
-''')
+'''
+        entries = alias + ordinary if alias_first else ordinary + alias
+        paths.CONFIG_FILE.write_text(f'{selection}arete_repo = "arete"\n{entries}')
 
     def test_uses_the_selected_repos_bounded_layer(self):
         self.write_config()
@@ -223,10 +234,96 @@ pipeline = true
         with self.assertRaisesRegex(config.UnknownRepo, "zte_repo.*missing"):
             config.load()
 
-    def test_removing_zte_repo_invalidates_an_admitted_delivery(self):
-        self.write_layer(self.ordinary_layer, workers=1, minutes=40, repairs=1)
+    def test_alias_first_preserves_ordinary_checkout_lookup_and_explicit_alias_selection(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+
+        self.assertEqual(cfg.repos[0].name, "arete-zte")
+        self.assertEqual(cfg.repo_for_path(self.repo.path), cfg.repo("arete"))
+        self.assertEqual(cfg.repo_for_work_dir(self.repo.path / "subdir"), cfg.repo("arete"))
+        self.assertEqual(cfg.repo_for_work_dir(paths.WORKTREES_DIR / "arete-zte-fixture"), cfg.repo("arete-zte"))
+        self.assertEqual(zte.settings(cfg, self.policy)[0], cfg.repo("arete-zte"))
+
+        self.write_config(zte_repo=None, alias_first=True)
+        cfg = config.load()
+        self.assertEqual(cfg.repo_for_path(self.repo.path), cfg.repo("arete-zte"))
+
+    def test_named_agent_loops_validate_and_launch_with_their_own_repo(self):
+        self.write_layer(self.ordinary_layer, workers=2, minutes=180, repairs=3, payment_mode="local")
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        folder = self.root / "watch"
+        folder.mkdir()
+        (folder / "prompt.md").write_text("Look for findings.\n")
+
+        for selection, model, expected in (
+            ("arete", "pi:openai/gpt-6.2-sol", "arete"),
+            ("arete-zte", "codex:gpt-6.2-sol", "arete-zte"),
+            (str(self.repo.path), "pi:openai/gpt-6.2-sol", "arete"),
+        ):
+            with self.subTest(repo=selection):
+                (folder / "loop.toml").write_text(f"[run]\nrepo = {json.dumps(selection)}\nmodel = {json.dumps(model)}\n")
+                loop = loops.load(folder, "user", "", cfg)
+                run = loop_run.LoopRun(loop, "fixture", cfg)
+                with (patch.object(loop_run.runner, "run", return_value=Result(ok=True)) as launch,
+                      patch.object(record, "note"), patch.object(run, "log")):
+                    run.agent("watch", "Look for findings.", self.repo.path)
+                self.assertEqual(launch.call_args.kwargs["repo"], cfg.repo(expected))
+
+    def test_named_shell_loops_get_their_own_environment_and_vault_values(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        values = {"FIXTURE_ORDINARY": "ordinary-env", "FIXTURE_ZTE": "zte-env"}
+        for name, allowed, other in (
+            ("arete", "FIXTURE_ORDINARY", "FIXTURE_ZTE"),
+            ("arete-zte", "FIXTURE_ZTE", "FIXTURE_ORDINARY"),
+        ):
+            with self.subTest(repo=name):
+                with (cfg.repo(name).layer_dir / "config.toml").open("a") as layer:
+                    layer.write(f'\n[environment]\npass = ["{allowed}"]\n')
+                loop = loops.Loop("fixture", self.root, "user", repo=name)
+                run = loop_run.LoopRun(loop, "fixture", cfg)
+                command = (f'test "${allowed}" = {values[allowed]} && test -z "${other}" '
+                           f'&& test "$FIXTURE_VALUE" = {name}-vault')
+                with (patch.dict(os.environ, values), patch.object(loop_run, "drop_unstaged"),
+                      patch.object(vault, "read", side_effect=lambda repo: {"FIXTURE_VALUE": f"{repo}-vault"})):
+                    result = loop_run.shell_result(run, command, self.repo.path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_selector_edit_preserves_ordinary_worker_and_workflow_policies(self):
+        self.write_config(zte_repo=None, alias_first=True)
+        before = config.load()
+        layer = config.load_layer(before.repo("arete").layer_dir)
+        run = SimpleNamespace(id="worker", repo=before.repo("arete"), kind="", closed_context=())
+        job = SimpleNamespace(run=run, ws=self.repo.path, cfg=before, layer=layer)
+        launch = delegation.request(job, "respond", "Fixture", steps.resolve(before, layer, "build"), (), [])
+
+        self.write_config(alias_first=True)
+        after = config.load()
+
+        delegation.check_policy(launch, after, layer)
+        self.assertEqual(delegation.legacy_settings_shas(before), delegation.legacy_settings_shas(after))
+        self.assertEqual(workflows.fingerprint(before, layer), workflows.fingerprint(after, layer))
+        for resume in (False, True):
+            self.assertEqual(orchestration.policy_fingerprint(before, layer, (), resume=resume),
+                             orchestration.policy_fingerprint(after, layer, (), resume=resume))
+
+    def test_reserved_digest_binds_the_selector_even_if_both_repos_use_the_same_layer(self):
         self.write_config()
-        repo, _, digest = zte.settings(config.load(), self.policy)
+        cfg = config.load()
+        cfg.repo("arete").layer = self.zte_layer
+        repo, layer, reserved_digest = zte.settings(cfg, self.policy)
+        fallback = replace(cfg, zte_repo="arete")
+        fallback_repo, fallback_layer, fallback_digest = zte.settings(fallback, self.policy)
+
+        self.assertEqual((repo.name, fallback_repo.name, fallback_layer), ("arete-zte", "arete", layer))
+        self.assertEqual(fallback_digest, orchestration.policy_fingerprint(cfg, layer, ()))
+        self.assertNotEqual(reserved_digest, fallback_digest)
+
+    def test_removing_zte_repo_invalidates_an_admitted_delivery(self):
+        self.write_config()
+        cfg = config.load()
+        repo, layer, digest = zte.settings(cfg, self.policy)
         deadline = util.iso(util.now() + timedelta(minutes=1))
         base = "b" * 40
         delivery = zte_store.reserve(self.policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE,
@@ -237,17 +334,108 @@ pipeline = true
         tasks_store.task_set_state(delivery.task, "running")
         dispatch = zte_store.transition(delivery, "dispatching")
         running = zte_store.transition(dispatch, "running", run=run_id)
+        controller = SimpleNamespace(run=SimpleNamespace(tid=delivery.task, closed_context=()),
+                                     job=SimpleNamespace(cfg=cfg, layer=layer))
+        policy_sha = orchestration.Controller.policy_sha(controller)
+        self.assertEqual(zte.config_digest(cfg, policy_sha), digest)
 
         with (patch.object(zte, "load_policy", return_value=self.policy),
               patch.object(zte, "PAUSE_FILE", self.root / "pause")):
             self.assertEqual(zte.for_run(repo, delivery.task, run_id, "running"), (running, self.policy))
 
             self.write_config(zte_repo=None)
-            fallback, _, fallback_digest = zte.settings(config.load(), self.policy)
-            self.assertEqual(fallback.name, "arete")
-            self.assertNotEqual(fallback_digest, digest)
-            with self.assertRaisesRegex(pilot.Held, "the admitted ZTE config changed"):
+            with self.assertRaisesRegex(pilot.Held, "^the admitted ZTE config changed$"):
                 zte.for_run(repo, delivery.task, run_id, "running")
+
+    def production_policy(self, base, issue_number, *, reconciled_hold=""):
+        before, after = zte.PRODUCTION_ISSUE_EDIT
+        return replace(self.policy, before=before, after=after, rehearsal=False,
+                       issue=zte_issue.Claim(issue_number, f"issue-{issue_number}", "e" * 64), close_after_health=True,
+                       issue_app=IssueApp(7, 8, 9), production_issue_base=base, accept_issue_races=True,
+                       reconciled_hold=reconciled_hold)
+
+    def installation(self):
+        return zte_release.Installation(self.root / "managed", "https://fixture.example:443",
+                                        "com.arete.serve", foundation.LATEST)
+
+    def reserve_under_arete(self, policy, *, days_ago):
+        created = self.delivery_day - timedelta(days=days_ago)
+        deadline = util.iso(created + timedelta(minutes=40))
+        base = policy.production_issue_base
+        with patch.object(util, "now", return_value=created):
+            return zte_store.reserve(policy.fingerprint, "arete", base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,
+                                     policy.signal(base).task(),
+                                     {"github": asdict(policy.identity), "issue": asdict(policy.issue),
+                                      "approved_installation": self.installation().to_receipt(),
+                                      "production_issue_base": base, "close_after_health": True})
+
+    def healthy_predecessor(self):
+        delivery = self.reserve_under_arete(self.production_policy("a" * 40, 1), days_ago=2)
+        with foundation.tx() as c:
+            c.execute("UPDATE zte_deliveries SET phase = 'healthy' WHERE task = ?", (delivery.task,))
+        zte_store.note_conforming(zte_store.find(delivery.task), "d" * 40)
+        return zte_store.find(delivery.task)
+
+    def find_production_delivery(self, policy, client):
+        self.write_config()
+        base = policy.production_issue_base
+        client.tip.return_value = base
+        policy_file = self.root / "zte.toml"
+        policy_file.touch()
+        with (patch.object(util, "now", return_value=self.delivery_day),
+              patch.object(zte, "POLICY_FILE", policy_file),
+              patch.object(zte, "PAUSE_FILE", self.root / "pause"),
+              patch.object(zte, "load_policy", return_value=policy),
+              patch.object(zte.Policy, "client", return_value=client),
+              patch.object(zte, "observation", return_value=("eligible", base)),
+              patch.object(zte_issue, "current"),
+              patch.object(zte_release, "installation", return_value=self.installation()),
+              patch.object(zte_release, "selected", return_value=base)):
+            zte.finder(config.load())
+        return zte_store.latest()
+
+    def test_alias_reserves_next_pinned_production_delivery_after_healthy_arete_delivery(self):
+        previous = self.healthy_predecessor()
+        policy = self.production_policy("b" * 40, 2)
+
+        delivery = self.find_production_delivery(policy, Mock())
+
+        self.assertEqual((delivery.repo, delivery.phase, delivery.policy), ("arete-zte", "queued", policy.fingerprint))
+        self.assertEqual(tasks_store.task_get(delivery.task)["repo"], "arete-zte")
+        self.assertEqual(zte_store.find(previous.task), previous)
+
+    def test_alias_recovers_eligible_pre_pr_hold_with_arete_predecessor(self):
+        previous = self.healthy_predecessor()
+        held_policy = self.production_policy("b" * 40, 2)
+        pushed = self.reserve_under_arete(held_policy, days_ago=1)
+        for phase in ("dispatching", "running", "prepared", "push_intent"):
+            pushed = zte_store.transition(pushed, phase)
+        branch, head = f"arete/{pushed.task}-fixture", "f" * 40
+        pushed = zte_store.transition(pushed, "pushed", branch=branch, head=head,
+                                      push_sent_after=pushed.created)
+        held = zte_store.transition(pushed, "held", stopped_at="pushed",
+                                    reason="the issue is not in the dedicated delivery queue")
+        policy = self.production_policy("c" * 40, 3, reconciled_hold=held.task)
+        identity = policy.identity
+        client = Mock(identity=identity)
+        client.branch_head.return_value = head
+        client.branch_prs.return_value = []
+        client.read.return_value = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": held.base}}
+        client.issue_snapshot.return_value = {
+            "databaseId": identity.number, "id": identity.node, "nameWithOwner": identity.name,
+            "owner": {"databaseId": identity.owner}, "defaultBranchRef": {"name": "main"},
+            "issue": {"number": held_policy.issue.number, "id": held_policy.issue.node, "state": "OPEN",
+                      "timelineItems": {"nodes": []}, "blockedBy": {"totalCount": 0}, "subIssues": {"totalCount": 0}},
+        }
+
+        delivery = self.find_production_delivery(policy, client)
+
+        self.assertEqual((delivery.repo, delivery.phase, delivery.policy), ("arete-zte", "queued", policy.fingerprint))
+        self.assertEqual(delivery.data["reconciled_hold"],
+                         {"task": held.task, "version": held.version, "branch": branch, "head": head})
+        self.assertEqual(tasks_store.task_get(delivery.task)["repo"], "arete-zte")
+        self.assertEqual(zte_store.find(held.task), held)
+        self.assertEqual(zte_store.find(previous.task), previous)
 
 
 HELPER_GUARD = """\

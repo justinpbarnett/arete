@@ -563,10 +563,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
 
 
 def loop_repo(run: LoopRun) -> config.Repo | None:
-    if not run.loop.repo:
-        return None
-    repo = run.loop.work_repo(run.cfg)
-    return run.cfg.repo_for_path(repo.path) or repo
+    return run.loop.routing_repo(run.cfg)
 
 
 def jev_readable(run: LoopRun, events: list[dict]) -> list[dict]:
