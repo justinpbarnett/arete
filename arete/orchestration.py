@@ -240,8 +240,15 @@ class Controller:
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
             ledger.save(self.lease, self.data)
-            outcome = self.atomic("prepare", tree=str(self.job.ws))
+            try:
+                outcome = self.atomic("prepare", tree=str(self.job.ws))
+            except owner_asks.Asked:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
+                raise
             if not outcome.passed:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
             self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
@@ -897,7 +904,7 @@ class Controller:
                 raise UnchangedPushedHead(f"nothing changed since the pushed {label} {shas}")
         b.validate_diff(staged, after)
 
-    def publish(self):
+    def publish(self, unverified_measurement: dict | None = None):
         self.barrier()
         if pending := ledger.catch_up_push(self.data):
             return self.reconcile_catch_up(pending)
@@ -913,13 +920,15 @@ class Controller:
         catch_up = self.data.get("catch_up_hold")
         if catch_up and (not flows.retry_passed(self.job.verified) or not self.job.review.approved()):
             raise ValueError("publication after a catch-up hold requires passing verification and an approving review")
+        measurement_section = (pipeline.unverified_measurement_section(unverified_measurement)
+                               if unverified_measurement else "")
         if (not self.run.dry_run and not zte.reserved(str(self.run.tid)) and self.data.get("ci_failed")
                 and (retry := self.data.get("ci_retry")) and (tree := self.fingerprint())
                 and tree == self.data.get("published_tree")):
-            return self.retry_publication_ci(retry, tree)
+            return self.retry_publication_ci(retry, tree, measurement_section=measurement_section)
         self.validate_publication_diff()
         if self.run.dry_run:
-            self.ending = flows.end_dry_run(self.flow)
+            self.ending = flows.end_dry_run(self.flow, measurement_section=measurement_section)
             return {"status": "dry-run"}
         if zte.reserved(str(self.run.tid)):
             grant = zte.prepare_candidate(self.run, self.job, self.data)
@@ -931,7 +940,7 @@ class Controller:
             self.take_merge_lease(checkout)
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
-        outcome = self.atomic("pr", tree=str(self.job.ws))
+        outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section)
         if not outcome.passed:
             self.ending = flows.ended(self.flow, outcome)
             return outcome.data
@@ -949,7 +958,7 @@ class Controller:
             return self.settle_publication_failure(failure)
         return self.finish_publication()
 
-    def retry_publication_ci(self, retry, tree):
+    def retry_publication_ci(self, retry, tree, *, measurement_section=""):
         job = self.job
         self.check_pilot_publication()
         flows.require_environment_owner_clear(job)
@@ -976,6 +985,14 @@ class Controller:
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
+        observed = [] if measurement_section else pipeline.observed_measurements(self.run, job.verified)
+        if measurement_section or observed:
+            for checkout in pushed:
+                try:
+                    pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
+                                                            observed_requirements=observed)
+                except gh.GhError as error:
+                    raise ValueError(f"could not update the unverified requirement in {checkout.pr}") from error
         saved = retry.get("reruns")
         if automatic_requested or (saved is None and not retry.get("legacy_rerun")):
             if self.refresh_publication_ci(pushed, retry, automatic_requested):
@@ -1320,10 +1337,10 @@ class Controller:
         self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
         self.stamp("verify", asdict(job.verified))
         self.stamp("review", job.review.asdict())
+        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
         self.data["publication_intent"].pop("catch_up", None)
         self.persist()
-        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
     def finish_publication(self):
         self.check_pilot_publication()
@@ -1489,7 +1506,7 @@ class Controller:
                 raise ValueError("; ".join(errors))
             return self.atomic("orchestrate_ask", request=ask).data
         if op == "publication.request":
-            return self.publish()
+            return self.publish(args.get("unverified_measurement"))
         if op == "run.finish":
             if args["reason"] == "noop" and self.data.get("ci_failed"):
                 raise ValueError("CI is still failed; retry CI through publication.request, repair, or finish failed")

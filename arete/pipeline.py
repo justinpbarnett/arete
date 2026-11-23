@@ -102,6 +102,16 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
+UNVERIFIED_REQUIREMENT_HEADING = "## Unverified requirement"
+RECORDED_MEASUREMENT_LABEL = "**Recorded measurement**"
+MEASUREMENT_START, MEASUREMENT_END = "<!-- arete:measurement -->", "<!-- /arete:measurement -->"
+MEASUREMENT_SECTION = re.compile(
+    rf"^{re.escape(MEASUREMENT_START)}\r?\n\r?\n{re.escape(UNVERIFIED_REQUIREMENT_HEADING)}\r?\n\r?\n"
+    r"(?P<requirement>[^\r\n]+)\r?\n\r?\n"
+    rf"{re.escape(RECORDED_MEASUREMENT_LABEL)}\r?\n\r?\n[^\r\n]+\r?\n\r?\n{re.escape(MEASUREMENT_END)}"
+    r"(?P<separator>(?:\r?\n){1,2}|\Z)",
+    re.MULTILINE,
+)
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -730,13 +740,12 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> dict | None:
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner | None:
     earlier = workspace.owner_in(workspace.made_before(ws))
     if run.alone:
         return earlier
-    created = earlier.get("created") if earlier else None
-    return {"run": run.id, "repo": run.repo.name, "ticket": str(run.tid), "created": created or util.iso(),
-            "checkouts": [{"dir": c.dir, "github": c.github, "src": str(c.src), "wt": str(c.wt)} for c in checkouts]}
+    created = earlier.created if earlier else ""
+    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
@@ -748,9 +757,10 @@ def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -
     if run.catch_up_preserved:
         run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
         return False
-    if workspace.remove_workspace(ws, checkouts):
+    release = workspace.remove_workspace(ws, checkouts)
+    if release.state == "removed":
         return True
-    names = workspace.blocked_by(ws, checkouts)
+    names = release.held_by
     shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
     run.log(f"workspace kept at {ws}: removal blocked by {shown or 'the folder could not be deleted'}")
     return False
@@ -2650,15 +2660,66 @@ def summary_of(review: Review, build_summary: str) -> str:
     return cut_at_end(str(review.changes or "").strip() or build_summary, SUMMARY_CHARS)
 
 
+def unverified_measurement_section(disclosure: dict) -> str:
+    requirement = verify.one_line(disclosure["requirement"])
+    measurement = verify.one_line(disclosure["measurement"])
+    return (f"{MEASUREMENT_START}\n\n{UNVERIFIED_REQUIREMENT_HEADING}\n\n{requirement}\n\n"
+            f"{RECORDED_MEASUREMENT_LABEL}\n\n{measurement}\n\n{MEASUREMENT_END}\n\n")
+
+
+def markdown_fences(body: str) -> Iterator[tuple[int, int]]:
+    start, offset, closing = 0, 0, None
+    for line in body.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if closing:
+            if closing.fullmatch(bare):
+                yield start, offset + len(line)
+                closing = None
+        elif opening := outbound.FENCE_OPEN.match(bare):
+            start = offset
+            fence = opening[2]
+            closing = re.compile(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*")
+        offset += len(line)
+    if closing:
+        yield start, offset
+
+
+def with_unverified_measurement(body: str, section: str, *, observed_requirements: list[str] | None = None,
+                                existing_only: bool = False) -> str:
+    found = MEASUREMENT_SECTION.search(body)
+    if found:
+        for start, end in markdown_fences(body):
+            if not found or found.start() < start:
+                break
+            if found.start() < end:
+                found = MEASUREMENT_SECTION.search(body, end)
+    if found:
+        if not section and observed_requirements is not None and found["requirement"].casefold() not in observed_requirements:
+            return body
+        replacement = section.rstrip() + found["separator"] if section else ""
+        return body[:found.start()] + replacement + body[found.end():]
+    if section and not existing_only:
+        return f"{body}\n\n{section}" if body else section
+    return body
+
+
+def observed_measurements(run: Run, verified: verify.Verified | None) -> list[str]:
+    if verified is None:
+        return []
+    return sorted({gh.outgoing(public_text(run, requirement)).casefold()
+                   for requirement in verified.observed_requirements()})
+
+
 def report_body(run: Run, *, summary: str, review: Review, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
-                size: str, held: str = "", written: str = "") -> str:
+                size: str, held: str = "", written: str = "", measurement_section: str = "") -> str:
     return public_text(run, (
         f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
         + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
+        + measurement_section
         + review.markdown()
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
@@ -3042,7 +3103,23 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
     return (wanted if had else ""), public_text(run, left_synced)
 
 
-def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True):
+def publish_unverified_measurement(run: Run, t: tracker.Ticket, pr: str, section: str, *,
+                                   observed_requirements: list[str]) -> None:
+    try:
+        body = gh.pr_body(pr)
+    except ci.READ_ERRORS as error:
+        run.log(f"ci: could not read the unverified requirement in {pr}: {util.first_line(str(error), 300)}")
+        return
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    kept, text = gh.split_link(body, links)
+    updated = with_unverified_measurement(text, public_text(run, section),
+                                         observed_requirements=observed_requirements, existing_only=True)
+    if updated != text and gh.outgoing(updated, kept) != body:
+        gh.pr_edit_body(pr, updated, link=kept)
+
+
+def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True, *,
+                   measurement_section: str = ""):
     stops = stops or {}
     ci_stopped = []
     for c in with_prs:
@@ -3059,6 +3136,8 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         kept, text = synced_pr_body(run, c.pr, body, t, left)
         if opened:
             text = with_siblings(text, others)
+        if c in standing:
+            text = with_unverified_measurement(text, public_text(run, measurement_section))
         if gh.outgoing(text, kept) != body:
             gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
@@ -3977,6 +4056,8 @@ def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
         "checked": public_text(run, outbound.screen(checked)),
         "review": public_text(run, outbound.screen(reviewed)),
     }
+    if observed := observed_measurements(run, verified):
+        evidence["observed_requirements"] = observed
     target = run.repo.name, str(t.id), c.pr
     retrying = run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence)
     if retrying:
@@ -3999,15 +4080,18 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
                 run.log(f"automerge: discarded pending gate evidence in {pr} because its head changed")
                 return True
         body = gh.pr_body(pr)
-        if links is None:
-            for heading, section in sections:
-                screened = gh.outgoing(public_text(run, section)).rstrip()
-                body = replace_gate_section(body, heading, screened, exact=True)
+        exact = links is None
+        if links is not None:
+            kept, body = gh.split_link(body, links)
+        for heading, section in sections:
+            if exact:
+                section = gh.outgoing(public_text(run, section))
+            body = replace_gate_section(body, heading, section.rstrip(), exact=exact)
+        if observed := evidence.get("observed_requirements"):
+            body = with_unverified_measurement(body, "", observed_requirements=observed)
+        if exact:
             gh.pr_write_body(pr, gh.Outgoing(body))
         else:
-            kept, body = gh.split_link(body, links)
-            for heading, section in sections:
-                body = replace_gate_section(body, heading, section.rstrip())
             gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
     except gh.GhError as e:
         run.log(f"automerge: could not update gate evidence in {pr}: {util.first_line(str(e), 300)}")
@@ -4016,17 +4100,23 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
 
 
 def replace_gate_section(body: str, heading: str, section: str, *, exact: bool = False) -> str:
-    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
-    if not pattern.search(body):
-        if exact:
-            return f"{body}\n\n{section}" if body else section
-        return f"{body.rstrip()}\n\n{section}"
-
-    def replacement(found: re.Match) -> str:
-        last = exact and found.end() == len(body)
-        return section.rstrip() + ("" if last else "\n\n")
-
-    return pattern.sub(replacement, body, count=1)
+    marker = "|".join(map(re.escape, (MEASUREMENT_START, ci.SECTION_START)))
+    boundary = rf"^(?:## |(?:{marker})\r?$)"
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?={boundary}|\Z)", re.M | re.S)
+    start = 0
+    for fence_start, fence_end in markdown_fences(body):
+        if UNVERIFIED_REQUIREMENT_HEADING in body[fence_start:fence_end]:
+            if found := pattern.search(body, start, fence_start):
+                break
+            start = fence_end
+    else:
+        found = pattern.search(body, start)
+    if found:
+        separator = "" if exact and found.end() == len(body) else "\n\n"
+        return body[:found.start()] + section.rstrip() + separator + body[found.end():]
+    if exact:
+        return f"{body}\n\n{section}" if body else section
+    return f"{body.rstrip()}\n\n{section}"
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
@@ -4413,7 +4503,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
                 run.log(retained_line(step, attempt))
         finally:
-            restore_worktrees(untracked_before, evidence)
+            removed = restore_worktrees(untracked_before, evidence)
     if probes and probes.verdict != "pass":
         verified = probes
     elif replay_only:
@@ -4422,7 +4512,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                    blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
         if not drivers:
-            return verified
+            return save_verification(run, step, verified, removed) if removed else verified
     else:
         verified = verify.Verified.from_agent(res.structured)
     if probes and probes.verdict == "pass" and not replay_only:
@@ -4432,10 +4522,14 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         verified.native_trees = checked_trees
-    return save_verification(run, step, verified)
+    return save_verification(run, step, verified, removed if agent_started else 0)
 
 
-def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
+def save_verification(run: Run, step: str, verified: verify.Verified, removed: int = 0) -> verify.Verified:
+    if removed:
+        cleanup = (f"Arete removed {util.count(removed, 'untracked file')} that verification added to the worktree, "
+                   "after verification ended. None is left behind.")
+        verified.summary = "\n\n".join(filter(None, (verified.summary, cleanup)))
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
@@ -4473,8 +4567,9 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "and read the status and body.")
 
 
-def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> int:
     view = workspace.scratch_view()
+    removed = 0
     for d, name in untracked_added_since(untracked_before):
         f = d / name
         if workspace.record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
@@ -4482,10 +4577,13 @@ def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) ->
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
+            existed = f.exists(follow_symlinks=False)
             workspace.remove_untracked(d, name)
+            removed += existed
     for d in untracked_before:
         if not workspace.record_holds(view, d):
             git(["checkout", "-q", "--", "."], d)
+    return removed
 
 
 def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) -> dict[str, str]:

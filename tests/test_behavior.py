@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
 from dataclasses import asdict, replace
+from datetime import timedelta
 from http.client import HTTPConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
@@ -24,7 +25,8 @@ from unittest import mock
 
 from arete import (
     accounts, api_check, api_http, chat, cli, client, config, contract, control, dashboard, event_stream, events, gh,
-    idempotency, jira, paths, pipeline, principals, screening, serve, tailnet, tasks, tool_events, triage, util, verify_faults,
+    heartbeat, idempotency, jira, paths, pipeline, principals, record, sandbox, screening, serve, tailnet, tasks,
+    tool_events, tracker, triage, util, verify_faults, workspace,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
@@ -39,6 +41,518 @@ from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 def setUpModule():
     support.isolate_live_state()
+
+
+class _WorkspaceChildCase(unittest.TestCase):
+    def run_child(self, entry):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
+        env = api_check.isolated_env(root)
+        (root / "config/config.toml").write_text("max_parallel = 1\n")
+        command = api_check.child_command(Path(__file__).resolve().parents[1], entry)
+        result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
+                                timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
+    def test_owner_rows_match_legacy_records_and_ownerless_fallback(self):
+        self.run_child(r"""
+import json
+from pathlib import Path
+from arete import config, paths, pipeline, record, workspace
+from arete.store import db
+
+db.migrate()
+repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
+short = config.Repo("sample", Path.cwd() / "other")
+cfg = config.Config(repos=[short, repo])
+ws = paths.WORKTREES_DIR / "sample-app-7"
+ws.mkdir()
+run = pipeline.Run("sample-run", repo, paths.RUNS_DIR / "sample-run", tracker=None, tid=7)
+c = workspace.Checkout("api", "test/sample", repo.path / "api", ws / "api", "main", onto="saved")
+legacy = {"run": "sample-run", "repo": "sample-app", "ticket": "7", "created": "2026-01-01T00:00:00Z",
+          "checkouts": [{"dir": "api", "github": "test/sample", "src": str(c.src), "wt": str(c.wt)}]}
+(ws / "sample.txt").write_text("sample\n")
+made = {"sample.txt": "old-fingerprint", "\0head api/": "old-head", "\0salt": "old-salt", "\0owner": legacy}
+file = workspace.made_record(ws)
+file.parent.mkdir()
+file.write_text(json.dumps(made))
+owner = workspace.WorkspaceOwner.from_row(workspace.made_before(ws)["\0owner"])
+assert owner.checkouts == [workspace.Checkout(c.dir, c.github, c.src, c.wt, "")]
+assert workspace.owner_of(ws, cfg) == owner
+made_owner = pipeline.workspace_owner(run, ws, [c])
+assert json.dumps(made_owner.to_row()) == json.dumps(legacy)
+run.alone = True
+assert pipeline.workspace_owner(run, ws, [c]) == owner
+del made["\0owner"]
+file.write_text(json.dumps(made))
+record.start("pipeline", repo="sample", issue="app-7", status="merged")
+record.start("pipeline", repo="sample-app", issue="7", status="merged")
+fallback = workspace.owner_of(ws, cfg)
+assert fallback == workspace.WorkspaceOwner("", "sample-app", "7", "", owner.checkouts)
+workspace.note_made(ws, [c], made_owner)
+saved = json.loads(file.read_text())
+assert saved["\0owner"] == legacy
+assert saved["sample.txt"] == workspace.fingerprint(ws / "sample.txt", saved["\0salt"])
+""")
+
+
+class WorkspaceBackfillTests(_WorkspaceChildCase):
+    def test_imports_legacy_records_and_file_bearing_orphan_without_removal(self):
+        self.run_child(r"""
+import json
+from pathlib import Path
+from arete import config, paths, record, util, workspace
+from arete.store import db, workspaces
+
+db.migrate()
+repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
+cfg = config.Config(repos=[config.Repo("sample", Path.cwd() / "short"), repo])
+src = repo.path / "api"
+src.mkdir(parents=True)
+util.git(["init", "-q", "-b", "main"], src)
+util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+          "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "sample"], src)
+
+def checkout(ticket):
+    folder = paths.WORKTREES_DIR / f"{repo.name}-{ticket}"
+    c = workspace.Checkout("api", "test/sample", src, folder / "api", "main")
+    workspace.add_worktree(c, f"fixture-{ticket}", "main")
+    (c.wt / "notes.txt").write_text(f"ticket {ticket}\n")
+    return folder, c
+
+merged, a = checkout("7")
+waiting, b = checkout("8")
+orphan, _ = checkout("9")
+started = "2026-01-01T00:00:00Z"
+finished = "2026-01-01T00:01:00Z"
+run_id = record.start("pipeline", repo=repo.name, issue="7", started=started, finished=finished, status="merged")
+record.start("pipeline", repo=repo.name, issue="7", started=finished, status="running")
+record.start("pipeline", repo="sample", issue="app-8", status="done")
+record.start("pipeline", repo=repo.name, issue="8", status="needs-info")
+owner = workspace.WorkspaceOwner(run_id, repo.name, "7", started, [a]).to_row()
+records = {}
+for folder, c, salt in ((merged, a, "merged-salt"), (waiting, b, "waiting-salt")):
+    made = {"api/notes.txt": workspace.fingerprint(c.wt / "notes.txt", salt),
+            "\0salt": salt, "\0head api/": util.git(["rev-parse", "HEAD"], c.wt).strip()}
+    if folder == merged:
+        made.update({"\0owner": owner, "\0onto api/": "saved-base",
+                     "\0retained": {"roots": ["scratch-root"], "names": ["api/notes.txt"]}})
+    source = workspace.made_record(folder)
+    source.parent.mkdir(exist_ok=True)
+    source.write_text(json.dumps(made))
+    records[folder] = (source, source.read_bytes(), made)
+(a.wt / "notes.txt").write_text("edited after the fingerprint was recorded\n")
+folders = (merged, waiting, orphan)
+registrations = util.git(["worktree", "list", "--porcelain"], src)
+assert all(f"worktree {folder / 'api'}" in registrations.splitlines() for folder in folders)
+
+assert workspaces.backfill(cfg) == 3
+rows = [workspaces.open_for(folder.name) for folder in folders]
+released, kept, held = rows
+assert [row["state"] for row in rows] == ["released", "kept", "held"], rows
+assert released["owner_run"] == run_id and released["released_at"] == finished
+assert released["made_at"] == started and released["checkouts"] == owner["checkouts"]
+assert released["onto"] == {"api/": "saved-base"}
+assert released["retained"] == records[merged][2]["\0retained"]
+assert (kept["repo"], kept["ticket"], kept["owner_run"], kept["kept_reason"]) == ("sample-app", "8", "", "needs-info")
+assert kept["checkouts"] == workspace.WorkspaceOwner("", repo.name, "8", "", [b]).to_row()["checkouts"]
+assert held["owner_run"] == "" and held["checkouts"] == [] and workspaces.files(held["id"]) == {}
+for row, folder in zip(rows, folders, strict=True):
+    assert row["bytes"] == workspace.tree_bytes(folder) > 0
+    if folder in records:
+        made = records[folder][2]
+        assert row["salt"] == made["\0salt"]
+        assert row["heads"] == {"api/": made["\0head api/"]}
+        assert workspaces.files(row["id"]) == {"api/notes.txt": made["api/notes.txt"]}
+
+assert workspaces.backfill(cfg) == 0
+assert [workspaces.open_for(folder.name) for folder in folders] == rows
+workspaces.update(released["id"], base_version=released["version"], state="removed")
+assert workspaces.backfill(cfg) == 0
+assert workspaces.open_for(merged.name) is None
+with db.reader() as c:
+    assert c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 3
+    assert c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'workspace.changed'").fetchone()[0] == 4
+assert all((folder / "api/notes.txt").is_file() for folder in folders)
+assert all(source.read_bytes() == saved for source, saved, _ in records.values())
+assert util.git(["worktree", "list", "--porcelain"], src) == registrations
+""")
+
+
+class WorkspaceStoreTests(_WorkspaceChildCase):
+    def test_workspace_versions_files_and_events_are_atomic(self):
+        self.run_child("""
+import json
+import sqlite3
+import unittest
+from unittest.mock import patch
+from arete.store import db, events, workspaces, writes
+
+case = unittest.TestCase()
+db.migrate()
+with db.reader() as c:
+    tables = {r["name"]: r["strict"] for r in c.execute("PRAGMA table_list")}
+    assert tables["workspaces"] == tables["workspace_files"] == 1
+    assert {r["name"] for r in c.execute("PRAGMA index_list(workspaces)") if r["unique"] and r["partial"]} == {
+        "workspaces_one_open"
+    }
+    assert [r["name"] for r in c.execute("PRAGMA index_info(workspaces_by_state)")] == ["state", "released_at"]
+    assert [(r["table"], r["from"], r["to"]) for r in c.execute("PRAGMA foreign_key_list(workspace_files)")] == [
+        ("workspaces", "workspace", "id")
+    ]
+
+for name, fields in (("/sample", {}), ("sample", {"state": "unknown"}), ("sample", {"bytes": "large"})):
+    with case.assertRaises(sqlite3.IntegrityError):
+        workspaces.create(name, **fields)
+made = workspaces.create("sample", files={"app/input": "first"}, owner_run="r1")
+wid = made["id"]
+assert made["version"] == 1
+with case.assertRaises(sqlite3.IntegrityError):
+    workspaces.create("sample")
+
+with db.tx():
+    with patch.object(events, "emit", side_effect=RuntimeError("event write failed")):
+        with case.assertRaisesRegex(RuntimeError, "event write failed"):
+            workspaces.update(wid, base_version=1, state="removed", files={"app/alternate": "lost"})
+    assert workspaces.get(wid) == made
+    assert workspaces.files(wid) == {"app/input": "first"}
+
+kept = workspaces.update(wid, base_version=1, state="kept", kept_reason="operator", owner_run="r2",
+                         files={"app/input": "second"})
+assert kept["version"] == 2
+assert workspaces.files(wid) == {"app/input": "second"}
+assert workspaces.update(wid, base_version=2, state="kept", files={"app/input": "second"}) == kept
+with case.assertRaises(writes.VersionConflict):
+    workspaces.update(wid, base_version=1, state="released")
+removed = workspaces.update(wid, base_version=2, state="removed", kept_reason="")
+assert removed["version"] == 3 and removed["removed_at"]
+assert workspaces.open_for("sample") is None
+new = workspaces.create("sample", state="held", held_by=[f"app/blocker-{i}" for i in range(21)])
+assert new["id"] > wid and len(new["held_by"]) == 20
+assert workspaces.by_state("held") == [new]
+with db.reader() as c:
+    changes = [(r["ver"], r["class"], json.loads(r["data"])) for r in c.execute(
+        "SELECT * FROM events_log WHERE subject = ? AND kind = 'workspace.changed' ORDER BY seq",
+        (f"workspace:{wid}",),
+    )]
+live = {"state": "live", "kept_reason": "", "owner_run": "r1"}
+keep = {"state": "kept", "kept_reason": "operator", "owner_run": "r2"}
+gone = {"state": "removed", "kept_reason": "", "owner_run": "r2"}
+assert changes == [(1, "derived", {"old": None, "new": live}), (2, "derived", {"old": live, "new": keep}),
+                   (3, "derived", {"old": keep, "new": gone})], changes
+""")
+
+
+class _WorkspaceWorkflowCase(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
+        env = api_check.isolated_env(root)
+        self.enterContext(mock.patch.dict(os.environ, env, clear=True))
+        state = root / "state"
+        self.enterContext(mock.patch.multiple(paths, HOME=root / "home", CONFIG_DIR=root / "config",
+                                             CONFIG_FILE=root / "config/config.toml", STATE_DIR=state,
+                                             DB_FILE=state / "arete.db", LOCKS_DIR=state / "locks",
+                                             RUNS_DIR=state / "runs", WORKTREES_DIR=root / "worktrees",
+                                             LOG_DIR=root / "logs"))
+        self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "config/verification-authority"))
+        paths.CONFIG_FILE.write_text("max_parallel = 1\n")
+        db.migrate()
+        self.enterContext(mock.patch.object(workspace, "HELD_FILE", state / "held-workspaces.json"))
+        src = root / "repo"
+        src.mkdir()
+        util.git(["init", "-q", "-b", "main"], src)
+        (src / ".gitignore").write_text(".venv/\n")
+        (src / "notes.txt").write_text("original\n")
+        util.git(["add", "."], src)
+        util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                  "-c", "commit.gpgsign=false", "commit", "-qm", "sample"], src)
+        self.repo = config.Repo("sample", src, github="test/sample")
+        self.cfg = config.Config(repos=[self.repo])
+
+    def checkout(self, tid, status, *, owned=True, part="", **fields):
+        ws = paths.WORKTREES_DIR / f"{self.repo.name}-{tid}"
+        c = workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
+        workspace.add_worktree(c, f"arete/{tid}", "main")
+        (c.wt / ".venv").mkdir()
+        (c.wt / ".venv/pyvenv.cfg").write_text("home\n")
+        rid = record.start("pipeline", repo=self.repo.name, issue=tid, status=status, **fields)
+        run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(self.cfg, self.repo, tid),
+                           tid=tid)
+        run.dir.mkdir(parents=True)
+        if owned:
+            workspace.note_made(ws, [c], pipeline.workspace_owner(run, ws, [c]))
+        else:
+            workspace.note_made(ws, [c])
+        return ws, c, run
+
+    def registered(self, wt):
+        found = util.git(["worktree", "list", "--porcelain"], self.repo.path)
+        return f"worktree {wt}" in found.splitlines()
+
+
+class WorkspaceSweepTests(_WorkspaceWorkflowCase):
+    def test_sweep_distinguishes_waiting_workspaces_from_blocked_removal(self):
+        old = util.iso(util.now() - timedelta(days=30))
+        merged, _, _ = self.checkout("1", "merged", owned=False, started=old, finished=old)
+        running, _, _ = self.checkout("2", "running")
+        blocked, c, _ = self.checkout("3", "merged")
+        hand = blocked / "hand.txt"
+        hand.write_text("by hand\n")
+        self.assertEqual(workspace.remove_workspace(blocked, [c]), workspace.Release("held", ["hand.txt"]))
+        self.assertTrue(self.registered(blocked))
+        gone, _, _ = self.checkout("4", "done")
+        shutil.rmtree(gone)
+
+        workspace.cleanup_worktrees(cfg=self.cfg)
+        self.assertFalse(merged.exists())
+        self.assertFalse(workspace.made_record(merged).exists())
+        self.assertFalse(self.registered(merged))
+        self.assertFalse(self.registered(gone))
+        self.assertTrue(running.exists())
+        self.assertEqual(hand.read_text(), "by hand\n")
+        held, = workspace.held_summary()["rows"]
+        self.assertTrue(held["blocked"])
+        self.assertEqual(held["names"], ["hand.txt"])
+        self.assertEqual(json.loads(workspace.HELD_FILE.read_text()), [held])
+        self.assertIn("hand.txt", held["why"])
+        self.assertIn("hand.txt", heartbeat.check_workspaces()[0].detail)
+
+        hand.unlink()
+        notes = blocked / "notes.txt"
+        notes.write_text("edited by hand\n")
+        self.assertEqual(workspace.workspace_blockers(blocked, [c]), [])
+        self.assertEqual(workspace.workspace_blockers(blocked, [c], edits=True), ["notes.txt"])
+        workspace.cleanup_worktrees(cfg=self.cfg)
+        held, = workspace.held_summary()["rows"]
+        self.assertTrue(held["blocked"])
+        self.assertEqual(held["names"], ["notes.txt"])
+        self.assertEqual(notes.read_text(), "edited by hand\n")
+
+        util.git(["restore", "notes.txt"], blocked)
+        external, _, _ = self.checkout("5", "failed")
+        local_id = task_store.task_add(self.repo.name, "closed task", reserved_id="t-a123")
+        task_store.task_set_state(local_id, "closed")
+        closed, _, _ = self.checkout(local_id, "failed")
+        with mock.patch.object(tracker, "for_repo", side_effect=AssertionError("sweep read an external ticket")):
+            workspace.cleanup_worktrees(cfg=self.cfg)
+        self.assertFalse(blocked.exists())
+        self.assertFalse(workspace.made_record(blocked).exists())
+        self.assertFalse(closed.exists())
+        self.assertTrue(external.exists())
+        waiting, = workspace.held_summary()["rows"]
+        self.assertFalse(waiting["blocked"])
+        self.assertEqual(waiting["names"], [])
+        self.assertTrue(waiting["why"].endswith("waits for the ticket"))
+
+
+class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
+    def test_pr_release_records_setup_files_and_removes_the_workspace(self):
+        ws, c, run = self.checkout("7", "pr")
+        made = workspace.made_before(ws)
+        self.assertEqual(made[workspace.OWNER_KEY]["run"], run.id)
+        self.assertIn(".venv/", made)
+        (c.wt / ".venv/pyvenv.cfg").write_text("changed during the run\n")
+        self.assertTrue(pipeline.release_workspace(run, ws, [c]))
+        self.assertFalse(ws.exists())
+        self.assertFalse(workspace.made_record(ws).exists())
+        self.assertFalse(self.registered(ws))
+        self.assertFalse((run.dir / "run.log").exists())
+
+    def test_removal_reports_files_that_arrive_under_lock_and_after_git(self):
+        ws, c, _ = self.checkout("7", "done", part="api")
+        repo_lock = util.repo_lock
+        late = c.wt / "hand.txt"
+
+        @contextmanager
+        def write_under_lock(src):
+            with repo_lock(src):
+                late.write_text("arrived under lock\n")
+                yield
+
+        with mock.patch.object(util, "repo_lock", write_under_lock):
+            with self.assertRaisesRegex(workspace.RunFailed, r"\(api/hand\.txt\)"):
+                workspace.clear_workspace(ws, [c], c.src, [])
+        self.assertTrue(self.registered(c.wt))
+        late.unlink()
+
+        outside = ws / "hand.txt"
+
+        def write_after_git(args, *a, **kw):
+            out = util.git(args, *a, **kw)
+            if args[:2] == ["worktree", "remove"]:
+                outside.write_text("arrived after git\n")
+            return out
+
+        with mock.patch.object(workspace, "git", write_after_git):
+            release = workspace.remove_workspace(ws, [c])
+        self.assertEqual(release, workspace.Release("held", ["hand.txt"]))
+        self.assertEqual(outside.read_text(), "arrived after git\n")
+        self.assertTrue(workspace.made_record(ws).is_file())
+        self.assertFalse(self.registered(c.wt))
+        outside.unlink()
+        self.assertEqual(workspace.remove_workspace(ws, [c]), workspace.Release("removed"))
+        self.assertFalse(ws.exists())
+        self.assertFalse(workspace.made_record(ws).exists())
+
+    def test_excluded_checkout_keeps_surviving_workspace_and_record(self):
+        ws, c, _ = self.checkout("8", "done", part="api")
+        saved = workspace.made_record(ws).read_bytes()
+        excluded = ws / "closed"
+        excluded.mkdir()
+        (excluded / "hand.txt").write_text("preserved\n")
+
+        release = workspace.remove_workspace(ws, [c], excluded={excluded})
+
+        self.assertEqual(release.state, "removed")
+        self.assertEqual(workspace.made_record(ws).read_bytes(), saved)
+        self.assertEqual((excluded / "hand.txt").read_text(), "preserved\n")
+        self.assertFalse(self.registered(c.wt))
+
+
+class WorkspaceBlockerTests(_WorkspaceWorkflowCase):
+    def test_removal_preserves_untracked_file_saved_during_sibling_scan(self):
+        ws = paths.WORKTREES_DIR / "sample-9"
+        api, web = [workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
+                    for part in ("api", "web")]
+        for c in (api, web):
+            workspace.add_worktree(c, f"arete/9-{c.dir}", "main")
+        late = api.wt / "late.txt"
+        checkout_blockers = workspace.checkout_blockers
+        repo_lock = util.repo_lock
+        saved = False
+
+        def save_during_scan(c, made, edits):
+            nonlocal saved
+            if c is web and not saved:
+                late.write_text("saved during the sibling scan\n")
+                saved = True
+            return checkout_blockers(c, made, edits)
+
+        @contextmanager
+        def save_under_lock(src):
+            with repo_lock(src), mock.patch.object(workspace, "checkout_blockers", save_during_scan):
+                yield
+
+        with mock.patch.object(util, "repo_lock", save_under_lock):
+            release = workspace.remove_workspace(ws, [api, web])
+
+        self.assertTrue(saved, "the locked sibling scan never saved the file")
+        self.assertTrue(late.is_file(), "the file saved during the sibling scan was removed")
+        self.assertEqual(late.read_text(), "saved during the sibling scan\n")
+        self.assertEqual(release, workspace.Release("held", ["api/late.txt"]))
+        self.assertTrue(self.registered(api.wt))
+        self.assertTrue(self.registered(web.wt))
+
+    def test_removal_preserves_checkout_restored_during_sibling_scan(self):
+        ws = paths.WORKTREES_DIR / "sample-10"
+        api, web = [workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
+                    for part in ("api", "web")]
+        for c in (api, web):
+            workspace.add_worktree(c, f"arete/10-{c.dir}", "main")
+        untracked = api.wt / "hand.txt"
+        untracked.write_text("work from the restored checkout\n")
+        parked = paths.WORKTREES_DIR.parent / "parked-api"
+        api.wt.rename(parked)
+        checkout_blockers = workspace.checkout_blockers
+        repo_lock = util.repo_lock
+
+        def restore_during_scan(c, made, edits):
+            if c is web and parked.exists():
+                parked.rename(api.wt)
+            return checkout_blockers(c, made, edits)
+
+        @contextmanager
+        def restore_under_lock(src):
+            with repo_lock(src), mock.patch.object(workspace, "checkout_blockers", restore_during_scan):
+                yield
+
+        with mock.patch.object(util, "repo_lock", restore_under_lock):
+            release = workspace.remove_workspace(ws, [api, web])
+
+        self.assertFalse(parked.exists(), "the locked sibling scan never restored the checkout")
+        self.assertTrue(untracked.is_file(), "the restored checkout's untracked file was removed")
+        self.assertEqual(untracked.read_text(), "work from the restored checkout\n")
+        self.assertEqual(release, workspace.Release("held", ["api/hand.txt"]))
+        self.assertTrue(self.registered(api.wt))
+        self.assertTrue(self.registered(web.wt))
+
+    def test_removal_names_files_outside_and_inside_checkouts(self):
+        ws, c, _ = self.checkout("9", "done", part="api")
+        second = workspace.Checkout("web", c.github, c.src, ws / "web", "main")
+        workspace.add_worktree(second, "arete/9-web", "main")
+        (ws / "hand.txt").write_text("outside\n")
+        (c.wt / ".venv/another.cfg").write_text("ignored\n")
+        (second.wt / "local.txt").write_text("untracked\n")
+
+        release = workspace.remove_workspace(ws, [c, second])
+
+        self.assertEqual(release.state, "held")
+        self.assertEqual(set(release.held_by), {"hand.txt", "api/.venv/", "web/local.txt"})
+        self.assertTrue(self.registered(c.wt))
+        self.assertTrue(self.registered(second.wt))
+
+        scratch_record = sandbox.AUTHORITY / "held.json"
+        with mock.patch.object(workspace, "scratch_left", return_value=[ws, c.wt, scratch_record]):
+            held = workspace.remove_workspace(ws, [c, second])
+        self.assertEqual(held.state, "held")
+        self.assertEqual(set(held.held_by), {*release.held_by, str(ws), str(c.wt), str(scratch_record)})
+
+
+class WorkspaceSymlinkTests(_WorkspaceWorkflowCase):
+    def assert_late_link_held(self, ws, checkouts, link, destination, other, *, scan_name, sibling=None):
+        checkout = workspace.Checkout("", self.repo.github, self.repo.path, other, "main")
+        workspace.add_worktree(checkout, f"arete/{ws.name}-other", "main")
+        untracked = other / "hand.txt"
+        untracked.write_text("keep the other checkout's work\n")
+        scan = getattr(workspace, scan_name)
+        repo_lock = util.repo_lock
+
+        def link_after_scan(*args):
+            names = scan(*args)
+            if (sibling is None or args[0] is sibling) and not link.is_symlink():
+                link.symlink_to(destination, target_is_directory=True)
+            return names
+
+        @contextmanager
+        def link_under_lock(src):
+            with repo_lock(src), mock.patch.object(workspace, scan_name, link_after_scan):
+                yield
+
+        def guard_git(args, *a, **kw):
+            self.assertNotEqual(args[:3], ["worktree", "remove", "--force"])
+            return util.git(args, *a, **kw)
+
+        with (mock.patch.object(util, "repo_lock", link_under_lock),
+              mock.patch.object(workspace, "git", guard_git)):
+            release = workspace.remove_workspace(ws, checkouts)
+
+        self.assertEqual(link.readlink(), destination)
+        self.assertEqual(release.state, "held")
+        self.assertIn(str(link), release.held_by)
+        self.assertTrue(self.registered(other))
+        self.assertEqual(untracked.read_text(), "keep the other checkout's work\n")
+
+    def test_removal_holds_checkout_linked_during_sibling_scan(self):
+        ws = paths.WORKTREES_DIR / "sample-parts"
+        api, web = [workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
+                    for part in ("api", "web")]
+        workspace.add_worktree(web, "arete/sibling", "main")
+        other = paths.WORKTREES_DIR / "other"
+
+        self.assert_late_link_held(ws, [api, web], api.wt, other, other,
+                                  scan_name="checkout_blockers", sibling=web)
+
+    def test_removal_holds_workspace_root_linked_after_outside_scan(self):
+        for part in ("", "api"):
+            with self.subTest(part=part):
+                ws = paths.WORKTREES_DIR / f"sample-{part or 'single'}"
+                other_root = paths.WORKTREES_DIR / f"other-{part or 'single'}"
+                checkouts = [workspace.Checkout(name, self.repo.github, self.repo.path, ws / name, "main")
+                             for name in ((part, "web") if part else (part,))]
+
+                self.assert_late_link_held(ws, checkouts, ws, other_root, other_root / part,
+                                          scan_name="outside_blockers")
 
 
 class ConfigRegistryTests(unittest.TestCase):

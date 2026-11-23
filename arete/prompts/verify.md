@@ -65,13 +65,14 @@ $journeys## Rules
   off goes in `checks` with `passed` false and `cause` `environment`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
 - Do not edit the repo's files and do not fix what you find; fixtures in the scratch folder are not edits to the change. Arete gives your findings to the builder.
+- Arete removes untracked files you made in the worktree when verification ends. Do not report those files as left behind.
 - Never run git commands that write. Arete deletes the `__pycache__` your commands leave, so do not report it.
 - A problem that is also on the base branch is not a failure of this change. Note it in `saw` and do not fail it.
 
 ## What to return
 
 - `checks`: one entry for each thing you checked.
-  - `what`: the behavior, in the user's words.
+  - `what`: the behavior, using the exact wording of the user's requirement so a fresh measurement can be matched to it.
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is what the change should give.
@@ -80,6 +81,9 @@ $journeys## Rules
     page that crashed the tab or a request the product refused. When every
     failed check is `environment`, Arete treats the result as blocked, not as a failure of the change.
   - `screenshot`: the file name of the screenshot for a browser check, else leave it out.
+- `unmeasured_requirements`: list the exact wording of each requirement whose measurement your environment cannot
+  establish, and explain the limitation in `summary`. For example, timing that includes sandbox setup does not
+  establish standalone runtime. Keep observed failures in `checks` and follow the same verdict rules.
 - `verdict`: `pass` when every check passed. `fail` when the product does not do what the issue asks or something
   near it broke. `blocked` when you could not check something essential for a reason outside the change (no
   login, missing data, a command you may not run); say what in `blocked_by`.

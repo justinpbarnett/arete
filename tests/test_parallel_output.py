@@ -19,6 +19,7 @@ TAIL = 3000
 SUITE = '''import os
 import time
 import unittest
+from unittest.mock import patch
 
 
 def crowd(test):
@@ -63,6 +64,56 @@ class Sleeper(unittest.TestCase):
 
     def test_hangs(self):
         time.sleep(60)
+
+
+class BusySolo(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        marker = os.path.join(os.environ["PARALLEL_MARKERS"], cls.__name__)
+        with open(marker, "a+") as attempts:
+            attempts.seek(0)
+            cls.attempt = len(attempts.readlines()) + 1
+            print(cls.attempt, file=attempts)
+
+
+def skip_cleanup():
+    raise unittest.SkipTest("module cleanup skipped")
+
+
+def broken_cleanup():
+    raise RuntimeError("module cleanup failed")
+
+
+class ModuleCleanupFailure(BusySolo):
+    def test_cleanup(self):
+        # unittest reports the first cleanup exception in LIFO execution order.
+        unittest.addModuleCleanup(skip_cleanup)
+        unittest.addModuleCleanup(broken_cleanup)
+
+
+class AssertionWithReplacePatched(BusySolo):
+    def test_assertion(self):
+        self.enterContext(patch.object(os, "replace", side_effect=PermissionError("replacement denied")))
+        self.fail("assertion while os.replace is patched")
+
+
+class BusyTimeout(BusySolo):
+    class_timeout = 1
+
+    def test_hangs(self):
+        if self.attempt <= 2:
+            time.sleep(60)
+
+
+class BusyTimeoutThenFailure(BusySolo):
+    class_timeout = 1
+
+    def test_hangs_on_first_solo_attempt(self):
+        if self.attempt == 1:
+            self.fail("force an alone rerun")
+        if self.attempt == 2:
+            time.sleep(60)
+        self.fail("assertion on the extra solo attempt")
 '''
 
 
@@ -78,10 +129,19 @@ class RunnerOutputTests(unittest.TestCase):
         (root / "markers").mkdir()
         self.env = {key: value for key, value in os.environ.items()
                     if key not in ("ARETE_VERIFY_SCRATCH", "ARETE_CONFIG_DIR")}
-        self.env.update(PARALLEL_MARKERS=str(root / "markers"), ARETE_STATE_DIR=str(root / "state"))
+        self.env.update(PARALLEL_MARKERS=str(root / "markers"), ARETE_STATE_DIR=str(root / "state"), TMPDIR=str(root))
 
-    def run_suite(self, *names):
-        done = subprocess.run([sys.executable, "-m", "tests.parallel", "-s", str(self.suite), *names],
+    def run_suite(self, *names, loads=(0,)):
+        runner = ("from types import SimpleNamespace; from tests import parallel; "
+                  f"loads = iter({loads!r}); "
+                  "parallel.os.cpu_count = lambda: 14; "
+                  "parallel.os.getloadavg = lambda: (next(loads, 0), 0, 0); "
+                  "parallel.LOAD_WAIT_BUDGET = 0; "
+                  # The managed sandbox can deny removal of temporary directories.
+                  "remove_reports = parallel.shutil.rmtree; "
+                  "parallel.shutil = SimpleNamespace(rmtree=lambda path: remove_reports(path, ignore_errors=True)); "
+                  "raise SystemExit(parallel.main())")
+        done = subprocess.run([sys.executable, "-c", runner, "-s", str(self.suite), *names],
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         return done.returncode, done.stdout + done.stderr
@@ -123,6 +183,152 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertLess(output.rindex("class exceeded"), output.index("Ran "))
         self.assertNotIn("on its first run", output)
 
+    def test_module_cleanup_error_fails_the_suite(self):
+        name = "ModuleCleanupFailure"
+        identifier = f"test_sample.{name}"
+        code, output = self.run_suite(identifier, loads=(0, 20, 20))
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"{identifier}: errors\ntearDownModule (test_sample)", output)
+        self.assertIn("RuntimeError: module cleanup failed", output)
+        self.assertIn(f"Failed classes: {identifier}", output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / name
+        self.assertEqual(marker.read_text().splitlines(), ["1", "2"], output)
+
+    def test_busy_alone_assertion_remains_visible_with_replace_patched(self):
+        name = "AssertionWithReplacePatched"
+        identifier = f"test_sample.{name}"
+        code, output = self.run_suite(identifier, loads=(0, 20, 20))
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"{identifier}: starting alone at host load 20", output)
+        self.assertIn(f"{identifier}: failures", output)
+        self.assertIn("AssertionError: assertion while os.replace is patched", output)
+        self.assertNotIn("PermissionError: replacement denied", output)
+        self.assertIn(f"Failed classes: {identifier}", output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / name
+        self.assertEqual(marker.read_text().splitlines(), ["1", "2"], output)
+
+    def test_busy_alone_timeout_gets_one_extra_rerun_and_reports_both_loads(self):
+        identifier = "test_sample.BusyTimeout"
+        code, output = self.run_suite(identifier, loads=(0, 0, 20, 20, 20, 21, 21))
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"{identifier}: ran past its deadline on its first run, "
+                      "ran past its deadline alone at host load 20, then passed alone at host load 21", output)
+        self.assertTrue(output.rstrip().endswith(": OK"), output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / "BusyTimeout"
+        self.assertEqual(marker.read_text().splitlines(), ["1", "2", "3"], output)
+
+    def test_failed_extra_solo_attempt_keeps_the_first_solo_timeout_stack(self):
+        name = "BusyTimeoutThenFailure"
+        identifier = f"test_sample.{name}"
+        code, output = self.run_suite(identifier, loads=(0, 20, 20, 20, 21, 21))
+        self.assertEqual(code, 1, output)
+        self.assertEqual(output.count(f"{identifier}: starting alone at host load"), 2, output)
+        self.assertIn(f"{identifier}: starting alone at host load 20", output)
+        self.assertIn(f"{identifier}: starting alone at host load 21", output)
+        self.assertIn(f"{identifier}: failures", output)
+        before_failure = output.partition(f"{identifier}: failures")[0]
+        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 3s x load [\d.]+\)\nPython class stack")
+        self.assertIn("in test_hangs_on_first_solo_attempt\n", before_failure)
+        self.assertIn("AssertionError: assertion on the extra solo attempt", output)
+        self.assertIn(f"Failed classes: {identifier}", output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / name
+        self.assertEqual(marker.read_text().splitlines(), ["1", "2", "3"], output)
+
+
+def report(**details):
+    return {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [],
+            "seconds": 0.10, "output": "", "timeout": "", **details}
+
+
+class RunnerLoadTests(unittest.TestCase):
+    def run_suite(self, loads, outcomes):
+        events = []
+        clock = 0
+        loads = iter(loads)
+        outcomes = {name: iter(attempts) for name, attempts in outcomes.items()}
+
+        def getloadavg():
+            load = next(loads)
+            events.append(("load", load))
+            return load, 0, 0
+
+        def sleep(seconds):
+            nonlocal clock
+            events.append(("sleep", seconds))
+            clock += seconds
+
+        def child(item, stretch=1):
+            index, batch = item
+            events.append((batch.identifier, index, stretch))
+            runner.results[batch.identifier] = next(outcomes[batch.identifier])
+
+        tests = [SimpleNamespace(id=lambda name=name: f"{name}.test_it") for name in outcomes]
+        with (patch.object(parallel, "open", side_effect=OSError, create=True),
+              patch.object(parallel.tempfile, "mkdtemp", return_value="worker-reports"),
+              patch.object(parallel.shutil, "rmtree"),
+              patch.object(parallel.os, "cpu_count", return_value=14),
+              patch.object(parallel.os, "getloadavg", side_effect=getloadavg),
+              patch.object(parallel, "time", SimpleNamespace(monotonic=lambda: clock, sleep=sleep)),
+              redirect_stdout(StringIO()) as output):
+            runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+            with patch.object(runner, "child", side_effect=child):
+                code = runner.run(tests)
+        return code, output.getvalue(), events
+
+    def test_rerun_starts_after_the_third_load_check_and_logs_the_wait(self):
+        code, output, events = self.run_suite([18, 16, 13], {
+            "First": [report(timeout="initial timeout"), report()],
+        })
+        self.assertEqual(code, 0, output)
+        self.assertEqual(events, [("First", 0, 1), ("load", 18), ("sleep", 5), ("load", 16),
+                                  ("sleep", 5), ("load", 13), ("First", "0.alone", 3)])
+        self.assertEqual(output.splitlines()[:2], [
+            "First: waiting for host load to fall from 18 to 14 or less",
+            "First: starting alone at host load 13 after waiting 10.00s",
+        ])
+
+    def test_wait_budget_is_shared_by_all_classes_and_both_alone_attempts(self):
+        timeout = report(ran=0, timeout="class exceeded its deadline")
+        code, output, events = self.run_suite([18, 14, *([20] * 60), 21, 22], {
+            "First": [timeout, report()],
+            "Second": [timeout, timeout, report()],
+            "Third": [timeout, report()],
+        })
+        self.assertEqual(code, 0, output)
+        self.assertEqual(events.count(("sleep", 5)), 60)
+        self.assertEqual(output.count("waiting for host load to fall"), 2)
+        self.assertIn("First: starting alone at host load 14 after waiting 5.00s", output)
+        self.assertIn("Second: starting alone at host load 20 after waiting 295.00s", output)
+        self.assertEqual(events[-6:], [("load", 20), ("Second", "1.alone", 3),
+                                       ("load", 21), ("Second", "1.alone-retry", 3),
+                                       ("load", 22), ("Third", "2.alone", 3)])
+        self.assertIn("Second: ran past its deadline on its first run, ran past its deadline alone at host load 20, "
+                      "then passed alone at host load 21 within three times its deadline", output)
+        self.assertTrue(output.rstrip().endswith(": OK"), output)
+
+    def test_quiet_timeout_stays_failed_after_one_alone_run(self):
+        timeout = report(ran=0, timeout="class exceeded its deadline")
+        code, output, events = self.run_suite([14], {"First": [timeout, timeout]})
+        self.assertEqual(code, 1, output)
+        self.assertEqual(events, [("First", 0, 1), ("load", 14), ("First", "0.alone", 3)])
+        self.assertIn("Failed classes: First", output)
+
+    def test_only_over_capacity_timeouts_get_one_extra_rerun(self):
+        timeout = report(ran=0, timeout="class exceeded its deadline")
+        assertion = report(failures=[("test_it", "AssertionError: failed")])
+        error = report(errors=[("test_it", "RuntimeError: failed")])
+        code, output, events = self.run_suite([20] * 64, {
+            "TimedOut": [timeout, timeout, timeout],
+            "Assertion": [timeout, assertion],
+            "Error": [timeout, error],
+        })
+        self.assertEqual(code, 1, output)
+        self.assertEqual([event for event in events if len(event) == 3 and event[2] == 3], [
+            ("TimedOut", "0.alone", 3), ("TimedOut", "0.alone-retry", 3),
+            ("Assertion", "1.alone", 3), ("Error", "2.alone", 3),
+        ])
+        self.assertIn("Failed classes: Assertion, Error, TimedOut", output)
+
 
 class RunnerFailureSummaryTests(unittest.TestCase):
     crowded = "test_sample.Crowded"
@@ -130,25 +336,21 @@ class RunnerFailureSummaryTests(unittest.TestCase):
     crowded_note = (f"{crowded}: ran past its deadline on its first run, "
                     "then passed alone within three times its deadline in 0.10s")
 
-    def report(self, **details):
-        return {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [],
-                "seconds": 0.10, "output": "", "timeout": "", **details}
-
     def finish_suite(self, failures, slowest=0):
         with (patch.object(parallel, "open", side_effect=OSError, create=True),
               patch.object(parallel.shutil, "rmtree"), redirect_stdout(StringIO()) as output):
             runner = parallel.Runner(SimpleNamespace(slowest=slowest))
             runner.folder = "worker-reports"
-            runner.results = {self.crowded: self.report(), **failures}
+            runner.results = {self.crowded: report(), **failures}
             runner.crowded = [self.crowded]
-            runner.first_failures[self.crowded] = self.report(timeout=f"Python class stack\n{self.crowded_stack}")
+            runner.first_failures[self.crowded] = report(timeout=f"Python class stack\n{self.crowded_stack}")
             code = runner.finish(0.25)
         return code, output.getvalue()
 
     def test_tail_names_every_failed_class_after_the_reports(self):
         code, output = self.finish_suite({
-            "test_sample.TimedOut": self.report(ran=0, timeout="class exceeded its retry deadline"),
-            "test_sample.Noisy": self.report(failures=[("test_assertion", "AssertionError: " + "x" * 2000)]),
+            "test_sample.TimedOut": report(ran=0, timeout="class exceeded its retry deadline"),
+            "test_sample.Noisy": report(failures=[("test_assertion", "AssertionError: " + "x" * 2000)]),
         }, slowest=1)
         self.assertEqual(code, 1, output)
         tail = output[-1500:]
