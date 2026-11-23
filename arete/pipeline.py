@@ -2286,8 +2286,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if run.workspace and not zte_grant:
                     if not keep_edits_blocker():
                         keep_edits(run)
-                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                        excluded=run.closed_checkout_paths)
+                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                                        preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
                     workspaces.keep(run.workspace[0], status)
             except (OSError, sqlite3.Error) as e:
                 run.log(f"could not finalize workspace {run.workspace[0]}: {util.first_line(str(e), 300)}")

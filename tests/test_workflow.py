@@ -2341,7 +2341,7 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
         self.assertIn("uncommitted edits that arete has no record of leaving there (personal.txt)", why)
 
     def test_signal_preserves_checkouts_excluded_from_the_final_save(self):
-        workspaces.claim(self.wt, "fixture", "1", "earlier", checkouts=[self.checkout])
+        workspaces.claim(self.wt, "fixture", "1", "previous-run", checkouts=[self.checkout])
         workspace.note_made(self.wt, [self.checkout])
         original_record = workspace.made_record(self.wt).read_bytes()
         cases = (

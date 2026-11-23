@@ -2388,6 +2388,21 @@ With HTTPS on, scratch state asks for no certificate.
 1. Set `https = true` under `[dashboard]`. Once serve has a TLS listener, run `arete pair` on the serve host for the first pairing. Open the link in a browser signed in to the same tailnet login and submit the six-digit code. The code expires after five minutes.
 2. In a paired dashboard, open **Pair a device and manage tokens**. Use **Pair a device** for another browser or **Issue a token** for another CLI or script. Choose the scopes it needs, such as `read` and `task:write`. Copy the token when it is displayed. This page also rotates or revokes tokens and signs out the browser.
 3. On the CLI host, point `ARETE_SERVER` or `[server] url` at the dashboard's HTTPS address. Pipe the issued token into `arete login --token-stdin`. The CLI validates the token and stores it in a mode 0600 `<tag>.token` file under `$XDG_STATE_HOME/arete/client/` (default `~/.local/state/arete/client/`). Run `arete logout` to revoke that token and remove its local copy.
+4. On the MCP client host, use the same HTTPS server setting and CLI login. Add a stdio server with command `arete` and arguments `["mcp"]`.
+
+   ```json
+   {
+     "mcpServers": {
+       "arete": {
+         "command": "arete",
+         "args": ["mcp"],
+         "env": { "ARETE_SERVER": "https://your-arete-host:8796" }
+       }
+     }
+   }
+   ```
+
+   The MCP process uses the stored CLI token unless its environment supplies `ARETE_TOKEN`. One stdio MCP process can run per Arete state directory. Clients with Streamable HTTP and bearer authentication can instead connect directly to the dashboard's HTTPS `/api/v1/mcp` endpoint. Tool discovery reflects the token's profile, scopes, and allowed commands.
 
 Serve provisions its own CLI token at startup. A restore invalidates issued tokens and browser sessions while keeping the instance ID. After serve starts again, use the new owner CLI token to run `arete pair` again.
 

@@ -163,14 +163,15 @@ def matches_etag(headers, tag):
 
 
 class RateLimits:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, *, command_limit=(20, 60)):
         self.clock = clock
+        self.command_limit = command_limit
         self.lock = threading.Lock()
         self.buckets = {}
         self.swept = self.clock()
 
     def take(self, actor, command, cost=1):
-        rate, burst = (20, 60) if command else (50, 50)
+        rate, burst = self.command_limit if command else (50, 50)
         identity = actor, command
         with self.lock:
             now = self.clock()

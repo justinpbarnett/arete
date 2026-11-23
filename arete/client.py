@@ -49,10 +49,11 @@ class Down(Exception):
 
 
 class Failed(Exception):
-    def __init__(self, answer: dict, code: int = 0, *, retry_after: float | None = None):
+    def __init__(self, answer: dict, code: int = 0, *, retry_after: float | None = None, headers=None):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
         self.retry_after = retry_after
+        self.headers = headers
         self.after_restart = False
 
 
@@ -509,7 +510,8 @@ def request(method: str, path: str, body: dict | None = None,
 def request_once(method: str, path: str, body: dict | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
                  key: str | None = None, *, deadline: float | None = None,
-                 where: Server | None = None, buffered: bool = False, token: str | None = None) -> http.client.HTTPResponse:
+                 where: Server | None = None, buffered: bool = False, token: str | None = None,
+                 extra_headers: dict[str, str] | None = None) -> http.client.HTTPResponse:
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
     where = where or server()
@@ -528,6 +530,8 @@ def request_once(method: str, path: str, body: dict | None = None,
                 with transport_budget(transport, deadline):
                     transport.settimeout(read_seconds if deadline is None else budget_left(deadline))
                     headers = headers_for(where, token=token)
+                    if extra_headers:
+                        headers.update(extra_headers)
                     if key is not None:
                         headers["Idempotency-Key"] = key
                     if payload is not None:
@@ -573,12 +577,12 @@ def request_once(method: str, path: str, body: dict | None = None,
         failure.update(answer)
     wait = retry_after(resp.getheader("Retry-After"), limit=None if resp.status == 429 else RESTART_WAIT_SECONDS)
     if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
-        failure = InFlight(failure, resp.status)
+        failure = InFlight(failure, resp.status, headers=resp.headers)
         failure.seconds = 1 if wait is None else wait
         raise failure
     if resp.status == 503 and wait is not None:
         raise Restarting(failure, wait)
-    raise Failed(failure, resp.status, retry_after=wait)
+    raise Failed(failure, resp.status, retry_after=wait, headers=resp.headers)
 
 
 def retry_after(header, *, limit):

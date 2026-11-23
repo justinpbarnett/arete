@@ -308,8 +308,8 @@ def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
                            if selected and c.wt not in selected and os.path.lexists(c.wt)}
                 earlier = {Path(wt) for wt in row["release_excluded"] or ()}
                 selection = _release_selection(checkouts, set(excluded) | omitted | (earlier - selected))
-            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD,
-                                   **selection)
+            return _change_current(row, state="released", kept_reason="",
+                                   legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD, **selection)
     return None
 
 
@@ -501,11 +501,25 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
             return None
     snapshot = snapshot_fields(made)
     owner = workspace.owner_in(made)
-    takeover = None
-    if active and active["release_excluded"] is not None:
-        takeover = _legacy_takeover(active, owner)
-        if not takeover:
-            return change(active, legacy_mtime_ns=modified, **snapshot)
+    has_selection = active is not None and active["release_excluded"] is not None
+    takeover = _legacy_takeover(active, owner) if has_selection else None
+    preserve_selection = has_selection and not takeover
+    if preserve_selection and owner and owner.run and owner.run != active["owner_run"]:
+        # A stale owner's record can refresh fingerprints without reopening the release selection.
+        return change(active, legacy_mtime_ns=modified, **snapshot)
+    if active and active["state"] == "released" and (
+        snapshot["heads"] != active["heads"] or snapshot["onto"] != active["onto"]
+        or snapshot["files"] != files(active["id"])
+    ):
+        owner = owner_of(active) if preserve_selection or owner is None else owner
+        status = (takeover or _run_for(owner)).get("status") or ""
+        return change(active, legacy_mtime_ns=modified, state="kept", released_at="",
+                      release_excluded=active["release_excluded"] if preserve_selection else None,
+                      remove_asked_by="", held_by=[], last_sweep_error="", kept_reason=status,
+                      repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows(),
+                      **snapshot)
+    if preserve_selection:
+        return change(active, legacy_mtime_ns=modified, **snapshot)
     owner = owner or legacy_owner(cfg or config.load(), ws, made)
     identity = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
     if not active:
