@@ -7,7 +7,9 @@ Keep the approved scope, dependencies, review and publication rules, and all ver
 
 ${verification_policy}
 
-Return exactly one JSON object with `action`, `evidence` (a nonempty list of observation evidence IDs), and `reason` (what is blocked and why the action helps).
+Return exactly one JSON object with `action`, `evidence` (a nonempty list of exact keys directly inside the observation's `evidence` object), and `reason` (what is blocked and why the action helps).
+Cite `asks`, not an individual ask ID; use the ask ID only in `answers` or in a `needs_owner` action's `asks` list.
+Cite `ticket`, not the ticket ID, and do not cite a key that is absent from this observation.
 Use exactly one of these actions:
 
 - `retry`: include `direction` with the concrete next step and `limit` with the exhausted limit named in the observation, or an empty string if none exhausted.
