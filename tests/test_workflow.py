@@ -1813,8 +1813,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         paths.DB_FILE.touch()
         self.enterContext(mock.patch.object(dbstats.Timing, "finished"))
         self.enterContext(mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)))
-        with (redirect_stdout(StringIO()),
-              mock.patch.object(db.migrations, "owners", return_value=db.migrations.owners())):
+        with redirect_stdout(StringIO()):
             db.migrate()
         record.start("pipeline", run_id="prior-run", repo=repo.name, issue=self.run.tid)
         self.run.repairs = "repair-source"
@@ -1864,8 +1863,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         def worktree_git(args, cwd, *, check=True):
             if args[:2] == ["worktree", "remove"]:
-                self.assertEqual((args[-1], cwd), (str(c.wt), c.src))
-                self.assertFalse(check)
+                self.assertEqual((args, cwd), (["worktree", "remove", "--force", str(c.wt)], c.src))
+                self.assertTrue(check)
                 (c.wt / ".git").unlink()
                 return ""
             if args == ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"]:

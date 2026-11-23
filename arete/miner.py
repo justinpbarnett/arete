@@ -34,7 +34,6 @@ from .store import approvals as approvals_store
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import runs as runs_store
-from .store.db import migrate_on_demand
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -990,8 +989,6 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
     paths.ensure_dirs()
     cfg = config.load()
-    if not dry_run:
-        migrate_on_demand()
     with util.lock(run_store.run_lock("miner")) as got:
         if not got:
             print("miner already running")

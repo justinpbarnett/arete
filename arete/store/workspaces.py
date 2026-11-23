@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import stat
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
@@ -25,6 +26,7 @@ WRITABLE = frozenset((*JSON_FIELDS, *CHANGE_FIELDS, "repo", "ticket", "remove_as
 FOLDER_LOCKS: ContextVar[frozenset[Path]] = ContextVar("workspace_folder_locks", default=frozenset())
 TICKET_LOCKS: ContextVar[frozenset[str]] = ContextVar("workspace_ticket_locks", default=frozenset())
 SWEEP_STATES = ("live", "released", "held", "kept")
+NO_LEGACY_RECORD = -1
 
 
 class SnapshotUnavailable(RuntimeError):
@@ -32,6 +34,10 @@ class SnapshotUnavailable(RuntimeError):
 
 
 class UnreadableSnapshot(SnapshotUnavailable):
+    pass
+
+
+class UnstatableSnapshot(UnreadableSnapshot):
     pass
 
 
@@ -146,7 +152,7 @@ def create(name: str, *, files: Mapping[str, str] | None = None, **fields) -> di
 
 
 def _create(name: str, fields: dict, fingerprints: dict[str, str]) -> dict:
-    values = {"name": name, "state": "live", "made_at": util.iso(), **fields}
+    values = {"name": name, "state": "live", "made_at": util.iso(), "legacy_mtime_ns": NO_LEGACY_RECORD, **fields}
     _state_time(values)
     columns = ", ".join(values)
     marks = ", ".join("?" for _ in values)
@@ -272,21 +278,24 @@ def _snapshot(row: dict) -> dict:
     return made
 
 
-def made_before(ws: Path) -> dict:
+def made_before(ws: Path, *, strict: bool = False) -> dict:
     migrate_on_demand()
     with folder_lock(ws):
-        row, _, _ = _reconcile(ws)
+        row, _, _ = _reconcile(ws, strict=strict)
         with reader():
             if row:
                 return _snapshot(row)
     return {}
 
 
-def release(ws: Path) -> dict | None:
-    migrate_on_demand()
+def release(ws: Path, *, reconcile: bool = True) -> dict | None:
     with folder_lock(ws):
-        row, _, _ = _reconcile(ws)
-        return _change_current(row, state="released") if row else None
+        row = open_for(ws.name)
+        if row and reconcile:
+            row, _, _ = _reconcile(ws)
+        if row:
+            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD)
+    return None
 
 
 def unlink_record(ws: Path) -> None:
@@ -302,16 +311,17 @@ def save_snapshot(ws: Path, row: dict, made: dict, owner: workspace.WorkspaceOwn
             _save_snapshot(ws, current, made, owner)
 
 
-def clear_snapshot(ws: Path, row: dict) -> None:
+def clear_snapshot(ws: Path, row: dict, *, unlink_legacy: bool = True) -> None:
     with writes.atomic():
         if (current := get(row["id"])) and current["state"] != "removed":
             modified = current["legacy_mtime_ns"]
-            try:
-                unlink_record(ws)
-            except OSError:
-                with suppress(SnapshotUnavailable):
-                    if st := _record_stat(workspace.made_record(ws)):
-                        modified = max(modified, st.st_mtime_ns)
+            if unlink_legacy:
+                try:
+                    unlink_record(ws)
+                except OSError:
+                    with suppress(SnapshotUnavailable):
+                        if st := _record_stat(workspace.made_record(ws)):
+                            modified = max(modified, st.st_mtime_ns)
             change(current, legacy_mtime_ns=modified, **snapshot_fields({}))
 
 
@@ -374,8 +384,20 @@ def _require_record_version(source: Path, version: tuple[int, ...] | None) -> No
         raise SnapshotUnavailable(f"{source}: legacy workspace record changed")
 
 
-def _read_record(source: Path) -> tuple[dict | None, int, tuple[int, ...]] | None:
-    before = _record_stat(source)
+def require_unstatable_record(ws: Path) -> None:
+    source = workspace.made_record(ws)
+    try:
+        _record_stat(source)
+    except UnreadableSnapshot:
+        return
+    raise SnapshotUnavailable(f"{source}: legacy workspace record can now be checked")
+
+
+def _read_record(source: Path, *, strict: bool = False) -> tuple[dict | None, int, tuple[int, ...]] | None:
+    try:
+        before = _record_stat(source)
+    except UnreadableSnapshot as e:
+        raise UnstatableSnapshot(str(e)) from e
     if before is None:
         return None
     version = _record_version(before)
@@ -395,7 +417,9 @@ def _read_record(source: Path) -> tuple[dict | None, int, tuple[int, ...]] | Non
         _require_record_version(source, version)
     except OSError as e:
         _require_record_version(source, version)
-        raise UnreadableSnapshot(f"{source}: {e}") from e
+        if strict:
+            raise UnreadableSnapshot(f"{source}: {e}") from e
+        made = None
     except ValueError as e:
         raise SnapshotUnavailable(f"{source}: {e}") from e
     if not isinstance(made, dict) or any(
@@ -406,12 +430,13 @@ def _read_record(source: Path) -> tuple[dict | None, int, tuple[int, ...]] | Non
     return made, before.st_mtime_ns, version
 
 
-def _reconcile(ws: Path, cfg: config.Config | None = None) -> tuple[dict | None, tuple[int, ...] | None, bool]:
+def _reconcile(ws: Path, cfg: config.Config | None = None, *,
+               strict: bool = False) -> tuple[dict | None, tuple[int, ...] | None, bool]:
     with reader() as c:
         row = _decode(c.execute("SELECT * FROM workspaces WHERE name = ? "
                                 "ORDER BY state = 'removed', id DESC LIMIT 1", (ws.name,)).fetchone())
     source = workspace.made_record(ws)
-    recorded = _read_record(source)
+    recorded = _read_record(source, strict=strict)
     version = recorded[2] if recorded else None
     if recorded is None:
         _require_record_version(source, None)
@@ -422,8 +447,12 @@ def _reconcile(ws: Path, cfg: config.Config | None = None) -> tuple[dict | None,
 def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, int, tuple[int, ...]] | None,
                       cfg: config.Config | None) -> dict | None:
     active = row if row and row["state"] != "removed" else None
+    if (active and active["state"] == "released" and active["legacy_mtime_ns"] == 0
+            and not active["remove_asked_by"] and active["kept_reason"] != "operator"):
+        status = _run_for(owner_of(active)).get("status") or ""
+        active = change(active, state="kept", kept_reason=status, released_at="")
     if recorded is None:
-        if active and active["legacy_mtime_ns"]:
+        if active and active["legacy_mtime_ns"] > 0:
             return change(active, **snapshot_fields({}))
         return active
     made, modified, _ = recorded
@@ -500,7 +529,7 @@ def backfill(cfg: config.Config) -> int:
     names = {p.name.removesuffix(".json") for p in record_dir.glob("*.json")}
     with reader() as c:
         names.update(r[0] for r in c.execute("SELECT name FROM workspaces "
-                                            "WHERE state != 'removed' AND legacy_mtime_ns != 0"))
+                                            "WHERE state != 'removed' AND legacy_mtime_ns > 0"))
     imported = 0
     for name in sorted(names - {"", ".", ".."}):
         ws = paths.WORKTREES_DIR / name
@@ -573,8 +602,8 @@ def _sweep_row(ws: Path, row: dict) -> None:
     try:
         ws.lstat()
     except FileNotFoundError:
-        unlink_record(ws)
         _change_current(row, state="removed", held_by=[], bytes=0)
+        unlink_record(ws)
         return
     if row["kept_reason"] == "operator":
         return
@@ -593,7 +622,7 @@ def _sweep_row(ws: Path, row: dict) -> None:
             names = workspace.workspace_blockers(ws, checkouts, edits=True)
         _change_current(row, state="held", held_by=blockers(ws, names), bytes=workspace.tree_bytes(ws),
                         last_sweep_error=util.first_line(str(e), 300))
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, sqlite3.Error) as e:
         _change_current(row, last_sweep_error=util.first_line(str(e), 300))
 
 
@@ -605,7 +634,10 @@ def _sweep_owned(cfg: config.Config, ws: Path, row: dict) -> None:
         with folder_lock(ws, wait=False) as got:
             if not got:
                 return
-            current, _, _ = _reconcile(ws, cfg)
+            try:
+                current = _reconcile(ws, cfg)[0] if os.path.lexists(ws) else open_for(ws.name)
+            except UnreadableSnapshot:
+                current = open_for(ws.name)
             if current and current["id"] == row["id"] and (current["repo"], current["ticket"]) == (repo, ticket):
                 _sweep_row(ws, current)
 
@@ -615,7 +647,7 @@ def _sweep_unowned(cfg: config.Config, ws: Path, cutoff: float) -> None:
         return
     owner = legacy_owner(cfg, ws, {})
     with ticket_lock(owner.repo, owner.ticket) as ticket_held, folder_lock(ws, wait=False) as got:
-        if not ticket_held or not got or open_for(ws.name) or _record_stat(workspace.made_record(ws)) is not None:
+        if not ticket_held or not got or open_for(ws.name):
             return
         try:
             modified = ws.stat().st_mtime
@@ -623,11 +655,27 @@ def _sweep_unowned(cfg: config.Config, ws: Path, cutoff: float) -> None:
             return
         if modified >= cutoff:
             return
+        source = workspace.made_record(ws)
+        try:
+            recorded = _read_record(source)
+        except UnreadableSnapshot:
+            if names := workspace.unexamined(ws, set()):
+                _record_orphan(ws, owner.repo, modified, names)
+            return
+        if recorded and recorded[0] is not None:
+            return
+        version = recorded[2] if recorded else None
         if names := workspace.unexamined(ws, set()):
-            create(ws.name, repo=owner.repo, state="held", held_by=names, bytes=workspace.tree_bytes(ws),
-                   made_at=util.iso(datetime.fromtimestamp(modified, UTC)))
+            _require_record_version(source, version)
+            _record_orphan(ws, owner.repo, modified, names)
         elif not workspace.scratch_left(ws, []) and not workspace.unexamined(ws, set()):
+            _require_record_version(source, version)
             shutil.rmtree(ws, ignore_errors=True)
+
+
+def _record_orphan(ws: Path, repo: str, modified: float, names: list[str]) -> None:
+    create(ws.name, repo=repo, state="held", held_by=names, bytes=workspace.tree_bytes(ws),
+           made_at=util.iso(datetime.fromtimestamp(modified, UTC)))
 
 
 def sweep(cfg: config.Config) -> None:

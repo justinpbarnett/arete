@@ -38,6 +38,7 @@ from .refusals import TrackerFailed
 from .store import asks as ask_store
 from .store import db as foundation
 from .store import idempotency as claims
+from .store import migrations
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import tasks as task_store
@@ -501,7 +502,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         folder = "its work folder was left in place"
         try:
             release = kept_folder_removed(repo, tid, run_id) if latest else None
-        except OSError as e:
+        except (OSError, sqlite3.Error, migrations.Refused) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
             if release and release.state == "removed":

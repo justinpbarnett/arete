@@ -306,9 +306,6 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         print(f"skip {s}")
     if dry_run or not picked:
         return 0
-    from .store.db import migrate_on_demand
-
-    migrate_on_demand()
     lock = run_store.run_lock("eval-mine")
     with util.lock(lock) as got:
         if not got:

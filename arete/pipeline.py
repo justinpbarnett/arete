@@ -758,18 +758,16 @@ def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
-    if run.closed_checkouts or run.catch_up_preserved:
-        workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
-                            excluded=run.closed_checkout_paths)
-    if run.closed_checkouts:
-        run.log(f"workspace kept at {ws}: it contains closed PR worktrees")
-        return False
-    if run.catch_up_preserved:
-        run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
-        return False
     try:
+        if run.closed_checkouts or run.catch_up_preserved:
+            workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
+                                excluded=run.closed_checkout_paths)
+            why = ("it contains closed PR worktrees" if run.closed_checkouts
+                   else "it contains files that existed before catch-up")
+            run.log(f"workspace kept at {ws}: {why}")
+            return False
         release = workspace.remove_workspace(ws, checkouts, by=run.id)
-    except OSError as e:
+    except (OSError, sqlite3.Error) as e:
         run.log(f"workspace kept at {ws}: removal failed: {util.first_line(str(e), 300)}")
         return False
     if release.state == "removed":
@@ -1801,7 +1799,6 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     from .store import db
     from .store import zte as zte_store
 
-    db.migrate_on_demand()
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
         print(refusal)
@@ -2207,6 +2204,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
                                         excluded=run.closed_checkout_paths)
                     workspaces.keep(run.workspace[0], status)
+            except (OSError, sqlite3.Error) as e:
+                run.log(f"could not finalize workspace {run.workspace[0]}: {util.first_line(str(e), 300)}")
             finally:
                 slot.free()
         if run.catch_up_cleanup_park and (held := kept_heads(run)):

@@ -465,7 +465,6 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 def poll(dry_run: bool = False) -> int:
     if not dry_run:
-        db.migrate_on_demand()
         paths.ensure_dirs()
     cfg = config.load()
     with (nullcontext(True) if dry_run else util.lock("poll")) as got:

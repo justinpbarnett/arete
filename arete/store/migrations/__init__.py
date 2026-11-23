@@ -41,22 +41,23 @@ def owners():
     return found
 
 
-def area_owner(area, name=""):
+def area_owner(area, name, registered):
     if area == "work" and name == "m0004_work_event_routing.py":
         area = "loops"
     owner = "db" if area == "foundation" else area
-    return owner if owner in owners() else None
+    return owner if owner in registered else None
 
 
 def load(folder=None):
     folder = FOLDER if folder is None else Path(folder)
+    registered = owners()
     found = {}
     for path in sorted(folder.glob("m*.py")):
         match = NAME.fullmatch(path.name)
         if not match:
             raise Refused(f"{path.name}: expected mNNNN_area_name.py")
         n, area = int(match[1]), match[2]
-        if area_owner(area, path.name) is None:
+        if area_owner(area, path.name, registered) is None:
             raise Refused(f"{path.name}: unknown area {area}")
         if n in found:
             raise Refused(f"{found[n].name}, {path.name}: repeated migration {n}")
