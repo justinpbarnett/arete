@@ -540,55 +540,107 @@ class QueueScoringTests(unittest.TestCase):
 
 
 class PipelineNoSlotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        cls.template = cls.state / "template.db"
+        with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
+                                  LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
+                                  LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
+            db.migrate()
+
     def setUp(self):
-        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        root = self.state / self._testMethodName
+        root.mkdir()
+        shutil.copyfile(self.template, root / "arete.db")
         self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
                                              RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
                                              WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
-        with redirect_stdout(StringIO()):
-            db.migrate()
+        paths.ensure_dirs()
         remote = "fixture/repo"
-        repo = config.Repo("fixture", root, github=remote, layer=root, parts=[config.Part("", remote)])
-        cfg = config.Config(repos=[repo], max_parallel=1)
+        self.repo = config.Repo("fixture", root, github=remote, layer=root, parts=[config.Part("", remote)])
+        cfg = config.Config(repos=[self.repo], max_parallel=1)
         self.enterContext(mock.patch.object(config, "load", return_value=cfg))
         self.enterContext(mock.patch.multiple(pipeline.scratch, process_ids=set, service_labels=set))
-        self.free_slots = self.enterContext(mock.patch.object(slots, "slots_free_to_start", return_value=0))
-        self.hold_slot = self.enterContext(mock.patch.object(slots.RunSlot, "hold"))
 
-    def refused_child(self, state="OPEN", labels=(), feedback=()):
-        issue = {"state": state, "labels": [{"name": label} for label in labels]}
-        script = pipeline.Script("orchestrate", mock.Mock(side_effect=AssertionError("started without a slot")))
+    def refused_child(self, issue, *, tid="765", path="orchestrate", status=1):
+        def no_slots(_):
+            read_issue.side_effect = AssertionError("tracker read after the slot check")
+            return 0
+
+        script = pipeline.Script(path, mock.Mock(side_effect=AssertionError("started without a slot")))
         log = paths.LOG_DIR / pipeline.RUNS_LOG
         with (
-            mock.patch.object(gh, "issue", side_effect=[{"labels": []}, issue]),
-            mock.patch.object(pipeline, "pending_feedback", return_value=list(feedback)),
+            mock.patch.object(gh, "issue", return_value=issue) as read_issue,
+            mock.patch.object(slots, "slots_free_to_start", side_effect=no_slots) as free_slots,
+            mock.patch.object(slots.RunSlot, "hold") as hold_slot,
             log.open("w") as stdout,
             redirect_stdout(stdout),
         ):
-            self.assertEqual(pipeline.run_issue("fixture", "765", force=True, script=script), 1)
-        self.free_slots.assert_called_once_with(1)
-        self.hold_slot.assert_not_called()
+            self.assertEqual(pipeline.run_issue("fixture", tid, force=True, script=script), status)
+        if issue is None:
+            read_issue.assert_not_called()
+        else:
+            read_issue.assert_called_once_with(self.repo.github, int(tid))
+        if status == 1:
+            free_slots.assert_called_once_with(1)
+        else:
+            free_slots.assert_not_called()
+        hold_slot.assert_not_called()
         return log.read_text().strip()
 
+    def record_feedback(self, path="orchestrate", tid="765"):
+        url = f"https://github.com/{self.repo.github}/pull/{tid}"
+        run = record.start("pipeline", repo=self.repo.name, issue=tid)
+        self.assertTrue(record.move(run, "pr", ("running",), pr_url=url))
+        with redirect_stdout(StringIO()):
+            pipeline.run_lines.write(run, "execution", path=path)
+        pipeline.insights_store.add_feedback([dict(pr_url=url, kind="comment", gh_id=1, repo=self.repo.name, issue=tid,
+                                                   body="Please revise", created="2026-01-01T00:00:00Z",
+                                                   status="new", pr_state="OPEN")])
+
+    def assert_original_refusal(self, line, name="fixture#765"):
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, f"{name} was not started: no run slot is free (max_parallel 1). "
+                               "Wait for a run to finish or raise max_parallel in "
+                               f"{paths.short_path(paths.CONFIG_FILE)}.")
+
     def test_no_slot_queues_ticket_for_next_poll(self):
-        line = self.refused_child()
+        line = self.refused_child({"state": "OPEN", "labels": []})
         row, = pipeline.source_store.tickets_passed_over()
         self.assertEqual((row["repo"], row["issue"]), ("fixture", "765"))
         self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
                                "Ticket queued for the next poll.")
 
-    def test_zte_label_seen_at_refusal_keeps_original_refusal(self):
-        line = self.refused_child(labels=(tracker.ZTE_LABEL,))
+    def test_zte_label_keeps_original_refusal(self):
+        line = self.refused_child({"state": "OPEN", "labels": [{"name": tracker.ZTE_LABEL}]}, status=2)
         self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
-        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
-                               "Wait for a run to finish or raise max_parallel in "
-                               f"{paths.short_path(paths.CONFIG_FILE)}.")
+        self.assertEqual(line, f"could not read fixture#765: {tracker.ZTE_QUEUE}")
 
     def test_closed_issue_with_pr_feedback_is_not_queued(self):
-        line = self.refused_child(state="CLOSED", feedback=({"status": "new", "run_id": None},))
-        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
-        self.assertIn("no run slot is free", line)
-        self.assertNotIn("queued", line)
+        self.record_feedback()
+        self.assert_original_refusal(self.refused_child({"state": "CLOSED", "labels": []}))
+
+    def test_closed_issue_with_feedback_in_recorded_flow_is_not_queued(self):
+        for tid, flow in (("765", "feature"), ("766", "patch")):
+            with self.subTest(flow=flow):
+                self.record_feedback(path=flow, tid=tid)
+                path = pipeline.dispatch_path(self.repo, tid)
+                self.assertEqual(path, flow)
+                line = self.refused_child({"state": "CLOSED", "labels": []}, tid=tid, path=path)
+                self.assert_original_refusal(line, name=f"fixture#{tid}")
+
+    def test_missing_github_metadata_keeps_original_refusal(self):
+        for issue in ({"state": "OPEN"}, {"labels": []}):
+            with self.subTest(issue=issue):
+                self.assert_original_refusal(self.refused_child(issue))
+
+    def test_jira_without_metadata_keeps_original_refusal(self):
+        self.repo.tracker = "jira"
+        with mock.patch.object(tracker.JiraTracker, "client", new_callable=mock.PropertyMock,
+                               side_effect=AssertionError("unexpected Jira tracker read")) as client:
+            self.assert_original_refusal(self.refused_child(None, tid="FIX-765"), name="fixture FIX-765")
+        client.assert_not_called()
 
 
 class PolicyRetryCapTests(unittest.TestCase):

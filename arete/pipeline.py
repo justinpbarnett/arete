@@ -1856,8 +1856,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                               and layer.factory_path == ORCHESTRATED,
                               "the one-shot task requires the approved first scheduled orchestration")
                 wall_deadline = permit["deadline"]
+            issue_state = None
             if isinstance(tk, tracker.GitHubTracker):
-                tk.require_ordinary(tid)
+                issue = gh.issue(repo.github, int(tid)) or {}
+                labels = issue.get("labels")
+                if any(label["name"] == tracker.ZTE_LABEL for label in labels or ()):
+                    raise tracker.TaskError(tracker.ZTE_QUEUE)
+                if labels is not None:
+                    issue_state = issue.get("state")
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             latest = budget_history[0] if budget_history else None
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
@@ -1907,23 +1913,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.hold()
                 elif not due or zte_store.activation_pending():
                     slot_admission.close()
-                    pass_over = True
-                    try:
-                        if isinstance(tk, tracker.GitHubTracker):
-                            issue = gh.issue(repo.github, int(tid)) or {}
-                            reserved = any(label["name"] == tracker.ZTE_LABEL for label in issue.get("labels", []))
-                            pass_over = bool(issue) and not (reserved or (feedback and issue.get("state") == "CLOSED"))
-                        elif isinstance(tk, tracker.JiraTracker):
-                            fields = tk.client.issue(tid, ["labels", "status"]).get("fields") or {}
-                            reserved = tracker.ZTE_LABEL in (fields.get("labels") or [])
-                            closed = ((fields.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
-                            pass_over = not (reserved or (feedback and closed))
-                        elif feedback and tracker.task_state(tid) in config.TASK_FINISHED:
-                            pass_over = False
-                    except tracker.ERRORS:
-                        pass_over = False
+                    can_queue = not zte_grant and issue_state in ("OPEN", "CLOSED", "MERGED")
+                    if can_queue and issue_state != "OPEN":
+                        prepare_reads_feedback = (script and script.path in ("feature", "patch")
+                                                  and not (script.repairs or only))
+                        can_queue = not (feedback or (prepare_reads_feedback and pending_feedback(repo.name, tid)))
                     refusal = f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}."
-                    if pass_over and not zte_grant:
+                    if can_queue:
                         source_store.pass_over(repo.name, str(tid))
                         print(f"{refusal} Ticket queued for the next poll.")
                     else:
