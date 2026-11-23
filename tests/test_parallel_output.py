@@ -67,8 +67,6 @@ class Sleeper(unittest.TestCase):
 
 
 class BusySolo(unittest.TestCase):
-    class_timeout = 1
-
     @classmethod
     def setUpClass(cls):
         marker = os.path.join(os.environ["PARALLEL_MARKERS"], cls.__name__)
@@ -88,24 +86,28 @@ def broken_cleanup():
 
 class ModuleCleanupFailure(BusySolo):
     def test_cleanup(self):
-        # unittest runs the last registered cleanup first.
+        # unittest reports the first cleanup exception in LIFO execution order.
         unittest.addModuleCleanup(skip_cleanup)
         unittest.addModuleCleanup(broken_cleanup)
 
 
 class AssertionWithReplacePatched(BusySolo):
     def test_assertion(self):
-        with patch.object(os, "replace", side_effect=PermissionError("replacement denied")):
-            self.fail("assertion while os.replace is patched")
+        self.enterContext(patch.object(os, "replace", side_effect=PermissionError("replacement denied")))
+        self.fail("assertion while os.replace is patched")
 
 
 class BusyTimeout(BusySolo):
+    class_timeout = 1
+
     def test_hangs(self):
         if self.attempt <= 2:
             time.sleep(60)
 
 
 class BusyTimeoutThenFailure(BusySolo):
+    class_timeout = 1
+
     def test_hangs_on_first_solo_attempt(self):
         if self.attempt == 1:
             self.fail("force an alone rerun")
