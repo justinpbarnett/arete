@@ -1654,7 +1654,7 @@ class Controller:
             try:
                 self.close()
             except BaseException as cleanup_error:
-                if park_reason is not None:
+                if park_reason is not None and pipeline._termination is None:
                     try:
                         self.run.catch_up_cleanup_park = self.park_catch_up(
                             park_reason, on_ticket=True, close_failed=True)

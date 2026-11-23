@@ -2098,7 +2098,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return f"a Git operation is in progress in {checkout.wt}"
             return ""
 
-        handler_restored = False
+        def keep_workspace():
+            if run.workspace and not zte_grant:
+                if not (retaining_catch_up or run.catch_up_preserved) and (
+                        not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
+                    keep_edits(run)
+                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
+                                    excluded=run.closed_checkout_paths)
+
         try:
             try:
                 signal.signal(signal.SIGTERM, stop_on_term(run, zte_grant=zte_grant is not None))
@@ -2218,28 +2225,26 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     else:
                         run.give_up("crashed before finishing")
             finally:
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                handler_restored = True
-        finally:
-            if handler_restored or _termination is not None:
                 try:
-                    blocked = termination_keep_blocker(sys.exception()) if _termination is not None else ""
+                    if _termination is None:
+                        keep_workspace()
+                finally:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                if _termination is None:
+                    slot.free()
+        finally:
+            if _termination is not None:
+                try:
+                    blocked = termination_keep_blocker(sys.exception())
                     if blocked:
                         run.log(f"SIGTERM: did not keep work because {blocked}")
-                    elif run.workspace and not zte_grant:
-                        if not (retaining_catch_up or run.catch_up_preserved) and (
-                                not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
-                            keep_edits(run)
-                        workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                            excluded=run.closed_checkout_paths)
+                    else:
+                        keep_workspace()
                     slot.free()
                 except Exception as error:
-                    if _termination is None:
-                        raise
                     run.log(f"SIGTERM: could not keep work: {error}")
                 finally:
-                    if _termination is not None:
-                        os.kill(os.getpid(), signal.SIGTERM)
+                    os.kill(os.getpid(), signal.SIGTERM)
         if run.catch_up_cleanup_park and (held := kept_heads(run)):
             try:
                 if parked := runlimits.metadata(run.id, "parked.json"):

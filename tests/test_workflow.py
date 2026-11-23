@@ -2069,14 +2069,27 @@ class SigtermKeepWorkTests(unittest.TestCase):
         children = []
         enter = pipeline.Run.enter
         set_handler = signal.signal
+        keep = pipeline.keep_edits
         sent_term = False
 
         def reset_at_finalization(signum, handler):
+            previous = set_handler(signum, handler)
+            if signum == signal.SIGTERM and handler == signal.SIG_DFL:
+                signal.raise_signal(signal.SIGTERM)
+            return previous
+
+        def keep_at_finalization(run):
             nonlocal sent_term
-            if signum == signal.SIGTERM and handler == signal.SIG_DFL and not sent_term:
+            if not sent_term:
                 sent_term = True
                 signal.raise_signal(signal.SIGTERM)
-            return set_handler(signum, handler)
+            keep(run)
+
+        def live_child():
+            child = subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            children.append(child)
+            return child
 
         def enter_state(run, status):
             if status == "failed" and case in {"park", "failure"}:
@@ -2112,6 +2125,17 @@ class SigtermKeepWorkTests(unittest.TestCase):
             if case == "catch-up-parked":
                 controller.prepare = repair
                 return controller.drive()
+            if case == "catch-up-close":
+                controller.prepare = lambda: None
+                controller.observe = dict
+                controller.merge_lease = None
+                controller.policy = config.Orchestration(max_decisions=1)
+                controller.lease = ledger.acquire(run.id, "", controller.data)
+                ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+                controller.workers["writer"] = SimpleNamespace(
+                    receive=lambda: (), proc=live_child(), close=lambda: signal.raise_signal(signal.SIGTERM))
+                run.enter("running")
+                return controller.drive()
             with (mock.patch.object(pipeline, "catch_up_target", return_value=("base", "")),
                   mock.patch.object(pipeline, "catch_up_base", side_effect=restore_failure)):
                 failure = controller.catch_up(checkout)
@@ -2124,15 +2148,14 @@ class SigtermKeepWorkTests(unittest.TestCase):
             run.workspace = wt, [checkout]
             (wt / "file.txt").write_text("tracked edit\n")
             (wt / "new.txt").write_text("new file\n")
-            if case == "finalization":
+            if case in {"finalization-keep", "finalization-reset"}:
                 return "failed", "fixture ended", ""
-            if case in {"catch-up-parked", "catch-up-park-result"}:
+            if case in {"catch-up-parked", "catch-up-park-result", "catch-up-close"}:
                 return catch_up(run, checkout)
             if case == "stopped":
                 record.ask_stop(run.id)
             elif case == "child":
-                children.append(subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE,
-                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                live_child()
             elif case == "park":
                 raise runlimits.Parked("budget exhausted")
             elif case == "failure":
@@ -2156,7 +2179,8 @@ class SigtermKeepWorkTests(unittest.TestCase):
               mock.patch.object(pipeline, "_run", side_effect=work),
               mock.patch.object(pipeline, "check_lane", return_value=nullcontext(())),
               mock.patch.object(pipeline.environment, "sh", side_effect=check),
-              mock.patch.object(signal, "signal", reset_at_finalization) if case == "finalization" else nullcontext()):
+              mock.patch.object(pipeline, "keep_edits", keep_at_finalization) if case == "finalization-keep" else nullcontext(),
+              mock.patch.object(signal, "signal", reset_at_finalization) if case == "finalization-reset" else nullcontext()):
             return pipeline.run_issue(repo.name, tid)
 
     def run_case(self, case, expected=-signal.SIGTERM):
@@ -2216,8 +2240,12 @@ class SigtermKeepWorkTests(unittest.TestCase):
     def test_signal_during_failure_reporting_keeps_edits(self):
         self.assert_kept(self.run_case("failure"))
 
-    def test_signal_at_finalization_entry_keeps_edits_for_restart(self):
-        self.assert_kept(self.run_case("finalization"))
+    def test_signal_at_normal_save_entry_keeps_edits_for_restart(self):
+        self.assert_kept(self.run_case("finalization-keep"))
+        self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
+
+    def test_signal_after_finalization_handler_reset_finds_edits_kept(self):
+        self.assert_kept(self.run_case("finalization-reset"))
         self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
 
     def test_catch_up_budget_alarm_during_unwind_prevents_keeping(self):
@@ -2227,6 +2255,11 @@ class SigtermKeepWorkTests(unittest.TestCase):
     def test_catch_up_publication_park_result_during_unwind_prevents_keeping(self):
         run_id = self.assert_not_kept("catch-up-park-result", "the termination exception did not survive unwinding")
         self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+
+    def test_signal_during_decision_limit_close_leaves_ticket_running_for_reaper(self):
+        run_id = self.assert_not_kept("catch-up-close", "a child process is still alive")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+        self.assertEqual(task_store.task_get(run_store.run_get(run_id)["issue"])["state"], "running")
 
     def test_live_child_prevents_keeping(self):
         self.assert_not_kept("child", "a child process is still alive")
