@@ -4584,14 +4584,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                              stop_on_driver_failure=False)
                 run.save(f"{step}-replay-drivers.json", asdict(observed))
             if not replay_only and probes_passed:
-                pair = lifetime.get("dashboard_pairing")
-                pairing_note = ("\n\nOpen this one-time scratch pairing link in the browser and submit the "
-                                f"pre-filled code before opening the dashboard: {pair()}\n"
-                                if pair else "")
-                fault_controls = verify.fault_note(v, lifetime) if url and delivery_verification else ""
                 agent_started = True
+                fault_controls = verify.fault_note(v) if url and delivery_verification else ""
                 res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence) + pairing_note + fault_controls, notes=v.notes,
+                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
                     scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     env_example=verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",

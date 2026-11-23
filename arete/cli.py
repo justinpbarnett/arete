@@ -27,7 +27,7 @@ class ShowVersion(argparse.Action):
 
 
 def parser() -> argparse.ArgumentParser:
-    from . import pilot, zte
+    from . import mcp_stdio, pilot, zte
     from .commands import api, costs, credentials, hooks, lab, loops, records, research, runs, sessions, setup, tasks, verify_fault
     from .commands.arguments import Parser
 
@@ -35,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
     for group in (api, runs, tasks, loops, sessions, credentials, hooks, costs, records, research, lab, setup,
-                  pilot, zte, verify_fault):
+                  mcp_stdio, pilot, zte, verify_fault):
         group.register(sub)
     return ap
 
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         args.cmd, args.fn = "status", cmd_status
     else:
         args = parser().parse_args(argv)
-        if args.cmd in ("api", "verify-fault"):
+        if args.cmd in ("api", "mcp", "verify-fault"):
             return args.fn(args) or 0
         from .paths import PER_CALL_HOOKS
 

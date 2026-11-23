@@ -17,7 +17,6 @@ from uuid import uuid4
 from . import local_paths
 
 MARKER = b"arete-verification-scratch-v1"
-DASHBOARD_PREFIX = ".arete-verify-dashboard-"
 SPEC = "verify-faults.json"
 REFUSAL = ("verify-fault requires ARETE_STATE_DIR under a user-owned verification scratch directory "
            "with a valid .arete-owned marker. Run it through the verification sandbox wrapper.")

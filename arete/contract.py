@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 6
+MINOR = 5
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -132,8 +132,7 @@ AUTH_ERRORS = {"unauthenticated", "ambiguous_credential", "token_expired", "toke
                "csrf", "bad_origin", "tls_required", "auth_blocked"}
 
 
-def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=(), success_status=200,
-              credential_required=True):
+def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=(), success_status=200):
     shown = sample(result)
     if "seq" in result.get("properties", {}):
         shown["seq"] = "0.1"
@@ -142,11 +141,8 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     optional_errors = {"invalid_state", "task_version_conflict"}
     if noun not in ("token", "pairing", "principal") and name != "session.end":
         optional_errors |= AUTH_ERRORS
-    if credential_required or name == "meta.get":
-        optional_errors.discard("unauthenticated")
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
-            "credential_required": credential_required,
             "errors": [r["code"] for r in ERRORS if r["code"] not in optional_errors or r["code"] in errors],
             "example": {"input": example or {}, "result": shown}}
 
@@ -198,8 +194,7 @@ ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema":
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
                  "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
-                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER,
-                 "credential_required": BOOLEAN},
+                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER},
                 ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
              "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
@@ -213,8 +208,7 @@ TOKEN_ISSUE = obj({"label": STRING, "scopes": array(STRING), "profile": {**STRIN
                    "expires": STRING, "commands": array(STRING), "spend_cap_usd": {**NUMBER, "minimum": 0}},
                   ["label", "scopes"])
 TOKEN_ISSUED = envelope({"token": TOKEN, "text": STRING})
-AWAITING_PRESENCE = "awaiting_presence"
-OPERATIONS = [operation("meta.get", "meta", META, credential_required=False),
+OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
               operation("error.list", "errors", envelope({"errors": array(ERROR)})),
@@ -248,8 +242,7 @@ OPERATIONS += [
               obj({**CONFIG_ID, "from": STRING, "to": STRING}, list(CONFIG_ID)), CONFIG_EXAMPLE),
     operation("token.list", "tokens", envelope({"tokens": array(TOKEN)})),
     operation("token.issue", "tokens", TOKEN_ISSUED, TOKEN_ISSUE,
-              {"label": "Remote CLI", "scopes": ["read", "task:write"]}, "POST", success_status=201,
-              credential_required=False),
+              {"label": "Remote CLI", "scopes": ["read", "task:write"]}, "POST", success_status=201),
     operation("token.get", "tokens/{token}", envelope({"token": TOKEN}), obj({"token": STRING}), {"token": "abcdef01"}),
     operation("token.rotate", "tokens/{token}/rotate", TOKEN_ISSUED,
               obj({"token": STRING, "grace_seconds": {**INTEGER, "minimum": 0}}, ["token"]),
@@ -261,7 +254,7 @@ OPERATIONS += [
     operation("pairing.start", "auth/pairings", envelope({"code": STRING, "link": STRING, "expires": STRING}),
               method="POST", success_status=201),
     operation("pairing.claim", "auth/pairings/claim", envelope({"principal": STRING}),
-              obj({"code": STRING}), {"code": "123456"}, "POST", success_status=201, credential_required=False),
+              obj({"code": STRING}), {"code": "123456"}, "POST", success_status=201),
     operation("session.end", "auth/logout", envelope({"ended": BOOLEAN}), method="POST"),
     operation("run.diff", "runs/{id}/diff", envelope({"diff": STRING}), obj({"id": STRING}), {"id": "example"}),
     operation("task.history", "tasks/{id}/history", envelope({"comments": array(obj({"version": INTEGER,

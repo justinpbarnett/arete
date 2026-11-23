@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import alerts, client, codebase, config, gh, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
+from . import alerts, codebase, config, gh, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
 from .store import db, runs
 from .store import zte as store
 
@@ -245,30 +245,22 @@ def require_fresh_runtime(install: Installation, sha: str, observation: dict, un
 
 def probe_https(install: Installation, sha: str, *, until: datetime | None = None) -> None:
     reason = "authenticated HTTPS did not confirm the selected engine and schema"
-    probe_deadline = util.now() + timedelta(seconds=8)
-    until = probe_deadline if until is None else min(until, probe_deadline)
-    status, engines, body = metadata_response(install, client.META, until, reason)
-    if pilot.legacy_metadata(status, body):
-        status, engines, body = metadata_response(install, "/api/meta", until, reason)
-    pilot.require(status == 200 and engines == [sha[:12].encode()]
-                  and json.loads(body)["schema"]["version"] == install.schema, reason)
-
-
-def metadata_response(install, path, until, reason):
     with tempfile.TemporaryFile() as headers:
         timeout = activation_timeout(until, 8)
         result = subprocess.run([
             "/usr/bin/curl", "--disable", "--noproxy", "*", "--proto", "=https", "--silent",
             "--max-time", str(timeout), "--max-filesize", str(2**18), "--header", "Accept: application/json",
-            "--dump-header", f"/dev/fd/{headers.fileno()}", "--write-out", "\n%{http_code}", install.endpoint + path,
+            "--dump-header", f"/dev/fd/{headers.fileno()}", "--write-out", "\n%{http_code}", f"{install.endpoint}/api/meta",
         ], pass_fds=(headers.fileno(),), capture_output=True, timeout=timeout, check=False)
-        activation_time_left(until)
+        if until is not None:
+            activation_time_left(until)
         pilot.require(result.returncode == 0, reason)
         headers.seek(0)
         engines = [line.partition(b":")[2].strip() for line in headers.read(2**18).splitlines()
                    if line.partition(b":")[0].lower() == b"x-arete-engine"]
     body, status = result.stdout.rsplit(b"\n", 1)
-    return int(status), engines, body
+    pilot.require(status == b"200" and engines == [sha[:12].encode()]
+                  and json.loads(body)["schema"]["version"] == install.schema, reason)
 
 
 def failure_reason(error: Exception) -> str:

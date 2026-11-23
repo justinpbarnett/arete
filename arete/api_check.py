@@ -228,7 +228,8 @@ class Check:
     def response(self, method, path, body=None, headers=None):
         conn = HTTPConnection(ADDRESS, self.port, timeout=5)
         merged = {"Accept": "application/json", **(headers or {})}
-        merged.setdefault("Authorization", f"Bearer {self.token}")
+        if method != "GET":
+            merged.setdefault("Authorization", f"Bearer {self.token}")
         if merged.get("Authorization") == "":
             del merged["Authorization"]
         if body is not None:
@@ -245,6 +246,8 @@ class Check:
     def request(self, method, path, body=None, *, status=200, headers=None):
         from . import contract
 
+        if method == "GET":
+            headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
         with self.response(method, path, body, headers) as response:
             raw = response.read()
             at = f"{method} {path}"
@@ -327,15 +330,10 @@ class Check:
         catalog = self.read("/api/v1/errors")["errors"]
         require(catalog == self.published["errors"], "error.list disagrees with contract.get")
         errors = {error["code"]: error for error in catalog}
-        for op in self.published["operations"]:
-            require(not op["credential_required"] or "unauthenticated" in op["errors"],
-                    f"{op['name']} does not declare its credential refusal")
         for client, minimum in contract.OLDEST_CLIENT.items():
             self.request("GET", "/api/v1/meta", headers={"X-Arete-Client": f"{client}/{minimum}"})
-        self.request("GET", "/api/v1/meta", headers={"Authorization": ""})
+        self.request("POST", "/api/v1/tasks", {}, headers={"X-Arete": "1", "Authorization": ""}, status=401)
         for method, path, body, custom, code in (
-            ("GET", "/api/v1/runs", None, {"Authorization": ""}, "unauthenticated"),
-            ("POST", "/api/v1/tasks", {}, {"X-Arete": "1", "Authorization": ""}, "unauthenticated"),
             ("GET", "/api/v1/no-such-operation", None, {}, "not_found"),
             ("PUT", "/api/v1/meta", None, {}, "method_not_allowed"),
             ("GET", "/api/v1/meta", None, {"X-Arete-Client": "cli/0.9"}, "client_too_old"),
@@ -381,8 +379,8 @@ class Check:
                 not sent["isError"] and rejected["isError"], f"ask_owner JSON-RPC results: {sent!r}, {rejected!r}")
 
     def streams(self):
-        from . import contract, credential_files, run_lines
-        from .store import db, events, runs, tokens
+        from . import contract, run_lines
+        from .store import db, events, runs
 
         runs.add_feed(self.run, "plan", "Add kumquat")
         run_lines.write(self.run, "step_end", step="plan", result="pass")
@@ -396,32 +394,28 @@ class Check:
         for path in ("/api/v1/events", "/api/events"):
             with db.one_read() as connection:
                 epoch, _ = events.cursor(events.metadata(connection)["head"])
-            query = urlencode({"since": f"{epoch}.0", "subject": f"run:{self.run}", "kinds": "run.started"})
-            target = f"{path}?{query}"
-            headers = {"Accept": "application/x-ndjson"}
-            with self.response("GET", target, headers=headers) as response:
-                require(response.status == 200 and response.headers.get("Content-Type") == "application/x-ndjson"
-                        and response.headers.get("Arete-API") == contract.VERSION, f"{path} did not open an NDJSON stream")
+            query = urlencode({"since": f"{epoch}.0", "subject": f"run:{self.run}"})
+            with self.response("GET", f"{path}?{query}", headers={"Accept": "application/x-ndjson"}) as response:
+                try:
+                    require(response.status == 200 and response.headers.get("Content-Type") == "application/x-ndjson"
+                            and response.headers.get("Arete-API") == contract.VERSION, f"{path} did not open an NDJSON stream")
+                    for _ in range(16):
+                        row = json.loads(response.readline(65536))
+                        if row.get("kind") == "run.started" and row.get("id"):
+                            break
+                    else:
+                        raise RuntimeError(f"{path} did not send the committed run event with a cursor")
+                finally:
+                    with db.tx() as connection:
+                        connection.execute("UPDATE schema_meta SET value = ? WHERE key = 'restore_epoch'",
+                                           (str(int(epoch) + 1),))
                 for _ in range(16):
                     row = json.loads(response.readline(65536))
-                    if row.get("kind") == "run.started" and row.get("id"):
+                    if row == {"kind": "reset", "reason": "epoch"}:
                         break
                 else:
-                    raise RuntimeError(f"{path} did not send the committed run event with a cursor")
-                next_epoch = int(epoch) + 1
-                with db.tx() as connection:
-                    tokens.invalidate_restore(connection, db.metadata(connection), next_epoch)
-                    connection.execute("UPDATE schema_meta SET value = ? WHERE key = 'restore_epoch'", (str(next_epoch),))
-                reset = response.readline(65536)
-                require(reset.endswith(b"\n") and json.loads(reset) == {"kind": "reset", "reason": "epoch"},
-                        f"{path} did not send an epoch reset on the open stream")
+                    raise RuntimeError(f"{path} did not reset after the fixture epoch changed")
                 require(not response.read(1), f"{path} kept streaming after reset")
-            _, raw = self.request("GET", target, headers=headers, status=401)
-            require(json.loads(raw)["code"] == "unauthenticated", f"{path} accepted the pre-restore token")
-            tokens.init_owner()
-            self.token = credential_files.read_client(db.schema_metadata()["instance_tag"])
-            _, raw = self.request("GET", target, headers=headers)
-            require(json.loads(raw) == {"kind": "reset", "reason": "epoch"}, f"{path} did not reset the stale cursor")
 
     def shapes(self):
         from . import agent, contract, dashboard, paths, principals, record, replay, triage
@@ -519,11 +513,23 @@ def worker(lifeline):
     stage = "scratch startup"
     try:
         with offline(), ExitStack() as cleanup:
-            from . import api_http, codebase, control, credential_files, dashboard, paths, pipeline, principals, tailnet
+            from . import (
+                api_http,
+                codebase,
+                control,
+                credential_files,
+                dashboard,
+                paths,
+                pipeline,
+                principals,
+                tailnet,
+                verify_faults,
+            )
             from .store import db, tokens
 
             root = Path.cwd()
             require(not paths.DB_FILE.exists(), "state database already exists")
+            (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
             body = "\n".join(config) + "\n"
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
@@ -552,7 +558,7 @@ def worker(lifeline):
             logins = tailnet.Logins(tailnet.ScratchHost())
             logins.of = lambda _: LOGIN
             stage = f"listen on {ADDRESS}:0"
-            handler = type("FixtureHandler", (dashboard.Handler,), {"disable_nagle_algorithm": True})
+            handler = type("FixtureHandler", (dashboard.handlers().open,), {"disable_nagle_algorithm": True})
             with patch("socket.getfqdn", return_value=ADDRESS):
                 server = tailnet.Server(ADDRESS, 0, node, logins, False, handler, dashboard.Redirect)
             server.daemon_threads = False

@@ -16,7 +16,6 @@ TABLES = {"tokens": "kept"}
 SESSION_DAYS = 400
 TOKEN_ID = credential_files.TAG
 SESSION_SECONDS = SESSION_DAYS * 86400
-STREAM_EPOCH_CHANGED = "restore_epoch_changed"
 TOKEN_ROW = ("SELECT t.*, p.role, p.status AS person_status, p.kind AS person_kind, client.status AS client_status "
              "FROM tokens t JOIN principals p ON p.id = t.principal "
              "LEFT JOIN principals client ON client.id = 'client:' || t.id WHERE t.id = ?")
@@ -42,6 +41,8 @@ class Credential:
     epoch: str
     generation: str
     deadline: str | None
+    profile: str | None = None
+    commands: frozenset[str] | None = None
 
     def allows(self, scope):
         return ("*" in self.scopes or scope in self.scopes) and (self.role == "owner" or scope == "read")
@@ -181,7 +182,23 @@ def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None):
         actor = f"client:{identity}" if kind == "token" else person
     return Credential(identity, person, role, actor, kind, frozenset(json.loads(row["scopes"])),
                       meta["token_key_ref"], meta["restore_epoch"],
-                      meta["token_generation"], deadline_of(row))
+                      meta["token_generation"], deadline_of(row), row["profile"],
+                      frozenset(json.loads(row["commands"])) if row["commands"] is not None else None)
+
+
+def rotation_lineage(credential):
+    with db.reader() as c:
+        rows = c.execute("WITH RECURSIVE lineage(id, parent) AS ("
+                         "SELECT id, rotated_from FROM tokens WHERE id = ? UNION "
+                         "SELECT t.id, t.rotated_from FROM tokens t JOIN lineage l ON t.id = l.parent "
+                         "WHERE t.principal = ? AND coalesce(t.kind, 'token') = 'token' "
+                         "AND t.audience = (SELECT value FROM schema_meta WHERE key = 'instance_id')) "
+                         "SELECT id, parent FROM lineage", (credential.id, credential.principal)).fetchall()
+    lineage = dict(rows)
+    root = credential.id
+    while (parent := lineage.pop(root, None)) in lineage:
+        root = parent
+    return root, frozenset(row["id"] for row in rows)
 
 
 def init_owner():
@@ -293,9 +310,7 @@ def stream_status(credential, marker):
     try:
         with db.one_read(timeout=.1) as c:
             meta = db.metadata(c)
-            if meta["restore_epoch"] != credential.epoch:
-                return STREAM_EPOCH_CHANGED, marker
-            if meta["token_key_ref"] != credential.key_ref:
+            if meta["token_key_ref"] != credential.key_ref or meta["restore_epoch"] != credential.epoch:
                 return "unauthenticated", marker
             generation, deadline = marker
             current = meta["token_generation"]

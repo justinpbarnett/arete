@@ -8765,7 +8765,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
             self.assertTrue(serve.dashboard_answers())
             for_login.assert_not_called()
             self.assertEqual(get(dashboard.READY_PATH, {}), 403)
-            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN}), 401)
+            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN}), 403)
             meta.assert_called_once()
             meta.return_value = {"schema": {"version": db.NEEDED - 1}}
             self.assertFalse(serve.dashboard_answers())

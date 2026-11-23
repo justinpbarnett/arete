@@ -14,10 +14,9 @@ import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from . import client, config, delegation, gh, jev, paths, principals, slots, steps, util, verify, workspace
+from . import config, delegation, gh, jev, paths, principals, slots, steps, util, verify, workspace
 from .review import Review
 from .store import db, orchestration, runs, tasks
 
@@ -338,31 +337,10 @@ def healthy() -> str:
             and server.get("scheme") == "https" and server.get("state") == str(paths.STATE_DIR)
             and server.get("config") == str(paths.CONFIG_FILE) and server.get("pid") == beat.get("pid")
             and util.pid_alive(server.get("pid")), "the local service is not healthy")
-    endpoint = f"https://{server['host']}:{server['port']}"
-    with open_metadata(endpoint) as response:
+    with urlopen(f"https://{server['host']}:{server['port']}/api/meta", timeout=10) as response:
         require(response.status == 200 and json.load(response)["schema"]["version"] == beat["schema"],
                 "the dashboard API did not confirm the healthy schema")
     return beat["at"]
-
-
-def open_metadata(endpoint):
-    try:
-        return urlopen(endpoint + client.META, timeout=10)
-    except HTTPError as error:
-        with error:
-            if error.code != 404 or not legacy_metadata(error.code, error.read(65536)):
-                raise
-    return urlopen(endpoint + "/api/meta", timeout=10)
-
-
-def legacy_metadata(status, body):
-    if status != 404:
-        return False
-    try:
-        answer = json.loads(body)
-    except ValueError:
-        return False
-    return isinstance(answer, dict) and client.unknown_route(client.Failed(answer, status), "GET", client.META)
 
 
 def wait_for(deadline: float, check, why: str, *, interval: float = 2):

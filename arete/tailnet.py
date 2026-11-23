@@ -33,8 +33,6 @@ WATCH_SECONDS = 30
 WHOIS_SECONDS = 60
 PROXY_SECONDS = 20
 TLS_HANDSHAKE = b"\x16\x03"
-VERIFICATION_ADDRESS = "127.0.0.1"
-VERIFICATION_TLS = "verification-dashboard-tls"
 
 
 def tailscale_exe() -> str:
@@ -141,20 +139,6 @@ class ScratchHost(Tailscale):
         return None
 
 
-class VerificationHost(ScratchHost):
-    login = "verifier@example.invalid"
-
-    def node(self) -> Node:
-        address = VERIFICATION_ADDRESS
-        return Node((address,), frozenset({address}), address)
-
-    def seed_identity(self, login):
-        return self.login, "Verifier"
-
-    def whois(self, address: str) -> tuple[str, str]:
-        return (self.login, "verification-loopback") if address == VERIFICATION_ADDRESS else ("", "")
-
-
 def host_services() -> Tailscale:
     return ScratchHost() if paths.ISOLATED else Tailscale()
 
@@ -230,10 +214,10 @@ def fetch_certificate(host: Tailscale, name: str) -> bool:
         raise CertError(f"cannot store the certificate: {e.strerror or e}") from None
 
 
-def tls_context(bundle: Path | None = None) -> ssl.SSLContext:
+def tls_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(bundle or paths.TLS_CERT_FILE, None if bundle else paths.TLS_KEY_FILE)
+    context.load_cert_chain(paths.TLS_CERT_FILE, paths.TLS_KEY_FILE)
     return context
 
 
@@ -329,14 +313,14 @@ def serve_status(host: Tailscale) -> dict[int, dict[str, str]] | None:
 
 
 def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool, handlers: Handlers,
-               secure: bool = False, *, tls: ssl.SSLContext | None = None) -> Front:
+               secure: bool = False) -> Front:
     status = serve_status(host)
     mapping = (f"tailscale serve has a mapping on port {port}, which takes this port's tailnet traffic; "
                f"turn it off (for an HTTPS mapping, `tailscale serve --https={port} off`)") \
         if status is not None and port in status else ""
     opened = open_servers(node.addresses, port, node, logins, inside_serve, handlers)
     try:
-        reason = ""
+        tls, reason = None, ""
         if secure:
             try:
                 fetch_certificate(host, node.name)
@@ -397,14 +381,13 @@ def watch(host: Tailscale, node: Node, front: Front, secure: bool = False) -> st
 
 
 def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool = False,
-          host: Tailscale | None = None, *, tls: ssl.SSLContext | None = None) -> NoReturn:
+          host: Tailscale | None = None) -> NoReturn:
     host = host or host_services()
     logins = Logins(host)
     hold = util.lock_file(f"dashboard-{port}")
     held = False
     waiting_for = ""
     last_line = ""
-    renew = cfg.dashboard_https and tls is None
     atexit.register(forget_server)
     try:
         while True:
@@ -423,7 +406,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
                     raise OSError(f"another dashboard on this state holds port {port}")
                 seed_owner(host, cfg)
                 tokens.init_owner()
-                front = open_front(host, node, port, logins, inside_serve, handlers, renew, tls=tls)
+                front = open_front(host, node, port, logins, inside_serve, handlers, cfg.dashboard_https)
             except OSError as e:
                 if str(e) != waiting_for:
                     say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
@@ -434,7 +417,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
             for s in front.servers:
                 threading.Thread(target=s.serve_forever, daemon=True).start()
             last_line = announce(node, port, front, last_line)
-            reason = watch(host, node, front, renew)
+            reason = watch(host, node, front, cfg.dashboard_https)
             say(f"{reason}; listening again")
             for s in front.servers:
                 stop_listener(s)

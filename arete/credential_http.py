@@ -13,7 +13,7 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, idempotency, principals, util
+from . import api_http, contract, idempotency, principals, refusals, util
 from .store import db, events, tokens
 from .store import idempotency as claims
 
@@ -32,8 +32,9 @@ def problem(code, **details):
     return contract.Problem(code, AUTH_MESSAGES[code], **details)
 
 
-class StreamEpochChanged(ConnectionAbortedError):
-    pass
+class AwaitingPresence(refusals.Refusal):
+    status = 202
+    code = "awaiting_presence"
 
 
 @dataclass
@@ -139,6 +140,14 @@ def recent(buckets, key, since):
     return values
 
 
+def require_scope(credential, scope):
+    if credential is None:
+        if scope != "read":
+            raise problem("unauthenticated")
+    elif not credential.allows(scope):
+        raise problem("scope_missing")
+
+
 def session_cookie(text, age):
     return f"{COOKIE}={text}; Max-Age={age}; HttpOnly; Secure; SameSite=Strict; Path=/"
 
@@ -178,23 +187,26 @@ def check_origin(handler):
             raise problem("bad_origin")
 
 
-def authenticate(handler, method, *, api_route, browser_asset=False):
+def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scratch=False):
     op = handler.operation[0] if handler.operation else None
     name = op["name"] if op else ""
     secure = handler.origin[0] == "https"
+    auth = handler.headers.get_all("Authorization", [])
+    cookies = session_values(handler.headers)
+    claim = name == "pairing.claim"
+    meta = method == "GET" and path in ("/api/meta", "/api/v1/meta")
+    api_route = path == "/api" or path.startswith("/api/")
+    requires_credential = api_route and not (mcp or scratch or meta or claim or name == "token.issue")
+    if (mcp or require_tls(op) and (auth or cookies or not requires_credential)) and not secure:
+        raise problem("tls_required")
     peer = handler.client_address[0]
     logins = handler.server.logins
     traffic = logins.credentials
     traffic.check(peer)
-    auth = handler.headers.get_all("Authorization", [])
-    cookies = session_values(handler.headers)
-    if api_route and (op is None or op["credential_required"]) and not (auth or cookies):
-        raise unauthenticated(handler, method)
-    if require_tls(op) and not secure:
-        raise problem("tls_required")
+    if mcp and not auth:
+        raise problem("unauthenticated")
     if auth and cookies:
         raise problem("ambiguous_credential")
-    claim = name == "pairing.claim"
     if claim and auth:
         raise problem("unauthenticated")
 
@@ -228,12 +240,12 @@ def authenticate(handler, method, *, api_route, browser_asset=False):
     principals.admit(handler.actor)
 
     write = method in WRITES and name != "batch.run"
-    if write and (credential or claim):
+    if mcp or write and (credential or claim):
         check_origin(handler)
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
-    if not claim:
-        authorize(handler, op, name, method, write, peer)
+    if not (claim or mcp):
+        authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential, scratch=scratch)
     if credential:
         logins.of(peer)
         try:
@@ -244,31 +256,31 @@ def authenticate(handler, method, *, api_route, browser_asset=False):
             handler.set_cookie = session_cookie(text, tokens.SESSION_SECONDS)
 
 
-def unauthenticated(handler, method):
-    if method in WRITES and handler.headers.get_all("X-Arete", []) == ["1"]:
-        message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser."
-                   if handler.origin[0] == "https" else
+def unauthenticated(handler, write, secure):
+    if write and handler.headers.get_all("X-Arete", []) == ["1"]:
+        message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
                    "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.")
         return contract.Problem("unauthenticated", message)
     return problem("unauthenticated")
 
 
-def authorize(handler, op, name, method, write, peer):
+def authorize(handler, op, name, write, secure, peer, *, requires_credential, scratch):
     credential = handler.credential
+    if requires_credential and credential is None:
+        raise unauthenticated(handler, write, secure)
     if name in PRESENCE:
         if credential is None and name == "token.issue":
             logins = handler.server.logins
             logins.credentials.issue(logins.node_key(peer))
-            return
+            if not scratch:
+                raise AwaitingPresence("Issue a token from a paired browser.")
         require_presence(credential)
-    if credential is None:
-        if write:
-            raise unauthenticated(handler, method)
-        return
-    if name == "pairing.start" and credential.kind != "session":
+    if name == "pairing.start" and (credential is None or credential.kind != "session"):
         with db.reader() as c:
             if tokens.live_session(c):
                 require_presence(credential)
+    if write and credential is None:
+        raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":
         raise problem("unauthenticated")
     if name in ("session.end", "pairing.start") or (name == "token.revoke" and credential.kind == "token"
@@ -279,8 +291,7 @@ def authorize(handler, op, name, method, write, peer):
         provider = (handler.alias or {}).get("provider", "")
         resource = provider.removeprefix("post_").split("_", 1)[0]
         scope = f"{LEGACY_SCOPES.get(resource, resource)}:write" if resource else "*"
-    if not credential.allows(scope):
-        raise problem("scope_missing")
+    require_scope(credential, scope)
 
 
 def issue_grants(values):

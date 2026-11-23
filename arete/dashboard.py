@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import secrets
 import select
@@ -38,6 +37,8 @@ from . import (
     idempotency,
     install_files,
     jira,
+    mcp_http,
+    mcp_protocol,
     loop_run,
     oncall,
     paths,
@@ -243,6 +244,8 @@ def canonical_path(path: str) -> bool:
 
 
 def canonical_methods(path: str) -> tuple[str, ...]:
+    if path == mcp_protocol.PATH:
+        return ("GET", "POST")
     if path in ("/api/v1/events", "/api/v1/principals") or re.fullmatch(r"/api/v1/principals/[^/]+", path):
         return ("GET",)
     return tuple(method for method in ("GET", "POST", "PATCH", "DELETE") if contract.match(method, path))
@@ -282,10 +285,11 @@ def fault_body(fault: verify_faults.Fault, path: str, query: dict[str, str]) -> 
 
 
 @contextmanager
-def write_claim(handler, key, sha, route):
-    actor = f"session:{handler.credential.id}" if route == "/api/v1/auth/logout" else handler.person
+def write_claim(handler, key, sha, route, *, actor=None):
+    if actor is None:
+        actor = f"session:{handler.credential.id}" if route == "/api/v1/auth/logout" else handler.person
     with idempotency.owning(actor, key, sha, route) as context:
-        if route != credential_http.PAIRING_START_ROUTE:
+        if route not in (credential_http.PAIRING_START_ROUTE, mcp_protocol.PATH):
             handler.server.logins.credentials.reject_pairing_key(actor, key)
         row = (credential_http.matching_pairing_claim(context)
                if route == credential_http.PAIRING_CLAIM_ROUTE else idempotency.matching_claim(context))
@@ -321,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if self.command not in ("GET", "POST", "PATCH", "DELETE") and self.api_path:
+        if self.command not in ("GET", "POST", "PATCH", "DELETE") and canonical_methods(self.api_path):
             self.answer(self.command)
             return False
         return True
@@ -377,7 +381,8 @@ class Handler(BaseHTTPRequestHandler):
         self.operation = contract.match(method, path)
         route = (self.alias or (self.operation[0] if self.operation else {})).get("path")
         self.route = route or ("/api/v1/principals/{id}" if path.startswith("/api/v1/principals/") else
-                               path if path in ("/api/v1/events", "/api/v1/principals") else "unmatched")
+                               path if path in ("/api/v1/events", "/api/v1/principals", mcp_protocol.PATH)
+                               else "unmatched")
         with principals.acting("hand"), event_store.request_scope(f"{method} {self.route}"):
             self.actor = None
             self.write_receipt = None
@@ -389,6 +394,8 @@ class Handler(BaseHTTPRequestHandler):
             self.set_cookie = None
             self.success_status = 200
             self.instance_header = None
+            self.mcp_session = None
+            self.mcp_rotation_accepted = None
             self.stream_check_at = 0
             self.stream_marker = None
             return self.answer_as_person(method)
@@ -401,8 +408,6 @@ class Handler(BaseHTTPRequestHandler):
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
-            if method not in ("GET", "POST", "PATCH", "DELETE"):
-                raise credential_http.problem("not_implemented")
             if path.startswith(webhooks.HOOK_PATH):
                 if self.restarting:
                     raise contract.Problem("draining", RESTARTING)
@@ -410,8 +415,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(202 if got["queued"] else 200, got)
             if method in ("POST", "PATCH", "DELETE"):
                 self.check_write_instance()
-            if self.operation and self.operation[0]["name"] == "token.issue" and self.credential is None:
-                return self.send_json(202, {"code": contract.AWAITING_PRESENCE})
             self.validate_transport(method, path)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
@@ -426,6 +429,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.keyed_start()
             if method == "GET" and path in EVENT_STREAM_PATHS:
                 return event_stream.serve(self, query, WEB_CODE)
+            if path == mcp_protocol.PATH:
+                return mcp_http.serve(self, method)
             if method == "POST" and path == EVIDENCE_PATH:
                 return self.send_json(200, self.stage_evidence(query))
             if method == "GET" and (item := EVIDENCE_ITEM.fullmatch(path)):
@@ -480,19 +485,11 @@ class Handler(BaseHTTPRequestHandler):
         issue, self.stream_marker = tokens.stream_status(self.credential, marker)
         return issue
 
-    def check_stream_credential(self, *, pristine=True, epoch_reset=False):
-        issue = self.stream_problem()
-        if issue is None or (epoch_reset and issue == tokens.STREAM_EPOCH_CHANGED):
-            return
-        if pristine and issue == tokens.STREAM_EPOCH_CHANGED:
-            raise credential_http.StreamEpochChanged()
-        raise ConnectionAbortedError()
-
     def stream_headers(self):
         self.close_connection = True
         self.end_headers(streaming=self.credential is not None)
 
-    def stream_write(self, block, *, epoch_reset=False):
+    def stream_write(self, block):
         if self.credential is None:
             self.wfile.write(block)
             self.wfile.flush()
@@ -504,7 +501,8 @@ class Handler(BaseHTTPRequestHandler):
         sock.setblocking(False)
         try:
             while pending:
-                self.check_stream_credential(pristine=len(pending) == len(block), epoch_reset=epoch_reset)
+                if self.stream_problem():
+                    raise ConnectionAbortedError()
                 wait = .25 if deadline is None else min(.25, deadline - time.monotonic())
                 if wait <= 0:
                     raise TimeoutError()
@@ -527,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_transport(self, method, path):
         if self.api_path and (self.restarting or
-                              method == "GET" and path not in ("/api/v1/meta", "/api/meta") and POSTS_IN_FLIGHT.draining()):
+                              method == "GET" and path != "/api/meta" and POSTS_IN_FLIGHT.draining()):
             raise contract.Problem("draining", RESTARTING)
         client = self.headers.get("X-Arete-Client", "")
         if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
@@ -611,12 +609,19 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False):
-        key = self.headers.get("Idempotency-Key")
-        if key is None:
-            return action()
-        sha = idempotency.fingerprint(method, route, parameters, self.body())
-        with write_claim(self, key, sha, route) as (context, row):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False, claim=None,
+                     read_only=False):
+        if claim is None:
+            key = self.headers.get("Idempotency-Key")
+            if key is None:
+                return action()
+            sha = idempotency.fingerprint(method, route, parameters, self.body())
+            owning = write_claim(self, key, sha, route)
+        else:
+            actor, key, claim_route, body = claim
+            sha = idempotency.fingerprint("POST", claim_route, {}, body)
+            owning = write_claim(self, key, sha, claim_route, actor=actor)
+        with owning as (context, row):
             if route == credential_http.PAIRING_START_ROUTE:
                 self.success_status = status
                 return credential_http.start_pairing(self, key)
@@ -625,11 +630,22 @@ class Handler(BaseHTTPRequestHandler):
                 result = json.loads(row["response"])
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
+            elif read_only:
+                row, result = self.complete_read_action(context, action, status)
             else:
                 row, result = self.complete_action(context, action, atomic, status, redact)
             self.success_status = row["status"]
             self.write_receipt = claims.receipt(row["last_seq"])
             return result
+
+    def complete_read_action(self, context, action, status):
+        result = action()
+        payload = api_http.json_bytes(result)
+        with foundation.tx():
+            if (row := idempotency.matching_claim(context)) and row["status"]:
+                self.idempotent_replayed = True
+                return row, json.loads(row["response"])
+            return claims.complete(context, status, payload, None), result
 
     def complete_action(self, context, action, atomic, status, redact):
         if not atomic:
@@ -662,8 +678,8 @@ class Handler(BaseHTTPRequestHandler):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        credential_http.authenticate(self, method, api_route=path == "/api" or path.startswith("/api/"),
-                                     browser_asset=path in WEB_BY_PATH)
+        credential_http.authenticate(self, method, path, browser_asset=path in WEB_BY_PATH,
+                                     mcp=path == mcp_protocol.PATH, scratch=self.verify_controls is not None)
 
     def api(self, method: str, path: str, query: dict):
         if self.operation:
@@ -735,8 +751,7 @@ class Handler(BaseHTTPRequestHandler):
                            publication=publication)
         return {"ref": ref, "said": f"{said} {start_poll_without_failing_the_send()}"}
 
-    def usage_row(self) -> dict:
-        b = self.body()
+    def usage_row(self, b) -> dict:
         kind = b.get("kind")
         if kind not in USAGE_KINDS:
             raise Refusal(400, f"The kind is one of {', '.join(USAGE_KINDS)}.")
@@ -817,6 +832,8 @@ class Handler(BaseHTTPRequestHandler):
         kind = "application/json"
         if status >= 400 and canonical_path(getattr(self, "api_path", "")):
             data = api_http.problem(status, data)
+            if self.api_path == mcp_protocol.PATH:
+                data = mcp_protocol.protect_problem(data)
             kind = "application/problem+json"
         self.send(status, api_http.json_bytes(data), kind, "private, no-cache" if conditional else "no-store",
                   retry_after, conditional=conditional, tag=tag)
@@ -861,6 +878,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Arete-Session", "paired")
         if getattr(self, "set_cookie", None):
             self.send_header("Set-Cookie", self.set_cookie)
+        if getattr(self, "mcp_session", None):
+            self.send_header(mcp_protocol.SESSION_HEADER, self.mcp_session)
         if streaming and self.request_version != "HTTP/0.9":
             self._headers_buffer.append(b"\r\n")
             self.stream_write(b"".join(self._headers_buffer))
@@ -876,6 +895,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         if status == 405 and (allowed := getattr(self, "allowed_methods", ())):
             self.send_header("Allow", ", ".join(allowed))
+        if status == 409 and (rotation := getattr(self, "mcp_rotation_accepted", None)):
+            self.send_header(mcp_protocol.ROTATION_ACCEPTED_HEADER, rotation)
         self.send_header("Cache-Control", cache)
         self.send_header("X-Arete-Code", WEB_CODE)
         if getattr(self, "idempotent_replayed", False):
@@ -918,7 +939,7 @@ class Redirect(Handler):
     def answer(self, method: str) -> None:
         path = request_path(self.path)
         route = contract.match(method, path)
-        if credential_http.require_tls(route[0] if route else None):
+        if path == mcp_protocol.PATH or credential_http.require_tls(route[0] if route else None):
             error = credential_http.problem("tls_required")
             return self.send_json(error.status, refusal_answer(error))
         node: tailnet.Node = self.server.node
@@ -1119,7 +1140,11 @@ def get_sessions(handler, rest, query):
 
 
 def post_usage(handler, rest, query):
-    insights_store.add_usage(handler.usage_row(), board.KEEP_USAGE_DAYS)
+    return record_usage(handler, handler.body())
+
+
+def record_usage(handler, values):
+    insights_store.add_usage(handler.usage_row(values), board.KEEP_USAGE_DAYS)
     return {}
 
 
@@ -1363,33 +1388,7 @@ def handlers() -> tailnet.Handlers:
     return tailnet.Handlers(ScratchHandler, Redirect)
 
 
-def verification_tls():
-    state = verify_faults.state_path()
-    if state is None or state != paths.STATE_DIR.absolute():
-        raise PermissionError(verify_faults.REFUSAL)
-    root = state.parent
-    if (state.name != "state" or not root.name.startswith(verify_faults.DASHBOARD_PREFIX)
-            or root.resolve() != root or root.stat().st_mode & 0o077
-            or paths.CONFIG_DIR.resolve() != root / "config" or paths.HOME.resolve() != root / "home"
-            or not paths.TOKEN_CLIENT_DIR.resolve().is_relative_to(root)
-            or paths.DB_FILE.exists() or paths.DB_FILE.is_symlink()):
-        raise PermissionError("Verification dashboard TLS requires a fresh private scratch layout.")
-    with verify_faults.scratch_state(state) as directory:
-        with verify_faults.plain_file(directory, tailnet.VERIFICATION_TLS) as bundle:
-            if os.fstat(bundle.fileno()).st_mode & 0o077:
-                raise PermissionError("Verification dashboard TLS needs a private bundle.")
-        context = tailnet.tls_context(state / tailnet.VERIFICATION_TLS)
-        os.unlink(tailnet.VERIFICATION_TLS, dir_fd=directory)
-    return context
-
-
-def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None, *,
-          verification_https=False) -> NoReturn:
-    tls = None
-    if verification_https:
-        tls = verification_tls()
-        host = tailnet.VerificationHost()
-        foundation.migrate()
+def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
     while True:
@@ -1410,7 +1409,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
             if free:
                 capture.recover()
     with util.repeating(60, maintain_credentials, "credential-maintenance"):
-        tailnet.serve(handlers(), cfg, port, inside_serve, host, tls=tls)
+        tailnet.serve(handlers(), cfg, port, inside_serve, host)
 
 
 def maintain_credentials():
