@@ -385,6 +385,132 @@ if sys.argv[1] == "double":
             self.assertEqual(self.record(attempt)["state"], "done")
 
 
+class ScratchSlotReplacementTests(ScratchRecordTests):
+    slot = "config/config.toml"
+
+    def setUp(self):
+        super().setUp()
+        with paths.directory_fd(self.base) as fd:
+            if scratch.filesystem(fd) != "apfs":
+                self.skipTest("requires APFS file IDs")
+        self.enterContext(patch.object(scratch.sandbox, "AUTHORITY", self.base))
+        self.enterContext(patch.object(scratch, "read_secret", return_value=b"fixture signing material"))
+        self.enterContext(patch.object(scratch, "processes", return_value={}))
+        self.enterContext(patch.object(scratch, "service_labels", return_value={}))
+
+    def registry(self, create=False):
+        return super().registry()
+
+    def make_attempt(self):
+        worktree, run_dir = self.base / "workspace", self.base / "run"
+        worktree.mkdir()
+        run_dir.mkdir()
+        attempt = scratch.make(run_dir.name, "verify", worktree, run_dir)
+        self.addCleanup(self.release_lease, attempt)
+        return attempt
+
+    def release_lease(self, attempt):
+        if (lease := scratch.LEASES.pop(attempt.selector, None)) is not None:
+            os.close(lease)
+
+    def replace_slot(self, attempt, content):
+        slot = Path(attempt.root) / self.slot
+        temporary = slot.with_suffix(".new")
+        temporary.write_bytes(content)
+        os.replace(temporary, slot)
+        return scratch.identity(slot.stat())
+
+    def assert_pending(self, attempt, reason):
+        data = self.record(attempt)
+        self.assertEqual(data["state"], "pending")
+        self.assertEqual(data["diagnostic"]["unknown_entries"], [self.slot])
+        self.assertEqual(data["diagnostic"]["reasons"], {self.slot: reason})
+
+    def test_atomic_replacement_is_snapshotted_and_archived(self):
+        attempt = self.make_attempt()
+        replacement = self.replace_slot(attempt, b"atomic config\n")
+
+        snapshot, saved, kept = scratch.end(attempt, Path(attempt.run_dir))
+
+        data = self.record(attempt)
+        self.assertEqual(kept, [], data["diagnostic"])
+        self.assertFalse(Path(attempt.root).exists())
+        self.assertEqual(saved, list(scratch.SLOTS))
+        self.assertEqual(data["state"], "done")
+        self.assertEqual(data["replaced"], {self.slot: replacement})
+        self.assertEqual(data["snapshot"], snapshot)
+        manifest = json.loads((Path(snapshot) / "manifest.json").read_text())
+        self.assertEqual((Path(snapshot) / str(manifest["files"].index(self.slot))).read_bytes(), b"atomic config\n")
+        tree = self.base / attempt.selector / data["final_tree"]
+        self.assertEqual(scratch.identity(tree.stat()), attempt.directories[""])
+        self.assertEqual((tree / self.slot).read_bytes(), b"atomic config\n")
+
+    def test_hard_link_replacement_is_left_out_and_named(self):
+        attempt = self.make_attempt()
+        external = self.base / "external"
+        external.write_bytes(b"outside scratch")
+        slot = Path(attempt.root) / self.slot
+        slot.unlink()
+        os.link(external, slot)
+
+        snapshot, saved, kept = scratch.end(attempt, Path(attempt.run_dir))
+
+        self.assertEqual(kept, [attempt.root])
+        self.assert_pending(attempt, scratch.LINKED)
+        manifest = json.loads((Path(snapshot) / "manifest.json").read_text())
+        self.assertNotIn(self.slot, saved)
+        self.assertEqual(manifest["files"], saved)
+        self.assertEqual(manifest["left_out"], [self.slot])
+
+    def test_file_from_before_attempt_is_named(self):
+        old = self.base / "old-config.toml"
+        old.write_bytes(b"before scratch")
+        attempt = self.make_attempt()
+        os.replace(old, Path(attempt.root) / self.slot)
+
+        self.assertEqual(scratch.end(attempt, Path(attempt.run_dir))[2], [attempt.root])
+        self.assert_pending(attempt, scratch.EXISTED)
+
+    def test_second_replacement_after_snapshot_is_named(self):
+        attempt = self.make_attempt()
+        first = self.replace_slot(attempt, b"first config")
+        external = self.base / "external"
+        external.touch()
+        blocker = Path(attempt.root) / "unrelated-link"
+        os.link(external, blocker)
+
+        snapshot, _, kept = scratch.end(attempt, Path(attempt.run_dir))
+        self.assertEqual(kept, [attempt.root])
+        pending = self.record(attempt)
+        self.assertEqual(pending["diagnostic"]["reasons"], {blocker.name: scratch.LINKED})
+        self.assertEqual(pending["replaced"], {self.slot: first})
+        blocker.unlink()
+        self.replace_slot(attempt, b"second config")
+
+        self.assertEqual(scratch.end(attempt, Path(attempt.run_dir)), ("", [], [attempt.root]))
+        self.assert_pending(attempt, scratch.REPLACED_AFTER_SNAPSHOT)
+        data = self.record(attempt)
+        self.assertEqual(data["snapshot"], snapshot)
+        self.assertEqual(data["archives"], pending["archives"])
+        self.assertEqual(data["replaced"], pending["replaced"])
+
+    def test_recovers_pending_estale_without_snapshot(self):
+        attempt = self.make_attempt()
+        replacement = self.replace_slot(attempt, b"config from interrupted finalization")
+        with self.registry() as (fd, key):
+            data = scratch.load(fd, key, attempt.selector)
+            data.update(state="pending", diagnostic={"error": "OSError", "errno": 70})
+            scratch.store(fd, key, data)
+        self.release_lease(attempt)
+
+        recovered = scratch.recover_pending()
+        data = self.record(attempt)
+        self.assertEqual(recovered, [attempt.root], data["diagnostic"])
+        self.assertEqual(data["state"], "done")
+        self.assertEqual(data["replaced"], {self.slot: replacement})
+        self.assertTrue(scratch.settled_record(attempt.selector, Path(attempt.workspace)))
+
+
 class OptimizeTests(unittest.TestCase):
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
         def trials(arm, outcomes, cost):
