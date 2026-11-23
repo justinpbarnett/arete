@@ -1920,8 +1920,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         can_queue = not (feedback or (prepare_reads_feedback and pending_feedback(repo.name, tid)))
                     refusal = f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}."
                     if can_queue:
-                        source_store.pass_over(repo.name, str(tid))
-                        print(f"{refusal} Ticket queued for the next poll.")
+                        try:
+                            with db.tx(timeout=0.5):
+                                source_store.pass_over(repo.name, str(tid))
+                        except sqlite3.OperationalError:
+                            print(f"{refusal} Ticket could not be queued for the next poll because the database "
+                                  "was busy. Start the ticket again.")
+                        else:
+                            print(f"{refusal} Ticket queued for the next poll.")
                     else:
                         print(f"{refusal} Wait for a run to finish or raise max_parallel in "
                               f"{paths.short_path(paths.CONFIG_FILE)}.")

@@ -612,6 +612,18 @@ class PipelineNoSlotTests(unittest.TestCase):
         self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
                                "Ticket queued for the next poll.")
 
+    def test_no_slot_refuses_promptly_when_database_is_busy(self):
+        with closing(sqlite3.connect(paths.DB_FILE)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            line = self.refused_child({"state": "OPEN", "labels": []})
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2)
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
+                               "Ticket could not be queued for the next poll because the database was busy. "
+                               "Start the ticket again.")
+
     def test_zte_label_keeps_original_refusal(self):
         line = self.refused_child({"state": "OPEN", "labels": [{"name": tracker.ZTE_LABEL}]}, status=2)
         self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
