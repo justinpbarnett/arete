@@ -378,6 +378,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return with_spent(res, limited)
         limit = res.usage_limit
         why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
+               else f"{chosen_route.runner} provider could not be reached" if limit.kind == "unreachable"
                else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
         for a in picked.auths:
             devices_store.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
