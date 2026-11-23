@@ -8574,9 +8574,9 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.server.code_problem = ""
         self.server.every_loop = self.server.live = []
         self.server.failing, self.server.logged = {}, {}
-        actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dispatch", "approvals",
-                   "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks", "release_closed_when_due",
-                   "remind")
+        actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "unblock_when_due", "dispatch",
+                   "approvals", "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks",
+                   "release_closed_when_due", "remind")
         with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
                                   **{action: mock.DEFAULT for action in actions}) as stages,
               mock.patch.object(db, "ensure_schema"),
