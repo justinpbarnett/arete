@@ -91,7 +91,9 @@ OPERATIONS = {
                           "A positive timeout caps the wait further and omission defaults to 60 seconds.",
                           {"after": (int, 0), "timeout_seconds": (int, 60)},
                           {"after": {"minimum": 0}, "timeout_seconds": {"minimum": 0}}),
-    "publication.request": Operation("Request existing engine publication; current evidence and authority are required.", {}),
+    "publication.request": Operation("Request existing engine publication; current evidence and authority are required. "
+                                     "For an unmeasurable requirement, supply requirement and measurement strings "
+                                     "in unverified_measurement.", {"unverified_measurement": (dict, {})}),
     "run.finish": Operation("Finish failed, noop or delivered; delivered requires engine publication.",
                              {"reason": required(str), "evidence_refs": (list, [])},
                              {"reason": {"enum": ["failed", "noop", "delivered"]}}),
@@ -264,6 +266,12 @@ class Catalog:
                 _, errors = owner_asks.validate(args["request"])
                 if errors:
                     raise ValueError("; ".join(errors))
+            if op == "publication.request" and (measurement := args["unverified_measurement"]):
+                if (measurement.keys() != {"requirement", "measurement"}
+                        or any(type(value) is not str or not value.strip() or len(value) > 16000
+                               for value in measurement.values())):
+                    raise ValueError("unverified_measurement needs requirement and measurement strings "
+                                     "of 1 to 16000 characters")
             if op == "run.finish":
                 self.refs(args["evidence_refs"])
             calls.append({"op": op, "args": args})

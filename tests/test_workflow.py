@@ -635,6 +635,113 @@ class PolicyRetryCapTests(unittest.TestCase):
         self.assertEqual(output, "")
 
 
+class PrepareResumeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(tempfile.mkdtemp()).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.state, ignore_errors=True)
+        cls.template = cls.state / "template.db"
+        connect = db.connect_db
+
+        def fixture_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if not kwargs.get("readonly"):
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            return conn
+
+        cls.enterClassContext(mock.patch.object(db, "connect_db", fixture_connect))
+        cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
+        with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
+                                  LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
+                                  LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
+            db.migrate()
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=self.state))
+        shutil.copyfile(self.template, self.root / "arete.db")
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.root, DB_FILE=self.root / "arete.db",
+                                             RUNS_DIR=self.root / "runs", LOCKS_DIR=self.root / "locks",
+                                             WORKTREES_DIR=self.root / "worktrees", LOG_DIR=self.root / "logs"))
+        self.repo = config.Repo("fixture", self.root)
+        self.cfg = config.Config(repos=[self.repo])
+        self.tracker = mock.Mock(states=("running", "needs-info"), label_name=lambda status: status, ref=lambda tid: tid)
+        self.tracker.label.return_value = self.tracker.move.return_value = self.tracker.comment.return_value = ""
+        self.enterContext(mock.patch.object(pipeline.alerts, "ask_notice"))
+
+    def controller(self, run_id, previous=""):
+        record.start("pipeline", run_id=run_id, repo=self.repo.name, issue="7")
+        folder = self.root / run_id
+        folder.mkdir()
+        run = pipeline.Run(run_id, self.repo, folder, tracker=self.tracker, tid="7", path="orchestrate", cfg=self.cfg)
+        return orchestration.Controller(flows.start(self.cfg, run, {}, continues=previous))
+
+    def check_ask_resume(self, first_prepare):
+        from arete.store import asks as ask_store
+
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=first_prepare)
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            status, summary, _ = flows.driven(first.flow, lambda _: first.prepare())
+        self.assertEqual(status, "needs-info")
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertNotIn("preparing", saved)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, status, summary=summary)
+        ask, = ask_store.asks_of(first.run.id, "open")
+        answer = "Keep the branch change."
+        self.assertTrue(ask_store.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, answer)))
+
+        resumed = self.controller("resumed", first.run.id)
+
+        def resolve(flow, tree):
+            flow.ctx.run.agent("resolve", "Resolve the merge.", Path(tree), resume=NO_SESSION)
+            return factory.Outcome("stop", data={"ending": "quiet", "status": "noop"})
+
+        prepare.side_effect = resolve
+        with (mock.patch.dict(factory.STEPS, prepare=prepare),
+              mock.patch.object(pipeline.AgentRun, "agent", return_value=Result(ok=True)) as agent):
+            self.assertEqual(resumed.prepare()[0], "noop")
+        prepare.assert_called_with(resumed.flow, tree=str(resumed.job.ws))
+        self.assertEqual(prepare.call_count, 2)
+        agent.assert_called_once()
+        self.assertIn(f"Answer: {answer}", agent.call_args.args[1])
+        self.assertEqual(ask_store.ask_get(ask["id"])["taken_by"], resumed.run.id)
+
+    def test_returned_prepare_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            sent = owner_asks.text_ask("Which change should the merge keep?")
+            return factory.Outcome("ask", data={
+                "ending": "ask", "summary": "Resolve the merge", "session": asdict(NO_SESSION),
+                "asked": [{**sent, "ask_id": "first-a1", "step": "prepare", "call": "resolve"}],
+            })
+
+        self.check_ask_resume(ask)
+
+    def test_resolver_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            flow.ctx.run.owner_ask("resolve", [owner_asks.text_ask("Which change should the merge keep?")], NO_SESSION)
+
+        self.check_ask_resume(ask)
+
+    def test_interrupted_prepare_still_refuses_resume(self):
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=RuntimeError("prepare interrupted"))
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(RuntimeError, "prepare interrupted"):
+                first.prepare()
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertIs(saved["preparing"], True)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, "interrupted")
+        resumed = self.controller("resumed", first.run.id)
+        prepare.reset_mock()
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(factory.Refused, "preparation was interrupted before durable workspace authority"):
+                resumed.prepare()
+        prepare.assert_not_called()
+
+
 class RestoredPRRevisionTests(unittest.TestCase):
     base = "old-base"
     head = "pr-head"
@@ -3022,6 +3129,267 @@ class HeadWorkflowHoldRefreshTests(AutomaticCIRerunFixture, unittest.TestCase):
         self.push_fix.assert_not_called()
 
 
+class VerifierMeasurementPublicationTests(PublicationFixture):
+    def test_rendered_prompt_limits_retries_for_an_unmeasurable_requirement(self):
+        rendered = prompt_loader.prompt("orchestrate", api=help_text(), observation="{}")
+
+        self.assertIn(
+            "Have the verifier explicitly list that requirement as unverified in its summary and record the stubbed "
+            "evidence that covers it, then request publication so both appear in the PR body.\n"
+            "When two verifications on the same final tree each report that their environment cannot measure the "
+            "same requirement (such as timing that includes sandbox setup), stop retrying verification for that "
+            "requirement.\n"
+            "Request publication with `unverified_measurement` containing `requirement` and `measurement`. Copy the "
+            "actual measurement and its source from the builder or checks even if the verifier reports only the "
+            "limitation. The PR body will label the requirement as unverified and show the measurement.\n"
+            "Never apply this exception to a requirement any verifier observed fail.\n",
+            rendered,
+        )
+
+    def test_publication_includes_the_measurement_recorded_only_by_the_builder(self):
+        controller, checkout = self.controller, self.checkout
+        self.file.write_text("implementation\n")
+        self.enterContext(mock.patch.object(factory, "fingerprint",
+                                            side_effect=lambda folder: (folder / "file.txt").read_text()))
+        self.build.layer.verify = config.Verify(publish_evidence=False)
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", checkout.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("unverified"), stamp=False)
+        requirement = "Each changed TestCase class finishes alone in under 5 seconds."
+        job.build_summary = "Builder timed the changed class alone outside the verification sandbox at 4.683 s."
+        changes = "The controller stops retrying when two verifier environments cannot measure a requirement."
+        job.review = Review.stored({"verdict": "approve", "changes": changes})
+        controller.stamp("checks", {"full": True})
+        controller.stamp("review", job.review.asdict())
+        controller.run.path = "orchestrate"
+        controller.catalog.route.return_value = SimpleNamespace(step="verify")
+        limitation = "The verifier could not time the class alone because sandbox migrations were included."
+        verified = verify.Verified("pass", limitation, checks=[
+            {"what": "Rendered controller rule", "how": "Read the rendered prompt", "saw": "Rule present", "passed": True},
+        ], unmeasured_requirements=[requirement])
+        pr = "https://github.com/fixture/repo/pull/7"
+        with (mock.patch.object(pipeline, "check_in_use", return_value=verified) as check,
+              mock.patch.object(pipeline, "commit_and_push"),
+              mock.patch.object(pipeline, "release_workspace"),
+              mock.patch.object(pipeline, "supersede_older_runs"),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.record, "metered_spent", return_value=0),
+              mock.patch.object(ci, "watch", side_effect=lambda target, log: ci.Watched(target, {})),
+              mock.patch.object(gh, "open_pr_url", return_value=""),
+              mock.patch.object(gh, "pr_create", return_value=pr) as create,
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: create.call_args.args[4]),
+              mock.patch.object(gh, "pr_edit_body") as edit):
+            for attempt in (1, 2):
+                verification = {"id": f"d000{attempt}-0", "op": "verification.run", "state": "accepted",
+                                "request": {"route_id": "fixture", "effort": "", "goal_refs": []}}
+                self.assertIsNone(controller.dispatch(verification))
+                self.assertEqual(controller.data["evidence"]["verify"]["tree"],
+                                 controller.data["evidence"]["checks"]["tree"])
+            decision = {"version": 1, "decision_id": "d0003", "state_version": 3, "rationale": limitation,
+                        "calls": [{"op": "publication.request", "args": {"unverified_measurement": {
+                            "requirement": requirement, "measurement": job.build_summary}}}]}
+            call, = orchestration.Catalog.validate(controller.catalog, decision, "d0003", 3, {})["calls"]
+            publication = {**self.action, "id": "d0003-0", "request": call["args"]}
+            self.assertIsNone(controller.dispatch(publication))
+
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual((controller.ending[0], controller.ending[2]), ("pr", pr))
+        create.assert_called_once()
+        edit.assert_called_once()
+        for body in (create.call_args.args[4], edit.call_args.args[1]):
+            self.assertIn(f"## Summary\n\n{changes}", body)
+            self.assertIn(limitation, body)
+            self.assertIn(pipeline.unverified_measurement_section(
+                {"requirement": requirement, "measurement": job.build_summary}), body)
+
+
+class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCase):
+    disclosure = {"requirement": "The class finishes alone in under 5 seconds.",
+                  "measurement": "The builder measured 4.683 s."}
+
+    def setUp(self):
+        super().setUp()
+        self.link = "Closes #7"
+        self.run.tracker.pr_link.return_value = self.link
+        self.pr_text = gh.outgoing("## Summary\n\nFixture PR", self.link)
+        gh.pr_body.side_effect = lambda _: self.pr_text
+        self.body.side_effect = self.save_body
+
+    def save_body(self, pr, body, *, link):
+        self.assertEqual(pr, self.checkout.pr)
+        self.pr_text = gh.outgoing(body, link)
+
+    def test_standing_pr_preserves_unmarked_and_fenced_disclosures(self):
+        checkout = self.checkout
+        section = pipeline.unverified_measurement_section(self.disclosure)
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        example = f"   ~~~~markdown\n{section}~~~\n   ~~~~"
+        self.pr_text += f"\n\n{example}\n\n{lookalike}"
+        self.pr_text = ci.with_section(self.pr_text, ci.section([], 0, "Checks passed."))
+        original = self.pr_text
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link)
+        self.body.assert_not_called()
+        self.assertEqual(self.pr_text, original)
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link,
+                                measurement_section=section)
+        self.assertEqual(self.pr_text, f"{original}\n\n{section}")
+
+    def test_refreshing_a_standing_pr_measurement_preserves_maintainer_notes_and_ci_stop(self):
+        checkout = self.checkout
+        earlier_disclosure = {**self.disclosure, "measurement": "The builder measured 4.900 s."}
+        old = pipeline.unverified_measurement_section(earlier_disclosure)
+        summary = self.pr_text
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
+        self.pr_text = ci.with_section(f"{summary}\n\n{old}{notes}", ci_stop)
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+
+        stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "",
+                                          self.link, measurement_section=measurement)
+
+        self.assertEqual(stopped, [checkout])
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_stop}")
+        ci_pass = ci.section([], 0, "Checks passed.")
+        pipeline.publish_ci(self.run, self.build.ticket, [checkout], ci_pass)
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_pass}")
+
+    def test_refresh_after_repair_removes_the_disclosure_when_the_requirement_is_verified(self):
+        checkout = self.checkout
+        summary = self.pr_text
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        notes = "### Rollout notes\n\n- Keep the existing rollout order.\n\n## Maintainer checklist\n\n- [ ] Roll out"
+        ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
+        self.pr_text = ci.with_section(f"{summary}\n\n{measurement}{notes}", ci_stop)
+        report = "## Checked in use\n\nThe verifier measured the class alone at 4.2 s on the repaired revision."
+
+        stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [checkout],
+                                          report, "", self.link)
+
+        self.assertEqual(stopped, [checkout])
+        self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
+        self.comment.assert_called_once_with(checkout.pr, f"Pushed more work for #7.\n\n{report}")
+
+    def test_same_head_ci_retry_updates_the_disclosure_before_finishing_publication(self):
+        self.verdicts = {}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        measurement = pipeline.unverified_measurement_section(self.disclosure).rstrip()
+        earlier = pipeline.unverified_measurement_section({**self.disclosure, "measurement": "Builder measured 4.900 s."})
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        self.pr_text += f"\n\n{earlier}{notes}"
+
+        def reruns(*_):
+            self.assertEqual(ci.SECTION.search(self.pr_text).group().strip(), failed_ci)
+            self.assertIn(notes, self.pr_text)
+            self.assertIn(measurement, self.pr_text)
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
+
+        def finish():
+            self.assertTrue(self.pr_text.startswith(f"{self.link}\n\n## Summary"))
+            self.assertIn(measurement, self.pr_text)
+            self.assertIn(notes, self.pr_text)
+            self.assertEqual(self.pr_text.count(ci.SECTION_START), 1)
+            self.assertEqual(self.pr_text.count(ci.SECTION_END), 1)
+            return {"ending": "done"}
+
+        controller.finish_publication.side_effect = finish
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
+            self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
+            self.assertNotIn(measurement, self.pr_text)
+            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
+                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
+                    controller.publish(self.disclosure)
+            self.assertTrue(controller.data["ci_failed"])
+            gh.gh.assert_not_called()
+            controller.finish_publication.assert_not_called()
+            self.assertEqual(controller.publish(self.disclosure), {"ending": "done"})
+
+        gh.gh.assert_called_once()
+        controller.finish_publication.assert_called_once()
+
+    def test_same_head_ci_retry_removes_only_the_disclosure_for_the_measured_requirement(self):
+        self.verdicts = {}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        example = f"```markdown\n{measurement}```"
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        original = f"{self.pr_text}\n\n{example}\n\n{notes}"
+        published = f"{self.pr_text}\n\n{example}\n\n{measurement}{notes}"
+        self.pr_text = published
+
+        def reruns(*_):
+            self.assertEqual(self.pr_text, ci.with_section(original, failed_ci))
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
+
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
+            self.assertEqual(controller.publish(self.disclosure)["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
+            controller.job.verified = verify.Verified.from_agent({
+                "verdict": "pass", "summary": "The class finished alone at 4.2 s.", "checks": [
+                    {"what": self.disclosure["requirement"], "how": "Run the class alone", "saw": "4.2 s", "passed": True},
+                ],
+            })
+            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
+                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
+                    controller.publish()
+            self.assertTrue(controller.data["ci_failed"])
+            self.assertEqual(self.pr_text, ci.with_section(published, failed_ci))
+            gh.gh.assert_not_called()
+            controller.finish_publication.assert_not_called()
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertTrue(self.pr_text.startswith(original))
+        self.assertEqual(self.pr_text.count(pipeline.MEASUREMENT_START), 1)
+        gh.gh.assert_called_once()
+        controller.finish_publication.assert_called_once()
+
+
+class MeasurementCIRetryFallbackTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.verdicts = {"checks": True}
+        self.publication = self.controller()
+        self.publication.job.opened = self.publication.job.found = self.publication.job.ci_stopped = []
+        self.enterContext(mock.patch.object(pipeline, "set_draft"))
+        self.assertEqual(self.publication.publish()["failures"], orchestration.CI_FAILURES)
+        self.failed = [self.job("checks", 201, "success")]
+        self.body.reset_mock()
+        gh.pr_body.reset_mock()
+
+    def assert_ci_refreshed(self, disclosure=None):
+        self.assertEqual(self.publication.publish(disclosure), {"ending": "done"})
+        self.assertEqual(self.checkout.lease, "original-head")
+        self.assertNotIn("ci_failed", self.publication.data)
+        self.publication.atomic.assert_called_once()
+        self.publication.finish_publication.assert_called_once()
+        gh.gh.assert_not_called()
+        gh.pr_body.assert_called_with(self.checkout.pr)
+
+    def test_body_read_failure_with_a_measured_requirement_still_refreshes_ci(self):
+        self.publication.job.verified = verify.Verified("pass", checks=[
+            {"what": "The class finishes alone in under 5 seconds.", "passed": True},
+        ])
+        gh.pr_body.side_effect = gh.GhError("body unavailable")
+
+        self.assert_ci_refreshed()
+
+        self.body.assert_not_called()
+
+    def test_body_without_a_disclosure_only_refreshes_ci(self):
+        self.assert_ci_refreshed({"requirement": "The class finishes alone in under 5 seconds.",
+                                  "measurement": "The builder measured 4.683 s."})
+
+        self.body.assert_called_once()
+        body = self.body.call_args.args[1]
+        self.assertIn("GitHub now reports passing checks on the published head.", body)
+        self.assertNotIn(pipeline.UNVERIFIED_REQUIREMENT_HEADING, body)
+
+
 class LiveOutsideEventPublicationTests(PublicationFixture):
     def test_rendered_prompt_requests_publication_for_one_live_outside_event(self):
         rendered = prompt_loader.prompt("orchestrate", api=help_text(), observation="{}")
@@ -3564,11 +3932,6 @@ class ClosedPRPublicationTests(PublicationFixture):
         branch, controller, b = "arete/7-edit-fixture", self.controller, self.build
         remote = lease
         pushes = []
-        state_dir = other / "state"
-        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state_dir, DB_FILE=state_dir / "arete.db",
-                                             RUNS_DIR=state_dir / "runs", LOCKS_DIR=state_dir / "locks",
-                                             WORKTREES_DIR=other / "worktrees", LOG_DIR=state_dir / "logs"))
-        db.migrate()
 
         def git(args, cwd, **kw):
             nonlocal remote
@@ -3581,7 +3944,8 @@ class ClosedPRPublicationTests(PublicationFixture):
             return ""
 
         pr = "https://github.com/fixture/repo/pull/8"
-        with (mock.patch.object(workspace, "fetch") as fetch,
+        with (mock.patch.object(paths, "WORKTREES_DIR", other / "worktrees"),
+              mock.patch.object(workspace, "fetch") as fetch,
               mock.patch.object(workspace, "remote_head", side_effect=lambda src, branch: remote),
               mock.patch.object(gh, "open_pr_url", return_value=""),
               mock.patch.object(gh, "closed_pr_heads", return_value={lease}),
@@ -6218,8 +6582,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertEqual(errors, [error])
         commit.assert_any_call(run.id, checkout, run.layer)
         owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
-        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set(),
-                                          settled="failed")
+        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set())
         self.assertTrue(self.draft)
         hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
         self.assertEqual(len(hold_comments), 1)
@@ -6271,8 +6634,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
         keep.assert_called_once_with(run)
         owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
-        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set(),
-                                          settled="failed")
+        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set())
 
     def test_budget_expiry_during_limit_cleanup_preserves_catch_up_park(self):
         self.use_last_repair()
@@ -6675,6 +7037,104 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertEqual(merge_attempt.call_count, 2)
         self.assertEqual(self.edit.call_count, 2)
         self.push.assert_not_called()
+
+
+class MeasurementCatchUpPublicationTests(MovedBasePublicationFixture, unittest.TestCase):
+    def test_fresh_verification_on_moved_base_replaces_the_old_disclosure(self):
+        self.publish_with_catch_up("measured")
+
+    def test_fresh_verification_on_moved_base_preserves_a_still_unmeasured_requirement(self):
+        self.publish_with_catch_up("unmeasured")
+
+    def test_observed_failure_on_moved_base_holds_publication(self):
+        self.publish_with_catch_up("failed")
+
+    def publish_with_catch_up(self, result):
+        controller, checkout = self.controller()
+        job, run = controller.job, controller.run
+        run.budget = None
+        job.ticket = tracker.Ticket("7", "#7", "Fixture")
+        run.tracker.pr_link.return_value = "Closes #7"
+        controller.data["acceptance"] = "fixture"
+        controller.policy_sha = mock.Mock(return_value="policy")
+        disclosure = {"requirement": "The class finishes alone in under 5 seconds.",
+                      "measurement": "The builder measured 4.683 s on the original tree."}
+        failed = result == "failed"
+        unmeasured = result == "unmeasured"
+        if unmeasured:
+            summary = "The sandbox timing still includes migrations, so it cannot measure the class alone."
+            check = {"what": "Rendered controller rule", "how": "Load the prompt", "saw": "Rule present", "passed": True}
+        else:
+            timing = "5.4 s" if failed else "4.2 s"
+            summary = f"The verifier measured the class alone at {timing} on the new base."
+            check = {"what": disclosure["requirement"], "how": "Run the class alone", "saw": timing, "passed": not failed}
+        fresh = verify.Verified.from_agent({"verdict": "fail" if failed else "pass", "summary": summary, "checks": [check],
+                                            "unmeasured_requirements": [disclosure["requirement"]] if unmeasured else []})
+        review = Review("approve", "Reviewed on the new base.")
+        ci_text = ci.section([], 0, "Checks passed.")
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        body = ""
+
+        def edit(pr, text, *, link):
+            nonlocal body
+            self.assertEqual(pr, checkout.pr)
+            body = gh.outgoing(text, link)
+
+        def atomic(name, **kwargs):
+            if name == "publish":
+                return flows.publish(controller.flow, **kwargs)
+            section = kwargs["measurement_section"]
+            initial = "## Checked in use\n\nVerifier environment could not measure the class."
+            example = f"```markdown\n{section}```"
+            edit(checkout.pr, f"{initial}\n\n{section}{notes}\n\n{lookalike}\n\n"
+                 f"## Review\n\nEarlier review.\n\n{example}\n\n{ci_text}", link="Closes #7")
+            return factory.Outcome("pass", data={"heads": {checkout.github: checkout.lease}})
+
+        def catch_up(*_, before_push):
+            self.assertIn(disclosure["measurement"], body)
+            if failed:
+                raise pipeline.CatchUpGateHold("verify", "standalone timing failed", "candidate", "", verified=fresh,
+                                               review=review)
+            before_push("caught-up", fresh, review)
+            checkout.note_pushed_head("caught-up")
+            controller.fingerprint.return_value = "new-tree"
+            return fresh, review
+
+        controller.atomic.side_effect = atomic
+        with (mock.patch.object(controller, "publication_ci", return_value=None) as watch,
+              mock.patch.object(pipeline.slots, "take_merge_lease"),
+              mock.patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+              mock.patch.object(pipeline, "own_draft_state", return_value=False),
+              mock.patch.object(pipeline, "note_review"),
+              mock.patch.multiple(pipeline.run_store, save_pr_gate_refresh=mock.Mock(return_value=False),
+                                  clear_pr_gate_refresh=mock.DEFAULT),
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: body),
+              mock.patch.object(gh, "pr_edit_body", side_effect=edit),
+              mock.patch.object(flows, "ended")):
+            publication = controller.publish(disclosure)
+
+        checked = fresh.markdown()
+        if failed:
+            self.assertEqual(publication["failures"], orchestration.CATCH_UP_FAILURE)
+            merge.assert_called_once()
+            watch.assert_called_once_with([checkout])
+            self.assertEqual(checkout.lease, "head")
+            checked = ("Catch-up to `main` at `new-base` held on verify: standalone timing failed. "
+                       f"Checked candidate `candidate` and kept it in the worktree for repair.\n\n{checked}")
+        else:
+            self.assertEqual(publication["ending"], "pr")
+            self.assertEqual(merge.call_count, 2)
+            self.assertEqual(merge.call_args.args[2:4], (fresh, review))
+            self.assertEqual(watch.call_args_list, [mock.call([checkout]), mock.call([checkout], caught_up=True)])
+            self.assertEqual(controller.data["evidence"]["verify"]["tree"], "new-tree")
+        section = pipeline.unverified_measurement_section(disclosure)
+        example = f"```markdown\n{section}```"
+        retained = section if unmeasured else ""
+        self.assertEqual(body, f"Closes #7\n\n## Checked in use\n\n{checked}\n\n{retained}{notes}\n\n"
+                         f"{lookalike}\n\n{review.markdown().rstrip()}\n\n{example}\n\n{ci_text}")
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
@@ -7460,7 +7920,6 @@ class SelfDeployRollbackTests(unittest.TestCase):
 
     def test_deploy_requires_a_full_tick_and_dashboard_readiness(self):
         self.prepare_state()
-        db.migrate()
         self.server.with_dashboard = False
         cfg = config.Config()
         with mock.patch.object(self.server, "deploy") as deploy:
@@ -7485,6 +7944,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
                    "remind")
         with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
                                   **{action: mock.DEFAULT for action in actions}) as stages,
+              mock.patch.object(db, "ensure_schema"),
               mock.patch.object(serve.loop_store, "loop_states", return_value={}),
               mock.patch.object(serve.codebase, "RELEASE", ""),
               mock.patch.object(serve_guard, "at_tip", return_value=True),

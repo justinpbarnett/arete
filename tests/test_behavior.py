@@ -12,6 +12,7 @@ import threading
 import unittest
 from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
+from dataclasses import asdict, replace
 from datetime import timedelta
 from http.client import HTTPConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,7 +34,6 @@ from arete.store import idempotency as claims
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
 from arete.store import triage as triage_store
-from arete.store import workspaces as workspace_store
 from tests import support, versioned_api_fixture
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -42,16 +42,24 @@ def setUpModule():
     support.isolate_live_state()
 
 
-class WorkspaceOwnerTests(unittest.TestCase):
-    def test_owner_rows_match_legacy_records_and_ownerless_fallback(self):
+class _WorkspaceChildCase(unittest.TestCase):
+    def run_child(self, entry):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
         env = api_check.isolated_env(root)
         (root / "config/config.toml").write_text("max_parallel = 1\n")
-        entry = """
+        command = api_check.child_command(Path(__file__).resolve().parents[1], entry)
+        result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
+                                timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
+    def test_owner_rows_match_legacy_records_and_ownerless_fallback(self):
+        self.run_child(r"""
 import json
 from pathlib import Path
 from arete import config, paths, pipeline, record, workspace
-from arete.store import db, workspaces
+from arete.store import db
 
 db.migrate()
 repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
@@ -63,49 +71,32 @@ run = pipeline.Run("sample-run", repo, paths.RUNS_DIR / "sample-run", tracker=No
 c = workspace.Checkout("api", "test/sample", repo.path / "api", ws / "api", "main", onto="saved")
 legacy = {"run": "sample-run", "repo": "sample-app", "ticket": "7", "created": "2026-01-01T00:00:00Z",
           "checkouts": [{"dir": "api", "github": "test/sample", "src": str(c.src), "wt": str(c.wt)}]}
-(ws / "sample.txt").write_text("sample\\n")
-made = {"sample.txt": "old-fingerprint", "\\0head api/": "old-head", "\\0salt": "old-salt", "\\0owner": legacy}
+(ws / "sample.txt").write_text("sample\n")
+made = {"sample.txt": "old-fingerprint", "\0head api/": "old-head", "\0salt": "old-salt", "\0owner": legacy}
 file = workspace.made_record(ws)
 file.parent.mkdir()
 file.write_text(json.dumps(made))
-owner = workspace.WorkspaceOwner.from_row(workspace.made_before(ws)["\\0owner"])
+owner = workspace.WorkspaceOwner.from_row(workspace.made_before(ws)["\0owner"])
 assert owner.checkouts == [workspace.Checkout(c.dir, c.github, c.src, c.wt, "")]
 assert workspace.owner_of(ws, cfg) == owner
 made_owner = pipeline.workspace_owner(run, ws, [c])
 assert json.dumps(made_owner.to_row()) == json.dumps(legacy)
 run.alone = True
 assert pipeline.workspace_owner(run, ws, [c]) == owner
-del made["\\0owner"]
+del made["\0owner"]
 file.write_text(json.dumps(made))
 record.start("pipeline", repo="sample", issue="app-7", status="merged")
 record.start("pipeline", repo="sample-app", issue="7", status="merged")
 fallback = workspace.owner_of(ws, cfg)
 assert fallback == workspace.WorkspaceOwner("", "sample-app", "7", "", owner.checkouts)
-before = file.read_bytes()
 workspace.note_made(ws, [c], made_owner)
-row = workspaces.open_for(ws.name)
-assert row["state"] == "live" and row["checkouts"] == legacy["checkouts"]
-assert workspace.made_before(ws)["\\0owner"] == legacy
-assert file.read_bytes() == before
-"""
-        command = api_check.child_command(Path(__file__).resolve().parents[1], entry)
-        result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
-                                timeout=CHILD_HANG_TIMEOUT)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+saved = json.loads(file.read_text())
+assert saved["\0owner"] == legacy
+assert saved["sample.txt"] == workspace.fingerprint(ws / "sample.txt", saved["\0salt"])
+""")
 
 
-class _WorkspaceStoreCase(unittest.TestCase):
-    def run_child(self, entry):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
-        env = api_check.isolated_env(root)
-        (root / "config/config.toml").write_text("max_parallel = 1\n")
-        command = api_check.child_command(Path(__file__).resolve().parents[1], entry)
-        result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
-                                timeout=CHILD_HANG_TIMEOUT)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-
-class WorkspaceBackfillTests(_WorkspaceStoreCase):
+class WorkspaceBackfillTests(_WorkspaceChildCase):
     def test_imports_legacy_records_and_file_bearing_orphan_without_removal(self):
         self.run_child(r"""
 import json
@@ -188,7 +179,7 @@ assert util.git(["worktree", "list", "--porcelain"], src) == registrations
 """)
 
 
-class WorkspaceStoreTests(_WorkspaceStoreCase):
+class WorkspaceStoreTests(_WorkspaceChildCase):
     def test_workspace_versions_files_and_events_are_atomic(self):
         self.run_child("""
 import json
@@ -266,6 +257,7 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "config/verification-authority"))
         paths.CONFIG_FILE.write_text("max_parallel = 1\n")
         db.migrate()
+        self.enterContext(mock.patch.object(workspace, "HELD_FILE", state / "held-workspaces.json"))
         src = root / "repo"
         src.mkdir()
         util.git(["init", "-q", "-b", "main"], src)
@@ -290,11 +282,7 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         if owned:
             workspace.note_made(ws, [c], pipeline.workspace_owner(run, ws, [c]))
         else:
-            made = workspace.scan_snapshot(ws, [c], {}, (), ())
-            legacy = workspace.made_record(ws)
-            legacy.parent.mkdir(exist_ok=True)
-            legacy.write_text(json.dumps(made))
-            workspace_store.backfill(self.cfg)
+            workspace.note_made(ws, [c])
         return ws, c, run
 
     def registered(self, wt):
@@ -317,7 +305,7 @@ class WorkspaceSweepTests(_WorkspaceWorkflowCase):
 
         workspace.cleanup_worktrees(cfg=self.cfg)
         self.assertFalse(merged.exists())
-        self.assertIsNone(workspace_store.open_for(merged.name))
+        self.assertFalse(workspace.made_record(merged).exists())
         self.assertFalse(self.registered(merged))
         self.assertFalse(self.registered(gone))
         self.assertTrue(running.exists())
@@ -325,10 +313,8 @@ class WorkspaceSweepTests(_WorkspaceWorkflowCase):
         held, = workspace.held_summary()["rows"]
         self.assertTrue(held["blocked"])
         self.assertEqual(held["names"], ["hand.txt"])
+        self.assertEqual(json.loads(workspace.HELD_FILE.read_text()), [held])
         self.assertIn("hand.txt", held["why"])
-        blocked_row = workspace_store.open_for(blocked.name)
-        self.assertEqual(blocked_row["sweep_attempts"], 1)
-        self.assertIn("hand.txt", blocked_row["last_sweep_error"])
         self.assertIn("hand.txt", heartbeat.check_workspaces()[0].detail)
 
         hand.unlink()
@@ -350,9 +336,7 @@ class WorkspaceSweepTests(_WorkspaceWorkflowCase):
         with mock.patch.object(tracker, "for_repo", side_effect=AssertionError("sweep read an external ticket")):
             workspace.cleanup_worktrees(cfg=self.cfg)
         self.assertFalse(blocked.exists())
-        removed = workspace_store.get(blocked_row["id"])
-        self.assertEqual((removed["state"], removed["sweep_attempts"], removed["last_sweep_error"]),
-                         ("removed", 3, ""))
+        self.assertFalse(workspace.made_record(blocked).exists())
         self.assertFalse(closed.exists())
         self.assertTrue(external.exists())
         waiting, = workspace.held_summary()["rows"]
@@ -364,21 +348,15 @@ class WorkspaceSweepTests(_WorkspaceWorkflowCase):
 class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
     def test_pr_release_records_setup_files_and_removes_the_workspace(self):
         ws, c, run = self.checkout("7", "pr")
-        made = workspace_store.open_for(ws.name)
-        self.assertEqual(made["owner_run"], run.id)
+        made = workspace.made_before(ws)
+        self.assertEqual(made[workspace.OWNER_KEY]["run"], run.id)
+        self.assertIn(".venv/", made)
         (c.wt / ".venv/pyvenv.cfg").write_text("changed during the run\n")
         self.assertTrue(pipeline.release_workspace(run, ws, [c]))
         self.assertFalse(ws.exists())
         self.assertFalse(workspace.made_record(ws).exists())
         self.assertFalse(self.registered(ws))
         self.assertFalse((run.dir / "run.log").exists())
-        removed = workspace_store.get(made["id"])
-        self.assertEqual(removed["state"], "removed")
-        self.assertTrue(removed["released_at"] and removed["removed_at"])
-        self.assertEqual(removed["version"], made["version"] + 2)
-        self.assertRegex(workspace_store.files(removed["id"])[".venv/"], r"^[0-9a-f]{64}$")
-        workspace.note_made(ws, [c], pipeline.workspace_owner(run, ws, [c]), settled="pr")
-        self.assertIsNone(workspace_store.open_for(ws.name))
 
     def test_removal_reports_files_that_arrive_under_lock_and_after_git(self):
         ws, c, _ = self.checkout("7", "done", part="api")
@@ -409,17 +387,16 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
             release = workspace.remove_workspace(ws, [c])
         self.assertEqual(release, workspace.Release("held", ["hand.txt"]))
         self.assertEqual(outside.read_text(), "arrived after git\n")
-        row = workspace_store.open_for(ws.name)
-        self.assertEqual((row["state"], row["held_by"]), ("held", ["hand.txt"]))
+        self.assertTrue(workspace.made_record(ws).is_file())
         self.assertFalse(self.registered(c.wt))
         outside.unlink()
         self.assertEqual(workspace.remove_workspace(ws, [c]), workspace.Release("removed"))
         self.assertFalse(ws.exists())
-        self.assertEqual(workspace_store.get(row["id"])["state"], "removed")
+        self.assertFalse(workspace.made_record(ws).exists())
 
-    def test_excluded_checkout_keeps_surviving_workspace_open(self):
+    def test_excluded_checkout_keeps_surviving_workspace_and_record(self):
         ws, c, _ = self.checkout("8", "done", part="api")
-        row = workspace_store.open_for(ws.name)
+        saved = workspace.made_record(ws).read_bytes()
         excluded = ws / "closed"
         excluded.mkdir()
         (excluded / "hand.txt").write_text("preserved\n")
@@ -427,67 +404,69 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
         release = workspace.remove_workspace(ws, [c], excluded={excluded})
 
         self.assertEqual(release.state, "removed")
-        remaining = workspace_store.open_for(ws.name)
-        self.assertEqual((remaining["id"], remaining["state"], remaining["held_by"]),
-                         (row["id"], "held", ["closed"]))
-        self.assertEqual(remaining["removed_at"], "")
+        self.assertEqual(workspace.made_record(ws).read_bytes(), saved)
         self.assertEqual((excluded / "hand.txt").read_text(), "preserved\n")
         self.assertFalse(self.registered(c.wt))
 
 
-class WorkspaceScratchTests(_WorkspaceStoreCase):
-    def test_nested_scratch_refresh_updates_the_saved_fingerprint(self):
+class WorkspaceBlockerTests(_WorkspaceWorkflowCase):
+    def test_removal_names_files_outside_and_inside_checkouts(self):
+        ws, c, _ = self.checkout("9", "done", part="api")
+        second = workspace.Checkout("web", c.github, c.src, ws / "web", "main")
+        workspace.add_worktree(second, "arete/9-web", "main")
+        (ws / "hand.txt").write_text("outside\n")
+        (c.wt / ".venv/another.cfg").write_text("ignored\n")
+        (second.wt / "local.txt").write_text("untracked\n")
+
+        release = workspace.remove_workspace(ws, [c, second])
+
+        self.assertEqual(release.state, "held")
+        self.assertEqual(set(release.held_by), {"hand.txt", "api/.venv/", "web/local.txt"})
+        self.assertTrue(self.registered(c.wt))
+        self.assertTrue(self.registered(second.wt))
+
+
+class WorkspaceScratchTests(_WorkspaceChildCase):
+    def test_scratch_recovery_refreshes_the_json_fingerprint(self):
         self.run_child(r"""
-from pathlib import Path
 from unittest.mock import patch
 from arete import paths, workspace
-from arete.store import db, workspaces
 
-db.migrate()
 ws = paths.WORKTREES_DIR / "sample-7"
-checkout = workspace.Checkout("api", "test/sample", Path.cwd() / "repo", ws / "api", "")
-root = checkout.wt / (paths.SCRATCH_PREFIX + "fixture")
+root = ws / (paths.SCRATCH_PREFIX + "fixture")
 root.mkdir(parents=True)
-output = checkout.wt / "output.txt"
+output = ws / "output.txt"
 output.write_text("before recovery")
-selector = Path.cwd() / "registry" / "selector.json"
-owner = workspace.WorkspaceOwner("r1", "sample", "7", "", [checkout])
-with patch.object(workspace, "scratch_left", return_value=[ws, root, selector]):
-    workspace.note_made(ws, [checkout], owner)
-    saved = workspaces.open_for(ws.name)
-    assert saved["retained"] == {"roots": [root.name], "names": ["api/output.txt"]}, saved
-    assert workspace.remove_workspace(ws, [checkout]).state == "held"
-held = workspaces.open_for(ws.name)
-assert held["held_by"] == [".", f"api/{root.name}", selector.name], held
-before = workspaces.files(held["id"])["api/output.txt"]
-(ws / "hand.txt").write_text("arrived during removal")
-workspace.note_made(ws, [checkout], owner, settled="done")
-assert "hand.txt" not in workspaces.files(held["id"])
+with patch.object(workspace, "scratch_left", return_value=[root]):
+    workspace.note_made(ws, [])
+    saved = workspace.made_before(ws)
+    assert saved[workspace.RETAINED_KEY] == {"roots": [root.name], "names": ["output.txt"]}
+    assert workspace.remove_workspace(ws, []) == workspace.Release("held", [str(root)])
 output.write_text("after recovery")
 with patch.object(workspace.scratch, "recover_pending", return_value=[str(root)]):
     workspace.finalize_scratch()
-refreshed = workspaces.open_for(ws.name)
-assert refreshed["version"] == held["version"] + 1, refreshed
-assert refreshed["state"] == "held" and refreshed["retained"] == {}
-assert workspaces.files(held["id"])["api/output.txt"] == workspace.fingerprint(output, held["salt"]) != before
-assert not workspace.made_record(ws).exists()
+refreshed = workspace.made_before(ws)
+assert workspace.RETAINED_KEY not in refreshed
+assert refreshed["output.txt"] == workspace.fingerprint(output, saved[workspace.SALT_KEY])
+assert refreshed["output.txt"] != saved["output.txt"]
 """)
 
 
-class WorkspaceServeTests(_WorkspaceStoreCase):
-    def test_serve_backfills_before_sweeping_and_records_the_attempt(self):
+class WorkspaceServeTests(_WorkspaceChildCase):
+    def test_serve_sweeps_legacy_records(self):
         self.run_child(r"""
 import json
 from pathlib import Path
 from unittest.mock import Mock, patch
-from arete import config, paths, record, serve, workspace
-from arete.store import db, workspaces
+from arete import config, paths, record, serve, util, workspace
+from arete.store import db
 
 db.migrate()
 repo = config.Repo("sample", Path.cwd() / "repo", tracker="local")
 cfg = config.Config(repos=[repo])
 ws = paths.WORKTREES_DIR / "sample-7"
 ws.mkdir()
+workspace.HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
 (ws / "hand.txt").write_text("preserved")
 run = record.start("pipeline", repo=repo.name, issue="7", status="merged")
 c = workspace.Checkout("", "", repo.path, ws, "")
@@ -499,33 +478,300 @@ stages = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dis
           "rotate_when_due", "prune_when_due", "expire_asks", "release_closed_when_due", "remind")
 with (patch.object(config, "load_or_problem", return_value=(cfg, "")),
       patch.object(serve, "code_stamp", return_value=frozenset()),
-      patch.object(serve.devices, "sweep") as vms,
-      patch.object(workspaces, "backfill", wraps=workspaces.backfill) as backfill):
+      patch.object(serve.devices, "sweep") as vms):
     server = serve.Server()
     server.swept = float("-inf")
     try:
         with patch.multiple(server, load=Mock(return_value=True), **{name: Mock() for name in stages}):
-            assert workspaces.open_for(ws.name) is None
             assert server.tick()
             server.sweep.result(timeout=3)
-            row = workspaces.open_for(ws.name)
-            assert row["owner_run"] == run and row["state"] == "held", row
-            assert row["held_by"] == ["hand.txt"] and row["sweep_attempts"] == 1, row
-            assert row["version"] == 2 and row["last_sweep_at"], row
-            assert "hand.txt" in row["last_sweep_error"]
-            with db.reader() as connection:
-                event = connection.execute("SELECT data FROM events_log WHERE subject = ? AND ver = ?",
-                                           (f"workspace:{row['id']}", row["version"])).fetchone()
-            change = json.loads(event["data"])
-            assert change["old"]["state"] == "released" and change["new"]["state"] == "held", change
-            assert server.tick()
-            assert workspaces.get(row["id"]) == row
-        backfill.assert_called_once_with(cfg)
+            row, = util.read_json(workspace.HELD_FILE, [])
+            assert row["run"] == run and row["blocked"], row
+            assert row["names"] == ["hand.txt"] and "hand.txt" in row["why"], row
         vms.assert_called_once()
     finally:
         server.pool.shutdown()
 assert (ws / "hand.txt").read_text() == "preserved" and legacy.is_file()
 """)
+
+
+class ConfigRegistryTests(unittest.TestCase):
+    class_timeout = CHILD_HANG_TIMEOUT
+    golden = Path(__file__).parent / "golden" / "config_errors.json"
+    config_errors = {
+        "dashboard flag": "[dashboard]\nhttps = 1",
+        "server URL": "[server]\nurl = false",
+        "factory folder": "[factory]\nadws = false",
+        "tier keys": '[tiers.default.fast]\nz = 1\na = 2',
+        "tier route": '[tiers.default.fast]\nrunner = "bad"\nmodel = "sonnet"',
+        "step names": "[steps.z]\n[steps.a]",
+        "step keys": "[steps.build]\nz = 1\na = 2",
+        "step count": "[steps.build]\ntries = true",
+        "step amount": "[steps.build]\nbudget_usd = nan",
+        "step amount bool": "[steps.build]\nbudget_usd = true",
+        "step flag": "[steps.build]\nstructured_output = 1",
+        "step cleanup flag": "[steps.build]\ndirectory_cleanup = 1",
+        "step alias": "[steps.implement]\n[steps.build]",
+        "kind names": "[kinds.z]\n[kinds.a]",
+        "kind keys": "[kinds.feat]\nz = 1",
+        "kind step names": "[kinds.feat.steps.bad]",
+        "pricing number": "[pricing.models.sonnet]\ninput = false",
+        "routing keys": "[routing]\nz = 1",
+        "routing flag": "[routing]\nfallback = 0",
+        "routing modes": "[routing]\npayment_modes = []",
+        "capability keys": "[routing.capabilities.sonnet]\nz = 1",
+        "capability context": "[routing.capabilities.sonnet]\ncontext = true",
+        "capability flag": "[routing.capabilities.sonnet]\nstructured_output = 0",
+        "paid keys": "[routing.paid]\nz = 1",
+        "paid number": "[routing.paid]\nmax_input = inf",
+        "jira state": '[jira.transitions]\nmerged = "Done"\ndone = "Done"',
+        "jira number": '[jira]\nauto_per_refresh = "bad"',
+        "jev question": '[jev.screen_lines]\nz = 1',
+        "jev weight": '[jev.risk_weights]\nz = 1',
+        "jev number": '[jev]\nconfidence = "bad"',
+        "github app table": 'github_app = true',
+        "github app ID": '[github_app]\ninstallation_id = "bad"',
+        "repo tracker": '[[repo]]\nname = "extra"\ntracker = "bad"',
+        "job label": "[[job]]\nkeepalive = 1",
+        "probe number": '[[probe]]\nname = "bad"\ncommand = ["test"]\ntimeout = "bad"',
+        "oncall keys": "[oncall]\nz = 1",
+        "oncall flag": "[oncall]\nenabled = 1",
+        "oncall whole": "[oncall]\nmax_attempts = true",
+        "oncall amount": "[oncall]\nincident_budget_usd = 0",
+        "oncall inclusive amount": "[oncall]\nkeep_days = nan",
+        "oncall source keys": "[[oncall.source]]\nz = 1",
+        "oncall source path": "[[oncall.source]]\npath = true",
+        "replay keys": "[replay]\nz = 1",
+        "mcp keys": "[mcp.example]\nz = 1",
+        "mcp command": "[mcp.example]\ncommand = false",
+        "research keys": "[research]\nz = 1",
+        "research planner": "[research]\nplanner = 1",
+        "research search": "[research]\nsearch = 1",
+        "research synthesis": "[research]\nsynthesis = 1",
+        "research audit": "[research]\naudit = 1",
+        "research workers": "[research]\nsearch_workers = 9",
+        "research share": "[research]\nsearch_share = 1",
+        "ask keys": "[ask]\nz = 1",
+        "ask count": "[ask]\nmax_per_run = -1",
+        "ask flag": "[ask]\nsettle = 1",
+        "ask expiration": "[ask]\nexpire_days = inf",
+        "ask reminder": "[ask]\nremind_hours = true",
+        "triage keys": "[triage]\nz = 1",
+        "triage auto": "[triage]\nauto = 1",
+        "triage route fixes": "[triage]\nroute_fixes = 1",
+        "triage count": "[triage]\nauto_per_refresh = true",
+        "retention keys": "[retention]\nz = 1",
+        "retention number": "[retention]\ndays = nan",
+        "backup keys": "[backup]\nz = 1",
+        "backup destination": "[backup]\ncopy_to = false",
+        "chat keys": "[chat]\nz = 1",
+        "chat count": "[chat]\ncontext_tokens = true",
+        "chat number": "[chat]\nbudget_usd = inf",
+        "environment keys": "[environment]\nz = 1",
+        "environment names": "[environment]\npass = false",
+        "document keys": "[document]\nz = 1",
+        "document flag": "[document]\nenabled = 1",
+        "capture keys": "[capture]\nz = 1",
+        "capture flag": "[capture]\npublic_evidence = 1",
+        "capture order": "[capture]\nevidence_branch = false\npublic_evidence = 1\nvision = 1",
+        "ab keys": "[ab.test]\nz = 1",
+        "ab step": "[ab.test]\nstep = []",
+        "ab kind": '[ab.test]\nstep = "build"\nkind = "bad"',
+        "ab share": '[ab.test]\nstep = "build"\nshare = true',
+        "ab arm keys": '[ab.test]\nstep = "build"\nshare = 0.25\n[ab.test.arm]\nz = 1',
+        "section order": "[capture]\npublic_evidence = 1\n[ask]\nsettle = 1\n[routing]\nfallback = 1",
+        "step order": "[steps.build]\ndirectory_cleanup = 1\nbudget_usd = 0\ntries = 0",
+        "research order": "[research]\nsearch = true\nsynthesis = 1\naudit = 1",
+    }
+    layer_errors = {
+        "check policy keys": "[check_policy]\nz = 1",
+        "limits flag": "[limits]\nparallel_checks = 1",
+        "limits number": "[limits]\nmax_run_minutes = false",
+        "verify publish flag": "[verify]\npublish_evidence = 1",
+        "verify patch flag": "[verify]\nallow_patch_gaps = 1",
+        "verify number": "[verify]\npreflight_seconds = true",
+        "verify order": "[verify]\nallow_patch_gaps = 1\npreflight_seconds = true\npublish_evidence = 1",
+        "orchestration keys": "[orchestration]\nz = 1",
+        "orchestration number": "[orchestration]\nmax_actions = true",
+        "patch policy keys": "[factory.patch]\nz = 1",
+        "patch policy number": "[factory.patch]\nmax_lines = true",
+        "layer environment keys": "[environment]\nz = 1",
+    }
+    settings_config = """
+[research]
+planner = true
+search = true
+synthesis = true
+audit = true
+search_workers = 4
+search_share = 0.5
+[capture]
+vision = "capture.md"
+evidence_branch = "capture/test"
+public_evidence = true
+[routing]
+payment_modes = ["api_key", "subscription"]
+[routing.capabilities.sonnet]
+modalities = ["text", "image"]
+context = 8000
+[routing.floors]
+quality = ["opus"]
+global = ["haiku"]
+[routing.paid]
+providers = ["anthropic", "openai"]
+max_input = 8
+[steps.build]
+floor = "quality"
+budget_usd = 3.5
+[steps.verify]
+floor = "global"
+[kinds.fix.steps.review]
+tries = 2
+[oncall]
+keep_days = inf
+daily_budget_usd = inf
+"""
+    settings_layer = """
+[routing]
+fallback = false
+payment_modes = ["local", "subscription", "api_key"]
+[routing.capabilities.sonnet]
+context = 16000
+structured_output = true
+[routing.capabilities.opus]
+context = 40000
+[routing.floors]
+quality = ["sonnet", "opus"]
+[routing.paid]
+providers = ["openai"]
+max_input = 4
+[steps.build]
+min_context = 8000
+[kinds.feat.steps.build]
+timeout_minutes = 40
+"""
+
+    @classmethod
+    def observe(cls, case):
+        with tempfile.TemporaryDirectory(prefix="arete-config-registry-") as directory:
+            root = Path(directory).resolve()
+            command = api_check.child_command(Path(__file__).resolve().parents[1],
+                                              "from tests.test_behavior import ConfigRegistryTests as T; "
+                                              "T.run_case(sys.argv[1])", case)
+            done = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
+                                  text=True, timeout=CHILD_HANG_TIMEOUT)
+            if done.returncode:
+                raise AssertionError(done.stdout + done.stderr)
+            return json.loads(done.stdout)
+
+    @classmethod
+    def run_case(cls, case):
+        from arete import loop_run, sources
+        from arete.commands import setup
+
+        with (api_check.offline(), mock.patch.object(pipeline, "spawn_run") as spawn,
+              mock.patch.object(loop_run, "launch") as launch, mock.patch.object(sources, "fire") as fire,
+              mock.patch.object(serve.Server, "scan_oncall") as scan):
+            with redirect_stdout(StringIO()):
+                assert setup.cmd_init(SimpleNamespace(force=False)) == 0
+            root = Path.cwd()
+            lines, _ = api_check.prepare_replay(root)
+            base = "\n".join(lines) + "\n"
+            layer_dir = root / "sample/layer"
+            if case == "errors":
+                result = cls.errors(base, layer_dir)
+            elif case == "roles":
+                result = cls.roles()
+            else:
+                paths.CONFIG_FILE.write_text(base + cls.settings_config)
+                layer_file = layer_dir / "config.toml"
+                layer_file.write_text(layer_file.read_text() + cls.settings_layer)
+                result = cls.steps_output() if case == "cli" else cls.settings(layer_dir)
+            for fake in (spawn, launch, fire, scan):
+                fake.assert_not_called()
+            print(json.dumps(result))
+
+    @classmethod
+    def errors(cls, base, layer_dir):
+        def error(name, read):
+            try:
+                read()
+            except (ValueError, TypeError, KeyError) as exc:
+                return [type(exc).__name__, str(exc)]
+            raise AssertionError(f"expected an error for {name}")
+
+        found = {}
+        for name, snippet in cls.config_errors.items():
+            # The replay sample already declares [replay].
+            paths.CONFIG_FILE.write_text(snippet if name in ("replay keys", "github app table") else base + snippet)
+            found[name] = error(name, lambda: config.load(strict=True))
+        for name, snippet in cls.layer_errors.items():
+            (layer_dir / "config.toml").write_text(snippet)
+            found[name] = error(name, lambda: config.load_layer(layer_dir, strict=True))
+        paths.CONFIG_FILE.write_text(base + "[research]\nz = 1\nplanner = true\n[steps.a]\n")
+        cfg = config.load()
+        assert cfg.ignored == ("[steps] a", "[research] z")
+        assert cfg.research.planner
+        return found
+
+    @staticmethod
+    def roles():
+        from arete import steps
+
+        for name in ("KEEPS_NO_SESSION", "READ_ONLY", "SEARCHES", "FETCHES", "NO_WEB"):
+            assert not hasattr(steps, name), name
+        return {name: list(getattr(config, name)) if isinstance(getattr(config, name), tuple)
+                else list(getattr(config, name).items())
+                for name in ("MODEL_ROLES", "MODEL_FALLBACKS", "INHERITS", "STEP_ROLES", "STEP_NAMES")}
+
+    @staticmethod
+    def steps_output():
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = cli.main(["steps", "--repo", "replay-sample"])
+        assert status == 0 and not err.getvalue(), err.getvalue()
+        return util.digest(out.getvalue())
+
+    @staticmethod
+    def settings(layer_dir):
+        from arete import routing, steps
+
+        cfg, layer = config.load(), config.load_layer(layer_dir)
+        assert config.Config().routing.payment_modes == config.PAYMENT_MODES
+        assert config.RepoLayer(dir=layer_dir).routing.payment_modes is None
+        restricted = replace(layer, routing=replace(layer.routing, payment_modes=("local", "subscription")))
+        assert config.allowed_payment_modes(cfg, restricted) == ("subscription",)
+        local_only = replace(layer, routing=replace(layer.routing, payment_modes=("local",)))
+        assert config.allowed_payment_modes(cfg, local_only) == ()
+        return {
+            "steps": {kind: {step: util.digest(json.dumps(asdict(steps.resolve(cfg, layer, step, kind)), sort_keys=True))
+                             for step in config.STEP_NAMES} for kind in ("", *config.KINDS)},
+            "research": asdict(cfg.research),
+            "capture": {"evidence_branch": cfg.capture.evidence_branch, "public_evidence": cfg.capture.public_evidence},
+            "capture_vision": Path(cfg.capture.vision).relative_to(paths.CONFIG_DIR).as_posix(),
+            "payment_modes": config.allowed_payment_modes(cfg, layer),
+            "capabilities": routing.Discovery(cfg, layer=layer).declared,
+            "paid": asdict(config.allowed_paid_routes(cfg, layer)),
+            "oncall_accepts_inf": cfg.oncall.keep_days == cfg.oncall.daily_budget_usd == float("inf"),
+        }
+
+    def assert_observation(self, case):
+        expected = json.loads(self.golden.read_text())[case]
+        self.assertEqual(self.observe(case), expected)
+
+    def test_config_errors_and_order(self):
+        self.assert_observation("errors")
+
+    def test_roles_and_order(self):
+        self.assert_observation("roles")
+
+    def test_steps_output(self):
+        self.assert_observation("cli")
+
+    def test_resolved_settings(self):
+        self.assert_observation("settings")
 
 
 class _CliThroughServeCase(unittest.TestCase):

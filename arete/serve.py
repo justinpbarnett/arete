@@ -63,7 +63,6 @@ from .store import incidents as incident_store
 from .store import loops as loop_store
 from .store import runs as run_store
 from .store import sources as source_store
-from .store import workspaces as workspace_store
 
 TICK_SECONDS = 20
 DEPLOY_SECONDS = 120
@@ -358,7 +357,6 @@ class Server:
         self.migration_stamp = None
         self.migration_error = ""
         self.contracts_waiting = False
-        self.workspaces_backfilled = False
         self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
 
@@ -433,10 +431,6 @@ class Server:
         foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return False
-        if not self.workspaces_backfilled:
-            if self.guard("stage:workspace-backfill", workspace_store.backfill, self.cfg) is None:
-                return False
-            self.workspaces_backfilled = True
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
