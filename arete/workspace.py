@@ -20,6 +20,7 @@ OWNER_KEY = "\0owner"
 RETAINED_KEY = "\0retained"
 ENDED = ("merged", "rejected", "done")
 WAITING = ("running", "pr", "needs-info")
+termination_pending = False
 
 
 @dataclass
@@ -253,6 +254,8 @@ def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[P
 
 def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
                      excluded: Collection[Path] = ()) -> Release:
+    if termination_pending:
+        return Release("held", ["SIGTERM unwinding"])
     with workspaces.folder_lock(ws):
         options = {}
         try:
@@ -560,7 +563,10 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
 
 
 def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None = None,
-              *, preserve: Collection[str] = (), excluded: Collection[Path] = ()) -> None:
+              *, preserve: Collection[str] = (), excluded: Collection[Path] = (),
+              during_termination: bool = False) -> None:
+    if termination_pending and not during_termination:
+        return
     with workspaces.folder_lock(ws):
         if row := workspaces.open_for(ws.name):
             _note_made(ws, checkouts, row, owner, preserve, excluded)
