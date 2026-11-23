@@ -4619,7 +4619,7 @@ class CredentialWriteTests(_CredentialCase):
             for bearer, count, status in ((self.owner_text, 49, 200), (other, 2, 429)):
                 body = {"requests": [{"operation": "meta.get"}] * count}
                 self.request(server, "POST", "/api/v1/batch", bearer=bearer, body=body, status=status)
-            self.request(server, "GET", self.TASKS, status=429, code="rate_limited")
+            self.request(server, "GET", self.TASKS, bearer=other, status=429, code="rate_limited")
         self.assertEqual(len(self.task_actors()), 1)
 
     @credential_test
@@ -4881,15 +4881,15 @@ class ApiCredentialCutoverTests(unittest.TestCase):
 
 class CredentialAdmissionTests(_CredentialCase):
     @credential_test
-    def test_whois_read_only_tls_and_issue_replay(self, _):
+    def test_whois_requires_credentials_tls_and_issue_replay(self, _):
         only_header = {"X-Arete": "1"}
         with self.listen() as server, self.cli_environment(server):
-            self.request(server, "GET", self.TASKS, headers=only_header)
+            self.request(server, "GET", self.TASKS, headers=only_header, status=401, code="unauthenticated")
             for path in (self.TASKS, "/api/tasks"):
                 self.task(server, path=path, headers=only_header, status=401, code="unauthenticated")
-            for bearer in (None, self.owner_text):
-                result, _ = self.request(server, "POST", self.TOKENS, bearer=bearer, status=403, code="forbidden")
-                self.assertEqual(result["reason"], "presence_required")
+            self.request(server, "POST", self.TOKENS, status=202, code="awaiting_presence")
+            result, _ = self.request(server, "POST", self.TOKENS, bearer=self.owner_text, status=403, code="forbidden")
+            self.assertEqual(result["reason"], "presence_required")
             printed, link = self.cli(["pair"]).splitlines()
             pairing = link.rsplit("#", 1)[1]
             self.assertEqual(printed, f"Pairing code {pairing}")
@@ -4916,7 +4916,7 @@ class CredentialAdmissionTests(_CredentialCase):
         with self.listen(secure=False) as server:
             for path in (self.TOKENS, self.PAIRINGS + "/claim"):
                 self.request(server, "POST", path, status=426, code="tls_required")
-            self.request(server, "GET", self.TASKS)
+            self.request(server, "GET", self.TASKS, bearer=self.owner_text)
             self.task(server, bearer=self.owner_text)
 
 

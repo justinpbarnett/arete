@@ -678,8 +678,10 @@ class Handler(BaseHTTPRequestHandler):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        credential_http.authenticate(self, method, path, browser_asset=path in WEB_BY_PATH,
-                                     mcp=path == mcp_protocol.PATH, scratch=self.verify_controls is not None)
+        credential_http.authenticate(
+            self, method, path, browser_asset=path in WEB_BY_PATH,
+            mcp=path == mcp_protocol.PATH, scratch=self.verify_controls is not None,
+        )
 
     def api(self, method: str, path: str, query: dict):
         if self.operation:
