@@ -264,8 +264,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         stderr = "".join(line for line in stderr.splitlines(keepends=True) if not line.startswith(UNRECOGNIZED_MODEL))
     if not (data := result_event(out)):
         error = util.tail(stderr or out or f"exit {proc.returncode}", 1500)
-        result = Result(ok=False, session=resume, error=error,
-                        usage_limit=usage_limit({}, stderr + out, model))
+        limit = usage_or_overload_limit({}, f"{stderr}\n{out}", model)
+        if limit is None:
+            limit = unreachable_limit([stderr, *output_diagnostics(out)], model)
+        result = Result(ok=False, session=resume, error=error, usage_limit=limit)
         seen = {}
         for line in out.splitlines():
             if turn := streamed_turn(line, seen):
@@ -291,7 +293,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=int(data.get("num_turns") or 0),
         error=(failure_reason(data) if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
-        usage_limit=usage_limit(data, failure_reason(data) + stderr, model) if is_error or proc.returncode else None,
+        usage_limit=usage_limit(data, f"{failure_reason(data)}\n{stderr}", model) if is_error or proc.returncode else None,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
         api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),
@@ -310,6 +312,16 @@ def result_event(out: str) -> dict:
         if isinstance(event, dict) and event.get("type") == "result":
             return event
     return {}
+
+
+def output_diagnostics(out: str) -> list:
+    diagnostics = []
+    for line in out.splitlines():
+        try:
+            diagnostics.append(json.loads(line))
+        except json.JSONDecodeError:
+            diagnostics.append(line)
+    return diagnostics
 
 
 def first_context_tokens(stream: str) -> int:
@@ -341,11 +353,15 @@ def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
 
 
 def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLimit | None:
+    return usage_or_overload_limit(data, text, model) or unreachable_limit([text, data], model)
+
+
+def usage_or_overload_limit(data: dict | list | str, text: str, model: str) -> UsageLimit | None:
     text = text + "\n" + json.dumps(data, default=str)
     model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b|"
                                 r"(?:^|\n)You've reached your Fable limit\. Switch to another model", text, re.IGNORECASE))
     if not model_only and "usage_limit_reached" not in text and not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model) or unreachable_limit(text, model)
+        return overload_limit(text, model)
     legacy = LEGACY_LIMIT_RESET.search(text)
     resets = provider_reset(data) or provider_reset(text)
     if resets is None and legacy:

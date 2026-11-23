@@ -148,6 +148,86 @@ class UnreachableReaderTests(unittest.TestCase):
         auth = accounts.Auth(mode="api_key", provider="openai")
         self.assertIsNone(pi.usage_limit(auth, "openai", event, self.model))
 
+    def test_codex_http_error_in_event_or_stderr_is_not_a_limit(self):
+        for provider in (codex.CHATGPT_PROVIDER, codex.KEY_PROVIDER):
+            for prefix in ("Request failed\n", "Error: "):
+                message = f"{prefix}500 Internal Server Error: fetch failed"
+                event = {"type": "turn.failed", "error": {"message": message}}
+                for stdout, stderr in ((json.dumps(event), ""), ("", message)):
+                    with self.subTest(provider=provider, prefix=prefix, stream="stdout" if stdout else "stderr"):
+                        proc = subprocess.CompletedProcess([], 1, stdout, stderr)
+                        result = codex.parse(proc, agent.NO_SESSION, self.model, None, provider)
+                        self.assertFalse(result.ok)
+                        self.assertIsNone(result.usage_limit)
+
+    def test_pi_http_error_in_reply_or_early_failure_is_not_a_limit(self):
+        multiline = "Request failed\n500 Internal Server Error"
+        prefixed = "Error: 500 Internal Server Error: fetch failed"
+        cases = (
+            ({"type": "error", "message": "fetch failed"}, multiline),
+            ({"type": "error", "message": prefixed}, ""),
+            ({"type": "agent_end", "messages": [
+                {"role": "assistant", "stopReason": "error", "errorMessage": f"{multiline}: fetch failed"},
+            ]}, ""),
+            ({"type": "agent_end", "messages": [
+                {"role": "assistant", "stopReason": "error", "errorMessage": prefixed},
+            ]}, ""),
+        )
+        for mode, family in (("subscription", "codex"), ("subscription", "claude"), ("api_key", "codex")):
+            auth = accounts.Auth(mode=mode, family=family, provider="openai")
+            for event, stderr in cases:
+                with self.subTest(mode=mode, family=family, event=event, stderr=stderr):
+                    proc = subprocess.CompletedProcess([], 1, json.dumps(event), stderr)
+                    result = pi.parse(proc, agent.NO_SESSION, self.model, None, auth)
+                    self.assertFalse(result.ok)
+                    self.assertIsNone(result.usage_limit)
+
+    def test_pi_claude_subscription_overload_event_wins_over_weekly_limit_reply(self):
+        model = "anthropic/claude-opus-4-7"
+        auth = accounts.Auth(mode="subscription", family="claude", provider="anthropic")
+        error = {"type": "error", "message": "API Error: 529 Overloaded"}
+        reply = {"role": "assistant", "stopReason": "error", "errorMessage": "Weekly limit"}
+        end = {"type": "agent_end", "messages": [reply]}
+        proc = subprocess.CompletedProcess([], 1, "\n".join(map(json.dumps, (error, end))), "")
+        result = pi.parse(proc, agent.NO_SESSION, model, None, auth)
+        self.assertFalse(result.ok)
+        limit = result.usage_limit
+        self.assertIsNotNone(limit)
+        self.assertEqual((limit.kind, limit.scope), ("overloaded", agent.model_scope(model)))
+        self.assertAlmostEqual(minutes_ahead(limit), 10, delta=0.5)
+
+    def test_claude_error_prefix_in_final_result_does_not_hide_http_status(self):
+        result = claude.parse(claude_failure("Error: 500 Internal Server Error: fetch failed"),
+                              agent.NO_SESSION, self.model, None)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.usage_limit)
+
+    def test_claude_http_status_at_start_of_stderr_is_not_a_limit(self):
+        proc = claude_failure("fetch failed")
+        proc.stderr = "500 Internal Server Error"
+        result = claude.parse(proc, agent.NO_SESSION, self.model, None)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.usage_limit)
+
+    def test_claude_early_exit_checks_decoded_diagnostics_and_stream_boundaries(self):
+        def assistant_event(message):
+            return json.dumps({"type": "assistant", "error": "unknown",
+                               "message": {"content": [{"type": "text", "text": message}]}})
+
+        prelude = json.dumps({"type": "system", "subtype": "init"})
+        for stdout, stderr in (
+            (f"{prelude}\n{assistant_event('Request failed\n500 Internal Server Error: fetch failed')}", ""),
+            ("500 Internal Server Error", "fetch failed."),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                proc = subprocess.CompletedProcess([], 1, stdout, stderr)
+                result = claude.parse(proc, agent.NO_SESSION, self.model, None)
+                self.assertFalse(result.ok)
+                self.assertIsNone(result.usage_limit)
+
+        proc = subprocess.CompletedProcess([], 1, assistant_event(self.timeout_error), "")
+        self.assert_unreachable(claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit)
+
 
 class OverloadHoldTests(unittest.TestCase):
     def test_hold_covers_only_the_overloaded_model_on_a_login(self):

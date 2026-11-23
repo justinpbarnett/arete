@@ -114,7 +114,7 @@ UNREACHABLE_TEXT = re.compile(
 )
 PROVIDER_ERROR_STATUS = re.compile(
     r"""(?:\b(?:api[ _-]error(?:[ _-]status)?|(?:http[ _-]?)?status(?:[ _-]?code)?|code|http(?:/\d(?:\.\d)?)?)"""
-    r"""[\s\\'":=()]+|(?:^|\n|["'])\s*)[45]\d{2}(?=$|[\s\\'":),}\].])""", re.IGNORECASE,
+    r"""[\s\\'":=()]+|(?:^|\n|["'])\s*(?:error:\s*)?)[45]\d{2}(?=$|[\s\\'":),}\].])""", re.IGNORECASE,
 )
 
 
@@ -129,7 +129,19 @@ def unreachable_limit(text, model: str) -> UsageLimit | None:
     raw = text if isinstance(text, str) else json.dumps(text, default=str)
     if not UNREACHABLE_TEXT.search(raw) or PROVIDER_ERROR_STATUS.search(raw):
         return None
+    if not isinstance(text, str) and has_provider_error_status(text):
+        return None
     return model_hold(model, "unreachable")
+
+
+def has_provider_error_status(data) -> bool:
+    if isinstance(data, str):
+        return bool(PROVIDER_ERROR_STATUS.search(data))
+    if isinstance(data, dict):
+        return any(has_provider_error_status(value) for value in data.values())
+    if isinstance(data, (list, tuple)):
+        return any(has_provider_error_status(value) for value in data)
+    return False
 
 
 def model_hold(model: str, kind: str) -> UsageLimit:
