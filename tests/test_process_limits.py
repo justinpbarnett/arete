@@ -34,6 +34,7 @@ from arete import (
     gh,
     jira,
     launch_lease,
+    loops,
     orchestration,
     outcomes,
     paths,
@@ -236,6 +237,20 @@ pipeline = true
         self.write_config(alias_first=True)
         with self.assertRaisesRegex(ValueError, "zte_repo 'arete-zte'.*arete_repo 'arete'"):
             config.load()
+
+    def test_shared_checkout_resolves_to_the_arete_repo(self):
+        self.write_config()
+        cfg = config.load()
+        checkout = self.repo.path
+        ordinary = cfg.repo("arete")
+
+        self.assertIs(cfg.repo_for_path(checkout), ordinary)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(checkout)
+        for kind, repo in (("watch", "arete"), ("search", "arete"), ("watch", "")):
+            with self.subTest(kind=kind, repo=repo):
+                loop = loops.Loop(name="fixture", dir=self.root, origin="local", kind=kind, repo=repo)
+                self.assertIs(loop.work_repo(cfg), ordinary)
 
     def test_selector_edit_preserves_ordinary_worker_and_workflow_policies(self):
         self.write_config(zte_repo=None)
