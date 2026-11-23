@@ -84,6 +84,7 @@ class UnreachableReaderTests(unittest.TestCase):
                 self.failure({"type": "turn.failed", "error": {"message": text}}),
                 agent.NO_SESSION, self.model, None, provider).usage_limit, usage)
         yield "claude", self.claude_limit, CODEX_LIMIT
+        yield "claude api_key", lambda text: self.claude_api_key_result(claude_failure(text)).usage_limit, "Insufficient quota"
         for mode, family in (("subscription", "codex"), ("subscription", "claude"), ("api_key", "codex")):
             auth = accounts.Auth(mode=mode, family=family, provider="openai")
             yield (f"pi {mode} {family}", lambda text, auth=auth: self.pi_error_limit(text, self.model, auth),
@@ -163,17 +164,16 @@ class UnreachableReaderTests(unittest.TestCase):
     def test_http_response_messages_with_connection_codes_do_not_hold_the_model(self):
         for name, read, _ in self.readers():
             for text in ("HTTP error 500: upstream connect ECONNREFUSED",
-                         "API Error: 500 Internal Server Error: upstream connect ECONNREFUSED",
-                         'OpenAI API error (500): {"message":"Upstream connect ECONNREFUSED"}'):
+                         'OpenAI API error (500): {"message":"Upstream connect ECONNREFUSED"}',
+                         "unexpected status 500 Internal Server Error: upstream connect ECONNREFUSED",
+                         '500: {"message":"upstream connect ECONNREFUSED"}',
+                         '{"error":{"code":500,"message":"connect ECONNREFUSED"}}',
+                         "Upstream request failed (HTTP 502): connect ECONNREFUSED",
+                         "connect ECONNREFUSED after status:400",
+                         "connect ECONNREFUSED (599)",
+                         "connect ECONNREFUSED api.openai.com:443 (timeout: 500 ms)"):
                 with self.subTest(reader=name, text=text):
                     self.assertIsNone(read(text))
-
-    def test_codex_unexpected_status_with_connection_code_does_not_hold_the_model(self):
-        text = "unexpected status 500 Internal Server Error: upstream connect ECONNREFUSED"
-        proc = self.failure({"type": "turn.failed", "error": {"message": text}})
-        for provider in (codex.CHATGPT_PROVIDER, codex.KEY_PROVIDER):
-            with self.subTest(provider=provider):
-                self.assertIsNone(codex.parse(proc, agent.NO_SESSION, self.model, None, provider).usage_limit)
 
     def test_pi_adapter_http_responses_with_connection_codes_do_not_hold_the_model(self):
         body = '{"message":"upstream connect ECONNREFUSED"}'
@@ -196,7 +196,7 @@ class UnreachableReaderTests(unittest.TestCase):
                 model = f"{provider}/model-a"
                 auth = accounts.Auth(mode="api_key", provider=provider)
                 self.assertIsNone(self.pi_error_limit("500 upstream connect ECONNREFUSED", model, auth, api=api))
-                transport = "500 ms elapsed: connect ECONNREFUSED upstream.example:500"
+                transport = "500ms elapsed: connect ECONNREFUSED upstream.example:500"
                 for text in (transport, f"Connection error.: {transport}"):
                     self.assert_unreachable(self.pi_error_limit(text, model, auth, api=api), model)
 
@@ -245,10 +245,45 @@ class UnreachableReaderTests(unittest.TestCase):
             with self.subTest(stdout=proc.stdout, stderr=proc.stderr):
                 self.assert_unreachable(claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit)
 
-    def test_ports_and_timeout_durations_do_not_prevent_a_connection_hold(self):
+    def test_ports_and_numbers_inside_words_do_not_prevent_a_connection_hold(self):
         for name, read, _ in self.readers():
             with self.subTest(reader=name):
-                self.assert_unreachable(read("connect ECONNREFUSED api.openai.com:500 (timeout: 500 ms)"))
+                self.assert_unreachable(read("connect ECONNREFUSED api.openai.com:500 (timeout: 500ms) attempt 1500"))
+
+    def test_status_veto_considers_all_provider_failures(self):
+        codex_failure = {"type": "turn.failed", "error": {"message": self.timeout_error}}
+        pi_reply = {"role": "assistant", "stopReason": "error", "errorMessage": self.timeout_error}
+        pi_failure = {"type": "agent_end", "messages": [pi_reply]}
+        claude_proc = claude_failure(self.timeout_error)
+        claude_proc.stderr = "Earlier request returned 500"
+        cases = (
+            (claude.parse, claude_proc, ()),
+            (codex.parse, self.failure({"type": "error", "message": "Retrying", "status": 500}, codex_failure),
+             (codex.CHATGPT_PROVIDER,)),
+            (pi.parse, self.failure({"type": "error", "error": {"message": "Retrying", "code": 500}}, pi_failure), ()),
+            (pi.parse, self.failure(dict(pi_failure, messages=[dict(pi_reply, errorMessage="Retrying after 500"),
+                                                               pi_reply])), ()),
+        )
+        for read, proc, args in cases:
+            with self.subTest(reader=read.__module__, stdout=proc.stdout):
+                self.assertIsNone(read(proc, agent.NO_SESSION, self.model, None, *args).usage_limit)
+
+    def test_status_in_tool_and_assistant_output_does_not_veto_connection_hold(self):
+        claude_output = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "HTTP 500"},
+        ]}}
+        codex_output = {"type": "item.completed", "item": {"type": "agent_message", "text": "HTTP 500"}}
+        pi_output = {"role": "toolResult", "content": [{"type": "text", "text": "HTTP 500"}]}
+        pi_reply = {"role": "assistant", "stopReason": "error", "errorMessage": self.timeout_error,
+                    "content": [{"type": "text", "text": "HTTP 500"}]}
+        cases = (
+            (claude.parse, self.failure(claude_output, stderr=self.timeout_error), ()),
+            (codex.parse, self.failure(codex_output, stderr=self.timeout_error), (codex.CHATGPT_PROVIDER,)),
+            (pi.parse, self.failure({"type": "agent_end", "messages": [pi_output, pi_reply]}), ()),
+        )
+        for read, proc, args in cases:
+            with self.subTest(reader=read.__module__):
+                self.assert_unreachable(read(proc, agent.NO_SESSION, self.model, None, *args).usage_limit)
 
     def test_pi_claude_subscription_preserves_native_overload_precedence(self):
         model = "anthropic/claude-opus-4-7"

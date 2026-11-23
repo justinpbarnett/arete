@@ -42,6 +42,7 @@ from .agent import (
     credit_limit,
     json_from_text,
     overload_limit,
+    provider_failure_fields,
     provider_reset,
     unreachable_limit,
     usage_totals,
@@ -68,11 +69,6 @@ ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
                           "put an Anthropic Console key in pi.env or use claude:<model>")
 REMOTE_AUTH_UNVERIFIED = ("pi cannot validate or isolate credentials on a remote device; "
                           "run pi locally or use the claude runner")
-STATUS_FIRST_APIS = ("anthropic-messages", "openai-completions")
-STATUS_FIRST_ERROR = re.compile(
-    r"^[45][0-9]{2} +(?!(?:ns|us|µs|ms|s|sec(?:ond)?s?|(?:nano|micro|milli)seconds?|minutes?|mins?)\b)\S",
-    re.IGNORECASE,
-)
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
              "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
              "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
@@ -628,12 +624,10 @@ def authentication(model: str, passing=None, providers=None) -> accounts.Auth:
 
 
 def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "", *,
-                failure_text: str | list[str] | None = None) -> UsageLimit | None:
+                failure_text: str | list[str | int | None] | None = None) -> UsageLimit | None:
     data = text
     if failure_text is None:
         failure_text = text if isinstance(text, str) else ""
-    if isinstance(data, list) and any(assistant_http_error(accounts.mapping(message)) for message in data):
-        failure_text = []
     if auth.mode != "subscription":
         return credit_limit(data) or overload_limit(data, model) or unreachable_limit(failure_text, model)
     text = data if isinstance(data, str) else json.dumps(data, default=str)
@@ -1019,38 +1013,29 @@ def error_messages(data) -> list[str]:
     return [message for value in values for message in error_messages(value)]
 
 
-def assistant_http_error(message: dict) -> bool:
+def reply_failures(message: dict) -> list[str | int | None]:
     if message.get("role") != "assistant" or message.get("stopReason") != "error":
-        return False
-    text = message.get("errorMessage")
-    if message.get("api") in STATUS_FIRST_APIS and isinstance(text, str) and STATUS_FIRST_ERROR.match(text):
-        return True
+        return []
+    failures = [message.get("errorMessage")]
     diagnostics = message.get("diagnostics")
-    if not isinstance(diagnostics, list):
-        return False
-    for diagnostic in map(accounts.mapping, diagnostics):
-        if diagnostic.get("type") == "bedrock_response_failure":
-            status = accounts.mapping(diagnostic.get("details")).get("status")
-            if isinstance(status, int) and 400 <= status < 600:
-                return True
-    return False
+    if isinstance(diagnostics, list):
+        failures.extend(accounts.mapping(diagnostic.get("details")).get("status")
+                        for diagnostic in map(accounts.mapping, diagnostics)
+                        if diagnostic.get("type") == "bedrock_response_failure")
+    return failures
 
 
-def stream_failures(stream: list[dict]) -> list[str]:
+def stream_failures(stream: list[dict]) -> list[str | int | None]:
     failures = []
     for event in stream:
         kind = event.get("type")
         if kind in ("error", "api_error", "turn.failed"):
             error = event.get("error") or event.get("api_error")
-            details = accounts.mapping(error)
-            fields = [event.get("message"), event.get("errorMessage"), event.get("code"),
-                      error, details.get("message"), details.get("code")]
-            failures.extend(text for text in fields if isinstance(text, str))
+            failures.append(error)
+            failures.extend(provider_failure_fields(event))
+            failures.extend(provider_failure_fields(accounts.mapping(error)))
         elif kind == "message_end":
-            message = accounts.mapping(event.get("message"))
-            if (message.get("role") == "assistant" and message.get("stopReason") == "error"
-                    and isinstance(error := message.get("errorMessage"), str)):
-                failures.append(error)
+            failures.extend(reply_failures(accounts.mapping(event.get("message"))))
     return failures
 
 
@@ -1083,8 +1068,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     error = (last.get("errorMessage") or util.first_line(proc.stderr, 1500) or "pi stopped on an error") if failed else ""
     limit = None
     if failed:
-        if isinstance(error, str):
-            failures.append(error)
+        for reply in replies:
+            failures.extend(reply_failures(reply))
+        if last.get("stopReason") != "error":
+            failures.append(last.get("errorMessage"))
         limit = usage_limit(auth, provider, [*diagnostics, error_metadata(last), proc.stderr], model, failure_text=failures)
     return Result(
         ok=not failed,

@@ -283,15 +283,15 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     limit = None
     if not ok:
         limit = usage_limit(data, f"{reason}\n{stderr}", model)
-        if limit is None and not re.fullmatch(r"[45][0-9]{2}", str(data.get("api_error_status"))):
-            failures = [stderr]
+        if limit is None:
+            failures = [stderr, data.get("api_error_status")]
             if is_error:
                 failures.append(data.get("api_error"))
                 if data.get("subtype", "success") in ("success", "error_during_execution"):
                     if data.get("stop_reason") != "refusal":
                         failures.append(data.get("result"))
                     failures.extend(data.get("errors") or [])
-            limit = unreachable_limit([text for text in failures if isinstance(text, str)], model)
+            limit = unreachable_limit(failures, model)
     session = resume
     if data.get("session_id"):
         spent = resume.spent_usd if openrouter else float(data.get("total_cost_usd") or 0)

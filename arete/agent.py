@@ -4,7 +4,6 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from http import HTTPStatus
 
 from . import config, util
 
@@ -113,19 +112,8 @@ UNREACHABLE_TEXT = re.compile(
     r"\b(?:UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b",
     re.IGNORECASE,
 )
-HTTP_ERROR_RESPONSE = re.compile(
-    r"^[ \t]*(?:(?:(?:HTTP(?: error|/\d(?:\.\d)?)?|unexpected status)[ \t]+|API error:[ \t]*)"
-    r"[45][0-9]{2}(?=[: \t\r\n]|$)"
-    r"|(?:Azure OpenAI|[a-z0-9][a-z0-9_-]*) API error \([45][0-9]{2}\)[ \t]*:"
-    r"|[45][0-9]{2}(?::(?![0-9])|[ \t]+(?=\{|\[)))",
-    re.IGNORECASE | re.MULTILINE,
-)
-HTTP_ERROR_REASON = re.compile(
-    r"^[ \t]*(?:" + "|".join(f"{status.value} {re.escape(status.phrase)}" for status in HTTPStatus if status >= 400)
-    + r")(?=[: \t\r\n]|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
-GOOGLE_ERROR_PREFIX = re.compile(r"^got status: \w+\. ")
+PROVIDER_STATUS = re.compile(r"\b[45][0-9]{2}\b")
+HOST_PORT = re.compile(r"(\b(?:localhost|(?:[a-z0-9-]+\.)+[a-z0-9-]+\.?):)[0-9]+\b", re.IGNORECASE)
 
 
 def overload_limit(text, model: str) -> UsageLimit | None:
@@ -135,25 +123,17 @@ def overload_limit(text, model: str) -> UsageLimit | None:
     return model_hold(model, "overloaded")
 
 
-def unreachable_limit(text: str | list[str], model: str) -> UsageLimit | None:
-    failures = [text] if isinstance(text, str) else text
-    if not any(UNREACHABLE_TEXT.search(failure) for failure in failures) or any(map(http_error_response, failures)):
+def unreachable_limit(text: str | list[str | int | None], model: str) -> UsageLimit | None:
+    failures = [text] if isinstance(text, str) else [str(value) for value in text if isinstance(value, (str, int))]
+    if not any(UNREACHABLE_TEXT.search(failure) for failure in failures):
+        return None
+    if any(PROVIDER_STATUS.search(HOST_PORT.sub(r"\1", failure)) for failure in failures):
         return None
     return model_hold(model, "unreachable")
 
 
-def http_error_response(text: str) -> bool:
-    if HTTP_ERROR_RESPONSE.search(text) or HTTP_ERROR_REASON.search(text):
-        return True
-    body = GOOGLE_ERROR_PREFIX.sub("", text.lstrip())
-    if not body.startswith("{"):
-        return False
-    try:
-        response = json.loads(body)
-    except (ValueError, RecursionError):
-        return False
-    error = response.get("error")
-    return isinstance(error, dict) and isinstance(code := error.get("code"), int) and 400 <= code < 600
+def provider_failure_fields(data: dict) -> list[str | int | None]:
+    return [data.get(key) for key in ("message", "errorMessage", "code", "status", "status_code", "statusCode")]
 
 
 def model_hold(model: str, kind: str) -> UsageLimit:

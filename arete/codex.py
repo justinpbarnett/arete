@@ -17,7 +17,17 @@ from pathlib import Path
 
 from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
-from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text, overload_limit, unreachable_limit
+from .agent import (
+    NO_SESSION,
+    Result,
+    Session,
+    UsageLimit,
+    credit_limit,
+    json_from_text,
+    overload_limit,
+    provider_failure_fields,
+    unreachable_limit,
+)
 from .pi import SCHEMA_RULE
 
 LIMIT_SCOPE = "codex"
@@ -697,10 +707,17 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     limit = None
     if not ok:
         errors = "\n".join([*failures, proc.stderr])
+        failure_text = [proc.stderr]
+        for event in diagnostics:
+            detail = event.get("error")
+            failure_text.append(detail)
+            failure_text.extend(provider_failure_fields(event))
+            failure_text.extend(provider_failure_fields(accounts.mapping(detail)))
         if provider == KEY_PROVIDER:
-            limit = credit_limit([*diagnostics, proc.stderr]) or overload_limit(errors, model) or unreachable_limit(errors, model)
+            limit = (credit_limit([*diagnostics, proc.stderr]) or overload_limit(errors, model)
+                     or unreachable_limit(failure_text, model))
         else:
-            limit = usage_limit(errors, model)
+            limit = usage_limit(errors, model, failure_text=failure_text)
     return Result(
         ok=ok,
         text=text,
@@ -721,9 +738,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     )
 
 
-def usage_limit(text: str, model: str = "") -> UsageLimit | None:
+def usage_limit(text: str, model: str = "", *, failure_text: list[str | int | None] | None = None) -> UsageLimit | None:
     if not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model) or unreachable_limit(text, model)
+        return overload_limit(text, model) or unreachable_limit(text if failure_text is None else failure_text, model)
     soonest = util.now() + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
     resets = reset_time(text)
     until = (max(soonest, resets + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)) if resets
