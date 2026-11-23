@@ -6,7 +6,6 @@ import re
 import stat
 import subprocess
 import tomllib
-from collections import Counter
 from dataclasses import asdict
 from difflib import unified_diff
 
@@ -18,7 +17,7 @@ REVISION = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
 
 def listing(kind: str, *, name: str | None = None) -> list[dict]:
     root = paths.CONFIG_DIR.resolve()
-    candidates = []
+    found = {}
     for home in configkinds.REGISTRY[kind].home:
         pattern = re.sub(r"\{\w+\}", "*", home.pattern)
         for path in sorted(root.glob(pattern)):
@@ -26,19 +25,17 @@ def listing(kind: str, *, name: str | None = None) -> list[dict]:
                 continue
             relative = path.relative_to(root).as_posix()
             item = ("attention", "defaults") if kind == "attention" else configkinds.classify(relative)
-            if item and item[0] == kind:
-                candidates.append((item[1], relative))
-    counts = Counter(item_name for item_name, _ in candidates)
-    found = {}
-    for item_name, relative in candidates:
-        if kind == "prompt" and counts[item_name] > 1:
-            item_name = configkinds.prompt_append_address(relative)
-        if name is not None and item_name != name:
-            continue
-        if item_name in found:
-            first = found[item_name]["path"]
-            raise refusals.Conflict(f"Config item {kind}/{item_name} is ambiguous: {first} and {relative}")
-        found[item_name] = {"kind": kind, "name": item_name, "path": relative}
+            if item is None or item[0] != kind:
+                continue
+            item_name = item[1]
+            if kind == "step_settings" and relative == "layers/defaults/config.toml":
+                item_name = configkinds.DEFAULTS_LAYER_ADDRESS
+            if name is not None and item_name != name:
+                continue
+            if item_name in found:
+                first = found[item_name]["path"]
+                raise refusals.Conflict(f"Config item {kind}/{item_name} is ambiguous: {first} and {relative}")
+            found[item_name] = {"kind": kind, "name": item_name, "path": relative}
     return [found[key] for key in sorted(found)]
 
 
@@ -132,7 +129,7 @@ def diff(found: dict, first: str | None, last: str | None) -> str | None:
 
 def attention_text(text: str) -> str:
     try:
-        ask = config.ask_table(tomllib.loads(text).get("ask", {}), ignored=[])
+        ask = config.ask_table(tomllib.loads(text).get("ask", {}))
     except (TypeError, ValueError) as error:
         raise refusals.Invalid(str(error)) from error
     return json.dumps(asdict(ask), indent=2) + "\n"

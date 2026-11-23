@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+PROMPT_NAME_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]*"
 VERBS = ("list", "read", "versions", "diff")
-DEFAULTS_LAYER_NAME = re.compile(r"defaults(?:\.layer)*")
+DEFAULTS_LAYER_ADDRESS = "defaults@layer"
 
 
 @dataclass(frozen=True)
@@ -14,11 +15,12 @@ class Home:
     pattern: str
     name: str = "{name}"
     escape_repo: bool = False
+    name_pattern: str = NAME_PATTERN
 
     def item(self, path: str) -> str | None:
         pattern = re.escape(self.pattern)
-        for field in ("repo", "name"):
-            pattern = pattern.replace(re.escape("{" + field + "}"), f"(?P<{field}>{NAME_PATTERN})")
+        pattern = pattern.replace(re.escape("{repo}"), f"(?P<repo>{NAME_PATTERN})")
+        pattern = pattern.replace(re.escape("{name}"), f"(?P<name>{self.name_pattern})")
         if found := re.fullmatch(pattern, path):
             values = found.groupdict()
             if self.escape_repo:
@@ -40,8 +42,9 @@ def kind(name: str, gate: str, *home: Home) -> Kind:
 
 
 REGISTRY = {
-    "prompt": kind("prompt", "review", Home("prompts/{name}.md"),
-                   Home("layers/{repo}/prompts/{name}.append.md", "{repo}.{name}.append")),
+    "prompt": kind("prompt", "review", Home("prompts/{name}.md", name_pattern=PROMPT_NAME_PATTERN),
+                   Home("layers/{repo}/prompts/{name}.append.md", "{repo}.{name}.append",
+                        name_pattern=PROMPT_NAME_PATTERN)),
     "schema": kind("schema", "check", Home("schemas/{name}.json")),
     "adw": kind("adw", "review", Home("adws/{name}.py")),
     "routes": kind("routes", "review", Home("routes/{name}.toml")),
@@ -65,12 +68,6 @@ REGISTRY = {
 }
 
 
-def prompt_append_address(path: str) -> str:
-    _, repo, _, filename = path.split("/")
-    name = filename.removesuffix(".append.md")
-    return f"layer-{repo.encode().hex()}-{name.encode().hex()}.append"
-
-
 def classify(path: str | PurePosixPath) -> tuple[str, str] | None:
     relative = PurePosixPath(path)
     if relative.is_absolute() or ".." in relative.parts:
@@ -81,10 +78,6 @@ def classify(path: str | PurePosixPath) -> tuple[str, str] | None:
             item = home.item(path)
             if item is None:
                 continue
-            if name == "prompt" and path.startswith("prompts/") and item.endswith(".append"):
-                return None
-            if name == "step_settings" and "{repo}" in home.pattern and DEFAULTS_LAYER_NAME.fullmatch(item):
-                item += ".layer"
             if name == "loop" and path.startswith("loops/") and "." in item:
                 return None
             return name, item

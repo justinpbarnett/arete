@@ -33,7 +33,7 @@ def current() -> dict:
 
 
 def attention() -> dict:
-    return asdict(config.load(required=True).ask)
+    return asdict(config.ask_table(config.read_data().get("ask", {})))
 
 
 def save_attention(values: dict) -> dict:

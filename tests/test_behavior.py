@@ -845,7 +845,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         fixture = root / "fixture"
         entry = "from tests.test_behavior import ConfigKindRegistryTests as T; T.prepare_sample()"
         lines = cls.run_child(fixture, entry)
-        cases = ("resolutions", "defaults", "schemas", "registry", "attention")
+        cases = ("resolutions", "defaults", "schemas", "registry", "layer_addresses", "attention")
         workers = ThreadPoolExecutor(max_workers=len(cases))
         cls.addClassCleanup(workers.shutdown, cancel_futures=True)
         entry = "from tests.test_behavior import ConfigKindRegistryTests as T; T.run_case(*sys.argv[1:])"
@@ -960,35 +960,31 @@ class ConfigKindRegistryTests(unittest.TestCase):
         assert configkinds.classify(f"{relative}/config.toml") == ("step_settings", layer.name)
         assert configkinds.classify(f"{relative}/prompts/build.append.md") == (
             "prompt", f"{layer.name}.build.append")
+        assert configkinds.classify("prompts/api.build.md") is None
         assert configkinds.classify(f"prompts/{layer.name}.build.append.md") is None
         assert configkinds.classify("../config.toml") is None
         root = paths.CONFIG_DIR
-        defaults_layer = root / "layers/defaults/config.toml"
-        alias_layer = root / "layers/defaults.layer/config.toml"
         append = root / "layers/team.api/prompts/build.append.md"
+        dotted_append = root / "layers/team/prompts/api.build.append.md"
         append_name = "team.api.build.append"
-        assert configkinds.classify(defaults_layer.relative_to(root)) == ("step_settings", "defaults.layer")
-        assert configkinds.classify(alias_layer.relative_to(root)) == ("step_settings", "defaults.layer.layer")
         assert configkinds.classify(append.relative_to(root)) == ("prompt", append_name)
-        for path, text in ((defaults_layer, "[steps.build]\ntries = 1\n"),
-                           (alias_layer, "[steps.build]\ntries = 4\n"), (append, "Original append\n")):
-            path.parent.mkdir(parents=True)
-            path.write_text(text)
-        initial_versions = api_check.config_fixture_git("log", "--format=%H", "--", "config.toml").splitlines()
-        assert initial_versions
-        before = paths.CONFIG_FILE.read_text()
-        sample = config.load(strict=True).repo(layer.name)
-        before += ('\n[[repo]]\nname = "defaults"\ntracker = "local"\n'
-                   f"path = {json.dumps(str(sample.path))}\nlayer = {json.dumps(str(defaults_layer.parent))}\n")
-        paths.CONFIG_FILE.write_text("max_parallel = 1\n" + before)
-        api_check.config_fixture_git("add", "--", "config.toml", "layers")
-        api_check.config_fixture_git("commit", "-qm", "Initial config items")
-        paths.CONFIG_FILE.write_text("max_parallel = 2\n" + before)
-        defaults_layer.write_text("[steps.build]\ntries = 2\n")
+        assert configkinds.classify(dotted_append.relative_to(root)) is None
+        append.parent.mkdir(parents=True)
+        append.write_text("Original append\n")
+        api_check.config_fixture_git("add", "--", append.relative_to(root).as_posix())
+        api_check.config_fixture_git("commit", "-qm", "Add layer prompt append")
         append.write_text("Updated append\n")
-        api_check.config_fixture_git("commit", "-qam", "Update config items")
-        assert config.load(strict=True).repo("defaults").layer_dir == defaults_layer.parent
+        api_check.config_fixture_git("commit", "-qm", "Update layer prompt append", "--",
+                                     append.relative_to(root).as_posix())
         commits = api_check.config_fixture_git("rev-list", "--max-count=2", "HEAD").splitlines()
+        dotted_append.parent.mkdir(parents=True)
+        dotted_append.write_text("Different origin\n")
+        api_check.config_fixture_git("add", "--", dotted_append.relative_to(root).as_posix())
+        api_check.config_fixture_git("commit", "-qm", "Add dotted append basename")
+        prompt = root / "prompts/unrelated.md"
+        prompt.parent.mkdir()
+        prompt.write_text("Unrelated prompt\n")
+        (prompt.parent / "api.build.md").write_text("Dotted prompt basename\n")
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
@@ -996,16 +992,13 @@ class ConfigKindRegistryTests(unittest.TestCase):
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds for op in ops.values())
             items = api.read("/api/v1/config/step_settings")["items"]
             assert [(found["name"], found["path"]) for found in items] == [
-                ("defaults", "config.toml"), ("defaults.layer", "layers/defaults/config.toml"),
-                ("defaults.layer.layer", "layers/defaults.layer/config.toml"), (layer.name, f"{relative}/config.toml")]
+                ("defaults", "config.toml"), (layer.name, f"{relative}/config.toml")]
             assert api.read(f"/api/v1/config/step_settings/{layer.name}")["item"]["content"] == (
                 layer / "config.toml").read_text()
             assert api.read("/api/v1/config/prompt")["items"] == [
-                {"kind": "prompt", "name": append_name, "path": append.relative_to(root).as_posix()}]
-            cls.assert_config_history(api, "step_settings/defaults", paths.CONFIG_FILE,
-                                      [*commits, *initial_versions], "max_parallel = 1", "max_parallel = 2")
-            cls.assert_config_history(api, "step_settings/defaults.layer", defaults_layer, commits,
-                                      "tries = 1", "tries = 2")
+                {"kind": "prompt", "name": append_name, "path": append.relative_to(root).as_posix()},
+                {"kind": "prompt", "name": "unrelated", "path": "prompts/unrelated.md"}]
+            assert api.read("/api/v1/config/prompt/unrelated")["item"]["content"] == prompt.read_text()
             cls.assert_config_history(api, f"prompt/{append_name}", append, commits, "Original append", "Updated append")
             _, error = api.request("GET", "/api/v1/config/feat", status=400)
             assert json.loads(error)["code"] == "invalid_input"
@@ -1027,41 +1020,65 @@ class ConfigKindRegistryTests(unittest.TestCase):
             assert all(tuple(tool["inputSchema"]["properties"]["kind"]["enum"]) == kinds for tool in tools["tools"])
             assert not selected["isError"]
             assert json.loads(selected["content"][0]["text"])["item"]["name"] == layer.name
-            collision = root / "layers/team/prompts/api.build.append.md"
-            collision.parent.mkdir(parents=True)
-            collision.write_text("Different origin\n")
-            api_check.config_fixture_git("add", "--", collision.relative_to(root).as_posix())
-            api_check.config_fixture_git("commit", "-qm", "Add colliding append")
-            collision.write_text("Updated different origin\n")
-            api_check.config_fixture_git("commit", "-qam", "Update colliding append")
-            collision_commits = api_check.config_fixture_git("rev-list", "--max-count=2", "HEAD").splitlines()
-            unrelated = root / "prompts/unrelated.md"
-            unrelated.parent.mkdir()
-            unrelated.write_text("Unrelated prompt\n")
-            prompts = api.read("/api/v1/config/prompt")["items"]
-            names = {item["path"]: item["name"] for item in prompts}
-            assert len(prompts) == len(set(names.values())) == 3
-            for path, history, old, new in ((append, commits, "Original append", "Updated append"),
-                                             (collision, collision_commits, "Different origin", "Updated different origin")):
-                name = names[path.relative_to(root).as_posix()]
-                cls.assert_config_history(api, f"prompt/{name}", path, history, old, new)
-            assert api.read("/api/v1/config/prompt")["items"] == prompts
-            assert api.read("/api/v1/config/prompt/unrelated")["item"]["content"] == unrelated.read_text()
         return True
 
     @staticmethod
     def assert_config_history(api, item, path, versions, old, new):
         route = f"/api/v1/config/{item}"
         kind, name = item.split("/")
+        relative = path.relative_to(paths.CONFIG_DIR).as_posix()
         assert api.read(route)["item"] == {"kind": kind, "name": name, "content": path.read_text(),
-                                           "path": path.relative_to(paths.CONFIG_DIR).as_posix()}
+                                           "path": relative}
         assert api.read(f"{route}/versions")["versions"] == versions
         latest, first = versions[:2]
         diff = api.read(f"{route}/diff?from={first}&to={latest}")["diff"].splitlines()
+        assert diff[:2] == [f"--- a/{relative}", f"+++ b/{relative}"]
         assert f"-{old}" in diff and f"+{new}" in diff
 
     def test_registry_and_contract(self):
         self.assertTrue(self.results["registry"].result())
+
+    @classmethod
+    def layer_addresses(cls, layer):
+        from arete import configkinds
+
+        root = paths.CONFIG_DIR
+        kind = "step_settings"
+        cases = (
+            ("config.toml", "defaults", "defaults", "max_parallel = 1", "max_parallel = 2"),
+            ("layers/defaults/config.toml", "defaults", "defaults@layer", "tries = 3", "tries = 4"),
+            ("layers/defaults.layer/config.toml", "defaults.layer", "defaults.layer", "tries = 5", "tries = 6"),
+        )
+        initial = api_check.config_fixture_git("rev-parse", "HEAD")
+        histories = {}
+        for relative, repo_name, address, old, new in cases:
+            assert configkinds.classify(relative) == (kind, repo_name)
+            path = root / relative
+            if path == paths.CONFIG_FILE:
+                original = f"{old}\n" + path.read_text()
+            else:
+                path.parent.mkdir(parents=True)
+                original = f"[steps.build]\n{old}\n"
+            path.write_text(original)
+            api_check.config_fixture_git("add", "--", relative)
+            api_check.config_fixture_git("commit", "-qm", f"Start history for {relative}")
+            first = api_check.config_fixture_git("rev-parse", "HEAD")
+            path.write_text(original.replace(old, new, 1))
+            api_check.config_fixture_git("commit", "-qm", f"Update {relative}", "--", relative)
+            latest = api_check.config_fixture_git("rev-parse", "HEAD")
+            histories[address] = [latest, first, initial] if path == paths.CONFIG_FILE else [latest, first]
+        with cls.server() as api:
+            items = api.read(f"/api/v1/config/{kind}")["items"]
+            expected = {address: relative for relative, _, address, _, _ in cases}
+            expected[layer.name] = (layer / "config.toml").relative_to(root).as_posix()
+            assert len(items) == len(expected)
+            assert {found["name"]: found["path"] for found in items} == expected
+            for relative, _, address, old, new in cases:
+                cls.assert_config_history(api, f"{kind}/{address}", root / relative, histories[address], old, new)
+        return True
+
+    def test_layer_addresses(self):
+        self.assertTrue(self.results["layer_addresses"].result())
 
     @staticmethod
     def defaults(layer):
@@ -1114,6 +1131,10 @@ class ConfigKindRegistryTests(unittest.TestCase):
             with unittest.TestCase().assertRaisesRegex(settings.Refused, "payment_modes"):
                 settings.save_attention({"settle": True})
             assert paths.CONFIG_FILE.read_bytes() == incompatible
+            for invalid in ("ask = false", "ask = { unknown = true }", "ask = { expire_days = 0 }"):
+                paths.CONFIG_FILE.write_text(invalid + "\n" + original)
+                _, error = api.request("GET", route, status=400)
+                assert json.loads(error)["code"] == "invalid_input"
         return True
 
     @staticmethod

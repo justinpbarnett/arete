@@ -195,7 +195,10 @@ for _name, _shape in RESOURCE.items():
                    operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
                              obj({"id": STRING, **_selectors}), {"id": "example", **{k: "example" for k in _selectors}})]
 CONFIG_KIND = {"type": "string", "enum": list(configkinds.REGISTRY)}
-CONFIG_ID = {"kind": CONFIG_KIND, "name": {**STRING, "pattern": f"^{configkinds.NAME_PATTERN}$"}}
+CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkinds.DEFAULTS_LAYER_ADDRESS})$",
+               "description": "For step_settings, defaults selects config.toml and defaults@layer selects "
+                              "layers/defaults/config.toml."}
+CONFIG_ID = {"kind": CONFIG_KIND, "name": CONFIG_NAME}
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
 CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
 OPERATIONS += [
