@@ -182,11 +182,11 @@ def check_origin(handler):
             raise problem("bad_origin")
 
 
-def authenticate(handler, method, *, browser_asset=False):
+def authenticate(handler, method, *, browser_asset=False, mcp=False):
     op = handler.operation[0] if handler.operation else None
     name = op["name"] if op else ""
     secure = handler.origin[0] == "https"
-    if require_tls(op) and not secure:
+    if (mcp or require_tls(op)) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
     logins = handler.server.logins
@@ -194,6 +194,8 @@ def authenticate(handler, method, *, browser_asset=False):
     traffic.check(peer)
     auth = handler.headers.get_all("Authorization", [])
     cookies = session_values(handler.headers)
+    if mcp and not auth:
+        raise problem("unauthenticated")
     if auth and cookies:
         raise problem("ambiguous_credential")
     claim = name == "pairing.claim"
@@ -230,11 +232,11 @@ def authenticate(handler, method, *, browser_asset=False):
     principals.admit(handler.actor)
 
     write = method in WRITES and name != "batch.run"
-    if write and (credential or claim):
+    if mcp or write and (credential or claim):
         check_origin(handler)
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
-    if not claim:
+    if not (claim or mcp):
         authorize(handler, op, name, write, secure, peer)
     if credential:
         logins.of(peer)

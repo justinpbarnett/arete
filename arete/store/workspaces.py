@@ -302,8 +302,8 @@ def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
             row, _, _ = _reconcile(ws)
         if row:
             selection = _release_selection(checkouts, excluded) if checkouts is not None else {}
-            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD,
-                                   **selection)
+            return _change_current(row, state="released", kept_reason="",
+                                   legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD, **selection)
     return None
 
 
@@ -480,6 +480,16 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
         if modified // 1_000_000_000 < removed or not ws.is_dir() or ws.is_symlink():
             return None
     snapshot = snapshot_fields(made)
+    if active and active["state"] == "released" and (
+        snapshot["heads"] != active["heads"] or snapshot["onto"] != active["onto"]
+        or snapshot["files"] != files(active["id"])
+    ):
+        owner = (legacy_owner(cfg or config.load(), ws, made) if snapshot["legacy_owner"] is not None
+                 else owner_of(active))
+        return change(active, legacy_mtime_ns=modified, state="kept", released_at="", release_excluded=None,
+                      remove_asked_by="", last_sweep_error="", kept_reason=_run_for(owner).get("status") or "",
+                      repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows(),
+                      **snapshot)
     if active and active["release_excluded"] is not None:
         return change(active, legacy_mtime_ns=modified, **snapshot)
     owner = legacy_owner(cfg or config.load(), ws, made)

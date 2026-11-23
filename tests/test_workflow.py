@@ -583,7 +583,7 @@ class PipelineNoSlotTests(unittest.TestCase):
             read_issue.assert_not_called()
         else:
             read_issue.assert_called_once_with(self.repo.github, int(tid))
-        if status == 1:
+        if status in (1, pipeline.SLOT_QUEUE_FAILED_EXIT):
             free_slots.assert_called_once_with(1)
         else:
             free_slots.assert_not_called()
@@ -617,7 +617,7 @@ class PipelineNoSlotTests(unittest.TestCase):
         with closing(sqlite3.connect(paths.DB_FILE)) as writer:
             writer.execute("BEGIN IMMEDIATE")
             started = time.monotonic()
-            line = self.refused_child({"state": "OPEN", "labels": []})
+            line = self.refused_child({"state": "OPEN", "labels": []}, status=pipeline.SLOT_QUEUE_FAILED_EXIT)
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 2)
         self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
@@ -654,6 +654,52 @@ class PipelineNoSlotTests(unittest.TestCase):
                                side_effect=AssertionError("unexpected Jira tracker read")) as client:
             self.assert_original_refusal(self.refused_child(None, tid="FIX-765"), name="fixture FIX-765")
         client.assert_not_called()
+
+
+class TaskSlotQueueFallbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        cls.template = cls.root / "template.db"
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.root, DB_FILE=cls.template,
+                                                  RUNS_DIR=cls.root / "runs", LOCKS_DIR=cls.root / "locks",
+                                                  WORKTREES_DIR=cls.root / "worktrees", LOG_DIR=cls.root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+
+    def setUp(self):
+        database = self.root / f"{self._testMethodName}.db"
+        shutil.copyfile(self.template, database)
+        self.enterContext(mock.patch.object(paths, "DB_FILE", database))
+        self.repo = config.Repo("fixture", self.root, github="fixture/repo", layer=self.root)
+        self.cfg = config.Config(repos=[self.repo], max_parallel=1)
+        self.enterContext(mock.patch.object(tasks, "held", return_value=""))
+
+    def child_command(self, code):
+        return [sys.executable, "-c", f"raise SystemExit({code})"]
+
+    def begin_with_exit(self, code):
+        def spawn(repo, tid, force):
+            return tasks.control.launch(self.child_command(code), pipeline.RUNS_LOG)
+
+        with mock.patch.object(pipeline, "spawn_run", side_effect=spawn):
+            return tasks.begin(self.cfg, self.repo, "936", force=True, poller_picks=True)
+
+    def test_begin_queues_slot_refusal_even_when_a_slot_is_free(self):
+        result = self.begin_with_exit(pipeline.SLOT_QUEUE_FAILED_EXIT)
+        self.assertEqual(result["state"], "queued")
+        row, = pipeline.source_store.tickets_passed_over()
+        self.assertEqual((row["repo"], row["issue"]), (self.repo.name, "936"))
+
+    def test_begin_still_refuses_other_exits_when_a_slot_is_free(self):
+        with self.assertRaisesRegex(tasks.control.Refused, "did not show as running"):
+            self.begin_with_exit(1)
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+
+    def test_launch_queues_slot_refusal(self):
+        command = self.child_command(pipeline.SLOT_QUEUE_FAILED_EXIT)
+        result = tasks.launch(self.cfg, self.repo, "936", command)
+        self.assertEqual(result["state"], "queued")
 
 
 class PolicyRetryCapTests(unittest.TestCase):
@@ -2011,6 +2057,369 @@ class PublicationFixture(unittest.TestCase):
             controller.stamp("checks", {"full": True})
             controller.stamp("review", job.review.asdict())
         return job
+
+
+class SigtermKeepWorkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from functools import cache
+        from inspect import getsource
+        from textwrap import dedent
+
+        from arete.store import migrations
+
+        source = dedent(getsource(cls.run_ticket)).removeprefix("@staticmethod\n")
+        cls.child_script = """\
+import os, signal, subprocess, sys
+from contextlib import nullcontext
+from functools import cache
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+from arete.store import migrations
+migrations.owners = cache(migrations.owners)
+from arete import config, flows, orchestration, pipeline, record, runlimits, util, workspace
+from arete.store import orchestration as ledger, runs as run_store, tasks as task_store
+""" + source + "\nraise SystemExit(run_ticket(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]))"
+
+        seed = Path(tempfile.mkdtemp(prefix="arete-sigterm-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, seed, ignore_errors=True)
+        cls.source = seed / "source"
+        cls.source.mkdir()
+        env = cls.fixture_env(seed)
+        with mock.patch.dict(os.environ, {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}):
+            PublicationFixture.create_repository(cls.source)
+            cls.initial_head = util.git(["rev-parse", "HEAD"], cls.source).strip()
+        state = seed / "state"
+        cls.seed_db = state / "arete.db"
+        with (mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=cls.seed_db, RUNS_DIR=state / "runs",
+                                  LOCKS_DIR=state / "locks", WORKTREES_DIR=seed / "worktrees", LOG_DIR=seed / "logs"),
+              mock.patch.object(migrations, "owners", cache(migrations.owners)),
+              redirect_stdout(StringIO())):
+            db.migrate()
+
+    @staticmethod
+    def fixture_env(root):
+        env = {**os.environ, "ARETE_CONFIG_DIR": str(root / "config"), "ARETE_STATE_DIR": str(root / "state"),
+               "ARETE_LOG_DIR": str(root / "logs"), "ARETE_WORKTREES_DIR": str(root / "worktrees"),
+               "ARETE_DESKTOP_NOTIFY": "0", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        env.pop(paths.SCRATCH_ENV, None)
+        return env
+
+    def setUp(self):
+        self.root = self.make_checkout()
+        self.wt = self.root / "ticket"
+        self.state = self.root / "state"
+        self.env = self.fixture_env(self.root)
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.state, DB_FILE=self.state / "arete.db",
+                                              RUNS_DIR=self.state / "runs"))
+        self.checkout = workspace.Checkout("", "fixture/repo", self.source, self.wt, "main")
+
+    def make_checkout(self):
+        root = Path(tempfile.mkdtemp(prefix="arete-sigterm-test-")).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        state = root / "state"
+        state.mkdir()
+        shutil.copyfile(self.seed_db, state / "arete.db")
+        util.git(["worktree", "add", "-qb", root.name, str(root / "ticket")], self.source, env=self.fixture_env(root))
+        return root
+
+    def git(self, *args):
+        return util.git(list(args), self.wt, env=self.env).strip()
+
+    @staticmethod
+    def run_ticket(root, source, case):
+        from arete import environment_gaps
+
+        wt = root / "ticket"
+        repo = config.Repo("fixture", source, parts=[config.Part("", "fixture/repo")])
+        cfg = config.Config(repos=[repo], max_parallel=1)
+        layer = config.RepoLayer(repo.layer_dir, factory_path="classic", checks={"check": "write output"})
+        tid = task_store.task_add(repo.name, "Edit files", "Fixture ticket")
+        children = []
+        set_handler = signal.signal
+        keep = pipeline.keep_edits
+        resetting = False
+
+        def reset_at_finalization(signum, handler):
+            nonlocal resetting
+            if not resetting and signum == signal.SIGTERM and handler == signal.SIG_DFL:
+                resetting = True
+                signal.raise_signal(signal.SIGTERM)
+            return set_handler(signum, handler)
+
+        def signal_after_keep(run):
+            keep(run)
+            signal.raise_signal(signal.SIGTERM)
+
+        def live_child():
+            child = subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            children.append(child)
+            return child
+
+        def check(*_args, **_kwargs):
+            (wt / "check-output.txt").write_text("temporary check output\n")
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        def catch_up(run, checkout):
+            controller = orchestration.Controller.__new__(orchestration.Controller)
+            controller.run = run
+            controller.data = {"catch_up_hold": {"reason": "checks failed"}}
+            controller.workers = {}
+            controller.ending = None
+            controller.job = SimpleNamespace(with_prs=[], b=SimpleNamespace(catch_ups=0), slot=None,
+                                             branch="ticket", goal="goal", plan_text="plan", review=None,
+                                             with_left=lambda text: text, check_publication_targets=None)
+
+            def repair():
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    signal.raise_signal(signal.SIGALRM)
+
+            def restore_failure(*_args, **_kwargs):
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    raise OSError("verifier restore failed")
+
+            if case == "catch-up-parked":
+                controller.prepare = repair
+                return controller.drive()
+            if case == "catch-up-close":
+                controller.prepare = lambda: None
+                controller.observe = dict
+                controller.merge_lease = None
+                controller.policy = config.Orchestration(max_decisions=1)
+                controller.lease = ledger.acquire(run.id, "", controller.data)
+                ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+                controller.workers["writer"] = SimpleNamespace(
+                    receive=lambda: (), proc=live_child(), close=lambda: signal.raise_signal(signal.SIGTERM))
+                run.enter("running")
+                return controller.drive()
+            with (mock.patch.object(pipeline, "catch_up_target", return_value=("base", "")),
+                  mock.patch.object(pipeline, "catch_up_base", side_effect=restore_failure)):
+                failure = controller.catch_up(checkout)
+            controller.settle_publication_failure(failure)
+            return controller.ending or ("failed", failure["error"], "")
+
+        def collision(run, checkout):
+            checkout.lease, tree = util.git(["rev-parse", "HEAD", "HEAD^{tree}"], wt).splitlines()
+            prior_review = pipeline.Review(verdict="approve", trees={"": tree})
+            build = SimpleNamespace(run=run, layer=layer, ticket=None, checked={}, report="", staged={})
+            log = run.log
+
+            def log_collision(message):
+                if message.startswith("automerge: catch-up failed: the merge would overwrite untracked file"):
+                    assert not run.catch_up_preserved
+                    signal.raise_signal(signal.SIGTERM)
+                log(message)
+
+            (wt / "collision.txt").write_text("preexisting file\n")
+            with (mock.patch.object(run, "log", log_collision),
+                  mock.patch.object(pipeline, "merge_moved_bases",
+                                    side_effect=pipeline.CatchUpPathCollision("collision.txt", "untracked"))):
+                return pipeline.catch_up_base(build, checkout, "ticket", "moved-base", "goal", "plan", prior_review)
+
+        def work(_cfg, run, _slot):
+            (root / "run-id").write_text(run.id)
+            checkout = workspace.Checkout("", "fixture/repo", source, wt, "main")
+            pipeline.claim_workspace(run, wt, [checkout])
+            if case == "collision":
+                return collision(run, checkout)
+            (wt / "file.txt").write_text("tracked edit\n")
+            (wt / "new.txt").write_text("new file\n")
+            if case == "finalization-reset":
+                record.ask_stop(run.id)
+                return "failed", "fixture ended", ""
+            if case in {"catch-up-parked", "catch-up-park-result", "catch-up-close"}:
+                return catch_up(run, checkout)
+            if case == "stopped":
+                record.ask_stop(run.id)
+            elif case == "child":
+                live_child()
+            elif case == "park":
+                raise runlimits.Parked("budget exhausted")
+            try:
+                if case == "check":
+                    pipeline.run_checks(layer, wt, [wt], run, 2)
+                else:
+                    os.kill(os.getpid(), signal.SIGTERM)
+            finally:
+                if case == "unwind":
+                    (root / "release-result").write_text(str(pipeline.release_workspace(run, wt, [checkout])))
+                    raise RuntimeError("cleanup failed after releasing the workspace")
+                if case == "second":
+                    (root / "unwinding").touch()
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        def resume(flow):
+            run = flow.ctx.run
+            (root / "run-id").write_text(run.id)
+            checkout = workspace.Checkout("", "fixture/repo", source, wt, "main")
+            if case == "reconcile":
+                ledger.acquire(run.id, flow.continues, {})
+            pipeline.claim_workspace(run, wt, [checkout])
+            if case == "verify-retry":
+                (wt / "file.txt").write_text("setup edit\n")
+            signal.raise_signal(signal.SIGTERM)
+
+        script = None
+        if case in {"reconcile", "verify-retry"}:
+            head = util.git(["rev-parse", "HEAD"], wt).strip()
+            pr = "https://github.com/fixture/repo/pull/1"
+            previous = record.start("pipeline", repo=repo.name, issue=tid, branch="ticket", pr_url=pr)
+            if case == "reconcile":
+                pending = {"action": "d0001-1", "pr": pr, "previous": "previous-head",
+                           "head": head, "base": "base", "verified": {}, "review": {}}
+                ledger.acquire(previous, "", {"mode": "orchestrate",
+                                              "publication_intent": {"phase": "publish", "catch_up": pending}})
+                record.move(previous, "interrupted", ("running",))
+                (wt / "personal.txt").write_text("added between runs\n")
+                script = pipeline.Script("orchestrate", resume, continues=previous)
+            else:
+                run_store.save_environment_hold(previous, [("fixture/repo", 1, pr, head)])
+                record.move(previous, "pr", ("running",))
+                script = pipeline.Script("classic", resume, continues=previous, again="verify",
+                                         environment_release="live-release")
+
+        with (mock.patch.object(config, "load", return_value=cfg),
+              mock.patch.object(config, "load_layer", return_value=layer),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict),
+              mock.patch.object(pipeline, "_run", side_effect=work),
+              mock.patch.object(pipeline, "check_lane", return_value=nullcontext(())),
+              mock.patch.object(pipeline.environment, "sh", side_effect=check),
+              mock.patch.object(environment_gaps, "live_release", return_value="live-release"),
+              mock.patch.object(environment_gaps, "confirmed_retry_gaps", return_value=(("fixture", 1),)),
+              mock.patch.object(flows, "check_environment_workspace"),
+              mock.patch.object(pipeline, "keep_edits", signal_after_keep) if case == "park" else nullcontext(),
+              mock.patch.object(signal, "signal", reset_at_finalization) if case == "finalization-reset" else nullcontext()):
+            return pipeline.run_issue(repo.name, tid, script=script)
+
+    def run_child(self, root, case):
+        return subprocess.run([sys.executable, "-c", self.child_script, str(root), str(self.source), case],
+                              env=self.fixture_env(root), capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+
+    def run_case(self, case, expected=-signal.SIGTERM):
+        child = self.run_child(self.root, case)
+        self.assertEqual(child.returncode, expected, child.stdout + child.stderr)
+        run_id = (self.root / "run-id").read_text()
+        self.assertEqual(run_store.run_get(run_id)["status"], "running" if expected == -signal.SIGTERM else "stopped")
+        return run_id
+
+    def assert_kept(self, run_id):
+        head, subject, _, *changed = self.git("show", "--format=%H%n%s", "--name-only", "HEAD").splitlines()
+        self.assertTrue(subject.startswith(f"wip: edits of arete run {run_id},"))
+        self.assertEqual(changed, ["file.txt", "new.txt"])
+        self.assertEqual((self.wt / "file.txt").read_text(), "tracked edit\n")
+        self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        made = workspace.made_before(self.wt)
+        self.assertEqual(workspace.head_recorded(made, self.checkout), head)
+        self.assertEqual(workspace.owner_in(made).run, run_id)
+
+    def assert_not_kept(self, case, gate=""):
+        run_id = self.run_case(case)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial_head)
+        self.assertFalse(workspace.made_record(self.wt).exists())
+        self.assertEqual((self.wt / "file.txt").read_text(), "tracked edit\n")
+        self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
+        if gate:
+            log = (self.state / "runs" / run_id / "run.log").read_text().splitlines()
+            failed_gates = [line for line in log if "SIGTERM: did not keep work" in line]
+            self.assertEqual(len(failed_gates), 1, failed_gates)
+            self.assertIn(gate, failed_gates[0])
+        return run_id
+
+    def test_signal_during_check_keeps_run_edits_for_restart_and_refuses_later_file(self):
+        self.assert_kept(self.run_case("check"))
+        self.assertFalse((self.wt / "check-output.txt").exists())
+        self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
+        (self.wt / "personal.txt").write_text("added after the run died\n")
+        why = workspace.kept_checkout(self.wt, self.checkout, self.source, [])
+        self.assertIn("uncommitted edits that arete has no record of leaving there (personal.txt)", why)
+
+    def test_signal_preserves_checkouts_excluded_from_the_final_save(self):
+        workspaces.claim(self.wt, "fixture", "1", "previous-run", checkouts=[self.checkout])
+        workspace.note_made(self.wt, [self.checkout])
+        original_record = workspace.made_record(self.wt).read_bytes()
+        cases = (
+            ("collision", self.root, "??", "collision.txt", "preexisting file\n"),
+            ("reconcile", self.make_checkout(), "??", "personal.txt", "added between runs\n"),
+            ("verify-retry", self.make_checkout(), " M", "file.txt", "setup edit\n"),
+        )
+        with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+            children = [pool.submit(self.run_child, root, case) for case, root, *_ in cases]
+            for (case, root, status, name, contents), child in zip(cases, children, strict=True):
+                with self.subTest(case=case):
+                    result = child.result()
+                    self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+                    wt, env = root / "ticket", self.fixture_env(root)
+                    self.assertEqual(util.git(["rev-parse", "HEAD"], wt, env=env).strip(), self.initial_head)
+                    self.assertEqual(util.git(["status", "--porcelain"], wt, env=env), f"{status} {name}\n")
+                    self.assertEqual((wt / name).read_text(), contents)
+                    with mock.patch.object(paths, "STATE_DIR", root / "state"):
+                        made = workspace.made_record(wt)
+                        if case == "collision":
+                            self.assertEqual(made.read_bytes(), original_record)
+                        else:
+                            self.assertFalse(made.exists())
+
+    def test_unwind_error_blocks_release_and_keeping(self):
+        self.assert_not_kept("unwind", "the termination exception did not survive unwinding")
+        self.assertEqual((self.root / "release-result").read_text(), "False")
+
+    def test_signal_after_park_commit_leaves_head_unrecorded(self):
+        run_id = self.run_case("park")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+        self.assertIn(f"wip: edits of arete run {run_id},", self.git("log", "-1", "--format=%s"))
+        self.assertFalse(workspace.made_record(self.wt).exists())
+        self.assertIn("1 commit that are not on origin", workspace.kept_checkout(self.wt, self.checkout, self.source, []))
+
+    def test_stop_signal_during_finalization_handler_reset_keeps_nothing(self):
+        self.assert_not_kept("finalization-reset")
+
+    def test_catch_up_budget_alarm_during_unwind_prevents_keeping(self):
+        run_id = self.assert_not_kept("catch-up-parked", "the termination exception did not survive unwinding")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+
+    def test_catch_up_publication_park_result_during_unwind_prevents_keeping(self):
+        run_id = self.assert_not_kept("catch-up-park-result", "the termination exception did not survive unwinding")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+
+    def test_signal_during_decision_limit_close_leaves_ticket_running_for_reaper(self):
+        run_id = self.assert_not_kept("catch-up-close", "a child process is still alive")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+        self.assertEqual(task_store.task_get(run_store.run_get(run_id)["issue"])["state"], "running")
+
+    def test_live_child_prevents_keeping(self):
+        self.assert_not_kept("child", "a child process is still alive")
+
+    def test_merge_in_progress_prevents_keeping(self):
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+        merge_head = git_dir / "MERGE_HEAD"
+        merge_head.write_text(self.initial_head + "\n")
+        self.assert_not_kept("merge", "a Git operation is in progress")
+        self.assertTrue(merge_head.exists())
+
+    def test_requested_stop_still_settles_as_stopped(self):
+        self.assert_kept(self.run_case("stopped", expected=1))
+
+    def test_second_signal_kills_during_unwinding(self):
+        self.assert_not_kept("second")
+        self.assertTrue((self.root / "unwinding").exists())
+
+    def test_zte_and_runs_without_a_workspace_use_default_death(self):
+        for checkouts, zte_grant in ((None, False), ((self.wt, [self.checkout]), True)):
+            with (self.subTest(workspace=bool(checkouts), zte_grant=zte_grant),
+                  mock.patch.object(record, "stop_asked", return_value=False),
+                  mock.patch.object(signal, "signal") as set_handler,
+                  mock.patch.object(os, "kill") as kill):
+                run = SimpleNamespace(id="fixture", workspace=checkouts, parking=False)
+                pipeline.stop_on_term(run, zte_grant=zte_grant, finalizing=lambda: False)()
+                set_handler.assert_called_once_with(signal.SIGTERM, signal.SIG_DFL)
+                kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
 
 
 class AutomaticCIRerunFixture:
