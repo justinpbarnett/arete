@@ -193,7 +193,7 @@ def remind(cfg: config.Config) -> list[str]:
         return []
     cutoff = util.iso(util.now() - timedelta(hours=cfg.ask.remind_hours))
     notes = []
-    for ask in asks_store.open_asks():
+    for ask in asks_store.open_asks(owner_only=True):
         if ask.get("reminded") or ask["asked"] > cutoff or not asks_store.ask_remind(ask["id"]):
             continue
         rows = push_store.push_list()

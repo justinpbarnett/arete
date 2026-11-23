@@ -134,12 +134,15 @@ const ticket = (run) => run.issue
 async function runQueue(signal) {
   const result = await projection("runs", data.runs())(signal);
   if (!result.data?.more || !Array.isArray(result.data.runs) || result.data.runs.length >= data.RUN_LIMIT) return result;
-  const history = await versioned("/api/v1/runs", signal, () => legacy(data.runs(), signal));
+  const expanded = await legacy(data.runs(), signal);
+  const history = Array.isArray(expanded.data?.runs) ? expanded
+    : await versioned("/api/v1/runs", signal, () => expanded);
   if (!Array.isArray(history.data?.runs)) return { error: history.error ?? malformed() };
   const restored = result.seq && history.seq && result.seq.split(".")[0] !== history.seq.split(".")[0];
   const head = restored ? [] : result.data.runs;
   const current = new Set(head.map((run) => run.id));
-  const tail = history.data.runs.filter((run) => !current.has(run.id)).map((run) => ({ ...run, ticket: ticket(run) }));
+  const tail = history.data.runs.filter((run) => !current.has(run.id))
+    .map((run) => run.ticket ? run : { ...run, ticket: ticket(run) });
   const runs = [...head, ...tail];
   return { seq: restored ? history.seq : result.seq, data: { runs: runs.slice(0, data.RUN_LIMIT),
     more: Boolean(history.data.more) || runs.length > data.RUN_LIMIT || history.data.runs.length >= data.RUN_LIMIT } };

@@ -1277,6 +1277,41 @@ A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
+### Automatic ticket unblocking
+
+Off by default.
+Enable it on the serve host for an explicit list of repos, starting with a disposable local replay repo and then a single pilot repo.
+Choose a tool-free route that supports high reasoning under your existing routing and payment policy.
+
+```toml
+[unblock]
+enabled = true
+repos = ["example"]
+
+[unblock.step]
+tier = "strong"
+effort = "high"
+```
+
+Replace `strong` with a tier already defined on your host, or pin an allowed model instead.
+For rollout, first confirm that the diagnosis runs on the expected route and that no agent tools, browser, workspace, or credentials are available to it.
+Verify that a child registers only once and uses the normal delivery path and verification gates before expanding the allowlist.
+
+The supervisor looks for approved work stopped at an unanswered pipeline question, a cumulative budget, a held PR, or an approved dependency cycle.
+It diagnoses at most twice per observation and can admit at most two continuations for the same blocker and three per ticket in 24 hours.
+An allowance is small, applies to only one exhausted limit, and does not change the repo's normal limits.
+It will not restart a human stop, approve a ticket, provision credentials, or run a dependent ticket ahead of its prerequisite.
+For a local dependency cycle, an owner can confirm that a standalone declaration is obsolete with the ticket comment `Arete dependency correction: remove t-1234`, replacing the example ID with the obsolete prerequisite.
+The supervisor can remove only that declaration on the current version and only if the edit breaks the observed cycle without admitting work outside normal queue rules.
+For external trackers, it does not overwrite the description or change dependency status.
+
+`arete status` and the dashboard's Work and Run views show the recovery case and its progress.
+Routine questions do not appear in Needs you while recovery investigates; `arete answer RUN_ID` still lets an operator answer them.
+An owner notification requires a verified missing owner-managed secret or a confirmed owner directive (`Arete owner action: ASK_ID`) on the ticket, not just a stalled model or an exhausted quota.
+Secret input still uses the regular secure question path.
+To roll back, set `enabled = false` or remove the repo from `repos`.
+This prevents new supervised admissions and returns open questions to the normal owner flow; it does not stop registered runs or undo ticket and PR changes they have made.
+
 ### Pipeline auto-merge
 
 Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.

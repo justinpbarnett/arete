@@ -144,8 +144,18 @@ def print_status(cfg, problem, views, snap, records, server_url):
     show(records, "the record store", lambda s: print_records(s, None if server_url else cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
+    if recovery := snap.get("recovery"):
+        show(recovery, "automatic recovery", print_recovery)
     show(snap["triage"], "triage", print_triage)
     show(snap["live"], "the live runs", print_live)
+
+
+def print_recovery(rows):
+    if rows:
+        print("automatic recovery:")
+    for row in rows:
+        print(f"  {row['repo']} {row['ticket']}: {row['phase']} ({row['cause']}) {row['detail']}")
+
 
 
 def print_delivery(cfg: config.Config) -> None:

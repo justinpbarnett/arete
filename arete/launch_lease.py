@@ -15,6 +15,7 @@ from . import paths
 ENV = "ARETE_LAUNCH_LEASE"
 POLL = "ARETE_POLL_LAUNCH"
 READMISSION = "ARETE_POLL_READMISSION"
+RECOVERY = "ARETE_RECOVERY_GRANT"
 CURRENT = ContextVar("task_launch_lease", default=None)
 
 
@@ -109,6 +110,7 @@ class Lease:
     passed: bool = False
     readmission: str = ""
     poll: bool = False
+    recovery: str = ""
 
 
 @contextmanager
@@ -135,6 +137,7 @@ def child_environment(keep: tuple[int, ...]) -> tuple[tuple[int, ...], dict]:
     env.pop(ENV, None)
     env.pop(POLL, None)
     env.pop(READMISSION, None)
+    env.pop(RECOVERY, None)
     if lease := CURRENT.get():
         keep = tuple(dict.fromkeys((*keep, lease.fd)))
         env[ENV] = lease.message
@@ -142,6 +145,8 @@ def child_environment(keep: tuple[int, ...]) -> tuple[tuple[int, ...], dict]:
             env[POLL] = "1"
         if lease.readmission:
             env[READMISSION] = lease.readmission
+        if lease.recovery:
+            env[RECOVERY] = lease.recovery
     return keep, env
 
 
@@ -176,6 +181,7 @@ def verify(repo: str, tid: str, *, release: bool = False) -> None:
             os.environ.pop(ENV, None)
             os.environ.pop(POLL, None)
             os.environ.pop(READMISSION, None)
+            os.environ.pop(RECOVERY, None)
     except (OSError, ValueError, TypeError) as e:
         raise PermissionError("invalid inherited task launch lease") from e
 
@@ -191,6 +197,12 @@ def readmission(repo: str, tid: str) -> str:
     if evidence := os.environ.get(READMISSION, ""):
         verify(repo, tid)
     return evidence
+
+
+def recovery(repo: str, tid: str) -> str:
+    if grant := os.environ.get(RECOVERY, ""):
+        verify(repo, tid)
+    return grant
 
 
 def registered(repo: str, tid: str) -> None:
