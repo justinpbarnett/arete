@@ -527,6 +527,7 @@ class Run(AgentRun):
     owner_questions_blocked: bool = False
     environment_release: str = ""
     preview_of: str = ""
+    recovery: dict = field(default_factory=dict)
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -559,8 +560,18 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if kw.get("read_only"):
             return super().agent(step, text, cwd, role, **kw)
+        if self.recovery.get("direction") and role in ("plan", "build", "check_repair", "review_repair", "ci_repair"):
+            from . import unblock
+
+            text = unblock.brief(self, text)
         if not self.asks_owner:
+            due = self.answers_due if step == "plan" and not self.path else []
+            if due:
+                text = self.fresh_text(text, due)
             res = super().agent(step, text, cwd, role, **kw)
+            if due and res.ok:
+                asks_store.asks_taken([a["id"] for a in due], self.id)
+                self.answers_due = []
             if self.owner_questions_blocked and res.record and any(
                     event.get("kind") == "tool_call" and owner_asks.is_ask(event.get("name"))
                     for event in record.events(paths.record_dir(self.id) / res.record)):
@@ -1812,7 +1823,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, launch_lease, pilot, zte
+    from . import flows, launch_lease, pilot, unblock, zte
     from .store import db
     from .store import zte as zte_store
 
@@ -1827,7 +1838,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     if not script:
-        adw = dispatch_path(repo, str(tid)) != "classic"
+        recovery_child = launch_lease.recovery(repo.name, str(tid))
+        adw = not recovery_child and dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1901,8 +1913,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             feedback = pending_feedback(repo.name, tid) if may_revise else []
             feedback_readmits = (not dry_run and script and script.path == "orchestrate"
                                  and insights_store.has_fresh_feedback(feedback))
+            recovery, recovery_case = unblock.child_grant(cfg, repo, tk, str(tid), force=force, script=script,
+                                                           dry_run=dry_run)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-            if feedback_readmits and not (force or readmission):
+            if recovery or (feedback_readmits and not (force or readmission)):
                 budget_admission = runlimits.Admission()
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
@@ -1937,6 +1951,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
+            if recovery and slots.slots_free_to_start(cfg.max_parallel) == 0:
+                print(f"{name}: recovery is waiting for a run slot")
+                return SLOT_QUEUE_FAILED_EXIT
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
@@ -2026,6 +2043,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=committed)
+            elif recovery:
+                try:
+                    run_id = unblock.register(repo, recovery, recovery_case, start)
+                except ValueError as error:
+                    slot.free()
+                    print(f"{name}: {error}")
+                    return 2
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -2037,7 +2061,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
+                      recovery=recovery.get("grant", {}),
                 **(script.run_fields if script else {}))
+            if run.recovery:
+                run_lines.write(run.id, "recovery", grant=recovery["id"], source=recovery_case["source"],
+                                allowance=run.recovery["allowance"], action=recovery["decision"]["action"],
+                                direction=run.recovery.get("direction", ""))
+            if not script and run.answering and not dry_run:
+                run.answers_due = asks_store.asks_due([run.answering["id"]])
             try:
                 with handoff_io():
                     run.dir.mkdir(parents=True, exist_ok=True)
@@ -2142,8 +2173,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
-            parent = parent_run(script, earlier, budget_history)
-            allow_reset = not (dry_run or retry_of)
+            parent = recovery_case["source"] if recovery else parent_run(script, earlier, budget_history)
+            if restarting and not (dry_run or only or run.recovery or zte_grant):
+                run.recovery = unblock.inherited(earlier, lambda: runlimits.specification(tk.get(tid)))
+            allow_reset = not (dry_run or retry_of or run.recovery)
             previous = "" if allow_reset and budget_admission.reset_time else parent
             repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
             can_reset_specs = bool(previous) and allow_reset and not restarting and not run.repairs and not run.alone
@@ -2152,8 +2185,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             current = tk.get(tid) if reset_changed_specs else None
             answered_runs = ()
             if not dry_run and not only and not (flow and flow.refusal):
-                answered_runs = tuple(a["run"] for a in run.answers_due)
-                if run.answering and answer_text(run.answering["id"]).strip():
+                answered_runs = tuple(a["run"] for a in run.answers_due if not owner_asks.supervisor_answered([a]))
+                if run.answering and not run.recovery and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
             new_budget = partial(runlimits.Budget, run, runlimits.Policy.of(layer), previous,
                                  repair_previous=repair_parent, answered_runs=answered_runs,
@@ -2386,9 +2419,20 @@ def question_time(run: dict) -> str:
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
+        questions = run_lines.read(answering["id"])
         asked = question_time(answering)
         if asked:
-            run_lines.waited(run_id, "person", asked, passed_over or now)
+            until = passed_over or now
+            if any(line.get("event") == "question" and line.get("recovery") for line in questions):
+                from .store import unblock as unblock_store
+
+                owner_at = unblock_store.notified_at(answering["id"])
+                handled = min(owner_at, until) if owner_at else until
+                run_lines.waited(run_id, "unblock", asked, handled)
+                if owner_at and owner_at < until:
+                    run_lines.waited(run_id, "person", owner_at, until)
+            else:
+                run_lines.waited(run_id, "person", asked, until)
     if passed_over:
         run_lines.waited(run_id, "slot", passed_over, now)
 
@@ -2401,18 +2445,29 @@ def run_minutes(row: dict) -> float:
 
 def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, summary: str,
          asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
+    from . import unblock
+
+    recover = (not run.dry_run and not run.alone and unblock.active(run.config, run.repo.name, str(run.tid))
+               and not unblock.exclude(run.repo.name, str(run.tid)))
+    if recover and not asked:
+        question = owner_asks.text_ask(summary)
+        asked = [{**question, "step": "plan", "call": "plan", "ask_id": f"{run.id}-a1"}]
+        session = {}
     for ask in asked or [{}]:
-        run_lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
+        run_lines.write(run.id, "question", question=comment, summary=summary[:300], recovery=recover, **ask)
     if asked and session is not None and not run.dry_run:
         for ask in asked:
             asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
-                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session)
-        run.say(outbound.screen(comment))
+                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session,
+                          recovery_route="unblock" if recover else "owner")
+        if not recover:
+            run.say(outbound.screen(comment))
         run.enter("needs-info")
         devices.release(run.id, run.log)
-        alerts.ask_notice(run.where, summary)
-        for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
-            run.log(note)
+        if not recover:
+            alerts.ask_notice(run.where, summary)
+            for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
+                run.log(note)
         run.log("needs-info: kept the work folder and the step's session for the answer")
         return "needs-info", summary[:300], ""
     run.say(comment)

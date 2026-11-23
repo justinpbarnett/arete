@@ -246,6 +246,12 @@ def main() -> None:
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]))
+        if launch["step"] == "unblock":
+            from . import unblock
+
+            if launch["role"] != "orchestrate" or repo.name not in cfg.unblock_repos:
+                raise PolicyChanged("unblock role or repository is no longer eligible")
+            _, run.resolved_settings["orchestrate"] = unblock.setting_for(cfg, repo)
         kept = Session(**launch["session"])
         if kept.id:
             run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept

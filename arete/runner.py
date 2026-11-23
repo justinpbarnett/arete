@@ -742,11 +742,12 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if target.remote:
         kw["remote"] = target
     else:
-        kw["passing"] = environment.passed(cfg, repo)
+        supervisor = getattr(getattr(trip, "settings", None), "step", "") == "unblock" or trace[1] == "unblock"
+        kw["passing"] = [] if supervisor else environment.passed(cfg, repo)
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
             kw["read_roots"] = tuple(Path(root) for root in roots)
-        kept = {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
+        kept = {} if supervisor else {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
         if picked.selected:
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
         if kept:

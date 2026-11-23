@@ -1022,14 +1022,13 @@ def prompted(i: int, q: dict) -> dict:
 
 
 def open_ask(run_id: str, ask_id: str) -> dict:
-    asks = field(call("GET", "/api/asks"), "asks")
-    if not isinstance(asks, list):
-        raise Failed({"error": "server answer has an invalid field asks"})
-    open_asks = [a for a in asks
-                 if a["run"] == run_id and (not ask_id or a["id"] == ask_id)]
-    if not open_asks:
-        raise Failed({"error": f"run {run_id} has no open ask"})
-    return open_asks[0]
+    for path in ("/api/asks", "/api/asks?include_recovery=1"):
+        asks = field(call("GET", path), "asks")
+        if not isinstance(asks, list):
+            raise Failed({"error": "server answer has an invalid field asks"})
+        if found := next((a for a in asks if a["run"] == run_id and (not ask_id or a["id"] == ask_id)), None):
+            return found
+    raise Failed({"error": f"run {run_id} has no open ask"})
 
 
 def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:

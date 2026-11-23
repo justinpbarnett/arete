@@ -32,6 +32,23 @@ class Parked(BaseException):
     pass
 
 
+LIMIT_TRANCHES = {"max_run_minutes": 60, "max_verify_minutes": 20, "max_repair_cycles": 2}
+
+
+def exhausted(reason: str) -> str:
+    if reason.startswith("the run chain reached its cumulative "):
+        return "max_run_minutes"
+    if reason.startswith("verification reached its cumulative "):
+        return "max_verify_minutes"
+    if reason.startswith("the repair chain used its "):
+        return "max_repair_cycles"
+    if reason.startswith("controller used its "):
+        return "max_decisions"
+    if reason.startswith("run used its ") and " action allowance" in reason:
+        return "max_actions"
+    return ""
+
+
 @dataclass(frozen=True)
 class Policy:
     max_repair_cycles: int = 2
@@ -243,11 +260,22 @@ class Admission:
     reset_repairs: bool = False
 
 
+def authorized_interruption(repo, tid: str, title_and_body) -> bool:
+    latest = run_store.newest_live_whole_run(repo.name, tid) or {}
+    if latest.get("status") != "interrupted":
+        return False
+    from . import unblock
+
+    return bool(unblock.inherited(latest, lambda: specification(title_and_body())))
+
+
 def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
               readmission: Readmission | None = None) -> Admission:
     row, saved = latest_park(repo.name, tid)
     if not saved:
         return Admission("the parked run changed before launch" if readmission else "")
+    if not explicit and authorized_interruption(repo, tid, lambda: tracker.get(tid)):
+        return Admission()
     if explicit:
         spec = specification(tracker.get(tid)) if saved.get("specification") else ""
         if inputs_changed(saved, spec, asdict(policy)):
@@ -262,7 +290,7 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
 
 def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmission | None]:
     row, saved = latest_park(repo.name, tid)
-    if not saved:
+    if not saved or authorized_interruption(repo, tid, lambda: ticket):
         return "", None
     reason = park_reason(row, saved)
     tried = f"{reason} Poll already tried these inputs."
@@ -343,6 +371,11 @@ class Budget:
                  answered_runs: tuple[str, ...] = (),
                  wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
                  checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = (), started: float | None = None) -> None:
+        recovery = getattr(run, "recovery", {})
+        self.base_policy = policy
+        self.recovery = recovery.get("allowance", {})
+        policy = replace(policy, **{k: getattr(policy, k) + self.recovery[k]
+                                    for k in LIMIT_TRANCHES if k in self.recovery})
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
         self.pending_specification = pending_specification
         self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
@@ -357,7 +390,7 @@ class Budget:
             live = {rid for rid, row in rows.items() if not row["dry_run"] and row["status"] != "dry-run"}
             chain = [rid for rid in chain if rid in live]
             repair_chain = [rid for rid in repair_chain if rid in live]
-        fresh_feedback = (not run.dry_run and not run.alone and run.path == "orchestrate"
+        fresh_feedback = (not recovery and not run.dry_run and not run.alone and run.path == "orchestrate"
                           and insights_store.has_fresh_feedback(run.feedback))
         excluded = set(rows) if fresh_feedback else set()
         if not (run.dry_run or fresh_feedback) and forced and current:
@@ -457,8 +490,10 @@ class Budget:
             verify_open = max(0, now - self.verify_started) if self.verify_started is not None else 0
             saved = {
                 "version": 1, "parents": self.parents, "repair_parents": self.repair_parents,
-                "policy": asdict(self.policy),
+                "policy": asdict(self.base_policy),
                 "specification": self.specification, **self.left_out_waits(now)}
+            if self.recovery:
+                saved.update(recovery=self.recovery, effective_policy=asdict(self.policy))
             if not self.run.dry_run:
                 saved.update(left_out=self.left_out, repair_left_out=self.repair_left_out)
             compatibility = getattr(self, "compatibility", True)
@@ -637,7 +672,8 @@ class Budget:
         pr_url = str(row.get("pr_url") or next((r.get("pr_url") for rid in self.parents
                      if (r := run_store.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
-            "reason": reason, "charged": self.charged, "policy": asdict(self.policy), "specification": self.specification,
+            "reason": reason, "limit": exhausted(reason), "charged": self.charged,
+            "policy": asdict(self.base_policy), "specification": self.specification,
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},
             "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY,
             **self.left_out_waits()})

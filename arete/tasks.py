@@ -289,6 +289,50 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
     raise did_not_show(repo, tid)
 
 
+def launch_recovery(cfg: config.Config, repo: config.Repo, row: dict, attempt: dict) -> dict:
+    from . import oncall, poll, routing, unblock
+
+    tid = str(row["issue"])
+    with util.lock("oncall") as got:
+        if not got:
+            return answer(tid, repo.name, "", "queued", "Waiting for the on-call interlock")
+        with util.lock(STEER_LOCK, wait=True), PENDING_LOCK, util.lock(START_LOCK, wait=True):
+            if pending := pending_start(repo.name, tid):
+                return pending
+            if live_run(repo.name, tid) or held(cfg, repo):
+                return answer(tid, repo.name, "", "queued", "Waiting for an available run slot")
+            if tid in oncall.parked(repo.name):
+                raise control.Refused("on-call already owns this ticket")
+            source = tracker.for_ticket(cfg, repo, tid)
+            ticket = source.get(tid)
+            if ticket.blocker or not unblock.approval(source, ticket)[0] or not unblock.active(cfg, repo.name, tid):
+                raise control.Refused("normal ticket admission no longer passes")
+            layer = config.load_layer(repo.layer_dir)
+            mode = pipeline.recorded_path(row["id"])
+            repairing = attempt["grant"].get("entry") == "repair"
+            path = "repair" if repairing else mode
+            discovery = routing.Discovery(cfg, repo, priced=False, layer=layer)
+            if why := poll.step_without_route(cfg, repo, ticket, discovery, layer, mode=mode, repairing=repairing):
+                return answer(tid, repo.name, "", "queued", why)
+            if path == "classic":
+                command = control.command(["run", repo.name, tid, "--local"])
+            else:
+                if pipeline.script_file(cfg, path).resolve().parent != paths.ADWS_DIR.resolve():
+                    raise control.Refused("recovery does not launch custom delivery scripts")
+                command = command_of(cfg, path, repo.name, tid, "--repair" if repairing else "--continue", row["id"])
+
+            def spawn():
+                launch_lease.CURRENT.get().recovery = attempt["id"]
+                return control.launch(command, pipeline.RUNS_LOG)
+
+            new, state = spawned(repo.name, tid, spawn)
+            if state == SLOT_QUEUE_FAILED:
+                return answer(tid, repo.name, "", "queued", "Waiting for an available run slot")
+            if state == "exited":
+                return answer(tid, repo.name, "", "refused", "Recovery child did not pass admission")
+            return answer(tid, repo.name, new, state, "Recovery child started" if new else "Recovery child is starting")
+
+
 def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
     if not (row := run_store.run_get(run_id)):
         raise control.NotFound(f"no run {run_id}")
@@ -387,16 +431,45 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
     kept = store_answer(cfg, repo, tid, text)
     with writes.atomic():
         for a in waiting:
-            if not ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text)):
+            answers = owner_asks.text_answers(owner_asks.unstaged(a), text)
+            if not ask_store.ask_close(a["id"], "answered", owner_asks.combine_staged(a, answers)):
                 raise AlreadyResolved(f"ask {a['id']} was already resolved; the answer was stored as a comment, "
                                       "but this reply did not update the asks or resume the run")
     started = continue_asked(cfg, repo, row, command)
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
 
-def asks_view() -> dict:
+def asks_view(*, owner_only=True) -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for a in ask_store.open_asks(connect=foundation.reader)]}
+    return {"asks": [{k: a[k] for k in keys} for row in ask_store.open_asks(connect=foundation.reader, owner_only=owner_only)
+                     if (a := owner_asks.unstaged(row))["questions"]]}
+
+
+def stage_recovery_answers(group: list[dict], decision: dict, *, scrub) -> None:
+    open_asks = {a["id"]: a for a in group if a["status"] == "open"}
+    for ask_id, answers in decision["answers"].items():
+        if ask_id not in open_asks or not isinstance(answers, dict) or not answers:
+            raise ValueError("recovery answered an unknown ask or returned an empty answer")
+        ask = open_asks[ask_id]
+        staged = dict(ask["staged_answers"])
+        for index, entry in answers.items():
+            if (not isinstance(index, str) or index not in {str(i) for i in range(len(ask["questions"]))}
+                    or index in staged or not isinstance(entry, dict)):
+                raise ValueError("recovery answered an unknown or already settled question")
+            q = ask["questions"][int(index)]
+            if q["kind"] not in ("choice", "text") or set(entry) != {q["kind"]}:
+                raise ValueError("recovery may answer only text and choice questions")
+            if q["kind"] == "text" and isinstance(entry["text"], str):
+                entry = {"text": scrub(entry["text"], owner_asks.MAX_TEXT)}
+            answer_row = owner_asks.answers_for({"questions": [q]}, {"answers": [entry]})[0]
+            staged[index] = {**answer_row, "by": "rule:unblock", "basis": decision["reason"],
+                             "evidence": decision["evidence"]}
+        if len(staged) == len(ask["questions"]):
+            ok = ask_store.ask_close(ask_id, "answered", [staged[str(i)] for i in range(len(staged))])
+        else:
+            ok = ask_store.stage(ask_id, staged)
+        if not ok:
+            raise AlreadyResolved(f"ask {ask_id} changed before recovery settlement")
 
 
 def answer_ask(ask_id: str, body) -> dict:
@@ -417,11 +490,12 @@ def answer_ask(ask_id: str, body) -> dict:
             if body != {"stop": True}:
                 raise control.Refused('To stop the run, send {"stop": true} alone')
             return let_go(cfg, repo, row, "stopped")
+        remaining = owner_asks.unstaged(ask)
         try:
-            answers = owner_asks.answers_for(ask, body)
+            answers = owner_asks.combine_staged(ask, owner_asks.answers_for(remaining, body))
         except (ValueError, TypeError) as e:
             raise control.Refused(str(e)) from None
-        given = owner_asks.secret_values(ask, body)
+        given = owner_asks.secret_values(remaining, body)
         if problems := [f"{name}: {why}" for name, value in given.items()
                         if (why := runner.reserved(name) or vault.unfit(value))]:
             raise control.Refused("; ".join(problems) + "; nothing was stored")
@@ -491,7 +565,11 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.R
                      for c in flows.prepared_data(run_id).get("checkouts") or []]
     except (TypeError, KeyError):
         return None
-    return workspace.remove_workspace(paths.WORKTREES_DIR / f"{repo.name}-{tid}", checkouts)
+    ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
+    with workspaces.folder_lock(ws):
+        if (imported := workspaces.import_legacy(ws)) and not checkouts:
+            checkouts = workspaces.owner_of(imported).checkouts
+        return workspace.remove_workspace(ws, checkouts)
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
@@ -510,7 +588,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         folder = "its work folder was left in place"
         try:
             release = kept_folder_removed(repo, tid, run_id) if latest else None
-        except (OSError, sqlite3.Error, migrations.Refused) as e:
+        except (OSError, sqlite3.Error, migrations.Refused, workspaces.SnapshotUnavailable) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
             if release and release.state == "removed":

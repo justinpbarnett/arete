@@ -420,9 +420,7 @@ made = {workspace.OWNER_KEY: owner.to_row(), workspace.SALT_KEY: salt,
         ".venv/": workspace.fingerprint(output.parent, salt)}
 source = write_workspace_record(ws, made)
 assert not workspaces.open_for(ws.name)
-
 release = workspace.remove_workspace(ws, [c], by=rid)
-
 row = workspaces.open_for(ws.name)
 assert release == workspace.Release("held", [".venv/"]), release
 assert row["state"] == "held" and row["held_by"] == [".venv/"] and not row["owner_run"], row
@@ -445,7 +443,6 @@ source = workspace.made_record(ws)
 source.write_text('{"partial":')
 older = row["legacy_mtime_ns"] - 1_000_000_000
 os.utime(source, ns=(older, older))
-
 with workspaces.ticket_lock(repo.name, "7") as got:
     assert got
     assert workspace.made_before(ws) == {}
@@ -456,7 +453,6 @@ with workspaces.ticket_lock(repo.name, "7") as got:
     assert why == "", why
     run = pipeline.Run("resumed-run", repo, paths.RUNS_DIR / "resumed-run", tracker=None, tid="7")
     pipeline.claim_workspace(run, ws, [c])
-
 row = workspaces.get(wid)
 assert row["state"] == "live" and row["owner_run"] == run.id
 assert not row["salt"] and not row["heads"] and not row["onto"] and not workspaces.files(wid)
@@ -892,7 +888,6 @@ ws, c, rid, wid = checkout(ticket, "needs-info")
 with (patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}),
       patch.object(workspaces, "change", side_effect=sqlite3.OperationalError("database is locked"))):
     result = tasks.let_go(cfg, repo, runs.run_get(rid), "stopped")
-
 assert result["state"] == "stopped" and "database is locked" in result["why"], result
 assert runs.run_get(rid)["status"] == "stopped"
 assert any(line.get("event") == "report" and line.get("status") == "stopped" for line in run_lines.read(rid))
@@ -960,7 +955,6 @@ row = workspaces.get(wid)
 assert row["state"] == "released" and "locked" in row["last_sweep_error"], row
 assert [c["wt"] for c in row["checkouts"]] == [str(wt)], row
 assert registered(wt)
-
 util.git(["worktree", "unlock", str(wt)], src)
 workspaces.sweep(cfg)
 assert workspaces.get(wid)["state"] == "removed" and not wt.exists() and not registered(wt)
@@ -981,13 +975,11 @@ assert tasks.kept_folder_removed(repo, "7", rid).state == "held"
 row = workspaces.get(wid)
 assert row["checkouts"] == row["release_excluded"] == [], row
 assert (wt / ".git").is_file() and (wt / "notes.txt").is_file() and registered(wt)
-
 workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "held" and row["held_by"] == ["hand.txt"], row
 assert hand.read_text() == "edited by hand" and registered(wt)
 hand.unlink()
-
 workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "removed" and row["sweep_attempts"] == 2, row
@@ -1018,7 +1010,6 @@ assert spawn.call_args.kwargs["start_new_session"]
 env = spawn.call_args.kwargs["env"]
 worker_run = env.get("ARETE_RUN_ID")
 assert worker_run and worker_run != rid, worker_run
-
 def apply(cfg, run_id, wt, props):
     assert wt == ws and run_id == rid
     assert workspaces.open_for(ws.name)["owner_run"] == worker_run

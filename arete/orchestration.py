@@ -82,7 +82,8 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     if layer.verify:
         effective["verify"] = layer.verify.policy()
     policy_config = config.policy_dict(cfg)
-    policy_config.pop("server_url")
+    for field in ("server_url", "unblock_repos", "unblock_step"):
+        policy_config.pop(field)
     policy_config["max_parallel_checks"] = config.Config.max_parallel_checks
     if resume:
         config.remove_controller_only_settings(policy_config)
@@ -105,6 +106,12 @@ class Controller:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
         self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(
             pipeline.config.load_layer(self.run.repo.layer_dir).orchestration)))
+        if self.run.recovery.get("allowance"):
+            base = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
+            extra = self.run.recovery["allowance"]
+            self.policy = replace(self.policy, max_decisions=max(self.policy.max_decisions,
+                                                                  base.max_decisions + extra.get("max_decisions", 0)),
+                                  max_actions=max(self.policy.max_actions, base.max_actions + extra.get("max_actions", 0)))
         self.run.overrides = {**self.data.get("overrides", {}), **self.run.overrides}
         inherited = self.data.get("step_overrides", {})
         self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
@@ -596,6 +603,7 @@ class Controller:
         return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
+                **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
                 "catalog": {kind: self.catalog.list(kind, 0, 10) for kind in ("models", "prompts", "tools", "context")},
@@ -732,6 +740,9 @@ class Controller:
         goal += "\n" + "\n".join(queued) if queued else ""
         if name in ("delegate", "investigate") and self.job.triage:
             contexts = "\n\n".join(filter(None, (self.job.triage, contexts)))
+        direction = self.run.recovery.get("direction")
+        if (writing or name == "plan") and isinstance(direction, str) and direction:
+            contexts += "\n\nArete unblocker guidance (does not change acceptance criteria):\n" + direction
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}

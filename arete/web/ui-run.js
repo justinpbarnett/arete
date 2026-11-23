@@ -10,8 +10,8 @@ import { parse } from "./ui-router.js";
 import { runHash as hashOf, taskHash } from "./ui-data.js";
 
 const html = htm.bind(h);
-export const GROUPS = ["Running", "Waiting on you", "Fault", "Done"];
-const GLYPHS = { Running: "▷", "Waiting on you": "◆", Fault: "×", Done: "✓" };
+export const GROUPS = ["Running", "Recovering", "Waiting on you", "Fault", "Done"];
+const GLYPHS = { Running: "▷", Recovering: "▷", "Waiting on you": "◆", Fault: "×", Done: "✓" };
 const FAULTS = ["failed", "interrupted", "stopped"];
 const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
 const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
@@ -20,6 +20,10 @@ const safeLink = (url) => /^https?:\/\//i.test(String(url ?? "")) ? url : "";
 export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
   : FAULTS.includes(status) ? "Fault" : "Done";
 export const wordOf = (status) => status === "stopped" ? "■ STOPPED" : `${GLYPHS[groupOf(status)]} ${status === "needs-info" ? "WAITING" : String(status).toUpperCase()}`;
+const runGroup = (run) => run.ask_route === "unblock" ? "Recovering"
+  : run.ask_route === "closed" ? "Done" : groupOf(run.status);
+const runWord = (run) => run.ask_route === "unblock" ? "▷ RECOVERY"
+  : run.ask_route === "closed" ? "✓ QUESTION CLOSED" : wordOf(run.status);
 
 export function duration(seconds) {
   if (!Number.isFinite(seconds)) return "";
@@ -40,8 +44,8 @@ function elapsed(run, now) {
 
 function rowOf(run) {
   const seconds = Number.isFinite(run.seconds) ? run.seconds : elapsed(run, Date.now());
-  return { id: run.id, title: [run.ticket || run.id, run.summary].filter(Boolean).join(" · "), state: wordOf(run.status), status: run.status,
-    group: groupOf(run.status), repo: run.repo ?? "", priority: "", number: duration(seconds), url: safeLink(run.pr_url) };
+  return { id: run.id, title: [run.ticket || run.id, run.summary].filter(Boolean).join(" · "), state: runWord(run), status: run.status,
+    group: runGroup(run), repo: run.repo ?? "", priority: "", number: duration(seconds), url: safeLink(run.pr_url) };
 }
 
 const queue = createList({ rows: [], empty: "No runs yet", facets: [], sorts: [{ id: "source", label: "Newest first" }, { id: "id", label: "Id", key: "id" }],
@@ -173,18 +177,20 @@ const recordedTurns = (view) => view.events.reduce((sum, event) => sum + (event.
 
 function Head({ view, now }) {
   const run = view.detail.run;
-  const group = groupOf(run.status);
+  const group = runGroup(run);
   const steps = stepsOf(view);
   const models = view.detail.models ?? [];
   const tokensIn = models.reduce((sum, model) => sum + (model.tokens_in || 0), 0);
   const tokensOut = models.reduce((sum, model) => sum + (model.tokens_out || 0), 0);
   const link = safeLink(run.pr_url);
   return html`<header class="run-head">
-    <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${wordOf(run.status)}</span>
+    <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${runWord(run)}</span>
       <span class="run-id mono">${run.id}</span>
       ${taskOf(run) ? html`<a class="run-task" href=${taskOf(run)}>${run.ticket || run.issue}</a>` : null}
       ${run.status === "running" ? html`<span class="run-live" aria-label="Live">● LIVE</span>` : null}</div>
     <h2 class="run-summary">${run.summary || run.id}</h2>
+    ${view.detail.recovery ? html`<p class="run-meta">Automatic recovery: ${view.detail.recovery.phase.replaceAll("_", " ")}
+      ${view.detail.recovery.detail ? ` · ${view.detail.recovery.detail}` : ""}</p>` : null}
     <p class="run-meta mono"><span>step ${steps} of ${steps}</span><span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
       <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${recordedTurns(view)} turns</span>
       ${link ? html`<a href=${link} target="_blank" rel="noopener noreferrer">PR</a>` : null}</p>
@@ -259,7 +265,7 @@ export class RunFocus extends Component {
       return view.id ? h(Loading, { what: "run" }) : view.settled && !(view.queue ?? []).length ? h(Empty, { what: "No runs yet" }) : h(Loading, { what: "runs" });
     }
     const run = view.detail.run;
-    const group = groupOf(run.status);
+    const group = runGroup(run);
     const { tab, open } = this.state;
     const context = this.actionOf();
     const turns = view.turns;

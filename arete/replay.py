@@ -77,7 +77,7 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     if not isinstance(answer, dict):
         return failed(f"replay: {answer_file} is not one JSON object")
     controller = trace[1].startswith("orchestrate-")
-    if controller and (patched or answer.get("tool_calls")):
+    if (controller or trace[1] == "unblock") and (patched or answer.get("tool_calls")):
         return failed("replay: controller answers cannot apply patches or execute tool calls")
     if controller and "decision" in answer:
         try:

@@ -235,6 +235,15 @@
       },
       "additionalProperties": false
     },
+    "unblock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "repos": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "step": {"$ref": "step_settings.json#/$defs/step"}
+      }
+    },
     "oncall": {
       "type": "object",
       "properties": {

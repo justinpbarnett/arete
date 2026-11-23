@@ -1067,7 +1067,7 @@ def get_task(handler, rest, query):
 
 
 def get_asks(handler, rest, query):
-    return tasks.asks_view()
+    return tasks.asks_view(owner_only=query.get("include_recovery") != "1")
 
 
 def get_health(handler, rest, query):

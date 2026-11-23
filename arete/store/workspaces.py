@@ -451,10 +451,12 @@ def _read_record(source: Path, *, strict: bool = False) -> tuple[dict | None, in
 
 
 def _reconcile(ws: Path, cfg: config.Config | None = None, *,
-               strict: bool = False) -> tuple[dict | None, tuple[int, ...] | None, bool]:
+               strict: bool = False, untracked_only: bool = False) -> tuple[dict | None, tuple[int, ...] | None, bool]:
     with reader() as c:
         row = _decode(c.execute("SELECT * FROM workspaces WHERE name = ? "
                                 "ORDER BY state = 'removed', id DESC LIMIT 1", (ws.name,)).fetchone())
+    if untracked_only and (row is not None or not ws.is_dir() or ws.is_symlink()):
+        return None, None, False
     source = workspace.made_record(ws)
     recorded = _read_record(source, strict=strict)
     version = recorded[2] if recorded else None
@@ -462,6 +464,13 @@ def _reconcile(ws: Path, cfg: config.Config | None = None, *,
         _require_record_version(source, None)
     current = _reconcile_record(ws, row, recorded, cfg)
     return current, version, current is not None and current != row
+
+
+def import_legacy(ws: Path) -> dict | None:
+    """Import a legacy snapshot for a folder with no workspace row history."""
+    migrate_on_demand()
+    with folder_lock(ws):
+        return _reconcile(ws, untracked_only=True)[0]
 
 
 def _legacy_takeover(row: dict, owner: workspace.WorkspaceOwner | None) -> dict | None:

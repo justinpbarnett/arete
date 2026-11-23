@@ -321,6 +321,8 @@ class Server:
         self.deploy_refusals: set[tuple[str, str]] = set()
         self.checkout_update = threading.Lock()
         self.zte_work: Future | None = None
+        self.unblock_work: Future | None = None
+        self.unblock_at = 0.0
         self.zte_at = 0.0
         self.oncall_error = ""
         self.tried: dict[str, float] = {}
@@ -445,6 +447,7 @@ class Server:
         stages = (
             ("forget", self.forget_unpolled_errors, (self.live,)),
             ("oncall", self.watch_oncall, ()), ("zte", self.zte_when_due, ()),
+            ("unblock", self.unblock_when_due, ()),
             ("dispatch", self.dispatch, ({x.name: x for x in reversed(self.every_loop)},)),
             ("approvals", self.approvals, ()), ("rotate", self.rotate_when_due, ()),
             ("prune", self.prune_when_due, ()), ("sweep", self.sweep_when_due, ()),
@@ -478,6 +481,18 @@ class Server:
         if time.monotonic() - self.zte_at >= zte.INTERVAL:
             self.zte_at = time.monotonic()
             self.zte_work = self.pool.submit(zte_delivery.tick, self.cfg)
+
+    def unblock_when_due(self) -> None:
+        from . import unblock, unblock_watch
+
+        if self.unblock_work is not None:
+            if not self.unblock_work.done():
+                return
+            finished, self.unblock_work = self.unblock_work, None
+            finished.result()
+        if time.monotonic() - self.unblock_at >= unblock.INTERVAL:
+            self.unblock_at = time.monotonic()
+            self.unblock_work = self.pool.submit(unblock_watch.watch, self.cfg)
 
     def approvals(self) -> None:
         for released in delivery.release_lapsed():
