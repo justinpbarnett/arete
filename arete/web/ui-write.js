@@ -1,3 +1,4 @@
+import { pairingHelp } from "./browser-auth.js";
 import { webFetch } from "./ui-request.js";
 import { staleWrite } from "./ui-notice.js";
 
@@ -41,6 +42,7 @@ export function isPublication(path, body) {
 
 export async function sendPublication(path, body, onResponse) {
   const fresh = prepareWrite(path, body);
+  if (!crypto.subtle) return sendWrite(fresh, onResponse);
   const fingerprint = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([path, fresh.body])));
   const id = PUBLICATION_PREFIX + Array.from(new Uint8Array(fingerprint), byte => byte.toString(16).padStart(2, "0")).join("");
   const request = publications.get(id) ?? Object.freeze({ ...fresh, key: savedPublication(id) ?? fresh.key });
@@ -74,7 +76,9 @@ export async function sendWrite(request, onResponse = null) {
   const data = await response.json().catch(() => null);
   const valid = data && typeof data === "object" && !Array.isArray(data);
   if (!response.ok) {
-    const error = new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
+    let message = typeof data?.error === "string" ? data.error : `Request failed (${response.status})`;
+    if (response.status === 401 && request.url !== "/api/v1/auth/pairings/claim") message = pairingHelp();
+    const error = new Error(message);
     error.status = response.status;
     error.conflict = response.status === 409 && (data?.code ?? data?.error) === "version_conflict";
     if (error.conflict) staleWrite.value = "This item changed. Review the latest version before trying again.";

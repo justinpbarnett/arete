@@ -5,6 +5,7 @@ import math
 import time
 
 from . import control, events
+from .credential_http import problem
 from .store import db as foundation
 
 
@@ -29,21 +30,24 @@ def stream(handler, query, code):
         raise Refusal(400, str(e)) from None
     accept = handler.headers.get("Accept", "")
     fmt = "json" if "application/json" in accept else "ndjson" if "application/x-ndjson" in accept else "sse"
-    def start(content_type, instance, head):
+    def start(content_type, instance, head, length=None):
         handler.read_seq = head
         handler.send_response(200)
         handler.send_header("Content-Type", content_type)
         handler.send_header("X-Arete-Code", code)
+        if length is not None:
+            handler.send_header("Content-Length", str(length))
         for key, value in (("Cache-Control", "no-store"), ("X-Accel-Buffering", "no"),
                            ("Connection", "close"), ("Arete-Instance", instance)):
             handler.send_header(key, value)
-        handler.end_headers()
-        handler.close_connection = True
+        handler.stream_headers()
         handler.connection.settimeout(30)
 
     started = time.monotonic()
     if fmt == "json":
         while True:
+            if issue := handler.stream_problem():
+                raise problem(issue)
             if handler.verify_controls is not None:
                 handler.verify_controls.poll()
             with foundation.one_read() as c:
@@ -56,8 +60,9 @@ def stream(handler, query, code):
                 else:
                     data = None
             if data is not None:
-                start("application/json", instance, meta["head"])
-                handler.wfile.write(json.dumps(data).encode())
+                block = json.dumps(data).encode()
+                start("application/json", instance, meta["head"], len(block))
+                handler.stream_write(block)
                 return
             seq = top
             time.sleep(min(.25, max(0, timeout - (time.monotonic() - started))))
@@ -70,29 +75,29 @@ def stream(handler, query, code):
     with handler.event_connection() as dropped, foundation.reader(streaming=True) as c:
         start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
 
-        def write(value):
-            handler.wfile.write(value)
-            handler.wfile.flush()
-
         def message(kind, data, ident=None):
             if fmt == "ndjson":
-                write((json.dumps(data) + "\n").encode())
+                handler.stream_write((json.dumps(data) + "\n").encode())
             else:
                 frame = (f"id: {ident}\n" if ident is not None else "")
                 if kind in ("reset", "serve.beat") or query.get("named"):
                     frame += f"event: {kind}\n"
-                write((frame + "data: " + json.dumps(data) + "\n\n").encode())
+                handler.stream_write((frame + "data: " + json.dumps(data) + "\n\n").encode())
 
         beat = started + 15
         try:
             if fmt == "sse":
-                write(b"retry: 2000\n\n")
+                handler.stream_write(b"retry: 2000\n\n")
             while dropped is None or not dropped():
+                if handler.stream_problem():
+                    return
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
                     return
                 for row in rows:
+                    if handler.stream_problem():
+                        return
                     position = f"{epoch}.{row['seq']}"
                     message(row["kind"], events.envelope(c, row, epoch), position)
                     if time.monotonic() >= beat:

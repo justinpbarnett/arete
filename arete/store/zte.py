@@ -121,8 +121,9 @@ def recovery_ready(delivery: Delivery, now: datetime, *, allow_same_day: bool = 
                 and (now.date() > created.date() or (allow_same_day is True and now.date() == created.date())))
 
 
-def same_installation(delivery: Delivery, repo: str, data: dict, *, migrating_recovery: bool = False) -> bool:
-    if delivery.repo != repo or not data.get("github") or data["github"] != delivery.data.get("github"):
+def same_installation(delivery: Delivery, repo: str, data: dict, *, legacy_repo: str | None = None,
+                      migrating_recovery: bool = False) -> bool:
+    if delivery.repo not in (repo, legacy_repo) or not data.get("github") or data["github"] != delivery.data.get("github"):
         return False
     prior = delivery.data.get("approved_installation")
     current = data.get("approved_installation")
@@ -137,7 +138,7 @@ def same_installation(delivery: Delivery, repo: str, data: dict, *, migrating_re
 
 
 def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: str, body: str,
-            data: dict) -> Delivery | None:
+            data: dict, *, legacy_repo: str | None = None) -> Delivery | None:
     with db.tx() as c:
         now = util.now()
         previous = latest()
@@ -151,13 +152,15 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
             return None
         if recovery:
             if not (pinned and recovery == pre_pr_hold(previous)
-                    and same_installation(previous, repo, data, migrating_recovery=allow_same_day)
+                    and same_installation(previous, repo, data, legacy_repo=legacy_repo,
+                                          migrating_recovery=allow_same_day)
                     and recovery_ready(previous, now, allow_same_day=allow_same_day) and base != previous.base
                     and all(issue.get(key) and issue[key] != previous.data["issue"][key] for key in ("number", "node"))):
                 return None
             predecessor = decode(c.execute("SELECT * FROM zte_deliveries WHERE phase = 'healthy' "
                                           "ORDER BY rowid DESC LIMIT 1").fetchone())
-            if predecessor is None or not same_installation(predecessor, repo, data, migrating_recovery=allow_same_day):
+            if predecessor is None or not same_installation(predecessor, repo, data, legacy_repo=legacy_repo,
+                                                           migrating_recovery=allow_same_day):
                 return None
         day = now.date().isoformat()
         if previous and previous.created[:10] == day:
@@ -166,7 +169,8 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
             data = {**data, "same_day_recovery": True}
         if previous and (predecessor.phase != "healthy"
                          or not (predecessor.policy == policy or (pinned and same_installation(
-                             predecessor, repo, data, migrating_recovery=bool(recovery) and allow_same_day)))
+                             predecessor, repo, data, legacy_repo=legacy_repo,
+                             migrating_recovery=bool(recovery) and allow_same_day)))
                          or not predecessor.conformed or base in (predecessor.base, predecessor.conformed)):
             return None
         if issue:
