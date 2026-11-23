@@ -53,20 +53,6 @@ def by_state(state: str) -> list[dict]:
                                                   (state,))]
 
 
-def open_rows() -> list[dict]:
-    with reader() as c:
-        return [_decode(row) for row in c.execute("SELECT * FROM workspaces WHERE state != 'removed' ORDER BY id")]
-
-
-def snapshot_for(name: str) -> tuple[dict | None, dict[str, str]]:
-    with reader() as c:
-        row = _decode(c.execute("SELECT * FROM workspaces WHERE name = ? AND state != 'removed'", (name,)).fetchone())
-        if row:
-            return row, _files(c, row["id"])
-        return _decode(c.execute("SELECT * FROM workspaces WHERE name = ? ORDER BY id DESC LIMIT 1",
-                                 (name,)).fetchone()), {}
-
-
 def files(workspace_id: int) -> dict[str, str]:
     with reader() as c:
         return _files(c, workspace_id)
@@ -206,10 +192,10 @@ def import_record(cfg: config.Config, source: Path, folder: Path) -> dict | None
     made_at = owner.created or run.get("started") or recorded_at
     snapshot = snapshot_fields(made)
     fingerprints = snapshot.pop("files")
-    fields = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.to_row()["checkouts"],
+    fields = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows(),
                   state=state, kept_reason=reason, made_at=made_at,
                   released_at=(run.get("finished") or run.get("started") or made_at) if state == "released" else "",
-                  bytes=workspace.tree_bytes(folder), **snapshot)
+                  bytes=0 if folder.is_symlink() else workspace.tree_bytes(folder), **snapshot)
     return _create(folder.name, _encode(fields), fingerprints, backfill=True)
 
 
@@ -230,7 +216,7 @@ def backfill(cfg: config.Config) -> int:
         if import_record(cfg, source, paths.WORKTREES_DIR / name) is not None:
             imported += 1
             known.add(name)
-    for folder in paths.WORKTREES_DIR.iterdir():
+    for folder in paths.WORKTREES_DIR.glob("*"):
         if folder.name in known or folder.is_symlink() or not folder.is_dir():
             continue
         source = workspace.made_record(folder)

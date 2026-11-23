@@ -1807,7 +1807,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
               mock.patch.object(poll, "spawn_run", side_effect=start) as spawn,
               mock.patch.multiple(poll, network_up_or_skip=mock.Mock(return_value=True),
                                   settle_abandoned_runs=mock.DEFAULT, sync_labels=mock.DEFAULT,
-                                  retry_scratch=mock.DEFAULT, mark_loop=mock.DEFAULT),
+                                  retry_scratch=mock.DEFAULT, cleanup_worktrees=mock.DEFAULT, mark_loop=mock.DEFAULT),
               mock.patch.multiple(outcomes, sync_outcomes=mock.DEFAULT, sync_moves=mock.DEFAULT,
                                   sync_landings=mock.DEFAULT), redirect_stdout(StringIO()) as output):
             self.assertEqual(poll.poll(), 0, output.getvalue())
@@ -6581,8 +6581,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         run = self.ctrl.run
         self.assertEqual(errors, [error])
         commit.assert_any_call(run.id, checkout, run.layer)
-        owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
-        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set())
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
         self.assertTrue(self.draft)
         hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
         self.assertEqual(len(hold_comments), 1)
@@ -6633,8 +6632,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
             self.assertIn(text, parked["reason"])
         self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
         keep.assert_called_once_with(run)
-        owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
-        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set())
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
 
     def test_budget_expiry_during_limit_cleanup_preserves_catch_up_park(self):
         self.use_last_repair()

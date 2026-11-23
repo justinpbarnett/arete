@@ -54,7 +54,6 @@ from . import (
     tracker,
     util,
     webpush,
-    workspace,
 )
 from .loops import Loop
 from .store import approvals as approvals_store
@@ -492,7 +491,7 @@ class Server:
 
     def sweep_when_due(self) -> None:
         if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
-            self.sweep = self.pool.submit(self.sweep_leftovers, self.cfg)
+            self.sweep = self.pool.submit(self.sweep_vms)
             self.swept = time.monotonic()
 
     def expire_asks(self) -> None:
@@ -856,13 +855,6 @@ class Server:
     def sweeping(self) -> bool:
         return bool(self.sweep) and not self.sweep.done()
 
-    def sweep_leftovers(self, cfg: config.Config) -> None:
-        try:
-            workspace.cleanup_worktrees(cfg=cfg)
-        except Exception as e:
-            self.say(f"sweeping worktrees failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
-        self.sweep_vms()
-
     def sweep_vms(self) -> None:
         try:
             devices.sweep(self.sweep_log)
@@ -1003,7 +995,7 @@ class Server:
         if self.oncall and not self.oncall.done():
             return "an on-call scan is still running"
         if self.sweeping():
-            return "a workspace and VM sweep is still running"
+            return "a sweep of left-over VMs is still running"
         if dashboard.POSTS_IN_FLIGHT.active():
             return "the dashboard is still answering a request"
         if chat.any_busy():

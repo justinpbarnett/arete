@@ -1803,7 +1803,7 @@ class PollFixture(Isolated):
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
                 patch.object(poll, "retry_scratch"), \
-                patch.object(poll, "mark_loop"), \
+                patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return poll.poll(dry_run=dry_run)
 
@@ -4114,6 +4114,7 @@ class EnvironmentRequeueTests(Isolated):
             (gh, "default_branch", lambda repo: "main"),
             (poll, "network_up_or_skip", lambda *args: True),
             (poll, "mark_loop", lambda *args: None),
+            (poll, "cleanup_worktrees", lambda **kwargs: None),
             (outcomes, "sync_outcomes", lambda cfg: None),
             (outcomes, "sync_moves", lambda cfg: None),
             (outcomes, "sync_landings", lambda cfg: None),

@@ -121,9 +121,11 @@ class WorkspaceOwner:
         return cls(row.get("run") or "", row["repo"], str(row["ticket"]), row.get("created") or "", checkouts)
 
     def to_row(self) -> dict:
-        checkouts = [c.to_row() for c in self.checkouts]
         return {"run": self.run, "repo": self.repo, "ticket": self.ticket, "created": self.created,
-                "checkouts": [{k: c[k] for k in OWNER_CHECKOUT_FIELDS} for c in checkouts]}
+                "checkouts": self.checkout_rows()}
+
+    def checkout_rows(self) -> list[dict]:
+        return [{k: row[k] for k in OWNER_CHECKOUT_FIELDS} for row in (c.to_row() for c in self.checkouts)]
 
 
 @dataclass
@@ -258,9 +260,10 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, excluded: Collectio
     made = made_before(ws)
     if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made):
         return Release("held", names)
-    for c in checkouts:
+    for index, c in enumerate(checkouts):
+        target_last = checkouts[:index] + checkouts[index + 1:] + [c]
         with util.repo_lock(c.src):
-            if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made):
+            if names := workspace_blockers(ws, target_last, excluded=excluded, made=made, target=c):
                 return Release("held", names)
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
     if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made, after_removal=True):
@@ -269,7 +272,7 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, excluded: Collectio
         return Release("removed")
     shutil.rmtree(ws, ignore_errors=True)
     if os.path.lexists(ws):
-        return Release("held", workspace_blockers(ws, checkouts, made=made, after_removal=True) or ["."])
+        return Release("held", workspace_blockers(ws, checkouts, made=made, after_removal=True))
     made_record(ws).unlink(missing_ok=True)
     for c in checkouts:
         with util.repo_lock(c.src):
@@ -282,39 +285,94 @@ def recorded(made: dict, base: Path, name: str, prefix: str = "") -> bool:
     return bool(salt) and made.get(prefix + name) == fingerprint(base / name, salt)
 
 
+def unverified(made: dict, base: Path, name: str, prefix: str = "") -> bool:
+    try:
+        return prefix + name not in made or not recorded(made, base, name, prefix)
+    except OSError:
+        return True
+
+
 def outside_blockers(ws: Path, made: dict, examined: set[Path]) -> list[str]:
     try:
-        return [n for n in unexamined(ws, examined) if not recorded(made, ws, n)]
+        return [n for n in unexamined(ws, examined) if ws / n not in examined and unverified(made, ws, n)]
     except OSError:
         return ["."]
 
 
+def checkout_attachment(ws: Path, wt: Path) -> tuple[bool, Path | None]:
+    if not wt.is_relative_to(ws):
+        return False, wt
+    parts = wt.relative_to(ws).parts
+    if ".." in parts:
+        return False, wt
+    path = ws
+    try:
+        for path in reversed((wt, *wt.parents[:len(parts)])):
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                return False, path
+        path = wt / ".git"
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False, None
+    except (OSError, ValueError):
+        return False, path
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        return False, path
+    return True, None
+
+
 def checkout_blockers(c: Checkout, made: dict, edits: bool) -> list[str]:
     try:
-        loose = sorted(untracked_files(c.wt))
-        if edits:
-            loose += uncommitted(c.wt, tracked_only=True)
-        found = [*ignored_files(c.wt), *loose]
-        return [c.prefix + n for n in dict.fromkeys(found) if not recorded(made, c.wt, n, c.prefix)]
+        found = (uncommitted(c.wt) + ignored_files(c.wt) if edits
+                 else ignored_files(c.wt) + sorted(untracked_files(c.wt)))
+        return [c.prefix + n for n in dict.fromkeys(found) if unverified(made, c.wt, n, c.prefix)]
     except (OSError, RuntimeError):
         return [c.dir or "."]
 
 
 def workspace_blockers(ws: Path, checkouts: list[Checkout], edits: bool = False, *,
                        excluded: Collection[Path] = (), made: dict | None = None,
-                       after_removal: bool = False) -> list[str]:
+                       after_removal: bool = False, target: Checkout | None = None) -> list[str]:
     held = scratch_left(ws, checkouts)
     names = [str(p) for p in held]
-    if ws in held or ws.is_symlink():
+    try:
+        unsafe_root = not stat.S_ISDIR(ws.lstat().st_mode)
+    except FileNotFoundError:
+        unsafe_root = False
+    except OSError:
+        unsafe_root = True
+    if unsafe_root:
         return list(dict.fromkeys([*names, str(ws)]))
-    names += [str(wt) for wt in sorted(excluded)
-              if any(wt.resolve().is_relative_to(c.wt.resolve()) for c in checkouts)]
-    attached = [] if after_removal else [c for c in checkouts if c.wt not in held and (c.wt / ".git").exists()]
+    for wt in sorted(excluded):
+        try:
+            overlaps = any(wt.resolve().is_relative_to(c.wt.resolve()) for c in checkouts)
+        except (OSError, RuntimeError, ValueError):
+            overlaps = True
+        if overlaps:
+            names.append(str(wt))
     made = made_before(ws) if made is None else made
-    examined = {c.wt for c in attached}
-    names += outside_blockers(ws, made, examined.union(excluded, held))
-    for c in attached:
-        names += checkout_blockers(c, made, edits)
+    examined = set()
+    if not after_removal:
+        for c in checkouts:
+            attached, unsafe = checkout_attachment(ws, c.wt)
+            if unsafe is not None:
+                names.append(str(unsafe))
+            if attached:
+                examined.add(c.wt)
+    containers = {ws, *(c.wt for c in checkouts)}
+    names += outside_blockers(ws, made, examined.union(excluded, set(held) - containers))
+    if not after_removal:
+        for c in checkouts:
+            attached, unsafe = checkout_attachment(ws, c.wt)
+            if unsafe is not None:
+                names.append(str(unsafe))
+                continue
+            if attached:
+                names += checkout_blockers(c, made, edits)
+            if c is target:
+                still_attached, unsafe = checkout_attachment(ws, c.wt)
+                if unsafe is not None or still_attached != attached:
+                    names.append(str(unsafe or c.wt))
     return list(dict.fromkeys(names))
 
 
@@ -425,7 +483,7 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None 
               *, preserve: Collection[str] = (), excluded: Collection[Path] = ()) -> None:
     try:
         before = made_before(ws) if excluded or not owner else {}
-        owner = owner or owner_in(before)
+        owner_row = owner.to_row() if owner else before.get(OWNER_KEY)
         salt = salt_of(before) if excluded else ""
         excluded_records = {n: digest for n, digest in before.items() if salt and not n.startswith("\0")
                             and any((ws / n).is_relative_to(wt) for wt in excluded)}
@@ -442,8 +500,8 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None 
         if names or heads or excluded_records:
             salt = salt if excluded_records else os.urandom(16).hex()
             made = excluded_records | {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
-            if owner:
-                made[OWNER_KEY] = owner.to_row()
+            if isinstance(owner_row, dict) and owner_row:
+                made[OWNER_KEY] = owner_row
             if held:
                 made[RETAINED_KEY] = retained(ws, checkouts, names, held)
             made_record(ws).parent.mkdir(parents=True, exist_ok=True)
@@ -511,12 +569,12 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
     return ""
 
 
-def scratch_failure(why: str, ws: Path, held: list[Path]) -> RunFailed:
+def scratch_failure(why: str, ws: Path, held: list[Path], *, held_by: list[str] | None = None) -> RunFailed:
     records = [p for p in held if p.parent == sandbox.AUTHORITY]
     selectors = sorted({p.stem for p in records if scratch.SELECTOR_FILE.fullmatch(p.name)})
     unidentifiable = sandbox.AUTHORITY in held or any(not scratch.SELECTOR_FILE.fullmatch(p.name) for p in records)
     return RunFailed(why, recovery={"reason": "scratch", "workspace": str(ws), "selectors": selectors,
-                                    "unidentifiable_record": unidentifiable})
+                                    "unidentifiable_record": unidentifiable}, held_by=held_by)
 
 
 def worktree_failure(why: str, ws: Path, branch: str) -> RunFailed:
@@ -542,11 +600,8 @@ def removal_failure(ws: Path, checkouts: list[Checkout], release: Release) -> Ru
     if release.held_by:
         why += f" ({', '.join(release.held_by[:5])})"
     if left := scratch_left(ws, checkouts):
-        failure = scratch_failure(why, ws, left)
-    else:
-        failure = RunFailed(why, recovery={"reason": "worktree-removal", "workspace": str(ws)})
-    failure.held_by = release.held_by
-    return failure
+        return scratch_failure(why, ws, left, held_by=release.held_by)
+    return RunFailed(why, recovery={"reason": "worktree-removal", "workspace": str(ws)}, held_by=release.held_by)
 
 
 def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str]:
@@ -653,8 +708,6 @@ def owner_of(d: Path, cfg: config.Config) -> WorkspaceOwner | None:
 
 
 def tree_bytes(d: Path) -> int:
-    if d.is_symlink():
-        return 0
     total = 0
     for root, dirs, files in os.walk(d):
         for n in dirs + files:
