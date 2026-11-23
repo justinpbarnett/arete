@@ -2466,7 +2466,7 @@ class OwnerAnswerBudgetFixture(PollFixture):
                 tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
         with patch.object(util, "now", return_value=datetime(2026, 1, 15, tzinfo=UTC)), \
                 patch.object(config, "load", return_value=self.cfg), \
-                patch.object(tasks, "kept_folder_removed", return_value=True):
+                patch.object(tasks, "kept_folder_removed", return_value=workspace.Release("removed")):
             self.assertEqual(len(tasks.expire_asks(self.cfg)), 1)
         self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "expired")
         self.assertIn("Reply here and remove", self.local.get(self.ticket).comments)
