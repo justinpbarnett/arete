@@ -4503,7 +4503,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 fixture_blocker = "Verification scratch resources remain unresolved; the workspace is retained."
                 run.log(retained_line(step, attempt))
         finally:
-            restore_worktrees(untracked_before, evidence)
+            removed = restore_worktrees(untracked_before, evidence)
     if probes and probes.verdict != "pass":
         verified = probes
     elif replay_only:
@@ -4512,7 +4512,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                    blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
         if not drivers:
-            return verified
+            return save_verification(run, step, verified, removed) if removed else verified
     else:
         verified = verify.Verified.from_agent(res.structured)
     if probes and probes.verdict == "pass" and not replay_only:
@@ -4522,10 +4522,14 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         verified.native_trees = checked_trees
-    return save_verification(run, step, verified)
+    return save_verification(run, step, verified, removed if agent_started else 0)
 
 
-def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
+def save_verification(run: Run, step: str, verified: verify.Verified, removed: int = 0) -> verify.Verified:
+    if removed:
+        cleanup = (f"Arete removed {util.count(removed, 'untracked file')} that verification added to the worktree, "
+                   "after verification ended. None is left behind.")
+        verified.summary = "\n\n".join(filter(None, (verified.summary, cleanup)))
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
@@ -4563,8 +4567,9 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "and read the status and body.")
 
 
-def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
+def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> int:
     view = workspace.scratch_view()
+    removed = 0
     for d, name in untracked_added_since(untracked_before):
         f = d / name
         if workspace.record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
@@ -4572,10 +4577,13 @@ def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) ->
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
+            existed = f.exists(follow_symlinks=False)
             workspace.remove_untracked(d, name)
+            removed += existed
     for d in untracked_before:
         if not workspace.record_holds(view, d):
             git(["checkout", "-q", "--", "."], d)
+    return removed
 
 
 def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) -> dict[str, str]:

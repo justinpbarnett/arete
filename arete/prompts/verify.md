@@ -65,6 +65,7 @@ $journeys## Rules
   off goes in `checks` with `passed` false and `cause` `environment`. When the step is essential to know
   whether the change works, return `blocked` and name the step and what stopped you in `blocked_by`.
 - Do not edit the repo's files and do not fix what you find; fixtures in the scratch folder are not edits to the change. Arete gives your findings to the builder.
+- Arete removes untracked files you made in the worktree when verification ends. Do not report those files as left behind.
 - Never run git commands that write. Arete deletes the `__pycache__` your commands leave, so do not report it.
 - A problem that is also on the base branch is not a failure of this change. Note it in `saw` and do not fail it.
 
