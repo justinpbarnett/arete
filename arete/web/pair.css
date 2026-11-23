@@ -1,0 +1,7 @@
+.credential-page { max-width: 44rem; margin: 2rem auto; padding: 0 1rem 3rem; }
+.credential-page label { display: block; margin: .65rem 0; }
+.credential-page input { display: block; width: min(100%, 30rem); }
+.credential-page ul { list-style: none; padding: 0; }
+.credential-page li { border-top: 1px solid currentColor; padding: .65rem 0; }
+.credential-page button { margin-inline-end: .5rem; }
+.credential-secret input { font-family: monospace; width: 100%; }

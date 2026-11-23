@@ -74,7 +74,7 @@ def serve_command() -> list[str]:
 
 def serve_environment() -> dict[str, str]:
     return {"ARETE_CONFIG_DIR": str(paths.CONFIG_DIR), "ARETE_STATE_DIR": str(paths.STATE_DIR),
-            "ARETE_LOG_DIR": str(paths.LOG_DIR)}
+            "ARETE_LOG_DIR": str(paths.LOG_DIR), "XDG_STATE_HOME": str(paths.CLIENT_DIR.parent.absolute())}
 
 
 def serve_plist() -> dict:

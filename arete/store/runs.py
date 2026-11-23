@@ -600,7 +600,7 @@ def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **
 
 def ask_stop(run_id: str, base_version=None) -> dict | None:
     with writes.atomic():
-        row = writes.check_run(run_id, base_version)
+        row = writes.check_run(run_id, base_version, for_stop=True)
         if not row or row["status"] != "running":
             return row
         if row["stop_asked"]:
@@ -609,7 +609,7 @@ def ask_stop(run_id: str, base_version=None) -> dict | None:
                                         "current version (legacy or expired history); a repeated stop cannot "
                                         "be acknowledged with an audit receipt.")
             return row
-        return writes.update("runs", run_id, {"stop_asked": util.iso()}, base_version=base_version,
+        return writes.update("runs", run_id, {"stop_asked": util.iso()}, base_version=row["version"],
                              expect=("running",))
 
 

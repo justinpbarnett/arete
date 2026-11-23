@@ -8,6 +8,17 @@ from unittest.mock import patch
 from arete import install
 
 
+class ServeEnvironmentTests(unittest.TestCase):
+    def test_services_use_the_cli_state_home(self):
+        state_home = Path("custom state 50%").absolute()
+        with patch.object(install.paths, "CLIENT_DIR", state_home / "arete-client"):
+            plist = install.serve_plist()
+            unit = install.serve_unit()
+        self.assertEqual(plist["EnvironmentVariables"]["XDG_STATE_HOME"], str(state_home))
+        escaped = str(state_home).replace("%", "%%")
+        self.assertIn(f'Environment="XDG_STATE_HOME={escaped}"', unit.splitlines())
+
+
 class LaunchdReinstallTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(install, "AGENTS_DIR", Path(__file__).parent))

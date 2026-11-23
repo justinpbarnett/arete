@@ -2343,8 +2343,8 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local task Board, and live Health.
 The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
-A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
-Admission maps the whois login through `principal_logins` to an active human principal.
+Unpaired browsers can read when their tailnet login maps through `principal_logins` to an active person. A valid bearer token also admits a client on a tagged host.
+Changes require a bearer token with the relevant scope or a paired browser session. The dashboard sends `X-Arete: 1` with its session writes.
 `[dashboard] owner` seeds the first person once; if empty, the seed uses the node's own login.
 The person gets a random `u:` id and the Tailscale display name (or the login's local part).
 Editing `owner` after seeding changes neither admission nor the person's login binding.
@@ -2374,14 +2374,23 @@ HTTPS is off until the owner turns it on with `https = true` under `[dashboard]`
 With it on, the dashboard answers over HTTPS on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
 The certificate and key are `dashboard.crt` and `dashboard.key` in the state folder, mode 0600; arete fetches them at start and every week, and keeps the old ones when a renewal fails.
 The first fetch makes Tailscale issue a public certificate, which lists the machine and tailnet name in public certificate transparency logs, and that cannot be undone.
-With HTTPS on, plain HTTP on the same port answers 308 and redirects to HTTPS, so webhook senders should use the HTTPS address.
-Admission is the same over HTTPS: the host must be the tailnet name or address, the login must be the owner's, and a change needs `X-Arete`.
+With HTTPS on, ordinary HTTP requests to the same port redirect with 308. Use the HTTPS address for webhooks and credential routes.
+Use the tailnet name or address in the Host header. HTTPS is required to pair a browser, issue a token, or rotate one. Bearer tokens also authorize ordinary API calls when the dashboard uses HTTP.
 `tailscale cert` writes the certificate and key to stdout, which the Mac App Store app also runs.
 On Linux it needs root or the Tailscale operator: run `sudo tailscale set --operator=$USER` once for the user that runs arete.
 When no certificate comes, the dashboard serves plain HTTP on the tailnet addresses with the reason and tries again every hour.
 arete never makes, changes or removes a `tailscale serve` mapping. A mapping on the dashboard port takes that port's tailnet traffic and is named in the start line.
 A second dashboard on the same state folder and port waits and changes nothing.
 With HTTPS on, scratch state asks for no certificate.
+
+### Pair a browser and log in a CLI
+
+1. Set `https = true` under `[dashboard]`. Once serve has a TLS listener, run `arete pair` on the serve host for the first pairing. Open the link in a browser signed in to the same tailnet login and submit the six-digit code. The code expires after five minutes.
+2. In a paired dashboard, open **Pair a device and manage tokens**. Use **Pair a device** for another browser or **Issue a token** for another CLI or script. Choose the scopes it needs, such as `read` and `task:write`. Copy the token when it is displayed. This page also rotates or revokes tokens and signs out the browser.
+3. On the CLI host, point `ARETE_SERVER` or `[server] url` at the dashboard's HTTPS address. Pipe the issued token into `arete login --token-stdin`. The CLI validates the token and stores it in a mode 0600 `<tag>.token` file under `$XDG_STATE_HOME/arete/client/` (default `~/.local/state/arete/client/`). Run `arete logout` to revoke that token and remove its local copy.
+
+Serve provisions its own CLI token at startup. A restore invalidates issued tokens and browser sessions while keeping the instance ID. After serve starts again, use the new owner CLI token to run `arete pair` again.
+
 Over HTTPS the page can be added to the Home Screen of a phone, where it opens as the app Arete without browser chrome.
 
 Notifications: Settings has an Allow notifications button, a list of subscribed devices with a Remove control, and Send a test. On an iPhone the app must be added to the Home Screen first and opened from there, and the permission is asked only after a tap. An ask that goes to the owner sends one Web Push to every subscribed device, and one reminder follows after `[ask] remind_hours` if it is still open; an ask that JEV settles sends none. The push service receives an empty POST and a signed VAPID token naming the push service's origin and the contact (`[ask] push_contact`, else the owner's login when it is an email), never question text. The service worker then reads `/api/asks` from arete itself and shows the repo, the ticket and the first question's header, or "Arete is waiting on you" when that fails; the notification's tag is the ask id, so a reminder replaces the earlier one, and a tap opens `/#ask/ID`. The signing key pair is made once with the `openssl` CLI and kept in the state folder as `webpush.key` with mode 0600. A 404 or 410 from a push service removes that device. The desktop notification still fires.
@@ -2541,7 +2550,7 @@ For the opt-in hook, the corresponding file paths are `ARETE_API_USAGE` and `ARE
 
 #### Route reference
 
-These routes pass the same caller check as the page, and a POST needs the `X-Arete: 1` header.
+These routes use the same credential checks as the dashboard. Send `Authorization: Bearer $ARETE_TOKEN` from scripts. The paired dashboard sends `X-Arete: 1` for session writes to its own origin.
 A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
 Send JSON bodies with `Content-Type: application/json` and a single `Content-Length`.
 Unkeyed legacy routes still accept an omitted media type, or no length for an empty body, but a supplied unsupported media type now returns 415.
@@ -2573,7 +2582,7 @@ These routes steer a ticket's run. The first four answer `{"task", "repo", "run"
 
 - `POST /api/runs/RUN_ID/answer` with `{"text": "..."}` answers the question of a run that ended `needs-info`. It stores the answer on the ticket, as the owner's reply on a local task, a comment on a GitHub issue, which then loses its `needs-info` label, or a comment on a Jira ticket, and keeps it in the run's folder as `answer.md`. Then it starts the ticket's next run, whose `answer` line carries the `text`. A run of the ticket going on, or no free slot, refuses with 409 before the answer is stored. A label GitHub would not remove is named in `why`, and the run starts anyway.
 - `GET /api/incidents` returns `watcher` (`state` is `on`, `switched_off` or `disabled`; `config`, `last_scan`, `ok`, `detail`, `expected`, `switched`) and `incidents`, open first and then the newest, each with its state, phase, class, source, signature, `first_seen`, `last_seen`, `count`, decision, confidence, reason, `recovery`, `closed` and the `decision_line` and `repair_line`, never its evidence. `GET /api/incidents/ID` returns one as `incident` with the redacted `evidence`, `answers`, the newest 500 `notes` (`ts`, `note`) and `notes_total`, its `repairs` (each with its `runs`: `id`, `status`, `started`, `finished`, `pr_url`, `paid`), the total `paid`, and `can` (`dismiss`, `retry`, `cancel`). An unknown or non-numeric id answers 404.
-- `POST /api/incidents/ID/dismiss`, `/retry` and `/cancel` do what `arete oncall dismiss`, `retry` and `cancel` do and answer as they print. `POST /api/incidents/switch` takes `{"on": true}` or `{"on": false}` and answers `{"wakes": "on"}` or `{"wakes": "off"}`. An unknown id answers 404, a refused action or a body without a boolean 400, and a missing `X-Arete` header 403. `GET /api/health` also carries `incidents`, the blocked incidents.
+- `POST /api/incidents/ID/dismiss`, `/retry` and `/cancel` do what `arete oncall dismiss`, `retry` and `cancel` do and answer as they print. `POST /api/incidents/switch` takes `{"on": true}` or `{"on": false}` and answers `{"wakes": "on"}` or `{"wakes": "off"}`. An unknown id answers 404, and a refused action or a body without a boolean answers 400. `GET /api/health` also carries `incidents`, the blocked incidents.
 - `GET /api/asks` lists the open asks, oldest first, each with `id`, `repo`, `ticket`, `run`, `step`, `asked`, `why`, `tried`, `questions` and `reminded` (empty until the reminder push). Asks of a run that is not the ticket's latest are left out.
 - `GET /api/push` returns the public `key` and the subscribed `devices` (`id`, `label`, `created`, `last_success`; never an endpoint or key). `POST /api/push/subscribe` takes `{"endpoint", "keys": {"p256dh", "auth"}, "label"}`, `POST /api/push/remove` takes `{"id"}`, and `POST /api/push/test` pushes to every device and returns `sent`, `removed` and `failed`; each returns the device list.
 - `POST /api/asks/ASK_ID/answer` answers a parked ask with `{"answers": [...]}`, one entry per question (`{"choice": "label" or number or list"}`, `{"text": "..."}`, `{"done": true}` or `{"declined": true}`; `null` takes the first option of a choice when `"recommended": true` is set), with `{"recommended": true}` alone for an ask of choices only, or with `{"stop": true}`. A secret question takes `{"secret": "VALUE"}` or `{"declined": true}`; the value is stored for the repo and never logged or echoed in an error, and a refused answer stores nothing. An answer, once the run's last open ask has one, continues the run and prints the new run; 404 for no such ask, 400 for a closed ask, a run that is not the ticket's latest, or bad input, 409 while a run of the ticket is going.
@@ -2598,11 +2607,11 @@ The feedback draft has nine routes. Each answers `{"draft", "limits", "kinds", "
 - `POST /api/capture/evidence/ID/drop` removes one item and its file. An unknown id still answers 200.
 
 ```sh
-curl -H 'X-Arete: 1' -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' http://HOST:PORT/api/tasks
-curl 'http://HOST:PORT/api/runs/RUN_ID/events?follow=1'
-curl -H 'X-Arete: 1' -d '{"text": "Put the toggle in the header."}' http://HOST:PORT/api/runs/RUN_ID/answer
-curl -H 'X-Arete: 1' -d '{"step": "verify"}' http://HOST:PORT/api/runs/RUN_ID/resume
-curl -H 'X-Arete: 1' --data-binary @shot.png 'http://HOST:PORT/api/capture/evidence?name=shot.png&source=attached'
+curl -H "Authorization: Bearer $ARETE_TOKEN" -d '{"repo": "web", "prompt": "Add a dark mode toggle."}' https://NAME:PORT/api/tasks
+curl -H "Authorization: Bearer $ARETE_TOKEN" 'https://NAME:PORT/api/runs/RUN_ID/events?follow=1'
+curl -H "Authorization: Bearer $ARETE_TOKEN" -d '{"text": "Put the toggle in the header."}' https://NAME:PORT/api/runs/RUN_ID/answer
+curl -H "Authorization: Bearer $ARETE_TOKEN" -d '{"step": "verify"}' https://NAME:PORT/api/runs/RUN_ID/resume
+curl -H "Authorization: Bearer $ARETE_TOKEN" --data-binary @shot.png 'https://NAME:PORT/api/capture/evidence?name=shot.png&source=attached'
 ```
 
 ### From the CLI
@@ -2627,7 +2636,7 @@ These commands contact serve and print JSON. All but `task show` print one JSON 
 | `arete stop RUN_ID` | `POST /api/v1/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-The CLI looks for `ARETE_SERVER` first, then `url` in the `[server]` section of `config.toml`. Set either to `https://NAME:PORT` or `http://HOST:PORT`. With neither set, the CLI reads `server.json` in its state folder and checks that the named process is live and uses the same state folder and config file. HTTPS verifies the server certificate, and HTTP follows the dashboard's HTTPS upgrade. On first connection the CLI saves the server's instance ID for that URL under the config directory. Each invocation checks the instance and sends the verified ID in `X-Arete-Instance` on every write attempt. Serve rejects a mismatched ID before acting on the write or looking up its idempotency key.
+The CLI looks for `ARETE_SERVER` first, then `url` in the `[server]` section of `config.toml`. Set either to `https://NAME:PORT` or `http://HOST:PORT`. With neither set, the CLI reads `server.json` in its state folder and checks that the named process is live and uses the same state folder and config file. HTTPS verifies the server certificate. The CLI follows the dashboard's HTTPS upgrade during discovery. It first fetches `Arete-Instance` from `/api/v1/meta` without a bearer and saves that ID for the URL under the config directory. It refuses a changed ID, uses the first eight characters of the ID to find its stored token, and sends the verified ID in `X-Arete-Instance` on writes. Serve checks that ID before acting on the write or looking up its idempotency key.
 
 Failed server commands print one JSON error line and exit 1. An unreachable server reports `reason: "server_down"` and names the URL. Server-backed commands require serve. To read the local store, use `task show --offline`, `lines --offline` or `status --offline`. Each JSON line from those reads includes `"source": "local"`. When a stream drops, `wait`, `lines --follow` and `arete run` reconnect from the last line they read. They report an error when the run ended without a report or when two minutes pass without a line. During code reload the CLI retries a 503 with `Retry-After` and any ensuing refused connections for up to 30 seconds, keeping the write's idempotency key. If the deadline expires the command reports the 503.
 

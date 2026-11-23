@@ -1856,8 +1856,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                               and layer.factory_path == ORCHESTRATED,
                               "the one-shot task requires the approved first scheduled orchestration")
                 wall_deadline = permit["deadline"]
+            issue_state = None
             if isinstance(tk, tracker.GitHubTracker):
-                tk.require_ordinary(tid)
+                issue = gh.issue(repo.github, int(tid)) or {}
+                labels = issue.get("labels")
+                if any(label["name"] == tracker.ZTE_LABEL for label in labels or ()):
+                    raise tracker.TaskError(tracker.ZTE_QUEUE)
+                if labels is not None:
+                    issue_state = issue.get("state")
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             latest = budget_history[0] if budget_history else None
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
@@ -1896,8 +1902,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
-        with slots.admitting(wait=zte_grant is None) as admitting:
-            if not admitting:
+        with ExitStack() as slot_admission:
+            if not slot_admission.enter_context(slots.admitting(wait=zte_grant is None)):
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
@@ -1906,8 +1912,25 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
                 elif not due or zte_store.activation_pending():
-                    print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
-                          f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+                    slot_admission.close()
+                    can_queue = not zte_grant and issue_state in ("OPEN", "CLOSED", "MERGED")
+                    if can_queue and issue_state != "OPEN":
+                        prepare_reads_feedback = (script and script.path in ("feature", "patch")
+                                                  and not (script.repairs or only))
+                        can_queue = not (feedback or (prepare_reads_feedback and pending_feedback(repo.name, tid)))
+                    refusal = f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}."
+                    if can_queue:
+                        try:
+                            with db.tx(timeout=0.5):
+                                source_store.pass_over(repo.name, str(tid))
+                        except sqlite3.OperationalError:
+                            print(f"{refusal} Ticket could not be queued for the next poll because the database "
+                                  "was busy. Start the ticket again.")
+                        else:
+                            print(f"{refusal} Ticket queued for the next poll.")
+                    else:
+                        print(f"{refusal} Wait for a run to finish or raise max_parallel in "
+                              f"{paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]

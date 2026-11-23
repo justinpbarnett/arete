@@ -539,6 +539,122 @@ class QueueScoringTests(unittest.TestCase):
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
 
 
+class PipelineNoSlotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        cls.template = cls.state / "template.db"
+        with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
+                                  LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
+                                  LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
+            db.migrate()
+
+    def setUp(self):
+        root = self.state / self._testMethodName
+        root.mkdir()
+        shutil.copyfile(self.template, root / "arete.db")
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
+                                             RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
+                                             WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
+        paths.ensure_dirs()
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", root, github=remote, layer=root, parts=[config.Part("", remote)])
+        cfg = config.Config(repos=[self.repo], max_parallel=1)
+        self.enterContext(mock.patch.object(config, "load", return_value=cfg))
+        self.enterContext(mock.patch.multiple(pipeline.scratch, process_ids=set, service_labels=set))
+
+    def refused_child(self, issue, *, tid="765", path="orchestrate", status=1):
+        def no_slots(_):
+            read_issue.side_effect = AssertionError("tracker read after the slot check")
+            return 0
+
+        script = pipeline.Script(path, mock.Mock(side_effect=AssertionError("started without a slot")))
+        log = paths.LOG_DIR / pipeline.RUNS_LOG
+        with (
+            mock.patch.object(gh, "issue", return_value=issue) as read_issue,
+            mock.patch.object(slots, "slots_free_to_start", side_effect=no_slots) as free_slots,
+            mock.patch.object(slots.RunSlot, "hold") as hold_slot,
+            log.open("w") as stdout,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(pipeline.run_issue("fixture", tid, force=True, script=script), status)
+        if issue is None:
+            read_issue.assert_not_called()
+        else:
+            read_issue.assert_called_once_with(self.repo.github, int(tid))
+        if status == 1:
+            free_slots.assert_called_once_with(1)
+        else:
+            free_slots.assert_not_called()
+        hold_slot.assert_not_called()
+        return log.read_text().strip()
+
+    def record_feedback(self, path="orchestrate", tid="765"):
+        url = f"https://github.com/{self.repo.github}/pull/{tid}"
+        run = record.start("pipeline", repo=self.repo.name, issue=tid)
+        self.assertTrue(record.move(run, "pr", ("running",), pr_url=url))
+        with redirect_stdout(StringIO()):
+            pipeline.run_lines.write(run, "execution", path=path)
+        pipeline.insights_store.add_feedback([dict(pr_url=url, kind="comment", gh_id=1, repo=self.repo.name, issue=tid,
+                                                   body="Please revise", created="2026-01-01T00:00:00Z",
+                                                   status="new", pr_state="OPEN")])
+
+    def assert_original_refusal(self, line, name="fixture#765"):
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, f"{name} was not started: no run slot is free (max_parallel 1). "
+                               "Wait for a run to finish or raise max_parallel in "
+                               f"{paths.short_path(paths.CONFIG_FILE)}.")
+
+    def test_no_slot_queues_ticket_for_next_poll(self):
+        line = self.refused_child({"state": "OPEN", "labels": []})
+        row, = pipeline.source_store.tickets_passed_over()
+        self.assertEqual((row["repo"], row["issue"]), ("fixture", "765"))
+        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
+                               "Ticket queued for the next poll.")
+
+    def test_no_slot_refuses_promptly_when_database_is_busy(self):
+        with closing(sqlite3.connect(paths.DB_FILE)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            line = self.refused_child({"state": "OPEN", "labels": []})
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2)
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
+                               "Ticket could not be queued for the next poll because the database was busy. "
+                               "Start the ticket again.")
+
+    def test_zte_label_keeps_original_refusal(self):
+        line = self.refused_child({"state": "OPEN", "labels": [{"name": tracker.ZTE_LABEL}]}, status=2)
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, f"could not read fixture#765: {tracker.ZTE_QUEUE}")
+
+    def test_closed_issue_with_pr_feedback_is_not_queued(self):
+        self.record_feedback()
+        self.assert_original_refusal(self.refused_child({"state": "CLOSED", "labels": []}))
+
+    def test_closed_issue_with_feedback_in_recorded_flow_is_not_queued(self):
+        for tid, flow in (("765", "feature"), ("766", "patch")):
+            with self.subTest(flow=flow):
+                self.record_feedback(path=flow, tid=tid)
+                path = pipeline.dispatch_path(self.repo, tid)
+                self.assertEqual(path, flow)
+                line = self.refused_child({"state": "CLOSED", "labels": []}, tid=tid, path=path)
+                self.assert_original_refusal(line, name=f"fixture#{tid}")
+
+    def test_missing_github_metadata_keeps_original_refusal(self):
+        for issue in ({"state": "OPEN"}, {"labels": []}):
+            with self.subTest(issue=issue):
+                self.assert_original_refusal(self.refused_child(issue))
+
+    def test_jira_without_metadata_keeps_original_refusal(self):
+        self.repo.tracker = "jira"
+        with mock.patch.object(tracker.JiraTracker, "client", new_callable=mock.PropertyMock,
+                               side_effect=AssertionError("unexpected Jira tracker read")) as client:
+            self.assert_original_refusal(self.refused_child(None, tid="FIX-765"), name="fixture FIX-765")
+        client.assert_not_called()
+
+
 class PolicyRetryCapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -8669,6 +8785,68 @@ class CommandConfinementTests(unittest.TestCase):
             exception = f"RESTORE0={sandbox.real_path(paths.PACKAGE_DIR) / filename}"
             self.assertEqual([arg for arg in command if arg.startswith("RESTORE")], [exception])
             self.assertEqual(command[command.index("-p") + 1], recovery_profile)
+
+
+@unittest.skipUnless(sandbox.can_confine(False), "requires macOS sandbox-exec")
+@unittest.skipIf(sandbox.can_confine(False) and sandbox.sandboxed(),
+                 "sandbox-exec cannot install a profile inside the test runner's sandbox")
+class CredentialConfinementTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.workspace = root / "work"
+        local_client = self.workspace / "local/arete-client"
+        self.live = local_client.with_name("arete") / "client" / "live.token"
+        self.default = self.workspace / "default/arete/client/live.token"
+        state = self.workspace / ".arete-sandbox/state"
+        state.mkdir(parents=True)
+        self.enterContext(mock.patch.multiple(paths, CLIENT_DIR=local_client, TOKEN_CLIENT_DIR=state / "client",
+                                             DEFAULT_TOKEN_CLIENT_DIR=self.default.parent,
+                                             WORKTREES_DIR=root, STATE_DIR=state, SERVER_FILE=state / "server.json"))
+
+    def test_pi_shell_cannot_read_or_write_live_client_tokens(self):
+        from arete import pi_shell
+
+        for token in (self.live, self.default):
+            token.parent.mkdir(parents=True)
+            token.write_text("live fixture")
+        (self.workspace / "control").write_text("control")
+        until = time.monotonic() + 4
+        shell = pi_shell.Shell(self.workspace, (), guard.Floor((), (), ()), ("Bash",), (), {}, (), False, until)
+        with mock.patch.object(pi_shell, "runtime_roots", return_value=()):
+            profile = shell.profile(threading.Event(), until)
+        for token in (self.live, self.default):
+            live = shlex.quote(str(token))
+            for operation in (f"cat {live}", f"printf changed > {live}"):
+                result = subprocess.run([*profile, "/bin/sh", "-c", f"cat control && ( {operation} )"],
+                                        cwd=self.workspace, capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.stdout, "control", result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(token.read_text(), "live fixture")
+
+    def test_verifier_service_can_replace_scratch_client_tokens(self):
+        from arete import scratch
+
+        attempt = SimpleNamespace(workspace=str(self.workspace))
+        command = ("set -eu; umask 077; cd .arete-sandbox; mkdir -p state/client; "
+                   "printf old > state/client/t.token; printf new > state/client/t.token.new; "
+                   "mv state/client/t.token.new state/client/t.token; cat state/client/t.token")
+        result = subprocess.run(scratch.service_command(attempt, command), cwd=self.workspace,
+                                capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual((result.returncode, result.stdout), (0, "new"), result.stderr)
+
+
+class CredentialAuthorityRootTests(unittest.TestCase):
+    def test_live_client_directory_is_protected_and_verification_state_is_available(self):
+        root = Path("/fixture")
+        client_dir = root / "xdg/arete-client"
+        live = client_dir.with_name("arete") / "client"
+        scratch = root / ".arete-sandbox/state/client"
+        with mock.patch.multiple(paths, CLIENT_DIR=client_dir, TOKEN_CLIENT_DIR=live):
+            self.assertIn(live, sandbox.authority_roots())
+            with mock.patch.object(paths, "TOKEN_CLIENT_DIR", scratch):
+                roots = sandbox.authority_roots()
+                self.assertIn(live, roots)
+                self.assertFalse(any(scratch.is_relative_to(path) for path in roots))
 
 
 class CodexReadOnlyTempTests(unittest.TestCase):
