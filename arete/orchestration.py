@@ -1218,6 +1218,8 @@ class Controller:
         except pipeline.CatchUpPushUnconfirmed:
             raise
         except (workspace.RunFailed, RuntimeError, OSError) as e:
+            if pipeline._termination is not None:
+                raise
             if isinstance(e, pipeline.CatchUpGateHold) and e.candidate_restored:
                 return self.hold_catch_up(checkout, base_sha, e)
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
@@ -1641,7 +1643,7 @@ class Controller:
                         break
             return self.ending
         except runlimits.Parked as error:
-            if self.data.get("catch_up_hold"):
+            if pipeline._termination is None and self.data.get("catch_up_hold"):
                 return self.park_catch_up(str(error))
             raise
         except ledger.Conflict as error:

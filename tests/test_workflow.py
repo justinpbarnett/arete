@@ -2068,6 +2068,15 @@ class SigtermKeepWorkTests(unittest.TestCase):
         tid = task_store.task_add(repo.name, "Edit files", "Fixture ticket")
         children = []
         enter = pipeline.Run.enter
+        set_handler = signal.signal
+        sent_term = False
+
+        def reset_at_finalization(signum, handler):
+            nonlocal sent_term
+            if signum == signal.SIGTERM and handler == signal.SIG_DFL and not sent_term:
+                sent_term = True
+                signal.raise_signal(signal.SIGTERM)
+            return set_handler(signum, handler)
 
         def enter_state(run, status):
             if status == "failed" and case in {"park", "failure"}:
@@ -2078,11 +2087,47 @@ class SigtermKeepWorkTests(unittest.TestCase):
             (wt / "check-output.txt").write_text("temporary check output\n")
             os.kill(os.getpid(), signal.SIGTERM)
 
+        def catch_up(run, checkout):
+            controller = orchestration.Controller.__new__(orchestration.Controller)
+            controller.run = run
+            controller.data = {"catch_up_hold": {"reason": "checks failed"}}
+            controller.workers = {}
+            controller.ending = None
+            controller.job = SimpleNamespace(with_prs=[], b=SimpleNamespace(catch_ups=0), slot=None,
+                                             branch="ticket", goal="goal", plan_text="plan", review=None,
+                                             with_left=lambda text: text, check_publication_targets=None)
+
+            def repair():
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    signal.raise_signal(signal.SIGALRM)
+
+            def restore_failure(*_args, **_kwargs):
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    raise OSError("verifier restore failed")
+
+            if case == "catch-up-parked":
+                controller.prepare = repair
+                return controller.drive()
+            with (mock.patch.object(pipeline, "catch_up_target", return_value=("base", "")),
+                  mock.patch.object(pipeline, "catch_up_base", side_effect=restore_failure)):
+                failure = controller.catch_up(checkout)
+            controller.settle_publication_failure(failure)
+            return controller.ending or ("failed", failure["error"], "")
+
         def work(_cfg, run, _slot):
             (root / "run-id").write_text(run.id)
-            run.workspace = wt, [workspace.Checkout("", "fixture/repo", source, wt, "main")]
+            checkout = workspace.Checkout("", "fixture/repo", source, wt, "main")
+            run.workspace = wt, [checkout]
             (wt / "file.txt").write_text("tracked edit\n")
             (wt / "new.txt").write_text("new file\n")
+            if case == "finalization":
+                return "failed", "fixture ended", ""
+            if case in {"catch-up-parked", "catch-up-park-result"}:
+                return catch_up(run, checkout)
             if case == "stopped":
                 record.ask_stop(run.id)
             elif case == "child":
@@ -2110,7 +2155,8 @@ class SigtermKeepWorkTests(unittest.TestCase):
               mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict),
               mock.patch.object(pipeline, "_run", side_effect=work),
               mock.patch.object(pipeline, "check_lane", return_value=nullcontext(())),
-              mock.patch.object(pipeline.environment, "sh", side_effect=check)):
+              mock.patch.object(pipeline.environment, "sh", side_effect=check),
+              mock.patch.object(signal, "signal", reset_at_finalization) if case == "finalization" else nullcontext()):
             return pipeline.run_issue(repo.name, tid)
 
     def run_case(self, case, expected=-signal.SIGTERM):
@@ -2144,7 +2190,10 @@ class SigtermKeepWorkTests(unittest.TestCase):
         self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
         if gate:
             log = (self.state / "runs" / run_id / "run.log").read_text().splitlines()
-            self.assertEqual(sum(gate in line for line in log if "SIGTERM: did not keep work" in line), 1)
+            failed_gates = [line for line in log if "SIGTERM: did not keep work" in line]
+            self.assertEqual(len(failed_gates), 1, failed_gates)
+            self.assertIn(gate, failed_gates[0])
+        return run_id
 
     def test_signal_during_check_keeps_run_edits_for_restart_and_refuses_later_file(self):
         self.assert_kept(self.run_case("check"))
@@ -2166,6 +2215,18 @@ class SigtermKeepWorkTests(unittest.TestCase):
 
     def test_signal_during_failure_reporting_keeps_edits(self):
         self.assert_kept(self.run_case("failure"))
+
+    def test_signal_at_finalization_entry_keeps_edits_for_restart(self):
+        self.assert_kept(self.run_case("finalization"))
+        self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
+
+    def test_catch_up_budget_alarm_during_unwind_prevents_keeping(self):
+        run_id = self.assert_not_kept("catch-up-parked", "the termination exception did not survive unwinding")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
+
+    def test_catch_up_publication_park_result_during_unwind_prevents_keeping(self):
+        run_id = self.assert_not_kept("catch-up-park-result", "the termination exception did not survive unwinding")
+        self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
 
     def test_live_child_prevents_keeping(self):
         self.assert_not_kept("child", "a child process is still alive")
