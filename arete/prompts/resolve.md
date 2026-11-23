@@ -30,7 +30,10 @@ $base_log
 Denied paths: $denied.
 
 - Edit only the conflicting files, the branch's own files listed above, and incoming-side files for the reason
-  permitted above. Remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
+  permitted above. You may also move a file the branch added to a new name in the same folder, for example to
+  renumber a migration whose number the base took. Each new name requires deleting a separate file that is present
+  on the branch and absent from both the common ancestor and the incoming commit.
+  Remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
 - Keep both the branch's requested work and the base's already-landed behaviour. Never drop either side to make the
   conflict go away.
 - Read the sides with `git show :1:<path>` (common ancestor), `git show :2:<path>` (the branch) and
