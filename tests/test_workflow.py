@@ -582,7 +582,7 @@ class PipelineNoSlotTests(unittest.TestCase):
             read_issue.assert_not_called()
         else:
             read_issue.assert_called_once_with(self.repo.github, int(tid))
-        if status == 1:
+        if status in (1, pipeline.SLOT_QUEUE_FAILED_EXIT):
             free_slots.assert_called_once_with(1)
         else:
             free_slots.assert_not_called()
@@ -616,7 +616,7 @@ class PipelineNoSlotTests(unittest.TestCase):
         with closing(sqlite3.connect(paths.DB_FILE)) as writer:
             writer.execute("BEGIN IMMEDIATE")
             started = time.monotonic()
-            line = self.refused_child({"state": "OPEN", "labels": []})
+            line = self.refused_child({"state": "OPEN", "labels": []}, status=pipeline.SLOT_QUEUE_FAILED_EXIT)
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 2)
         self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
@@ -653,6 +653,52 @@ class PipelineNoSlotTests(unittest.TestCase):
                                side_effect=AssertionError("unexpected Jira tracker read")) as client:
             self.assert_original_refusal(self.refused_child(None, tid="FIX-765"), name="fixture FIX-765")
         client.assert_not_called()
+
+
+class TaskSlotQueueFallbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        cls.template = cls.root / "template.db"
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.root, DB_FILE=cls.template,
+                                                  RUNS_DIR=cls.root / "runs", LOCKS_DIR=cls.root / "locks",
+                                                  WORKTREES_DIR=cls.root / "worktrees", LOG_DIR=cls.root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+
+    def setUp(self):
+        database = self.root / f"{self._testMethodName}.db"
+        shutil.copyfile(self.template, database)
+        self.enterContext(mock.patch.object(paths, "DB_FILE", database))
+        self.repo = config.Repo("fixture", self.root, github="fixture/repo", layer=self.root)
+        self.cfg = config.Config(repos=[self.repo], max_parallel=1)
+        self.enterContext(mock.patch.object(tasks, "held", return_value=""))
+
+    def child_command(self, code):
+        return [sys.executable, "-c", f"raise SystemExit({code})"]
+
+    def begin_with_exit(self, code):
+        def spawn(repo, tid, force):
+            return tasks.control.launch(self.child_command(code), pipeline.RUNS_LOG)
+
+        with mock.patch.object(pipeline, "spawn_run", side_effect=spawn):
+            return tasks.begin(self.cfg, self.repo, "936", force=True, poller_picks=True)
+
+    def test_begin_queues_slot_refusal_even_when_a_slot_is_free(self):
+        result = self.begin_with_exit(pipeline.SLOT_QUEUE_FAILED_EXIT)
+        self.assertEqual(result["state"], "queued")
+        row, = pipeline.source_store.tickets_passed_over()
+        self.assertEqual((row["repo"], row["issue"]), (self.repo.name, "936"))
+
+    def test_begin_still_refuses_other_exits_when_a_slot_is_free(self):
+        with self.assertRaisesRegex(tasks.control.Refused, "did not show as running"):
+            self.begin_with_exit(1)
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+
+    def test_launch_queues_slot_refusal(self):
+        command = self.child_command(pipeline.SLOT_QUEUE_FAILED_EXIT)
+        result = tasks.launch(self.cfg, self.repo, "936", command)
+        self.assertEqual(result["state"], "queued")
 
 
 class PolicyRetryCapTests(unittest.TestCase):
