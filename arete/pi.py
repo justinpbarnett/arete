@@ -43,6 +43,7 @@ from .agent import (
     json_from_text,
     overload_limit,
     provider_reset,
+    unreachable_limit,
     usage_totals,
 )
 from .store import devices as devices_store
@@ -624,16 +625,15 @@ def authentication(model: str, passing=None, providers=None) -> accounts.Auth:
 def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
     data = text
     if auth.mode != "subscription":
-        return credit_limit(data)
+        return credit_limit(data) or overload_limit(data, model) or unreachable_limit(data, model)
     text = data if isinstance(data, str) else json.dumps(data, default=str)
     native_limit = (claude.usage_limit(data, "\n".join([text, *error_messages(data)]), model)
                     if auth.family == "claude" else None)
-    if native_limit and native_limit.kind == "overloaded":
-        return native_limit
-    if (not native_limit and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
+    native_usage = native_limit if native_limit and native_limit.kind not in ("overloaded", "unreachable") else None
+    if (not native_usage and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
                                           r"you.ve (?:hit|reached).{0,30}limit|weekly limit|five.hour limit",
                                           text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text)):
-        return overload_limit(text, model)
+        return native_limit or overload_limit(text, model) or unreachable_limit(text, model)
     from . import codex
 
     legacy = claude.LEGACY_LIMIT_RESET.search(text)
@@ -658,7 +658,7 @@ def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, mod
     scope = claude.EVERY_MODEL if auth.family == "claude" else codex.LIMIT_SCOPE if auth.family == "codex" else provider
     if auth.family == "claude":
         kind = next((name for name in claude.LIMIT_SCOPES if name in text), "")
-        scope = native_limit.scope if native_limit else claude.LIMIT_SCOPES.get(kind, scope)
+        scope = native_usage.scope if native_usage else claude.LIMIT_SCOPES.get(kind, scope)
     return UsageLimit(util.iso(until.astimezone(UTC)), scope, "subscription")
 
 

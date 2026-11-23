@@ -108,13 +108,32 @@ def model_scope(model: str) -> str:
 OVERLOAD_SECONDS = 600
 OVERLOAD_TEXT = re.compile(r"at capacity|\boverloaded\b|(?:status|code|http)\W{0,4}529\b|\b529\b\W{0,3}overloaded",
                            re.IGNORECASE)
+UNREACHABLE_TEXT = re.compile(
+    r"\b(?:UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed)\b"
+    r"|\b(?:Connection error|Request timed out)\.", re.IGNORECASE,
+)
+PROVIDER_ERROR_STATUS = re.compile(
+    r"""(?:\b(?:api[ _-]error(?:[ _-]status)?|(?:http[ _-]?)?status(?:[ _-]?code)?|code|http(?:/\d(?:\.\d)?)?)"""
+    r"""[\s\\'":=()]+|(?:^|\n|["'])\s*)[45]\d{2}(?=$|[\s\\'":),}\].])""", re.IGNORECASE,
+)
 
 
 def overload_limit(text, model: str) -> UsageLimit | None:
     raw = text if isinstance(text, str) else json.dumps(text, default=str)
     if not OVERLOAD_TEXT.search(raw):
         return None
-    return UsageLimit(util.iso(util.now() + timedelta(seconds=OVERLOAD_SECONDS)), model_scope(model), "overloaded")
+    return model_hold(model, "overloaded")
+
+
+def unreachable_limit(text, model: str) -> UsageLimit | None:
+    raw = text if isinstance(text, str) else json.dumps(text, default=str)
+    if not UNREACHABLE_TEXT.search(raw) or PROVIDER_ERROR_STATUS.search(raw):
+        return None
+    return model_hold(model, "unreachable")
+
+
+def model_hold(model: str, kind: str) -> UsageLimit:
+    return UsageLimit(util.iso(util.now() + timedelta(seconds=OVERLOAD_SECONDS)), model_scope(model), kind)
 
 
 def reset_at(value) -> datetime | None:

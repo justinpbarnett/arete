@@ -24,6 +24,7 @@ from .agent import (
     provider_reset,
     rate_limit_type,
     streamed_turn,
+    unreachable_limit,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -248,8 +249,10 @@ def _run(
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
     fallback = Session(fresh_session, 0.0, "claude") if remote and proc.started and fresh_session else resume
     result = parse(proc, fallback, model, json_schema, openrouter=openrouter)
-    if auth and auth.mode == "api_key" and not openrouter:
-        result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) if not result.ok else None
+    if not result.ok and auth and auth.mode == "api_key" and not openrouter:
+        limit = result.usage_limit
+        model_limit = limit if limit and limit.kind in ("overloaded", "unreachable") else None
+        result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) or model_limit
     return result
 
 
@@ -342,7 +345,7 @@ def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLim
     model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b|"
                                 r"(?:^|\n)You've reached your Fable limit\. Switch to another model", text, re.IGNORECASE))
     if not model_only and "usage_limit_reached" not in text and not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model)
+        return overload_limit(text, model) or unreachable_limit(text, model)
     legacy = LEGACY_LIMIT_RESET.search(text)
     resets = provider_reset(data) or provider_reset(text)
     if resets is None and legacy:

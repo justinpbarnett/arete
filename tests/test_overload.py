@@ -73,6 +73,82 @@ class OverloadReaderTests(unittest.TestCase):
         self.assertIsNone(pi.usage_limit(auth, "openai", "bad request", "gpt-6.2-sol"))
 
 
+class UnreachableReaderTests(unittest.TestCase):
+    timeout_error = ("Request timed out.: Connect Timeout Error "
+                     "(attempted address: api.openai.com:443, timeout: 10000ms) (UND_ERR_CONNECT_TIMEOUT)")
+    model = "openai/gpt-6.2-sol"
+
+    def readers(self):
+        yield "codex", lambda text: codex.usage_limit(text, self.model), CODEX_LIMIT
+        yield "claude", self.claude_limit, CODEX_LIMIT
+        for mode, family in (("subscription", "codex"), ("subscription", "claude"), ("api_key", "codex")):
+            auth = accounts.Auth(mode=mode, family=family, provider="openai")
+            yield (f"pi {mode} {family}", lambda text, auth=auth: pi.usage_limit(auth, "openai", text, self.model),
+                   "Insufficient quota" if mode == "api_key" else CODEX_LIMIT)
+
+    def claude_limit(self, text, status=None):
+        proc = claude_failure(text, status)
+        return claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit
+
+    def assert_unreachable(self, limit):
+        self.assertIsNotNone(limit)
+        self.assertEqual((limit.kind, limit.scope), ("unreachable", agent.model_scope(self.model)))
+        self.assertAlmostEqual(minutes_ahead(limit), 10, delta=0.5)
+
+    def test_incident_timeout_holds_the_model_for_ten_minutes(self):
+        for name, read, _ in self.readers():
+            with self.subTest(reader=name):
+                self.assert_unreachable(read(self.timeout_error))
+
+    def test_each_connection_failure_marker_is_recognized(self):
+        for text in ("UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error", "ECONNRESET", "ECONNREFUSED",
+                     "ENOTFOUND", "EAI_AGAIN", "fetch failed", "Connection error.", "Request timed out."):
+            with self.subTest(text=text):
+                self.assert_unreachable(agent.unreachable_limit(text, self.model))
+
+    def test_native_api_key_readers_keep_the_model_limit(self):
+        proc = subprocess.CompletedProcess([], 1, "", self.timeout_error)
+        self.assert_unreachable(codex.parse(proc, agent.NO_SESSION, self.model, None, codex.KEY_PROVIDER).usage_limit)
+        with (mock.patch.object(claude, "command", return_value=[]),
+              mock.patch.object(claude, "agent_env", return_value={}),
+              mock.patch.object(claude.child, "stream", return_value=claude_failure(self.timeout_error))):
+            result = claude.run("review", ".", model=self.model, auth=accounts.Auth(mode="api_key"))
+        self.assert_unreachable(result.usage_limit)
+
+    def test_usage_limit_wins_over_connection_failure(self):
+        for name, read, usage in self.readers():
+            with self.subTest(reader=name):
+                expected = read(usage)
+                self.assertIsNotNone(expected)
+                actual = read(f"{usage}\n{self.timeout_error}")
+                self.assertIsNotNone(actual)
+                self.assertEqual((actual.kind, actual.scope), (expected.kind, expected.scope))
+
+    def test_overload_wins_over_connection_failure(self):
+        for name, read, _ in self.readers():
+            with self.subTest(reader=name):
+                limit = read(f"{CAPACITY}\n{self.timeout_error}")
+                self.assertIsNotNone(limit)
+                self.assertEqual((limit.kind, limit.scope), ("overloaded", agent.model_scope(self.model)))
+
+    def test_ordinary_failures_and_http_errors_are_not_limits(self):
+        for name, read, _ in self.readers():
+            for text in ("tests failed", "the sandbox refused the command", "HTTP 500 Internal Server Error",
+                         f"HTTP 400 Bad Request: {self.timeout_error}", f"API Error: 401 {self.timeout_error}",
+                         f"unexpected status 403 Forbidden: {self.timeout_error}",
+                         f"500 Internal Server Error: {self.timeout_error}"):
+                with self.subTest(reader=name, text=text):
+                    self.assertIsNone(read(text))
+
+    def test_structured_http_status_excludes_connection_failure(self):
+        self.assertIsNone(self.claude_limit(self.timeout_error, status=500))
+        event = {"type": "turn.failed", "error": {"message": self.timeout_error, "statusCode": 500}}
+        proc = subprocess.CompletedProcess([], 1, json.dumps(event), "")
+        self.assertIsNone(codex.parse(proc, agent.NO_SESSION, self.model, None, codex.CHATGPT_PROVIDER).usage_limit)
+        auth = accounts.Auth(mode="api_key", provider="openai")
+        self.assertIsNone(pi.usage_limit(auth, "openai", event, self.model))
+
+
 class OverloadHoldTests(unittest.TestCase):
     def test_hold_covers_only_the_overloaded_model_on_a_login(self):
         auth = accounts.Auth(mode="subscription", family="codex", identity="overload-login")

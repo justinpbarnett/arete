@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
-from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text, overload_limit
+from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text, overload_limit, unreachable_limit
 from .pi import SCHEMA_RULE
 
 LIMIT_SCOPE = "codex"
@@ -694,6 +694,14 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     ok = proc.returncode == 0 and not failures and bool(thread)
     error = "" if ok else util.tail("\n".join(failures) or proc.stderr.strip() or f"exit {proc.returncode}", 1500)
     session = Session(thread, 0.0, "codex") if thread else resume
+    limit = None
+    if not ok:
+        errors = "\n".join([*failures, proc.stderr])
+        diagnostic = [*diagnostics, proc.stderr]
+        if provider == KEY_PROVIDER:
+            limit = credit_limit(diagnostic) or overload_limit(errors, model) or unreachable_limit(diagnostic, model)
+        else:
+            limit = usage_limit(errors, model, diagnostic=diagnostic)
     return Result(
         ok=ok,
         text=text,
@@ -702,8 +710,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=turns,
         error=error,
         connection_failed=not ok and util.is_network_error(error),
-        usage_limit=None if ok else (credit_limit([*diagnostics, proc.stderr]) if provider == KEY_PROVIDER else
-                                    usage_limit("\n".join([*failures, proc.stderr]), model)),
+        usage_limit=limit,
         raw={"usage": usage, "thread_id": thread},
         tokens_in=usage.get("input_tokens", 0),
         tokens_out=usage.get("output_tokens", 0),
@@ -715,9 +722,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     )
 
 
-def usage_limit(text: str, model: str = "") -> UsageLimit | None:
+def usage_limit(text: str, model: str = "", *, diagnostic: list | None = None) -> UsageLimit | None:
     if not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model)
+        return overload_limit(text, model) or unreachable_limit(text if diagnostic is None else diagnostic, model)
     soonest = util.now() + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
     resets = reset_time(text)
     until = (max(soonest, resets + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)) if resets
