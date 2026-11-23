@@ -24,7 +24,13 @@ def code_files() -> list[Path]:
     found = [p for p in (CHECKOUT / "arete").rglob("*.py") if "__pycache__" not in p.parts]
     found += (CHECKOUT / "adws").glob("*.py")
     found += (CHECKOUT / "arete" / "prompts").glob("*.md")
+    found += config_data_files()
     return sorted(found)
+
+
+def config_data_files() -> list[Path]:
+    package = CHECKOUT / "arete"
+    return [*(package / "defaults").glob("*.toml"), *(package / "config_schemas").glob("*.json")]
 
 
 def inventory() -> tuple[str, int]:

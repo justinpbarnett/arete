@@ -205,6 +205,18 @@ def prepare_replay(root):
     return config, lambda repo: "origin" in sample_git(["remote"], repo.path).split()
 
 
+def config_fixture_git(*args):
+    from . import paths
+
+    require(paths.CONFIG_DIR == Path.cwd() / "config" and not paths.CONFIG_DIR.is_symlink(),
+            "config Git working directory escaped the fixture")
+    done = subprocess.run(["git", "-c", "user.name=Config Fixture", "-c", "user.email=config@example.invalid",
+                           "-c", "commit.gpgsign=false", *args], cwd=paths.CONFIG_DIR,
+                          capture_output=True, text=True, timeout=5)
+    require(done.returncode == 0, f"config fixture: git {args[0]}: {done.stderr.strip()}")
+    return done.stdout.strip()
+
+
 class Check:
     def __init__(self, port, root, spawn):
         self.port, self.root, self.spawn = port, root, spawn
@@ -418,6 +430,7 @@ class Check:
             values = op["example"]["input"].copy()
             resource = name.partition(".")[0]
             target = {**identities, "id": identities.get(resource, ""),
+                      **(values if resource == "config" else {}),
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -443,6 +456,12 @@ class Check:
                     require(data["seq"] == headers.get("Arete-Seq") and all(row["seq"] == data["seq"] for row in data["results"]),
                             "batch.run mixed snapshots")
             contract.validate(data, op["result"], f"{name} ({method} {path}) result")
+            if name == "config.versions":
+                require(bool(data["versions"]), "config.versions returned no config Git history")
+            if name == "config.diff":
+                lines = data["diff"].splitlines()
+                require("-max_parallel = 2" in lines and "+max_parallel = 3" in lines,
+                        "config.diff did not show the fixture's config change")
 
     def aliases(self):
         from . import paths
@@ -483,7 +502,12 @@ def worker(lifeline):
             root = Path.cwd()
             require(not paths.DB_FILE.exists(), "state database already exists")
             config, has_origin = prepare_replay(root)
-            paths.CONFIG_FILE.write_text("max_parallel = 3\n" + "\n".join(config) + "\n")
+            body = "\n".join(config) + "\n"
+            paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
+            config_fixture_git("init", "-q", "-b", "main")
+            config_fixture_git("add", "--", "config.toml")
+            config_fixture_git("commit", "-qm", "Initial config fixture")
+            paths.CONFIG_FILE.write_text("max_parallel = 3\n" + body)
             db.migrate()
             principals.seed_owner(LOGIN)
             codebase.load()

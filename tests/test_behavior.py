@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
 from dataclasses import asdict, replace
@@ -319,6 +320,379 @@ timeout_minutes = 40
         self.assert_observation("settings")
 
 
+class ConfigKindRegistryTests(unittest.TestCase):
+    golden = Path(__file__).parent / "golden" / "steps_resolve.json"
+
+    @classmethod
+    def setUpClass(cls):
+        scratch = tempfile.TemporaryDirectory(prefix="arete-config-kinds-")
+        cls.addClassCleanup(scratch.cleanup)
+        root = Path(scratch.name).resolve()
+        fixture = root / "fixture"
+        entry = "from tests.test_behavior import ConfigKindRegistryTests as T; T.prepare_sample()"
+        lines = cls.run_child(fixture, entry)
+        cases = ("resolutions", "defaults", "schemas", "registry", "attention")
+        workers = ThreadPoolExecutor(max_workers=len(cases))
+        cls.addClassCleanup(workers.shutdown, cancel_futures=True)
+        entry = "from tests.test_behavior import ConfigKindRegistryTests as T; T.run_case(*sys.argv[1:])"
+        cls.results = {case: workers.submit(cls.run_child, root / case, entry, case, str(fixture), json.dumps(lines))
+                       for case in cases}
+
+    @staticmethod
+    def run_child(root, entry, *args):
+        root.mkdir()
+        command = api_check.child_command(Path(__file__).resolve().parents[1], entry, *args)
+        result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
+                                text=True, timeout=CHILD_HANG_TIMEOUT)
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    @staticmethod
+    def prepare_config(fixture, lines):
+        from arete import replay
+        from arete.commands import setup
+
+        with redirect_stdout(StringIO()):
+            assert setup.cmd_init(SimpleNamespace(force=False)) == 0
+        layer = paths.CONFIG_DIR / "layers" / replay.SAMPLE_REPO
+        layer.parent.mkdir(exist_ok=True)
+        shutil.copytree(fixture / "sample/layer", layer)
+        lines = [f"layer = {json.dumps(str(layer))}" if line.startswith("layer = ") else line for line in lines]
+        paths.CONFIG_FILE.write_text("\n".join(lines) + "\n")
+        if not (paths.CONFIG_DIR / ".git").is_dir():
+            api_check.config_fixture_git("init", "-q", "-b", "main")
+        api_check.config_fixture_git("add", "--", "config.toml", "layers")
+        api_check.config_fixture_git("commit", "-qm", "Initialize replay config")
+        return layer
+
+    @classmethod
+    def prepare_sample(cls):
+        with api_check.offline():
+            root = Path.cwd()
+            lines, _ = api_check.prepare_replay(root)
+            cls.prepare_config(root, lines)
+        print(json.dumps(lines))
+
+    @classmethod
+    def run_case(cls, case, fixture, lines):
+        from arete import loop_run, sources
+
+        with (api_check.offline(), mock.patch.object(pipeline, "spawn_run") as spawn,
+              mock.patch.object(loop_run, "launch") as launch, mock.patch.object(sources, "fire") as fire,
+              mock.patch.object(serve.Server, "scan_oncall") as scan):
+            layer = cls.prepare_config(Path(fixture), json.loads(lines))
+            result = getattr(cls, case)(layer)
+            for fake in (spawn, launch, fire, scan):
+                fake.assert_not_called()
+            print(json.dumps(result))
+
+    @staticmethod
+    def resolutions(layer_dir):
+        from arete import steps
+
+        cfg = config.load(strict=True)
+        layer_file = layer_dir / "config.toml"
+        original = layer_file.read_text()
+        layer = config.load_layer(layer_dir, strict=True)
+        layer_file.write_text(original + "\n[kinds.fix.steps.build]\ntries = 2\n")
+        override = config.load_layer(layer_dir, strict=True)
+        layer_file.write_text(original + '\n[ab.cheaper]\nstep = "build"\nshare = 0.5\n'
+                              '[ab.cheaper.arm]\nmodel = "haiku"\n')
+        experiment = config.load_layer(layer_dir, strict=True)
+        kinds = ("", "feat", "fix")
+        result = {f"{case}/{kind}/{role}": asdict(steps.resolve(cfg, selected, role, kind))
+                  for case, selected in (("no layer", None), ("sample layer", layer), ("kind override", override))
+                  for kind in kinds for role in config.STEP_ROLES}
+        result.update({f"arm/{kind}/build": asdict(steps.resolve(cfg, experiment, "build", kind, side="arm"))
+                       for kind in kinds})
+        return result
+
+    def test_parent_resolutions(self):
+        self.assertEqual(self.results["resolutions"].result(), json.loads(self.golden.read_text()))
+
+    @staticmethod
+    @contextmanager
+    def server():
+        with redirect_stdout(StringIO()):
+            db.migrate()
+            principals.seed_owner(api_check.LOGIN)
+        node = SimpleNamespace(names={api_check.ADDRESS})
+        logins = SimpleNamespace(of=lambda _: api_check.LOGIN)
+        with mock.patch("socket.getfqdn", return_value=api_check.ADDRESS):
+            server = tailnet.Server(api_check.ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)
+        with server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
+            thread.start()
+            try:
+                yield api_check.Check(server.server_port, Path.cwd(), [])
+            finally:
+                server.shutdown()
+                thread.join()
+
+    @classmethod
+    def registry(cls, layer):
+        from arete import configkinds
+        from arete.commands import api as api_commands
+
+        kinds = ("prompt", "schema", "adw", "routes", "step_settings", "models", "prices", "budgets", "connector",
+                 "source", "target", "rule", "sync", "vocabularies", "device", "loop", "attention", "sound",
+                 "experiment")
+        assert tuple(configkinds.REGISTRY) == kinds
+        assert all((paths.PACKAGE_DIR.parent / entry.schema).is_file() and entry.home and entry.gate
+                   and entry.verbs == ("list", "read", "versions", "diff") for entry in configkinds.REGISTRY.values())
+        assert configkinds.classify("config.toml") == ("step_settings", "defaults")
+        relative = layer.relative_to(paths.CONFIG_DIR).as_posix()
+        assert configkinds.classify(f"{relative}/config.toml") == ("step_settings", layer.name)
+        assert configkinds.classify(f"{relative}/prompts/build.append.md") == (
+            "prompt", f"{layer.name}.build.append")
+        assert configkinds.classify(f"prompts/{layer.name}.build.append.md") is None
+        assert configkinds.classify("../config.toml") is None
+        root = paths.CONFIG_DIR
+        defaults_layer = root / "layers/defaults/config.toml"
+        alias_layer = root / "layers/defaults.layer/config.toml"
+        append = root / "layers/team.api/prompts/build.append.md"
+        append_name = "team.api.build.append"
+        assert configkinds.classify(defaults_layer.relative_to(root)) == ("step_settings", "defaults.layer")
+        assert configkinds.classify(alias_layer.relative_to(root)) == ("step_settings", "defaults.layer.layer")
+        assert configkinds.classify(append.relative_to(root)) == ("prompt", append_name)
+        for path, text in ((defaults_layer, "[steps.build]\ntries = 1\n"),
+                           (alias_layer, "[steps.build]\ntries = 4\n"), (append, "Original append\n")):
+            path.parent.mkdir(parents=True)
+            path.write_text(text)
+        initial_versions = api_check.config_fixture_git("log", "--format=%H", "--", "config.toml").splitlines()
+        assert initial_versions
+        before = paths.CONFIG_FILE.read_text()
+        sample = config.load(strict=True).repo(layer.name)
+        before += ('\n[[repo]]\nname = "defaults"\ntracker = "local"\n'
+                   f"path = {json.dumps(str(sample.path))}\nlayer = {json.dumps(str(defaults_layer.parent))}\n")
+        paths.CONFIG_FILE.write_text("max_parallel = 1\n" + before)
+        api_check.config_fixture_git("add", "--", "config.toml", "layers")
+        api_check.config_fixture_git("commit", "-qm", "Initial config items")
+        paths.CONFIG_FILE.write_text("max_parallel = 2\n" + before)
+        defaults_layer.write_text("[steps.build]\ntries = 2\n")
+        append.write_text("Updated append\n")
+        api_check.config_fixture_git("commit", "-qam", "Update config items")
+        assert config.load(strict=True).repo("defaults").layer_dir == defaults_layer.parent
+        commits = api_check.config_fixture_git("rev-list", "--max-count=2", "HEAD").splitlines()
+        with cls.server() as api:
+            published = api.read("/api/v1/contract")["operations"]
+            ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
+            assert tuple(ops) == configkinds.VERBS
+            assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds for op in ops.values())
+            items = api.read("/api/v1/config/step_settings")["items"]
+            assert [(found["name"], found["path"]) for found in items] == [
+                ("defaults", "config.toml"), ("defaults.layer", "layers/defaults/config.toml"),
+                ("defaults.layer.layer", "layers/defaults.layer/config.toml"), (layer.name, f"{relative}/config.toml")]
+            assert api.read(f"/api/v1/config/step_settings/{layer.name}")["item"]["content"] == (
+                layer / "config.toml").read_text()
+            assert api.read("/api/v1/config/prompt")["items"] == [
+                {"kind": "prompt", "name": append_name, "path": append.relative_to(root).as_posix()}]
+            cls.assert_config_history(api, "step_settings/defaults", paths.CONFIG_FILE,
+                                      [*commits, *initial_versions], "max_parallel = 1", "max_parallel = 2")
+            cls.assert_config_history(api, "step_settings/defaults.layer", defaults_layer, commits,
+                                      "tries = 1", "tries = 2")
+            cls.assert_config_history(api, f"prompt/{append_name}", append, commits, "Original append", "Updated append")
+            _, error = api.request("GET", "/api/v1/config/feat", status=400)
+            assert json.loads(error)["code"] == "invalid_input"
+            parser = argparse.ArgumentParser()
+            api_commands.register(parser.add_subparsers(required=True))
+            args = parser.parse_args(["config", "list", "step_settings"])
+            listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            read = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "config_read", "arguments": {"kind": "step_settings", "name": layer.name}}}
+            stdin = StringIO("\n".join(map(json.dumps, (listing, read))))
+            with mock.patch.object(client, "call", side_effect=lambda method, path: api.read(path)):
+                with redirect_stdout(StringIO()) as output:
+                    args.fn(args)
+                assert json.loads(output.getvalue())["items"] == items
+                with mock.patch("sys.stdin", stdin), redirect_stdout(StringIO()) as output:
+                    assert parser.parse_args(["mcp-config"]).fn(None) == 0
+            tools, selected = (json.loads(line)["result"] for line in output.getvalue().splitlines())
+            assert {tool["name"] for tool in tools["tools"]} == {"config_" + verb for verb in ops}
+            assert all(tuple(tool["inputSchema"]["properties"]["kind"]["enum"]) == kinds for tool in tools["tools"])
+            assert not selected["isError"]
+            assert json.loads(selected["content"][0]["text"])["item"]["name"] == layer.name
+            collision = root / "layers/team/prompts/api.build.append.md"
+            collision.parent.mkdir(parents=True)
+            collision.write_text("Different origin\n")
+            api_check.config_fixture_git("add", "--", collision.relative_to(root).as_posix())
+            api_check.config_fixture_git("commit", "-qm", "Add colliding append")
+            collision.write_text("Updated different origin\n")
+            api_check.config_fixture_git("commit", "-qam", "Update colliding append")
+            collision_commits = api_check.config_fixture_git("rev-list", "--max-count=2", "HEAD").splitlines()
+            unrelated = root / "prompts/unrelated.md"
+            unrelated.parent.mkdir()
+            unrelated.write_text("Unrelated prompt\n")
+            prompts = api.read("/api/v1/config/prompt")["items"]
+            names = {item["path"]: item["name"] for item in prompts}
+            assert len(prompts) == len(set(names.values())) == 3
+            for path, history, old, new in ((append, commits, "Original append", "Updated append"),
+                                             (collision, collision_commits, "Different origin", "Updated different origin")):
+                name = names[path.relative_to(root).as_posix()]
+                cls.assert_config_history(api, f"prompt/{name}", path, history, old, new)
+            assert api.read("/api/v1/config/prompt")["items"] == prompts
+            assert api.read("/api/v1/config/prompt/unrelated")["item"]["content"] == unrelated.read_text()
+        return True
+
+    @staticmethod
+    def assert_config_history(api, item, path, versions, old, new):
+        route = f"/api/v1/config/{item}"
+        kind, name = item.split("/")
+        assert api.read(route)["item"] == {"kind": kind, "name": name, "content": path.read_text(),
+                                           "path": path.relative_to(paths.CONFIG_DIR).as_posix()}
+        assert api.read(f"{route}/versions")["versions"] == versions
+        latest, first = versions[:2]
+        diff = api.read(f"{route}/diff?from={first}&to={latest}")["diff"].splitlines()
+        assert f"-{old}" in diff and f"+{new}" in diff
+
+    def test_registry_and_contract(self):
+        self.assertTrue(self.results["registry"].result())
+
+    @staticmethod
+    def defaults(layer):
+        from arete import steps
+
+        assert not hasattr(steps, "DEFAULTS") and not hasattr(steps, "BUILT_IN")
+        copy = Path.cwd() / "engine-defaults"
+        shutil.copytree(paths.DEFAULTS_DIR, copy)
+        path = copy / "steps.toml"
+        path.write_text(path.read_text().replace("timeout_minutes = 15", "timeout_minutes = 16", 1))
+        with mock.patch.object(paths, "DEFAULTS_DIR", copy):
+            cfg = config.load(strict=True)
+            assert steps.resolve(cfg, None, "learn").timeout_minutes == 16
+            path.write_text("schema = 9\n")
+            assert steps.resolve(cfg, None, "learn").timeout_minutes == 16
+            steps.engine_defaults.cache_clear()
+            with unittest.TestCase().assertRaisesRegex(ValueError, "requires defaults, steps"):
+                steps.engine_defaults()
+        return True
+
+    def test_engine_defaults_file(self):
+        self.assertTrue(self.results["defaults"].result())
+
+    @classmethod
+    def attention(cls, layer):
+        from arete import settings
+
+        original = paths.CONFIG_FILE.read_text()
+        cls.attention_comments(original)
+        paths.CONFIG_FILE.write_text('ask = { max_per_run = 4, push_contact = "mailto:owner@example.test" }\n'
+                                     + original)
+        route = "/api/v1/config/attention/defaults"
+        with cls.server() as api:
+            before = api.read(route)["item"]["content"]
+            assert before == {**asdict(config.AskConfig()), "max_per_run": 4, "push_contact": "mailto:owner@example.test"}
+            wanted = {"max_per_run": 0, "settle": False, "expire_days": 3650, "remind_hours": 87600,
+                      "push_contact": "https://example.test/owner#attention"}
+            assert settings.save_attention(wanted) == wanted
+            assert asdict(config.load(strict=True).ask) == api.read(route)["item"]["content"] == wanted
+            assert original in paths.CONFIG_FILE.read_text()
+            good = paths.CONFIG_FILE.read_bytes()
+            for bad in ({"unknown": True}, {"max_per_run": -1}, {"max_per_run": True}, {"settle": 1},
+                        {"expire_days": 0}, {"expire_days": 3651}, {"remind_hours": float("inf")},
+                        {"remind_hours": 87601}, {"push_contact": "https://example.test/with spaces"}):
+                with unittest.TestCase().assertRaises(ValueError, msg=repr(bad)):
+                    settings.save_attention(bad)
+                assert paths.CONFIG_FILE.read_bytes() == good
+            paths.CONFIG_FILE.write_bytes(good + b'\n[routing]\npayment_modes = ["local", "local"]\n')
+            incompatible = paths.CONFIG_FILE.read_bytes()
+            with unittest.TestCase().assertRaisesRegex(settings.Refused, "payment_modes"):
+                settings.save_attention({"settle": True})
+            assert paths.CONFIG_FILE.read_bytes() == incompatible
+        return True
+
+    @staticmethod
+    def attention_comments(original):
+        from arete import settings
+
+        original = "max_parallel = 2 # other setting\n" + original
+        contact = '"https://example.test/owner#,}"'
+        forms = (
+            (original + '\n["ask"] # owner attention\n# keep this note\nmax_per_run = 0x4 # keep the rate\n'
+             + f"push_contact = {contact} # keep the contact\n", "settle = false\n"),
+            (f'"ask" = {{ max_per_run = 0x4, push_contact = {contact} }} # owner attention\n' + original,
+             "settle = false"),
+            ('"ask" . max_per_run = 0x4 # keep the rate\n'
+             + f"ask.push_contact = {contact} # keep the contact\n" + original, "ask.settle = false\n"),
+        )
+        for initial, added in forms:
+            paths.CONFIG_FILE.write_text(initial)
+            before = asdict(config.load(strict=True).ask)
+            expected = {**before, "settle": False}
+            assert settings.save_attention({"settle": False}) == expected
+            assert asdict(config.load(strict=True).ask) == expected
+            actual = paths.CONFIG_FILE.read_text()
+            inserted = ", " + added if added == "settle = false" else added
+            assert actual.replace(inserted, "", 1) == initial
+            assert settings.save_attention({"settle": True}) == before
+            assert paths.CONFIG_FILE.read_text() == actual.replace("settle = false", "settle = true", 1)
+            saved = paths.CONFIG_FILE.read_bytes()
+            with unittest.TestCase().assertRaises(ValueError):
+                settings.save_attention({"settle": False, "expire_days": 0})
+            assert paths.CONFIG_FILE.read_bytes() == saved
+
+    def test_attention_round_trip(self):
+        self.assertTrue(self.results["attention"].result())
+
+    @staticmethod
+    def schemas(layer):
+        import tomllib
+
+        from arete import configschema
+
+        configschema.validate("config_toml", config.read_data())
+        configschema.validate("layer_toml", tomllib.loads((layer / "config.toml").read_text()))
+        assert configschema.keys(config.root_schema("steps")) == config.STEP_NAMES
+        reach = (
+            ("config_toml", "steps", "properties", "build"),
+            ("config_toml", "steps", "properties", "build", "properties", "tools"),
+            ("config_toml", "ab", "additionalProperties", "properties", "arm"),
+            ("config_toml", "mcp", "additionalProperties"),
+            ("config_toml", "oncall", "properties", "source", "items"),
+            ("config_toml", "routing", "properties", "payment_modes"),
+            ("config_toml", "routing", "properties", "floors"),
+            ("config_toml", "routing", "properties", "capabilities"),
+            ("config_toml", "tiers"), ("config_toml", "environment"),
+            ("config_toml", "oncall"), ("layer_toml", "factory", "properties", "path"),
+        )
+        for file, name, *nested in reach:
+            assert configschema.schema(file, "properties", name, *nested)["x-arete-reach"]
+        for name in ("capture", "ask", "dashboard"):
+            assert not config.root_schema(name).get("x-arete-reach")
+        test = unittest.TestCase()
+        for name in ("connector", "target", "device"):
+            with test.assertRaisesRegex(ValueError, "unavailable for writes"):
+                configschema.validate(name, {})
+        with test.assertRaisesRegex(ValueError, "directory_cleanup must be boolean"):
+            configschema.validate("step_settings", {"schema": 1, "defaults": {"tools": [], "mcp": [],
+                                  "session": "fresh"}, "steps": {"verify": {"directory_cleanup": 1}}})
+        copy = Path.cwd() / "schemas"
+        copy.mkdir()
+        shutil.copy(paths.CONFIG_SCHEMAS_DIR / "rule.json", copy)
+        with mock.patch.object(paths, "CONFIG_SCHEMAS_DIR", copy):
+            for domain in ("intake", "outbox"):
+                with test.assertRaisesRegex(ValueError, f"{domain} rules are unavailable"):
+                    configschema.validate("rule", {"domain": domain})
+            with test.assertRaisesRegex(ValueError, "outbox, intake"):
+                configschema.validate("rule", {"domain": "other"})
+            (copy / "rule_outbox.json").write_text(json.dumps({"type": "object", "additionalProperties": False,
+                "properties": {"domain": {"enum": ["outbox"]}, "example": {"type": "string"}},
+                "required": ["domain", "example"]}))
+            configschema.validate("rule", {"domain": "outbox", "example": "rule"})
+            with test.assertRaisesRegex(ValueError, "unknown key extra"):
+                configschema.validate("rule", {"domain": "outbox", "example": "rule", "extra": True})
+            with test.assertRaisesRegex(ValueError, "intake rules are unavailable"):
+                configschema.validate("rule", {"domain": "intake"})
+            (copy / "rule_intake.json").write_text('{"type": "object"}')
+            with test.assertRaisesRegex(ValueError, "intake rules need a strict schema"):
+                configschema.validate("rule", {"domain": "intake"})
+        return True
+
+    def test_strict_schemas(self):
+        self.assertTrue(self.results["schemas"].result())
+
+
 class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
     class_worker = None
@@ -339,6 +713,10 @@ class _CliThroughServeCase(unittest.TestCase):
         "wait r1": "GET /api/runs/{run}/events",
         "lines r1": "GET /api/runs/{run}/events",
         "status": None,
+        "config list step_settings": "GET /api/v1/config/{kind}",
+        "config read step_settings defaults": "GET /api/v1/config/{kind}/{name}",
+        "config versions step_settings defaults": "GET /api/v1/config/{kind}/{name}/versions",
+        "config diff step_settings defaults": "GET /api/v1/config/{kind}/{name}/diff",
         "stop r1": "POST /api/runs/{run}/stop",
         "approve 1": "POST /api/approvals/{id}",
         "forget 1": "POST /api/proposals/{id}/done",
@@ -391,7 +769,8 @@ class _CliThroughServeCase(unittest.TestCase):
         "guard": "guard", "heartbeat": "heartbeat", "hook": "tool_events", "init": "commands.setup",
         "install": "install", "jev compare": "lab.calibrate", "jev sample": "lab.calibrate",
         "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
-        "mcp-ask": "owner_asks", "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
+        "mcp-ask": "owner_asks", "mcp-config": "commands.api", "merge-check": "mergecheck",
+        "migrate": "store.db", "mine": "miner",
         "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
         "release-journeys": "releasejourneys", "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
@@ -2493,8 +2872,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 46)
-        self.assertEqual(len({op["name"] for op in operations}), 46)
+        self.assertEqual(len(operations), 50)
+        self.assertEqual(len({op["name"] for op in operations}), 50)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

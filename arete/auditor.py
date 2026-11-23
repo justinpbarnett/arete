@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from . import alerts, config, doctor, paths, tool_events, tracker, util
+from . import alerts, config, configschema, doctor, paths, tool_events, tracker, util
 from .heartbeat import mark_loop
 from .store import approvals as approvals_store
 from .store import incidents as incident_store
@@ -192,7 +192,7 @@ def check_repos(cfg: config.Config) -> list[Finding]:
         if f.exists():
             try:
                 data = tomllib.loads(f.read_text())
-                extra = set(data) - config.LAYER_SECTIONS
+                extra = set(data) - set(configschema.keys(configschema.schema("layer_toml")))
                 if extra:
                     out.append(Finding("agents-config", "warn", paths.short_path(f), f"unknown sections: {', '.join(sorted(extra))}"))
                 if r.pipeline and not data.get("checks"):

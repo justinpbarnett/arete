@@ -7,9 +7,9 @@ import threading
 from collections import Counter
 from functools import cache
 
-from . import refusals
+from . import configkinds, refusals
 
-MINOR = 3
+MINOR = 4
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -194,7 +194,20 @@ for _name, _shape in RESOURCE.items():
                              obj(_selectors, list(_selectors)), {k: "example" for k in _selectors}),
                    operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
                              obj({"id": STRING, **_selectors}), {"id": "example", **{k: "example" for k in _selectors}})]
+CONFIG_KIND = {"type": "string", "enum": list(configkinds.REGISTRY)}
+CONFIG_ID = {"kind": CONFIG_KIND, "name": {**STRING, "pattern": f"^{configkinds.NAME_PATTERN}$"}}
+CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
+CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
 OPERATIONS += [
+    operation("config.list", "config/{kind}", envelope({"items": array(obj(CONFIG_ITEM))}),
+              obj({"kind": CONFIG_KIND}), {"kind": "step_settings"}),
+    operation("config.read", "config/{kind}/{name}",
+              envelope({"item": obj({**CONFIG_ITEM, "content": {"type": ["string", "object"]}})}),
+              obj(CONFIG_ID), CONFIG_EXAMPLE),
+    operation("config.versions", "config/{kind}/{name}/versions", envelope({"versions": array(STRING)}),
+              obj(CONFIG_ID), CONFIG_EXAMPLE),
+    operation("config.diff", "config/{kind}/{name}/diff", envelope({"diff": STRING}),
+              obj({**CONFIG_ID, "from": STRING, "to": STRING}, CONFIG_ID), CONFIG_EXAMPLE),
     operation("run.diff", "runs/{id}/diff", envelope({"diff": STRING}), obj({"id": STRING}), {"id": "example"}),
     operation("task.history", "tasks/{id}/history", envelope({"comments": array(obj({"version": INTEGER,
               "author": STRING, "body": STRING, "ts": STRING})), "runs": array(RUN)}),

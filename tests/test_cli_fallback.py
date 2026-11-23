@@ -110,7 +110,13 @@ class CliRouteFallbackTests(unittest.TestCase):
         session_start = "POST /api/sessions"
         task_details = ["GET /api/tasks/t-1234", "GET /api/tasks/t-5678"]
         report = b'{"event":"report","seq":1,"status":"done"}\n'
+        config_list = "GET /api/v1/config/step_settings"
+        config_read = f"{config_list}/defaults"
+        config_item = {"kind": "step_settings", "name": "defaults", "path": "config.toml"}
+        config_replies = {config_list: {"items": [config_item]}, config_read: {"item": {**config_item, "content": ""}},
+                          f"{config_read}/versions": {"versions": []}, f"{config_read}/diff": {"diff": ""}}
         replies = {
+            **config_replies,
             meta: {"instance": {"id": "fallback"}}, loop: {"running": "r1"},
             ask: {"asks": [{"run": "r1", "id": "1", "questions": []}]},
             feed: {"restore_epoch": 0, "lines": []},
@@ -143,6 +149,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
                  "session start --attach work": [info, feed, info, feed, info]}
         values = dict(task="t-1234", run="r1", session="r1", id=1, step="build", name="example", chat=1)
+        config_values = dict(values, kind="step_settings", name="defaults")
         seen = []
         old = historical = False
 
@@ -166,7 +173,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                 if template is None:
                     continue
                 with self.subTest(command=command):
-                    legacy = template.format(**values)
+                    legacy = template.format(**(config_values if "{kind}" in template else values))
                     if legacy == "GET /api/runs/r1/events":
                         legacy = follow_events if command == "wait r1" else events_route
                     primary = canonical.get(legacy, legacy)
@@ -181,6 +188,8 @@ class CliRouteFallbackTests(unittest.TestCase):
                     seen.clear()
                     current = self.cli(command)
                     self.assertEqual(current[0], 0, current)
+                    if primary in config_replies:
+                        self.assertEqual(list(map(json.loads, current[1])), [config_replies[primary]])
                     self.assertEqual([(route, key) for route, key, _ in seen], expected([*prefix, primary, *suffix]))
                     current_requests = seen.copy()
 
@@ -192,7 +201,12 @@ class CliRouteFallbackTests(unittest.TestCase):
                         with self.subTest(historical=historical):
                             seen.clear()
                             result = self.cli(command)
-                            self.assertEqual(result, current)
+                            if primary in config_replies:
+                                code, lines, err = result
+                                self.assertEqual((code, len(lines), err), (1, 1, ""), result)
+                                self.assertEqual(json.loads(lines[0])["code"], "unknown_route")
+                            else:
+                                self.assertEqual(result, current)
                             self.assertEqual([(route, key) for route, key, _ in seen],
                                              expected([*prefix, primary, *retry, *suffix]))
                             self.assertEqual(seen[:len(prefix) + 1], current_requests[:len(prefix) + 1])
