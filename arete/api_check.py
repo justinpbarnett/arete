@@ -297,14 +297,16 @@ class Check:
 
         path = f"/api/v1/runs/{self.run}"
         before = self.read(path)["run"]
-        record.note(self.run, summary="Bumped by contract check")
-        current = self.read(path)["run"]
-        _, raw = self.request("POST", f"/api/runs/{self.run}/stop", {"base_version": before["version"]}, status=409)
-        problem = json.loads(raw)
-        require(problem.get("code") == "version_conflict" and problem.get("current") == current and
-                current == self.read(path)["run"] and current["version"] == before["version"] + 1 and
-                self.spawn[0].poll() is None and not current.get("stop_asked"),
-                "stale run stop changed the run, signalled its child, or returned the wrong current object")
+        with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                              stdin=subprocess.PIPE, start_new_session=True) as replacement:
+            record.note(self.run, pid=replacement.pid)
+            current = self.read(path)["run"]
+            _, raw = self.request("POST", f"/api/runs/{self.run}/stop", {"base_version": before["version"]}, status=409)
+            problem = json.loads(raw)
+            require(problem.get("code") == "version_conflict" and problem.get("current") == current and
+                    current == self.read(path)["run"] and current["version"] == before["version"] + 1 and
+                    replacement.poll() is None and not current.get("stop_asked"),
+                    "stale run stop changed the run, signalled its child, or returned the wrong current object")
 
     def errors(self):
         from . import contract
