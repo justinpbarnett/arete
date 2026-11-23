@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "daily_budget_usd": {"type": "number"},
+    "loop_dirs": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "queues": {
+      "type": "object",
+      "additionalProperties": {"type": "integer"}
+    },
+    "session_idle_hours": {"type": "number"}
+  },
+  "additionalProperties": false
+}

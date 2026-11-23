@@ -156,7 +156,8 @@ def answer_for(request: dict) -> dict:
     raise LookupError(method)
 
 
-def serve(stdin: TextIO, stdout: TextIO) -> int:
+def serve(stdin: TextIO, stdout: TextIO, *, answer=None) -> int:
+    answer = answer or answer_for
     for raw in stdin:
         if not raw.strip():
             continue
@@ -167,7 +168,7 @@ def serve(stdin: TextIO, stdout: TextIO) -> int:
         if not isinstance(request, dict) or "id" not in request:
             continue
         try:
-            body = {"result": answer_for(request)}
+            body = {"result": answer(request)}
         except LookupError:
             body = {"error": {"code": -32601, "message": f"no method {request.get('method')}"}}
         stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], **body}) + "\n")
