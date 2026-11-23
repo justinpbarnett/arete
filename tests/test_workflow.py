@@ -8098,8 +8098,8 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.prepare_state()
         address = "127.0.0.1"
         node = tailnet.Node((address,), frozenset({address}), address)
-        logins = tailnet.Logins(SimpleNamespace(whois=lambda _: ("visitor@example.test", "fixture-node")))
-        server = SimpleNamespace(node=node, logins=logins, inside_serve=True, tls=None)
+        logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "visitor@example.test"))
+        server = SimpleNamespace(node=node, logins=logins, inside_serve=True)
 
         def connect(conn):
             browser, app = socketpair()
@@ -8559,6 +8559,8 @@ class CommandConfinementTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sandbox.can_confine(False), "requires macOS sandbox-exec")
+@unittest.skipIf(sandbox.can_confine(False) and sandbox.sandboxed(),
+                 "sandbox-exec cannot install a profile inside the test runner's sandbox")
 class CredentialConfinementTests(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(TemporaryDirectory())).resolve()
@@ -8602,6 +8604,20 @@ class CredentialConfinementTests(unittest.TestCase):
         result = subprocess.run(scratch.service_command(attempt, command), cwd=self.workspace,
                                 capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual((result.returncode, result.stdout), (0, "new"), result.stderr)
+
+
+class CredentialAuthorityRootTests(unittest.TestCase):
+    def test_live_client_directory_is_protected_and_verification_state_is_available(self):
+        root = Path("/fixture")
+        client_dir = root / "xdg/arete-client"
+        live = client_dir.with_name("arete") / "client"
+        scratch = root / ".arete-sandbox/state/client"
+        with mock.patch.multiple(paths, CLIENT_DIR=client_dir, TOKEN_CLIENT_DIR=live):
+            self.assertIn(live, sandbox.authority_roots())
+            with mock.patch.object(paths, "TOKEN_CLIENT_DIR", scratch):
+                roots = sandbox.authority_roots()
+                self.assertIn(live, roots)
+                self.assertFalse(any(scratch.is_relative_to(path) for path in roots))
 
 
 class CodexReadOnlyTempTests(unittest.TestCase):

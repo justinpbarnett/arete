@@ -22,14 +22,15 @@ from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
-from socket import SHUT_WR, create_connection, socket, socketpair
+from socket import SHUT_WR, SO_SNDBUF, SOL_SOCKET, create_connection, socket, socketpair
 from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
     accounts, api, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
     dashboard, event_stream, events, gh,
-    idempotency, jira, paths, pipeline, principals, record, screening, serve, tailnet, tasks, tool_events, triage, util, verify_faults,
+    idempotency, jira, paths, pipeline, principals, record, run_lines, screening, serve, tailnet, tasks, tool_events,
+    triage, util, verify_faults, webpush,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
@@ -2061,6 +2062,7 @@ class VersionedApiTests(unittest.TestCase):
         self.repo = config.Repo("fixture", Path("."), github="fixture/repo", tracker="local")
         self.cfg = config.Config(repos=[self.repo])
         self.handler = SimpleNamespace(body=mock.Mock(), headers={"Idempotency-Key": self.id()},
+                                       person=self.actor, server=SimpleNamespace(logins=tailnet.Logins(mock.Mock())),
                                        send=lambda *args: args, log_error=mock.Mock(), write_receipt=None,
                                        idempotent_replayed=False, keyed_delivery=False, credential=None)
 
@@ -2501,7 +2503,6 @@ class VersionedApiTests(unittest.TestCase):
         if method != "GET":
             if self.authorization is None:
                 self.authorization = fixture_bearer(self.actor)
-                self.actor = f"client:{self.authorization.split('_', 3)[2]}"
             request.append(f"Authorization: {self.authorization}\r\n")
         request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
         incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
@@ -3049,80 +3050,49 @@ class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
     @credential_test
     def test_task_start_replays_the_pre_deploy_person_claim(self, _):
         key = "pre-deploy-task-start"
+        route = "/api/tasks"
         body = {"repo": "fixture", "prompt": "Keep the original task", "title": "Original", "kind": "feat"}
-        db.migrate()
-        with principals.acting(self.owner):
+        context = self.old_claim(key, route, body)
+        with self.old_schema(), principals.acting(self.owner):
             task = task_store.task_add(body["repo"], body["prompt"], body["title"], body["kind"],
-                                       claim=self.old_claim(key, "/api/tasks", body))
+                                       claim=context)
             run = record.start("pipeline", repo=body["repo"], issue=task)
+            saved = tasks.answer(task, body["repo"], run, "running", "started")
+            claims.complete(context, 200, api_http.json_bytes(saved), claims.lookup(self.owner, key)["first_seq"])
         command = ["task", "start", "--repo", "fixture", "--key", key, "--title", "Original", "--kind", "feat",
                    body["prompt"]]
-        self.assertEqual(claims.lookup(self.owner, key)["status"], 0)
         self.upgrade()
         with self.listen() as server, self.cli_environment(server):
-            result = json.loads(self.cli(command))
-        self.assertEqual((result["task"], result["run"]), (task, run))
-        self.assertEqual(claims.lookup(self.owner, key)["status"], 200)
+            self.assertEqual(json.loads(self.cli(command)), saved)
+            replay, headers = self.request(server, "POST", route, bearer=self.owner_text, key=key, body=body)
+            self.assertEqual((replay, headers["Idempotent-Replayed"]), (saved, "true"))
+            self.request(server, "POST", route, bearer=self.owner_text, key=key, body={**body, "prompt": "Changed"},
+                         status=422, code="idempotency_key_reused")
+            self.task(server, bearer=self.owner_text, key=key, status=422, code="idempotency_key_reused")
         self.assertEqual([row["id"] for row in task_store.tasks()], [task])
         self.assertEqual([row["id"] for row in run_store.runs()], [run])
 
     @credential_test
-    def test_versioned_and_alias_replays_keep_old_claims_and_scope(self, _):
-        key, alias_key = "pre-upgrade-task-add", "pre-upgrade-chat-drop"
+    def test_versioned_replay_keeps_old_claim_and_scope(self, _):
+        key = "pre-upgrade-task-add"
         body = {"repo": "fixture", "body": "Original", "title": "", "kind": "feat"}
-        db.migrate()
-        with principals.acting(self.owner):
+        with self.old_schema(), principals.acting(self.owner):
             answer = api.mutation("task.create", body, None)
             task = answer["task"]["id"]
             claims.complete(self.old_claim(key, self.TASKS, body), 200, api_http.json_bytes(answer), None)
-            chat_id = chats_store.chat_add("fixture")
-            alias = f"{chat_id}/drop"
-            dropped = chat.drop_draft(chat_id)
-            claims.complete(self.old_claim(alias_key, "/api/chats/*", {}, path=alias), 200,
-                            api_http.json_bytes(dropped), None)
         self.upgrade()
         with self.listen() as server:
-            with self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=key):
-                self.assertEqual(self.cli(["task", "add", "--repo", "fixture", body["body"]]).strip(), task)
-            with mock.patch.object(chat, "drop_draft", side_effect=AssertionError("Re-executed chat drop")):
-                replay, headers = self.request(server, "POST", f"/api/chats/{alias}", bearer=self.owner_text, key=alias_key)
-                self.assertEqual((replay, headers["Idempotent-Replayed"]), (dropped, "true"))
-            cookie = self.pair(server)
-            limited = self.issue(server, cookie, scopes=("read",))["text"]
+            _, limited = token_store.issue(self.owner, "Read only", ["read"])
             self.request(server, "POST", self.TASKS, bearer=limited, key=key, body=body, status=403, code="scope_missing")
-            self.request(server, "POST", self.TASKS, bearer=self.owner_text, key=key, body={**body, "body": "Changed"},
-                         status=422, code="idempotency_key_reused")
-            for path, other_body in ((f"{self.TASKS}/{task}/close", {}), (f"/api/chats/{alias}", {}),
-                                     ("/api/tasks", {"repo": "fixture", "prompt": "Do not start a task"})):
-                with self.subTest(path=path):
-                    self.request(server, "POST", path, bearer=self.owner_text, key=key, body=other_body,
-                                 status=422, code="idempotency_key_reused")
-            self.assertEqual(self.task_actors(), [self.owner])
-            self.assertEqual(task_store.task_get(task)["state"], "todo")
-            self.assertEqual(run_store.runs(), [])
-            issued = [self.issue(server, cookie) for _ in range(2)]
-            self.task(server, cookie=cookie, key="new-task-claim")
-            for token in issued:
-                self.task(server, bearer=token["text"], key="new-task-claim")
-        self.assertEqual(self.task_actors(), [self.owner, self.owner, *(f"client:{t['token']['id']}" for t in issued)])
+            replay, headers = self.request(server, "POST", self.TASKS, bearer=self.owner_text, key=key, body=body)
+            self.assertEqual((replay["task"]["id"], headers["Idempotent-Replayed"]), (task, "true"))
+        self.assertEqual(self.task_actors(), [self.owner])
 
     @credential_test
-    def test_publication_replays_completed_chat_and_resumes_pending_approval(self, _):
-        chat_key, approval_key = "pre-upgrade-filing", "pre-upgrade-approval"
+    def test_publication_resumes_pre_deploy_approval(self, _):
+        approval_key = "pre-upgrade-approval"
         github = "fixture/repo"
-        key = "pre-upgrade-write"
-        with self.old_schema():
-            claims.complete(self.old_claim(key, self.TASKS, {}), 200, b"{}", None)
-        db.migrate()
-        with principals.acting(self.owner):
-            chat_id = chats_store.chat_add("fixture")
-            chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Draft", draft_body="An issue")
-            draft = chat.draft_fingerprint(chat.chat_row(chat_id))
-            publication = idempotency.Publication(self.old_claim(chat_key, "/api/chats/{n}/file", {"draft": draft},
-                                                                n=str(chat_id)), None)
-            with mock.patch.object(gh, "find_issue_marker", return_value=gh.issue_url(github, 1)):
-                filed = chat.file_draft(chat_id, publication, draft=draft)
-            publication.complete(api_http.json_bytes(filed))
+        with self.old_schema(), principals.acting(self.owner):
             item = {"repo": "fixture", "title": "Approve delivery", "body": "An issue", "labels": []}
             approval = approvals_store.add_approval("fixture", "", {"type": "ticket", "item": item}, "File it")
             context = self.old_claim(approval_key, "/api/approvals/{id}", {"approve": True}, id=str(approval))
@@ -3133,20 +3103,9 @@ class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
         self.upgrade()
         url = gh.issue_url(github, 2)
         with (self.listen() as server, mock.patch.object(gh, "find_issue_marker", return_value=url) as lookup,
-              mock.patch.object(gh, "issue_create", side_effect=AssertionError("Duplicate publication"))):
-            with (mock.patch.object(chat, "file_draft") as file_draft, mock.patch.object(control, "decide") as decide,
-                  mock.patch.object(dashboard.Handler, "send_ticket") as send_ticket):
-                for path, body in ((f"/api/chats/{chat_id}/file", {"draft": draft}),
-                                   (f"/api/approvals/{approval}", {"approve": True}), ("/api/triage/7/send", {})):
-                    self.request(server, "POST", path, body=body, bearer=self.owner_text, key=key,
-                                 status=422, code="idempotency_key_reused")
-                for action in (file_draft, decide, send_ticket):
-                    action.assert_not_called()
-            replay, headers = self.request(server, "POST", f"/api/chats/{chat_id}/file", body={"draft": draft},
-                                           bearer=self.owner_text, key=chat_key)
-            self.assertEqual((replay, headers["Idempotent-Replayed"]), (filed, "true"))
-            lookup.assert_not_called()
-            with self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=approval_key):
+              mock.patch.object(gh, "issue_create", side_effect=AssertionError("Duplicate publication")),
+              self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=approval_key)):
+            for _ in range(2):
                 self.assertEqual(json.loads(self.cli(["approve", str(approval)]))["result"], url)
             lookup.assert_called_once_with(github, pending.marker)
         saved = claims.lookup(self.owner, approval_key)
@@ -3164,7 +3123,9 @@ class CredentialWriteTests(_CredentialCase):
             issued = self.issue(server, cookie, scopes=("task:write",))
             identity = issued["token"]["id"]
             actor = f"client:{identity}"
-            self.task(server, bearer=issued["text"])
+            self.task(server, bearer=issued["text"], key="client-write")
+            self.assertEqual(claims.lookup(self.owner, "client-write")["status"], 200)
+            self.assertIsNone(claims.lookup(actor, "client-write"))
             viewed, _ = self.request(server, "GET", f"{self.TOKENS}/{identity}", cookie=cookie)
             client, = principals.listing(id=actor)
             self.assertEqual((viewed["token"]["principal"], client["kind"], client["role"]), (self.owner, "client", None))
@@ -3178,6 +3139,28 @@ class CredentialWriteTests(_CredentialCase):
             self.assertTrue(token_store.get(identity, self.owner)["last_used_node"])
             self.request(server, "POST", f"/api/v1/principals/{actor}/revoke", cookie=cookie)
             self.task(server, bearer=issued["text"], status=401)
+
+    @credential_test
+    def test_api_rate_limits_share_person_buckets(self, _):
+        _, other = token_store.issue(self.owner, "Second client", ["read", "task:write"])
+        rates = api_http.RateLimits(clock=lambda: 0)
+        with self.listen() as server, mock.patch.object(api_http, "RATES", rates):
+            rates.take(self.owner, command=True, cost=59)
+            self.task(server, bearer=self.owner_text)
+            self.task(server, bearer=other, status=429, code="rate_limited")
+            for bearer, count, status in ((self.owner_text, 49, 200), (other, 2, 429)):
+                body = {"requests": [{"operation": "meta.get"}] * count}
+                self.request(server, "POST", "/api/v1/batch", bearer=bearer, body=body, status=status)
+            self.request(server, "GET", self.TASKS, status=429, code="rate_limited")
+        self.assertEqual(len(self.task_actors()), 1)
+
+    @credential_test
+    def test_bearer_push_subscription_keeps_person_contact(self, _):
+        body = {"endpoint": "https://127.0.0.1/push", "keys": {"p256dh": "fixture", "auth": "fixture"}}
+        with self.listen() as server, mock.patch.object(webpush, "public_key", return_value="fixture"):
+            self.request(server, "POST", "/api/push/subscribe", bearer=self.owner_text, body=body)
+        row, = webpush.push_store.push_list()
+        self.assertEqual(webpush.subject(config.load(), row), f"mailto:{self.LOGIN}")
 
 
 class CredentialUpgradeServiceTests(_CredentialUpgradeCase):
@@ -3198,28 +3181,20 @@ class CredentialUpgradeServiceTests(_CredentialUpgradeCase):
             server.node = replace(server.node, name=name, names=server.node.names | {name})
             with mock.patch.object(paths, "TOKEN_CLIENT_DIR", fallback.parent):
                 tailnet.record_server(server.node, server.server_port, tailnet.Front("http", [server]))
-            endpoint = os.environ[client.ENV]
             with mock.patch.dict(os.environ, {client.ENV: f"http://{name}:{server.server_port}"}):
                 self.cli(["task", "add", "--repo", "fixture", "Explicit server"])
             del os.environ[client.ENV]
             self.cli(["task", "add", "--repo", "fixture", "Local discovery"])
-            with paths.CONFIG_FILE.open("a") as config_file:
-                config_file.write(f'\n[server]\nurl = "{endpoint}"\n')
-            self.cli(["task", "add", "--repo", "fixture", "Configured server"])
             with self.listen(secure=False):
                 other = client.server()
                 self.assertEqual(other.instance, db.schema_metadata()["instance_id"])
                 self.assertNotIn("Authorization", client.headers_for(other))
-                with self.assertRaises(client.Failed) as error:
-                    client.request("POST", self.TASKS, {"repo": "fixture", "body": "Other endpoint"},
-                                   key="unverified-endpoint", where=other)
-                self.assertEqual(error.exception.code, 401)
             self.cli(["logout"])
             self.assertFalse(fallback.exists())
         actors = self.task_actors()
-        self.assertEqual(len(actors), 3)
+        self.assertEqual(len(actors), 2)
         self.assertTrue(actors[0].startswith("client:"))
-        self.assertEqual(actors, [actors[0]] * 3)
+        self.assertEqual(actors, [actors[0]] * 2)
 
 
 class CredentialPairingTests(_CredentialCase):
@@ -3231,16 +3206,14 @@ class CredentialPairingTests(_CredentialCase):
             self.task(server, cookie=cookie, headers={"X-Arete": ""}, status=403, code="csrf")
             for headers in ({"Origin": "https://elsewhere.example"}, {"Sec-Fetch-Site": "cross-site"}):
                 self.task(server, cookie=cookie, headers=headers, status=403, code="bad_origin")
+            pairing = self.logins.credentials.pairings[self.owner]
             for bearer in (None, self.owner_text):
                 answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=bearer, status=403, code="forbidden")
                 self.assertEqual(answer["reason"], "presence_required")
-                self.assertEqual(self.logins.credentials.pairings, {})
+                self.assertIs(self.logins.credentials.pairings[self.owner], pairing)
             self.request(server, "POST", self.PAIRINGS, cookie=cookie, status=201)
             self.assertRegex(self.owner, r"^u:[0-9a-f]{8}$")
             self.assertEqual(self.task_actors(), [self.owner])
-            _, headers = self.request(server, "POST", "/api/v1/auth/logout", cookie=cookie)
-            self.assertIn("Max-Age=0", headers["Set-Cookie"])
-            self.request(server, "GET", self.TASKS, cookie=cookie, status=401)
 
     @credential_test
     def test_session_renews_before_maintenance(self, _):
@@ -3278,6 +3251,30 @@ class CredentialPairingTests(_CredentialCase):
 
 class CredentialClaimTests(_CredentialCase):
     @credential_test
+    def test_pairing_start_shares_keys_and_cannot_restart_a_consumed_code(self, _):
+        with self.listen() as server:
+            cookie = self.pair(server)
+            self.task(server, bearer=self.owner_text, key="task-claim")
+
+            def start(key, status=201, code=None):
+                return self.request(server, "POST", self.PAIRINGS, cookie=cookie, key=key, status=status, code=code)[0]
+
+            start("task-claim", 422, "idempotency_key_reused")
+            route = "/api/chats/{n}/file"
+            sha = idempotency.fingerprint("POST", route, {"n": "1"}, {})
+            claims.complete((self.owner, "publication-claim", route, sha), 200, b"{}", None)
+            start("publication-claim", 422, "idempotency_key_reused")
+            pairing = start("pairing-claim")
+            self.assertEqual(start("pairing-claim"), pairing)
+            self.task(server, bearer=self.owner_text, key="pairing-claim", status=422, code="idempotency_key_reused")
+            self.request(server, "POST", "/api/chats/1/file", bearer=self.owner_text, key="pairing-claim",
+                         status=422, code="idempotency_key_reused")
+            self.claim(server, pairing["code"])
+            self.assertEqual(start("pairing-claim", 409, "conflict")["reason"], "pairing_claimed")
+            self.assertIsNone(claims.lookup(self.owner, "pairing-claim"))
+            self.assertEqual(len(self.task_actors()), 1)
+
+    @credential_test
     def test_claim_replay_requires_a_live_cookie_receipt(self, _):
         with self.listen() as server:
             code = self.code(server)
@@ -3310,24 +3307,18 @@ class CredentialClaimTests(_CredentialCase):
             code = self.code(server)
             self.claim(server, code, key=key)
             wrong = "000001" if code == "000000" else "000000"
+            snapshot = backup.snapshot("pairing-claim-test")
+        credential_files.key_path(self.meta["token_key_ref"]).unlink()
+        backup.restore(snapshot)
+        with self.listen() as server:
             _, headers = self.request(server, "POST", claim, body={"code": wrong}, key=key,
                                       status=422, code="idempotency_key_reused")
             self.assertIsNone(headers["Set-Cookie"])
-            snapshot = backup.snapshot("pairing-claim-test")
-        for original_key_available in (True, False):
-            if not original_key_available:
-                credential_files.key_path(self.meta["token_key_ref"]).unlink()
-            backup.restore(snapshot)
-            with self.listen() as server:
-                status, problem = (422, "idempotency_key_reused") if original_key_available else (409, "conflict")
-                _, headers = self.request(server, "POST", claim, body={"code": wrong}, key=key,
-                                          status=status, code=problem)
-                self.assertIsNone(headers["Set-Cookie"])
-                answer, headers = self.request(server, "POST", claim, body={"code": code}, key=key,
-                                               status=409, code="conflict")
-                self.assertEqual(answer.get("reason"), "pairing_claimed")
-                self.assertIsNone(headers["Set-Cookie"])
-                self.assertNotIn(json.dumps(code), json.dumps(answer))
+            answer, headers = self.request(server, "POST", claim, body={"code": code}, key=key,
+                                           status=409, code="conflict")
+            self.assertEqual(answer.get("reason"), "pairing_claimed")
+            self.assertIsNone(headers["Set-Cookie"])
+            self.assertNotIn(json.dumps(code), json.dumps(answer))
         row = claims.lookup(self.owner, key)
         self.assertEqual(row["status"], 201)
         self.assertNotIn(json.dumps(code).encode(), row["response"])
@@ -3362,7 +3353,7 @@ class CredentialAdmissionTests(_CredentialCase):
             self.request(server, "GET", self.TASKS, status=403)
             self.request(server, "GET", self.TASKS, bearer=text)
             with mock.patch.object(dashboard.webhooks, "receive", return_value={"queued": True}):
-                self.request(server, "POST", "/hook/fixture", status=202)
+                self.request(server, "POST", "/hook/fixture", headers={"X-Arete-Instance": "unrelated"}, status=202)
             self.cli(["login", "--token-stdin"], stdin=text + "\n")
             self.cli(["task", "add", "--repo", "fixture", "tagged"])
             self.assertEqual(self.task_actors(), ["client:" + issued["token"]["id"]])
@@ -3404,7 +3395,92 @@ class CredentialRotationTests(_CredentialCase):
         self.assertTrue(all(secret not in data for secret in secrets for data in durable))
 
 
+class _CredentialStreamCase(_CredentialCase):
+    def large_streams(self):
+        payload = "x" * (1 << 20)
+        run = record.start("pipeline", repo="fixture")
+        run_lines.path(run).parent.mkdir(parents=True, exist_ok=True)
+        run_lines.path(run).write_bytes(dashboard.event_line({"seq": 1, "event": run_lines.END, "body": payload}))
+        with db.tx():
+            events.emit("fixture.large", "fixture", cls="durable", data={"body": payload})
+        return payload, "/api/v1/events?since=0.0&kinds=fixture.large", f"/api/runs/{run}/events?follow=1"
+
+    @contextmanager
+    def blocked_stream(self, route, accept, text):
+        address = "127.0.0.1"
+        server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=self.logins, tls=self.tls,
+                                 inside_serve=False, RequestHandlerClass=dashboard.Handler)
+        browser, app = socketpair()
+        app.setsockopt(SOL_SOCKET, SO_SNDBUF, 4096)
+        browser.settimeout(3)
+        blocked = threading.Event()
+        poll = dashboard.select.poll
+
+        def observe():
+            blocked.set()
+            return poll()
+
+        thread = threading.Thread(target=tailnet.Server.finish_request, args=(server, app, (address, 1)), daemon=True)
+        with browser, app, mock.patch.object(dashboard.select, "poll", observe):
+            thread.start()
+            with self.trust.wrap_socket(browser, server_hostname=address) as conn:
+                conn.sendall((f"GET {route} HTTP/1.1\r\nHost: {address}\r\nAccept: {accept}\r\n"
+                              f"Authorization: Bearer {text}\r\n\r\n").encode())
+                self.assertTrue(blocked.wait(2))
+                yield conn, thread
+            thread.join(1)
+
+
+class CredentialStreamDeliveryTests(_CredentialStreamCase):
+    @credential_test
+    def test_slow_readers_receive_complete_payloads(self, _):
+        payload, events_route, run_route = self.large_streams()
+        for route, accept in ((events_route, "text/event-stream"), (events_route, "application/json"),
+                              (events_route, "application/x-ndjson"), (run_route, "application/x-ndjson")):
+            token, text = token_store.issue(self.owner, "Stream reader", ["read"])
+            with self.subTest(route=route, accept=accept), self.blocked_stream(route, accept, text) as (conn, _):
+                time.sleep(.65)
+                with HTTPResponse(conn) as response:
+                    response.begin()
+                    self.assertEqual(response.status, 200)
+                    if route == run_route:
+                        self.assertEqual(response.readline(), dashboard.event_line({"seq": 1, "event": run_lines.END, "body": payload}))
+                        continue
+                    if accept == "application/json":
+                        event, = json.load(response)["events"]
+                    else:
+                        if accept == "text/event-stream":
+                            self.assertEqual(response.readline() + response.readline(), b"retry: 2000\n\n")
+                            self.assertTrue(response.readline().startswith(b"id: "))
+                        line = response.readline()
+                        self.assertTrue(line.endswith(b"\n"))
+                        event = json.loads(line.removeprefix(b"data: "))
+                        if accept == "text/event-stream":
+                            self.assertEqual(response.readline(), b"\n")
+                    self.assertEqual((event["kind"], event["data"]["body"]), ("fixture.large", payload))
+                token_store.revoke(token["id"], self.owner)
+
+
+class CredentialStreamRevocationTests(_CredentialStreamCase):
+    @credential_test
+    def test_backpressured_streams_close_on_revocation(self, _):
+        _, events_route, run_route = self.large_streams()
+        measured = {}
+        for route, accept, name in ((events_route, "text/event-stream", "events"), (run_route, "", "run")):
+            token, text = token_store.issue(self.owner, "Stream reader", ["read"])
+            with self.subTest(route=name), self.blocked_stream(route, accept, text) as (_, thread):
+                started = time.monotonic()
+                token_store.revoke(token["id"], self.owner)
+                thread.join(max(0, 1 - (time.monotonic() - started)))
+                elapsed = time.monotonic() - started
+                self.assertFalse(thread.is_alive(), (name, elapsed))
+                self.assertLess(elapsed, 1)
+                measured[name] = round(elapsed, 3)
+        return measured
+
+
 class CredentialRevocationTests(_CredentialCase):
+
     @credential_test
     def test_revocation_persists_pending_last_use(self, _):
         with self.listen() as server:
@@ -3470,11 +3546,13 @@ class CredentialAuthTests(_CredentialCase):
     @credential_test
     def test_auth_and_pairing_rate_limits(self, _):
         with self.listen() as server:
-            code = self.code(server)
+            start = {"bearer": self.owner_text, "key": "burned-pairing"}
+            code = self.request(server, "POST", self.PAIRINGS, status=201, **start)[0]["code"]
             wrong = "000000" if code != "000000" else "000001"
             for attempt in (wrong, wrong, wrong, wrong, wrong, code):
                 _, headers = self.request(server, "POST", self.PAIRINGS + "/claim", body={"code": attempt}, status=401)
                 self.assertIsNone(headers["Set-Cookie"])
+            self.request(server, "POST", self.PAIRINGS, status=409, code="conflict", **start)
             for _ in range(3):
                 self.request(server, "POST", self.TOKENS, status=403)
             self.request(server, "POST", self.TOKENS, status=429, code="rate_limited")

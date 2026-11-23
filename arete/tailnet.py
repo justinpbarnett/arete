@@ -164,7 +164,8 @@ class Logins:
             seen = self.seen.get(address)
         if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
             return seen[1]
-        login, node = self.host.whois(address)
+        found = self.host.whois(address)
+        login, node = (found, "") if isinstance(found, str) else found
         if login or node:
             with self.guard:
                 self.seen[address] = (time.monotonic(), login, node)
@@ -338,7 +339,7 @@ def record_server(node: Node, port: int, front: Front) -> None:
     fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": list(node.addresses), "port": port,
               "scheme": front.scheme, "host": node.name,
               "default_token_dir": paths.TOKEN_CLIENT_DIR == paths.DEFAULT_TOKEN_CLIENT_DIR}
-    if fields["default_token_dir"]:
+    if fields["default_token_dir"] and paths.DB_FILE.is_file():
         fields["instance"] = db.schema_metadata()["instance_id"]
     try:
         util.write_json(paths.SERVER_FILE, {**fields, **paths.state_and_config(), "at": util.iso()})

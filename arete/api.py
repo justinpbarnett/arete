@@ -222,9 +222,6 @@ def dispatch(handler, op, path_values, query):
     try:
         if write:
             prepare(name, values)
-            if name == "pairing.start":
-                handler.success_status = op["success_status"]
-                return credential_http.start_pairing(handler)
             result = handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
                                           atomic=name not in ("run.stop", "serve.install"),
                                           status=op["success_status"], redact=name in ("token.issue", "token.rotate"))

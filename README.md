@@ -2391,7 +2391,6 @@ With HTTPS on, scratch state asks for no certificate.
 
 Serve provisions its own CLI token at startup. A restore invalidates issued tokens and browser sessions while keeping the instance ID. After serve starts again, use the new owner CLI token to run `arete pair` again.
 
-
 Over HTTPS the page can be added to the Home Screen of a phone, where it opens as the app Arete without browser chrome.
 
 Notifications: Settings has an Allow notifications button, a list of subscribed devices with a Remove control, and Send a test. On an iPhone the app must be added to the Home Screen first and opened from there, and the permission is asked only after a tap. An ask that goes to the owner sends one Web Push to every subscribed device, and one reminder follows after `[ask] remind_hours` if it is still open; an ask that JEV settles sends none. The push service receives an empty POST and a signed VAPID token naming the push service's origin and the contact (`[ask] push_contact`, else the owner's login when it is an email), never question text. The service worker then reads `/api/asks` from arete itself and shows the repo, the ticket and the first question's header, or "Arete is waiting on you" when that fails; the notification's tag is the ask id, so a reminder replaces the earlier one, and a tap opens `/#ask/ID`. The signing key pair is made once with the `openssl` CLI and kept in the state folder as `webpush.key` with mode 0600. A 404 or 410 from a push service removes that device. The desktop notification still fires.

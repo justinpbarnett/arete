@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import math
 import re
@@ -12,11 +13,12 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, credential_files, idempotency, principals, util
+from . import api_http, contract, idempotency, principals, util
 from .store import db, events, tokens
 from .store import idempotency as claims
 
 COOKIE = "__Host-arete_session"
+PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim"}
 PRESENCE = {"token.issue", "token.rotate"}
@@ -32,7 +34,7 @@ def problem(code, **details):
 
 @dataclass
 class Pairing:
-    code: str
+    code: str | None
     key: str
     key_ref: str
     deadline: float
@@ -57,7 +59,9 @@ class Traffic:
                 self.failed = {k: v for k, v in self.failed.items() if v[-1] > now - 300}
                 self.blocked = {k: v for k, v in self.blocked.items() if v > now}
                 self.issues = {k: v for k, v in self.issues.items() if v[-1] > now - 600}
-                self.pairings = {k: v for k, v in self.pairings.items() if v.deadline > now}
+                for pairing in self.pairings.values():
+                    if pairing.deadline <= now:
+                        pairing.code = None
                 self.claimed = {k: v for k, v in self.claimed.items() if v[0] > now}
                 self.swept = now
             if (until := self.blocked.get(peer, 0)) > now:
@@ -86,24 +90,32 @@ class Traffic:
         now = time.monotonic()
         with self.lock:
             pairing = self.pairings.get(person)
-            if pairing is None or pairing.deadline <= now or pairing.key != key or pairing.key_ref != ref:
+            if pairing is not None and pairing.key == key:
+                if pairing.code is None or pairing.deadline <= now or pairing.key_ref != ref:
+                    raise pairing_claimed()
+            else:
                 pairing = Pairing(f"{secrets.randbelow(1_000_000):06d}", key, ref, now + 300,
                                   util.iso(util.now() + timedelta(minutes=5)))
                 self.pairings[person] = pairing
             return {"code": pairing.code, "link": f"{origin}/pair#{pairing.code}", "expires": pairing.expires}
 
+    def reject_pairing_key(self, person, key):
+        with self.lock:
+            if (pairing := self.pairings.get(person)) and pairing.key == key:
+                raise idempotency.Reused("This key was used with different content")
+
     def claim_pairing(self, person, code, ref):
         now = time.monotonic()
         with self.lock:
             pairing = self.pairings.get(person)
-            if not pairing or pairing.key_ref != ref or pairing.deadline <= now:
+            if not pairing or pairing.code is None or pairing.key_ref != ref or pairing.deadline <= now:
                 raise problem("unauthenticated")
             if hmac.compare_digest(code.encode(), pairing.code.encode()):
-                del self.pairings[person]
+                pairing.code = None
                 return
             pairing.remaining -= 1
             if pairing.remaining == 0:
-                del self.pairings[person]
+                pairing.code = None
             raise problem("unauthenticated")
 
     def claim_receipt(self, person, key, ref, session):
@@ -173,7 +185,7 @@ def check_origin(handler):
 def authenticate(handler, method, *, browser_asset=False):
     op = handler.operation[0] if handler.operation else None
     name = op["name"] if op else ""
-    secure = handler.server.tls is not None
+    secure = handler.origin[0] == "https"
     if require_tls(op) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
@@ -334,40 +346,29 @@ def issue_or_rotate(name, person, values):
         raise contract.Problem("invalid_input", "Grace period is too large.") from None
 
 
-def pairing_claim_fingerprint(body, ref):
-    secret = credential_files.read_key(ref)
-    proof = tokens.digest(secret, api_http.json_bytes(body).decode())
-    sha = idempotency.fingerprint("POST", PAIRING_CLAIM_ROUTE, {}, {"proof": proof})
-    return f"{ref}:{sha}"
+def pairing_claim_fingerprint(sha, salt=None):
+    salt = secrets.token_hex(16) if salt is None else salt
+    proof = hashlib.scrypt(sha.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1)
+    return f"{salt}:{proof.hex()}"
 
 
 def pairing_claimed():
-    return contract.Problem("conflict", "This pairing was already claimed. Start a new pairing.", reason="pairing_claimed")
+    return contract.Problem("conflict", "This pairing is no longer active. Start a new pairing.", reason="pairing_claimed")
 
 
-def matching_pairing_claim(context, body):
+def matching_pairing_claim(context):
     row = claims.lookup(*context[:2])
     if row is None:
         return None
-    if row["route"] == PAIRING_CLAIM_ROUTE:
-        saved = row["request_sha"]
-        ref, _, sha = saved.rpartition(":")
-        current_ref, _, current_sha = context[3].rpartition(":")
-        if ref and ref != current_ref:
-            try:
-                current_sha = pairing_claim_fingerprint(body, ref).rpartition(":")[2]
-            except OSError:
-                if row["status"] == 201:
-                    raise pairing_claimed() from None
-                raise idempotency.Reused("This key was used with different content") from None
-        if hmac.compare_digest(sha, current_sha):
-            return row
-        if not ref and row["status"] == 201:
-            raise pairing_claimed()
+    saved = row["request_sha"]
+    salt = saved.partition(":")[0]
+    if (row["route"] == PAIRING_CLAIM_ROUTE and re.fullmatch("[0-9a-f]{32}", salt)
+            and hmac.compare_digest(saved, pairing_claim_fingerprint(context[3], salt))):
+        return row
     raise idempotency.Reused("This key was used with different content")
 
 
-def pairing_claim_session(handler):
+def finish_pairing_claim(handler):
     ref = db.schema_metadata()["token_key_ref"]
     traffic = handler.server.logins.credentials
     text = traffic.claim_receipt(handler.person, handler.headers["Idempotency-Key"], ref, None)
@@ -377,18 +378,12 @@ def pairing_claim_session(handler):
         except tokens.InvalidCredential:
             pass
         else:
-            return text
+            handler.set_cookie = session_cookie(text, tokens.SESSION_SECONDS)
+            return
     raise pairing_claimed()
 
 
-def finish_pairing_claim(handler):
-    handler.set_cookie = session_cookie(pairing_claim_session(handler), tokens.SESSION_SECONDS)
-
-
-def start_pairing(handler):
-    key = handler.headers["Idempotency-Key"]
-    if not idempotency.KEY.fullmatch(key):
-        raise contract.Problem("invalid_input", "Send a valid Idempotency-Key.")
+def start_pairing(handler, key):
     with db.tx() as c:
         credential = handler.credential
         if tokens.live_session(c):
