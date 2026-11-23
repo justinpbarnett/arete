@@ -1266,6 +1266,9 @@ def post_session(handler, rest, query):
     if action == "send":
         return steer_run(session_id, str(handler.body().get("text", "")))
     if action == "stop":
+        session = run_store.run_get(session_id)
+        if not session or session["kind"] != "session":
+            raise control.NotFound(f"no session {session_id}")
         return stop_run(handler, session_id)
     raise NoRoute
 

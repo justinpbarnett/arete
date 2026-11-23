@@ -1,6 +1,6 @@
 export function pairingHelp(protocol = location.protocol) {
   return protocol === "https:"
-    ? "Pair this browser before making changes. Run ‘arete pair’ on the serve host or use Pair a device in a paired browser."
+    ? "To pair this browser, open /pair and use the code from ‘arete pair’ on the serve host or from Pair a device in a paired browser."
     : "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.";
 }
 

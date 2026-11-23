@@ -1,3 +1,4 @@
+import { pairingHelp } from "./browser-auth.js";
 import { webFetch } from "./ui-request.js";
 import { staleWrite } from "./ui-notice.js";
 
@@ -75,7 +76,9 @@ export async function sendWrite(request, onResponse = null) {
   const data = await response.json().catch(() => null);
   const valid = data && typeof data === "object" && !Array.isArray(data);
   if (!response.ok) {
-    const error = new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
+    let message = typeof data?.error === "string" ? data.error : `Request failed (${response.status})`;
+    if (response.status === 401 && request.url !== "/api/v1/auth/pairings/claim") message = pairingHelp();
+    const error = new Error(message);
     error.status = response.status;
     error.conflict = response.status === 409 && (data?.code ?? data?.error) === "version_conflict";
     if (error.conflict) staleWrite.value = "This item changed. Review the latest version before trying again.";

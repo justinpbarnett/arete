@@ -285,7 +285,14 @@ async function call(path, body, signal) {
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
     if (!changes && data && typeof data === "object" && !data.seq) data.seq = response.headers?.get?.("Arete-Seq");
-    if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data, response.status);
+    if (!response.ok) {
+      let message = data?.error || `The server answered ${response.status}.`;
+      if (changes && response.status === 401) {
+        const { pairingHelp } = await import("./browser-auth.js");
+        message = pairingHelp();
+      }
+      throw new ErrorAnswer(message, data, response.status);
+    }
     return data;
   } finally {
     // the caller says its result in the microtasks after this returns, so the change still counts until then

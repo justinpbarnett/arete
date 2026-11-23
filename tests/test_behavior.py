@@ -3557,6 +3557,63 @@ class _CredentialUpgradeCase(_CredentialCase):
         return self.owner, key, route, idempotency.fingerprint("POST", route, parameters, body)
 
 
+class CredentialDashboardTests(unittest.TestCase):
+    def test_dashboard_write_401_shows_pairing_guidance(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            import { fileURLToPath } from "node:url";
+            import { constants, runInThisContext } from "node:vm";
+            import { visit } from "./arete/web/ui-data.js";
+            import { Shell } from "./arete/web/ui-shell.js";
+            import { prepareWrite, sendWrite } from "./arete/web/ui-write.js";
+
+            globalThis.matchMedia = () => ({});
+            globalThis.noteServedCode = () => {};
+            const classic = fileURLToPath(new URL("./arete/web/common.js", import.meta.url));
+            const call = runInThisContext(readFileSync(classic, "utf8") + "\\ncall", {
+              filename: classic, importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+            });
+            const route = "/api/settings";
+            const writes = [() => call(route, {}), () => sendWrite(prepareWrite(route))];
+            globalThis.fetch = async () => Response.json({ error: "unauthenticated" }, { status: 401 });
+            globalThis.location = { protocol: "https:" };
+            const shell = () => JSON.stringify(Shell({ route: { screen: "floor", path: [] }, snapshot: {}, resources: {} }));
+            assert.equal(await visit({ view: "floor" }), null);
+            assert.doesNotMatch(shell(), /Enter a pairing code/);
+            for (const [protocol, guidance] of [["https:", /\\/pair\\b/], ["http:", /pairing needs HTTPS/]]) {
+              globalThis.location.protocol = protocol;
+              for (const write of writes) await assert.rejects(write, { status: 401, message: guidance });
+              assert.doesNotMatch(shell(), /Enter a pairing code|pairing needs HTTPS/);
+            }
+            globalThis.location.protocol = "https:";
+            await assert.rejects(call(route), { status: 401, message: "unauthenticated" });
+            await assert.rejects(sendWrite(prepareWrite("/api/v1/auth/pairings/claim")),
+              { status: 401, message: "unauthenticated" });
+            globalThis.fetch = async () => Response.json({ error: "scope_missing" }, { status: 403 });
+            for (const write of writes) await assert.rejects(write, { status: 403, message: "scope_missing" });
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class CredentialSessionStopTests(_CredentialCase):
+    @credential_test
+    def test_legacy_stop_requires_a_session_run(self, _):
+        runs = [record.start(kind, pid=None) for kind in ("pipeline", "loop")]
+        session = record.start("session", pid=None)
+        with self.listen() as server:
+            token = self.issue(server, self.pair(server), scopes=("session:write",))["text"]
+            for run in (*runs, "missing"):
+                self.request(server, "POST", f"/api/sessions/{run}/stop", bearer=token, status=404)
+            result, _ = self.request(server, "POST", f"/api/sessions/{session}/stop", bearer=token)
+            self.assertTrue(result["stopped"])
+        for run in runs:
+            row = run_store.run_get(run)
+            self.assertEqual(row["status"], "running")
+            self.assertFalse(row["stop_asked"])
+        self.assertEqual(run_store.run_get(session)["status"], "stopped")
+
+
 class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
     @credential_test
     def test_task_start_replays_the_pre_deploy_person_claim(self, _):

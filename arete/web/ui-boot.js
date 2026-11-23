@@ -13,7 +13,7 @@ import { startHooks } from "./ui-hooks.js";
 import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
-import { browserPaired, pairingNotice } from "./ui-notice.js";
+import { browserPaired } from "./ui-notice.js";
 
 const route = signal(current());
 const connect = ({ screen, path }) => live(screen, ...path.slice(0, 2));
@@ -83,7 +83,6 @@ window.addEventListener("pageshow", () => {
   start("return");
   if (location.protocol === "https:") pairedBrowser().then(paired => {
     browserPaired.value = paired;
-    if (paired) pairingNotice.value = "";
   }).catch(() => {});
 });
 
