@@ -1,0 +1,58 @@
+schema = 1
+
+[defaults]
+tools = ["Read", "Glob", "Grep"]
+mcp = []
+session = "fresh"
+
+[steps.verify]
+directory_cleanup = true
+
+[steps.build]
+tools = ["Read", "Glob", "Grep", "Edit", "Write", "TodoWrite"]
+session = "resume"
+
+[steps.orchestrate]
+tools = []
+mcp = []
+instructions = []
+session = "fresh"
+
+[steps.learn]
+timeout_minutes = 15
+
+[steps.uat]
+timeout_minutes = 10
+tries = 3
+
+[steps.research_plan]
+timeout_minutes = 10
+tries = 2
+
+[steps.research_search]
+timeout_minutes = 10
+tries = 2
+tools = ["WebSearch", "WebFetch"]
+
+[steps.research_synthesis]
+timeout_minutes = 10
+tries = 2
+
+[steps.research_audit]
+timeout_minutes = 10
+tries = 2
+tools = ["Read", "Glob", "Grep", "WebFetch"]
+
+[steps.document]
+timeout_minutes = 10
+tries = 2
+instructions = []
+
+[steps.capture_evidence]
+timeout_minutes = 3
+tries = 1
+tools = ["Read"]
+instructions = []
+modalities = ["image"]
+structured_output = true
+budget_usd = 0.25
