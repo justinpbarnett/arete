@@ -13,7 +13,7 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, idempotency, principals, refusals, util
+from . import api_http, contract, idempotency, principals, util
 from .store import db, events, tokens
 from .store import idempotency as claims
 
@@ -30,11 +30,6 @@ LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "s
 
 def problem(code, **details):
     return contract.Problem(code, AUTH_MESSAGES[code], **details)
-
-
-class AwaitingPresence(refusals.Refusal):
-    status = 202
-    code = "awaiting_presence"
 
 
 @dataclass
@@ -245,7 +240,7 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
     if not (claim or mcp):
-        authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential, scratch=scratch)
+        authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential)
     if credential:
         logins.of(peer)
         try:
@@ -264,21 +259,19 @@ def unauthenticated(handler, write, secure):
     return problem("unauthenticated")
 
 
-def authorize(handler, op, name, write, secure, peer, *, requires_credential, scratch):
+def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
     if requires_credential and credential is None:
         raise unauthenticated(handler, write, secure)
-    if name in PRESENCE:
-        if credential is None and name == "token.issue":
-            logins = handler.server.logins
-            logins.credentials.issue(logins.node_key(peer))
-            if not scratch:
-                raise AwaitingPresence("Issue a token from a paired browser.")
-        require_presence(credential)
     if name == "pairing.start" and (credential is None or credential.kind != "session"):
         with db.reader() as c:
             if tokens.live_session(c):
                 require_presence(credential)
+    if name in PRESENCE:
+        if credential is None and name == "token.issue":
+            logins = handler.server.logins
+            logins.credentials.issue(logins.node_key(peer))
+        require_presence(credential)
     if write and credential is None:
         raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":

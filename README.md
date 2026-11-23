@@ -2344,8 +2344,8 @@ Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local
 The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
 A tailnet login mapped through `principal_logins` to an active person admits the connection. A valid bearer token also admits a client on a tagged host.
-The versioned API and its legacy aliases return `401 unauthenticated` without a bearer token or paired browser session, with the exceptions below. The dashboard sends `X-Arete: 1` with its session writes.
-Admitted peers can call `GET /api/v1/meta` and `GET /api/meta` without a credential. Over HTTPS, `POST /api/v1/auth/pairings/claim` accepts a pairing code, and `POST /api/v1/tokens` without a credential returns `202 awaiting_presence`. The `/hook/` path uses each webhook's own secret.
+The versioned API and its legacy aliases require a bearer token or paired browser session, with the bootstrap exceptions below. Protected reads without a credential return `401 unauthenticated` after connection admission. The dashboard sends `X-Arete: 1` with its session writes.
+Admitted peers can call `GET /api/v1/meta` and `GET /api/meta` without a credential. Over HTTPS, `POST /api/v1/auth/pairings/claim` accepts a pairing code, and `POST /api/v1/tokens` without a credential records an issuance request and returns `403 forbidden` with reason `presence_required`. The `/hook/` path uses each webhook's own secret.
 `[dashboard] owner` seeds the first person once; if empty, the seed uses the node's own login.
 The person gets a random `u:` id and the Tailscale display name (or the login's local part).
 Editing `owner` after seeding changes neither admission nor the person's login binding.
