@@ -239,7 +239,7 @@ OPERATIONS += [
     operation("config.versions", "config/{kind}/{name}/versions", envelope({"versions": array(STRING)}),
               obj(CONFIG_ID), CONFIG_EXAMPLE),
     operation("config.diff", "config/{kind}/{name}/diff", envelope({"diff": STRING}),
-              obj({**CONFIG_ID, "from": STRING, "to": STRING}, CONFIG_ID), CONFIG_EXAMPLE),
+              obj({**CONFIG_ID, "from": STRING, "to": STRING}, list(CONFIG_ID)), CONFIG_EXAMPLE),
     operation("token.list", "tokens", envelope({"tokens": array(TOKEN)})),
     operation("token.issue", "tokens", TOKEN_ISSUED, TOKEN_ISSUE,
               {"label": "Remote CLI", "scopes": ["read", "task:write"]}, "POST", success_status=201),

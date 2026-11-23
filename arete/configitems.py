@@ -8,6 +8,7 @@ import subprocess
 import tomllib
 from dataclasses import asdict
 from difflib import unified_diff
+from pathlib import Path
 
 from . import config, configkinds, paths, refusals, settings
 
@@ -78,8 +79,25 @@ def file_text(relative: str) -> str:
         raise refusals.Invalid("The selected config file must be UTF-8 text") from None
 
 
-def git(*args: str) -> str | None:
+def git_location(relative: str) -> tuple[Path, str] | None:
     root = paths.CONFIG_DIR.resolve()
+    path = root / relative
+    if path.parent.resolve() != path.parent:
+        return None
+    for directory in path.parents:
+        if not directory.is_relative_to(root):
+            break
+        git_dir = directory / ".git"
+        if git_dir.is_symlink():
+            return None
+        if git_dir.is_dir():
+            return directory, path.relative_to(directory).as_posix()
+        if git_dir.exists():
+            return None
+    return None
+
+
+def git(root: Path, *args: str) -> str | None:
     git_dir = root / ".git"
     if git_dir.is_symlink() or not git_dir.is_dir():
         return None
@@ -94,30 +112,35 @@ def git(*args: str) -> str | None:
 
 
 def revisions(found: dict) -> list[str]:
-    return (git("log", "-n", "50", "--format=%H", "--", found["path"]) or "").splitlines()
+    if (location := git_location(found["path"])) is None:
+        return []
+    root, path = location
+    return (git(root, "log", "-n", "50", "--format=%H", "--", path) or "").splitlines()
 
 
-def revision_text(ref: str, path: str) -> str | None:
+def revision_text(root: Path, ref: str, path: str) -> str | None:
     blob = f"{ref}^{{commit}}:{path}"
-    size = git("cat-file", "-s", blob)
+    size = git(root, "cat-file", "-s", blob)
     if size is None:
         return None
     if int(size) > MAX_CONTENT:
         raise refusals.TooLarge("The selected config revision is too large")
-    return git("cat-file", "blob", blob)
+    return git(root, "cat-file", "blob", blob)
 
 
 def diff(found: dict, first: str | None, last: str | None) -> str | None:
     if any(ref is not None and not re.fullmatch(REVISION, ref) for ref in (first, last)):
         raise refusals.Invalid("Config revisions must be full Git commit IDs")
-    path = found["path"]
-    start = first or (git("rev-parse", "--verify", "HEAD^{commit}") or "").strip()
+    if (location := git_location(found["path"])) is None:
+        return None
+    root, path = location
+    start = first or (git(root, "rev-parse", "--verify", "HEAD^{commit}") or "").strip()
     if not start:
         return None
-    before = revision_text(start, path)
+    before = revision_text(root, start, path)
     if before is None:
         return None
-    after = revision_text(last, path) if last else file_text(path)
+    after = revision_text(root, last, path) if last else file_text(found["path"])
     if after is None:
         return None
     if found["kind"] == "attention":

@@ -205,13 +205,15 @@ def prepare_replay(root):
     return config, lambda repo: "origin" in sample_git(["remote"], repo.path).split()
 
 
-def config_fixture_git(*args):
+def config_fixture_git(*args, layers=False):
     from . import paths
 
     require(paths.CONFIG_DIR == Path.cwd() / "config" and not paths.CONFIG_DIR.is_symlink(),
             "config Git working directory escaped the fixture")
+    root = paths.CONFIG_DIR / "layers" if layers else paths.CONFIG_DIR
+    require(root.resolve() == root, "config Git working directory escaped the fixture")
     done = subprocess.run(["git", "-c", "user.name=Config Fixture", "-c", "user.email=config@example.invalid",
-                           "-c", "commit.gpgsign=false", *args], cwd=paths.CONFIG_DIR,
+                           "-c", "commit.gpgsign=false", *args], cwd=root,
                           capture_output=True, text=True, timeout=5)
     require(done.returncode == 0, f"config fixture: git {args[0]}: {done.stderr.strip()}")
     return done.stdout.strip()
