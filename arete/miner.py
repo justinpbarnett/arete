@@ -910,7 +910,7 @@ def file_rule(proposal_id: int) -> str:
 def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
     base = gh.default_branch(repo.github)
     run_id = p["run_id"]
-    wt = workspace.make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}", owner=run_id)
+    wt = workspace.make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}")
     try:
         res = apply_in(cfg, run_id, wt, [p])
         if not res.ok:
@@ -926,7 +926,7 @@ def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
         git(["push", "-q", "origin", f"HEAD:{base}"], wt, timeout=300)
         return base
     finally:
-        workspace.remove_worktree(repo, wt, owner=run_id)
+        workspace.remove_worktree(repo, wt)
 
 
 def catch_up(repo: config.Repo, base: str) -> str:

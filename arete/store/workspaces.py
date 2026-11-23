@@ -625,7 +625,7 @@ def _sweep_row(ws: Path, row: dict) -> None:
     excluded = {Path(wt) for wt in row["release_excluded"] or ()}
     _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(), last_sweep_error="")
     try:
-        if not checkouts and row["release_excluded"] is None:
+        if not checkouts and not excluded:
             checkouts = workspace.registered_root_checkout(ws)
         workspace.clear_workspace(ws, checkouts, checkouts[0].src if checkouts else ws, [], by="sweep",
                                   excluded=excluded)
