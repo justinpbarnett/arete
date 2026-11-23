@@ -4,11 +4,13 @@ import hashlib
 import json
 import re
 import secrets
+import select
+import ssl
 import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -27,6 +29,7 @@ from . import (
     config,
     contract,
     control,
+    credential_http,
     devices,
     event_stream,
     events,
@@ -61,7 +64,7 @@ from .store import events as event_store
 from .store import idempotency as claims
 from .store import insights as insights_store
 from .store import runs as run_store
-from .store import writes
+from .store import tokens, writes
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -123,6 +126,8 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
                            WEB_TYPES[f.suffix])
         elif f.suffix == ".webmanifest":
             served[f"/{f.name}"] = (install_files.manifest(body, colors), WEB_TYPES[f.suffix])
+        elif f.name == "pair.html":
+            served["/pair"] = (body, WEB_TYPES[f.suffix])
         else:
             served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
     for path, png in install_files.icons(colors).items():
@@ -275,6 +280,17 @@ def fault_body(fault: verify_faults.Fault, path: str, query: dict[str, str]) -> 
     return api_http.json_bytes(api_http.problem(fault.status, answer))
 
 
+@contextmanager
+def write_claim(handler, key, sha, route):
+    actor = f"session:{handler.credential.id}" if route == "/api/v1/auth/logout" else handler.person
+    with idempotency.owning(actor, key, sha, route) as context:
+        if route != credential_http.PAIRING_START_ROUTE:
+            handler.server.logins.credentials.reject_pairing_key(actor, key)
+        row = (credential_http.matching_pairing_claim(context)
+               if route == credential_http.PAIRING_CLAIM_ROUTE else idempotency.matching_claim(context))
+        yield context, row
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
@@ -362,11 +378,18 @@ class Handler(BaseHTTPRequestHandler):
         self.route = route or ("/api/v1/principals/{id}" if path.startswith("/api/v1/principals/") else
                                path if path in ("/api/v1/events", "/api/v1/principals") else "unmatched")
         with principals.acting("hand"), event_store.request_scope(f"{method} {self.route}"):
+            self.actor = None
             self.write_receipt = None
             self.keyed_delivery = False
             self.idempotent_replayed = False
             self.read_seq = None
             self.parsed_body = None
+            self.credential = None
+            self.set_cookie = None
+            self.success_status = 200
+            self.instance_header = None
+            self.stream_check_at = 0
+            self.stream_marker = None
             return self.answer_as_person(method)
 
     def answer_as_person(self, method: str) -> None:
@@ -374,8 +397,6 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
-            if method in ("POST", "PATCH", "DELETE"):
-                self.check_write_instance()
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
@@ -384,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise contract.Problem("draining", RESTARTING)
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
                 return self.send_json(202 if got["queued"] else 200, got)
+            if method in ("POST", "PATCH", "DELETE"):
+                self.check_write_instance()
             self.validate_transport(method, path)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
@@ -420,7 +443,9 @@ class Handler(BaseHTTPRequestHandler):
             tag = None
             if conditional and self.route == "/api/v1/screen" and query.get("view") == "board":
                 tag = api_http.board_etag(result)
-            self.send_json(200, result, conditional=conditional, tag=tag)
+            if self.route == "/api/v1/meta" and method == "GET":
+                self.instance_header = result["instance"]["id"]
+            self.send_json(self.success_status, result, conditional=conditional, tag=tag)
         except Exception as e:
             if self.keyed_delivery:
                 raise
@@ -442,6 +467,52 @@ class Handler(BaseHTTPRequestHandler):
     def event_connection(self):
         return self.verify_controls.stream(self.connection) if self.verify_controls else nullcontext()
 
+    def stream_problem(self):
+        if self.credential is None or time.monotonic() < self.stream_check_at:
+            return None
+        self.stream_check_at = time.monotonic() + .25
+        marker = self.stream_marker or (self.credential.generation, self.credential.deadline)
+        issue, self.stream_marker = tokens.stream_status(self.credential, marker)
+        return issue
+
+    def stream_headers(self):
+        self.close_connection = True
+        self.end_headers(streaming=self.credential is not None)
+
+    def stream_write(self, block):
+        if self.credential is None:
+            self.wfile.write(block)
+            self.wfile.flush()
+            return
+        sock = self.connection
+        timeout = sock.gettimeout()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        pending = memoryview(block)
+        sock.setblocking(False)
+        try:
+            while pending:
+                if self.stream_problem():
+                    raise ConnectionAbortedError()
+                wait = .25 if deadline is None else min(.25, deadline - time.monotonic())
+                if wait <= 0:
+                    raise TimeoutError()
+                try:
+                    sent = sock.send(pending)
+                except ssl.SSLWantReadError:
+                    interest = select.POLLIN
+                except (BlockingIOError, ssl.SSLWantWriteError):
+                    interest = select.POLLOUT
+                else:
+                    if not sent:
+                        raise ConnectionAbortedError()
+                    pending = pending[sent:]
+                    continue
+                ready = select.poll()
+                ready.register(sock, interest)
+                ready.poll(wait * 1000)
+        finally:
+            sock.settimeout(timeout)
+
     def validate_transport(self, method, path):
         if self.api_path and (self.restarting or
                               method == "GET" and path != "/api/meta" and POSTS_IN_FLIGHT.draining()):
@@ -458,7 +529,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.api_path:
             return
         batch = path == "/api/v1/batch" and post
-        api_http.RATES.take(principals.current(), command=post and not batch)
+        api_http.RATES.take(self.person, command=post and not batch)
         if post and path == EVIDENCE_PATH:
             if not legacy or "Content-Type" in self.headers:
                 api_http.check_media(self.headers, {"application/octet-stream", *capture.EXTENSIONS}, self.content_size)
@@ -472,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
             if batch:
                 requests = self.body().get("requests")
                 if isinstance(requests, list) and 2 <= len(requests) <= 50:
-                    api_http.RATES.take(principals.current(), command=False, cost=len(requests) - 1)
+                    api_http.RATES.take(self.person, command=False, cost=len(requests) - 1)
             if self.alias:
                 rest = route_rest(self.alias["path"], path) or ""
                 contract.reject_unknown(self.body(), contract.alias_input(self.alias["provider"], unquote(rest)))
@@ -483,9 +554,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def keyed_start(self):
         body = self.body()
-        sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
-        with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha) as context:
-            row = idempotency.matching_claim(context)
+        route = "/api/tasks"
+        sha = idempotency.fingerprint("POST", route, {}, body)
+        key = self.headers["Idempotency-Key"]
+        with write_claim(self, key, sha, route) as (context, row):
             if row and row["status"]:
                 self.write_receipt = claims.receipt(row["last_seq"])
                 self.idempotent_replayed = True
@@ -518,8 +590,7 @@ class Handler(BaseHTTPRequestHandler):
         if "Idempotency-Key" not in self.headers:
             return action()
         sha = idempotency.fingerprint("POST", route, parameters, self.body())
-        with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha, route) as context:
-            row = idempotency.matching_claim(context)
+        with write_claim(self, self.headers["Idempotency-Key"], sha, route) as (context, row):
             if row and row["status"]:
                 self.idempotent_replayed = True
             else:
@@ -528,23 +599,27 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False):
         key = self.headers.get("Idempotency-Key")
         if key is None:
             return action()
         sha = idempotency.fingerprint(method, route, parameters, self.body())
-        with idempotency.owning(principals.current(), key, sha, route) as context:
-            row = idempotency.matching_claim(context)
+        with write_claim(self, key, sha, route) as (context, row):
+            if route == credential_http.PAIRING_START_ROUTE:
+                self.success_status = status
+                return credential_http.start_pairing(self, key)
             if row and row["status"]:
                 self.idempotent_replayed = True
+                result = json.loads(row["response"])
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
             else:
-                row = self.complete_action(context, action, atomic)
+                row, result = self.complete_action(context, action, atomic, status, redact)
+            self.success_status = row["status"]
             self.write_receipt = claims.receipt(row["last_seq"])
-            return json.loads(row["response"])
+            return result
 
-    def complete_action(self, context, action, atomic):
+    def complete_action(self, context, action, atomic, status, redact):
         if not atomic:
             claims.claim(context, None)
         with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
@@ -559,23 +634,23 @@ class Handler(BaseHTTPRequestHandler):
             seq = int(receipt["event_seq"].rsplit(".", 1)[1]) if receipt else None
             if atomic and collected:
                 seq = collected[-1][0]
-            return claims.complete(context, 200, api_http.json_bytes(result), seq)
+            payload = {**result, "text": "[shown once]"} if redact else result
+            if context[2] == credential_http.PAIRING_CLAIM_ROUTE:
+                context = (*context[:3], credential_http.pairing_claim_fingerprint(context[3]))
+            return claims.complete(context, status, api_http.json_bytes(payload), seq), result
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
-        if tailnet.host_name(self.headers.get("Host", "")) not in node.names:
+        hosts = self.headers.get_all("Host", [])
+        scheme = "https" if getattr(self.server, "tls", None) is not None else "http"
+        self.origin = credential_http.origin_of(scheme, hosts[0]) if len(hosts) == 1 else None
+        if self.origin is None or self.origin[1] not in node.names:
             raise Refusal(421, "This server answers only to its tailnet name or address.")
         if path.startswith(webhooks.HOOK_PATH):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        person = principals.for_login(self.server.logins.of(self.client_address[0]))
-        if not person:
-            raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
-        principals.admit(person)
-        self.actor = principals.current()
-        if method in ("POST", "PATCH", "DELETE") and self.headers.get("X-Arete") != "1":
-            raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
+        credential_http.authenticate(self, method, browser_asset=path in WEB_BY_PATH)
 
     def api(self, method: str, path: str, query: dict):
         if self.operation:
@@ -745,19 +820,20 @@ class Handler(BaseHTTPRequestHandler):
             found = (line for line in run_lines.read(run_id) if run_lines.seq_of(line) > start)
             return self.send(200, b"".join(map(event_line, found)), EVENTS_TYPE, "private, no-cache", conditional=True)
         self.head(200, EVENTS_TYPE, "no-store")
-        self.close_connection = True
         try:
             with self.event_connection() as dropped:
-                self.end_headers()
+                self.stream_headers()
                 ended = run_ended(run_id)
-                until = (lambda: dropped() or ended()) if dropped else ended
+
+                def until():
+                    return self.stream_problem() or (dropped and dropped()) or ended()
+
                 for line in run_lines.follow(run_id, start, until):
-                    self.wfile.write(event_line(line))
-                    self.wfile.flush()
+                    self.stream_write(event_line(line))
         except OSError:
             pass
 
-    def end_headers(self) -> None:
+    def end_headers(self, *, streaming=False) -> None:
         self.send_header("X-Arete-Engine", codebase.STAMP)
         if not getattr(self, "hook", False):
             self.send_header("Arete-API", contract.VERSION)
@@ -765,7 +841,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Deprecation", "true")
         if getattr(self, "read_seq", None):
             self.send_header("Arete-Seq", self.read_seq)
-        super().end_headers()
+        if getattr(self, "instance_header", None):
+            self.send_header("Arete-Instance", self.instance_header)
+            credential = getattr(self, "credential", None)
+            if credential is not None and credential.kind == "session":
+                self.send_header("Arete-Session", "paired")
+        if getattr(self, "set_cookie", None):
+            self.send_header("Set-Cookie", self.set_cookie)
+        if streaming and self.request_version != "HTTP/0.9":
+            self._headers_buffer.append(b"\r\n")
+            self.stream_write(b"".join(self._headers_buffer))
+            self._headers_buffer.clear()
+        else:
+            super().end_headers()
 
     def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
         self.send_response(status)
@@ -815,6 +903,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class Redirect(Handler):
     def answer(self, method: str) -> None:
+        path = request_path(self.path)
+        route = contract.match(method, path)
+        if credential_http.require_tls(route[0] if route else None):
+            error = credential_http.problem("tls_required")
+            return self.send_json(error.status, refusal_answer(error))
         node: tailnet.Node = self.server.node
         path = self.path if self.path.startswith("/") else "/"
         self.send_response(308)
@@ -1133,7 +1226,7 @@ def drop_chat(chat_id):
 
 
 def post_push_subscribe(handler, rest, query):
-    return webpush.subscribe(handler.body(), principals.contact(principals.current()))
+    return webpush.subscribe(handler.body(), principals.contact(handler.person))
 
 
 def post_push_remove(handler, rest, query):
@@ -1173,6 +1266,9 @@ def post_session(handler, rest, query):
     if action == "send":
         return steer_run(session_id, str(handler.body().get("text", "")))
     if action == "stop":
+        session = run_store.run_get(session_id)
+        if not session or session["kind"] != "session":
+            raise control.NotFound(f"no session {session_id}")
         return stop_run(handler, session_id)
     raise NoRoute
 
@@ -1274,4 +1370,12 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
         with util.lock(serve.SERVE_LOCK) as free:
             if free:
                 capture.recover()
-    tailnet.serve(handlers(), cfg, port, inside_serve, host)
+    with util.repeating(60, maintain_credentials, "credential-maintenance"):
+        tailnet.serve(handlers(), cfg, port, inside_serve, host)
+
+
+def maintain_credentials():
+    try:
+        tokens.maintain()
+    except Exception as error:
+        print(f"Credential maintenance failed ({type(error).__name__})", file=sys.stderr)

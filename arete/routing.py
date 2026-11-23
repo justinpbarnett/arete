@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 from typing import TYPE_CHECKING
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, util
+from . import accounts, claude, codex, config, configschema, devices, environment, paths, pi, prices, sandbox, scrub, util
 from .agent import REPLAY, TRAITS, model_scope, traits_of
 from .store import db as foundation
 from .store import devices as devices_store
@@ -710,7 +710,7 @@ class Discovery:
         sources: dict[str, str] = {}
 
         def take(values: dict, source: str, only_missing: bool = False) -> None:
-            for key in config.CAPABILITY_KEYS:
+            for key in configschema.keys(configschema.schema("routes", "$defs", "capability")):
                 if values.get(key) is not None and not (only_missing and key in found):
                     found[key], sources[key] = values[key], source
 

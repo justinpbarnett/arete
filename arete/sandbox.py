@@ -87,6 +87,7 @@ def sandboxed() -> bool:
 
 def authority_roots() -> tuple[Path, ...]:
     return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
+            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
             *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
 
 

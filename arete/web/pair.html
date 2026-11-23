@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Arete · Browser pairing and tokens</title>
+  <link rel="stylesheet" href="/pattern.css">
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/pair.css">
+  <script type="module" src="/pair.js"></script>
+</head>
+<body>
+<main class="credential-page">
+  <nav aria-label="Dashboard"><a href="/">Classic dashboard</a> <a href="/ui.html">New dashboard</a></nav>
+  <h1>Browser pairing and tokens</h1>
+  <p id="credential-status" class="said" role="status">Checking browser pairing…</p>
+  <section id="claim" hidden>
+    <form id="claim-form" method="post" autocomplete="off">
+      <label>Pairing code <input name="code" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required></label>
+      <button type="submit">Pair browser</button>
+    </form>
+  </section>
+  <section id="manage" hidden>
+      <button id="start-pair" type="button">Pair a device</button>
+      <button id="sign-out" type="button">Sign out of this browser</button>
+      <div id="pair-link" class="credential-secret" hidden>
+        <label>Pairing link <input readonly></label>
+        <p id="pair-expiry"></p>
+      </div>
+      <h2>Access tokens</h2>
+      <ul id="token-list"></ul>
+      <form id="issue-form" method="post" autocomplete="off">
+        <h3>Issue a token</h3>
+        <label>Label <input name="label" maxlength="120" required></label>
+        <label>Scopes <input name="scopes" value="read" required placeholder="read, task:write"></label>
+        <label>Profile <select name="profile"><option value="remote">Remote</option><option value="full">Full</option></select></label>
+        <button type="submit">Issue token</button>
+      </form>
+      <div id="issued" class="credential-secret" hidden>
+        <label>Token shown once <input readonly spellcheck="false" autocomplete="off"></label>
+        <button id="hide-token" type="button">Hide token</button>
+      </div>
+  </section>
+</main>
+</body>
+</html>

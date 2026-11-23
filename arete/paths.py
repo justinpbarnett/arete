@@ -31,12 +31,15 @@ def drop_credentials() -> None:
 
 
 CLIENT_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "arete-client"
+DEFAULT_TOKEN_CLIENT_DIR = HOME / ".local/state/arete/client"
 GUARD_HOOK = sys.argv[1:2] in (["guard"], ["codex-guard"])
 CONFIG_DIR, STATE_DIR, ISOLATED = local_paths.local_dirs(HOME, guard_hook=GUARD_HOOK)
 if ISOLATED:
     drop_credentials()
 SCRATCH_CONFIG = confined(CONFIG_DIR) is not None
 SCRATCH_STATE = confined(STATE_DIR) is not None
+TOKEN_CLIENT_DIR = (STATE_DIR if SCRATCH_STATE or STATE_DIR.parent.name == ".arete-sandbox"
+                    else CLIENT_DIR.with_name("arete")) / "client"
 LOG_DIR = local_paths.log_dir(HOME, STATE_DIR, ISOLATED)
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
@@ -68,6 +71,8 @@ ZTE_LIVE_INSTALL = HOME / "Library/Developer/arete/zte-managed"
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
+DEFAULTS_DIR = PACKAGE_DIR / "defaults"
+CONFIG_SCHEMAS_DIR = PACKAGE_DIR / "config_schemas"
 ADWS_DIR = PACKAGE_DIR.parent / "adws"
 CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"

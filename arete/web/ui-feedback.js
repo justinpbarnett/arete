@@ -1,3 +1,4 @@
+import { pairingHelp } from "./browser-auth.js";
 import { notice, mode } from "./ui-keys.js";
 import { postBody } from "./ui-write.js";
 import { webFetch } from "./ui-request.js";
@@ -112,7 +113,11 @@ async function call(path, body, signal) {
     : postBody(path, raw ? body : JSON.stringify(body), raw ? "application/octet-stream" : "application/json");
   const response = await sent.catch(() => { throw new NoAnswer("The connection to arete failed."); });
   const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
-  if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data, response.status);
+  if (!response.ok) {
+    const message = body !== undefined && response.status === 401 ? pairingHelp()
+      : data?.error || `The server answered ${response.status}.`;
+    throw new ErrorAnswer(message, data, response.status);
+  }
   return data;
 }
 
@@ -301,6 +306,7 @@ async function sendFields() {
     sayFeedback("ok", `Draft saved at ${clock(new Date())}. It is kept, and nothing is filed.`);
   } catch (e) {
     sayFeedback("caution", `${failedFeedback(e)} ${ON_DEVICE}`);
+    return e instanceof ErrorAnswer && e.status === 401;
   } finally {
     saving = false;
     if (dirty) saveLater(saved ? SAVE_MS : RETRY_MS);
@@ -405,7 +411,7 @@ function pollChecks() {
 function submitFeedback() {
   return inTurn(async () => {
     await uploads;
-    await sendFields();
+    if (await sendFields()) return;
     if (dirty || pending.length || !draft) {
       return sayFeedback("caution", draft ? "The draft is not saved yet, or a file is still sending. Submit again once it is." : "Write the request before you submit it.");
     }

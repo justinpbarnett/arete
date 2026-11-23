@@ -3,11 +3,14 @@ from __future__ import annotations
 from collections import Counter
 from urllib.parse import unquote
 
-from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, tool_events, triage, util
+from . import (
+    board, codebase, config, configitems, contract, control, credential_http, events, record,
+    refusals, settings, tasks, tool_events, triage, util,
+)
 from .store import chats, insights, runs
 from .store import db as foundation
 from .store import tasks as task_store
-from .store import writes
+from .store import tokens, writes
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
@@ -135,6 +138,10 @@ def execute(name, values, handler=None):
 
 
 def read(name, values, handler):
+    if name == "token.list":
+        return {"tokens": tokens.listing(handler.person)}
+    if name == "token.get":
+        return {"token": needed(tokens.get(values["token"], handler.person), values["token"])}
     if name == "meta.get":
         return meta()
     if name == "contract.get":
@@ -153,6 +160,8 @@ def read(name, values, handler):
                 "view": projection(view, values.get("id", ""))}
     if name == "settings.get":
         return {"settings": settings.current()}
+    if name.startswith("config."):
+        return read_config(name.removeprefix("config."), values)
     if name == "health.get":
         return {"health": board.health_board()}
     if name == "hook_event.list":
@@ -202,6 +211,21 @@ def read(name, values, handler):
     return {resource: serialize(row, contract.RESOURCE[resource])}
 
 
+def read_config(verb, values):
+    kind = values["kind"]
+    if verb == "list":
+        return {"items": configitems.listing(kind)}
+    found = configitems.item(kind, values["name"])
+    if verb == "read":
+        return {"item": configitems.read(found)}
+    if verb == "versions":
+        return {"versions": configitems.revisions(found)}
+    diff = configitems.diff(found, values.get("from"), values.get("to"))
+    if diff is None:
+        raise contract.Problem("unavailable", "No config Git diff is available")
+    return {"diff": diff}
+
+
 def dispatch(handler, op, path_values, query):
     name, method = op["name"], op["method"]
     identity = {k: unquote(v) for k, v in path_values.items()}
@@ -215,8 +239,14 @@ def dispatch(handler, op, path_values, query):
     try:
         if write:
             prepare(name, values)
-            return handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
-                                        atomic=name not in ("run.stop", "serve.install"))
+            result = handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
+                                          atomic=name not in ("run.stop", "serve.install"),
+                                          status=op["success_status"], redact=name in ("token.issue", "token.rotate"))
+            if name == "pairing.claim":
+                credential_http.finish_pairing_claim(handler)
+            elif name == "session.end":
+                handler.set_cookie = credential_http.session_cookie("", 0)
+            return result
         return execute(name, values, handler)
     except refusals.Refusal as error:
         if not getattr(error, "code", None) and error.status in (400, 404):
@@ -227,7 +257,9 @@ def dispatch(handler, op, path_values, query):
 def mutation(name, values, handler):
     from . import dashboard
 
-    if name.startswith("task.") or name == "comment.create":
+    if name.startswith(("token.", "pairing.")) or name in ("principal.revoke", "session.end"):
+        result = credential_http.write_operation(name, values, handler)
+    elif name.startswith("task.") or name == "comment.create":
         result = {"task": change_task(name, values)}
     elif name == "run.stop":
         result = dashboard.stop_run(handler, values["run"], values["base_version"], public=True)

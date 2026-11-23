@@ -110,6 +110,10 @@ def update(principal, **fields):
         if not c.execute(f"UPDATE principals SET {', '.join(k + ' = ?' for k in fields)}, version = version + 1 "
                          "WHERE id = ?", (*fields.values(), principal)).rowcount:
             raise KeyError(principal)
+        if fields.keys() & {"kind", "role", "status"}:
+            from .tokens import bump_generation
+
+            bump_generation(c)
         changed(c, principal)
 
 

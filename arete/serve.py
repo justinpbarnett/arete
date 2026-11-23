@@ -157,7 +157,8 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 def code_stamp() -> frozenset:
     stamp = set()
-    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files()]:
+    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files(),
+              *codebase.config_data_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:

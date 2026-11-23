@@ -68,6 +68,9 @@ class Written:
     kept: float | None = None
 
 
+DOCUMENT_KINDS = ("message", "ticket", "pr", "doc")
+
+
 def brief_from(data: dict) -> Brief:
     if not isinstance(data, dict):
         raise TypeError("the brief must be one JSON object")
@@ -75,8 +78,8 @@ def brief_from(data: dict) -> Brief:
     if bad := sorted(set(data) - set(names)):
         raise ValueError(f"the brief has an unknown key {', '.join(bad)}; use {', '.join(names)}")
     kind = data.get("kind")
-    if kind not in config.DOCUMENT_KINDS:
-        raise ValueError(f"the brief's kind {kind!r} is not one of {', '.join(config.DOCUMENT_KINDS)}")
+    if kind not in DOCUMENT_KINDS:
+        raise ValueError(f"the brief's kind {kind!r} is not one of {', '.join(DOCUMENT_KINDS)}")
     found = {"kind": kind}
     for name in names[1:]:
         value = data.get(name, () if name in ("facts", "acceptance", "keep", "drop") else "")

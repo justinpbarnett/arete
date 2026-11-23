@@ -485,6 +485,9 @@ def apply_restore_metadata(target, data):
         meta = metadata(conn)
         if "restore_epoch" not in meta:
             return False
+        from . import tokens
+
+        tokens.invalidate_restore(conn, meta, data["epoch"])
         for key, value in {**data["identity"], "restore_epoch": str(data["epoch"])}.items():
             conn.execute("INSERT INTO schema_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (key, value))

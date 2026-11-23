@@ -130,15 +130,19 @@ def update(table, identity, fields, *, base_version=None, expect=(), increments=
         return row
 
 
-def check_run(run_id, base_version=None, *, public=False):
+def check_run(run_id, base_version=None, *, public=False, for_stop=False):
     validate_version(base_version)
     with tx() as c:
         row = current(c, "runs", run_id)
         deadline = c.execute("SELECT value FROM schema_meta WHERE key = 'versioned_api_grace_deadline'").fetchone()[0]
         if deadline:
             util.parse_iso(deadline)
-        if row and ((base_version is not None and row["version"] != base_version)
-                    or (public and base_version is None and deadline and util.iso() >= deadline)):
+        if row is None:
+            return None
+        version = row["version"]
+        minimum = row["stop_version"] if for_stop else version
+        if ((base_version is not None and not minimum <= base_version <= version)
+                or (public and base_version is None and deadline and util.iso() >= deadline)):
             raise VersionConflict(row)
         return row
 

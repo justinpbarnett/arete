@@ -28,13 +28,14 @@ class ShowVersion(argparse.Action):
 
 def parser() -> argparse.ArgumentParser:
     from . import pilot, zte
-    from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks, verify_fault
+    from .commands import api, costs, credentials, hooks, lab, loops, records, research, runs, sessions, setup, tasks, verify_fault
     from .commands.arguments import Parser
 
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
-    for group in (api, runs, tasks, loops, sessions, hooks, costs, records, research, lab, setup, pilot, zte, verify_fault):
+    for group in (api, runs, tasks, loops, sessions, credentials, hooks, costs, records, research, lab, setup,
+                  pilot, zte, verify_fault):
         group.register(sub)
     return ap
 

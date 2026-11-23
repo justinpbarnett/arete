@@ -15,7 +15,9 @@ from . import contract
 
 SOURCE = "arete/contract.py"
 REGISTRY_INPUTS = (SOURCE, "arete/refusals.py")
-PRODUCERS = (*REGISTRY_INPUTS, "arete/contract_evolution.py")
+REQUIRED_PRODUCERS = (*REGISTRY_INPUTS, "arete/contract_evolution.py")
+CONFIG_REGISTRY = "arete/configkinds.py"
+PRODUCERS = (*REQUIRED_PRODUCERS, CONFIG_REGISTRY)
 OPENAPI = "docs/openapi.json"
 BOOTSTRAP = "arete/contract_v1_baseline.json"
 BOOTSTRAP_SOURCES = {
@@ -66,7 +68,7 @@ def result_schema(op, operations):
 def snapshot(registry, minor, oldest_client):
     operations = registry["operations"]
     return {"minor": minor, "oldest_client": oldest_client, "operations": {op["name"]: {
-        **{key: value for key, value in op.items() if key != "example"},
+        **{key: value for key, value in op.items() if key not in ("example", "scope", "success_status")},
         "result": result_schema(op, operations),
     } for op in operations}, "aliases": {route(alias): alias for alias in registry["aliases"]},
         "errors": {e["code"]: {k: e[k] for k in ("status", "schema")} for e in registry["errors"]}}
@@ -112,8 +114,9 @@ def openapi(registry, minor, source_hashes, oldest_client):
         statuses = defaultdict(list)
         for code in op["errors"]:
             statuses[errors[code]["status"]].append(code)
-        responses = {"200": {"description": "Successful result", "content": {"application/json": {
-            "schema": ref(f"{name}.result"), "example": example["result"]}}}}
+        success = {"description": "Successful result", "content": {"application/json": {
+            "schema": ref(f"{name}.result"), "example": example["result"]}}}
+        responses = {str(op.get("success_status", 200)): success}
         for status, codes in sorted(statuses.items()):
             key = ".".join(sorted(codes))
             if key not in problems:
@@ -137,7 +140,8 @@ def openapi(registry, minor, source_hashes, oldest_client):
         if method == "GET":
             responses["304"] = {"description": "The representation matches If-None-Match"}
         else:
-            entry["parameters"].append({"name": "X-Arete", "in": "header", "required": True,
+            entry["parameters"].append({"name": "X-Arete", "in": "header", "required": False,
+                                        "description": "Required for writes using a browser session.",
                                         "schema": {"type": "string", "const": "1"}})
             if contract.keyed_write(op):
                 entry["parameters"].append({"name": "Idempotency-Key", "in": "header", "required": True,
@@ -149,6 +153,11 @@ def openapi(registry, minor, source_hashes, oldest_client):
                     "schema": ref(f"{name}.input") if not path_fields else body,
                     "example": {k: v for k, v in example["input"].items() if k not in path_fields}}}}
         paths.setdefault(path, {})[method.lower()] = entry
+    meta = paths["/api/v1/meta"]["get"]["responses"]
+    identity = {"Arete-Instance": {"schema": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}}
+    meta["200"]["headers"] = {**identity, "Arete-Session": {"schema": {"const": "paired"}}}
+    forbidden = meta["403"]["$ref"].rsplit("/", 1)[-1]
+    meta["403"] = {**problems[forbidden], "headers": identity}
     return {"openapi": "3.1.0", "info": {"title": "Arete API", "version": f"1.{minor}"}, "paths": paths,
             "components": {"schemas": schemas, "responses": problems}, "x-arete-contract-sources-sha256": source_hashes,
             "x-arete-oldest-client": oldest_client, "x-arete-aliases": {route(alias): alias for alias in registry["aliases"]},
@@ -191,15 +200,16 @@ def baseline(root, revision):
     def read(path):
         return git(root, "cat-file", "blob", f"{commit}:{path}")
 
-    has_artifact = bool(git(root, "ls-tree", "-z", commit, "--", OPENAPI))
-    if not has_artifact and sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
+    tracked = {entry.split(b"\t", 1)[1].decode() for entry in
+               git(root, "ls-tree", "-z", commit, "--", OPENAPI, *PRODUCERS).split(b"\0") if entry}
+    if OPENAPI not in tracked and sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
         frozen = (root / BOOTSTRAP).read_bytes()
         if sha(frozen) != BOOTSTRAP_DATA_SHA:
             raise ValueError(f"pre-OpenAPI baseline {BOOTSTRAP} was modified")
         return commit, {**json.loads(frozen)["registry"], "oldest_client": BOOTSTRAP_OLDEST_CLIENT}
     try:
         document = json.loads(read(OPENAPI))
-        source_hashes = sources(read)
+        source_hashes = sources(read, PRODUCERS if CONFIG_REGISTRY in tracked else REQUIRED_PRODUCERS)
         saved = document["x-arete-contract-sources-sha256"]
         if saved != source_hashes:
             changed = sorted(path for path in source_hashes if saved.get(path) != source_hashes[path])
