@@ -4346,6 +4346,119 @@ class SharedResolverScratchFixture(ResolverScratchFixture):
         cls.create_merge(cls.merge_fixture)
 
 
+class ResolverFileMoveTests(SharedResolverScratchFixture):
+    BASE_MIGRATION = "project/m0002_a.py"
+    BRANCH_MIGRATION = "project/m0002_b.py"
+    RENAMED_MIGRATION = "project/m0003_b.py"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = cls.merge_fixture
+
+        def git(*args, check=True):
+            util.git(list(args), root, check=check)
+
+        git("merge", "--abort")
+        (root / cls.BRANCH_MIGRATION).write_text("# branch migration\n")
+        (root / "conflict.txt").write_text("m0002_b.py\n")
+        git("add", "--", cls.BRANCH_MIGRATION, "conflict.txt")
+        git("commit", "-qm", "branch migration")
+        git("checkout", "-q", "main")
+        (root / cls.BASE_MIGRATION).write_text("# base migration\n")
+        (root / "conflict.txt").write_text("m0002_a.py\n")
+        git("add", "--", cls.BASE_MIGRATION, "conflict.txt")
+        git("commit", "-qm", "base migration")
+        git("checkout", "-q", "branch")
+        git("merge", "--no-commit", "main", check=False)
+
+    def setUp(self):
+        super().setUp()
+        self.merge()
+
+    def test_moves_branch_migration_in_same_folder(self):
+        def edit():
+            (self.root / self.BRANCH_MIGRATION).rename(self.root / self.RENAMED_MIGRATION)
+            (self.root / "conflict.txt").write_text("m0002_a.py\nm0003_b.py\n")
+
+        self.resolve(edit)
+        self.assertEqual(len(self.git("rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.git("show", f"HEAD:{self.BASE_MIGRATION}"), "# base migration")
+        self.assertEqual(self.git("show", f"HEAD:{self.RENAMED_MIGRATION}"), "# branch migration")
+        self.assertEqual(self.git("ls-tree", "HEAD", "--", self.BRANCH_MIGRATION), "")
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "m0002_a.py\nm0003_b.py")
+
+    def test_rejects_creation_without_deletion(self):
+        def edit():
+            (self.root / self.RENAMED_MIGRATION).write_text("# new migration\n")
+
+        self.assert_outside_conflict(edit, self.RENAMED_MIGRATION)
+
+    def test_rejects_move_to_another_folder(self):
+        destination = "m0003_b.py"
+
+        def edit():
+            (self.root / self.BRANCH_MIGRATION).rename(self.root / destination)
+
+        self.assert_outside_conflict(edit, destination)
+
+    def test_rejects_move_of_file_already_on_base(self):
+        source = "project/tracked.txt"
+
+        def edit():
+            (self.root / source).rename(self.root / self.RENAMED_MIGRATION)
+
+        self.assert_outside_conflict(edit, f"{self.RENAMED_MIGRATION}, {source}")
+
+    def test_rejects_two_creations_for_one_deletion(self):
+        extra = "project/m0004_b.py"
+
+        def edit():
+            (self.root / self.BRANCH_MIGRATION).rename(self.root / self.RENAMED_MIGRATION)
+            (self.root / extra).write_text("# extra migration\n")
+
+        self.assert_outside_conflict(edit, extra)
+
+    def test_rejects_preexisting_ignored_file_as_move_destination(self):
+        name = "project/private.local"
+        ignore = self.root / ".gitignore"
+        original = ignore.read_text()
+        self.git("merge", "--abort")
+        ignore.write_text(original + "# branch rule\n")
+        self.git("commit", "-qm", "branch ignore rule", "--", ".gitignore")
+        self.git("checkout", "-q", "main")
+        ignore.write_text(original + "# base rule\n")
+        self.git("commit", "-qm", "base ignore rule", "--", ".gitignore")
+        self.git("checkout", "-q", "branch")
+        self.git("merge", "--no-commit", "main", check=False)
+        self.checkout.base_commit = self.git("rev-parse", "main")
+        self.conflicts = pipeline.unmerged_paths(self.root)
+        self.assertEqual(self.conflicts, [".gitignore", "conflict.txt"])
+        (self.root / name).write_text("existing local file\n")
+        self.assertEqual(self.git("check-ignore", "--", name), name)
+
+        def edit():
+            ignore.write_text(original.replace(f"{name}\n", ""))
+            (self.root / self.BRANCH_MIGRATION).unlink()
+
+        self.assert_outside_conflict(edit, name)
+
+    def test_rejects_conflict_markers_in_move_destination(self):
+        head = self.git("rev-parse", "HEAD")
+
+        def edit():
+            (self.root / self.BRANCH_MIGRATION).unlink()
+            (self.root / self.RENAMED_MIGRATION).write_text(
+                "<<<<<<< HEAD\n# branch migration\n=======\n# base migration\n>>>>>>> main\n")
+
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.resolve(edit)
+        self.assertEqual(str(failed.exception),
+                         f"conflict markers remain in {self.RENAMED_MIGRATION} after 1 attempt in fixture/repo")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("ls-files", "--", self.RENAMED_MIGRATION), "")
+
+
 class ResolverScratchTests(SharedResolverScratchFixture):
     def test_wrapper_scratch_stays_out_of_merge(self):
         self.merge()
