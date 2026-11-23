@@ -302,8 +302,8 @@ def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
             row, _, _ = _reconcile(ws)
         if row:
             selection = _release_selection(checkouts, excluded) if checkouts is not None else {}
-            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD,
-                                   **selection)
+            return _change_current(row, state="released", kept_reason="",
+                                   legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD, **selection)
     return None
 
 
@@ -480,7 +480,10 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
         if modified // 1_000_000_000 < removed or not ws.is_dir() or ws.is_symlink():
             return None
     snapshot = snapshot_fields(made)
-    if active and active["release_excluded"] is not None:
+    resumed = (active and active["state"] == "released"
+               and (snapshot["heads"] != active["heads"] or snapshot["onto"] != active["onto"]
+                    or snapshot["files"] != files(active["id"])))
+    if active and active["release_excluded"] is not None and not resumed:
         return change(active, legacy_mtime_ns=modified, **snapshot)
     owner = legacy_owner(cfg or config.load(), ws, made)
     identity = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
@@ -488,7 +491,11 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
         return _import_new(ws, owner, modified, identity, snapshot)
     if not snapshot["legacy_owner"] and active["owner_run"]:
         identity = {}
-    if any(active[key] != identity[key] for key in ("repo", "ticket", "owner_run") if key in identity):
+        owner = owner_of(active)
+    if resumed:
+        identity.update(state="kept", kept_reason=_run_for(owner).get("status") or "", released_at="",
+                        release_excluded=None, held_by=[], remove_asked_by="", last_sweep_error="")
+    elif any(active[key] != identity[key] for key in ("repo", "ticket", "owner_run") if key in identity):
         state, reason = _state_for(_run_for(owner).get("status") or "")
         identity.update(state=state, kept_reason=reason)
     return change(active, legacy_mtime_ns=modified, **identity, **snapshot)
@@ -714,8 +721,8 @@ def held_entry(row: dict) -> dict:
     run = runs.run_get(run_id) if run_id else None
     run = run or {}
     status = run.get("status") or row["kept_reason"]
-    blocked = row["state"] == "held"
     why = row["last_sweep_error"]
+    blocked = row["state"] == "held" or bool(why)
     if not why:
         if blocked:
             why = "workspace removal blocked"

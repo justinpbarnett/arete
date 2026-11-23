@@ -23,19 +23,22 @@ from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
+from select import select
 from socket import SHUT_WR, SO_SNDBUF, SOL_SOCKET, create_connection, socket, socketpair
 from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
     accounts, api, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
-    dashboard, event_stream, events, gh, idempotency, jira, paths, pipeline, principals, record, run_lines,
-    sandbox, screening, serve, tailnet, tasks, tool_events, tracker, triage, util, verify_faults, webpush, workspace,
+    dashboard, event_stream, events, gh, idempotency, jira, mcp_http, mcp_protocol, mcp_stdio, paths, pipeline,
+    principals, record, research, run_lines, sandbox, screening, serve, tailnet, tasks, tool_events, tracker, triage,
+    util, verify_faults, webpush, workspace,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
+from arete.store import loops as loop_store
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
 from arete.store import tokens as token_store
@@ -135,6 +138,26 @@ assert saved["sample.txt"] == workspace.fingerprint(ws / "sample.txt", saved["\0
 
 
 class WorkspaceBackfillTests(_WorkspaceChildCase):
+    def test_released_workspace_with_newer_legacy_head_stays_kept(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from tests.test_behavior import write_workspace_record
+
+ws, c, _, wid = checkout("7", "pr")
+released = workspaces.release(ws, [c])
+owner = workspace.WorkspaceOwner("older-worker", repo.name, "7", util.iso(), [c])
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "resumed work"], ws)
+made = workspace.made_before(ws)
+made.update({workspace.OWNER_KEY: owner.to_row(), workspace.head_key(c): util.git(["rev-parse", "HEAD"], ws).strip()})
+write_workspace_record(ws, made, after=released["legacy_mtime_ns"])
+
+assert workspaces.backfill(cfg) == 1
+row = workspaces.get(wid)
+assert row["state"] == "kept" and row["owner_run"] == owner.run, row
+assert workspace.made_before(ws) == made
+workspaces.sweep(cfg)
+assert ws.is_dir() and registered(ws) and workspaces.get(wid)["state"] == "kept"
+""")
+
     def test_sweep_reimports_newer_json_for_existing_workspace(self):
         self.run_child(r"""
 from arete import config, paths, workspace
@@ -532,6 +555,27 @@ row = workspaces.get(unpublished_id)
 assert unpublished.exists() and row["state"] == "held"
 assert "not on origin" in row["last_sweep_error"]
 assert not released.exists() and workspaces.get(released_id)["state"] == "removed"
+""")
+
+    def test_sweep_errors_count_kept_and_released_workspaces_as_blocked(self):
+        self.run_child(WORKSPACE_REPO + r"""
+kept, kept_checkout, _, kept_id = checkout("7", "done")
+workspaces.keep(kept, "done")
+index = Path(util.git(["rev-parse", "--path-format=absolute", "--git-path", "index"], kept_checkout.wt).strip())
+index.write_bytes(b"invalid Git index")
+released, c, _, released_id = checkout("8", "pr")
+workspaces.release(released, [c])
+util.git(["worktree", "lock", str(released)], src)
+
+workspaces.sweep(cfg)
+summary = workspace.held_summary()
+assert summary["blocked"] == 2, summary
+entries = {entry["name"]: entry for entry in summary["rows"]}
+for ws, wid, state, error in ((kept, kept_id, "kept", "index"), (released, released_id, "released", "locked")):
+    row = workspaces.get(wid)
+    entry = entries[ws.name]
+    assert row["state"] == state and row["sweep_attempts"] == 1, row
+    assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
 """)
 
 
@@ -1141,6 +1185,24 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
 
 
 class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
+    def test_operator_keep_is_cleared_when_forced_cleanup_is_released(self):
+        ws, selected, run = self.checkout("7", "pr", part="api")
+        remaining = replace(selected, dir="closed", wt=ws / "closed")
+        workspace.add_worktree(remaining, "closed-pr", "main")
+        util.git(["update-ref", "refs/remotes/origin/main", "HEAD"], remaining.src)
+        wid = workspaces.open_for(ws.name)["id"]
+        workspace.remove_workspace(ws, [selected], by=run.id, excluded={remaining.wt})
+        self.assertEqual(workspaces.get(wid)["kept_reason"], "operator")
+        util.git(["worktree", "lock", str(remaining.wt)], remaining.src)
+        with self.assertRaisesRegex(OSError, "locked"):
+            workspace.remove_workspace(ws, [remaining])
+        row = workspaces.get(wid)
+        self.assertEqual((row["state"], row["kept_reason"]), ("released", ""))
+        util.git(["worktree", "unlock", str(remaining.wt)], remaining.src)
+        workspaces.sweep(self.cfg)
+        self.assertEqual(workspaces.get(wid)["state"], "removed")
+        self.assertFalse(ws.exists())
+
     def test_retry_keeps_excluded_worktree_after_snapshot_and_legacy_reconciliation(self):
         ws, selected, run = self.checkout("7", "pr", part="api")
         closed = replace(selected, dir="closed", wt=ws / "closed")
@@ -1171,7 +1233,6 @@ class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
         made = json.loads(legacy.read_text())
         self.assertEqual(made[workspace.OWNER_KEY]["checkouts"], earlier.checkout_rows())
         made[workspace.OWNER_KEY]["run"] = "older-worker"
-        made["legacy-fingerprint"] = "reconciled"
         write_workspace_record(ws, made, after=legacy.stat().st_mtime_ns)
         (closed.wt / "hand.txt").write_text("keep\n")
         git(["worktree", "unlock", str(selected.wt)], selected.src)
@@ -1182,7 +1243,7 @@ class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
         self.assertEqual((final["state"], final["kept_reason"], final["sweep_attempts"]), ("kept", "operator", 1), final)
         self.assertEqual(final["checkouts"], row["checkouts"])
         self.assertEqual(final["owner_run"], run.id)
-        self.assertEqual(workspaces.files(wid)["legacy-fingerprint"], "reconciled")
+        self.assertEqual(final["legacy_mtime_ns"], legacy.stat().st_mtime_ns)
         self.assertFalse(selected.wt.exists())
         self.assertFalse(self.registered(selected.wt))
         self.assertTrue(self.registered(closed.wt))
@@ -1760,7 +1821,10 @@ class ConfigKindRegistryTests(unittest.TestCase):
     def server():
         with redirect_stdout(StringIO()):
             db.migrate()
-            principals.seed_owner(api_check.LOGIN)
+            owner = principals.seed_owner(api_check.LOGIN)
+        with db.tx() as c:
+            token_store.ensure_key(c)
+            _, token = token_store.issue(owner, "Config fixture", ["read"])
         node = SimpleNamespace(names={api_check.ADDRESS})
         logins = tailnet.Logins(tailnet.ScratchHost())
         logins.of = lambda _: api_check.LOGIN
@@ -1770,7 +1834,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
             thread.start()
             try:
-                yield api_check.Check(server.server_port, Path.cwd(), [], token="")
+                yield api_check.Check(server.server_port, Path.cwd(), [], token=token)
             finally:
                 server.shutdown()
                 thread.join()
@@ -2168,8 +2232,8 @@ class _CliThroughServeCase(unittest.TestCase):
         "guard": "guard", "heartbeat": "heartbeat", "hook": "tool_events", "init": "commands.setup",
         "install": "install", "jev compare": "lab.calibrate", "jev sample": "lab.calibrate",
         "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
-        "mcp-ask": "owner_asks", "mcp-config": "commands.api", "merge-check": "mergecheck",
-        "migrate": "store.db", "mine": "miner",
+        "mcp": "mcp_stdio", "mcp-ask": "owner_asks", "mcp-config": "commands.api",
+        "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
         "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
         "release-journeys": "releasejourneys", "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
@@ -3553,7 +3617,8 @@ class VerifyFaultTests(unittest.TestCase):
         self.assertEqual(self.command("clear"), (status, reason))
 
         endpoint = self.endpoint()
-        status, body = self.request(endpoint, "GET", self.board_route)
+        status, body = self.request(endpoint, "GET", self.board_route,
+                                    headers={"Authorization": fixture_bearer(self.actor)})
         self.assertEqual(status, 200)
         self.assertIn("view", body)
         self.assertEqual(self.spec.read_bytes(), saved)
@@ -4269,7 +4334,13 @@ class VersionedApiTests(unittest.TestCase):
         request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
         incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
-        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend, settimeout=lambda _: None)
+
+        def send(block):
+            outgoing.extend(block)
+            return len(block)
+
+        connection = mock.Mock(makefile=lambda *args: incoming, sendall=outgoing.extend, send=send,
+                               gettimeout=lambda: None)
         logins = tailnet.Logins(mock.Mock())
         logins.of = lambda _: "fixture@example.test"
         server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
@@ -4282,9 +4353,9 @@ class VersionedApiTests(unittest.TestCase):
         def request(path, *, body=None, headers=None, status=200):
             connection = HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                request_headers = {"Accept": "application/json"}
+                request_headers = {"Accept": "application/json", "Authorization": self.authorization}
                 if body is not None:
-                    request_headers.update({"Content-Type": "application/json", "Authorization": self.authorization})
+                    request_headers["Content-Type"] = "application/json"
                 connection.request("GET" if body is None else "POST", path,
                                    body=None if body is None else json.dumps(body),
                                    headers={**request_headers, **(headers or {})})
@@ -4362,10 +4433,12 @@ class VersionedApiTests(unittest.TestCase):
     def test_board_view(self):
         self.enterContext(mock.patch.object(paths, "DB_FILE", paths.DB_FILE.with_name("board.db")))
         db.migrate()
-        principals.seed_owner("fixture@example.test")
+        owner = principals.seed_owner("fixture@example.test")
+        authorization = fixture_bearer(owner)
 
         def request(path, *, headers=None, status=200):
-            actual, response, raw = self.wire_request("GET", path, {"Accept": "application/json", **(headers or {})})
+            request_headers = {"Accept": "application/json", "Authorization": authorization, **(headers or {})}
+            actual, response, raw = self.wire_request("GET", path, request_headers)
             self.assertEqual(actual, status, (path, raw))
             return (json.loads(raw) if raw else None), response
 
@@ -4636,9 +4709,14 @@ class PrincipalTests(unittest.TestCase):
 
         logins = tailnet.Logins(mock.Mock())
         logins.of = mock.Mock(return_value="fixture@example.test")
+        with db.tx() as c:
+            token_store.ensure_key(c)
+            _, session = token_store.issue(owner, "Principal fixture", ["read"], kind="session",
+                                           expires=token_store.session_lifetime(util.now()))
         handler = SimpleNamespace(server=SimpleNamespace(node=SimpleNamespace(names={"fixture.test"}),
-                                  logins=logins, tls=None), operation=None, alias=None,
+                                  logins=logins, tls=object()), operation=None, alias=None, verify_controls=None,
                                   client_address=("127.0.0.1", 1), headers=headers("fixture.test"))
+        handler.headers["Cookie"] = f"__Host-arete_session={session}"
         with principals.acting("hand"):
             dashboard.Handler.admit(handler, "GET", "/api/tasks")
             self.assertEqual(principals.current(), owner)
@@ -4788,6 +4866,473 @@ def credential_test(check):
     def launch(self):
         self.scratch(check.__qualname__)
     return launch
+
+
+def mcp_request(method, identity=1, params=None):
+    return {"jsonrpc": "2.0", "id": identity, "method": method, "params": params or {}}
+
+
+class _CredentialMcpCase(_CredentialCase):
+    def mcp(self, server, text):
+        def post(method, identity, params=None, **expected):
+            return self.request(server, "POST", mcp_protocol.PATH, bearer=text, headers=headers,
+                                body=mcp_request(method, identity, params), **expected)
+
+        headers = {}
+        _, response = post("initialize", 1)
+        headers["Mcp-Session-Id"] = response["Mcp-Session-Id"]
+        return post, headers["Mcp-Session-Id"]
+
+
+class CredentialMcpHttpTests(_CredentialMcpCase):
+    @credential_test
+    def test_registry_grants_actor_and_rate_limit(self, _):
+        rates = api_http.RateLimits(clock=lambda: 0, command_limit=(2, 10))
+        with self.listen() as server, mock.patch.object(mcp_http, "CALL_RATES", rates):
+            issued = self.issue(server, self.pair(server), scopes=("read", "task:write", "run:write"))
+            post, session = self.mcp(server, issued["text"])
+            names = {tool["name"] for tool in post("tools/list", 2)[0]["result"]["tools"]}
+            self.assertEqual(names, {"screen__get", "task__list", "task__get", "task__create", "comment__create",
+                                     "run__list", "run__get", "run__stop", "run__steer"})
+            post("tools/call", 3, {"name": "token__issue"}, status=403, code="scope_missing")
+            create = {"name": "task__create", "arguments": {"repo": "fixture", "body": "Work </untrusted>"}}
+            answer, _ = post("tools/call", 4, create)
+            task = json.loads(answer["result"]["content"][0]["text"])["task"]
+            self.assertEqual(task["body"], "<untrusted>Work &lt;/untrusted&gt;</untrusted>")
+            replay, headers = post("tools/call", 4, create)
+            self.assertEqual(replay, answer)
+            self.assertEqual(headers["Idempotent-Replayed"], "true")
+            actor = "client:" + issued["token"]["id"]
+            self.assertIsNotNone(claims.lookup(actor, f"mcp:{session}:4"))
+            self.assertEqual(self.task_actors(), [actor])
+            for identity in range(5, 12):
+                post("tools/call", identity, {"name": "task__list"})
+            post("tools/call", 12, {"name": "task__list"}, status=429, code="rate_limited")
+
+            _, text = token_store.issue(self.owner, "Commands", ["read"], profile="full",
+                                        commands=["batch.run", "task.list", "token.list", "run.stop"])
+            restricted, _ = self.mcp(server, text)
+            names = {tool["name"] for tool in restricted("tools/list", 2)[0]["result"]["tools"]}
+            self.assertEqual(names, {"batch__run", "task__list"})
+            restricted("tools/call", 3, {"name": "batch__run", "arguments": {"requests": [
+                {"operation": "token.list"}]}}, status=403, code="scope_missing")
+
+    @credential_test
+    def test_bearer_and_tls_required(self, _):
+        with self.listen() as server:
+            cookie = self.pair(server)
+            for method in ("GET", "POST"):
+                for browser in (None, cookie):
+                    self.request(server, method, mcp_protocol.PATH, cookie=browser, status=401, code="unauthenticated")
+        with self.listen(secure=False) as server:
+            self.request(server, "POST", mcp_protocol.PATH, bearer=self.owner_text, status=426, code="tls_required")
+
+    @credential_test
+    def test_create_conflict_protects_stored_task_text(self, _):
+        identity = task_store.task_add("fixture", "Body </untrusted>", title="Title <tag> & updated")
+        stored = task_store.task_get(identity)
+        conflict = contract.Problem("task_version_conflict", stored["title"], current={
+            "title": stored["title"], "body": stored["body"], "nested": [{"text": stored["body"]}],
+        })
+        with self.listen() as server, mock.patch.object(api, "mutation", side_effect=conflict):
+            _, token = token_store.issue(self.owner, "Create", ["task:write"], profile="remote")
+            post, _ = self.mcp(server, token)
+            problem, headers = post("tools/call", 2, {"name": "task__create", "arguments": {
+                "repo": "fixture", "body": "Another task"}}, status=409, code="task_version_conflict")
+        title = "<untrusted>Title &lt;tag&gt; &amp; updated</untrusted>"
+        body = "<untrusted>Body &lt;/untrusted&gt;</untrusted>"
+        self.assertEqual(headers["Content-Type"], "application/problem+json")
+        self.assertEqual(problem["current"], {"title": title, "body": body,
+                                             "<untrusted>nested</untrusted>": [{"<untrusted>text</untrusted>": body}]})
+        self.assertEqual(problem["error"], "<untrusted>Title &lt;tag&gt; &amp; updated.</untrusted>")
+        self.assertEqual(problem["detail"], problem["error"])
+
+
+class CredentialMcpStoredResultsTests(_CredentialMcpCase):
+    @credential_test
+    def test_marks_stored_names_in_direct_and_batch_reads(self, _):
+        stored = {"id": [{"</untrusted>": "<stored>"}]}
+        marked = {"<untrusted>id</untrusted>": [{"<untrusted>&lt;/untrusted&gt;</untrusted>":
+                                                "<untrusted>&lt;stored&gt;</untrusted>"}]}
+        folder = paths.CONFIG_DIR / "loops" / "mcp-fixture"
+        folder.mkdir(parents=True)
+        (folder / "loop.toml").write_text('kind = "watch"\n[run]\nrepo = "fixture"\n')
+        (folder / "prompt.md").write_text("Check the fixture.")
+        loop_store.set_loop_state("mcp-fixture", data=stored)
+        operations = [{"operation": "hook_event.list"}, {"operation": "loop.get", "input": {"id": "mcp-fixture"}},
+                      {"operation": "screen.get", "input": {"view": "loop", "id": "mcp-fixture"}}]
+
+        def read(post, identity, name, arguments=None):
+            answer, _ = post("tools/call", identity, {"name": name, "arguments": arguments or {}})
+            self.assertEqual((answer["jsonrpc"], answer["id"]), ("2.0", identity))
+            content, = answer["result"]["content"]
+            self.assertEqual(content["type"], "text")
+            return json.loads(content["text"])
+
+        with self.listen() as server:
+            _, full_token = token_store.issue(self.owner, "Full fixture", ["read", "hook:write"], profile="full")
+            _, remote_token = token_store.issue(self.owner, "Remote fixture", ["read"], profile="remote")
+            self.request(server, "POST", "/api/v1/hook-events", bearer=full_token, body={
+                "origin": "a" * 32, "offset": 0, "events": [{"ts": "2026-01-01T00:00:00Z", "kind": "tool",
+                "cls": "fixture", "tool": stored, "session": stored}],
+            })
+            full, _ = self.mcp(server, full_token)
+            remote, _ = self.mcp(server, remote_token)
+            events = read(full, 2, "hook_event__list")
+            loop = read(full, 3, "loop__get", operations[1]["input"])
+            screen = read(remote, 2, "screen__get", operations[2]["input"])
+            batch = read(full, 4, "batch__run", {"requests": operations})
+        event, = events["events"]
+        self.assertEqual((event["tool"], event["session"]), (marked, marked))
+        self.assertEqual(event["kind"], "<untrusted>tool</untrusted>")
+        self.assertEqual(loop["loop"]["detail"]["state"], marked)
+        self.assertEqual(screen["view"]["state"], marked)
+        batch_events, batch_loop, batch_screen = batch["results"]
+        self.assertEqual(batch_events, events)
+        self.assertEqual(batch_loop["loop"]["detail"]["state"], marked)
+        self.assertEqual(batch_screen["view"]["state"], marked)
+        self.assertRegex(batch["seq"], r"^\d+\.\d+$")
+
+
+class CredentialMcpResearchTests(_CredentialMcpCase):
+    @credential_test
+    def test_wraps_imported_references_in_direct_and_batch_reads(self, _):
+        ref = "external/report"
+        research.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        research.report_file(ref).write_text(f"# {ref}: Imported report\n\nReport body.\n")
+        research.adopt_reports()
+        _, token = token_store.issue(self.owner, "Research reader", ["read"], profile="full")
+        selector = {"id": ref}
+        requests = [{"operation": "research.list"}, {"operation": "research.get", "input": selector}]
+        with self.listen() as server:
+            post, _ = self.mcp(server, token)
+
+            def read(identity, name, arguments=None):
+                answer, _ = post("tools/call", identity, {"name": name, "arguments": arguments or {}})
+                return json.loads(answer["result"]["content"][0]["text"])
+
+            listed, = read(2, "research__list")["research"]
+            fetched = read(3, "research__get", selector)["research"]
+            batch_list, batch_get = read(4, "batch__run", {"requests": requests})["results"]
+
+        wrapped = f"<untrusted>{ref}</untrusted>"
+        self.assertEqual((listed["id"], listed["detail"]["ref"]), (wrapped, wrapped))
+        self.assertEqual((fetched["id"], fetched["detail"]["ref"]), (wrapped, wrapped))
+        self.assertEqual(batch_list["research"], [listed])
+        self.assertEqual(batch_get["research"], fetched)
+
+
+class CredentialMcpReadReplayTests(_CredentialMcpCase):
+    @credential_test
+    def test_replays_read_and_batch_snapshots_with_session_and_token_isolation(self, _):
+        _, token = token_store.issue(self.owner, "Reader", ["read"], profile="full")
+        _, other = token_store.issue(self.owner, "Other reader", ["read"], profile="full")
+        _, restricted = token_store.issue(self.owner, "Batch only", ["read"], profile="full", commands=["batch.run"])
+        task_id = task_store.task_add("fixture", "Original")
+        args = {"id": task_id}
+        read = {"name": "task__get", "arguments": args}
+        batch = {"name": "batch__run", "arguments": {"requests": [
+            {"operation": "task.get", "input": args}, {"operation": "task.list"}]}}
+        with self.listen() as server:
+            post, session = self.mcp(server, token)
+            initial_read, _ = post("tools/call", 2, read)
+            initial_batch, _ = post("tools/call", 3, batch)
+            task_store.task_update(task_id, task_store.task_get(task_id)["version"], {"body": "Updated"})
+
+            for identity, tool, original in ((2, read, initial_read), (3, batch, initial_batch)):
+                replay, headers = post("tools/call", identity, tool)
+                self.assertEqual(replay, original)
+                self.assertEqual(headers["Idempotent-Replayed"], "true")
+            post("tools/call", 2, {"name": "task__list"}, status=422, code="idempotency_key_reused")
+
+            fresh, _ = self.mcp(server, token)
+            latest, headers = fresh("tools/call", 2, read)
+            self.assertNotIn("Idempotent-Replayed", headers)
+            task = json.loads(latest["result"]["content"][0]["text"])["task"]
+            self.assertEqual(task["body"], "<untrusted>Updated</untrusted>")
+            same_session = {"Mcp-Session-Id": session}
+            answer, headers = self.request(server, "POST", mcp_protocol.PATH, bearer=other, headers=same_session,
+                                           body=mcp_request("tools/call", 2, read))
+            self.assertEqual(answer, latest)
+            self.assertNotIn("Idempotent-Replayed", headers)
+            self.request(server, "POST", mcp_protocol.PATH, bearer=restricted, headers=same_session,
+                         body=mcp_request("tools/call", 3, batch), status=403, code="scope_missing")
+
+
+class CredentialMcpProblemDetailsTests(_CredentialMcpCase):
+    @credential_test
+    def test_invalid_rpc_envelopes_return_api_problem_details(self, _):
+        with self.listen() as server:
+            for body in ({"jsonrpc": "1.0", "method": "ping", "id": 1},
+                         {"jsonrpc": "2.0", "method": "ping", "id": True},
+                         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": "invalid"}):
+                problem, headers = self.request(server, "POST", mcp_protocol.PATH, body=body,
+                                                bearer=self.owner_text, status=400, code="invalid_input")
+                self.assertEqual(headers["Content-Type"], "application/problem+json")
+                self.assertEqual(problem["type"], "urn:arete:problem:invalid_input")
+                self.assertEqual(problem["status"], 400)
+                self.assertEqual(problem["title"], "Bad Request")
+                self.assertEqual(problem["detail"], "<untrusted>Invalid JSON-RPC request.</untrusted>")
+
+
+class CredentialMcpStdioTests(_CredentialCase):
+    @credential_test
+    def test_stdio_replays_across_rotation(self, _):
+        issued, text = token_store.issue(self.owner, "Stdio fixture", ["task:write"], profile="remote")
+        request_once = client.request_once
+        attempts = {"commit": [], "unknown": []}
+
+        def transport(method, path, body=None, *args, **kwargs):
+            if path != mcp_protocol.PATH or body["method"] != "tools/call":
+                return request_once(method, path, body, *args, **kwargs)
+            content = body["params"]["arguments"]["body"]
+            seen = attempts[content]
+            seen.append(kwargs["key"])
+            self.assertEqual(kwargs["extra_headers"]["X-Arete-Client"], f"mcp/{contract.VERSION}")
+            self.assertRegex(kwargs["key"], r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+            if content == "unknown":
+                raise client.Broken({"error": "Injected response loss"})
+            response = request_once(method, path, body, *args, **kwargs)
+            if len(seen) == 1:
+                client.close_response(response)
+                _, replacement = token_store.rotate(issued["id"], self.owner, 0)
+                credential_files.write_client(self.meta["instance_tag"], replacement)
+                raise client.Broken({"error": "Injected response loss after commit"})
+            return response
+
+        calls = [mcp_request("initialize")] + [
+            mcp_request("tools/call", identity, {"name": "task__create",
+                        "arguments": {"repo": "fixture", "body": body}})
+            for identity, body in enumerate(attempts, 2)]
+        incoming = BytesIO(b"".join(json.dumps(call).encode() + b"\n" for call in calls))
+        with (self.listen() as server, self.cli_environment(server, ARETE_TOKEN=text),
+              mock.patch.object(client, "request_once", side_effect=transport),
+              mock.patch("sys.stdin", SimpleNamespace(buffer=incoming)),
+              mock.patch.object(principals, "cli_actor", side_effect=AssertionError("Stdio opened the local database")),
+              redirect_stdout(StringIO()) as out):
+            self.assertEqual(cli.main(["mcp"]), 0)
+        replies = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
+        self.assertNotIn("isError", replies[1]["result"])
+        self.assertEqual([len(seen) for seen in attempts.values()], [3, 4])
+        self.assertTrue(all(len(set(seen)) == 1 for seen in attempts.values()))
+        answer = json.loads(replies[2]["result"]["content"][0]["text"])
+        self.assertEqual(answer, {"code": "outcome_unknown", "idempotency_key": attempts["unknown"][0]})
+        self.assertEqual([task["body"] for task in task_store.tasks()], ["commit"])
+        self.assertEqual(self.task_actors(), ["client:" + issued["id"]])
+
+
+class CredentialMcpRotationTests(unittest.TestCase):
+    def test_stdio_keeps_replacement_after_tool_problem(self):
+        for status, code in ((404, "not_found"), (409, "task_version_conflict"), (401, "unauthenticated")):
+            with self.subTest(status=status):
+                self.check_replacement(status, code)
+
+    def check_replacement(self, status, code):
+        where = client.Server("https", "fixture.test", 443, "fixture.test", instance="a" * 32)
+        old_id = "b" * 8
+        original = f"ar_{where.tag}_{old_id}_fixture"
+        replacement = f"ar_{where.tag}_{'c' * 8}_fixture"
+        retry_problem = api_http.problem(status, {"code": code, "error": "Tool request failed"})
+        next_problem = api_http.problem(404, {"code": "not_found", "error": "Task not found"})
+        attempts = []
+
+        def transport(method, path, body=None, *, token=None, extra_headers=None, key=None, **kwargs):
+            headers = {"Arete-Instance": where.instance}
+            if (method, path) == ("GET", client.META):
+                return SimpleNamespace(getheader=headers.get, close=lambda: None)
+            self.assertEqual((method, path), ("POST", mcp_protocol.PATH))
+            self.assertEqual(body["id"], key)
+            previous = extra_headers.get(mcp_protocol.ROTATION_HEADER)
+            attempts.append((token, previous, key))
+            if token == original:
+                raise client.Failed({"code": "token_rotated"}, 401)
+            if previous == old_id:
+                raise client.Failed(retry_problem, status, headers=headers)
+            raise client.Failed(next_problem, 404, headers=headers)
+
+        bridge = mcp_stdio.Stdio()
+        bridge.where = where
+        bridge.token = original
+        bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+        with (mock.patch.object(client, "stored_token", return_value=replacement) as read_token,
+              mock.patch.object(client, "request_once", side_effect=transport)):
+            for identity, expected in ((2, (status, code)), (3, (404, "not_found"))):
+                call = mcp_request("tools/call", identity, {"name": "task__update", "arguments": {
+                    "id": "t-abcd", "base_version": 1, "title": "Stale edit"}})
+                reply = bridge.handle(call)["result"]
+                self.assertTrue(reply["isError"])
+                problem = json.loads(reply["content"][0]["text"])
+                self.assertEqual((problem["status"], problem["code"]), expected)
+
+        read_token.assert_called_once_with(where)
+        first, retry, next_call = attempts
+        self.assertEqual(first, (original, None, retry[2]))
+        self.assertEqual(retry[:2], (replacement, old_id))
+        self.assertEqual(next_call[:2], (replacement, None))
+
+
+class CredentialMcpMissingReplacementTests(_CredentialCase):
+    @credential_test
+    def test_stdio_blocks_retired_tokens_until_a_replacement_is_stored(self, _):
+        where = client.Server("https", "fixture.test", 443, "fixture.test", instance=self.meta["instance_id"])
+        issued, original = token_store.issue(self.owner, "Stdio fixture", ["read"], profile="remote")
+        _, replacement = token_store.rotate(issued["id"], self.owner, 0)
+        call = mcp_request("tools/call", 2, {"name": "task__list"})
+        for label, unavailable in (("missing", None), ("unreadable", PermissionError()), ("retired", original)):
+            with self.subTest(stored=label):
+                attempts = []
+                replacement_rotated = False
+
+                def transport(method, path, body=None, *, token=None, **kwargs):
+                    headers = {"Arete-Instance": where.instance}
+                    if (method, path) == ("GET", client.META):
+                        return SimpleNamespace(getheader=headers.get, close=lambda: None)
+                    self.assertEqual((method, path), ("POST", mcp_protocol.PATH))
+                    attempts.append(token)
+                    if token == original or replacement_rotated:
+                        raise client.Failed({"code": "token_rotated"}, 401)
+                    raise client.Failed({"code": "not_found"}, 404)
+
+                with mock.patch.dict(os.environ, {"ARETE_TOKEN": original}):
+                    bridge = mcp_stdio.Stdio()
+                bridge.where = where
+                bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+                with (mock.patch.object(credential_files, "read_client", side_effect=[
+                          unavailable, unavailable, replacement, original]),
+                      mock.patch.object(client, "request_once", side_effect=transport) as send):
+                    for _ in range(2):
+                        reply = bridge.handle(call)["result"]
+                        self.assertTrue(reply["isError"])
+                        problem = json.loads(reply["content"][0]["text"])
+                        self.assertEqual(problem["code"], "token_rotated")
+                        self.assertIn("Store a replacement token", problem["error"])
+                        self.assertNotIn("status", problem)
+                    self.assertEqual(attempts, [original])
+                    self.assertEqual(send.call_count, 2)
+                    reply = bridge.handle(call)["result"]
+                    self.assertEqual(json.loads(reply["content"][0]["text"])["code"], "not_found")
+                    replacement_rotated = True
+                    reply = bridge.handle(call)["result"]
+                    problem = json.loads(reply["content"][0]["text"])
+                    self.assertIn("Store a replacement token", problem["error"])
+                self.assertEqual(attempts, [original, replacement, replacement])
+
+    def test_lost_response_keeps_idempotency_key_when_replacement_is_missing(self):
+        where = client.Server("https", "fixture.test", 443, "fixture.test", instance="a" * 32)
+        bridge = mcp_stdio.Stdio()
+        bridge.where = where
+        bridge.token = f"ar_{where.tag}_{'b' * 8}_fixture"
+        bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+        failures = [client.Broken({"error": "Injected response loss"}),
+                    client.Failed({"code": "token_rotated"}, 401)]
+        with (mock.patch.object(bridge, "exchange", side_effect=failures) as exchange,
+              mock.patch.object(client, "stored_token", return_value=None)):
+            answer = bridge.handle(mcp_request("tools/call", 2, {"name": "task__list"}))["result"]
+        first, retry = exchange.call_args_list
+        self.assertEqual(first.args[1], retry.args[1])
+        problem = json.loads(answer["content"][0]["text"])
+        self.assertEqual((problem["code"], problem["idempotency_key"]), ("outcome_unknown", first.args[1]))
+        self.assertIn("Store a replacement token", problem["error"])
+
+
+class CredentialMcpRateRetryTests(_CredentialCase):
+    @credential_test
+    def test_rate_limit_delays_same_key_replay_after_lost_write_response(self, _):
+        issued, token = token_store.issue(self.owner, "Rate fixture", ["task:write"], profile="remote")
+        request_once = client.request_once
+        attempts = []
+        elapsed = 0
+        rates = api_http.RateLimits(clock=lambda: elapsed, command_limit=(2, 1))
+
+        def wait(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        sleep = mock.Mock(side_effect=wait)
+
+        def transport(method, path, body=None, **kwargs):
+            if path != mcp_protocol.PATH or body["method"] != "tools/call":
+                return request_once(method, path, body, **kwargs)
+            attempts.append((kwargs["key"], body["id"]))
+            try:
+                response = request_once(method, path, body, **kwargs)
+            except client.Failed as failure:
+                self.assertEqual((failure.code, failure.retry_after), (429, 1))
+                raise
+            if len(attempts) == 1:
+                client.close_response(response)
+                raise client.Broken({"error": "Injected response loss after commit"})
+            self.assertEqual(response.getheader("Idempotent-Replayed"), "true")
+            return response
+
+        calls = [mcp_request("initialize"), mcp_request("tools/call", 2, {"name": "task__create", "arguments": {
+            "repo": "fixture", "body": "Commit once"}})]
+        incoming = BytesIO(b"".join(json.dumps(call).encode() + b"\n" for call in calls))
+        clock = SimpleNamespace(monotonic=time.monotonic, time_ns=time.time_ns, sleep=sleep)
+        with (self.listen() as server, self.cli_environment(server, ARETE_TOKEN=token),
+              mock.patch.object(mcp_http, "CALL_RATES", rates), mock.patch.object(mcp_stdio, "time", clock),
+              mock.patch.object(client, "request_once", side_effect=transport),
+              mock.patch("sys.stdin", SimpleNamespace(buffer=incoming)), redirect_stdout(StringIO()) as out):
+            self.assertEqual(cli.main(["mcp"]), 0)
+        _, reply = map(json.loads, out.getvalue().splitlines())
+        self.assertEqual(reply["id"], 2)
+        self.assertNotIn("isError", reply["result"])
+        self.assertEqual(len(attempts), 3)
+        key = attempts[0][0]
+        self.assertEqual(attempts, [(key, key)] * 3)
+        sleep.assert_called_once_with(1)
+        self.assertEqual([task["body"] for task in task_store.tasks()], ["Commit once"])
+        self.assertEqual(self.task_actors(), ["client:" + issued["id"]])
+
+    def test_retry_after_past_deadline_keeps_unknown_outcome_and_key(self):
+        bridge = mcp_stdio.Stdio()
+        bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+        clock = SimpleNamespace(monotonic=lambda: 0, time_ns=time.time_ns, sleep=mock.Mock())
+        limited = client.Failed({"code": "rate_limited"}, 429, retry_after=mcp_stdio.BUDGET + 1)
+        failures = [client.Broken({"error": "Injected response loss"}), limited]
+        with (mock.patch.object(mcp_stdio, "time", clock),
+              mock.patch.object(bridge, "exchange", side_effect=failures) as exchange):
+            reply = bridge.handle(mcp_request("tools/call"))
+        first, second = exchange.call_args_list
+        key = first.args[1]
+        self.assertEqual(second.args[1], key)
+        clock.sleep.assert_not_called()
+        self.assertTrue(reply["result"]["isError"])
+        data = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(data, {"code": "outcome_unknown", "idempotency_key": key})
+
+
+class CredentialMcpInstanceTests(_CredentialCase):
+    def prepare(self):
+        pass
+
+    @credential_test
+    def test_second_stdio_process_refuses_and_next_starts_after_exit(self, _):
+        command = api_check.child_command(api_check.SOURCE, "from arete.cli import main; raise SystemExit(main())", "mcp")
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as first:
+            try:
+                first.stdin.write(b"{}\n")
+                first.stdin.flush()
+                self.assertTrue(select([first.stdout], [], [], 3)[0], "The first MCP process did not start")
+                expected = json.loads(first.stdout.readline())
+                self.assertEqual(expected["error"]["code"], -32600)
+
+                second = subprocess.run(command, input=b"", capture_output=True, timeout=CHILD_HANG_TIMEOUT)
+                self.assertEqual(second.returncode, 1, second.stderr)
+                self.assertEqual(second.stdout, b"")
+                self.assertIn(b"already running", second.stderr)
+                self.assertIsNone(first.poll())
+                first.stdin.close()
+                self.assertEqual(first.wait(timeout=3), 0)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+
+        third = subprocess.run(command, input=b"{}\n", capture_output=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(json.loads(third.stdout), expected)
+        self.assertFalse(paths.DB_FILE.exists())
 
 
 class _CredentialUpgradeCase(_CredentialCase):
@@ -4971,7 +5516,7 @@ class CredentialWriteTests(_CredentialCase):
             for bearer, count, status in ((self.owner_text, 49, 200), (other, 2, 429)):
                 body = {"requests": [{"operation": "meta.get"}] * count}
                 self.request(server, "POST", "/api/v1/batch", bearer=bearer, body=body, status=status)
-            self.request(server, "GET", self.TASKS, status=429, code="rate_limited")
+            self.request(server, "GET", self.TASKS, bearer=other, status=429, code="rate_limited")
         self.assertEqual(len(self.task_actors()), 1)
 
     @credential_test
@@ -5027,10 +5572,10 @@ class CredentialPairingTests(_CredentialCase):
             for headers in ({"Origin": "https://elsewhere.example"}, {"Sec-Fetch-Site": "cross-site"}):
                 self.task(server, cookie=cookie, headers=headers, status=403, code="bad_origin")
             pairing = self.logins.credentials.pairings[self.owner]
-            for bearer in (None, self.owner_text):
-                answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=bearer, status=403, code="forbidden")
-                self.assertEqual(answer["reason"], "presence_required")
-                self.assertIs(self.logins.credentials.pairings[self.owner], pairing)
+            self.request(server, "POST", self.PAIRINGS, status=401, code="unauthenticated")
+            answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=self.owner_text, status=403, code="forbidden")
+            self.assertEqual(answer["reason"], "presence_required")
+            self.assertIs(self.logins.credentials.pairings[self.owner], pairing)
             self.request(server, "POST", self.PAIRINGS, cookie=cookie, status=201)
             self.assertRegex(self.owner, r"^u:[0-9a-f]{8}$")
             self.assertEqual(self.task_actors(), [self.owner])
@@ -5146,12 +5691,129 @@ class CredentialClaimTests(_CredentialCase):
                             idempotency.fingerprint("POST", claim, {}, {"code": code}))
 
 
+class ApiCredentialCutoverTests(unittest.TestCase):
+    def test_admitted_requests_need_credentials(self):
+        with tempfile.TemporaryDirectory(prefix="arete-read-auth-") as directory:
+            root = Path(directory).resolve()
+            entry = "from tests.test_behavior import ApiCredentialCutoverTests; ApiCredentialCutoverTests().check_routes()"
+            done = subprocess.run(api_check.child_command(api_check.SOURCE, entry), cwd=root,
+                                  env=api_check.isolated_env(root), capture_output=True, text=True,
+                                  timeout=CHILD_HANG_TIMEOUT)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def check_routes(self):
+        import re
+
+        with api_check.offline():
+            db.migrate()
+            login = "owner@example.invalid"
+            principals.seed_owner(login)
+            token_store.init_owner()
+            bearer = credential_files.read_client(db.schema_metadata()["instance_tag"])
+            address = "127.0.0.1"
+            logins = tailnet.Logins(SimpleNamespace(whois=lambda _: (login, "fixture-node")))
+            server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=logins, tls=None,
+                                     inside_serve=False)
+
+            def request(method, path, status, *, code=None, body=None, headers=None, handler=dashboard.Handler):
+                lines = [f"{method} {path} HTTP/1.0", f"Host: {address}"]
+                lines += [f"{name}: {value}" for name, value in (headers or {}).items()]
+                payload = json.dumps(body).encode() if body is not None else b""
+                if payload:
+                    lines += ["Content-Type: application/json", f"Content-Length: {len(payload)}"]
+                sent = BytesIO("\r\n".join([*lines, "", ""]).encode() + payload)
+                received = BytesIO()
+                wire = mock.Mock(makefile=lambda *_: sent, sendall=received.write)
+                handler(wire, (address, 0), server)
+                received.seek(0)
+                with HTTPResponse(mock.Mock(makefile=lambda *_: received)) as response:
+                    response.begin()
+                    answer = json.loads(response.read())
+                    self.assertEqual(response.status, status, (method, path, answer))
+                    if code:
+                        self.assertEqual(answer.get("code"), code, (method, path, answer))
+                    return answer
+
+            runs = "/api/v1/runs"
+            request("GET", runs, 401, code="unauthenticated")
+            allowed = request("GET", runs, 200, headers={"Authorization": f"Bearer {bearer}"})
+            self.assertEqual(allowed["runs"], [])
+            meta = {"/api/meta", "/api/v1/meta"}
+            pairing_start = "/api/v1/auth/pairings"
+            pairing_claim, issue = pairing_start + "/claim", "/api/v1/tokens"
+            routes = [(op["method"], re.sub(r"\{\w+\}", "fixture", op["path"])) for op in contract.OPERATIONS]
+            alias_ids = {
+                "/api/approvals/*": "1",
+                "/api/capture/evidence/*": "1",
+                "/api/chats/*": "1",
+                "/api/incidents/*": "1",
+                "/api/proposals/*": "1",
+                "/api/tasks/*": "t-a1b2",
+                "/api/triage/*": "fixture%237",
+            }
+            for alias in contract.ALIASES:
+                method, template = alias["method"], alias["path"]
+                path = template.replace("*", alias_ids.get(template, "fixture"))
+                actions = alias.get("actions", ())
+                if method == "GET" or not actions:
+                    routes.append((method, path))
+                routes.extend((method, path + "/" + re.sub(r"\{\w+\}", "fixture", action)) for action in actions)
+            routes += [("GET", path) for path in ("/api/v1/events", "/api/v1/principals", "/api/v1/principals/me")]
+            for method, path in routes:
+                if path == mcp_protocol.PATH:
+                    continue
+                if method == "GET" and path in meta:
+                    request(method, path, 200)
+                elif method == "POST" and path in (pairing_claim, issue):
+                    request(method, path, 426, code="tls_required")
+                else:
+                    target = path + "?timeout=0" if path in dashboard.EVENT_STREAM_PATHS else path
+                    request(method, target, 401, code="unauthenticated")
+
+            server.tls = object()
+            pending = request("POST", issue, 403, code="forbidden", body={"label": "Fixture", "scopes": ["read"]})
+            self.assertEqual(pending["reason"], "presence_required")
+            self.assertNotIn("text", pending)
+            self.assertEqual(len(logins.credentials.issues["fixture-node"]), 1)
+            start_key = {"Idempotency-Key": "fixture-pairing-start"}
+            bearer_headers = {"Authorization": f"Bearer {bearer}", **start_key}
+            pairing_code = request("POST", pairing_start, 201, body={}, headers=bearer_headers)
+            request("POST", pairing_claim, 201, body={"code": pairing_code["code"]},
+                    headers={"Idempotency-Key": "fixture-pairing-claim"})
+            request("POST", pairing_start, 401, code="unauthenticated", body={}, headers=start_key)
+            refused = request("POST", pairing_start, 403, code="forbidden", body={}, headers=bearer_headers)
+            self.assertEqual(refused["reason"], "presence_required")
+
+            server.tls = None
+            batch = "/api/v1/batch"
+            reads = {"requests": [{"operation": "meta.get"}]}
+            rotate = issue + "/fixture/rotate"
+            marker = paths.STATE_DIR.parent / ".arete-owned"
+            marker.write_bytes(b"invalid\n")
+            ordinary = dashboard.handlers().open
+            request("GET", runs, 401, code="unauthenticated", handler=ordinary)
+            request("POST", batch, 401, code="unauthenticated", body=reads, handler=ordinary)
+            request("POST", rotate, 401, code="unauthenticated", body={}, handler=ordinary)
+            marker.write_bytes(verify_faults.MARKER + b"\n")
+            scratch = dashboard.handlers().open
+            request("GET", runs, 200, handler=scratch)
+            request("POST", "/api/v1/tasks", 401, code="unauthenticated", handler=scratch)
+            request("POST", rotate, 426, code="tls_required", body={}, handler=scratch)
+            result = request("POST", batch, 200, body=reads, handler=scratch)
+            self.assertEqual(result["results"], [request("GET", "/api/v1/meta", 200, handler=scratch)])
+            request("POST", batch, 400, code="invalid_input", handler=scratch,
+                    body={"requests": [{"operation": "token.rotate"}]})
+            refused = request("POST", pairing_start, 403, code="forbidden", body={}, headers=start_key, handler=scratch)
+            self.assertEqual(refused["reason"], "presence_required")
+            request("GET", runs, 401, code="unauthenticated")
+
+
 class CredentialAdmissionTests(_CredentialCase):
     @credential_test
-    def test_whois_read_only_tls_and_issue_replay(self, _):
+    def test_whois_requires_credentials_tls_and_issue_replay(self, _):
         only_header = {"X-Arete": "1"}
         with self.listen() as server, self.cli_environment(server):
-            self.request(server, "GET", self.TASKS, headers=only_header)
+            self.request(server, "GET", self.TASKS, headers=only_header, status=401, code="unauthenticated")
             for path in (self.TASKS, "/api/tasks"):
                 self.task(server, path=path, headers=only_header, status=401, code="unauthenticated")
             for bearer in (None, self.owner_text):
@@ -5183,7 +5845,7 @@ class CredentialAdmissionTests(_CredentialCase):
         with self.listen(secure=False) as server:
             for path in (self.TOKENS, self.PAIRINGS + "/claim"):
                 self.request(server, "POST", path, status=426, code="tls_required")
-            self.request(server, "GET", self.TASKS)
+            self.request(server, "GET", self.TASKS, status=401, code="unauthenticated")
             self.task(server, bearer=self.owner_text)
 
 

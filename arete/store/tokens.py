@@ -41,6 +41,8 @@ class Credential:
     epoch: str
     generation: str
     deadline: str | None
+    profile: str | None = None
+    commands: frozenset[str] | None = None
 
     def allows(self, scope):
         return ("*" in self.scopes or scope in self.scopes) and (self.role == "owner" or scope == "read")
@@ -180,7 +182,23 @@ def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None):
         actor = f"client:{identity}" if kind == "token" else person
     return Credential(identity, person, role, actor, kind, frozenset(json.loads(row["scopes"])),
                       meta["token_key_ref"], meta["restore_epoch"],
-                      meta["token_generation"], deadline_of(row))
+                      meta["token_generation"], deadline_of(row), row["profile"],
+                      frozenset(json.loads(row["commands"])) if row["commands"] is not None else None)
+
+
+def rotation_lineage(credential):
+    with db.reader() as c:
+        rows = c.execute("WITH RECURSIVE lineage(id, parent) AS ("
+                         "SELECT id, rotated_from FROM tokens WHERE id = ? UNION "
+                         "SELECT t.id, t.rotated_from FROM tokens t JOIN lineage l ON t.id = l.parent "
+                         "WHERE t.principal = ? AND coalesce(t.kind, 'token') = 'token' "
+                         "AND t.audience = (SELECT value FROM schema_meta WHERE key = 'instance_id')) "
+                         "SELECT id, parent FROM lineage", (credential.id, credential.principal)).fetchall()
+    lineage = dict(rows)
+    root = credential.id
+    while (parent := lineage.pop(root, None)) in lineage:
+        root = parent
+    return root, frozenset(row["id"] for row in rows)
 
 
 def init_owner():

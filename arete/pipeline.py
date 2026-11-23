@@ -115,6 +115,7 @@ MEASUREMENT_SECTION = re.compile(
 )
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
+SLOT_QUEUE_FAILED_EXIT = 75
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 CHECK_LANE_POLL_SECONDS = 2
@@ -509,6 +510,7 @@ class Run(AgentRun):
     path: str = ""
     alone: bool = False
     facts: dict = field(default_factory=dict)
+    catch_up_owns_checkout: bool = field(default=False, init=False)
     catch_up_preserved: set[str] = field(default_factory=set)
     catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
@@ -516,6 +518,7 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
+    parking: bool = field(default=False, init=False)
     failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
@@ -1195,11 +1198,24 @@ class Stopped(BaseException):
     pass
 
 
-def stop_on_term(run_id: str) -> Callable:
+class Terminated(Stopped):
+    pass
+
+
+_termination: Terminated | None = None
+
+
+def stop_on_term(run: Run, *, zte_grant: bool, finalizing: Callable[[], bool]) -> Callable:
     def stop(*_) -> None:
-        if record.stop_asked(run_id):
+        global _termination
+        finishing = finalizing()
+        if not finishing and record.stop_asked(run.id):
             raise Stopped(record.STOPPED)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if not finishing and not zte_grant and not run.parking and run.workspace:
+            _termination = Terminated()
+            workspace.termination_pending = True
+            raise _termination
         os.kill(os.getpid(), signal.SIGTERM)
     return stop
 
@@ -1650,6 +1666,7 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
 
 
 def park_run(run: Run, reason: str, *, comment: bool = True) -> tuple[str, str, str]:
+    run.parking = True
     keep_edits(run)
     return record_park(run, reason, kept_heads(run), comment=comment)
 
@@ -1938,6 +1955,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         except sqlite3.OperationalError:
                             print(f"{refusal} Ticket could not be queued for the next poll because the database "
                                   "was busy. Start the ticket again.")
+                            return SLOT_QUEUE_FAILED_EXIT
                         else:
                             print(f"{refusal} Ticket queued for the next poll.")
                     else:
@@ -2080,8 +2098,44 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         def checkpoint_allowed():
             return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
 
+        def keep_edits_blocker() -> str:
+            if run.catch_up_preserved:
+                return "catch-up left files in place"
+            if retaining_catch_up:
+                return "the catch-up checkout is retained for reconciliation"
+            if run.environment_release and not ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
+                return "the automatic verification retry has not passed"
+            return ""
+
+        def termination_keep_blocker(error: BaseException | None) -> str:
+            if error is not _termination:
+                return "the termination exception did not survive unwinding"
+            if blocked := keep_edits_blocker():
+                return blocked
+            if run.catch_up_owns_checkout:
+                return "publication catch-up still owns the checkout"
+            if run.path == "orchestrate" and flows.pending_catch_up(run.id):
+                return "the catch-up checkout is retained for reconciliation"
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]:
+                    pass
+            except ChildProcessError:
+                pass
+            else:
+                return "a child process is still alive"
+            for checkout in run.workspace[1]:
+                if not (checkout.wt / ".git").exists():
+                    continue
+                git_dir = Path(git(["rev-parse", "--absolute-git-dir"], checkout.wt).rstrip("\n"))
+                states = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer")
+                if any((git_dir / state).exists() for state in states):
+                    return f"a Git operation is in progress in {checkout.wt}"
+            return ""
+
+        finalizing = False
         try:
-            signal.signal(signal.SIGTERM, stop_on_term(run_id))
+            signal.signal(signal.SIGTERM, stop_on_term(run, zte_grant=zte_grant is not None,
+                                                        finalizing=lambda: finalizing))
             if not run.claim_feedback_on_revise:
                 run.claim_feedback()
             if run.feedback:
@@ -2139,14 +2193,20 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             elif run.action_only:
                 passed = status == "step"
         except runlimits.Parked as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
+            if _termination is not None:
+                raise
             retaining_catch_up = reconciling_catch_up
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -2154,7 +2214,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
             else:
                 status, summary = "failed", str(e)
+        except Terminated:
+            raise
         except Stopped as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -2162,6 +2226,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
         except CatchUpPushUnconfirmed as e:
+            if _termination is not None:
+                raise
             retaining_catch_up = True
             status = "interrupted" if e.retryable and run.path == "orchestrate" else "failed"
             summary = f"{e.why}. {e.detail}"
@@ -2169,6 +2235,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 summary += " The next poll can reconcile the recorded push."
             run.log(summary)
         except workspace.RunFailed as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
@@ -2176,6 +2244,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             why = f"tracker refused {run.ref}: {e}"
@@ -2184,6 +2254,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 status, summary, pr_url = _fail(run, why)
         except Exception as e:
+            if _termination is not None:
+                raise
             if zte_grant:
                 failure = crash_failure(e) if isinstance(e, prompt_loader.MissingInputs) else None
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True, failure=failure)
@@ -2195,11 +2267,24 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 run.give_up("crashed before finishing")
         finally:
+            finalizing = True
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if _termination is not None:
+                try:
+                    if blocked := termination_keep_blocker(sys.exception()):
+                        run.log(f"SIGTERM: did not keep work because {blocked}")
+                    else:
+                        keep_edits(run)
+                        workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                                            preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths,
+                                            during_termination=True)
+                except Exception as error:
+                    run.log(f"SIGTERM: could not keep work: {error}")
+                finally:
+                    os.kill(os.getpid(), signal.SIGTERM)
             try:
                 if run.workspace and not zte_grant:
-                    if not (retaining_catch_up or run.catch_up_preserved) and (
-                            not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
+                    if not keep_edits_blocker():
                         keep_edits(run)
                     workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
                                         excluded=run.closed_checkout_paths)
@@ -2919,6 +3004,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   before_push: Callable[[str, verify.Verified, Review], None] | None = None,
                   check_targets: Callable[[], None] | None = None) -> tuple[verify.Verified, Review]:
     run = b.run
+    run.catch_up_owns_checkout = True
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
     tree = git(["rev-parse", f"{c.lease}^{{tree}}"], c.wt).strip()
@@ -2982,6 +3068,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         else:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
+        if tracked_restored and paths_restored and _termination is None:
+            run.catch_up_owns_checkout = False
         if isinstance(error, owner_asks.Asked):
             raise CatchUpNeedsInput("a catch-up worker needs owner input") from error
         raise
@@ -2989,6 +3077,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         run.owner_questions_blocked = blocked
     target_check = {"check_targets": check_targets} if check_targets else {}
     push_caught_up_head(b, c, branch, head, **target_check)
+    run.catch_up_owns_checkout = False
     return verified, review
 
 
@@ -4988,6 +5077,10 @@ def run_skipped(name: str) -> dict:
                                       "to finish or raise max_parallel in Settings")
             _, state = tasks.spawned(entry["repo"], str(entry["id"]),
                                      lambda: spawn_run(entry["repo"], entry["id"], force=True))
+            if state == tasks.SLOT_QUEUE_FAILED:
+                repo = cfg.repo(entry["repo"])
+                return {"ticket": name, "id": entry["id"],
+                        **tasks.queued(repo, str(entry["id"]), tasks.NO_SLOT_AT_START, repo.pipeline)}
             if state == "exited":
                 raise control.Refused(f"{name} ended before it showed as running; the end of "
                                       f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
