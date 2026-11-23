@@ -146,7 +146,7 @@ def working_loop(name: str, cfg: config.Config | None = None) -> Loop:
 
 
 def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
-    r = writes.check_run(run_id, base_version, public=public)
+    r = writes.check_run(run_id, base_version, public=public, for_stop=True)
     if not r:
         raise NotFound(f"no run {run_id}")
     if r["status"] != "running":

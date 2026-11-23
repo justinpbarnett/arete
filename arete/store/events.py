@@ -76,8 +76,10 @@ def reuse_receipt(subject, ver):
     return True
 
 
-def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None):
-    c = foundation.write_connection()
+def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None, connection=None):
+    c = foundation.write_connection() if connection is None else connection
+    if not c.in_transaction:
+        raise RuntimeError("event emission needs an open write transaction")
     actor = principals.current()
     if actor == "owner" or "@" in actor:
         raise ValueError("events need a principal id, not a login or owner")

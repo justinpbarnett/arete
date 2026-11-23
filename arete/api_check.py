@@ -34,7 +34,7 @@ def require(condition, message):
 
 def isolated_env(root):
     names = {"ARETE_CONFIG_DIR": "config", "ARETE_STATE_DIR": "state", "ARETE_LOG_DIR": "logs",
-             "ARETE_WORKTREES_DIR": "worktrees", "TMPDIR": "tmp", "HOME": "home"}
+             "ARETE_WORKTREES_DIR": "worktrees", "TMPDIR": "tmp", "HOME": "home", "XDG_STATE_HOME": "xdg"}
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", _test_stacks.PREFIX_ENV) if k in os.environ}
     for variable, name in names.items():
         folder = root / name
@@ -206,13 +206,18 @@ def prepare_replay(root):
 
 
 class Check:
-    def __init__(self, port, root, spawn):
+    def __init__(self, port, root, spawn, token):
         self.port, self.root, self.spawn = port, root, spawn
+        self.token = token
 
     @contextmanager
     def response(self, method, path, body=None, headers=None):
         conn = HTTPConnection(ADDRESS, self.port, timeout=5)
-        merged = {"X-Arete": "1", "Accept": "application/json", **(headers or {})}
+        merged = {"Accept": "application/json", **(headers or {})}
+        if method != "GET":
+            merged.setdefault("Authorization", f"Bearer {self.token}")
+        if merged.get("Authorization") == "":
+            del merged["Authorization"]
         if body is not None:
             merged.setdefault("Content-Type", "application/json")
         try:
@@ -292,14 +297,16 @@ class Check:
 
         path = f"/api/v1/runs/{self.run}"
         before = self.read(path)["run"]
-        record.note(self.run, summary="Bumped by contract check")
-        current = self.read(path)["run"]
-        _, raw = self.request("POST", f"/api/runs/{self.run}/stop", {"base_version": before["version"]}, status=409)
-        problem = json.loads(raw)
-        require(problem.get("code") == "version_conflict" and problem.get("current") == current and
-                current == self.read(path)["run"] and current["version"] == before["version"] + 1 and
-                self.spawn[0].poll() is None and not current.get("stop_asked"),
-                "stale run stop changed the run, signalled its child, or returned the wrong current object")
+        with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                              stdin=subprocess.PIPE, start_new_session=True) as replacement:
+            record.note(self.run, pid=replacement.pid)
+            current = self.read(path)["run"]
+            _, raw = self.request("POST", f"/api/runs/{self.run}/stop", {"base_version": before["version"]}, status=409)
+            problem = json.loads(raw)
+            require(problem.get("code") == "version_conflict" and problem.get("current") == current and
+                    current == self.read(path)["run"] and current["version"] == before["version"] + 1 and
+                    replacement.poll() is None and not current.get("stop_asked"),
+                    "stale run stop changed the run, signalled its child, or returned the wrong current object")
 
     def errors(self):
         from . import contract
@@ -309,7 +316,7 @@ class Check:
         errors = {error["code"]: error for error in catalog}
         for client, minimum in contract.OLDEST_CLIENT.items():
             self.request("GET", "/api/v1/meta", headers={"X-Arete-Client": f"{client}/{minimum}"})
-        self.request("POST", "/api/v1/batch", {"requests": []}, headers={"X-Arete": ""}, status=403)
+        self.request("POST", "/api/v1/tasks", {}, headers={"X-Arete": "1", "Authorization": ""}, status=401)
         for method, path, body, custom, code in (
             ("GET", "/api/v1/no-such-operation", None, {}, "not_found"),
             ("PUT", "/api/v1/meta", None, {}, "method_not_allowed"),
@@ -395,9 +402,9 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, contract, dashboard, paths, record, replay, triage
+        from . import agent, contract, dashboard, paths, principals, record, replay, triage
         from .sighting import Sighting
-        from .store import chats, incidents, insights, runs
+        from .store import chats, incidents, insights, runs, tokens
         from .store import triage as triage_store
 
         record.step(self.run, "plan", agent.Result(ok=True, runner="replay"), 0)
@@ -409,10 +416,12 @@ class Check:
         insights.research_set(ticket.ref, status="done", title="Fixture research")
         stopped = record.start("loop", pid=0)
         session = record.start("session")
+        fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
-                      "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll"}
+                      "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
+                      "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
@@ -433,11 +442,15 @@ class Check:
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
+                denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401}
+                if name in denied:
+                    self.request(method, path, values, headers=key, status=denied[name])
+                    continue
                 if name == "serve.install":
                     with patch.object(dashboard, "install_serve", return_value={"restarting": True}):
-                        headers, raw = self.request(method, path, values, headers=key)
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 else:
-                    headers, raw = self.request(method, path, values, headers=key)
+                    headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 data = json.loads(raw)
                 if name == "batch.run":
                     require(data["seq"] == headers.get("Arete-Seq") and all(row["seq"] == data["seq"] for row in data["results"]),
@@ -477,8 +490,8 @@ def worker(lifeline):
     stage = "scratch startup"
     try:
         with offline(), ExitStack() as cleanup:
-            from . import api_http, codebase, control, dashboard, paths, pipeline, principals, tailnet
-            from .store import db
+            from . import api_http, codebase, control, credential_files, dashboard, paths, pipeline, principals, tailnet
+            from .store import db, tokens
 
             root = Path.cwd()
             require(not paths.DB_FILE.exists(), "state database already exists")
@@ -486,6 +499,8 @@ def worker(lifeline):
             paths.CONFIG_FILE.write_text("max_parallel = 3\n" + "\n".join(config) + "\n")
             db.migrate()
             principals.seed_owner(LOGIN)
+            tokens.init_owner()
+            token = credential_files.read_client(db.schema_metadata()["instance_tag"])
             codebase.load()
             children = []
 
@@ -500,7 +515,8 @@ def worker(lifeline):
             cleanup.enter_context(patch.object(pipeline, "has_origin", has_origin))
             cleanup.enter_context(patch.object(api_http, "log_request"))
             node = SimpleNamespace(names={ADDRESS})
-            logins = SimpleNamespace(of=lambda _: LOGIN)
+            logins = tailnet.Logins(tailnet.ScratchHost())
+            logins.of = lambda _: LOGIN
             stage = f"listen on {ADDRESS}:0"
             handler = type("FixtureHandler", (dashboard.Handler,), {"disable_nagle_algorithm": True})
             with patch("socket.getfqdn", return_value=ADDRESS):
@@ -509,7 +525,7 @@ def worker(lifeline):
             with server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
                 thread.start()
-                check = Check(server.server_port, root, children)
+                check = Check(server.server_port, root, children, token)
                 actions = (check.registry, check.examples, check.replay, check.stale_write, check.errors, check.cli,
                            check.mcp, check.streams, check.shapes, check.aliases, check.reserved)
                 try:

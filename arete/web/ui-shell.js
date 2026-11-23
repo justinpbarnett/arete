@@ -10,7 +10,7 @@ import { FloorFocus, FloorQueue, HealthFocus, TaskFocus, TaskQueue } from "./ui-
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
-import { clientNotice, staleWrite } from "./ui-notice.js";
+import { browserPaired, clientNotice, staleWrite } from "./ui-notice.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -121,6 +121,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
       <div class="top-bar ops-links" aria-label="Dashboard shortcuts">
+        ${browserPaired.value ? html`<a href="/pair">Pair a device and manage tokens</a>` : null}
         ${route.screen === "run" ? html`<a href="/#sessions">Sessions in classic</a>` : null}
         <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
       </div>
