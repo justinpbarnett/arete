@@ -46,16 +46,36 @@ def failed(identity, key, answer, status=0):
     return mcp_protocol.error(identity, -32000, "Arete MCP request failed.", data)
 
 
+def outcome_unknown(identity, key, error=None):
+    data = {"code": "outcome_unknown", "idempotency_key": key}
+    if error is not None:
+        data["error"] = mcp_protocol.untrusted(error)
+    return mcp_protocol.reply(identity, mcp_protocol.tool_result(data, failed=True))
+
+
 class Stdio:
     def __init__(self):
         self.where = None
         self.token = os.environ.get("ARETE_TOKEN", "").strip() or None
+        self.retired_ids = set()
         self.headers = {"X-Arete-Client": f"mcp/{VERSION}", "Accept": "application/json"}
+
+    def replacement(self):
+        try:
+            token = client.stored_token(self.where)
+        except client.Failed:
+            token = None
+        if token and token_parts(token, self.where)[2] not in self.retired_ids:
+            return token
+        raise client.Failed({"code": "token_rotated", "error": "The bearer token was rotated. "
+                             "Store a replacement token for this Arete instance."})
 
     def exchange(self, message, key, deadline, previous):
         if self.where is None:
             self.where = client.server(deadline)
         else:
+            if self.token is None and self.retired_ids:
+                self.token = self.replacement()
             client.check_replay(self.where, deadline)
         where = self.where
         if where.scheme != "https":
@@ -107,17 +127,21 @@ class Stdio:
                 return {**answer, "id": identity}
             except (client.Down, client.Restarting, client.Failed) as failure:
                 status = getattr(failure, "code", 0)
+                if status == 401 and client.reason(failure.answer) == "token_rotated" and self.token:
+                    retired = token_parts(self.token, self.where)[2]
+                    self.retired_ids.add(retired)
+                    self.token = None
+                    if previous is None:
+                        try:
+                            self.token = self.replacement()
+                        except client.Failed as missing:
+                            if uncertain:
+                                return outcome_unknown(identity, key, missing.answer["error"])
+                            return failed(identity, key, missing.answer)
+                        previous = retired
+                        continue
                 if status == 401 and previous is not None:
                     return failed(identity, key, failure.answer, status)
-                if status == 401 and client.reason(failure.answer) == "token_rotated":
-                    try:
-                        replacement = client.stored_token(self.where)
-                    except client.Failed:
-                        replacement = None
-                    if replacement and replacement != self.token:
-                        previous = token_parts(self.token, self.where)[2]
-                        self.token = replacement
-                        continue
                 retryable = status >= 500 or isinstance(
                     failure, (client.Down, client.Broken, client.InFlight, client.Restarting))
                 rate_limited = status == 429 and failure.retry_after is not None
@@ -136,8 +160,7 @@ class Stdio:
             failure, status = terminal
             return failed(identity, key, failure.answer, status)
         if key:
-            data = {"code": "outcome_unknown", "idempotency_key": key}
-            return mcp_protocol.reply(identity, mcp_protocol.tool_result(data, failed=True))
+            return outcome_unknown(identity, key)
         return mcp_protocol.error(identity, -32000, "Arete MCP request timed out.")
 
 

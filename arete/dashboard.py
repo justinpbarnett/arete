@@ -609,7 +609,8 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False, claim=None):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False, claim=None,
+                     read_only=False):
         if claim is None:
             key = self.headers.get("Idempotency-Key")
             if key is None:
@@ -629,11 +630,22 @@ class Handler(BaseHTTPRequestHandler):
                 result = json.loads(row["response"])
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
+            elif read_only:
+                row, result = self.complete_read_action(context, action, status)
             else:
                 row, result = self.complete_action(context, action, atomic, status, redact)
             self.success_status = row["status"]
             self.write_receipt = claims.receipt(row["last_seq"])
             return result
+
+    def complete_read_action(self, context, action, status):
+        result = action()
+        payload = api_http.json_bytes(result)
+        with foundation.tx():
+            if (row := idempotency.matching_claim(context)) and row["status"]:
+                self.idempotent_replayed = True
+                return row, json.loads(row["response"])
+            return claims.complete(context, status, payload, None), result
 
     def complete_action(self, context, action, atomic, status, redact):
         if not atomic:

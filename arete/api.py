@@ -256,10 +256,12 @@ def dispatch(handler, op, path_values, query):
 
 def command(handler, op, values, path_values, *, claim=None):
     name = op["name"]
-    action = execute if name == "usage.record" else mutation
+    read_only = op["method"] == "GET" or name == "batch.run"
+    action = mutation if contract.keyed_write(op) else execute
     return handler.keyed_action(op["method"], op["path"], path_values, lambda: action(name, values, handler),
-                                atomic=name not in ("run.stop", "serve.install"), status=op["success_status"],
-                                redact=name in ("token.issue", "token.rotate"), claim=claim)
+                                atomic=not read_only and name not in ("run.stop", "serve.install"),
+                                status=op["success_status"],
+                                redact=name in ("token.issue", "token.rotate"), claim=claim, read_only=read_only)
 
 
 def mutation(name, values, handler):

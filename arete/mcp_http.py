@@ -19,6 +19,7 @@ CALL_RATES = api_http.RateLimits(command_limit=(2, 10))
 SIMPLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 HOOK_RESULT = contract.envelope({"events": contract.array(contract.obj(dict.fromkeys(
     contract.HOOK_EVENT["properties"], {})))})
+RESEARCH_ROW = contract.obj({"id": {}, "detail": contract.obj({**contract.RESEARCH["properties"], "ref": {}})})
 SCREEN_LOOP = contract.obj(dict.fromkeys((
     *contract.LOOP["properties"], "origin", "description", "repo", "trigger", "sources", "runner", "device", "queue",
     "budget_usd", "daily_budget_usd", "emits", "dir", "error", "next_due", "last_fire", "spent_24h", "last",
@@ -76,7 +77,11 @@ def protect_result(operation, arguments, data):
         return {**envelope, "results": results}
     if operation == "hook_event.list":
         schema = HOOK_RESULT
-    if operation == "screen.get" and arguments.get("view") == "loop":
+    elif operation == "research.list":
+        schema = contract.envelope({"research": contract.array(RESEARCH_ROW)})
+    elif operation == "research.get":
+        schema = contract.envelope({"research": RESEARCH_ROW})
+    elif operation == "screen.get" and arguments.get("view") == "loop":
         schema = contract.obj({**schema["properties"], "view": SCREEN_LOOP})
     return mcp_protocol.untrusted(data, schema)
 
@@ -97,11 +102,8 @@ def call(handler, params, identity, actor):
         if any(not permitted(handler.credential, contract.BY_NAME[read["operation"]]) for read in reads):
             raise credential_http.problem("scope_missing")
         api_http.RATES.take(handler.person, command=False, cost=len(reads) - 1)
-    if contract.keyed_write(op) or operation == "usage.record":
-        claim = actor, key, mcp_protocol.PATH, {"operation": operation, "arguments": arguments}
-        data = api.command(handler, op, arguments, {}, claim=claim)
-    else:
-        data = api.execute(operation, arguments, handler)
+    claim = actor, key, mcp_protocol.PATH, {"operation": operation, "arguments": arguments}
+    data = api.command(handler, op, arguments, {}, claim=claim)
     result = protect_result(operation, arguments, data)
     return mcp_protocol.reply(identity, mcp_protocol.tool_result(result))
 

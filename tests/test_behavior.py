@@ -31,7 +31,7 @@ from unittest import mock
 from arete import (
     accounts, api, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
     dashboard, event_stream, events, gh, heartbeat, idempotency, jira, mcp_http, mcp_protocol, mcp_stdio, paths, pipeline,
-    principals, record, run_lines,
+    principals, record, research, run_lines,
     sandbox, screening, serve, tailnet, tasks, tool_events, tracker, triage, util, verify_faults, webpush, workspace,
 )
 from arete.store import approvals as approvals_store
@@ -4097,6 +4097,71 @@ class CredentialMcpStoredResultsTests(_CredentialMcpCase):
         self.assertRegex(batch["seq"], r"^\d+\.\d+$")
 
 
+class CredentialMcpResearchTests(_CredentialMcpCase):
+    @credential_test
+    def test_wraps_imported_references_in_direct_and_batch_reads(self, _):
+        ref = "external/report"
+        research.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        research.report_file(ref).write_text(f"# {ref}: Imported report\n\nReport body.\n")
+        research.adopt_reports()
+        _, token = token_store.issue(self.owner, "Research reader", ["read"], profile="full")
+        selector = {"id": ref}
+        requests = [{"operation": "research.list"}, {"operation": "research.get", "input": selector}]
+        with self.listen() as server:
+            post, _ = self.mcp(server, token)
+
+            def read(identity, name, arguments=None):
+                answer, _ = post("tools/call", identity, {"name": name, "arguments": arguments or {}})
+                return json.loads(answer["result"]["content"][0]["text"])
+
+            listed, = read(2, "research__list")["research"]
+            fetched = read(3, "research__get", selector)["research"]
+            batch_list, batch_get = read(4, "batch__run", {"requests": requests})["results"]
+
+        wrapped = f"<untrusted>{ref}</untrusted>"
+        self.assertEqual((listed["id"], listed["detail"]["ref"]), (wrapped, wrapped))
+        self.assertEqual((fetched["id"], fetched["detail"]["ref"]), (wrapped, wrapped))
+        self.assertEqual(batch_list["research"], [listed])
+        self.assertEqual(batch_get["research"], fetched)
+
+
+class CredentialMcpReadReplayTests(_CredentialMcpCase):
+    @credential_test
+    def test_replays_read_and_batch_snapshots_with_session_and_token_isolation(self, _):
+        _, token = token_store.issue(self.owner, "Reader", ["read"], profile="full")
+        _, other = token_store.issue(self.owner, "Other reader", ["read"], profile="full")
+        _, restricted = token_store.issue(self.owner, "Batch only", ["read"], profile="full", commands=["batch.run"])
+        task_id = task_store.task_add("fixture", "Original")
+        args = {"id": task_id}
+        read = {"name": "task__get", "arguments": args}
+        batch = {"name": "batch__run", "arguments": {"requests": [
+            {"operation": "task.get", "input": args}, {"operation": "task.list"}]}}
+        with self.listen() as server:
+            post, session = self.mcp(server, token)
+            initial_read, _ = post("tools/call", 2, read)
+            initial_batch, _ = post("tools/call", 3, batch)
+            task_store.task_update(task_id, task_store.task_get(task_id)["version"], {"body": "Updated"})
+
+            for identity, tool, original in ((2, read, initial_read), (3, batch, initial_batch)):
+                replay, headers = post("tools/call", identity, tool)
+                self.assertEqual(replay, original)
+                self.assertEqual(headers["Idempotent-Replayed"], "true")
+            post("tools/call", 2, {"name": "task__list"}, status=422, code="idempotency_key_reused")
+
+            fresh, _ = self.mcp(server, token)
+            latest, headers = fresh("tools/call", 2, read)
+            self.assertNotIn("Idempotent-Replayed", headers)
+            task = json.loads(latest["result"]["content"][0]["text"])["task"]
+            self.assertEqual(task["body"], "<untrusted>Updated</untrusted>")
+            same_session = {"Mcp-Session-Id": session}
+            answer, headers = self.request(server, "POST", mcp_protocol.PATH, bearer=other, headers=same_session,
+                                           body=mcp_request("tools/call", 2, read))
+            self.assertEqual(answer, latest)
+            self.assertNotIn("Idempotent-Replayed", headers)
+            self.request(server, "POST", mcp_protocol.PATH, bearer=restricted, headers=same_session,
+                         body=mcp_request("tools/call", 3, batch), status=403, code="scope_missing")
+
+
 class CredentialMcpProblemDetailsTests(_CredentialMcpCase):
     @credential_test
     def test_invalid_rpc_envelopes_return_api_problem_details(self, _):
@@ -4162,7 +4227,7 @@ class CredentialMcpStdioTests(_CredentialCase):
 
 class CredentialMcpRotationTests(unittest.TestCase):
     def test_stdio_keeps_replacement_after_tool_problem(self):
-        for status, code in ((404, "not_found"), (409, "task_version_conflict"), (401, "token_rotated")):
+        for status, code in ((404, "not_found"), (409, "task_version_conflict"), (401, "unauthenticated")):
             with self.subTest(status=status):
                 self.check_replacement(status, code)
 
@@ -4208,6 +4273,70 @@ class CredentialMcpRotationTests(unittest.TestCase):
         self.assertEqual(first, (original, None, retry[2]))
         self.assertEqual(retry[:2], (replacement, old_id))
         self.assertEqual(next_call[:2], (replacement, None))
+
+
+class CredentialMcpMissingReplacementTests(_CredentialCase):
+    @credential_test
+    def test_stdio_blocks_retired_tokens_until_a_replacement_is_stored(self, _):
+        where = client.Server("https", "fixture.test", 443, "fixture.test", instance=self.meta["instance_id"])
+        issued, original = token_store.issue(self.owner, "Stdio fixture", ["read"], profile="remote")
+        _, replacement = token_store.rotate(issued["id"], self.owner, 0)
+        call = mcp_request("tools/call", 2, {"name": "task__list"})
+        for label, unavailable in (("missing", None), ("unreadable", PermissionError()), ("retired", original)):
+            with self.subTest(stored=label):
+                attempts = []
+                replacement_rotated = False
+
+                def transport(method, path, body=None, *, token=None, **kwargs):
+                    headers = {"Arete-Instance": where.instance}
+                    if (method, path) == ("GET", client.META):
+                        return SimpleNamespace(getheader=headers.get, close=lambda: None)
+                    self.assertEqual((method, path), ("POST", mcp_protocol.PATH))
+                    attempts.append(token)
+                    if token == original or replacement_rotated:
+                        raise client.Failed({"code": "token_rotated"}, 401)
+                    raise client.Failed({"code": "not_found"}, 404)
+
+                with mock.patch.dict(os.environ, {"ARETE_TOKEN": original}):
+                    bridge = mcp_stdio.Stdio()
+                bridge.where = where
+                bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+                with (mock.patch.object(credential_files, "read_client", side_effect=[
+                          unavailable, unavailable, replacement, original]),
+                      mock.patch.object(client, "request_once", side_effect=transport) as send):
+                    for _ in range(2):
+                        reply = bridge.handle(call)["result"]
+                        self.assertTrue(reply["isError"])
+                        problem = json.loads(reply["content"][0]["text"])
+                        self.assertEqual(problem["code"], "token_rotated")
+                        self.assertIn("Store a replacement token", problem["error"])
+                        self.assertNotIn("status", problem)
+                    self.assertEqual(attempts, [original])
+                    self.assertEqual(send.call_count, 2)
+                    reply = bridge.handle(call)["result"]
+                    self.assertEqual(json.loads(reply["content"][0]["text"])["code"], "not_found")
+                    replacement_rotated = True
+                    reply = bridge.handle(call)["result"]
+                    problem = json.loads(reply["content"][0]["text"])
+                    self.assertIn("Store a replacement token", problem["error"])
+                self.assertEqual(attempts, [original, replacement, replacement])
+
+    def test_lost_response_keeps_idempotency_key_when_replacement_is_missing(self):
+        where = client.Server("https", "fixture.test", 443, "fixture.test", instance="a" * 32)
+        bridge = mcp_stdio.Stdio()
+        bridge.where = where
+        bridge.token = f"ar_{where.tag}_{'b' * 8}_fixture"
+        bridge.headers[mcp_protocol.SESSION_HEADER] = "fixture"
+        failures = [client.Broken({"error": "Injected response loss"}),
+                    client.Failed({"code": "token_rotated"}, 401)]
+        with (mock.patch.object(bridge, "exchange", side_effect=failures) as exchange,
+              mock.patch.object(client, "stored_token", return_value=None)):
+            answer = bridge.handle(mcp_request("tools/call", 2, {"name": "task__list"}))["result"]
+        first, retry = exchange.call_args_list
+        self.assertEqual(first.args[1], retry.args[1])
+        problem = json.loads(answer["content"][0]["text"])
+        self.assertEqual((problem["code"], problem["idempotency_key"]), ("outcome_unknown", first.args[1]))
+        self.assertIn("Store a replacement token", problem["error"])
 
 
 class CredentialMcpRateRetryTests(_CredentialCase):
