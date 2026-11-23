@@ -5487,8 +5487,9 @@ class CredentialClaimTests(_CredentialCase):
 
 class ApiCredentialCutoverTests(unittest.TestCase):
     def test_admitted_requests_need_credentials(self):
-        with tempfile.TemporaryDirectory(prefix="arete-read-auth-") as directory:
-            root = Path(directory).resolve()
+        with tempfile.TemporaryDirectory(prefix="arete-read-auth-", dir=Path("/tmp").resolve(),
+                                         ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
             entry = "from tests.test_behavior import ApiCredentialCutoverTests; ApiCredentialCutoverTests().check_routes()"
             done = subprocess.run(api_check.child_command(api_check.SOURCE, entry), cwd=root,
                                   env=api_check.isolated_env(root), capture_output=True, text=True,
@@ -5501,9 +5502,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
         with api_check.offline():
             db.migrate()
             login = "owner@example.invalid"
-            principals.seed_owner(login)
-            token_store.init_owner()
-            bearer = credential_files.read_client(db.schema_metadata()["instance_tag"])
+            bearer = fixture_bearer(principals.seed_owner(login))
             address = "127.0.0.1"
             logins = tailnet.Logins(SimpleNamespace(whois=lambda _: (login, "fixture-node")))
             server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=logins, tls=None,
@@ -5530,7 +5529,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
 
             runs = "/api/v1/runs"
             request("GET", runs, 401, code="unauthenticated")
-            allowed = request("GET", runs, 200, headers={"Authorization": f"Bearer {bearer}"})
+            allowed = request("GET", runs, 200, headers={"Authorization": bearer})
             self.assertEqual(allowed["runs"], [])
             meta = {"/api/meta", "/api/v1/meta"}
             pairing_start = "/api/v1/auth/pairings"
@@ -5552,8 +5551,9 @@ class ApiCredentialCutoverTests(unittest.TestCase):
                 if method == "GET" or not actions:
                     routes.append((method, path))
                 routes.extend((method, path + "/" + re.sub(r"\{\w+\}", "fixture", action)) for action in actions)
-            routes += [("GET", path) for path in ("/api/v1/events", "/api/runs/fixture/events",
-                                                 "/api/v1/principals", "/api/v1/principals/me")]
+            routes.extend(("GET", path) for path in (
+                "/api/v1/events", "/api/runs/fixture/events", "/api/v1/principals", "/api/v1/principals/me",
+            ))
             for method, path in routes:
                 if path == mcp_protocol.PATH:
                     continue
@@ -5571,7 +5571,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
             self.assertNotIn("text", pending)
             self.assertEqual(len(logins.credentials.issues["fixture-node"]), 1)
             start_key = {"Idempotency-Key": "fixture-pairing-start"}
-            bearer_headers = {"Authorization": f"Bearer {bearer}", **start_key}
+            bearer_headers = {"Authorization": bearer, **start_key}
             pairing_code = request("POST", pairing_start, 201, body={}, headers=bearer_headers)
             request("POST", pairing_claim, 201, body={"code": pairing_code["code"]},
                     headers={"Idempotency-Key": "fixture-pairing-claim"})

@@ -195,8 +195,8 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
     claim = name == "pairing.claim"
     meta = method == "GET" and path in ("/api/meta", "/api/v1/meta")
     api_route = path == "/api" or path.startswith("/api/")
-    requires_credential = api_route and not (mcp or meta or claim or name == "token.issue"
-                                             or scratch and not registry_operation(name))
+    scratch_exempt = scratch and not registry_operation(name)
+    requires_credential = api_route and not (mcp or scratch_exempt or meta or claim or name == "token.issue")
     if (mcp or require_tls(op) and (auth or cookies or not requires_credential)) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
