@@ -24,6 +24,7 @@ from .agent import (
     provider_reset,
     rate_limit_type,
     streamed_turn,
+    unreachable_limit,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -248,8 +249,10 @@ def _run(
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
     fallback = Session(fresh_session, 0.0, "claude") if remote and proc.started and fresh_session else resume
     result = parse(proc, fallback, model, json_schema, openrouter=openrouter)
-    if auth and auth.mode == "api_key" and not openrouter:
-        result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) if not result.ok else None
+    if not result.ok and auth and auth.mode == "api_key" and not openrouter:
+        limit = result.usage_limit
+        model_limit = limit if limit and limit.kind in ("overloaded", "unreachable") else None
+        result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) or model_limit
     return result
 
 
@@ -261,8 +264,8 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         stderr = "".join(line for line in stderr.splitlines(keepends=True) if not line.startswith(UNRECOGNIZED_MODEL))
     if not (data := result_event(out)):
         error = util.tail(stderr or out or f"exit {proc.returncode}", 1500)
-        result = Result(ok=False, session=resume, error=error,
-                        usage_limit=usage_limit({}, stderr + out, model))
+        limit = usage_limit({}, f"{stderr}\n{out}", model) or unreachable_limit(stderr, model)
+        result = Result(ok=False, session=resume, error=error, usage_limit=limit)
         seen = {}
         for line in out.splitlines():
             if turn := streamed_turn(line, seen):
@@ -275,20 +278,34 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         structured = json_from_text(data.get("result", ""))
     is_error = (bool(data.get("is_error") or data.get("api_error") or data.get("errors"))
                 or data.get("subtype", "success") != "success")
+    ok = not is_error and proc.returncode == 0
+    reason = failure_reason(data) if not ok else ""
+    limit = None
+    if not ok:
+        limit = usage_limit(data, f"{reason}\n{stderr}", model)
+        if limit is None:
+            failures = [stderr, data.get("api_error_status")]
+            if is_error:
+                failures.append(data.get("api_error"))
+                if data.get("subtype", "success") in ("success", "error_during_execution"):
+                    if data.get("stop_reason") != "refusal":
+                        failures.append(data.get("result"))
+                    failures.extend(data.get("errors") or [])
+            limit = unreachable_limit(failures, model)
     session = resume
     if data.get("session_id"):
         spent = resume.spent_usd if openrouter else float(data.get("total_cost_usd") or 0)
         session = Session(data["session_id"], spent, "claude")
     return Result(
-        ok=not is_error and proc.returncode == 0,
+        ok=ok,
         text=data.get("result", "") or "",
         session=session,
         structured=structured,
         cost_usd=max(0.0, session.spent_usd - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
-        error=(failure_reason(data) if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
+        error=(reason if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
-        usage_limit=usage_limit(data, failure_reason(data) + stderr, model) if is_error or proc.returncode else None,
+        usage_limit=limit,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
         api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),

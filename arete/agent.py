@@ -108,13 +108,36 @@ def model_scope(model: str) -> str:
 OVERLOAD_SECONDS = 600
 OVERLOAD_TEXT = re.compile(r"at capacity|\boverloaded\b|(?:status|code|http)\W{0,4}529\b|\b529\b\W{0,3}overloaded",
                            re.IGNORECASE)
+UNREACHABLE_TEXT = re.compile(
+    r"\b(?:UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b",
+    re.IGNORECASE,
+)
+PROVIDER_STATUS = re.compile(r"\b[45][0-9]{2}\b")
+HOST_PORT = re.compile(r"(\b(?:localhost|(?:[a-z0-9-]+\.)+[a-z0-9-]+\.?):)[0-9]+\b", re.IGNORECASE)
 
 
 def overload_limit(text, model: str) -> UsageLimit | None:
     raw = text if isinstance(text, str) else json.dumps(text, default=str)
     if not OVERLOAD_TEXT.search(raw):
         return None
-    return UsageLimit(util.iso(util.now() + timedelta(seconds=OVERLOAD_SECONDS)), model_scope(model), "overloaded")
+    return model_hold(model, "overloaded")
+
+
+def unreachable_limit(text: str | list[str | int | None], model: str) -> UsageLimit | None:
+    failures = [text] if isinstance(text, str) else [str(value) for value in text if isinstance(value, (str, int))]
+    if not any(UNREACHABLE_TEXT.search(failure) for failure in failures):
+        return None
+    if any(PROVIDER_STATUS.search(HOST_PORT.sub(r"\1", failure)) for failure in failures):
+        return None
+    return model_hold(model, "unreachable")
+
+
+def provider_failure_fields(data: dict) -> list[str | int | None]:
+    return [data.get(key) for key in ("message", "errorMessage", "code", "status", "status_code", "statusCode")]
+
+
+def model_hold(model: str, kind: str) -> UsageLimit:
+    return UsageLimit(util.iso(util.now() + timedelta(seconds=OVERLOAD_SECONDS)), model_scope(model), kind)
 
 
 def reset_at(value) -> datetime | None:

@@ -4,8 +4,8 @@ from collections import Counter
 from urllib.parse import unquote
 
 from . import (
-    board, codebase, config, contract, control, credential_http, events, record, refusals,
-    settings, tasks, tool_events, triage, util,
+    board, codebase, config, configitems, contract, control, credential_http, events, record,
+    refusals, settings, tasks, tool_events, triage, util,
 )
 from .store import chats, insights, runs
 from .store import db as foundation
@@ -160,6 +160,8 @@ def read(name, values, handler):
                 "view": projection(view, values.get("id", ""))}
     if name == "settings.get":
         return {"settings": settings.current()}
+    if name.startswith("config."):
+        return read_config(name.removeprefix("config."), values)
     if name == "health.get":
         return {"health": board.health_board()}
     if name == "hook_event.list":
@@ -207,6 +209,21 @@ def read(name, values, handler):
     if resource == "view":
         row = {**row, "data": projection(identity)}
     return {resource: serialize(row, contract.RESOURCE[resource])}
+
+
+def read_config(verb, values):
+    kind = values["kind"]
+    if verb == "list":
+        return {"items": configitems.listing(kind)}
+    found = configitems.item(kind, values["name"])
+    if verb == "read":
+        return {"item": configitems.read(found)}
+    if verb == "versions":
+        return {"versions": configitems.revisions(found)}
+    diff = configitems.diff(found, values.get("from"), values.get("to"))
+    if diff is None:
+        raise contract.Problem("unavailable", "No config Git diff is available")
+    return {"diff": diff}
 
 
 def dispatch(handler, op, path_values, query):

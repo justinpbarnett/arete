@@ -1,0 +1,84 @@
+{
+  "type": "object",
+  "properties": {
+    "fallback": {"type": "boolean"},
+    "payment_modes": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["subscription", "api_key", "local"]},
+      "x-arete-reach": true
+    },
+    "capabilities": {"$ref": "#/$defs/capabilities"},
+    "floors": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"type": "string"}
+      },
+      "x-arete-reach": true
+    },
+    "paid": {"$ref": "#/$defs/paid"}
+  },
+  "additionalProperties": false,
+  "x-arete-reach": true,
+  "$defs": {
+    "tier_entry": {
+      "type": "object",
+      "properties": {
+        "runner": {"type": "string"},
+        "provider": {"type": "string"},
+        "model": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "tier": {
+      "type": ["object", "array"],
+      "properties": {
+        "runner": {"type": "string"},
+        "provider": {"type": "string"},
+        "model": {"type": "string"}
+      },
+      "additionalProperties": false,
+      "items": {"$ref": "#/$defs/tier_entry"},
+      "x-arete-reach": true
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"$ref": "#/$defs/tier"}
+      },
+      "x-arete-reach": true
+    },
+    "capability": {
+      "type": "object",
+      "properties": {
+        "modalities": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "context": {"type": "integer"},
+        "structured_output": {"type": "boolean"},
+        "data_handling": {"type": "string"}
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/capability"},
+      "x-arete-reach": true
+    },
+    "paid": {
+      "type": "object",
+      "properties": {
+        "providers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "max_input": {"type": "number"},
+        "max_output": {"type": "number"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

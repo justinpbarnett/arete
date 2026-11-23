@@ -1,0 +1,379 @@
+{
+  "type": "object",
+  "properties": {
+    "steps": {"$ref": "step_settings.json#/$defs/steps"},
+    "kinds": {"$ref": "step_settings.json#/$defs/kinds"},
+    "tiers": {"$ref": "routes.json#/$defs/tiers"},
+    "routing": {"$ref": "routes.json"},
+    "ab": {"$ref": "experiment.json#/$defs/experiments"},
+    "document": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "voice": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "style": {"type": "string"},
+        "words": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "array",
+              "items": {"type": "integer"}
+            },
+            "ticket": {
+              "type": "array",
+              "items": {"type": "integer"}
+            },
+            "pr": {
+              "type": "array",
+              "items": {"type": "integer"}
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "alert_repo": {"type": "string"},
+    "global_repo": {"type": "string"},
+    "arete_repo": {"type": "string"},
+    "zte_repo": {"type": "string"},
+    "max_parallel": {"type": "integer"},
+    "max_parallel_per_repo": {"type": "integer"},
+    "max_parallel_checks": {"type": "integer"},
+    "dashboard": {
+      "type": "object",
+      "properties": {
+        "port": {"type": "integer"},
+        "owner": {"type": "string"},
+        "https": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "models": {"$ref": "models.json"},
+    "pricing": {"$ref": "prices.json#/$defs/pricing"},
+    "serve": {"$ref": "budgets.json"},
+    "miner": {
+      "type": "object",
+      "properties": {
+        "lookback_hours": {"type": "number"},
+        "max_digest_chars": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "factory": {
+      "type": "object",
+      "properties": {
+        "tier_map": {"type": "string"},
+        "adws": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "repo": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "path": {"type": "string"},
+          "layer": {"type": "string"},
+          "github": {"type": "string"},
+          "jira_project": {"type": "string"},
+          "jira_label": {"type": "string"},
+          "pipeline": {"type": "boolean"},
+          "mine": {"type": "boolean"},
+          "public": {"type": "boolean"},
+          "jev": {"type": "boolean"},
+          "tracker": {"type": "string", "enum": ["github", "jira", "local"]},
+          "part": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "dir": {"type": "string"},
+                "github": {"type": "string"}
+              },
+              "additionalProperties": false,
+              "required": ["dir", "github"]
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": ["name", "path"]
+      }
+    },
+    "job": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {"type": "string"},
+          "log": {"type": "string"},
+          "max_age_hours": {"type": "number"},
+          "keepalive": {"type": "boolean"}
+        },
+        "additionalProperties": false,
+        "required": ["label"]
+      }
+    },
+    "probe": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "command": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "expect": {"type": "string"},
+          "every_hours": {"type": "number"},
+          "timeout": {"type": "integer"}
+        },
+        "additionalProperties": false,
+        "required": ["name", "command"]
+      }
+    },
+    "github_app": {
+      "type": "object",
+      "properties": {
+        "app_id": {"type": ["string", "integer"]},
+        "installation_id": {"type": ["string", "integer"]},
+        "private_key": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "jira": {
+      "type": "object",
+      "properties": {
+        "env_file": {"type": "string"},
+        "project": {"type": "string"},
+        "auto": {"type": "boolean"},
+        "sprint_only": {"type": "boolean"},
+        "auto_per_refresh": {"type": "integer"},
+        "skip_types": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "transitions": {
+          "type": "object",
+          "properties": {
+            "running": {"type": "string"},
+            "pr": {"type": "string"},
+            "failed": {"type": "string"},
+            "needs-info": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "research": {
+          "type": "object",
+          "properties": {
+            "running": {"type": "string"},
+            "pr": {"type": "string"},
+            "failed": {"type": "string"},
+            "done": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "landed": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "jev": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "guard": {"type": "boolean"},
+        "model": {"type": "string"},
+        "compact_tokens": {"type": "integer"},
+        "confidence": {"type": "number"},
+        "injection": {"type": "number"},
+        "risk_hold": {"type": "number"},
+        "irreversible_hold": {"type": "number"},
+        "secrets_hold": {"type": "number"},
+        "triage_skip": {"type": "number"},
+        "proof_hold": {"type": "number"},
+        "fixed_skip": {"type": "number"},
+        "research_rerun": {"type": "number"},
+        "research_answered": {"type": "number"},
+        "feedback_skip": {"type": "number"},
+        "screen_lines": {
+          "type": "object",
+          "properties": {
+            "weakens": {"type": "number"},
+            "secrets": {"type": "number"},
+            "outside": {"type": "number"},
+            "irreversible": {"type": "number"},
+            "feature": {"type": "number"},
+            "removes": {"type": "number"},
+            "renames": {"type": "number"},
+            "reach": {"type": "number"}
+          },
+          "additionalProperties": false
+        },
+        "risk_weights": {
+          "type": "object",
+          "properties": {
+            "blast": {"type": "number"},
+            "sensitivity": {"type": "number"},
+            "surprise": {"type": "number"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "oncall": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "source": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/oncall_source"}
+        },
+        "vision": {"type": "string"},
+        "scope": {"type": "string"},
+        "confidence": {"type": "number"},
+        "injection": {"type": "number"},
+        "max_repairs": {"type": "integer"},
+        "wakes_per_hour": {"type": "integer"},
+        "max_attempts": {"type": "integer"},
+        "incident_budget_usd": {"type": "number"},
+        "daily_budget_usd": {"type": "number"},
+        "cooldown_minutes": {"type": "number"},
+        "keep_days": {"type": "number"}
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "replay": {
+      "type": "object",
+      "properties": {
+        "all": {"type": "boolean"},
+        "dir": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string"},
+          "args": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "url": {"type": "string"}
+        },
+        "additionalProperties": false,
+        "x-arete-reach": true
+      }
+    },
+    "research": {
+      "type": "object",
+      "properties": {
+        "planner": {"type": "boolean"},
+        "search": {"type": "boolean"},
+        "synthesis": {"type": "boolean"},
+        "audit": {"type": "boolean"},
+        "search_workers": {"type": "integer"},
+        "search_share": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "ask": {"$ref": "attention.json"},
+    "triage": {
+      "type": "object",
+      "properties": {
+        "auto": {"type": "boolean"},
+        "route_fixes": {"type": "boolean"},
+        "auto_per_refresh": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number"},
+        "max_gb": {"type": "number"},
+        "lines_days": {"type": "number"},
+        "db_max_mb": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "backup": {
+      "type": "object",
+      "properties": {
+        "copy_to": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "chat": {
+      "type": "object",
+      "properties": {
+        "context_tokens": {"type": "integer"},
+        "summary_model": {"type": "string"},
+        "max_sessions": {"type": "integer"},
+        "budget_usd": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "pass": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "providers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "capture": {
+      "type": "object",
+      "properties": {
+        "vision": {"type": ["string", "boolean"]},
+        "evidence_branch": {"type": "string"},
+        "public_evidence": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "oncall_source": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "pattern": {"type": "string"},
+        "repo": {"type": "string"},
+        "check": {"type": "string"},
+        "vision": {"type": "string"},
+        "scope": {"type": "string"}
+      },
+      "additionalProperties": false,
+      "required": ["path"],
+      "x-arete-reach": true
+    }
+  }
+}
