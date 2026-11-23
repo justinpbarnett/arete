@@ -132,19 +132,8 @@ class Loop:
         return [self.model_for(cfg), *([self.classify.get("model") or cfg.model("classify")] if self.classify else [])]
 
     def routing_repo(self, cfg: config.Config) -> config.Repo | None:
-        if not self.repo:
-            return None
-        repo = self.work_repo(cfg)
-        checkout_repo = cfg.repo_for_path(repo.path) or repo
-        named = self.repo == repo.name
-        if cfg.zte_repo != cfg.arete_repo and (named or checkout_repo.name == cfg.zte_repo):
-            try:
-                ordinary, alias = cfg.repo(cfg.arete_repo), cfg.repo(cfg.zte_repo)
-            except config.UnknownRepo:
-                return checkout_repo
-            if ordinary.path.resolve() == alias.path.resolve() == repo.path.resolve():
-                return repo if named else ordinary
-        return checkout_repo
+        repo = self.work_repo(cfg) if self.repo else None
+        return (cfg.repo_for_path(repo.path) or repo) if repo else None
 
     def outlooks(self, cfg: config.Config, connect=foundation.reader) -> list[list]:
         from . import routing

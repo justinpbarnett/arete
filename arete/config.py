@@ -337,7 +337,7 @@ class Config:
     alert_repo: str = ""
     global_repo: str = "ai"
     arete_repo: str = "arete"
-    zte_repo: InitVar[str] = field(default="", kw_only=True)
+    zte_repo: InitVar[str | None] = field(default=None, kw_only=True)
     models: dict[str, str] = field(default_factory=dict)
     repos: list[Repo] = field(default_factory=list)
     jobs: list[Job] = field(default_factory=list)
@@ -381,8 +381,8 @@ class Config:
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
-    def __post_init__(self, zte_repo: str) -> None:
-        self.zte_repo = zte_repo or self.arete_repo
+    def __post_init__(self, zte_repo: str | None) -> None:
+        self.zte_repo = self.arete_repo if zte_repo is None else zte_repo
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -1120,7 +1120,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         alert_repo=data.get("alert_repo", ""),
         global_repo=data.get("global_repo", "ai"),
         arete_repo=data.get("arete_repo", "arete"),
-        zte_repo=data.get("zte_repo", ""),
+        zte_repo=data.get("zte_repo"),
         models=dict(data.get("models", {})),
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
@@ -1156,8 +1156,12 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.jev = jev_table(data.get("jev", {}), ignored)
     cfg.github_app = github_app_table(section(data, "github_app"))
     cfg.repos = [repo_table(repo) for repo in data.get("repo", [])]
-    if "zte_repo" in data and not any(repo.name == data["zte_repo"] for repo in cfg.repos):
-        raise UnknownRepo(f"zte_repo names unknown repo {data['zte_repo']!r}")
+    if "zte_repo" in data:
+        repo_names = [repo.name for repo in cfg.repos]
+        if cfg.zte_repo not in repo_names:
+            raise UnknownRepo(f"zte_repo names unknown repo {cfg.zte_repo!r}")
+        if cfg.zte_repo != cfg.arete_repo and cfg.arete_repo not in repo_names[:repo_names.index(cfg.zte_repo)]:
+            raise ValueError(f"zte_repo {cfg.zte_repo!r} must be listed after arete_repo {cfg.arete_repo!r}")
     cfg.jobs = [job_table(job) for job in data.get("job", [])]
     cfg.probes = [probe_table(probe) for probe in data.get("probe", [])]
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
