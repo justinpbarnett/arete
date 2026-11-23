@@ -17,7 +17,17 @@ from pathlib import Path
 
 from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
-from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text, overload_limit
+from .agent import (
+    NO_SESSION,
+    Result,
+    Session,
+    UsageLimit,
+    credit_limit,
+    json_from_text,
+    overload_limit,
+    provider_failure_fields,
+    unreachable_limit,
+)
 from .pi import SCHEMA_RULE
 
 LIMIT_SCOPE = "codex"
@@ -684,16 +694,30 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
             turns += item.get("type") != "reasoning"
         elif kind == "turn.completed":
             usage = {k: max(0, int(v or 0) - (before or {}).get(k, 0)) for k, v in (event.get("usage") or {}).items()}
-        elif kind == "turn.failed":
-            failures.append(str((event.get("error") or {}).get("message") or "the turn failed"))
-            diagnostics.append(event)
-        elif kind == "error":
-            failures.append(str(event.get("message") or "codex reported an error"))
+        elif kind in ("turn.failed", "error"):
+            details = accounts.mapping(event.get("error")) if kind == "turn.failed" else event
+            message = details.get("message")
+            fallback = "the turn failed" if kind == "turn.failed" else "codex reported an error"
+            failures.append(message if isinstance(message, str) and message else fallback)
             diagnostics.append(event)
     text = texts[-1] if texts else ""
     ok = proc.returncode == 0 and not failures and bool(thread)
     error = "" if ok else util.tail("\n".join(failures) or proc.stderr.strip() or f"exit {proc.returncode}", 1500)
     session = Session(thread, 0.0, "codex") if thread else resume
+    limit = None
+    if not ok:
+        errors = "\n".join([*failures, proc.stderr])
+        failure_text = [proc.stderr]
+        for event in diagnostics:
+            detail = event.get("error")
+            failure_text.append(detail)
+            failure_text.extend(provider_failure_fields(event))
+            failure_text.extend(provider_failure_fields(accounts.mapping(detail)))
+        if provider == KEY_PROVIDER:
+            limit = (credit_limit([*diagnostics, proc.stderr]) or overload_limit(errors, model)
+                     or unreachable_limit(failure_text, model))
+        else:
+            limit = usage_limit(errors, model, failure_text=failure_text)
     return Result(
         ok=ok,
         text=text,
@@ -702,8 +726,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=turns,
         error=error,
         connection_failed=not ok and util.is_network_error(error),
-        usage_limit=None if ok else (credit_limit([*diagnostics, proc.stderr]) if provider == KEY_PROVIDER else
-                                    usage_limit("\n".join([*failures, proc.stderr]), model)),
+        usage_limit=limit,
         raw={"usage": usage, "thread_id": thread},
         tokens_in=usage.get("input_tokens", 0),
         tokens_out=usage.get("output_tokens", 0),
@@ -715,9 +738,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     )
 
 
-def usage_limit(text: str, model: str = "") -> UsageLimit | None:
+def usage_limit(text: str, model: str = "", *, failure_text: list[str | int | None] | None = None) -> UsageLimit | None:
     if not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model)
+        return overload_limit(text, model) or unreachable_limit(text if failure_text is None else failure_text, model)
     soonest = util.now() + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
     resets = reset_time(text)
     until = (max(soonest, resets + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)) if resets
