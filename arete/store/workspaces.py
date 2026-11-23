@@ -31,6 +31,10 @@ class SnapshotUnavailable(RuntimeError):
     pass
 
 
+class UnreadableSnapshot(SnapshotUnavailable):
+    pass
+
+
 @contextmanager
 def ticket_lock(repo: str, ticket: str | int):
     name = runs.run_lock("pipeline", repo, ticket)
@@ -361,7 +365,7 @@ def _record_stat(source: Path) -> os.stat_result | None:
     except FileNotFoundError:
         return None
     except OSError as e:
-        raise SnapshotUnavailable(f"{source}: {e}") from e
+        raise UnreadableSnapshot(f"{source}: {e}") from e
 
 
 def _require_record_version(source: Path, version: tuple[int, ...] | None) -> None:
@@ -377,7 +381,7 @@ def _read_record(source: Path) -> tuple[dict | None, int, tuple[int, ...]] | Non
     version = _record_version(before)
     try:
         if not stat.S_ISREG(before.st_mode):
-            raise ValueError("expected a regular file")
+            raise UnreadableSnapshot(f"{source}: expected a regular file")
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as f:
             if _record_version(os.fstat(fd)) != version:
@@ -389,7 +393,10 @@ def _read_record(source: Path) -> tuple[dict | None, int, tuple[int, ...]] | Non
             if _record_version(os.fstat(fd)) != version:
                 raise ValueError("file changed while reading")
         _require_record_version(source, version)
-    except (OSError, ValueError) as e:
+    except OSError as e:
+        _require_record_version(source, version)
+        raise UnreadableSnapshot(f"{source}: {e}") from e
+    except ValueError as e:
         raise SnapshotUnavailable(f"{source}: {e}") from e
     if not isinstance(made, dict) or any(
         not name or name.startswith("/") or ".." in name.split("/") or "\0" in name or not isinstance(digest, str)
@@ -531,7 +538,11 @@ def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | No
             if partial:
                 change(row, state="kept", kept_reason="operator", bytes=size)
             else:
-                change(row, state="removed", held_by=[], bytes=0)
+                change(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
+
+
+def record_release_error(row: dict, error: OSError) -> None:
+    _change_current(row, last_sweep_error=util.first_line(str(error), 300))
 
 
 def _ticket_ended(row: dict) -> bool:

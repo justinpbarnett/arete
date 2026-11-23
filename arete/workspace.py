@@ -259,15 +259,20 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
             if row and by and by != "sweep" and by == row["owner_run"]:
                 note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
             made = workspaces.made_before(ws) if row else {}
-        except workspaces.SnapshotUnavailable:
-            if by == "sweep":
+        except workspaces.SnapshotUnavailable as e:
+            if by == "sweep" and not isinstance(e, workspaces.UnreadableSnapshot):
                 raise
             row = workspaces.open_for(ws.name)
             names = workspace_blockers(ws, checkouts, excluded=excluded, made={})
             release = Release("held", names or [str(ws)])
         else:
             force = by == "sweep" and bool(row and row["remove_asked_by"])
-            release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force)
+            try:
+                release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force)
+            except OSError as e:
+                if row:
+                    workspaces.record_release_error(row, e)
+                raise
         workspaces.record_release(ws, checkouts, row, release, partial=bool(excluded))
         return release
 
@@ -434,6 +439,8 @@ def fingerprint(p: Path, salt: str) -> str:
 def made_before(ws: Path) -> dict:
     try:
         return workspaces.made_before(ws)
+    except workspaces.UnreadableSnapshot:
+        return {}
     except workspaces.SnapshotUnavailable as e:
         raise worktree_failure(f"arete could not reconcile the existing workspace {ws}: {e}", ws, "") from e
 

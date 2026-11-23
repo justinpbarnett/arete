@@ -51,7 +51,7 @@ export class Operation extends Component {
       notice.value = say(result);
       return true;
     } catch (fault) {
-      this.setState({ error: clearSecret ? "The answer could not be confirmed. Secret fields were cleared. Check the current state before trying again."
+      this.setState({ error: clearSecret && fault.status !== 401 ? "The answer could not be confirmed. Secret fields were cleared. Check the current state before trying again."
         : fault.status ? fault.message : `${fault.message}. Check the current state before trying again.` });
       return false;
     } finally {

@@ -894,7 +894,6 @@ def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
 
 def file_rule(proposal_id: int) -> str:
     with util.lock(RULE_LOCK, wait=True):
-        migrate_on_demand()
         p = approvals_store.proposal(proposal_id)
         if not p or not approvals_store.move_proposal(proposal_id, ("approve", "filing"), "filing"):
             raise LookupError(f"#{proposal_id} is not a rule waiting for approval")

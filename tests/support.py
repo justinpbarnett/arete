@@ -29,6 +29,7 @@ def isolate_live_state():
                   mock.patch.object(paths, "CONFIG_FILE", root / "config/config.toml"),
                   mock.patch.object(paths, "PI_KEYS_FILE", root / "config/pi.env"),
                   mock.patch.object(paths, "STATE_DIR", root / "state"),
+                  mock.patch.object(paths, "TOKEN_CLIENT_DIR", root / "state/client"),
                   mock.patch.object(paths, "LOCKS_DIR", root / "state" / "locks"),
                   mock.patch.object(paths, "WORKTREES_DIR", root / "worktrees"),
                   mock.patch.object(paths, "LOG_DIR", root / "logs"),
