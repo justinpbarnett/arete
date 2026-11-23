@@ -408,12 +408,12 @@ def evidence_names(draft: dict) -> list[str]:
 
 def vision_of(cfg: config.Config) -> dict:
     found = {"path": "", "version": "", "text": "", "setting": ""}
-    if not cfg.capture_vision:
+    if not cfg.capture.vision:
         found["setting"] = (f'No vision file is set. Add vision = "vision.md" under [capture] in '
                             f'{paths.short_path(paths.CONFIG_FILE)}, naming a file in that folder that says what the '
                             f'app is for.')
         return found
-    path = Path(cfg.capture_vision)
+    path = Path(cfg.capture.vision)
     found["path"] = paths.short_path(path)
     try:
         data = paths.read_confined(path)
@@ -836,7 +836,7 @@ def short_config() -> str:
 
 def evidence_hold(repo: str, cfg: config.Config) -> str:
     private = gh.repo_private(repo)
-    if private or cfg.capture_public_evidence:
+    if private or cfg.capture.public_evidence:
         return ""
     why = f"{repo} is public, so the evidence would be public" if private is False else (
         f"{repo}'s visibility could not be read, so the evidence might be public")
@@ -845,7 +845,7 @@ def evidence_hold(repo: str, cfg: config.Config) -> str:
 
 
 def upload(draft: dict, repo: str, cfg: config.Config) -> str:
-    branch = cfg.capture_evidence_branch
+    branch = cfg.capture.evidence_branch
     pending = [e for e in draft["evidence"] if not e["link"]]
     if not pending:
         return ""

@@ -284,12 +284,6 @@ def clear_alert(cfg: config.Config, key: str) -> bool:
     return incident_store.alert_get(key) is None
 
 
-def route_outlook(cfg: config.Config, repo: config.Repo, setting) -> list:
-    from . import routing
-
-    return routing.outlook(cfg, repo, "local", setting.model, setting.runner, list(setting.tools), setting.denied)
-
-
 def fenced(data) -> str:
     return "```json\n" + json.dumps(data, indent=2, default=str).replace("```", "'''") + "\n```"
 
@@ -942,17 +936,14 @@ def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
 
     try:
         layer = config.load_layer(repo.layer_dir)
-        modes = routing.modes_for(cfg, repo)
+        discovery = routing.Discovery(cfg, repo, devices.LOCAL, priced=False, layer=layer)
         for role in ("plan", "build", *(("verify",) if layer.verify else ()), "review", *REPAIR_STEPS):
             setting = steps.resolve(cfg, layer, role, "fix")
-            which, name = routing.chosen(setting.model, setting.runner, cfg)
-            if which == REPLAY:
+            if setting.runner == REPLAY:
                 continue
-            request = routing.request_for(cfg, repo, which, name, None, True,
-                                          {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
-            if why := routing.fit_refusal(request, devices.LOCAL, modes):
+            if why := routing.fit_refusal(setting, devices.LOCAL, discovery.modes):
                 return f"{role}: {why}", True
-            routes = route_outlook(cfg, repo, setting)
+            routes = discovery.routes(setting)
             if any(c.state == "ready" for c in routes):
                 continue
             if words := routing.held_words(routes):

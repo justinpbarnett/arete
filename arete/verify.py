@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields, replace
+from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
@@ -33,6 +34,16 @@ MAX_EVIDENCE_BYTES = 32 * 1024 * 1024
 MAX_SAW_CHARS = 1200
 VERDICTS = ("pass", "fail", "blocked")
 ENVIRONMENT_FAULT = re.compile(r"[Oo]peration not permitted|\bEPERM\b|\[Errno 1\]|\bsandbox-exec\b")
+SHELL_QUOTING = r"""'[^'\n]*'|"(?:[^"\\\n]|\\.)*"|\\."""
+SHELL_WORD_BREAKS = r"""\s'"\\;&|()<>"""
+SHELL_LITERAL = rf"(?:[^{SHELL_WORD_BREAKS}*?]|{SHELL_QUOTING})"
+ENV_RULE_PREFIX = re.compile(
+    rf"(?![A-Za-z_][A-Za-z0-9_]*=)(?P<program>{SHELL_LITERAL}+)[ \t]+"
+    rf"(?:-{SHELL_LITERAL}*[ \t]+)*(?P<env>env[ \t]+)?")
+JOINED_TERMINAL_WILDCARD = re.compile(r"[^ \t]\*[ \t]*$")
+ENV_ASSIGNMENT = re.compile(
+    rf"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>(?:[^{SHELL_WORD_BREAKS}]|{SHELL_QUOTING})*)(?P<space>[ \t]+|$)")
+EXAMPLE_SERVER_PORT = "51390"
 
 SCHEMA = {
     "type": "object",
@@ -51,6 +62,7 @@ SCHEMA = {
             },
             "required": ["what", "how", "saw", "passed"],
         }},
+        "unmeasured_requirements": {"type": "array", "items": {"type": "string"}},
         "blocked_by": {"type": "string"},
     },
     "required": ["verdict", "summary", "checks"],
@@ -358,6 +370,54 @@ def trusted_wrapper(executable: str) -> bool:
         path.is_absolute() and path.parts[-3:] == ("verification-runtime", "harness", "sandbox"))
 
 
+def env_example(allow_bash: list[str], url: str) -> str:
+    for pattern in allow_bash:
+        prefix = ENV_RULE_PREFIX.match(pattern)
+        if not prefix or JOINED_TERMINAL_WILDCARD.search(pattern):
+            continue
+        program, = shlex.split(prefix["program"], comments=False)
+        if Path(program).name == "env":
+            continue
+        args = pattern[prefix.end():]
+        if args == "*":
+            env = "" if prefix["env"] else "env "
+            command = f"{prefix[0]}{env}ARETE_SERVER=<url> uv run arete task list"
+        elif prefix["env"] and (example := env_rule_args(args, url)):
+            command = prefix[0] + example
+        else:
+            continue
+        if fnmatchcase(command, pattern):
+            return f" For example, run `{command}`."
+    return ""
+
+
+def env_rule_args(args: str, url: str) -> str:
+    rendered, end, has_wildcard = [], 0, False
+    while assignment := ENV_ASSIGNMENT.match(args, end):
+        value = assignment["value"]
+        if "*" in value:
+            has_wildcard = True
+            value = env_rule_value(assignment["name"], value, url)
+        rendered.append(f'{assignment["name"]}={value}{assignment["space"]}')
+        end = assignment.end()
+    if not has_wildcard:
+        return ""
+    return "".join(rendered) + args[end:].replace("*", "example")
+
+
+def env_rule_value(name: str, pattern: str, url: str) -> str:
+    server = name == "ARETE_SERVER"
+    samples = (url, f"http://127.0.0.1:{EXAMPLE_SERVER_PORT}") if server else ("arete-placeholder-1",)
+    for sample in filter(None, samples):
+        shell_quoted = shlex.quote(sample)
+        single_quoted = f"'{sample}'" if shell_quoted == sample else shell_quoted
+        double_quoted = '"' + re.sub(r'(["\\$`])', r'\\\1', sample) + '"'
+        for candidate in (shell_quoted, double_quoted, single_quoted):
+            if fnmatchcase(candidate, pattern):
+                return candidate
+    return pattern.replace("*", EXAMPLE_SERVER_PORT if server else "example")
+
+
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -408,13 +468,16 @@ class Verified:
     saved: str = ""
     native_trees: dict[str, str] = field(default_factory=dict)
     behavior_reached: bool = True
+    unmeasured_requirements: list[str] = field(default_factory=list)
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
         said = found.get("verdict")
         checks = [{k: v for k, v in c.items() if k != "driver"} for c in found.get("checks", []) if isinstance(c, dict)]
+        names = found.get("unmeasured_requirements")
+        unmeasured = [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
-                checks, found.get("blocked_by", "").strip())
+                checks, found.get("blocked_by", "").strip(), unmeasured_requirements=unmeasured)
         if v.verdict not in VERDICTS:
             v.verdict = "blocked"
             v.blocked_by = v.blocked_by or f"the verifier's verdict {json.dumps(said)} is not pass, fail or blocked"
@@ -435,6 +498,15 @@ class Verified:
     @property
     def failed_checks(self) -> list[dict]:
         return [c for c in self.checks if not c.get("passed")]
+
+    def observed_requirements(self) -> set[str]:
+        failed = self.failed_checks
+        if self.verdict == "pass" and self.finished and not failed:
+            unmeasured = {one_line(name).casefold() for name in self.unmeasured_requirements}
+            passed = {one_line(c.get("what")) for c in self.checks if c.get("passed") is True}
+            return {name for name in passed if name and name.casefold() not in unmeasured}
+        return {one_line(c.get("what")) for c in failed
+                if c.get("passed") is False and str(c.get("cause") or "").strip().lower() != "environment"} - {""}
 
     def screenshots(self, evidence: Path) -> list[Path]:
         names = [Path(c["screenshot"]).name for c in self.checks if (c.get("screenshot") or "").strip()]

@@ -14,7 +14,8 @@ function serveState(serve) {
   const broken = Object.keys(serve.broken || {}).length;
   const errors = Object.keys(serve.poll_errors || {}).length;
   return el("p", {}, stateChip(serve.stuck ? "fault" : broken || errors || failing.length ? "caution" : "ok"),
-    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running ?? "unknown"} running, ${serve.pending ?? "unknown"} waiting.` + tickFails +
+    ` Serve is up since ${clock(serve.started)}: ${serve.loops} loops on, ${serve.off} off, ${serve.running ?? "unknown"} loop runs running, ${serve.pending ?? "unknown"} loop fires waiting` +
+    (serve.tickets === undefined ? "" : `, ${count(serve.tickets ?? "unknown", "ticket run", "ticket runs")} live`) + "." + tickFails +
     (broken ? ` ${count(broken, "loop does", "loops do")} not load.` : "") + (errors ? ` ${count(errors, "source fails", "sources fail")} to poll.` : ""));
 }
 

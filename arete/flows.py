@@ -586,7 +586,8 @@ class Job:
         return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
                                    owner=self.run.owner_note, comments=t.comments, attachments=self.attachments,
                                    expertise=self.expertise, commands=self.commands, max_lines=self.layer.max_diff_lines,
-                                   denied=prompt_loader.code_list(diffguard.denied_paths(self.layer)))
+                                   denied=prompt_loader.code_list(diffguard.denied_paths(self.layer)),
+                                   class_check=pipeline.class_check_example(self.run.dir, self.layer))
 
     @property
     def b(self) -> pipeline.Build:
@@ -1353,18 +1354,18 @@ def publication_outcome(job: Job, staged, summary, committed, draft_why="", repo
     return Outcome("pass", data=data)
 
 
-def report(job: Job, size: str, images: dict, held: str) -> str:
+def report(job: Job, size: str, images: dict, held: str, *, measurement_section: str = "") -> str:
     return pipeline.report_body(job.run, summary=job.build_summary, review=job.review, verified=job.verified,
                                 left=job.left_for_a_person, images=images, approval=job.approval, attempts=job.attempts,
                                 checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
-                                held=held, written=job.document)
+                                held=held, written=job.document, measurement_section=measurement_section)
 
 
 def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
-                        before_push=None) -> Outcome:
+                        before_push=None, *, measurement_section: str = "") -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
-    report_body = report(job, size, images, draft_why)
+    report_body = report(job, size, images, draft_why, measurement_section=measurement_section)
     link = tk.pr_link(t, whole=not job.left_for_a_person)
     opened = [c for c in found if c in staged.changed]
     found = list(opened)
@@ -1392,7 +1393,8 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     pipeline.note_prs(run, job.branch, with_prs)
     ci_stopped = [c for c in found if stops[c.github]]
     ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
-                                         job.left_for_a_person, link, stops, committed)
+                                         job.left_for_a_person, link, stops, committed,
+                                         measurement_section=measurement_section)
     drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
@@ -1412,7 +1414,7 @@ def require_environment_owner_clear(job: Job) -> None:
 
 
 @factory.step("pr")
-def pr(flow: factory.Flow, tree: str) -> Outcome:
+def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outcome:
     job: Job = flow.ctx
     run = job.run
     require_environment_owner_clear(job)
@@ -1440,7 +1442,8 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             return end_as("fail", "failed",
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
-    return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push)
+    return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push,
+                               measurement_section=measurement_section)
 
 
 def with_stop(text: str, stop: str) -> str:
@@ -1579,12 +1582,12 @@ def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
     return finish(flow, **outcome.data)
 
 
-def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
+def end_dry_run(flow: factory.Flow, *, measurement_section: str = "") -> tuple[str, str, str]:
     job = flow.ctx
     staged, size, outcome_text = change(job)
     job.run.save("diff.patch", staged.patch)
     job.run.save("pr_body.md", gh.outgoing(report(
-        job, size, {}, job.held_reason)))
+        job, size, {}, job.held_reason, measurement_section=measurement_section)))
     return finish(flow, "dry-run", summary=outcome_text)
 
 

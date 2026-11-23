@@ -536,7 +536,8 @@ def cmd_pilot(args) -> int:
                 and not controller.fallback and not steps.experiment_for(cfg, layer, "orchestrate", "fix"),
                 "the pilot requires the fixed Pi OpenAI controller at low effort with no model fallback")
         limits = layer.orchestration
-        require(repo.layer and not cfg.replay.all and (layer.payment_modes or cfg.payment_modes) == ("subscription",)
+        require(repo.layer and not cfg.replay.all
+                and (layer.routing.payment_modes or cfg.routing.payment_modes) == ("subscription",)
                 and limits.max_workers == 1 and limits.max_decisions <= 16 and limits.max_actions <= 64
                 and layer.max_run_minutes <= 40 and layer.max_verify_minutes <= 15 and layer.max_repair_cycles <= 1,
                 "the one-shot pilot needs the bounded subscription-only layer")

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from arete import api_check, contract
 from arete import contract_evolution as evolution
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 SOURCE = Path(__file__).resolve().parents[1]
 ROUTE = "GET /api/v1/settings"
@@ -23,8 +24,9 @@ batch['input']['properties']['requests']['items']['properties']['operation']['en
 """
 
 
-def run(root, command, env, *, timeout=30):
-    return subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+def run(root, command, env):
+    return subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
+                          timeout=CHILD_HANG_TIMEOUT, check=False)
 
 
 def git(root, env, *args):

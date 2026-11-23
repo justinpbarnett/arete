@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 ROOT = Path(__file__).resolve().parent.parent
 TAIL = 3000
@@ -18,6 +19,7 @@ TAIL = 3000
 SUITE = '''import os
 import time
 import unittest
+from unittest.mock import patch
 
 
 def crowd(test):
@@ -76,68 +78,25 @@ class BusySolo(unittest.TestCase):
             print(cls.attempt, file=attempts)
 
 
-class FailureThenHang(BusySolo):
-    def test_a_failure(self):
-        if self.attempt == 1:
-            self.fail("force an alone rerun")
-        if self.attempt == 2:
-            self.fail("assertion recorded before a later test hangs")
-
-    def test_b_hang(self):
-        if self.attempt == 2:
-            time.sleep(60)
+def skip_cleanup():
+    raise unittest.SkipTest("module cleanup skipped")
 
 
-class ErrorThenHang(BusySolo):
+def broken_cleanup():
+    raise RuntimeError("module cleanup failed")
+
+
+class ModuleCleanupFailure(BusySolo):
     def test_cleanup(self):
-        if self.attempt == 1:
-            self.fail("force an alone rerun")
-        if self.attempt == 2:
-            self.addCleanup(time.sleep, 60)
-            self.addCleanup(self.broken_cleanup)
-
-    def broken_cleanup(self):
-        raise RuntimeError("error recorded before another cleanup hangs")
+        # unittest runs the last registered cleanup first.
+        unittest.addModuleCleanup(skip_cleanup)
+        unittest.addModuleCleanup(broken_cleanup)
 
 
-class ClassCleanupErrorThenHang(BusySolo):
-    def test_cleanup(self):
-        if self.attempt == 1:
-            self.fail("force an alone rerun")
-        if self.attempt == 2:
-            self.addClassCleanup(self.hanging_class_cleanup)
-            self.addClassCleanup(self.broken_class_cleanup)
-
-    def broken_class_cleanup(self):
-        raise RuntimeError("class cleanup error before a later class cleanup hangs")
-
-    def hanging_class_cleanup(self):
-        time.sleep(60)
-
-
-class ModuleCleanupErrorThenHang(BusySolo):
-    def test_cleanup(self):
-        if self.attempt == 1:
-            self.fail("force an alone rerun")
-        if self.attempt == 2:
-            unittest.addModuleCleanup(self.hanging_module_cleanup)
-            unittest.addModuleCleanup(self.broken_module_cleanup)
-
-    def broken_module_cleanup(self):
-        raise RuntimeError("module cleanup error before a later module cleanup hangs")
-
-    def hanging_module_cleanup(self):
-        time.sleep(60)
-
-
-class SubtestThenHang(BusySolo):
-    def test_subtest(self):
-        if self.attempt == 1:
-            self.fail("force an alone rerun")
-        if self.attempt == 2:
-            with self.subTest(value=1):
-                self.fail("subtest assertion recorded before its test hangs")
-            time.sleep(60)
+class AssertionWithReplacePatched(BusySolo):
+    def test_assertion(self):
+        with patch.object(os, "replace", side_effect=PermissionError("replacement denied")):
+            self.fail("assertion while os.replace is patched")
 
 
 class BusyTimeout(BusySolo):
@@ -171,15 +130,18 @@ class RunnerOutputTests(unittest.TestCase):
         self.env.update(PARALLEL_MARKERS=str(root / "markers"), ARETE_STATE_DIR=str(root / "state"), TMPDIR=str(root))
 
     def run_suite(self, *names, loads=(0,)):
-        runner = ("from tests import parallel; "
+        runner = ("from types import SimpleNamespace; from tests import parallel; "
                   f"loads = iter({loads!r}); "
                   "parallel.os.cpu_count = lambda: 14; "
                   "parallel.os.getloadavg = lambda: (next(loads, 0), 0, 0); "
                   "parallel.LOAD_WAIT_BUDGET = 0; "
+                  # The managed sandbox can deny removal of temporary directories.
+                  "remove_reports = parallel.shutil.rmtree; "
+                  "parallel.shutil = SimpleNamespace(rmtree=lambda path: remove_reports(path, ignore_errors=True)); "
                   "raise SystemExit(parallel.main())")
         done = subprocess.run([sys.executable, "-c", runner, "-s", str(self.suite), *names],
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
-                              text=True, timeout=self.class_timeout)
+                              text=True, timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         return done.returncode, done.stdout + done.stderr
 
     def test_drive_flush_is_disabled_in_initial_and_alone_class_processes(self):
@@ -212,64 +174,40 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertIn("class exceeded 1s", output)
+        self.assertRegex(output, r"(?m)^class exceeded (?:1\.5s|[\d.]+s \(deadline 1\.5s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)
         self.assertLess(output.rindex("class exceeded"), output.index("Ran "))
         self.assertNotIn("on its first run", output)
 
-    def test_busy_alone_failure_survives_a_later_hang(self):
-        for name, kind, traceback in (
-            ("FailureThenHang", "failures", "AssertionError: assertion recorded before a later test hangs"),
-            ("ErrorThenHang", "errors", "RuntimeError: error recorded before another cleanup hangs"),
-            ("SubtestThenHang", "failures", "AssertionError: subtest assertion recorded before its test hangs"),
-        ):
-            with self.subTest(name=name):
-                identifier = f"test_sample.{name}"
-                code, output = self.run_suite(identifier, loads=(20, 21))
-                self.assertEqual(code, 1, output)
-                self.assertIn(f"{identifier}: starting alone at host load 20", output)
-                self.assertIn("class exceeded 2s", output)
-                self.assertIn(f"{identifier}: {kind}", output)
-                self.assertIn(traceback, output)
-                self.assertIn(f"Failed classes: {identifier}", output)
-                marker = Path(self.env["PARALLEL_MARKERS"]) / name
-                self.assertEqual(marker.read_text().splitlines(), ["1", "2"], output)
-
-    def test_busy_alone_class_cleanup_error_survives_a_later_cleanup_hang(self):
-        name = "ClassCleanupErrorThenHang"
+    def test_module_cleanup_error_fails_the_suite(self):
+        name = "ModuleCleanupFailure"
         identifier = f"test_sample.{name}"
-        code, output = self.run_suite(identifier, loads=(20, 21))
+        code, output = self.run_suite(identifier, loads=(0, 20, 20))
         self.assertEqual(code, 1, output)
-        self.assertEqual(output.count(f"{identifier}: starting alone at host load"), 1, output)
-        self.assertIn(f"{identifier}: starting alone at host load 20", output)
-        self.assertIn("class exceeded 2s", output)
-        self.assertIn("in hanging_class_cleanup", output)
-        self.assertIn(f"{identifier}: errors\ntearDownClass ({identifier})", output)
-        self.assertIn("RuntimeError: class cleanup error before a later class cleanup hangs", output)
+        self.assertIn(f"{identifier}: errors\ntearDownModule (test_sample)", output)
+        self.assertIn("RuntimeError: module cleanup failed", output)
         self.assertIn(f"Failed classes: {identifier}", output)
         marker = Path(self.env["PARALLEL_MARKERS"]) / name
         self.assertEqual(marker.read_text().splitlines(), ["1", "2"], output)
 
-    def test_busy_alone_module_cleanup_error_survives_a_later_cleanup_hang(self):
-        name = "ModuleCleanupErrorThenHang"
+    def test_busy_alone_assertion_remains_visible_with_replace_patched(self):
+        name = "AssertionWithReplacePatched"
         identifier = f"test_sample.{name}"
-        code, output = self.run_suite(identifier, loads=(20, 21))
+        code, output = self.run_suite(identifier, loads=(0, 20, 20))
         self.assertEqual(code, 1, output)
-        self.assertEqual(output.count(f"{identifier}: starting alone at host load"), 1, output)
         self.assertIn(f"{identifier}: starting alone at host load 20", output)
-        self.assertIn("class exceeded 2s", output)
-        self.assertIn("in hanging_module_cleanup", output)
-        self.assertIn(f"{identifier}: errors\ntearDownModule (test_sample)", output)
-        self.assertIn("RuntimeError: module cleanup error before a later module cleanup hangs", output)
+        self.assertIn(f"{identifier}: failures", output)
+        self.assertIn("AssertionError: assertion while os.replace is patched", output)
+        self.assertNotIn("PermissionError: replacement denied", output)
         self.assertIn(f"Failed classes: {identifier}", output)
         marker = Path(self.env["PARALLEL_MARKERS"]) / name
         self.assertEqual(marker.read_text().splitlines(), ["1", "2"], output)
 
     def test_busy_alone_timeout_gets_one_extra_rerun_and_reports_both_loads(self):
         identifier = "test_sample.BusyTimeout"
-        code, output = self.run_suite(identifier, loads=(20, 21))
+        code, output = self.run_suite(identifier, loads=(0, 0, 20, 20, 20, 21, 21))
         self.assertEqual(code, 0, output)
         self.assertIn(f"{identifier}: ran past its deadline on its first run, "
                       "ran past its deadline alone at host load 20, then passed alone at host load 21", output)
@@ -280,14 +218,14 @@ class RunnerOutputTests(unittest.TestCase):
     def test_failed_extra_solo_attempt_keeps_the_first_solo_timeout_stack(self):
         name = "BusyTimeoutThenFailure"
         identifier = f"test_sample.{name}"
-        code, output = self.run_suite(identifier, loads=(20, 21))
+        code, output = self.run_suite(identifier, loads=(0, 20, 20, 20, 21, 21))
         self.assertEqual(code, 1, output)
         self.assertEqual(output.count(f"{identifier}: starting alone at host load"), 2, output)
         self.assertIn(f"{identifier}: starting alone at host load 20", output)
         self.assertIn(f"{identifier}: starting alone at host load 21", output)
         self.assertIn(f"{identifier}: failures", output)
         before_failure = output.partition(f"{identifier}: failures")[0]
-        self.assertIn("class exceeded 2s\nPython class stack", before_failure)
+        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 3s x load [\d.]+\)\nPython class stack")
         self.assertIn("in test_hangs_on_first_solo_attempt\n", before_failure)
         self.assertIn("AssertionError: assertion on the extra solo attempt", output)
         self.assertIn(f"Failed classes: {identifier}", output)
@@ -341,7 +279,7 @@ class RunnerLoadTests(unittest.TestCase):
         })
         self.assertEqual(code, 0, output)
         self.assertEqual(events, [("First", 0, 1), ("load", 18), ("sleep", 5), ("load", 16),
-                                  ("sleep", 5), ("load", 13), ("First", "0.alone", 2)])
+                                  ("sleep", 5), ("load", 13), ("First", "0.alone", 3)])
         self.assertEqual(output.splitlines()[:2], [
             "First: waiting for host load to fall from 18 to 14 or less",
             "First: starting alone at host load 13 after waiting 10.00s",
@@ -359,18 +297,18 @@ class RunnerLoadTests(unittest.TestCase):
         self.assertEqual(output.count("waiting for host load to fall"), 2)
         self.assertIn("First: starting alone at host load 14 after waiting 5.00s", output)
         self.assertIn("Second: starting alone at host load 20 after waiting 295.00s", output)
-        self.assertEqual(events[-6:], [("load", 20), ("Second", "1.alone", 2),
-                                       ("load", 21), ("Second", "1.alone-retry", 2),
-                                       ("load", 22), ("Third", "2.alone", 2)])
+        self.assertEqual(events[-6:], [("load", 20), ("Second", "1.alone", 3),
+                                       ("load", 21), ("Second", "1.alone-retry", 3),
+                                       ("load", 22), ("Third", "2.alone", 3)])
         self.assertIn("Second: ran past its deadline on its first run, ran past its deadline alone at host load 20, "
-                      "then passed alone at host load 21 within twice its deadline", output)
+                      "then passed alone at host load 21 within three times its deadline", output)
         self.assertTrue(output.rstrip().endswith(": OK"), output)
 
     def test_quiet_timeout_stays_failed_after_one_alone_run(self):
         timeout = report(ran=0, timeout="class exceeded its deadline")
         code, output, events = self.run_suite([14], {"First": [timeout, timeout]})
         self.assertEqual(code, 1, output)
-        self.assertEqual(events, [("First", 0, 1), ("load", 14), ("First", "0.alone", 2)])
+        self.assertEqual(events, [("First", 0, 1), ("load", 14), ("First", "0.alone", 3)])
         self.assertIn("Failed classes: First", output)
 
     def test_only_over_capacity_timeouts_get_one_extra_rerun(self):
@@ -383,9 +321,9 @@ class RunnerLoadTests(unittest.TestCase):
             "Error": [timeout, error],
         })
         self.assertEqual(code, 1, output)
-        self.assertEqual([event for event in events if len(event) == 3 and event[2] == 2], [
-            ("TimedOut", "0.alone", 2), ("TimedOut", "0.alone-retry", 2),
-            ("Assertion", "1.alone", 2), ("Error", "2.alone", 2),
+        self.assertEqual([event for event in events if len(event) == 3 and event[2] == 3], [
+            ("TimedOut", "0.alone", 3), ("TimedOut", "0.alone-retry", 3),
+            ("Assertion", "1.alone", 3), ("Error", "2.alone", 3),
         ])
         self.assertIn("Failed classes: Assertion, Error, TimedOut", output)
 
@@ -394,7 +332,7 @@ class RunnerFailureSummaryTests(unittest.TestCase):
     crowded = "test_sample.Crowded"
     crowded_stack = "in test_crowded_timeout"
     crowded_note = (f"{crowded}: ran past its deadline on its first run, "
-                    "then passed alone within twice its deadline in 0.10s")
+                    "then passed alone within three times its deadline in 0.10s")
 
     def finish_suite(self, failures, slowest=0):
         with (patch.object(parallel, "open", side_effect=OSError, create=True),

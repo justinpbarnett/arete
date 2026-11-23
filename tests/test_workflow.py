@@ -1,5 +1,6 @@
 import ast
 import errno
+import fcntl
 import http.client
 import json
 import os
@@ -19,8 +20,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
+from itertools import chain, repeat
 from pathlib import Path
 from socket import socketpair
 from tempfile import TemporaryDirectory
@@ -30,16 +32,388 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh, guard, install, jev,
-    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks, paths, pipeline,
-    poll, principals, prompt_loader, queueing, record, runlimits, sandbox, serve, serve_guard, slots, tailnet,
-    tasks, tracker, util, verify, workspace,
+    accounts, api_check, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh,
+    guard, install, jev, journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks,
+    paths, pipeline, poll, principals, prompt_loader, queueing, record, routing, runlimits, runner, sandbox, serve,
+    serve_guard, slots, tailnet, tasks, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
+from tests import parallel
 from tests.parallel import stack_env
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+
+class ParallelDurationHistoryTests(unittest.TestCase):
+    class A(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    class B(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    def setUp(self):
+        self.history = Path(self.enterContext(TemporaryDirectory())) / "durations.json"
+        self.enterContext(mock.patch.object(parallel, "HISTORY", self.history))
+        self.a = self.A().id().rsplit(".", 1)[0]
+        self.b = self.B().id().rsplit(".", 1)[0]
+
+    def run_classes(self, runner, *tests):
+        started = []
+
+        def record_result(item):
+            _, batch = item
+            started.append(batch.identifier)
+            runner.results[batch.identifier] = dict(
+                ran=batch.count, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5,
+            )
+
+        with mock.patch.object(runner, "child", new=record_result), redirect_stdout(StringIO()):
+            self.assertEqual(runner.run(tests), 0)
+        return started
+
+    def test_partial_run_preserves_latest_duration_for_unrun_class(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+        self.history.write_text(json.dumps({self.a: 3.0, self.b: 5.0}))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_overlapping_runs_preserve_both_duration_updates(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(slowest=0))
+        runner.folder = tempfile.mkdtemp(dir=self.history.parent)
+        runner.results[self.b] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5)
+        first_writer = """
+import os
+import sys
+import tempfile
+from pathlib import Path
+from socket import socket
+from types import SimpleNamespace
+from unittest import mock
+
+from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+parallel.HISTORY = Path(sys.argv[1])
+runner = parallel.Runner(SimpleNamespace(slowest=0))
+runner.folder = tempfile.mkdtemp(dir=parallel.HISTORY.parent)
+runner.results[sys.argv[2]] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=3.0)
+replace = os.replace
+
+with socket(fileno=int(sys.argv[3])) as peer:
+    peer.settimeout(CHILD_HANG_TIMEOUT)
+
+    def pause_at_replace(source, target):
+        peer.sendall(b"R")
+        assert peer.recv(1) == b"W"
+        replace(source, target)
+        peer.sendall(b"W")
+        assert peer.recv(1) == b"F"
+
+    with mock.patch.object(os, "replace", side_effect=pause_at_replace):
+        sys.exit(runner.finish(0))
+"""
+        peer, child_peer = socketpair()
+        with peer, child_peer, subprocess.Popen(
+            [sys.executable, "-c", first_writer, str(self.history), self.a, str(child_peer.fileno())],
+            pass_fds=(child_peer.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        ) as first:
+            child_peer.close()
+            peer.settimeout(CHILD_HANG_TIMEOUT)
+            flock = fcntl.flock
+
+            def contend(lock, operation):
+                with self.assertRaises(BlockingIOError):
+                    flock(lock, operation | fcntl.LOCK_NB)
+                peer.sendall(b"W")
+                self.assertEqual(peer.recv(1), b"W")
+                # A fresh open after replacement must still contend with the first writer.
+                with open(lock.name, "a") as reopened, self.assertRaises(BlockingIOError):
+                    flock(reopened, operation | fcntl.LOCK_NB)
+                peer.sendall(b"F")
+                output, _ = first.communicate(timeout=CHILD_HANG_TIMEOUT)
+                self.assertEqual(first.returncode, 0, output)
+                flock(lock, operation | fcntl.LOCK_NB)
+
+            try:
+                self.assertEqual(peer.recv(1), b"R")
+                with mock.patch.object(fcntl, "flock", side_effect=contend), redirect_stdout(StringIO()):
+                    self.assertEqual(runner.finish(0), 0)
+            finally:
+                first.kill()
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_unreadable_history_is_replaced_with_this_runs_durations(self):
+        self.history.write_bytes(b"\xff")
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.b: 2.5})
+
+    def test_full_suite_starts_longest_recorded_class_first(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.assertEqual(self.run_classes(runner, self.A(), self.B()), [self.b, self.a])
+
+
+class ParallelStackEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+
+    def test_stack_env_creates_fresh_directories_outside_live_arete(self):
+        home = Path.home().resolve()
+        live = {"ARETE_STATE_DIR": home / ".local/share/arete",
+                "ARETE_CONFIG_DIR": home / ".config/arete",
+                "ARETE_LOG_DIR": home / "Library/Logs/arete"}
+        inherited = {name: str(self.home / directory.relative_to(home)) for name, directory in live.items()}
+        inherited["HOME"] = str(self.home)
+        first, second = stack_env(inherited), stack_env(inherited)
+
+        self.assertNotEqual(first["ARETE_STATE_DIR"], second["ARETE_STATE_DIR"])
+        for env in (first, second):
+            state, config_dir, log_dir = (Path(env[name]).resolve() for name in live)
+            self.assertIn(state, config_dir.parents)
+            self.assertIn(state, log_dir.parents)
+            for directory in (state, config_dir, log_dir):
+                self.assertTrue(directory.is_dir())
+                self.assertFalse(any(directory.is_relative_to(root) for root in live.values()), directory)
+
+    def test_child_import_resolves_locks_under_stack_state(self):
+        env = stack_env({"HOME": str(self.home)})
+        state = Path(env["ARETE_STATE_DIR"])
+        child = subprocess.run([sys.executable, "-c", "from arete.paths import LOCKS_DIR; print(LOCKS_DIR)"],
+                               env=env, check=True, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(Path(child.stdout.strip()), state / "locks")
+
+    def scratch_child(self, settings):
+        env = stack_env({"HOME": str(self.home), "ARETE_FIXTURE_TOKEN": "synthetic", **settings})
+        probe = """
+import os
+from arete import paths
+
+print(paths.CONFIG_DIR)
+print(paths.LOCKS_DIR)
+print(paths.ISOLATED)
+print("ARETE_FIXTURE_TOKEN" in os.environ)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT,
+        )
+
+    def test_child_scrubs_credentials_for_each_scratch_selector(self):
+        scratch = self.home / (paths.SCRATCH_PREFIX + "0123456789abcdef")
+        scratch.mkdir(mode=0o700)
+        for name, selected in ((paths.SCRATCH_ENV, scratch),
+                               ("ARETE_CONFIG_DIR", scratch / "custom-config"),
+                               ("ARETE_STATE_DIR", scratch / "custom-state")):
+            with self.subTest(selector=name):
+                child = self.scratch_child({name: str(selected)})
+                config_dir = selected if name == "ARETE_CONFIG_DIR" else scratch / "config"
+                state_dir = selected if name == "ARETE_STATE_DIR" else scratch / "state"
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout.splitlines(), [str(config_dir), str(state_dir / "locks"), "True", "False"])
+
+    def test_child_refuses_invalid_scratch_settings(self):
+        invalid = self.home / (paths.SCRATCH_PREFIX + "invalid")
+        invalid.mkdir(mode=0o700)
+        alias = self.home / "alias"
+        alias.symlink_to(invalid, target_is_directory=True)
+        for name, selected in ((paths.SCRATCH_ENV, invalid),
+                               ("ARETE_CONFIG_DIR", invalid / "config"),
+                               ("ARETE_STATE_DIR", invalid / "state"),
+                               ("ARETE_STATE_DIR", alias / "state"),
+                               ("HOME", invalid / "home")):
+            with self.subTest(selector=name, path=selected):
+                child = self.scratch_child({name: str(selected)})
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn("refusing to start", child.stderr)
+
+
+class ParallelClassDeadlineTests(unittest.TestCase):
+    def run_first_attempt(self, load_ratio, *, expected_samples):
+        folder = self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))
+        (Path(folder) / "deadline_worker.py").write_text(
+            "import time\n"
+            "import unittest\n\n"
+            "class Sleeper(unittest.TestCase):\n"
+            "    class_timeout = 1\n\n"
+            "    def test_sleep(self):\n"
+            "        time.sleep(1.5)\n"
+        )
+        batch = parallel.Batch("deadline_worker.Sleeper", 1, timeout=1)
+        runner = parallel.Runner(SimpleNamespace(start=folder, timeout=None, verbose=False))
+        runner.folder = folder
+        runner.lifeline, held = os.pipe()
+        self.addCleanup(os.close, runner.lifeline)
+        self.addCleanup(os.close, held)
+        load = load_ratio * os.cpu_count()
+        popen = subprocess.Popen
+
+        def start(*args, **kwargs):
+            getloadavg.assert_called_once_with()
+            return popen(*args, **kwargs)
+
+        with (mock.patch.object(os, "getloadavg", return_value=(load, 0, 0)) as getloadavg,
+              mock.patch.object(subprocess, "Popen", side_effect=start)):
+            runner.child((0, batch))
+        self.assertEqual(getloadavg.call_args_list, [mock.call()] * expected_samples)
+        return runner.results[batch.identifier]
+
+    def run_class(self, load, *, expected_samples, cpu_count=8, timeout=None, stretch=1):
+        class Sleeper(unittest.TestCase):
+            class_timeout = 1
+
+            def test_sleep(self):
+                time.sleep(1.5)
+
+        runner = parallel.Runner(SimpleNamespace(start="tests", timeout=timeout, verbose=False))
+        runner.folder = "worker-reports"
+        runner.lifeline = 0
+        batch = parallel.Batch("Sleeper", 1, timeout=Sleeper.class_timeout)
+        process = mock.Mock(returncode=0)
+        result = None
+
+        def open_report(path, mode="r"):
+            if mode == "w":
+                return StringIO()
+            if result is not None:
+                return StringIO(result)
+            raise FileNotFoundError(path)
+
+        def wait(deadline=None):
+            nonlocal result
+            if deadline is None:
+                return
+
+            def sleep(seconds):
+                if seconds > deadline:
+                    raise subprocess.TimeoutExpired(batch.identifier, deadline)
+
+            with mock.patch.object(time, "sleep", side_effect=sleep):
+                Sleeper("test_sleep").test_sleep()
+            result = json.dumps(dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[]))
+
+        def start(*args, **kwargs):
+            getloadavg.assert_called_once_with()
+            return process
+
+        process.wait.side_effect = wait
+        load_sample = {"side_effect": load} if isinstance(load, OSError) else {"return_value": (load, 0, 0)}
+        with (mock.patch.object(os, "cpu_count", return_value=cpu_count),
+              mock.patch.object(os, "getloadavg", **load_sample) as getloadavg,
+              mock.patch.object(subprocess, "Popen", side_effect=start),
+              mock.patch.object(parallel, "open", side_effect=open_report, create=True),
+              mock.patch.multiple(runner, kill=mock.DEFAULT, output=mock.Mock(return_value=""),
+                                  request_stacks=mock.Mock(return_value=[]))):
+            runner.child((0, batch), stretch=stretch)
+        self.assertEqual(getloadavg.call_args_list, [mock.call()] * expected_samples)
+        return runner.results[batch.identifier], process.wait.call_args_list[0].args[0]
+
+    def test_double_load_passes_on_first_run(self):
+        report = self.run_first_attempt(2, expected_samples=1)
+        self.assertFalse(parallel.failed(report), report)
+        self.assertEqual(report["ran"], 1)
+
+    def test_half_load_times_out_on_first_run(self):
+        report = self.run_first_attempt(0.5, expected_samples=2)
+        self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
+        self.assertIn("in test_sleep", report["timeout"])
+
+    def test_factor_is_capped_at_four(self):
+        report, deadline = self.run_class(80, expected_samples=1)
+        self.assertEqual(deadline, 4)
+        self.assertFalse(parallel.failed(report))
+
+    def test_unavailable_load_or_cpu_count_uses_unscaled_deadline(self):
+        for load, cpu_count in ((OSError("unavailable"), 8), (16, None)):
+            with self.subTest(load=load, cpu_count=cpu_count):
+                report, deadline = self.run_class(load, expected_samples=2, cpu_count=cpu_count)
+                self.assertEqual(deadline, 1)
+                self.assertIn("class exceeded 1s", report["timeout"].splitlines())
+
+    def test_scaled_timeout_reports_deadline_and_factor_for_stretched_override(self):
+        report, deadline = self.run_class(10.56, expected_samples=2, timeout=0.375, stretch=2)
+        self.assertAlmostEqual(deadline, 0.99)
+        self.assertIn("class exceeded 0.99s (deadline 0.75s x load 1.32)", report["timeout"].splitlines())
+
+
+class ParallelDeadlineExtensionTests(unittest.TestCase):
+    def sleeper(self, seconds):
+        folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (folder / "deadline_extension_worker.py").write_text(
+            "import time\n"
+            "import unittest\n\n"
+            "class Sleeper(unittest.TestCase):\n"
+            "    class_timeout = 1\n\n"
+            "    def test_sleep(self):\n"
+            f"        time.sleep({seconds})\n"
+        )
+        self.enterContext(mock.patch.object(parallel, "HISTORY", folder / "history.json"))
+        runner = parallel.Runner(SimpleNamespace(start=str(folder), timeout=None, verbose=False, jobs=1, slowest=0))
+        # Stack capture can add a second to each timeout and is covered elsewhere.
+        self.enterContext(mock.patch.object(runner, "request_stacks", return_value=[]))
+        return runner, "deadline_extension_worker.Sleeper"
+
+    def test_pool_timeout_passes_alone_with_triple_deadline(self):
+        # At load factor 1, the 2.5s sleep exceeds both the pool's 1s deadline
+        # and the old 2s rerun deadline. Allow 0.5s for worker overhead on the rerun.
+        runner, identifier = self.sleeper(2.5)
+        self.addCleanup(sys.modules.pop, "deadline_extension_worker", None)
+
+        def remove_reports(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+        # The managed sandbox can deny removal of temporary directories.
+        with (mock.patch.object(sys, "path", [runner.args.start, *sys.path]),
+              mock.patch.object(os, "getloadavg", return_value=(os.cpu_count(), 0, 0)),
+              mock.patch.object(parallel, "shutil", SimpleNamespace(rmtree=remove_reports)),
+              redirect_stdout(StringIO()) as output):
+            code = runner.run([], [identifier])
+        self.addCleanup(shutil.rmtree, runner.folder, ignore_errors=True)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("class exceeded 1s", runner.first_failures[identifier]["timeout"].splitlines())
+        self.assertEqual(runner.crowded, [identifier])
+        self.assertIn(f"{identifier}: ran past its deadline on its first run, "
+                      "then passed alone within three times its deadline", output.getvalue())
+        self.assertEqual(runner.results[identifier]["ran"], 1)
+
+    def first_attempt(self, deadline_load_ratio):
+        runner, identifier = self.sleeper(2)
+        runner.folder = runner.args.start
+        runner.lifeline, held = os.pipe()
+        self.addCleanup(os.close, runner.lifeline)
+        self.addCleanup(os.close, held)
+        cpus = os.cpu_count()
+        # Sample factor 1 at startup and the chosen factor at the 1s deadline.
+        # The 2s sleep has room to finish within 3s only when the deadline extends.
+        samples = chain([(cpus, 0, 0)], repeat((deadline_load_ratio * cpus, 0, 0)))
+        with mock.patch.object(os, "getloadavg", side_effect=samples) as getloadavg:
+            runner.child((0, parallel.Batch(identifier, 1, timeout=1)))
+        return runner.results[identifier], getloadavg.call_args_list
+
+    def test_rising_load_extends_first_attempt(self):
+        report, samples = self.first_attempt(3)
+        self.assertFalse(parallel.failed(report), report)
+        self.assertEqual(report["ran"], 1)
+        self.assertEqual(samples, [mock.call(), mock.call()])
+
+    def test_steady_load_times_out_on_first_attempt(self):
+        report, samples = self.first_attempt(1)
+        self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
+        self.assertEqual(samples, [mock.call(), mock.call()])
 
 
 class QueueScoringTests(unittest.TestCase):
@@ -163,6 +537,209 @@ class QueueScoringTests(unittest.TestCase):
 
         self.source.todo()
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
+
+
+class PolicyRetryCapTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.template = cls.state / "template.db"
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template,
+                                                 RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
+                                                 WORKTREES_DIR=cls.state / "worktrees", LOG_DIR=cls.state / "logs"))
+        db.migrate()
+
+    def setUp(self):
+        database = self.state / f"{self._testMethodName}.db"
+        shutil.copyfile(self.template, database)
+        self.enterContext(mock.patch.object(paths, "DB_FILE", database))
+        self.now = util.parse_iso("2026-11-22T16:00:00Z")
+        self.enterContext(mock.patch.object(util, "now", return_value=self.now))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", self.state, github=remote, parts=[config.Part("", remote)])
+        self.local = tracker.LocalTracker(self.repo)
+        self.tid = task_store.task_add(self.repo.name, "Retry policy fixture", reserved_id="t-0845")
+        task_store.task_set_state(self.tid, "failed")
+
+    def add_run(self, hours, *, tid=None, repo=None, status="failed", reason="policy-changed", duration=1):
+        tid = self.tid if tid is None else tid
+        repo = self.repo.name if repo is None else repo
+        run_store.insert_run(f"{repo}-{tid}-{hours}-{status}-{reason}", {
+            "kind": "pipeline", "repo": repo, "issue": tid, "status": status,
+            "started": util.iso(self.now - timedelta(hours=hours + duration)),
+            "finished": util.iso(self.now - timedelta(hours=hours)),
+            "summary": pipeline.worker_policy_changed(),
+            "failure": json.dumps({"class": "environment", "reason": reason}),
+        })
+
+    def pick(self, source):
+        output = StringIO()
+        with redirect_stdout(output):
+            ticket = poll.next_ticket(self.repo, source, pipeline.SkipLog({}))
+        return ticket, output.getvalue()
+
+    def test_local_retries_at_three_recent_policy_failures(self):
+        for hours in (1, 2, 3, 24):
+            self.add_run(hours)
+        self.add_run(4, status="stopped")
+        self.add_run(5, reason="engine-crash")
+        self.add_run(6, tid="t-0001")
+        self.add_run(7, repo="other")
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_local_stays_failed_at_four_recent_policy_failures(self):
+        for hours in (1, 2, 3):
+            self.add_run(hours)
+        self.add_run(4, duration=24)
+
+        with db.reader():
+            ticket, output = self.pick(self.local)
+
+        self.assertIsNone(ticket)
+        self.assertEqual(output.splitlines(), [
+            f"{util.iso(self.now)} {self.repo.name} {self.tid}: kept failed after 3 policy requeues in 24 hours",
+        ])
+
+    def test_local_retries_when_older_policy_failures_age_out(self):
+        for hours in (1, 2, 25, 26):
+            self.add_run(hours)
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_github_admission_still_depends_on_failed_label_and_park(self):
+        source = tracker.for_repo(config.Config(), self.repo)
+        tid = "845"
+        for hours in (1, 2, 3, 4):
+            self.add_run(hours, tid=tid)
+        issue = {"number": int(tid), "title": "GitHub retry fixture", "author": {"login": source.owner},
+                 "labels": [{"name": "agent"}, {"name": source.label_name("failed")}]}
+        self.enterContext(mock.patch.object(gh, "issues", return_value=[issue]))
+
+        self.assertEqual(self.pick(source), (None, ""))
+        with mock.patch.object(runlimits, "latest_park", return_value=({}, {"reason": "parked"})):
+            ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
+        issue["labels"].pop()
+        ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
+
+
+class PrepareResumeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(tempfile.mkdtemp()).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.state, ignore_errors=True)
+        cls.template = cls.state / "template.db"
+        connect = db.connect_db
+
+        def fixture_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if not kwargs.get("readonly"):
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            return conn
+
+        cls.enterClassContext(mock.patch.object(db, "connect_db", fixture_connect))
+        cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
+        with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
+                                  LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
+                                  LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
+            db.migrate()
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=self.state))
+        shutil.copyfile(self.template, self.root / "arete.db")
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.root, DB_FILE=self.root / "arete.db",
+                                             RUNS_DIR=self.root / "runs", LOCKS_DIR=self.root / "locks",
+                                             WORKTREES_DIR=self.root / "worktrees", LOG_DIR=self.root / "logs"))
+        self.repo = config.Repo("fixture", self.root)
+        self.cfg = config.Config(repos=[self.repo])
+        self.tracker = mock.Mock(states=("running", "needs-info"), label_name=lambda status: status, ref=lambda tid: tid)
+        self.tracker.label.return_value = self.tracker.move.return_value = self.tracker.comment.return_value = ""
+        self.enterContext(mock.patch.object(pipeline.alerts, "ask_notice"))
+
+    def controller(self, run_id, previous=""):
+        record.start("pipeline", run_id=run_id, repo=self.repo.name, issue="7")
+        folder = self.root / run_id
+        folder.mkdir()
+        run = pipeline.Run(run_id, self.repo, folder, tracker=self.tracker, tid="7", path="orchestrate", cfg=self.cfg)
+        return orchestration.Controller(flows.start(self.cfg, run, {}, continues=previous))
+
+    def check_ask_resume(self, first_prepare):
+        from arete.store import asks as ask_store
+
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=first_prepare)
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            status, summary, _ = flows.driven(first.flow, lambda _: first.prepare())
+        self.assertEqual(status, "needs-info")
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertNotIn("preparing", saved)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, status, summary=summary)
+        ask, = ask_store.asks_of(first.run.id, "open")
+        answer = "Keep the branch change."
+        self.assertTrue(ask_store.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, answer)))
+
+        resumed = self.controller("resumed", first.run.id)
+
+        def resolve(flow, tree):
+            flow.ctx.run.agent("resolve", "Resolve the merge.", Path(tree), resume=NO_SESSION)
+            return factory.Outcome("stop", data={"ending": "quiet", "status": "noop"})
+
+        prepare.side_effect = resolve
+        with (mock.patch.dict(factory.STEPS, prepare=prepare),
+              mock.patch.object(pipeline.AgentRun, "agent", return_value=Result(ok=True)) as agent):
+            self.assertEqual(resumed.prepare()[0], "noop")
+        prepare.assert_called_with(resumed.flow, tree=str(resumed.job.ws))
+        self.assertEqual(prepare.call_count, 2)
+        agent.assert_called_once()
+        self.assertIn(f"Answer: {answer}", agent.call_args.args[1])
+        self.assertEqual(ask_store.ask_get(ask["id"])["taken_by"], resumed.run.id)
+
+    def test_returned_prepare_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            sent = owner_asks.text_ask("Which change should the merge keep?")
+            return factory.Outcome("ask", data={
+                "ending": "ask", "summary": "Resolve the merge", "session": asdict(NO_SESSION),
+                "asked": [{**sent, "ask_id": "first-a1", "step": "prepare", "call": "resolve"}],
+            })
+
+        self.check_ask_resume(ask)
+
+    def test_resolver_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            flow.ctx.run.owner_ask("resolve", [owner_asks.text_ask("Which change should the merge keep?")], NO_SESSION)
+
+        self.check_ask_resume(ask)
+
+    def test_interrupted_prepare_still_refuses_resume(self):
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=RuntimeError("prepare interrupted"))
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(RuntimeError, "prepare interrupted"):
+                first.prepare()
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertIs(saved["preparing"], True)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, "interrupted")
+        resumed = self.controller("resumed", first.run.id)
+        prepare.reset_mock()
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(factory.Refused, "preparation was interrupted before durable workspace authority"):
+                resumed.prepare()
+        prepare.assert_not_called()
 
 
 class RestoredPRRevisionTests(unittest.TestCase):
@@ -387,7 +964,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
         return c, shas[advance]
 
     def fixture_git(self, cwd, *args, input=None):
-        result = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
+                                timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
@@ -2551,6 +3129,267 @@ class HeadWorkflowHoldRefreshTests(AutomaticCIRerunFixture, unittest.TestCase):
         self.push_fix.assert_not_called()
 
 
+class VerifierMeasurementPublicationTests(PublicationFixture):
+    def test_rendered_prompt_limits_retries_for_an_unmeasurable_requirement(self):
+        rendered = prompt_loader.prompt("orchestrate", api=help_text(), observation="{}")
+
+        self.assertIn(
+            "Have the verifier explicitly list that requirement as unverified in its summary and record the stubbed "
+            "evidence that covers it, then request publication so both appear in the PR body.\n"
+            "When two verifications on the same final tree each report that their environment cannot measure the "
+            "same requirement (such as timing that includes sandbox setup), stop retrying verification for that "
+            "requirement.\n"
+            "Request publication with `unverified_measurement` containing `requirement` and `measurement`. Copy the "
+            "actual measurement and its source from the builder or checks even if the verifier reports only the "
+            "limitation. The PR body will label the requirement as unverified and show the measurement.\n"
+            "Never apply this exception to a requirement any verifier observed fail.\n",
+            rendered,
+        )
+
+    def test_publication_includes_the_measurement_recorded_only_by_the_builder(self):
+        controller, checkout = self.controller, self.checkout
+        self.file.write_text("implementation\n")
+        self.enterContext(mock.patch.object(factory, "fingerprint",
+                                            side_effect=lambda folder: (folder / "file.txt").read_text()))
+        self.build.layer.verify = config.Verify(publish_evidence=False)
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", checkout.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("unverified"), stamp=False)
+        requirement = "Each changed TestCase class finishes alone in under 5 seconds."
+        job.build_summary = "Builder timed the changed class alone outside the verification sandbox at 4.683 s."
+        changes = "The controller stops retrying when two verifier environments cannot measure a requirement."
+        job.review = Review.stored({"verdict": "approve", "changes": changes})
+        controller.stamp("checks", {"full": True})
+        controller.stamp("review", job.review.asdict())
+        controller.run.path = "orchestrate"
+        controller.catalog.route.return_value = SimpleNamespace(step="verify")
+        limitation = "The verifier could not time the class alone because sandbox migrations were included."
+        verified = verify.Verified("pass", limitation, checks=[
+            {"what": "Rendered controller rule", "how": "Read the rendered prompt", "saw": "Rule present", "passed": True},
+        ], unmeasured_requirements=[requirement])
+        pr = "https://github.com/fixture/repo/pull/7"
+        with (mock.patch.object(pipeline, "check_in_use", return_value=verified) as check,
+              mock.patch.object(pipeline, "commit_and_push"),
+              mock.patch.object(pipeline, "release_workspace"),
+              mock.patch.object(pipeline, "supersede_older_runs"),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.record, "metered_spent", return_value=0),
+              mock.patch.object(ci, "watch", side_effect=lambda target, log: ci.Watched(target, {})),
+              mock.patch.object(gh, "open_pr_url", return_value=""),
+              mock.patch.object(gh, "pr_create", return_value=pr) as create,
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: create.call_args.args[4]),
+              mock.patch.object(gh, "pr_edit_body") as edit):
+            for attempt in (1, 2):
+                verification = {"id": f"d000{attempt}-0", "op": "verification.run", "state": "accepted",
+                                "request": {"route_id": "fixture", "effort": "", "goal_refs": []}}
+                self.assertIsNone(controller.dispatch(verification))
+                self.assertEqual(controller.data["evidence"]["verify"]["tree"],
+                                 controller.data["evidence"]["checks"]["tree"])
+            decision = {"version": 1, "decision_id": "d0003", "state_version": 3, "rationale": limitation,
+                        "calls": [{"op": "publication.request", "args": {"unverified_measurement": {
+                            "requirement": requirement, "measurement": job.build_summary}}}]}
+            call, = orchestration.Catalog.validate(controller.catalog, decision, "d0003", 3, {})["calls"]
+            publication = {**self.action, "id": "d0003-0", "request": call["args"]}
+            self.assertIsNone(controller.dispatch(publication))
+
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual((controller.ending[0], controller.ending[2]), ("pr", pr))
+        create.assert_called_once()
+        edit.assert_called_once()
+        for body in (create.call_args.args[4], edit.call_args.args[1]):
+            self.assertIn(f"## Summary\n\n{changes}", body)
+            self.assertIn(limitation, body)
+            self.assertIn(pipeline.unverified_measurement_section(
+                {"requirement": requirement, "measurement": job.build_summary}), body)
+
+
+class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCase):
+    disclosure = {"requirement": "The class finishes alone in under 5 seconds.",
+                  "measurement": "The builder measured 4.683 s."}
+
+    def setUp(self):
+        super().setUp()
+        self.link = "Closes #7"
+        self.run.tracker.pr_link.return_value = self.link
+        self.pr_text = gh.outgoing("## Summary\n\nFixture PR", self.link)
+        gh.pr_body.side_effect = lambda _: self.pr_text
+        self.body.side_effect = self.save_body
+
+    def save_body(self, pr, body, *, link):
+        self.assertEqual(pr, self.checkout.pr)
+        self.pr_text = gh.outgoing(body, link)
+
+    def test_standing_pr_preserves_unmarked_and_fenced_disclosures(self):
+        checkout = self.checkout
+        section = pipeline.unverified_measurement_section(self.disclosure)
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        example = f"   ~~~~markdown\n{section}~~~\n   ~~~~"
+        self.pr_text += f"\n\n{example}\n\n{lookalike}"
+        self.pr_text = ci.with_section(self.pr_text, ci.section([], 0, "Checks passed."))
+        original = self.pr_text
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link)
+        self.body.assert_not_called()
+        self.assertEqual(self.pr_text, original)
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link,
+                                measurement_section=section)
+        self.assertEqual(self.pr_text, f"{original}\n\n{section}")
+
+    def test_refreshing_a_standing_pr_measurement_preserves_maintainer_notes_and_ci_stop(self):
+        checkout = self.checkout
+        earlier_disclosure = {**self.disclosure, "measurement": "The builder measured 4.900 s."}
+        old = pipeline.unverified_measurement_section(earlier_disclosure)
+        summary = self.pr_text
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
+        self.pr_text = ci.with_section(f"{summary}\n\n{old}{notes}", ci_stop)
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+
+        stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "",
+                                          self.link, measurement_section=measurement)
+
+        self.assertEqual(stopped, [checkout])
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_stop}")
+        ci_pass = ci.section([], 0, "Checks passed.")
+        pipeline.publish_ci(self.run, self.build.ticket, [checkout], ci_pass)
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_pass}")
+
+    def test_refresh_after_repair_removes_the_disclosure_when_the_requirement_is_verified(self):
+        checkout = self.checkout
+        summary = self.pr_text
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        notes = "### Rollout notes\n\n- Keep the existing rollout order.\n\n## Maintainer checklist\n\n- [ ] Roll out"
+        ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
+        self.pr_text = ci.with_section(f"{summary}\n\n{measurement}{notes}", ci_stop)
+        report = "## Checked in use\n\nThe verifier measured the class alone at 4.2 s on the repaired revision."
+
+        stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [checkout],
+                                          report, "", self.link)
+
+        self.assertEqual(stopped, [checkout])
+        self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
+        self.comment.assert_called_once_with(checkout.pr, f"Pushed more work for #7.\n\n{report}")
+
+    def test_same_head_ci_retry_updates_the_disclosure_before_finishing_publication(self):
+        self.verdicts = {}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        measurement = pipeline.unverified_measurement_section(self.disclosure).rstrip()
+        earlier = pipeline.unverified_measurement_section({**self.disclosure, "measurement": "Builder measured 4.900 s."})
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        self.pr_text += f"\n\n{earlier}{notes}"
+
+        def reruns(*_):
+            self.assertEqual(ci.SECTION.search(self.pr_text).group().strip(), failed_ci)
+            self.assertIn(notes, self.pr_text)
+            self.assertIn(measurement, self.pr_text)
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
+
+        def finish():
+            self.assertTrue(self.pr_text.startswith(f"{self.link}\n\n## Summary"))
+            self.assertIn(measurement, self.pr_text)
+            self.assertIn(notes, self.pr_text)
+            self.assertEqual(self.pr_text.count(ci.SECTION_START), 1)
+            self.assertEqual(self.pr_text.count(ci.SECTION_END), 1)
+            return {"ending": "done"}
+
+        controller.finish_publication.side_effect = finish
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
+            self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
+            self.assertNotIn(measurement, self.pr_text)
+            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
+                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
+                    controller.publish(self.disclosure)
+            self.assertTrue(controller.data["ci_failed"])
+            gh.gh.assert_not_called()
+            controller.finish_publication.assert_not_called()
+            self.assertEqual(controller.publish(self.disclosure), {"ending": "done"})
+
+        gh.gh.assert_called_once()
+        controller.finish_publication.assert_called_once()
+
+    def test_same_head_ci_retry_removes_only_the_disclosure_for_the_measured_requirement(self):
+        self.verdicts = {}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        example = f"```markdown\n{measurement}```"
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        original = f"{self.pr_text}\n\n{example}\n\n{notes}"
+        published = f"{self.pr_text}\n\n{example}\n\n{measurement}{notes}"
+        self.pr_text = published
+
+        def reruns(*_):
+            self.assertEqual(self.pr_text, ci.with_section(original, failed_ci))
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
+
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
+            self.assertEqual(controller.publish(self.disclosure)["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
+            controller.job.verified = verify.Verified.from_agent({
+                "verdict": "pass", "summary": "The class finished alone at 4.2 s.", "checks": [
+                    {"what": self.disclosure["requirement"], "how": "Run the class alone", "saw": "4.2 s", "passed": True},
+                ],
+            })
+            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
+                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
+                    controller.publish()
+            self.assertTrue(controller.data["ci_failed"])
+            self.assertEqual(self.pr_text, ci.with_section(published, failed_ci))
+            gh.gh.assert_not_called()
+            controller.finish_publication.assert_not_called()
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertTrue(self.pr_text.startswith(original))
+        self.assertEqual(self.pr_text.count(pipeline.MEASUREMENT_START), 1)
+        gh.gh.assert_called_once()
+        controller.finish_publication.assert_called_once()
+
+
+class MeasurementCIRetryFallbackTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.verdicts = {"checks": True}
+        self.publication = self.controller()
+        self.publication.job.opened = self.publication.job.found = self.publication.job.ci_stopped = []
+        self.enterContext(mock.patch.object(pipeline, "set_draft"))
+        self.assertEqual(self.publication.publish()["failures"], orchestration.CI_FAILURES)
+        self.failed = [self.job("checks", 201, "success")]
+        self.body.reset_mock()
+        gh.pr_body.reset_mock()
+
+    def assert_ci_refreshed(self, disclosure=None):
+        self.assertEqual(self.publication.publish(disclosure), {"ending": "done"})
+        self.assertEqual(self.checkout.lease, "original-head")
+        self.assertNotIn("ci_failed", self.publication.data)
+        self.publication.atomic.assert_called_once()
+        self.publication.finish_publication.assert_called_once()
+        gh.gh.assert_not_called()
+        gh.pr_body.assert_called_with(self.checkout.pr)
+
+    def test_body_read_failure_with_a_measured_requirement_still_refreshes_ci(self):
+        self.publication.job.verified = verify.Verified("pass", checks=[
+            {"what": "The class finishes alone in under 5 seconds.", "passed": True},
+        ])
+        gh.pr_body.side_effect = gh.GhError("body unavailable")
+
+        self.assert_ci_refreshed()
+
+        self.body.assert_not_called()
+
+    def test_body_without_a_disclosure_only_refreshes_ci(self):
+        self.assert_ci_refreshed({"requirement": "The class finishes alone in under 5 seconds.",
+                                  "measurement": "The builder measured 4.683 s."})
+
+        self.body.assert_called_once()
+        body = self.body.call_args.args[1]
+        self.assertIn("GitHub now reports passing checks on the published head.", body)
+        self.assertNotIn(pipeline.UNVERIFIED_REQUIREMENT_HEADING, body)
+
+
 class LiveOutsideEventPublicationTests(PublicationFixture):
     def test_rendered_prompt_requests_publication_for_one_live_outside_event(self):
         rendered = prompt_loader.prompt("orchestrate", api=help_text(), observation="{}")
@@ -3302,7 +4141,8 @@ class ResolverScratchFixture(unittest.TestCase):
     @classmethod
     def create_merge(cls, root, tracked_changed_by="", tracked_added_by_base=False):
         def git(*args, check=True):
-            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True,
+                           timeout=CHILD_HANG_TIMEOUT)
 
         git("init", "-q", "-b", "main", "--template=")
         git("config", "user.name", "Fixture")
@@ -3954,7 +4794,7 @@ class CatchUpCleanupTests(unittest.TestCase):
         cls.empty_repo = Path(tempfile.mkdtemp()).resolve()
         cls.addClassCleanup(shutil.rmtree, cls.empty_repo, ignore_errors=True)
         subprocess.run(["git", "init", "-q", "--template=", "-b", "fixture"],
-                       cwd=cls.empty_repo, check=True, capture_output=True)
+                       cwd=cls.empty_repo, check=True, capture_output=True, timeout=CHILD_HANG_TIMEOUT)
 
     def setUp(self):
         root = Path(tempfile.mkdtemp()).resolve()
@@ -3992,7 +4832,8 @@ class CatchUpCleanupTests(unittest.TestCase):
         return [self.checkout]
 
     def repo_git(self, *args, cwd=None):
-        return subprocess.run(["git", *args], cwd=cwd or self.wt, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *args], cwd=cwd or self.wt, check=True, capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT).stdout
 
     def init_repo(self, cwd=None):
         shutil.copytree(self.empty_repo / ".git", (cwd or self.wt) / ".git", dirs_exist_ok=True)
@@ -5412,7 +6253,8 @@ os.kill(os.getpid(), signal.SIGKILL)
 """
         env = {**os.environ, "ARETE_STATE_DIR": str(self.state), "ARETE_LOG_DIR": str(self.state / "logs"),
                "ARETE_WORKTREES_DIR": str(self.state / "worktrees")}
-        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=2, env=env)
+        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT, env=env)
         self.assertEqual((done.returncode, done.stdout.strip()), (-signal.SIGKILL, "True"), done.stderr)
         self.assertFalse(util.lock_is_held("automerge-fixture%2Frepo"))
         run = SimpleNamespace(repo=SimpleNamespace(name="repo"), tid="2")
@@ -5482,6 +6324,68 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                     self.assertEqual(controller.ending[0], "pr")
                     self.assertIn(error.why, report.call_args.args[2])
                     park.assert_not_called()
+
+
+class ParkedTicketCommentTests(unittest.TestCase):
+    def setUp(self):
+        folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.tracker = mock.Mock(comment=mock.Mock(return_value=""), states=("failed",),
+                                 label=mock.Mock(return_value=""), move=mock.Mock(return_value=""),
+                                 ref=mock.Mock(return_value="#842"))
+        budget = mock.Mock()
+        budget.park.return_value = {"pr_url": ""}
+        self.run = pipeline.Run("parked-run", config.Repo("fixture", folder), folder,
+                                tracker=self.tracker, tid="842", budget=budget)
+        self.enterContext(mock.patch.object(record, "note"))
+        self.reason = "the repair chain used its 3 repair cycles"
+        self.retry = ("Change this ticket's title or body to retry; the next poll starts it again on the kept branch. "
+                      "Run `parked-run`.")
+
+    def save_review(self, name, *problems):
+        (self.run.dir / name).write_text(json.dumps({"structured": {"problems": problems}}))
+
+    def assert_comment(self, *review_lines):
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_called_once()
+        ticket, body = self.tracker.comment.call_args.args
+        self.assertEqual(ticket, "842")
+        self.assertEqual([line for line in body.splitlines() if line], [
+            f"{tracker.ARETE_TAG} Parked: {self.reason}.", *review_lines, self.retry,
+        ])
+
+    def test_comments_with_blocking_files_in_numeric_round_order(self):
+        self.run.feedback = [{"pr_url": "https://github.com/fixture/repo/pull/7"}]
+        self.enterContext(mock.patch.object(self.run, "say_on_prs"))
+        self.save_review("review10.json", {"file": "", "severity": "major"})
+        self.save_review("review2.json", {"file": "arete/z.py", "severity": "major", "problem": "PROBE-THREE"})
+        self.save_review("review.json",
+                         {"file": "arete/x.py:12", "severity": "blocker", "problem": "PROBE-ONE", "category": "issue"},
+                         {"file": "tests/y.py", "severity": "minor", "problem": "PROBE-TWO"})
+        (self.run.dir / "review-other.json").write_text("invalid JSON")
+        self.assert_comment("- Review 1 held on `arete/x.py:12` (blocker)",
+                            "- Review 2 held on `arete/z.py` (major)",
+                            "- Review 10 held on (no file) (major)")
+
+    def test_comments_without_review_files_in_this_run(self):
+        earlier = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (earlier / "review.json").write_text(json.dumps({"structured": {"problems": [
+            {"file": "old.py", "severity": "blocker"},
+        ]}}))
+        self.assert_comment()
+
+    def test_comments_without_review_lines_when_one_review_is_invalid(self):
+        for invalid_round in ("review.json", "review2.json"):
+            with self.subTest(invalid_round=invalid_round):
+                for name in ("review.json", "review2.json"):
+                    self.save_review(name, {"file": "arete/x.py", "severity": "blocker"})
+                (self.run.dir / invalid_round).write_text("invalid JSON")
+                self.assert_comment()
+                self.tracker.comment.reset_mock()
+
+    def test_dry_run_does_not_comment(self):
+        self.run.dry_run = True
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_not_called()
 
 
 class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
@@ -6133,6 +7037,104 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.push.assert_not_called()
 
 
+class MeasurementCatchUpPublicationTests(MovedBasePublicationFixture, unittest.TestCase):
+    def test_fresh_verification_on_moved_base_replaces_the_old_disclosure(self):
+        self.publish_with_catch_up("measured")
+
+    def test_fresh_verification_on_moved_base_preserves_a_still_unmeasured_requirement(self):
+        self.publish_with_catch_up("unmeasured")
+
+    def test_observed_failure_on_moved_base_holds_publication(self):
+        self.publish_with_catch_up("failed")
+
+    def publish_with_catch_up(self, result):
+        controller, checkout = self.controller()
+        job, run = controller.job, controller.run
+        run.budget = None
+        job.ticket = tracker.Ticket("7", "#7", "Fixture")
+        run.tracker.pr_link.return_value = "Closes #7"
+        controller.data["acceptance"] = "fixture"
+        controller.policy_sha = mock.Mock(return_value="policy")
+        disclosure = {"requirement": "The class finishes alone in under 5 seconds.",
+                      "measurement": "The builder measured 4.683 s on the original tree."}
+        failed = result == "failed"
+        unmeasured = result == "unmeasured"
+        if unmeasured:
+            summary = "The sandbox timing still includes migrations, so it cannot measure the class alone."
+            check = {"what": "Rendered controller rule", "how": "Load the prompt", "saw": "Rule present", "passed": True}
+        else:
+            timing = "5.4 s" if failed else "4.2 s"
+            summary = f"The verifier measured the class alone at {timing} on the new base."
+            check = {"what": disclosure["requirement"], "how": "Run the class alone", "saw": timing, "passed": not failed}
+        fresh = verify.Verified.from_agent({"verdict": "fail" if failed else "pass", "summary": summary, "checks": [check],
+                                            "unmeasured_requirements": [disclosure["requirement"]] if unmeasured else []})
+        review = Review("approve", "Reviewed on the new base.")
+        ci_text = ci.section([], 0, "Checks passed.")
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        body = ""
+
+        def edit(pr, text, *, link):
+            nonlocal body
+            self.assertEqual(pr, checkout.pr)
+            body = gh.outgoing(text, link)
+
+        def atomic(name, **kwargs):
+            if name == "publish":
+                return flows.publish(controller.flow, **kwargs)
+            section = kwargs["measurement_section"]
+            initial = "## Checked in use\n\nVerifier environment could not measure the class."
+            example = f"```markdown\n{section}```"
+            edit(checkout.pr, f"{initial}\n\n{section}{notes}\n\n{lookalike}\n\n"
+                 f"## Review\n\nEarlier review.\n\n{example}\n\n{ci_text}", link="Closes #7")
+            return factory.Outcome("pass", data={"heads": {checkout.github: checkout.lease}})
+
+        def catch_up(*_, before_push):
+            self.assertIn(disclosure["measurement"], body)
+            if failed:
+                raise pipeline.CatchUpGateHold("verify", "standalone timing failed", "candidate", "", verified=fresh,
+                                               review=review)
+            before_push("caught-up", fresh, review)
+            checkout.note_pushed_head("caught-up")
+            controller.fingerprint.return_value = "new-tree"
+            return fresh, review
+
+        controller.atomic.side_effect = atomic
+        with (mock.patch.object(controller, "publication_ci", return_value=None) as watch,
+              mock.patch.object(pipeline.slots, "take_merge_lease"),
+              mock.patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+              mock.patch.object(pipeline, "own_draft_state", return_value=False),
+              mock.patch.object(pipeline, "note_review"),
+              mock.patch.multiple(pipeline.run_store, save_pr_gate_refresh=mock.Mock(return_value=False),
+                                  clear_pr_gate_refresh=mock.DEFAULT),
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: body),
+              mock.patch.object(gh, "pr_edit_body", side_effect=edit),
+              mock.patch.object(flows, "ended")):
+            publication = controller.publish(disclosure)
+
+        checked = fresh.markdown()
+        if failed:
+            self.assertEqual(publication["failures"], orchestration.CATCH_UP_FAILURE)
+            merge.assert_called_once()
+            watch.assert_called_once_with([checkout])
+            self.assertEqual(checkout.lease, "head")
+            checked = ("Catch-up to `main` at `new-base` held on verify: standalone timing failed. "
+                       f"Checked candidate `candidate` and kept it in the worktree for repair.\n\n{checked}")
+        else:
+            self.assertEqual(publication["ending"], "pr")
+            self.assertEqual(merge.call_count, 2)
+            self.assertEqual(merge.call_args.args[2:4], (fresh, review))
+            self.assertEqual(watch.call_args_list, [mock.call([checkout]), mock.call([checkout], caught_up=True)])
+            self.assertEqual(controller.data["evidence"]["verify"]["tree"], "new-tree")
+        section = pipeline.unverified_measurement_section(disclosure)
+        example = f"```markdown\n{section}```"
+        retained = section if unmeasured else ""
+        self.assertEqual(body, f"Closes #7\n\n## Checked in use\n\n{checked}\n\n{retained}{notes}\n\n"
+                         f"{lookalike}\n\n{review.markdown().rstrip()}\n\n{example}\n\n{ci_text}")
+
+
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_conflict_after_a_rerun_passes_reaches_catch_up(self):
         controller, checkout = self.controller()
@@ -6488,7 +7490,8 @@ class ServeDeploymentFixture(unittest.TestCase):
 
     def git(self, cwd, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                        "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True, timeout=5).strip()
+                                       "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True,
+                                       timeout=CHILD_HANG_TIMEOUT).strip()
 
     def commit(self, cwd, subject):
         self.git(cwd, "add", ".")
@@ -6666,13 +7669,13 @@ class ServeDeploymentRefusalTests(ServeDeploymentFixture):
 
 
 class SelfDeployRollbackTests(unittest.TestCase):
-    class_timeout = 5
+    class_timeout = CHILD_HANG_TIMEOUT + 30
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                                       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
                                        cwd=self.checkout,
-                                       text=True, timeout=2).strip()
+                                       text=True, timeout=CHILD_HANG_TIMEOUT).strip()
 
     def prepare_state(self):
         root = Path(tempfile.mkdtemp()).resolve()
@@ -6723,7 +7726,8 @@ class SelfDeployRollbackTests(unittest.TestCase):
     def start(self):
         plist = install.serve_plist()
         return subprocess.run(plist["ProgramArguments"], cwd=plist["WorkingDirectory"],
-                              env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+                              env=plist["EnvironmentVariables"], capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT)
 
     def test_import_rejection_counts_as_a_failed_start(self):
         self.prepare_state()
@@ -6815,7 +7819,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.write_receipt(starts=3, started_at=time.time())
         restored = subprocess.run([sys.executable, "-I", "-S", str(wrapper), "serve"],
                                   cwd=self.checkout, env=install.serve_plist()["EnvironmentVariables"],
-                                  capture_output=True, text=True, timeout=2)
+                                  capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertIn("last good started", restored.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
@@ -7051,6 +8055,44 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.assertEqual(self.receipt()["rollback"], "code_only")
         self.assertEqual(list((self.state / serve_guard.HOLDS).iterdir()),
                          [serve_guard.hold_path(self.state, self.tip)])
+        with (mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:9]),
+              self.assertRaisesRegex(db.migrations.Refused, r"m0010_foundation_remote_turns_contract\.py")):
+            db.migrate(contracts=False)
+
+    def test_older_chain_migrates_and_writes_after_expand(self):
+        self.prepare_state()
+        older, newer = db._CHAIN[:4], db._CHAIN[:5]
+        with mock.patch.object(db.migrations, "load", return_value=newer), redirect_stdout(StringIO()):
+            self.assertFalse(db.migrate())
+        contents = paths.DB_FILE.read_bytes()
+        needed = max(m.n for m in older if m.phase != "contract")
+
+        with (mock.patch.object(db.migrations, "load", return_value=older),
+              mock.patch.multiple(db, LATEST=older[-1].n, NEEDED=needed, _CHECKED=set())):
+            self.assertFalse(db.migrate(contracts=False))
+            self.assertEqual(paths.DB_FILE.read_bytes(), contents)
+            with closing(db.checked_connection(timeout=0)) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], newer[-1].n)
+                with conn:
+                    conn.execute("INSERT INTO schema_meta VALUES ('rollback_fixture', 'written by older code')")
+            with closing(db.checked_connection(timeout=0)) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key = 'rollback_fixture'").fetchone(),
+                                 ("written by older code",))
+
+        for column in ("name", "sha256"):
+            with self.subTest(column=column), closing(db.connect_db(paths.DB_FILE)) as conn:
+                conn.execute(f"UPDATE schema_migrations SET {column} = 'changed' WHERE n = 1")
+                with self.assertRaisesRegex(db.migrations.Refused, r"m0001_foundation_ledger\.py.*sha256 differs"):
+                    db.migrations.validate(conn, older, newer[-1].n)
+
+    def test_older_chain_refuses_newer_backfill_by_name(self):
+        self.prepare_state()
+        with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:6]), redirect_stdout(StringIO()):
+            self.assertFalse(db.migrate())
+        for end in (4, 5):
+            with (self.subTest(end=end), mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:end]),
+                  self.assertRaisesRegex(db.migrations.Refused, r"m0006_runs_budget_backfill\.py")):
+                db.migrate(contracts=False)
 
     def test_dashboard_readiness_preserves_normal_access_checks(self):
         self.prepare_state()
@@ -7339,8 +8381,9 @@ signal.pause()
                 self.assertTrue(ready.exists())
                 self.assertEqual(lock.read_bytes(), b"partial index")
                 self.assertEqual((package / "fixture.py").read_text(), "version = ")
-                timeout = 0
-            return communicate(proc, input=input, timeout=timeout)
+                return communicate(proc, input=input, timeout=0)
+            timeout = CHILD_HANG_TIMEOUT if timeout is None else timeout
+            return communicate(proc, input=input, timeout=max(CHILD_HANG_TIMEOUT, timeout))
 
         with (mock.patch.object(sandbox, "protected_command", substitute_merge),
               mock.patch.object(subprocess.Popen, "communicate", expire_after_writes)):
@@ -7386,7 +8429,8 @@ signal.pause()
                                                                              str(ready)]))
         self.git(self.checkout, "config", "filter.delay.required", "true")
         self.git(self.checkout, "config", "checkout.workers", "1")
-        communicate, wait = subprocess.Popen.communicate, subprocess.Popen.wait
+        communicate = subprocess.Popen.communicate
+        wait = subprocess.Popen.wait
         interrupted = False
         cleanup_waits = []
 
@@ -7400,8 +8444,9 @@ signal.pause()
                 self.assertTrue(lock.exists())
                 self.assertTrue((self.checkout / "arete" / "fresh.py").is_file())
                 interrupted = True
-                timeout = 0
-            return communicate(proc, input=input, timeout=timeout)
+                return communicate(proc, input=input, timeout=0)
+            timeout = CHILD_HANG_TIMEOUT if timeout is None else timeout
+            return communicate(proc, input=input, timeout=max(CHILD_HANG_TIMEOUT, timeout))
 
         def observe_cleanup(proc, timeout=None):
             if interrupted and "--ff-only" in proc.args:
@@ -7513,6 +8558,185 @@ class CommandConfinementTests(unittest.TestCase):
             self.assertEqual(command[command.index("-p") + 1], recovery_profile)
 
 
+class CodexReadOnlyTempTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.worktree = self.root / "worktree"
+        self.added = self.root / "added"
+        self.authority = self.root / "authority"
+        self.parent_tmp = self.root / "parent-tmp"
+        for folder in (self.worktree, self.added, self.authority, self.parent_tmp):
+            folder.mkdir()
+        self.report = self.root / "report.json"
+        fake = self.root / "codex"
+        script = self.root / "fake.py"
+        script.write_text(f"""\
+import json, os, sys
+from pathlib import Path
+
+env = {{name: os.environ.get(name) for name in ('TMPDIR', 'TMP', 'TEMP')}}
+folder = Path(env['TMPDIR'])
+contents = sorted(p.name for p in folder.iterdir()) if folder.is_dir() else None
+if folder.name.startswith('arete-codex-tmp-'):
+    (folder / 'created-by-fake').touch()
+Path({str(self.report)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'env': env, 'contents': contents}}))
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'fixture'}}))
+sys.exit(int(sys.stdin.read()))
+""")
+        fake.write_text(f'#!/bin/sh\nexec {shlex.join([sys.executable, str(script)])} "$@"\n')
+        fake.chmod(0o700)
+        self.enterContext(mock.patch.object(codex, "binary", return_value=str(fake)))
+        self.enterContext(mock.patch.object(codex, "home", return_value=self.root / "codex-home"))
+        self.enterContext(mock.patch.object(sandbox, "authority_roots", return_value=(self.authority,)))
+        self.enterContext(mock.patch.object(tempfile, "gettempdir", return_value=str(self.parent_tmp)))
+        self.enterContext(mock.patch.dict(os.environ, TMPDIR=str(self.parent_tmp)))
+
+    def run_codex(self, status=0, tools=None):
+        return codex.run(str(status), self.worktree, tools=tools or ["Read", "Glob", "Grep"],
+                         add_dirs=[self.added], auth=accounts.Auth(), timeout=3)
+
+    def settings(self, argv):
+        return tomllib.loads("\n".join(value for flag, value in zip(argv, argv[1:]) if flag == "-c"))
+
+    def grants(self, settings, profile):
+        self.assertEqual(settings["default_permissions"], profile)
+        return {path for path, mode in settings["permissions"][profile]["filesystem"].items() if mode == "write"}
+
+    def test_read_only_call_gets_a_fresh_directory_and_cleans_it_up_after_either_exit(self):
+        alias = self.root / "tmp-alias"
+        alias.symlink_to(self.parent_tmp, target_is_directory=True)
+        seen = set()
+        for status in (0, 1):
+            with (self.subTest(status=status),
+                  mock.patch.object(tempfile, "gettempdir", return_value=str(alias))):
+                result = self.run_codex(status)
+                self.assertEqual(result.ok, status == 0, result.error)
+                if status:
+                    self.assertEqual(result.error, "exit 1")
+                report = json.loads(self.report.read_text())
+                folder = Path(report["env"]["TMPDIR"])
+                self.assertEqual(folder.parent.resolve(), self.parent_tmp.resolve())
+                self.assertTrue(folder.name.startswith("arete-codex-tmp-"))
+                self.assertNotIn(folder, seen)
+                seen.add(folder)
+                self.assertEqual(report["contents"], [])
+                self.assertEqual(report["env"], dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(folder)))
+                settings = self.settings(report["argv"])
+                self.assertEqual(self.grants(settings, "read_only"), {str(folder.absolute()), str(folder.resolve())})
+                self.assertTrue({"TMPDIR", "TMP", "TEMP"} <= set(settings["shell_environment_policy"]["include_only"]))
+                self.assertFalse(folder.exists())
+
+    def test_writing_call_uses_the_parent_temp_directory(self):
+        result = self.run_codex(tools=["Read", "Edit"])
+        self.assertTrue(result.ok, result.error)
+        report = json.loads(self.report.read_text())
+        expected = {str(p) for root in (self.worktree, self.added) for p in (root.absolute(), root.resolve())}
+        self.assertEqual(self.grants(self.settings(report["argv"]), "workspace_write"), expected)
+        self.assertEqual(report["env"]["TMPDIR"], str(self.parent_tmp))
+        self.assertEqual(report["contents"], [])
+
+    def assert_temp_dir_rejected(self, parent):
+        with (mock.patch.object(tempfile, "gettempdir", return_value=str(parent)),
+              mock.patch.object(tempfile, "mkdtemp", wraps=tempfile.mkdtemp) as mkdtemp,
+              mock.patch.dict(os.environ, TMPDIR=str(parent))):
+            base = codex.command(self.worktree, tools=["Read", "Glob", "Grep"], add_dirs=[self.added])
+            env = codex.agent_env()
+            result = self.run_codex()
+        self.assertTrue(result.ok, result.error)
+        mkdtemp.assert_called_once_with(prefix="arete-codex-tmp-")
+        report = json.loads(self.report.read_text())
+        settings = self.settings(report["argv"])
+        self.assertEqual(self.grants(settings, "read_only"), set())
+        self.assertEqual(settings, self.settings(base))
+        self.assertEqual(report["env"], {name: env.get(name) for name in ("TMPDIR", "TMP", "TEMP")})
+        self.assertEqual(report["contents"], [])
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_read_only_call_rejects_temp_directories_under_protected_roots(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.authority, target_is_directory=True)
+        for root in (self.worktree, self.added, alias):
+            with self.subTest(root=root):
+                parent = root / "tmp"
+                parent.mkdir()
+                self.assert_temp_dir_rejected(parent)
+
+    def test_read_only_call_checks_filesystem_identity_of_different_case_roots(self):
+        for root in (self.worktree, self.added, self.authority):
+            with self.subTest(root=root):
+                alternate = root.with_name(root.name.upper())
+                parent = alternate / "nested" / "tmp"
+                parent.mkdir(parents=True)
+                if alternate.samefile(root):
+                    self.assert_temp_dir_rejected(parent)
+                    continue
+                with mock.patch.object(tempfile, "gettempdir", return_value=str(parent)):
+                    result = self.run_codex()
+                self.assertTrue(result.ok, result.error)
+                report = json.loads(self.report.read_text())
+                folder = Path(report["env"]["TMPDIR"])
+                self.assertEqual(folder.parent, parent)
+                self.assertEqual(self.grants(self.settings(report["argv"]), "read_only"), set(codex.both(folder)))
+                self.assertFalse(folder.exists())
+
+                stat_path = Path.stat
+                alias_paths = {alternate, alternate.resolve()}
+
+                def alias_stat(path, **kwargs):
+                    return stat_path(root if path in alias_paths else path, **kwargs)
+
+                with mock.patch.object(Path, "stat", alias_stat):
+                    self.assert_temp_dir_rejected(parent)
+
+    def test_read_only_call_rejects_the_data_volume_spelling_of_the_worktree(self):
+        worktree = self.worktree.resolve()
+        alternate = Path("/System/Volumes/Data") / worktree.relative_to(worktree.anchor)
+        if not alternate.is_dir() or not alternate.samefile(worktree):
+            self.skipTest("worktree has no macOS Data-volume alias")
+        parent = alternate / "nested" / "tmp"
+        parent.mkdir(parents=True)
+        self.assert_temp_dir_rejected(parent)
+
+    def test_trusted_scratch_uses_the_parent_temp_directory(self):
+        producer = codex.verification_scratch.PRODUCING
+        token = producer.set(mock.sentinel.attempt)
+        try:
+            with mock.patch.object(codex, "launch", return_value=subprocess.CompletedProcess(
+                    [], 0, '{"type":"thread.started","thread_id":"fixture"}', "")) as launch:
+                result = self.run_codex()
+        finally:
+            producer.reset(token)
+        self.assertTrue(result.ok, result.error)
+        argv, _, _, env, *_ = launch.call_args.args
+        self.assertEqual(self.grants(self.settings(argv), "read_only"), set())
+        self.assertEqual(env["TMPDIR"], str(self.parent_tmp))
+        self.assertEqual(list(self.parent_tmp.iterdir()), [])
+
+    def test_cleans_up_after_timeout_and_launch_error(self):
+        for error, message in ((subprocess.TimeoutExpired("codex", 3), "timed out"),
+                               (FileNotFoundError("fixture"), "codex not found")):
+            with self.subTest(error=error):
+                def fail(argv, cwd, prompt, env, *args, **kwargs):
+                    self.assertTrue(Path(env["TMPDIR"]).is_dir())
+                    raise error
+
+                with mock.patch.object(codex, "launch", side_effect=fail) as launch:
+                    result = self.run_codex()
+                self.assertFalse(result.ok)
+                self.assertIn(message, result.error)
+                folder = Path(launch.call_args.args[3]["TMPDIR"])
+                self.assertEqual(folder.parent, self.parent_tmp)
+                self.assertFalse(folder.exists())
+
+    def test_cleanup_error_is_logged_without_changing_the_result(self):
+        with (mock.patch.object(shutil, "rmtree", side_effect=PermissionError("fixture")),
+              self.assertLogs(codex.__name__, level="WARNING") as logs):
+            result = self.run_codex()
+        self.assertTrue(result.ok, result.error)
+        self.assertIn("Could not remove Codex temporary directory", logs.output[0])
+        self.assertIn("fixture", logs.output[0])
+
+
 class DeploymentCiTests(unittest.TestCase):
     def test_ci_lookup_and_classification_share_a_single_attempt_budget(self):
         now = 0
@@ -7566,9 +8790,11 @@ class ServeStatusTests(unittest.TestCase):
             "at": "2026-11-21T00:00:00Z", "engine": running, "checkout_head": checkout,
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
-        result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
-                                capture_output=True, text=True, timeout=8)
+        child_env = {**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
+        stacked = stack_env(child_env)
+        child_env.update(PYTHONPATH=stacked["PYTHONPATH"], ARETE_DESKTOP_NOTIFY=stacked["ARETE_DESKTOP_NOTIFY"])
+        result = subprocess.run([str(installed), "status", *args], cwd=self.root, env=child_env,
+                                capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
@@ -7597,6 +8823,137 @@ class ServeStatusTests(unittest.TestCase):
         scratch.mkdir(mode=0o700)
         del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
         self.check_revisions({**self.env, "ARETE_VERIFY_SCRATCH": str(scratch)}, scratch / "state")
+
+
+class DBStatsRetentionTests(unittest.TestCase):
+    def setUp(self):
+        logs = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(mock.patch.object(paths, "LOG_DIR", logs))
+        self.enterContext(mock.patch.object(dbstats, "SUMMARIES", {}))
+        self.folder = logs / "dbstats"
+        self.now = datetime(2026, 11, 22, 18, tzinfo=UTC)
+
+    def write_summary(self, hours_ago):
+        hour = (self.now - timedelta(hours=hours_ago)).isoformat()
+        dbstats.retain("database", hour, {"mode": "read", "caller": "test", "process_kind": "cli",
+                                         "total_ms": 12, "begin_ms": 2, "commit_ms": 0, "error": ""})
+        return self.folder / f"database-{dbstats.INCARNATION}-{hour[:13]}.json"
+
+    def test_prune_uses_filename_hour_and_keeps_the_cutoff(self):
+        kept = {self.write_summary(hours) for hours in (1, 47, 48)}
+        self.write_summary(49)
+        unreadable = self.folder / "database-incarnation-2025-11-20T99.json"
+        unreadable.write_text("{}")
+        self.assertEqual(dbstats.prune(self.now), 1)
+        self.assertEqual(set(self.folder.iterdir()), kept | {unreadable})
+
+    def test_transaction_totals_opens_only_filenames_in_the_window(self):
+        self.write_summary(2)
+        self.write_summary(0)
+        included = self.write_summary(1)
+        wrong_content_hour = self.folder / included.name.replace(dbstats.INCARNATION, "other")
+        wrong_content_hour.write_text(self.write_summary(3).read_text())
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+            totals = dbstats.transaction_totals(self.now - timedelta(hours=1), self.now, "database")
+
+        self.assertCountEqual([call.args[0] for call in opened.call_args_list], [included, wrong_content_hour])
+        self.assertEqual(totals, {"transaction_count": 1, "p95_ms": 12, "max_ms": 12,
+                                  "transactions_by_kind": {"cli": 1}})
+
+    def test_serve_reports_dbstats_prune_and_continues_after_failure(self):
+        limits = SimpleNamespace(lines_days=3, days=30, max_gb=1)
+        cfg = SimpleNamespace(retention=limits, oncall=SimpleNamespace(keep_days=7))
+        for result, error, messages in (
+            (2, None, [mock.call("dbstats: removed 2 files")]),
+            (0, None, []),
+            (None, OSError("cannot unlink"), [mock.call("dbstats prune failed: OSError: cannot unlink")]),
+        ):
+            with self.subTest(result=result, error=error):
+                server = mock.Mock(cfg=cfg)
+                with (
+                    mock.patch.object(serve.backup, "snapshot", return_value=None),
+                    mock.patch.object(dbstats, "prune", return_value=result, side_effect=error) as prune,
+                    mock.patch.object(serve.store, "prune") as state_prune,
+                    mock.patch.object(record, "purge_folders", return_value=record.Purged(0, 0, ())) as purge,
+                    mock.patch.object(record, "prune", return_value=SimpleNamespace(removed=[], over=False)) as records,
+                    mock.patch.object(serve.tool_events, "rotate_events") as rotate,
+                ):
+                    serve.Server.prune_data(server)
+
+                prune.assert_called_once_with()
+                state_prune.assert_called_once_with(lines_days=3, keep_days=7)
+                purge.assert_called_once_with()
+                records.assert_called_once_with(30, 1)
+                rotate.assert_called_once_with(3)
+                self.assertEqual(server.say.call_args_list, messages)
+
+
+class ServeLoopCountsTests(unittest.TestCase):
+    def test_serve_line_labels_loop_counts(self):
+        from arete.commands.common import serve_line
+
+        beat = {"alive": True, "pid": 123, "loops": 2, "off": 0}
+        cases = (
+            (0, 2, "0 loop runs running, 2 loop fires waiting"),
+            (1, 1, "1 loop run running, 1 loop fire waiting"),
+            (None, None, "unknown loop runs running, unknown loop fires waiting"),
+        )
+        for running, pending, expected in cases:
+            with self.subTest(running=running, pending=pending):
+                self.assertIn(expected, serve_line(dict(beat, running=running, pending=pending)))
+
+    def test_web_serve_sentence_labels_loop_counts(self):
+        source = (Path(__file__).resolve().parents[1] / "arete" / "web" / "loops.js").read_text()
+        self.assertRegex(source, r"Serve is up since[^\n]*loop runs? running, [^\n]*loop fires? waiting")
+
+
+class ServeTicketCountsTests(unittest.TestCase):
+    def test_serve_line_labels_ticket_counts(self):
+        from arete.commands.common import serve_line
+
+        beat = {"alive": True, "pid": 123, "loops": 2, "off": 0, "running": 1, "pending": 2}
+        for tickets, expected in ((3, "3 ticket runs live"), (1, "1 ticket run live"),
+                                  (None, "unknown ticket runs live")):
+            with self.subTest(tickets=tickets):
+                self.assertIn(f"2 loop fires waiting, {expected}", serve_line(dict(beat, tickets=tickets)))
+        self.assertNotIn("ticket run", serve_line(beat))
+
+    def test_beat_counts_live_tickets_and_loop_runs(self):
+        server = object.__new__(serve.Server)
+        server.db_lock = threading.Lock()
+        server.db_future = None
+        server.db_health = {}
+        server.every_loop = server.live = []
+        server.failing = server.errors = {}
+        server.started = util.now()
+        server.ticks = 0
+        server.reloaded = False
+        server.cfg = SimpleNamespace(ignored=())
+        server.config_problem = server.code_problem = ""
+        rows = [
+            {"kind": "pipeline", "repo": "fixture", "issue": 1},
+            {"kind": "pipeline", "repo": "fixture", "issue": 2},
+            {"kind": "loop"},
+        ]
+        with (mock.patch.object(serve.loop_store, "pending", return_value=[]),
+              mock.patch.object(serve.codebase, "checkout_head", return_value="fixture"),
+              mock.patch.object(serve.run_store, "runs_marked_running", return_value=rows) as running,
+              mock.patch.object(util, "lock_is_held", return_value=True),
+              mock.patch.object(util, "write_json") as write):
+            server.beat()
+            running.assert_called_once_with()
+            beat = write.call_args.args[1]
+            self.assertEqual((beat["tickets"], beat["running"]), (2, 1))
+
+            running.side_effect = OSError("run store unavailable")
+            server.beat()
+            beat = write.call_args.args[1]
+            self.assertEqual((beat["tickets"], beat["running"]), (None, None))
+
+    def test_web_serve_sentence_labels_ticket_counts(self):
+        source = (Path(__file__).resolve().parents[1] / "arete" / "web" / "loops.js").read_text()
+        self.assertRegex(source, r'Serve is up since[^;]*loop fires waiting[^;]*"ticket run"')
 
 
 class SavedRunPolicyTests(unittest.TestCase):
@@ -8599,6 +9956,357 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("did not account for every manifest step", stderr)
         self.assertEqual(stdout, "")
         self.assertIn("2. [ordinary step 2] Inspect inventory", self.agent.call_args.args[2])
+
+
+class NamedClassCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.worktree = self.root / "work tree"
+        self.worktree.mkdir()
+        self.run_dir = self.root / "run"
+        self.script = self.run_dir / "checks"
+        self.config_file = self.root / "config.toml"
+        self.started = self.root / "started"
+        stand_in = self.root / "stand in.py"
+        stand_in.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).touch()\n"
+            "print(json.dumps([os.getcwd(), *sys.argv[2:]]))\n"
+        )
+        self.command = shlex.join([sys.executable, str(stand_in), str(self.started)])
+
+    def load_layer(self, command=None, *, other_check=False):
+        source = '[checks]\nlint = "printf lint | cat"\n' if other_check else ""
+        if command is not None:
+            source += f"[targeted_commands]\nclasses = {json.dumps(command)}\n"
+        self.config_file.write_text(source)
+        return config.load_layer(self.root, source_file=self.config_file)
+
+    def run_check(self, *args):
+        return subprocess.run([self.script, *args], cwd=self.root, capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT)
+
+    def test_classes_passes_literal_arguments_in_the_worktree(self):
+        fixture = self.worktree / "keep.txt"
+        fixture.write_text("keep me")
+        layer = self.load_layer(self.command, other_check=True)
+        pipeline.check_script(self.run_dir, layer, self.worktree)
+
+        result = self.run_check("classes", "test_a.B", "x; rm -rf .")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [str(self.worktree), "test_a.B", "x; rm -rf ."])
+        self.assertEqual(list(self.worktree.iterdir()), [fixture])
+        self.assertEqual(fixture.read_text(), "keep me")
+        self.assertEqual(self.run_check("lint").stdout, "lint")
+
+    def test_classes_rejects_invalid_arguments_before_execution(self):
+        pipeline.check_script(self.run_dir, self.load_layer(self.command), self.worktree)
+        for args in ((), ("--all",), ("",), ("test_a.B", "--all")):
+            with self.subTest(args=args):
+                result = self.run_check("classes", *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"usage: {self.script} classes", result.stderr)
+                self.assertFalse(self.started.exists())
+
+    def test_layer_refuses_a_shell_command_for_classes(self):
+        for command in ("uv run python -m tests.parallel; echo x", "echo '$HOME'", "echo '# comment'", "echo x\necho y",
+                        "echo 'unclosed", "", 123):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, r"targeted_commands\.classes"):
+                self.load_layer(command)
+
+    def job(self, layer):
+        cfg = config.Config()
+        repo = config.Repo("fixture", self.worktree)
+        run = pipeline.Run("run", repo, self.run_dir, tracker=tracker.GitHubTracker(repo), tid="825", cfg=cfg,
+                           layer=layer, overrides={"runner": "claude", "model": "claude-sonnet-4-6"},
+                           writes_lines=False)
+        checkout = workspace.Checkout("", "fixture/repo", self.worktree, self.worktree, "main")
+        job = flows.Job(cfg, run, self.worktree, layer=layer, checkouts=[checkout])
+        job.check_commands, job.check_rules = pipeline.check_script(self.run_dir, layer, self.worktree)
+        return job
+
+    def test_worker_prompts_only_advertise_the_classes_arm_when_configured(self):
+        example = f"`{self.script} classes test_x.SomeTests`"
+        original = "`uv run python -m tests.parallel test_x.SomeTests`"
+        for command in (None, self.command):
+            with self.subTest(configured=bool(command)):
+                job = self.job(self.load_layer(command))
+                build = job.brief.prompt("build", plan="", checks=job.checks, estimate=0, verify="")
+                repair = job.brief.prompt("repair", plan="", source="", findings="", checks=job.checks)
+                delegate = job.brief.prompt("delegate", goal="", context="", denied="")
+                for rendered in (build, repair):
+                    self.assertIn(example if command else original, rendered)
+                    self.assertNotIn(original if command else example, rendered)
+                self.assertEqual(example in delegate, bool(command))
+
+    def test_claude_build_grants_the_check_script_rule_and_review_does_not(self):
+        job = self.job(self.load_layer(self.command))
+        model = "claude-sonnet-4-6"
+        auth = accounts.Auth(mode="subscription", family="claude")
+        route = routing.Candidate(order=0, model=model, runner="claude", provider="anthropic", credential="login",
+                                  billing="subscription", tier="", position=0, requested=True, effort="",
+                                  instructions=(), price=None, state="ready", detail="")
+        picked = runner.Picked(route, auth, None, model, "", {auth}, None)
+        reply = json.dumps({"type": "result", "structured_output": {"verdict": "approve", "problems": []}})
+        completed = subprocess.CompletedProcess([], 0, reply, "")
+        self.enterContext(mock.patch.object(paths, "RUNS_DIR", self.root))
+        self.enterContext(mock.patch.object(config, "load", return_value=job.run.config))
+        self.enterContext(mock.patch.object(pipeline, "check_lanes", return_value=[]))
+        self.enterContext(mock.patch.object(pipeline.vault, "values", return_value=set()))
+        self.enterContext(mock.patch.object(runner.run_store, "step_tries", return_value=0))
+        self.enterContext(mock.patch.object(runner.devices_store, "clear_holds"))
+        self.enterContext(mock.patch.multiple(record, steps=mock.DEFAULT, label_step=mock.DEFAULT))
+        self.enterContext(mock.patch.object(runner.environment, "stored", return_value={}))
+        self.enterContext(mock.patch.object(runner.jev, "ready", return_value=False))
+        self.enterContext(mock.patch.object(runner, "pick", return_value=(picked, [])))
+        stream = self.enterContext(mock.patch.object(claude.child, "stream", return_value=completed))
+        self.enterContext(mock.patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"keep.txt": 1})))
+
+        self.assertTrue(flows.build(job).passed)
+        review = pipeline._review(replace(job.b, checkouts=[]), "", job.verified)
+
+        self.assertEqual(review.verdict, "approve")
+        build_call, review_call = stream.call_args_list
+        build_args, review_args = build_call.args[0], review_call.args[0]
+        build_allowed = build_args[build_args.index("--allowedTools") + 1:build_args.index("--disallowedTools")]
+        review_allowed = review_args[review_args.index("--allowedTools") + 1:review_args.index("--disallowedTools")]
+        self.assertIn(f"Bash({self.script} classes *)", build_allowed)
+        self.assertFalse(any(str(self.script) in rule for rule in review_allowed))
+
+
+class PromptSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.prompts = self.root / "arete" / "prompts"
+        self.prompts.mkdir(parents=True)
+        self.file = self.prompts / "x.md"
+        self.file.write_text("a $one")
+        self.enterContext(mock.patch.object(prompt_loader, "TEMPLATES", {}))
+
+    def test_prompt_keeps_startup_template_after_edit(self):
+        prompt_loader.load_templates(self.prompts)
+        self.file.write_text("a $one $two")
+
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "a 1")
+
+    def test_other_folder_reads_current_template_from_disk(self):
+        other = self.root / "other"
+        other.mkdir()
+        file = other / "x.md"
+        file.write_text("original $one")
+        prompt_loader.load_templates(self.prompts)
+        file.write_text("current $one")
+
+        self.assertEqual(prompt_loader.template("x", other).template, "current $one")
+
+    def test_undecodable_template_falls_back_to_disk(self):
+        bad = self.prompts / "bad.md"
+        bad.write_bytes(b"\xff")
+        prompt_loader.load_templates(self.prompts)
+        self.file.write_text("a $one $two")
+
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "a 1")
+        with self.assertRaises(UnicodeDecodeError):
+            prompt_loader.template("bad", self.prompts)
+        bad.write_text("repaired")
+        self.assertEqual(prompt_loader.template("bad", self.prompts).template, "repaired")
+
+    def test_run_child_command_snapshots_templates(self):
+        command = pipeline.script_command(config.Config(), "feature")
+
+        self.assertIn("codebase.load(templates=True)", command[3])
+
+    def test_default_codebase_load_reads_templates_from_disk(self):
+        with (mock.patch.multiple(codebase, CHECKOUT=self.root, STAMP="", RELEASE=""),
+              mock.patch.object(codebase, "import_everything"),
+              mock.patch.object(codebase, "head_and_dirt", return_value=("", False)),
+              mock.patch.object(codebase.arete, "IMPORTED_NS", self.file.stat().st_mtime_ns),
+              mock.patch.object(paths, "PROMPTS_DIR", self.prompts)):
+            codebase.load()
+
+        self.file.write_text("a $one $two")
+        self.assertEqual(prompt_loader.template("x", self.prompts).template, "a $one $two")
+
+    def test_inventory_digest_changes_when_prompt_changes(self):
+        with mock.patch.object(codebase, "CHECKOUT", self.root):
+            before, _ = codebase.inventory()
+            self.file.write_text("a $one $two")
+            after, _ = codebase.inventory()
+
+        self.assertNotEqual(before, after)
+
+    def test_template_change_during_codebase_load_triggers_reload(self):
+        def import_during_deploy():
+            self.file.write_text("deployed $one")
+
+        with (mock.patch.multiple(codebase, CHECKOUT=self.root, STAMP="", RELEASE=""),
+              mock.patch.object(codebase, "import_everything", side_effect=import_during_deploy),
+              mock.patch.object(codebase, "head_and_dirt", return_value=("", False)),
+              mock.patch.object(codebase.arete, "IMPORTED_NS", self.file.stat().st_mtime_ns),
+              mock.patch.object(paths, "PROMPTS_DIR", self.prompts),
+              mock.patch.dict(os.environ, {codebase.RELOADS: "0"}),
+              mock.patch.object(codebase, "reload") as reload):
+            codebase.load(templates=True)
+
+        reload.assert_called_once_with(1)
+        self.file.write_text("later $one $two")
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "deployed 1")
+
+
+class MissingPromptInputsTests(unittest.TestCase):
+    message = "prompt x: missing inputs: two"
+
+    def test_prompt_reports_missing_inputs_as_value_error(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            folder = Path(directory)
+            (folder / "x.md").write_text("a $one $two")
+
+            with self.assertRaises(prompt_loader.MissingInputs) as raised:
+                prompt_loader.prompt("x", folder, one="1")
+
+        self.assertEqual(str(raised.exception), self.message)
+        self.assertIsInstance(raised.exception, ValueError)
+
+    def scratch_state(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
+                                             RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
+                                             WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        return root
+
+    def worker_start(self, error, run=None):
+        if run is None:
+            self.scratch_state()
+            run = SimpleNamespace(id=self.id())
+        controller = object.__new__(orchestration.Controller)
+        controller.run = run
+        controller.lease = ledger.acquire(controller.run.id, "", {})
+        controller.perform = mock.Mock(side_effect=error)
+        controller.persist = mock.Mock()
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, 1)
+        action, = ledger.accept(controller.lease, turn, version, {"calls": [{"op": "worker.start", "args": {}}]}, 1)
+        return controller, action
+
+    def assert_failed_action(self, controller, action, error):
+        saved, = ledger.actions(controller.lease)
+        self.assertEqual((saved["id"], saved["state"], saved["result"]["error"]), (action["id"], "failed", str(error)))
+        line, = orchestration.run_lines.read(controller.run.id)
+        self.assertEqual((line["event"], line["action"], line["op"], line["state"]),
+                         ("action", action["id"], "worker.start", "failed"))
+
+    def test_dispatch_records_and_reraises_missing_inputs(self):
+        error = prompt_loader.MissingInputs(self.message)
+        controller, action = self.worker_start(error)
+
+        with self.assertRaises(prompt_loader.MissingInputs) as raised:
+            controller.dispatch(action)
+
+        self.assertIs(raised.exception, error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_dispatch_records_and_returns_plain_value_error(self):
+        error = ValueError("a dependency has not succeeded")
+        controller, action = self.worker_start(error)
+
+        self.assertIs(controller.dispatch(action), error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_missing_inputs_is_an_engine_crash(self):
+        self.assertEqual(pipeline.crash_failure(prompt_loader.MissingInputs(self.message)),
+                         {"class": "environment", "reason": "engine-crash"})
+
+    def test_scheduled_zte_worker_start_persists_engine_crash(self):
+        from arete import zte
+        from arete.store import zte as zte_store
+
+        root = self.scratch_state()
+        repo = config.Repo("fixture", root, parts=[config.Part("", "owner/fixture")])
+        cfg = config.Config(repos=[repo])
+        deadline = util.iso(util.now() + timedelta(minutes=10))
+        reserved = zte_store.reserve("fixture-policy", repo.name, "a" * 40, deadline,
+                                     "Fixture ZTE task", "fix", "Fixture ZTE specification", {"task_version": 1})
+        grant = zte_store.transition(reserved, "dispatching")
+        slot_lock = pipeline.run_store.run_lock("slot", repo.name, grant.task)
+
+        def drive(flow):
+            self.assertTrue(util.lock_is_held(slot_lock))
+            controller, action = self.worker_start(prompt_loader.MissingInputs(self.message), flow.ctx.run)
+            return controller.dispatch(action)
+
+        script = pipeline.Script("orchestrate", drive)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with (mock.patch.object(config, "load", return_value=cfg),
+              mock.patch.multiple(zte, INTERLOCK="fixture-zte", PAUSE_FILE=root / "pause"),
+              mock.patch.object(zte, "admit_run", return_value=grant),
+              mock.patch.object(zte, "require_launch_base"),
+              mock.patch.object(zte, "active"),
+              mock.patch.object(zte, "task_version", return_value=grant.data["task_version"]),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict, RUN_BASELINES={}, RUN_LABELS={}),
+              principals.acting("rule:poll"), redirect_stdout(StringIO())):
+            result = pipeline.run_issue(repo.name, grant.task, script=script)
+
+        self.assertNotEqual(result, 0)
+        saved, = pipeline.run_store.ticket_runs(repo.name, grant.task)
+        self.assertEqual(zte_store.find(grant.task).data["run"], saved["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(json.loads(saved["failure"] or "{}"), {"class": "environment", "reason": "engine-crash"})
+        self.assertFalse(util.lock_is_held(slot_lock))
+
+
+class ReviewRepairPromptTests(unittest.TestCase):
+    brief = prompt_loader.Brief("fixture", "test checkout", "#817", "Review and repair", "Cover analogous paths.")
+
+    def test_review_checks_and_reports_analogous_paths_before_holding(self):
+        rendered = self.brief.prompt("review", plan="", checks="", evidence="", compare="", diff="", earlier="")
+        blockers = rendered.split("## Blockers\n", 1)[1].split("\n## Notes", 1)[0]
+        blockers = " ".join(blockers.split())
+        self.assertIn(
+            "Before holding on a blocker, check every other path in this diff where the same kind of problem can occur.",
+            blockers,
+        )
+        self.assertIn("List each failing path as its own blocker in the same review.", blockers)
+
+    def test_repair_fixes_and_names_analogous_paths_within_scope(self):
+        rendered = self.brief.prompt("repair", plan="", source="fixture", findings="Fix the named path.", checks="")
+        rules = rendered.split("## Rules\n", 1)[1].split("\n## What to return", 1)[0]
+        rules = " ".join(rules.split())
+        self.assertIn(
+            "fix the named path and every other path in the change where the same problem occurs.",
+            rules,
+        )
+        self.assertIn("These fixes are part of what the finding asks.", rules)
+        self.assertIn("Name each extra path you fixed in the summary.", rules)
+        self.assertIn("Keep all other changes within what the findings ask. No scope growth", rules)
+
+
+class ReviewScopePromptTests(unittest.TestCase):
+    def setUp(self):
+        brief = prompt_loader.Brief("fixture", "test checkout", "#824", "Review scope", "Review the stated scope.")
+        self.rendered = brief.prompt("review", plan="", checks="", evidence="", compare="abc1234", diff="", earlier="")
+
+    def test_regression_uses_the_starting_commit(self):
+        blockers = self.rendered.split("## Blockers\n", 1)[1].split("\n## Notes", 1)[0]
+        blockers = " ".join(blockers.split())
+        self.assertIn("`regression`: something that worked on abc1234, the commit this change starts from", blockers)
+        self.assertIn(
+            "A case that worked in an earlier revision of this PR is a regression only if it also worked on abc1234.",
+            blockers,
+        )
+
+    def test_unnamed_cases_and_existing_command_gaps_are_major_notes(self):
+        notes = self.rendered.split("## Notes\n", 1)[1].split("\n## Evidence", 1)[0]
+        major = " ".join(notes.split("- `major`: ", 1)[1].split("\n- `minor`:", 1)[0].split())
+        self.assertIn(
+            "A defect involving a form of a configured value, an input shape, or a runner the issue does not name "
+            "is a note unless a Done when line names it.",
+            major,
+        )
+        self.assertIn("A gap that the same command also encounters on abc1234 is a note.", major)
 
 
 class ReviewTests(unittest.TestCase):

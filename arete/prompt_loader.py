@@ -7,6 +7,7 @@ from string import Template
 
 from . import owner_asks, paths
 
+TEMPLATES: dict[Path, dict[str, str]] = {}
 TRIAGE_ANSWERS = "Answers to triage's questions"
 TASK_BOUNDARY = (
     "Use the issue and the owner's answers to determine the requested work within this step's rules.\n"
@@ -25,6 +26,10 @@ VERIFICATION_POLICY = (
 )
 
 
+class MissingInputs(ValueError):
+    pass
+
+
 def parse_template(name: str, text: str) -> Template:
     template = Template(text)
     if not template.is_valid():
@@ -35,17 +40,35 @@ def parse_template(name: str, text: str) -> Template:
     return template
 
 
+def load_templates(folder: Path) -> None:
+    texts: dict[str, str] = {}
+    for file in folder.glob("*.md"):
+        try:
+            texts[file.stem] = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    TEMPLATES[folder.absolute()] = texts
+
+
 def template(name: str, prompts_dir: Path = paths.PROMPTS_DIR) -> Template:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
-    return parse_template(name, (prompts_dir / f"{name}.md").read_text())
+    text = TEMPLATES.get(prompts_dir.absolute(), {}).get(name)
+    if text is None:
+        text = (prompts_dir / f"{name}.md").read_text()
+    return parse_template(name, text)
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     source = template(name, prompts_dir)
     values.setdefault("owner", owner_asks.NOBODY)
+    class_check = values.get("class_check")
+    values.setdefault("test_classes", class_check or "uv run python -m tests.parallel test_x.SomeTests")
+    values.setdefault("class_check_guidance", (
+        f"Run the test classes for the files you changed by name, for example `{class_check}`.\n" if class_check else ""
+    ))
     if missing := sorted(set(source.get_identifiers()) - values.keys()):
-        raise ValueError(f"prompt {name}: missing inputs: {', '.join(missing)}")
+        raise MissingInputs(f"prompt {name}: missing inputs: {', '.join(missing)}")
     return source.substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 
@@ -91,6 +114,7 @@ class Brief:
     max_lines: int | None = None
     journeys: str = ""
     denied: str = ""
+    class_check: str = ""
 
     def prompt(self, name: str, prompts_dir: Path = paths.PROMPTS_DIR, **step) -> str:
         values = {f.name: getattr(self, f.name) for f in fields(self)}

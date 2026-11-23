@@ -45,6 +45,7 @@ from . import (
     runner,
     serve_guard,
     sessions,
+    slots,
     sources,
     startup_excerpt,
     store,
@@ -736,6 +737,13 @@ class Server:
             self.copy_off_machine(made)
         limits = self.cfg.retention
         try:
+            removed = dbstats.prune()
+        except Exception as e:
+            self.say(f"dbstats prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+        else:
+            if removed > 0:
+                self.say(f"dbstats: removed {removed} files")
+        try:
             store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
@@ -1101,10 +1109,13 @@ class Server:
             pending = len(loop_store.pending())
         except Exception:
             pending = None
+        running = None
         try:
-            running = sum(r["kind"] == "loop" for r in run_store.runs_marked_running())
+            rows = run_store.runs_marked_running()
+            running = sum(r["kind"] == "loop" for r in rows)
+            tickets = len(slots.holding(rows, "pipeline"))
         except Exception:
-            running = None
+            tickets = None
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1113,7 +1124,7 @@ class Server:
             "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
-            "running": running, "poll_errors": dict(self.errors),
+            "running": running, "tickets": tickets, "poll_errors": dict(self.errors),
             "tick_ok": not failing, "last_ok": self.last_ok, "failing": failing, "reloaded": self.reloaded,
             "config_ignored": list(self.cfg.ignored),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
