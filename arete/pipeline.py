@@ -3881,19 +3881,19 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
             tracked_edits.difference_update(names)
             tracked_edits.update(n for n in names if not workspace.recorded(made, c.wt, n, c.prefix))
         move_candidates = (new_untracked | move_destinations) & (untracked_after - scratch_after - parent_tracked)
-        move_candidates -= conflict_paths | supplemental
+        move_candidates -= conflict_paths | supplemental | watched_before
         deleted_in_folder = Counter(Path(p).parent for p in tracked_edits & move_sources
                                     if not os.path.lexists(c.wt / p))
         move_destinations = set()
         for path in sorted(move_candidates):
             folder = Path(path).parent
-            if deleted_in_folder[folder] and not denied(path):
+            if deleted_in_folder[folder] and not path.endswith("/") and not denied(path):
                 move_destinations.add(path)
                 deleted_in_folder[folder] -= 1
         touched = tracked_edits | new_untracked | changed_watched | restorations | move_candidates
         if outside := sorted((touched - conflict_paths - supplemental - move_destinations) | invalidated_edits):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
-        if left := marked(c.wt, conflicts):
+        if left := marked(c.wt, [*conflicts, *sorted(move_destinations)]):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
             if n == tries:
                 raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
