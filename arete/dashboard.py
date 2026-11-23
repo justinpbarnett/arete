@@ -1393,6 +1393,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
     while True:
         try:
             foundation.ensure_schema()
+            foundation.migrate_on_demand()
             break
         except foundation.IncompatibleSchema:
             if not inside_serve:

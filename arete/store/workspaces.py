@@ -27,6 +27,7 @@ FOLDER_LOCKS: ContextVar[frozenset[Path]] = ContextVar("workspace_folder_locks",
 TICKET_LOCKS: ContextVar[frozenset[str]] = ContextVar("workspace_ticket_locks", default=frozenset())
 SWEEP_STATES = ("live", "released", "held", "kept")
 NO_LEGACY_RECORD = -1
+LEGACY_RESUME = "legacy resume"
 
 
 class SnapshotUnavailable(RuntimeError):
@@ -475,6 +476,12 @@ def _legacy_takeover(row: dict, owner: workspace.WorkspaceOwner | None) -> dict 
     return None
 
 
+def _has_attached_onto(ws: Path, checkouts: list[workspace.Checkout], onto: dict, *, allow_root: bool) -> bool:
+    if not checkouts:
+        return bool(allow_root and onto.get("") and workspace.checkout_attachment(ws, ws)[0])
+    return any(onto.get(c.prefix) and workspace.checkout_attachment(ws, c.wt)[0] for c in checkouts)
+
+
 def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, int, tuple[int, ...]] | None,
                       cfg: config.Config | None) -> dict | None:
     active = row if row and row["state"] != "removed" else None
@@ -504,19 +511,20 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
     has_selection = active is not None and active["release_excluded"] is not None
     takeover = _legacy_takeover(active, owner) if has_selection else None
     preserve_selection = has_selection and not takeover
-    if preserve_selection and owner and owner.run and owner.run != active["owner_run"]:
-        # A stale owner's record can refresh fingerprints without reopening the release selection.
-        return change(active, legacy_mtime_ns=modified, **snapshot)
     if active and active["state"] == "released" and (
         snapshot["heads"] != active["heads"] or snapshot["onto"] != active["onto"]
         or snapshot["files"] != files(active["id"])
     ):
-        owner = owner_of(active) if preserve_selection or owner is None else owner
-        status = (takeover or _run_for(owner)).get("status") or ""
+        owner = owner or owner_of(active)
+        selection = owner_of(active) if preserve_selection else owner
+        excluded = active["release_excluded"] if preserve_selection else None
+        reason = LEGACY_RESUME
+        if _has_attached_onto(ws, selection.checkouts, snapshot["onto"], allow_root=not excluded):
+            reason = (takeover or _run_for(owner)).get("status") or ""
         return change(active, legacy_mtime_ns=modified, state="kept", released_at="",
-                      release_excluded=active["release_excluded"] if preserve_selection else None,
-                      remove_asked_by="", held_by=[], last_sweep_error="", kept_reason=status,
-                      repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows(),
+                      release_excluded=excluded,
+                      remove_asked_by="", held_by=[], last_sweep_error="", kept_reason=reason,
+                      repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=selection.checkout_rows(),
                       **snapshot)
     if preserve_selection:
         return change(active, legacy_mtime_ns=modified, **snapshot)
@@ -659,15 +667,14 @@ def _sweep_row(ws: Path, row: dict) -> None:
         return
     if row["kept_reason"] == "operator":
         return
+    if row["kept_reason"] == LEGACY_RESUME and not row["remove_asked_by"]:
+        return
     checkouts = owner_of(row).checkouts
     excluded = {Path(wt) for wt in row["release_excluded"] or ()}
-    if row["state"] != "released":
-        attached_onto = any(row["onto"].get(c.prefix) and workspace.checkout_attachment(ws, c.wt)[0]
-                            for c in checkouts)
-        root_onto = (not checkouts and not excluded and row["onto"].get("")
-                     and workspace.checkout_attachment(ws, ws)[0])
-        if attached_onto or root_onto or not _ticket_ended(row):
-            return
+    if row["state"] != "released" and (
+        _has_attached_onto(ws, checkouts, row["onto"], allow_root=not excluded) or not _ticket_ended(row)
+    ):
+        return
     _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(), last_sweep_error="")
     try:
         if not checkouts and not excluded:
@@ -759,14 +766,14 @@ def held_entry(row: dict) -> dict:
     run = runs.run_get(run_id) if run_id else None
     run = run or {}
     status = run.get("status") or row["kept_reason"]
-    blocked = row["state"] == "held"
     why = row["last_sweep_error"]
+    blocked = row["state"] == "held" or (row["state"] == "released" and bool(why))
     if not why:
         if blocked:
             why = "workspace removal blocked"
             if row["held_by"]:
                 why += f" ({', '.join(row['held_by'][:5])})"
-        elif row["onto"]:
+        elif row["onto"] or row["kept_reason"] == LEGACY_RESUME:
             why = "the workspace holds edits and waits for a resume"
         else:
             why = f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket"

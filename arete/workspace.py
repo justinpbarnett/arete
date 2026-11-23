@@ -858,8 +858,10 @@ def prune_repos(cfg: config.Config) -> None:
 
 
 def held_summary() -> dict:
-    rows = sorted((workspaces.held_entry(row) for row in workspaces.by_state("held", "kept")),
-                  key=lambda row: row["since"])
+    candidates = workspaces.by_state("held", "kept", "released")
+    rows = [workspaces.held_entry(row) for row in candidates
+            if row["state"] != "released" or row["last_sweep_error"]]
+    rows.sort(key=lambda row: row["since"])
     oldest = rows[0] if rows else {}
     return {"count": len(rows), "bytes": sum(r.get("bytes") or 0 for r in rows), "oldest": oldest.get("since", ""),
             "oldest_name": oldest.get("name", ""), "blocked": sum(1 for r in rows if r.get("blocked")), "rows": rows}
