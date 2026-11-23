@@ -41,7 +41,7 @@ from .store import idempotency as claims
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import tasks as task_store
-from .store import writes
+from .store import workspaces, writes
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -488,7 +488,7 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.R
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
     tid, run_id = str(row["issue"]), row["id"]
     name = tracker.issue_name(repo.name, tid)
-    with util.lock(run_store.run_lock("pipeline", repo.name, tid)) as got:
+    with workspaces.ticket_lock(repo.name, tid) as got:
         if not got:
             raise control.Busy(f"a run of {name}")
         if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
@@ -497,11 +497,18 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         ask_store.asks_retire(run_id, "stopped" if status == "closed" else status)
         latest = not run_store.later_run(repo.name, tid, run_id)
-        release = kept_folder_removed(repo, tid, run_id) if latest else None
-        removed = release is not None and release.state == "removed"
-        folder = "its work folder is removed" if removed else "its work folder was left in place"
-        if release and release.held_by:
-            folder += f" (removal blocked by {', '.join(release.held_by[:10])})"
+        removed = False
+        folder = "its work folder was left in place"
+        try:
+            release = kept_folder_removed(repo, tid, run_id) if latest else None
+        except OSError as e:
+            folder += f" (removal failed: {util.first_line(str(e), 300)})"
+        else:
+            if release and release.state == "removed":
+                removed = True
+                folder = "its work folder is removed"
+            elif release and release.held_by:
+                folder += f" (removal blocked by {', '.join(release.held_by[:10])})"
         if status == "closed":
             pipeline.write_report(run_store.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")

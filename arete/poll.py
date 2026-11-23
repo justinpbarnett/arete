@@ -49,7 +49,6 @@ from .store import db
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
-from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
 FEEDBACK_PICK = "revising the PR for your review comments"
@@ -466,6 +465,7 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 def poll(dry_run: bool = False) -> int:
     if not dry_run:
+        db.migrate_on_demand()
         paths.ensure_dirs()
     cfg = config.load()
     with (nullcontext(True) if dry_run else util.lock("poll")) as got:
@@ -499,7 +499,6 @@ def poll(dry_run: bool = False) -> int:
         if not dry_run:
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
             guard(errors, "poll", lambda: save_skips_and_landings(cfg, skips, outcomes.sync_landings))
-            guard(errors, "sweeping worktrees", lambda: cleanup_worktrees(cfg=cfg))
             mark_loop("poll", not errors, "; ".join(errors))
         elif not errors and not selected_work:
             print(f"{util.iso()} poll dry run: no new run would start")

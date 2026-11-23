@@ -24,7 +24,7 @@ from unittest import mock
 
 from arete import (
     accounts, api_check, api_http, chat, cli, client, config, contract, control, dashboard, event_stream, events, gh,
-    heartbeat, idempotency, jira, paths, pipeline, principals, record, sandbox, screening, serve, tailnet, tasks,
+    idempotency, jira, paths, pipeline, principals, record, sandbox, screening, serve, tailnet, tasks,
     tool_events, tracker, triage, util, verify_faults, workspace,
 )
 from arete.store import approvals as approvals_store
@@ -34,6 +34,7 @@ from arete.store import idempotency as claims
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
 from arete.store import triage as triage_store
+from arete.store import workspaces
 from tests import support, versioned_api_fixture
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -47,7 +48,9 @@ class _WorkspaceChildCase(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
         env = api_check.isolated_env(root)
         (root / "config/config.toml").write_text("max_parallel = 1\n")
-        command = api_check.child_command(Path(__file__).resolve().parents[1], entry)
+        fixture = ("from arete import paths, sandbox\n"
+                   "sandbox.AUTHORITY = paths.CONFIG_DIR / 'fixture-authority'\n")
+        command = api_check.child_command(Path(__file__).resolve().parents[1], fixture + entry)
         result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
                                 timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -59,7 +62,7 @@ class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
 import json
 from pathlib import Path
 from arete import config, paths, pipeline, record, workspace
-from arete.store import db
+from arete.store import db, workspaces
 
 db.migrate()
 repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
@@ -76,28 +79,56 @@ made = {"sample.txt": "old-fingerprint", "\0head api/": "old-head", "\0salt": "o
 file = workspace.made_record(ws)
 file.parent.mkdir()
 file.write_text(json.dumps(made))
+assert workspaces.backfill(cfg) == 1
+assert workspace.made_before(ws) == made
 owner = workspace.WorkspaceOwner.from_row(workspace.made_before(ws)["\0owner"])
 assert owner.checkouts == [workspace.Checkout(c.dir, c.github, c.src, c.wt, "")]
-assert workspace.owner_of(ws, cfg) == owner
 made_owner = pipeline.workspace_owner(run, ws, [c])
 assert json.dumps(made_owner.to_row()) == json.dumps(legacy)
 run.alone = True
 assert pipeline.workspace_owner(run, ws, [c]) == owner
-del made["\0owner"]
-file.write_text(json.dumps(made))
 record.start("pipeline", repo="sample", issue="app-7", status="merged")
 record.start("pipeline", repo="sample-app", issue="7", status="merged")
-fallback = workspace.owner_of(ws, cfg)
+fallback = workspaces.legacy_owner(cfg, ws, {})
 assert fallback == workspace.WorkspaceOwner("", "sample-app", "7", "", owner.checkouts)
 workspace.note_made(ws, [c], made_owner)
 saved = json.loads(file.read_text())
+assert saved == workspace.made_before(ws)
 assert saved["\0owner"] == legacy
 assert saved["sample.txt"] == workspace.fingerprint(ws / "sample.txt", saved["\0salt"])
 """)
 
 
 class WorkspaceBackfillTests(_WorkspaceChildCase):
-    def test_imports_legacy_records_and_file_bearing_orphan_without_removal(self):
+    def test_sweep_reimports_newer_json_for_existing_workspace(self):
+        self.run_child(r"""
+import json
+import os
+from arete import config, paths, workspace
+from arete.store import workspaces
+
+ws = paths.WORKTREES_DIR / "legacy-7"
+ws.mkdir(parents=True)
+source = workspace.made_record(ws)
+source.parent.mkdir()
+before = {"old": "old-fingerprint", "\0head ": "old-head", "\0salt": "old-salt"}
+source.write_text(json.dumps(before))
+cfg = config.Config()
+assert workspaces.backfill(cfg) == 1
+row = workspaces.open_for(ws.name)
+assert workspace.made_before(ws) == before
+after = {"new": "new-fingerprint", "\0head ": "new-head", "\0salt": "new-salt", "\0onto ": "base"}
+source.write_text(json.dumps(after))
+modified = row["legacy_mtime_ns"] + 1000
+os.utime(source, ns=(modified, modified))
+workspaces.sweep(cfg)
+assert workspace.made_before(ws) == after
+assert workspaces.open_for(ws.name)["id"] == row["id"]
+assert workspaces.files(row["id"]) == {"new": "new-fingerprint"}
+assert workspaces.backfill(cfg) == 0
+""")
+
+    def test_imports_legacy_records_without_removal(self):
         self.run_child(r"""
 import json
 from pathlib import Path
@@ -146,36 +177,61 @@ folders = (merged, waiting, orphan)
 registrations = util.git(["worktree", "list", "--porcelain"], src)
 assert all(f"worktree {folder / 'api'}" in registrations.splitlines() for folder in folders)
 
-assert workspaces.backfill(cfg) == 3
-rows = [workspaces.open_for(folder.name) for folder in folders]
-released, kept, held = rows
-assert [row["state"] for row in rows] == ["released", "kept", "held"], rows
-assert released["owner_run"] == run_id and released["released_at"] == finished
-assert released["made_at"] == started and released["checkouts"] == owner["checkouts"]
-assert released["onto"] == {"api/": "saved-base"}
-assert released["retained"] == records[merged][2]["\0retained"]
+assert workspaces.backfill(cfg) == 2
+rows = [workspaces.open_for(folder.name) for folder in (merged, waiting)]
+saved_edits, kept = rows
+assert [row["state"] for row in rows] == ["kept", "kept"], rows
+assert saved_edits["owner_run"] == run_id and saved_edits["kept_reason"] == "merged"
+assert saved_edits["made_at"] == started and saved_edits["checkouts"] == owner["checkouts"]
+assert saved_edits["onto"] == {"api/": "saved-base"}
+assert saved_edits["retained"] == records[merged][2]["\0retained"]
 assert (kept["repo"], kept["ticket"], kept["owner_run"], kept["kept_reason"]) == ("sample-app", "8", "", "needs-info")
 assert kept["checkouts"] == workspace.WorkspaceOwner("", repo.name, "8", "", [b]).to_row()["checkouts"]
-assert held["owner_run"] == "" and held["checkouts"] == [] and workspaces.files(held["id"]) == {}
-for row, folder in zip(rows, folders, strict=True):
+assert workspaces.open_for(orphan.name) is None
+for row, folder in zip(rows, (merged, waiting), strict=True):
     assert row["bytes"] == workspace.tree_bytes(folder) > 0
     if folder in records:
         made = records[folder][2]
+        assert workspace.made_before(folder) == made
         assert row["salt"] == made["\0salt"]
         assert row["heads"] == {"api/": made["\0head api/"]}
         assert workspaces.files(row["id"]) == {"api/notes.txt": made["api/notes.txt"]}
 
 assert workspaces.backfill(cfg) == 0
-assert [workspaces.open_for(folder.name) for folder in folders] == rows
-workspaces.update(released["id"], base_version=released["version"], state="removed")
+assert [workspaces.open_for(folder.name) for folder in (merged, waiting)] == rows
+workspaces.change(saved_edits, state="removed")
 assert workspaces.backfill(cfg) == 0
 assert workspaces.open_for(merged.name) is None
 with db.reader() as c:
-    assert c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 3
-    assert c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'workspace.changed'").fetchone()[0] == 4
+    assert c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 2
+    assert c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'workspace.changed'").fetchone()[0] == 3
 assert all((folder / "api/notes.txt").is_file() for folder in folders)
 assert all(source.read_bytes() == saved for source, saved, _ in records.values())
 assert util.git(["worktree", "list", "--porcelain"], src) == registrations
+""")
+
+
+class WorkspaceMigrationTests(_WorkspaceChildCase):
+    def test_first_workspace_read_migrates_an_older_database(self):
+        self.run_child("""
+from unittest.mock import patch
+from arete import paths, workspace
+from arete.store import db, workspaces
+
+chain = db.migrations.load()
+with patch.object(db.migrations, "load", return_value=chain[:-1]):
+    db.migrate()
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == chain[-2].n
+ws = paths.WORKTREES_DIR / "sample"
+assert workspace.made_before(ws) == {}
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == chain[-1].n
+wid = workspaces.claim(ws, "sample", "7", "live-run")
+assert workspaces.get(wid)["state"] == "live"
+workspaces.keep(ws, "failed")
+assert workspaces.claim(ws, "sample", "7", "next-run") == wid
+assert workspaces.get(wid)["owner_run"] == "next-run"
 """)
 
 
@@ -243,6 +299,934 @@ assert changes == [(1, "derived", {"old": None, "new": live}), (2, "derived", {"
 """)
 
 
+WORKSPACE_REPO = r"""
+from pathlib import Path
+from arete import config, paths, record, util, workspace
+from arete.store import db, workspaces
+
+db.migrate()
+src = Path.cwd() / "repo"
+src.mkdir()
+util.git(["init", "-q", "-b", "main"], src)
+(src / ".gitignore").write_text(".venv/\n")
+(src / "notes.txt").write_text("original\n")
+util.git(["add", "."], src)
+identity = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false"]
+util.git([*identity, "commit", "-qm", "sample"], src)
+util.git(["remote", "add", "origin", str(src)], src)
+workspace.fetch(src, "main")
+repo = config.Repo("sample", src, github="test/sample")
+cfg = config.Config(repos=[repo])
+
+def checkout(ticket, status, *, onto=""):
+    ws = paths.WORKTREES_DIR / f"sample-{ticket}"
+    c = workspace.Checkout("", repo.github, src, ws, "main", onto=onto)
+    workspace.add_worktree(c, f"fixture-{ticket}", c.origin_base)
+    rid = record.start("pipeline", repo=repo.name, issue=ticket, status=status)
+    wid = workspaces.claim(ws, repo.name, ticket, rid, checkouts=[c])
+    workspace.note_made(ws, [c])
+    return ws, c, rid, wid
+
+def registered(ws):
+    return f"worktree {ws}" in util.git(["worktree", "list", "--porcelain"], src).splitlines()
+"""
+
+
+LEGACY_WRITE = r"""
+import json
+import os
+
+def legacy_write(ws, made):
+    source = workspace.made_record(ws)
+    modified = source.stat().st_mtime_ns + 1000
+    source.write_text(json.dumps(made))
+    os.utime(source, ns=(modified, modified))
+"""
+
+
+class WorkspaceLegacyResumeTests(_WorkspaceChildCase):
+    def test_resume_reads_old_workers_new_head_and_base_before_sweep(self):
+        self.run_child(WORKSPACE_REPO + LEGACY_WRITE + r"""
+from arete.store import runs
+
+ws, c, _, wid = checkout("7", "failed", onto="first-base")
+with util.lock(runs.run_lock("pipeline", repo.name, "7")) as got:
+    assert got
+    made = workspace.made_before(ws)
+    util.git([*identity, "commit", "--allow-empty", "-qm", "older worker's edit"], ws)
+    head = util.git(["rev-parse", "HEAD"], ws).strip()
+    made.update({"\0head ": head, "\0onto ": "new-base"})
+    legacy_write(ws, made)
+    assert workspace.kept_onto(ws, [c], "fixture-7") == {str(ws): "new-base"}
+assert workspaces.get(wid)["heads"] == {"": head}
+""")
+
+
+class WorkspaceLegacyRemovalTests(_WorkspaceChildCase):
+    def test_stopping_task_honors_a_fingerprint_removed_by_an_old_worker(self):
+        self.run_child(WORKSPACE_REPO + LEGACY_WRITE + r"""
+from unittest.mock import patch
+from arete import flows, tasks
+from arete.store import runs
+
+ws, c, rid, wid = checkout("7", "needs-info")
+(ws / ".venv").mkdir()
+file = ws / ".venv/output"
+file.write_text("keep me")
+workspace.note_made(ws, [c])
+made = workspace.made_before(ws)
+assert made.pop(".venv/")
+legacy_write(ws, made)
+with (patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}),
+      util.lock(runs.run_lock("pipeline", repo.name, "7"))):
+    result = tasks.kept_folder_removed(repo, "7", rid)
+assert result.state == "held" and result.held_by == [".venv/"]
+assert workspaces.get(wid)["held_by"] == [".venv/"] and file.read_text() == "keep me"
+""")
+
+
+class WorkspaceLegacyUnstableReadTests(_WorkspaceChildCase):
+    def test_backfill_retries_when_a_legacy_record_changes_during_read(self):
+        self.run_child(LEGACY_WRITE + r"""
+from unittest.mock import patch
+from arete import config, paths, workspace
+from arete.store import workspaces
+
+cfg = config.Config()
+ws = paths.WORKTREES_DIR / "sample-7"
+ws.mkdir()
+(ws / "notes.txt").write_text("fixture")
+wid = workspaces.claim(ws, "sample", "7", "old-run")
+workspace.note_made(ws, [])
+source = workspace.made_record(ws)
+original = workspaces.get(wid)
+middle = workspace.made_before(ws) | {"\0onto ": "middle"}
+latest = middle | {"\0onto ": "latest"}
+legacy_write(ws, middle)
+load = json.load
+
+def read_then_rewrite(file):
+    made = load(file)
+    legacy_write(ws, latest)
+    return made
+
+with patch.object(json, "load", side_effect=read_then_rewrite):
+    assert workspaces.backfill(cfg) == 0
+assert workspaces.get(wid) == original
+assert workspaces.backfill(cfg) == 1
+assert workspace.made_before(ws) == latest
+assert workspaces.get(wid)["legacy_mtime_ns"] == source.stat().st_mtime_ns
+""")
+
+
+class WorkspaceMalformedLegacyTests(_WorkspaceChildCase):
+    def test_stable_malformed_record_revokes_snapshot_and_allows_clean_resume(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from arete import pipeline
+
+ws, c, rid, wid = checkout("7", "failed", onto="old-base")
+output = ws / "notes.txt"
+output.write_text("previous run's output")
+workspace.note_made(ws, [c])
+assert workspaces.get(wid)["onto"] == {"": "old-base"}
+assert "notes.txt" in workspaces.files(wid)
+workspace.made_record(ws).write_text('{"partial":')
+
+with workspaces.ticket_lock(repo.name, "7") as got:
+    assert got
+    assert workspace.kept_onto(ws, [c], "fixture-7") == {}
+    assert "notes.txt" in workspace.kept_work(ws, [c], src, [])
+    output.write_text("original\n")
+    why = workspace.kept_work(ws, [c], src, [])
+    assert why == "", why
+    run = pipeline.Run("resumed-run", repo, paths.RUNS_DIR / "resumed-run", tracker=None, tid="7")
+    pipeline.claim_workspace(run, ws, [c])
+
+row = workspaces.get(wid)
+assert row["state"] == "live" and row["owner_run"] == run.id
+assert not row["salt"] and not row["heads"] and not row["onto"] and not workspaces.files(wid)
+""")
+
+    def test_task_cleanup_records_unstable_read_refusal_with_or_without_row(self):
+        self.run_child(WORKSPACE_REPO + LEGACY_WRITE + r"""
+from unittest.mock import patch
+from arete import flows, tasks
+
+load = json.load
+for tid, claimed in (("7", True), ("8", False)):
+    ws = paths.WORKTREES_DIR / f"sample-{tid}"
+    c = workspace.Checkout("", repo.github, src, ws, "main")
+    workspace.add_worktree(c, f"fixture-{tid}", c.origin_base)
+    output = ws / ".venv/output"
+    output.parent.mkdir()
+    output.write_text("keep me")
+    rid = record.start("pipeline", repo=repo.name, issue=tid, status="needs-info")
+    wid = None
+    if claimed:
+        wid = workspaces.claim(ws, repo.name, tid, rid, checkouts=[c])
+        workspace.note_made(ws, [c])
+    source = workspace.made_record(ws)
+    source.parent.mkdir(exist_ok=True)
+    source.write_text('{"partial":')
+
+    def rewrite_while_parsing(handle):
+        try:
+            return load(handle)
+        finally:
+            legacy_write(ws, {"different": "complete snapshot"})
+
+    with (workspaces.ticket_lock(repo.name, tid) as got, patch.object(json, "load", rewrite_while_parsing),
+          patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]})):
+        assert got
+        try:
+            workspace.kept_onto(ws, [c], f"fixture-{tid}")
+        except workspace.RunFailed as error:
+            assert isinstance(error.__cause__, workspaces.SnapshotUnavailable)
+        else:
+            raise AssertionError("resume used an unstable snapshot")
+        source.write_text('{"partial":')
+        result = tasks.kept_folder_removed(repo, tid, rid)
+
+    row = workspaces.open_for(ws.name)
+    assert result == workspace.Release("held", [".venv/"]), result
+    assert row["state"] == "held" and row["held_by"] == [".venv/"]
+    assert row["bytes"] == workspace.tree_bytes(ws) > 0 and row["owner_run"] == (rid if claimed else "")
+    assert wid is None or row["id"] == wid
+    assert output.read_text() == "keep me" and registered(ws)
+""")
+
+
+class WorkspaceLegacyUnlinkTests(_WorkspaceChildCase):
+    def test_unlinked_legacy_record_revokes_snapshot_for_a_closed_failed_ticket(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from arete.store import tasks
+
+ticket = tasks.task_add(repo.name, "closed task", reserved_id="t-a123")
+tasks.task_set_state(ticket, "closed")
+ws, c, _, wid = checkout(ticket, "failed")
+(ws / ".venv").mkdir()
+file = ws / ".venv/output"
+file.write_text("keep me")
+workspace.note_made(ws, [c])
+assert ".venv/" in workspace.made_before(ws)
+workspace.made_record(ws).unlink()
+assert workspaces.backfill(cfg) == 1
+workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert row["state"] == "held" and row["held_by"] == [".venv/"]
+assert workspaces.files(wid) == workspace.made_before(ws) == {}
+assert not (row["salt"] or row["heads"] or row["onto"] or row["retained"])
+assert file.read_text() == "keep me"
+""")
+
+
+class WorkspaceLegacySweepTests(_WorkspaceChildCase):
+    def test_sweep_rechecks_saved_base_under_ticket_lock_after_backfill(self):
+        self.run_child(WORKSPACE_REPO + LEGACY_WRITE + r"""
+from unittest.mock import patch
+from arete.store import runs
+
+ws, _, _, wid = checkout("7", "done")
+newer = workspace.made_before(ws) | {"\0onto ": "saved-after-backfill"}
+backfill = workspaces.backfill
+
+def finish_legacy_writer(cfg):
+    backfill(cfg)
+    with util.lock(runs.run_lock("pipeline", repo.name, "7")) as got:
+        assert got
+        legacy_write(ws, newer)
+
+with patch.object(workspaces, "backfill", side_effect=finish_legacy_writer):
+    workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert ws.is_dir() and registered(ws)
+assert row["state"] == "kept" and row["onto"] == {"": "saved-after-backfill"}
+assert row["sweep_attempts"] == 0
+""")
+
+
+class WorkspaceLegacyScratchTests(_WorkspaceChildCase):
+    def test_scratch_refresh_uses_new_snapshot_and_keeps_unrelated_entries(self):
+        self.run_child(LEGACY_WRITE + r"""
+from arete import config, paths, workspace
+from arete.store import workspaces
+
+cfg = config.Config()
+for ticket, previously_retained in (("7", True), ("8", False)):
+    ws = paths.WORKTREES_DIR / f"sample-{ticket}"
+    ws.mkdir()
+    (ws / "output").write_text("before scratch")
+    wid = workspaces.claim(ws, "sample", ticket, "old-run")
+    workspace.note_made(ws, [])
+    made = workspace.made_before(ws)
+    held = {"roots": ["fixture-root"], "names": ["output"]}
+    if previously_retained:
+        legacy_write(ws, made | {"\0retained": held})
+        assert workspaces.backfill(cfg) == 1
+    latest = made | {"\0retained": held, "\0onto ": "new-base", "\0salt": "new-salt",
+                     "output": "old-output", "other": "preserved"}
+    legacy_write(ws, latest)
+    (ws / "output").write_text("after scratch")
+    assert workspace.refresh_released(ws, "fixture-root")
+    latest.pop("\0retained")
+    latest["output"] = workspace.fingerprint(ws / "output", "new-salt")
+    assert json.loads(workspace.made_record(ws).read_text()) == workspace.made_before(ws) == latest
+    assert workspaces.get(wid)["onto"] == {"": "new-base"}
+""")
+
+
+class WorkspaceSweepTests(_WorkspaceChildCase):
+    def test_sweep_reconciles_runs_retries_holds_and_prunes(self):
+        self.run_child(WORKSPACE_REPO + r"""
+import shutil
+from unittest.mock import patch
+from arete import heartbeat, tracker
+from arete.store import runs, tasks
+
+merged, _, _, mid = checkout("1", "merged")
+locked, _, _, lid = checkout("2", "done")
+blocked, c, _, bid = checkout("3", "merged")
+hand = blocked / "hand.txt"
+hand.write_text("by hand\n")
+gone, _, _, gid = checkout("4", "done")
+shutil.rmtree(gone)
+failed, _, _, fid = checkout("5", "failed")
+running, _, _, rid = checkout("6", "running")
+local = tasks.task_add(repo.name, "closed task", reserved_id="t-a123")
+tasks.task_set_state(local, "closed")
+closed, _, _, cid = checkout(local, "failed")
+record.start("pipeline", repo=repo.name, issue="1", status="failed", only_step="build")
+with util.lock(runs.run_lock("pipeline", repo.name, "2")) as got:
+    assert got
+    with patch.object(tracker, "for_repo", side_effect=AssertionError("external tracker lookup")):
+        workspaces.sweep(cfg)
+assert not merged.exists() and not registered(merged) and workspaces.get(mid)["state"] == "removed"
+assert not gone.exists() and not registered(gone) and workspaces.get(gid)["state"] == "removed"
+assert not closed.exists() and workspaces.get(cid)["state"] == "removed"
+assert locked.exists() and workspaces.get(lid)["state"] == "live"
+assert running.exists() and workspaces.get(rid)["state"] == "live"
+assert failed.exists() and workspaces.get(fid)["state"] == "kept"
+assert workspaces.get(fid)["kept_reason"] == "failed"
+row = workspaces.get(bid)
+assert row["state"] == "held" and row["held_by"] == ["hand.txt"]
+assert row["sweep_attempts"] == 1 and row["last_sweep_at"] and "hand.txt" in row["last_sweep_error"]
+assert hand.read_text() == "by hand\n" and "hand.txt" in heartbeat.check_workspaces()[0].detail
+hand.unlink()
+notes = blocked / "notes.txt"
+notes.write_text("edited by hand\n")
+assert workspace.workspace_blockers(blocked, [c]) == []
+workspaces.sweep(cfg)
+assert workspaces.get(bid)["held_by"] == ["notes.txt"]
+assert notes.read_text() == "edited by hand\n"
+util.git(["restore", "notes.txt"], blocked)
+workspaces.sweep(cfg)
+row = workspaces.get(bid)
+assert not blocked.exists() and not registered(blocked) and row["state"] == "removed"
+assert row["sweep_attempts"] == 3 and not row["last_sweep_error"]
+""")
+
+    def test_sweep_protects_kept_bases_and_unpublished_commits(self):
+        self.run_child(WORKSPACE_REPO + r"""
+saved, _, _, saved_id = checkout("1", "done", onto="saved-base")
+operator, _, _, operator_id = checkout("2", "done")
+workspaces.change(workspaces.get(operator_id), state="kept", kept_reason="operator")
+unpublished, _, _, unpublished_id = checkout("3", "done")
+util.git([*identity, "commit", "--allow-empty", "-qm", "local change"], unpublished)
+released, _, _, released_id = checkout("4", "pr")
+workspaces.change(workspaces.get(released_id), state="released")
+workspaces.sweep(cfg)
+assert saved.exists() and workspaces.get(saved_id)["state"] == "kept"
+assert operator.exists() and workspaces.get(operator_id)["sweep_attempts"] == 0
+row = workspaces.get(unpublished_id)
+assert unpublished.exists() and row["state"] == "held"
+assert "not on origin" in row["last_sweep_error"]
+assert not released.exists() and workspaces.get(released_id)["state"] == "removed"
+""")
+
+
+class WorkspaceSweepRecoveryTests(_WorkspaceChildCase):
+    def test_release_retries_after_a_filesystem_error_even_with_an_open_pr(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from unittest.mock import patch
+
+ws, c, _, wid = checkout("7", "pr")
+with patch.object(workspace, "remove_checkouts", side_effect=OSError("try again")):
+    try:
+        workspace.remove_workspace(ws, [c])
+    except OSError:
+        pass
+    workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert row["state"] == "released" and row["sweep_attempts"] == 1
+assert row["last_sweep_error"] == "try again" and ws.exists()
+workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert row["state"] == "removed" and row["sweep_attempts"] == 2 and not row["last_sweep_error"]
+assert not ws.exists() and not registered(ws)
+""")
+
+
+class WorkspaceLockedReleaseTests(_WorkspaceChildCase):
+    def test_git_lock_keeps_release_retryable_until_unlock_with_pr_open(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from arete import pipeline, tracker
+
+ws, c, rid, wid = checkout("7", "pr")
+run = pipeline.Run(rid, repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(cfg, repo, "7"), tid="7")
+run.dir.mkdir(parents=True, exist_ok=True)
+util.git(["worktree", "lock", str(ws)], src)
+assert not pipeline.release_workspace(run, ws, [c])
+workspace.remove_worktree(repo, ws, owner=rid)
+assert workspaces.get(wid)["state"] == "released"
+assert ws.is_dir() and registered(ws)
+
+workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert row["state"] == "released" and row["sweep_attempts"] == 1
+assert "locked" in row["last_sweep_error"] and registered(ws), row
+
+util.git(["worktree", "unlock", str(ws)], src)
+workspaces.sweep(cfg)
+row = workspaces.get(wid)
+assert row["state"] == "removed" and row["sweep_attempts"] == 2 and not row["last_sweep_error"], row
+assert not ws.exists() and not registered(ws)
+""")
+
+
+class WorkspaceCleanupOutcomeTests(_WorkspaceChildCase):
+    def test_published_run_settles_with_pr_when_workspace_cleanup_fails(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from dataclasses import replace
+from unittest.mock import patch
+from arete import flows, pipeline, scratch
+from arete.store import runs, tasks
+
+repo = replace(repo, tracker="local", pipeline=True)
+cfg.repos = [repo]
+ticket = tasks.task_add(repo.name, "Finish with published changes")
+ws = paths.WORKTREES_DIR / f"{repo.name}-{ticket}"
+pr = "https://github.com/test/sample/pull/12"
+c = workspace.Checkout("", repo.github, src, ws, "main", pr=pr)
+workspace.add_worktree(c, f"fixture-{ticket}", c.origin_base)
+
+def drive(flow):
+    job = flow.ctx
+    job.branch, job.checkouts = f"fixture-{ticket}", [c]
+    pipeline.claim_workspace(job.run, ws, [c])
+    with patch.object(workspace, "remove_checkouts", side_effect=PermissionError("cleanup denied")):
+        return flows.finish(flow, "pr", summary="published changes")
+
+with (patch.object(config, "load", return_value=cfg), patch.object(scratch, "process_ids", return_value=set()),
+      patch.object(scratch, "service_labels", return_value={})):
+    code = pipeline.run_issue(repo.name, ticket, force=True, script=pipeline.Script("adw", drive))
+run = runs.newest_whole_run(repo.name, ticket)
+assert code == 0 and run["status"] == "pr" and run["pr_url"] == pr and run["finished"], run
+row = workspaces.open_for(ws.name)
+assert row["state"] == "released" and row["owner_run"] == run["id"] and row["released_at"], row
+assert "cleanup denied" in (paths.RUNS_DIR / run["id"] / "run.log").read_text()
+assert ws.is_dir() and registered(ws)
+""")
+
+    def test_stopping_run_answers_and_writes_report_when_workspace_cleanup_fails(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from unittest.mock import patch
+from arete import flows, run_lines, tasks
+from arete.store import runs, tasks as task_store
+
+ticket = task_store.task_add(repo.name, "Stop while waiting for an answer")
+ws, c, rid, wid = checkout(ticket, "needs-info")
+with (patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}),
+      patch.object(workspace, "remove_checkouts", side_effect=PermissionError("cleanup denied"))):
+    result = tasks.let_go(cfg, repo, runs.run_get(rid), "stopped")
+
+assert result["state"] == "stopped" and "cleanup denied" in result["why"], result
+assert runs.run_get(rid)["status"] == "stopped"
+assert any(line.get("event") == "report" and line.get("status") == "stopped" for line in run_lines.read(rid))
+row = workspaces.get(wid)
+assert row["state"] == "released" and row["released_at"] and ws.is_dir() and registered(ws), row
+""")
+
+
+class WorkspaceSweepIsolationTests(_WorkspaceChildCase):
+    def test_unlink_error_for_one_folder_does_not_skip_other_rows_or_orphans(self):
+        self.run_child(r"""
+import os
+from unittest.mock import patch
+from arete import config, paths, serve, util
+from arete.store import workspaces
+
+gone = paths.WORKTREES_DIR / "sample-missing"
+missing = workspaces.create(gone.name, repo="sample", ticket="missing", state="released")
+other = workspaces.create("sample-other", repo="sample", ticket="other", state="kept")
+assert not gone.exists()
+orphan = paths.WORKTREES_DIR / "sample-orphan"
+orphan.mkdir()
+(orphan / "hand.txt").write_text("keep me")
+old = util.now().timestamp() - 8 * 86400
+os.utime(orphan, (old, old))
+unlink = workspaces.unlink_record
+
+def unlink_record(ws):
+    if ws == gone:
+        raise PermissionError("unreadable legacy record")
+    unlink(ws)
+
+with patch.object(workspaces, "unlink_record", side_effect=unlink_record):
+    server = serve.Server()
+    server.cfg = config.Config()
+    server.sweep_workspaces()
+assert workspaces.get(missing["id"])["state"] == "released"
+assert workspaces.get(other["id"])["state"] == "removed"
+assert workspaces.open_for(orphan.name)["held_by"] == ["hand.txt"]
+""")
+
+
+class WorkspaceFinalizationTests(_WorkspaceChildCase):
+    def test_run_records_kept_workspace_before_exit(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from dataclasses import replace
+from unittest.mock import patch
+from arete import pipeline, scratch
+from arete.store import runs, tasks
+
+repo = replace(repo, tracker="local", pipeline=True)
+cfg.repos = [repo]
+ticket = tasks.task_add(repo.name, "Hold a workspace")
+ws = paths.WORKTREES_DIR / f"{repo.name}-{ticket}"
+c = workspace.Checkout("", repo.github, src, ws, "main")
+workspace.add_worktree(c, f"fixture-{ticket}", c.origin_base)
+
+def drive(flow):
+    pipeline.claim_workspace(flow.ctx.run, ws, [c])
+    (ws / ".venv").mkdir()
+    (ws / ".venv/output").write_text("kept by the run")
+    return "failed", "fixture failure", ""
+
+with (patch.object(config, "load", return_value=cfg), patch.object(scratch, "process_ids", return_value=set()),
+      patch.object(scratch, "service_labels", return_value={}), patch.object(pipeline, "keep_edits")):
+    assert pipeline.run_issue(repo.name, ticket, force=True, script=pipeline.Script("adw", drive)) == 1
+row = workspaces.open_for(ws.name)
+run = runs.newest_whole_run(repo.name, ticket)
+assert row["state"] == "kept" and row["kept_reason"] == "failed" and row["owner_run"] == run["id"]
+assert ".venv/" in workspace.made_before(ws)
+""")
+
+
+class WorkspaceHelperTests(_WorkspaceChildCase):
+    def test_worktree_removal_snapshots_for_matching_owner(self):
+        self.run_child(WORKSPACE_REPO + r"""
+import os
+
+os.environ["ARETE_RUN_ID"] = "run-x"
+owned = workspace.make_worktree(repo, "main", "owned", "owned")
+row = workspaces.open_for(owned.name)
+assert row["owner_run"] == "run-x" and row["state"] == "live" and row["ticket"] == ""
+(owned / ".venv").mkdir()
+(owned / ".venv/output").write_text("run output")
+workspace.remove_worktree(repo, owned)
+assert workspaces.get(row["id"])["state"] == "removed" and not owned.exists() and not registered(owned)
+""")
+
+    def test_worktree_removal_holds_files_from_another_owner(self):
+        self.run_child(WORKSPACE_REPO + r"""
+import os
+
+os.environ["ARETE_RUN_ID"] = "run-x"
+other = workspace.make_worktree(repo, "main", "other", "other", owner="run-y")
+(other / ".venv").mkdir()
+(other / ".venv/output").write_text("someone else's output")
+workspace.remove_worktree(repo, other)
+row = workspaces.open_for(other.name)
+assert row["owner_run"] == "run-y" and row["state"] == "held" and row["held_by"] == [".venv/"]
+assert (other / ".venv/output").is_file() and registered(other)
+""")
+
+
+class WorkspaceRuleWorkerTests(_WorkspaceChildCase):
+    def test_detached_rule_filing_uses_the_proposals_run_for_cleanup(self):
+        self.run_child(WORKSPACE_REPO + r"""
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
+from arete import gh, miner
+from arete.store import approvals
+
+assert "ARETE_RUN_ID" not in os.environ
+rid = record.start("miner", status="done")
+approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
+                                change="Add a rule", why="fixture"), "approve")
+proposal, = approvals.proposals(status=["approve"])
+ws = paths.WORKTREES_DIR / f"{repo.name}-rule-{proposal['id']}"
+
+def apply(cfg, run_id, wt, props):
+    assert wt == ws and run_id == rid
+    assert workspaces.open_for(ws.name)["owner_run"] == rid
+    (wt / ".venv").mkdir()
+    (wt / ".venv/output").write_text("generated during rule filing")
+    return SimpleNamespace(ok=False, error="apply refused")
+
+with (patch.object(config, "load", return_value=cfg), patch.object(gh, "default_branch", return_value="main"),
+      patch.object(miner, "apply_in", side_effect=apply)):
+    try:
+        miner.file_rule(proposal["id"])
+    except RuntimeError as error:
+        assert "apply refused" in str(error)
+    else:
+        raise AssertionError("failed apply was reported as filed")
+row, = workspaces.by_state("removed")
+assert row["name"] == ws.name and row["owner_run"] == rid
+assert not ws.exists() and not registered(ws)
+assert approvals.proposal(proposal["id"])["status"] == "approve"
+""")
+
+
+WORKSPACE_SCHEMA_22 = r"""
+from unittest.mock import patch
+from arete import paths
+from arete.store import db
+
+chain = db.migrations.load()
+previous = 22
+with patch.object(db.migrations, "load", return_value=chain[:previous]):
+    db.migrate()
+
+def schema_version():
+    with db.reader() as c:
+        return c.execute("PRAGMA user_version").fetchone()[0]
+
+assert schema_version() == previous
+"""
+
+
+class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
+    def test_authorized_file_rule_worker_migrates_before_moving_proposal(self):
+        self.run_child(WORKSPACE_SCHEMA_22 + r"""
+import os
+from argparse import Namespace
+from arete import config, control, miner, record
+from arete.commands.tasks import cmd_file_rule
+from arete.store import approvals
+
+repo = config.Repo("sample", paths.WORKTREES_DIR)
+cfg = config.Config(repos=[repo])
+with patch.object(db, "NEEDED", previous):
+    rid = record.start("miner", status="done")
+    approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
+                                    change="Add a rule", why="fixture"), "approve")
+proposal, = approvals.proposals(status=["approve"])
+assert schema_version() == previous
+
+def push(cfg, repo, p):
+    assert schema_version() == db.LATEST
+    assert approvals.proposal(p["id"])["status"] == "filing"
+    return "main"
+
+with (patch.dict(os.environ, {control.WORKER_ENV: "file-rule"}), patch.object(db, "MIGRATE_WAIT_SECONDS", 0),
+      patch.object(config, "load", return_value=cfg), patch.object(miner, "push_rule", side_effect=push) as pushed,
+      patch.object(miner, "catch_up", return_value="filed") as caught_up):
+    assert cmd_file_rule(Namespace(id=proposal["id"], local=True)) == 0
+    pushed.assert_called_once()
+    caught_up.assert_called_once_with(repo, "main")
+assert approvals.proposal(proposal["id"])["status"] == "merged"
+""")
+
+
+class WorkspacePollPreviewTests(_WorkspaceChildCase):
+    def test_poll_preview_leaves_the_previous_schema_and_backups_alone(self):
+        self.run_child(WORKSPACE_SCHEMA_22 + r"""
+from arete import poll
+
+before = paths.DB_FILE.read_bytes()
+backups = sorted(paths.backups_dir().glob("*"))
+assert poll.poll(dry_run=True) == 0
+assert schema_version() == previous
+assert paths.DB_FILE.read_bytes() == before and sorted(paths.backups_dir().glob("*")) == backups
+""")
+
+
+class WorkspaceResearchNextTests(_WorkspaceChildCase):
+    def test_research_next_migrates_before_adopting_reports(self):
+        self.run_child(WORKSPACE_SCHEMA_22 + r"""
+from arete import research
+from arete.store import insights
+
+research.REPORTS_DIR.mkdir()
+research.report_file("FIX-7").write_text("# FIX-7: Restored report\n")
+with patch.object(research, "network_up_or_skip", return_value=False):
+    assert research.next_due() == 0
+assert schema_version() == chain[-1].n
+assert insights.research_get("FIX-7")["status"] == research.DONE
+""")
+
+
+class WorkspaceResearchRunTests(_WorkspaceChildCase):
+    def test_research_run_migrates_before_adopting_reports(self):
+        self.run_child(WORKSPACE_SCHEMA_22 + r"""
+from arete import research
+from arete.store import insights
+
+research.REPORTS_DIR.mkdir()
+research.report_file("FIX-7").write_text("# FIX-7: Restored report\n")
+with (patch.object(research, "ticket", return_value={"ref": "FIX-8"}),
+      patch.object(research, "research", return_value=(research.DONE, "finished"))):
+    assert research.run_now("FIX-8") == 0
+assert schema_version() == chain[-1].n
+assert insights.research_get("FIX-7")["status"] == research.DONE
+""")
+
+
+class WorkspaceSnapshotTests(_WorkspaceChildCase):
+    def test_snapshot_error_clears_fingerprints_and_logs(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from unittest.mock import patch
+
+ws, c, rid, wid = checkout("7", "failed", onto="base")
+run_dir = paths.RUNS_DIR / rid
+run_dir.mkdir(exist_ok=True)
+assert workspace.made_before(ws)
+(ws / "new").write_text("retain")
+with patch.object(workspace, "fingerprint", side_effect=OSError("fingerprint failed")):
+    workspace.note_made(ws, [c])
+row = workspaces.get(wid)
+assert row["owner_run"] == rid and not (row["salt"] or row["heads"] or row["onto"] or row["retained"])
+assert workspaces.files(wid) == {} and workspace.made_before(ws) == {}
+assert not workspace.made_record(ws).exists()
+assert "fingerprint failed" in (run_dir / "run.log").read_text()
+""")
+
+    def test_snapshot_keeps_rollback_json_in_sync_with_row(self):
+        self.run_child(WORKSPACE_REPO + r"""
+import json
+
+ws, c, rid, wid = checkout("7", "failed", onto="saved-base")
+(ws / "output").write_text("run output")
+workspace.note_made(ws, [c])
+row = workspaces.get(wid)
+saved = json.loads(workspace.made_record(ws).read_text())
+assert saved == workspace.made_before(ws)
+assert saved["\0salt"] == row["salt"] and row["salt"]
+assert saved["\0head "] == row["heads"][""] == util.git(["rev-parse", "HEAD"], ws).strip()
+assert saved["\0onto "] == row["onto"][""] == "saved-base"
+assert workspaces.files(wid) == {"output": saved["output"]}
+""")
+
+
+SCRATCH_RECORD = r"""
+import fcntl
+import os
+from contextlib import contextmanager
+from dataclasses import asdict
+from unittest.mock import patch
+from arete import scratch
+
+def pending_scratch(ws, rid):
+    run_dir = paths.RUNS_DIR / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    root = ws / (paths.SCRATCH_PREFIX + "fixture" + paths.SCRATCH_SUFFIX)
+    attempt = scratch.Attempt("a" * 64, "fixture", rid, "verify", str(ws), str(root), str(run_dir), {}, {})
+    data = dict(attempt=asdict(attempt), version=2, state="pending", diagnostic={},
+                source_mutations=False, run=scratch.identity(run_dir.stat()), producers={}, before=[])
+    with fixture_authority(create=True) as fd:
+        scratch.store(fd, key, data)
+        lease = os.open(attempt.selector + ".lease", os.O_CREAT | os.O_RDWR, 0o600, dir_fd=fd)
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return root, lease
+
+key = b"fixture signing material"
+# Fixture Git sees no authority directory. Scratch still reads signed records from a private store.
+authority = paths.CONFIG_DIR / "scratch-records"
+
+@contextmanager
+def fixture_authority(create=False):
+    if create:
+        authority.mkdir(mode=0o700, exist_ok=True)
+    with paths.directory_fd(authority) as fd:
+        yield fd
+
+@contextmanager
+def fixture_registry():
+    with fixture_authority() as fd:
+        yield fd, key
+
+@contextmanager
+def scratch_records():
+    with (patch.object(scratch, "authority_fd", fixture_authority),
+          patch.object(scratch, "read_secret", return_value=key),
+          patch.object(scratch, "registry", fixture_registry)):
+        yield
+"""
+
+
+class WorkspaceScratchSweepTests(_WorkspaceChildCase):
+    def test_done_workspace_sweeps_after_scratch_released(self):
+        self.run_child(WORKSPACE_REPO + SCRATCH_RECORD + r"""
+from dataclasses import replace
+from arete import pipeline, serve
+from arete.store import runs, tasks
+
+repo = replace(repo, tracker="local", pipeline=True)
+cfg.repos = [repo]
+ticket = tasks.task_add(repo.name, "Finish with scratch pending")
+ws = paths.WORKTREES_DIR / f"{repo.name}-{ticket}"
+c = workspace.Checkout("", repo.github, src, ws, "main")
+workspace.add_worktree(c, f"fixture-{ticket}", c.origin_base)
+output = ws / ".venv/output"
+held = {}
+
+def drive(flow):
+    run = flow.ctx.run
+    pipeline.claim_workspace(run, ws, [c])
+    output.parent.mkdir()
+    output.write_text("before scratch settled")
+    root, lease = pending_scratch(ws, run.id)
+    held.update(root=root, lease=lease)
+    root.mkdir()
+    assert not pipeline.release_workspace(run, ws, [c])
+    held["first_salt"] = workspaces.open_for(ws.name)["salt"]
+    return "done", "finished with scratch pending", ""
+
+with (scratch_records(), patch.object(config, "load", return_value=cfg),
+      patch.object(scratch, "process_ids", return_value=set()),
+      patch.object(scratch, "service_labels", return_value={})):
+    try:
+        assert pipeline.run_issue(repo.name, ticket, force=True, script=pipeline.Script("adw", drive)) == 0
+        root = held["root"]
+        row = workspaces.open_for(ws.name)
+        wid = row["id"]
+        run = runs.newest_whole_run(repo.name, ticket)
+        assert run["status"] == "done" and run["finished"] and row["owner_run"] == run["id"]
+        assert row["state"] == "held" and root.name in row["held_by"]
+        made = workspace.made_before(ws)
+        assert made[workspace.SALT_KEY] != held["first_salt"]
+        assert root.name in made[workspace.RETAINED_KEY]["roots"]
+        assert ".venv/" in made[workspace.RETAINED_KEY]["names"]
+    finally:
+        if "lease" in held:
+            os.close(held["lease"])
+    root.rename(Path.cwd() / "archived-scratch")
+    output.write_text("after scratch settled")
+    with patch.object(scratch, "holders", return_value=[]):
+        with util.lock(runs.run_lock("pipeline", repo.name, ticket)) as got:
+            assert got
+            pipeline.retry_scratch()
+            assert workspaces.get(wid)["retained"] == made[workspace.RETAINED_KEY]
+        pipeline.retry_scratch()
+    assert workspace.RETAINED_KEY not in workspace.made_before(ws)
+    assert workspace.made_before(ws)[".venv/"] != made[".venv/"]
+    server = serve.Server()
+    server.cfg = cfg
+    server.sweep_workspaces()
+    row = workspaces.get(wid)
+    assert not ws.exists() and not registered(ws) and row["state"] == "removed" and not row["retained"]
+""")
+
+
+class WorkspaceScratchRemovalRequestTests(_WorkspaceChildCase):
+    def test_removal_request_preserves_scratch_guards(self):
+        self.run_child(WORKSPACE_REPO + SCRATCH_RECORD + r"""
+ws, _, rid, wid = checkout("7", "done")
+(ws / "hand.txt").write_text("by hand")
+workspaces.change(workspaces.get(wid), remove_asked_by="hand")
+with scratch_records():
+    root, lease = pending_scratch(ws, rid)
+    try:
+        root.mkdir()
+        workspaces.sweep(cfg)
+        row = workspaces.get(wid)
+        assert row["state"] == "held" and root.name in row["held_by"]
+        assert (ws / "hand.txt").is_file()
+    finally:
+        os.close(lease)
+    root.rename(Path.cwd() / "archived-scratch")
+    with patch.object(scratch, "holders", return_value=[]):
+        workspaces.sweep(cfg)
+assert not ws.exists() and workspaces.get(wid)["state"] == "removed"
+""")
+
+
+class WorkspaceSweepTimerTests(_WorkspaceChildCase):
+    def test_workspace_sweep_has_independent_timer_and_retries_failure(self):
+        self.run_child(r"""
+from concurrent.futures import Future
+from unittest.mock import Mock, patch
+from arete import config, serve
+from arete.store import workspaces
+
+server = object.__new__(serve.Server)
+server.cfg = config.Config()
+server.swept = 600.0
+server.workspaces_swept = 0.0
+server.workspace_sweep = None
+server.say = Mock()
+pending, retry = Future(), Future()
+server.pool = Mock()
+server.pool.submit.side_effect = [pending, retry]
+with patch.object(serve.time, "monotonic", return_value=601) as now:
+    server.sweep_workspaces_when_due()
+    server.pool.submit.assert_called_once_with(server.sweep_workspaces)
+    now.return_value = 1202
+    server.sweep_workspaces_when_due()
+    assert server.pool.submit.call_count == 1
+    with patch.object(workspaces, "sweep", side_effect=[RuntimeError("first line\nsecond line"), None]) as sweep:
+        server.sweep_workspaces()
+        server.say.assert_called_once()
+        message = server.say.call_args.args[0]
+        assert "first line" in message and "\n" not in message
+        pending.set_result(None)
+        server.sweep_workspaces_when_due()
+        server.sweep_workspaces()
+        assert sweep.call_count == 2 and server.pool.submit.call_count == 2
+assert server.swept == 600 and server.workspaces_swept == 1202
+""")
+
+
+class WorkspaceOrphanTests(_WorkspaceChildCase):
+    def test_old_file_bearing_folder_is_listed_in_inbox(self):
+        self.run_child(r"""
+import os
+from pathlib import Path
+from arete import config, inbox, paths, util
+from arete.store import workspaces
+
+cfg = config.Config(repos=[config.Repo("sample", Path.cwd()), config.Repo("sample-app", Path.cwd())])
+for name, old in (("sample-app-stray", True), ("sample-app-young", False)):
+    folder = paths.WORKTREES_DIR / name
+    folder.mkdir(parents=True)
+    (folder / "notes.txt").write_text("do not remove")
+    modified = util.now().timestamp() - old * 8 * 86400
+    os.utime(folder, (modified, modified))
+workspaces.sweep(cfg)
+row = workspaces.open_for("sample-app-stray")
+assert (row["state"], row["repo"], row["owner_run"], row["held_by"]) == ("held", "sample-app", "", ["notes.txt"])
+assert workspaces.open_for("sample-app-young") is None
+item, = inbox.list()
+assert item["kind"] == "workspace" and item["id"] == row["id"]
+""")
+
+    def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
+        self.run_child("""
+from pathlib import Path
+from arete import config, paths, util
+from arete.store import workspaces
+""" + SCRATCH_RECORD + r"""
+folders = {name: paths.WORKTREES_DIR / name for name in ("empty", "young", "recorded", "file")}
+for folder in folders.values():
+    (folder / "empty-subdir").mkdir(parents=True)
+(folders["file"] / "notes.txt").write_text("keep")
+old = util.now().timestamp() - 8 * 86400
+for name in ("empty", "recorded", "file"):
+    os.utime(folders[name], (old, old))
+with scratch_records():
+    _, lease = pending_scratch(folders["recorded"], "run-scratch")
+    try:
+        workspaces.sweep(config.Config())
+    finally:
+        os.close(lease)
+assert not folders["empty"].exists()
+assert all(folders[name].is_dir() for name in ("young", "recorded", "file"))
+""")
+
+
 class _WorkspaceWorkflowCase(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(suffix=".noindex"))).resolve()
@@ -257,7 +1241,6 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "config/verification-authority"))
         paths.CONFIG_FILE.write_text("max_parallel = 1\n")
         db.migrate()
-        self.enterContext(mock.patch.object(workspace, "HELD_FILE", state / "held-workspaces.json"))
         src = root / "repo"
         src.mkdir()
         util.git(["init", "-q", "-b", "main"], src)
@@ -269,7 +1252,7 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         self.repo = config.Repo("sample", src, github="test/sample")
         self.cfg = config.Config(repos=[self.repo])
 
-    def checkout(self, tid, status, *, owned=True, part="", **fields):
+    def checkout(self, tid, status, *, snapshot=True, part="", **fields):
         ws = paths.WORKTREES_DIR / f"{self.repo.name}-{tid}"
         c = workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
         workspace.add_worktree(c, f"arete/{tid}", "main")
@@ -279,10 +1262,9 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(self.cfg, self.repo, tid),
                            tid=tid)
         run.dir.mkdir(parents=True)
-        if owned:
+        pipeline.claim_workspace(run, ws, [c])
+        if snapshot:
             workspace.note_made(ws, [c], pipeline.workspace_owner(run, ws, [c]))
-        else:
-            workspace.note_made(ws, [c])
         return ws, c, run
 
     def registered(self, wt):
@@ -290,73 +1272,48 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         return f"worktree {wt}" in found.splitlines()
 
 
-class WorkspaceSweepTests(_WorkspaceWorkflowCase):
-    def test_sweep_distinguishes_waiting_workspaces_from_blocked_removal(self):
-        old = util.iso(util.now() - timedelta(days=30))
-        merged, _, _ = self.checkout("1", "merged", owned=False, started=old, finished=old)
-        running, _, _ = self.checkout("2", "running")
-        blocked, c, _ = self.checkout("3", "merged")
-        hand = blocked / "hand.txt"
-        hand.write_text("by hand\n")
-        self.assertEqual(workspace.remove_workspace(blocked, [c]), workspace.Release("held", ["hand.txt"]))
-        self.assertTrue(self.registered(blocked))
-        gone, _, _ = self.checkout("4", "done")
-        shutil.rmtree(gone)
-
-        workspace.cleanup_worktrees(cfg=self.cfg)
-        self.assertFalse(merged.exists())
-        self.assertFalse(workspace.made_record(merged).exists())
-        self.assertFalse(self.registered(merged))
-        self.assertFalse(self.registered(gone))
-        self.assertTrue(running.exists())
-        self.assertEqual(hand.read_text(), "by hand\n")
-        held, = workspace.held_summary()["rows"]
-        self.assertTrue(held["blocked"])
-        self.assertEqual(held["names"], ["hand.txt"])
-        self.assertEqual(json.loads(workspace.HELD_FILE.read_text()), [held])
-        self.assertIn("hand.txt", held["why"])
-        self.assertIn("hand.txt", heartbeat.check_workspaces()[0].detail)
-
-        hand.unlink()
-        notes = blocked / "notes.txt"
-        notes.write_text("edited by hand\n")
-        self.assertEqual(workspace.workspace_blockers(blocked, [c]), [])
-        self.assertEqual(workspace.workspace_blockers(blocked, [c], edits=True), ["notes.txt"])
-        workspace.cleanup_worktrees(cfg=self.cfg)
-        held, = workspace.held_summary()["rows"]
-        self.assertTrue(held["blocked"])
-        self.assertEqual(held["names"], ["notes.txt"])
-        self.assertEqual(notes.read_text(), "edited by hand\n")
-
-        util.git(["restore", "notes.txt"], blocked)
-        external, _, _ = self.checkout("5", "failed")
-        local_id = task_store.task_add(self.repo.name, "closed task", reserved_id="t-a123")
-        task_store.task_set_state(local_id, "closed")
-        closed, _, _ = self.checkout(local_id, "failed")
-        with mock.patch.object(tracker, "for_repo", side_effect=AssertionError("sweep read an external ticket")):
-            workspace.cleanup_worktrees(cfg=self.cfg)
-        self.assertFalse(blocked.exists())
-        self.assertFalse(workspace.made_record(blocked).exists())
-        self.assertFalse(closed.exists())
-        self.assertTrue(external.exists())
-        waiting, = workspace.held_summary()["rows"]
-        self.assertFalse(waiting["blocked"])
-        self.assertEqual(waiting["names"], [])
-        self.assertTrue(waiting["why"].endswith("waits for the ticket"))
-
-
 class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
     def test_pr_release_records_setup_files_and_removes_the_workspace(self):
-        ws, c, run = self.checkout("7", "pr")
-        made = workspace.made_before(ws)
-        self.assertEqual(made[workspace.OWNER_KEY]["run"], run.id)
-        self.assertIn(".venv/", made)
-        (c.wt / ".venv/pyvenv.cfg").write_text("changed during the run\n")
+        ws, c, run = self.checkout("7", "pr", snapshot=False)
+        wid = workspaces.open_for(ws.name)["id"]
         self.assertTrue(pipeline.release_workspace(run, ws, [c]))
         self.assertFalse(ws.exists())
-        self.assertFalse(workspace.made_record(ws).exists())
+        self.assertFalse((paths.STATE_DIR / "workspaces").exists())
         self.assertFalse(self.registered(ws))
         self.assertFalse((run.dir / "run.log").exists())
+        row = workspaces.get(wid)
+        self.assertEqual((row["state"], row["owner_run"]), ("removed", run.id))
+        self.assertTrue(row["removed_at"])
+        with db.reader() as connection:
+            changes = [json.loads(event["data"]) for event in connection.execute(
+                "SELECT data FROM events_log WHERE subject = ? AND kind = 'workspace.changed' ORDER BY seq",
+                (f"workspace:{wid}",))]
+        self.assertEqual([change["new"]["state"] for change in changes if change["old"] != change["new"]],
+                         ["live", "released", "removed"])
+        workspace.note_made(ws, [c])
+        self.assertEqual(workspaces.get(wid), row)
+
+    def test_pr_release_without_snapshot_holds_setup_files(self):
+        ws, c, run = self.checkout("7", "pr", snapshot=False)
+        with mock.patch.object(workspace, "note_made"):
+            self.assertFalse(pipeline.release_workspace(run, ws, [c]))
+        row = workspaces.open_for(ws.name)
+        self.assertEqual((row["state"], row["held_by"]), ("held", [".venv/"]))
+        self.assertGreater(row["bytes"], 0)
+        self.assertTrue(self.registered(ws))
+
+    def test_release_is_durable_before_filesystem_removal(self):
+        ws, c, _ = self.checkout("7", "done")
+        with mock.patch.object(workspace, "remove_checkouts", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                workspace.remove_workspace(ws, [c])
+        row = workspaces.open_for(ws.name)
+        self.assertEqual(row["state"], "released")
+        self.assertTrue(row["released_at"])
+        self.assertTrue(self.registered(ws))
+
+
+class WorkspaceRemovalGuardTests(_WorkspaceWorkflowCase):
 
     def test_removal_reports_files_that_arrive_under_lock_and_after_git(self):
         ws, c, _ = self.checkout("7", "done", part="api")
@@ -387,16 +1344,16 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
             release = workspace.remove_workspace(ws, [c])
         self.assertEqual(release, workspace.Release("held", ["hand.txt"]))
         self.assertEqual(outside.read_text(), "arrived after git\n")
-        self.assertTrue(workspace.made_record(ws).is_file())
+        self.assertTrue(workspace.made_before(ws))
         self.assertFalse(self.registered(c.wt))
         outside.unlink()
         self.assertEqual(workspace.remove_workspace(ws, [c]), workspace.Release("removed"))
         self.assertFalse(ws.exists())
-        self.assertFalse(workspace.made_record(ws).exists())
+        self.assertEqual(workspace.made_before(ws), {})
 
     def test_excluded_checkout_keeps_surviving_workspace_and_record(self):
         ws, c, _ = self.checkout("8", "done", part="api")
-        saved = workspace.made_record(ws).read_bytes()
+        saved = workspace.made_before(ws)
         excluded = ws / "closed"
         excluded.mkdir()
         (excluded / "hand.txt").write_text("preserved\n")
@@ -404,7 +1361,8 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
         release = workspace.remove_workspace(ws, [c], excluded={excluded})
 
         self.assertEqual(release.state, "removed")
-        self.assertEqual(workspace.made_record(ws).read_bytes(), saved)
+        self.assertEqual(workspace.made_before(ws), saved)
+        self.assertEqual(workspaces.open_for(ws.name)["state"], "kept")
         self.assertEqual((excluded / "hand.txt").read_text(), "preserved\n")
         self.assertFalse(self.registered(c.wt))
 
@@ -3273,6 +4231,7 @@ class VersionedApiTests(unittest.TestCase):
         coordinator.polls, coordinator.oncall = {}, None
         coordinator.job_running = mock.Mock(return_value=False)
         coordinator.sweeping = mock.Mock(return_value=False)
+        coordinator.workspace_sweep = None
         coordinator.note_once = mock.Mock()
 
         def busy():

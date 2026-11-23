@@ -43,7 +43,8 @@ from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
-from tests import parallel
+from arete.store import workspaces
+from tests import parallel, support
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -746,10 +747,19 @@ class RestoredPRRevisionTests(unittest.TestCase):
     base = "old-base"
     head = "pr-head"
     deny = '[limits]\ndeny = ["owner-only.txt"]\n'
+    workspace_db_seed: bytes | None = None
 
     def setUp(self):
         root = Path(tempfile.mkdtemp(prefix="arete-restored-pr-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(support.workspace_state(root))
+        if self.workspace_db_seed is None:
+            db.migrate()
+            type(self).workspace_db_seed = paths.DB_FILE.read_bytes()
+        else:
+            paths.ensure_dirs()
+            paths.DB_FILE.write_bytes(self.workspace_db_seed)
+        self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "verification-authority"))
         self.ws = root / "worktrees"
         self.tips, self.heads, self.prs = {}, {}, {}
         self.conflicts, self.merging = set(), set()
@@ -956,10 +966,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.enterContext(mock.patch.multiple(workspace, fetch=self.workspace_git["fetch"],
                                               uncommitted=self.workspace_git["uncommitted"]))
         self.enterContext(mock.patch.multiple(pipeline, **self.pipeline_git))
-        lock_dir = self.ws.parent / "locks"
-        lock_dir.mkdir()
-        self.enterContext(mock.patch.object(paths, "LOCKS_DIR", lock_dir))
-        self.enterContext(mock.patch.object(paths, "ensure_dirs"))
         self.enterContext(mock.patch.object(workspace, "drop_untracked_bytecode"))
         return c, shas[advance]
 
@@ -975,7 +981,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.config.write_text('[limits]\ndeny = ["owner-only.txt", "prior-only.txt", "upstream.txt", '
                                '"ignored-*.txt", "tracked-denied.txt", "tracked-absent.txt", "deleted-local.txt"]\n'
                                '[checks]\nfixture = "check workspace"\n')
-        self.enterContext(mock.patch.object(paths, "STATE_DIR", self.ws.parent / "state"))
         tracked = c.wt / "tracked-denied.txt"
         tracked.write_text("pre-worker content")
         absent = c.wt / "tracked-absent.txt"
@@ -1000,6 +1005,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         absent.write_text("parked edit on a path absent from the saved baseline")
         with (mock.patch.object(workspace, "leftovers", return_value=[c.prefix + p.name for p in (tracked, absent)]),
               mock.patch.object(workspace, "git", return_value=c.lease)):
+            pipeline.claim_workspace(self.run, self.ws, [c])
             self.workspace_git["note_made"](self.ws, [c])
         self.answer_owner()
 
@@ -1064,7 +1070,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
         c, moved = self.real_checkout("main")
         self.config.write_text('[limits]\ndeny = ["tracked-denied.txt", "tracked-absent.txt"]\n'
                                '[checks]\nfixture = "check workspace"\n')
-        self.enterContext(mock.patch.object(paths, "STATE_DIR", self.ws.parent / "state"))
         tracked = c.wt / "tracked-denied.txt"
         absent = c.wt / "tracked-absent.txt"
         tracked.write_text("pre-worker content")
@@ -1128,14 +1133,11 @@ class RestoredPRRevisionTests(unittest.TestCase):
         (sibling.wt / ".git" / "info" / "exclude").write_text("*.cache\n")
         self.enterContext(mock.patch.multiple(workspace, ignored_files=self.workspace_git["ignored_files"],
                                               uncommitted=self.workspace_git["uncommitted"]))
-        self.enterContext(mock.patch.object(paths, "STATE_DIR", self.ws.parent / "state"))
         recorded = sibling.wt / "recorded.cache"
         recorded.write_text("content left by Arete")
-        made = workspace.made_record(self.ws)
-        made.parent.mkdir(parents=True)
         salt = "fixture-salt"
-        made.write_text(json.dumps({workspace.SALT_KEY: salt,
-                                    sibling.prefix + recorded.name: workspace.fingerprint(recorded, salt)}))
+        workspaces.create(self.ws.name, salt=salt,
+                          files={sibling.prefix + recorded.name: workspace.fingerprint(recorded, salt)})
         self.workspace_git["note_made"](self.ws, [], excluded={c.wt, sibling.wt})
         self.assertIsNone(self.controller.restore_pr_targets(self.controller.data["prepared"]))
         self.assertEqual(self.job.closed_prs, {sibling.pr})
@@ -1807,7 +1809,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
               mock.patch.object(poll, "spawn_run", side_effect=start) as spawn,
               mock.patch.multiple(poll, network_up_or_skip=mock.Mock(return_value=True),
                                   settle_abandoned_runs=mock.DEFAULT, sync_labels=mock.DEFAULT,
-                                  retry_scratch=mock.DEFAULT, cleanup_worktrees=mock.DEFAULT, mark_loop=mock.DEFAULT),
+                                  retry_scratch=mock.DEFAULT, mark_loop=mock.DEFAULT),
               mock.patch.multiple(outcomes, sync_outcomes=mock.DEFAULT, sync_moves=mock.DEFAULT,
                                   sync_landings=mock.DEFAULT), redirect_stdout(StringIO()) as output):
             self.assertEqual(poll.poll(), 0, output.getvalue())
@@ -4912,6 +4914,7 @@ class CatchUpCleanupTests(unittest.TestCase):
     def setUp(self):
         root = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(support.workspace_state(root))
         self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "verification-authority"))
         self.enterContext(mock.patch.object(sandbox, "can_confine", return_value=False))
         self.wt = root / "worktree"
@@ -5318,8 +5321,8 @@ class CatchUpCleanupTests(unittest.TestCase):
             return protect(command, *positional, **kwargs)
 
         self.uncommitted.return_value = mock.DEFAULT
-        with (mock.patch.object(util.sandbox, "protected_command", side_effect=report_raw_name),
-              mock.patch.object(paths, "STATE_DIR", self.wt.parent)):
+        workspaces.claim(self.wt, "fixture", "7", "fixture-run")
+        with mock.patch.object(util.sandbox, "protected_command", side_effect=report_raw_name):
             self.assertEqual(util.git_records(args, self.wt), ["?? stray\ufffd"])
             workspace.note_made(self.wt, [self.checkout])
             made = workspace.made_before(self.wt)
@@ -5357,9 +5360,9 @@ class CatchUpCleanupTests(unittest.TestCase):
             self.enterContext(mock.patch.object(workspace, "open", side_effect=open_raw, create=True))
 
         self.assertEqual(workspace.ignored_files(self.wt), ["cache/"])
-        with mock.patch.object(paths, "STATE_DIR", self.wt.parent):
-            workspace.note_made(self.wt, [self.checkout])
-            made = workspace.made_before(self.wt)
+        workspaces.claim(self.wt, "fixture", "7", "fixture-run")
+        workspace.note_made(self.wt, [self.checkout])
+        made = workspace.made_before(self.wt)
 
         self.assertRegex(made["cache/"], r"^[0-9a-f]{64}$")
         self.assertTrue(workspace.head_recorded(made, self.checkout))
@@ -7503,17 +7506,18 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_resolver_question_cleans_its_ignored_file_and_names_moved_base(self):
         controller, checkout = self.controller()
         root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(root))
         checkout.wt = controller.job.ws = root / "checkout"
         ignored = checkout.wt / "ignored"
         ignored.mkdir(parents=True)
         (checkout.wt / ".git").touch()
         existing, created = ignored / "kept", ignored / "resolver"
         existing_untracked, untracked = checkout.wt / "kept", checkout.wt / "resolver"
-        for path in (existing, created, existing_untracked, untracked, checkout.wt / ".git",
-                     root / "workspaces" / "checkout.json"):
+        for path in (existing, created, existing_untracked, untracked, checkout.wt / ".git"):
             self.addCleanup(path.unlink, missing_ok=True)
         existing.write_bytes(b"keep me")
         existing_untracked.write_bytes(b"keep me too")
+        pipeline.claim_workspace(controller.run, checkout.wt, [checkout])
         refs = {"state": "OPEN", "isDraft": False, "headRefOid": "head", "baseRefName": "main",
                 "baseRefOid": "moved-base"}
 
@@ -7532,6 +7536,10 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                 return ["!! ignored/"]
             return [f"?? {name}" for name in names] if "--untracked-files=all" in args else []
 
+        def check_removal(ws, checkouts, made, *, excluded, force):
+            self.assertEqual(workspace.workspace_blockers(ws, checkouts, made=made, excluded=excluded, force=force), [])
+            return workspace.Release("removed")
+
         with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
@@ -7544,12 +7552,12 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "merge_moved_bases", side_effect=resolve),
               mock.patch.object(pipeline, "abort_merge") as abort,
               mock.patch.object(pipeline, "commit_and_push") as push,
-              mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
-              mock.patch.object(workspace, "remove_workspace", return_value=workspace.Release("removed")) as remove,
+              mock.patch.object(workspace, "scratch_left", return_value=[]),
+              mock.patch.object(workspace, "remove_workspace", wraps=workspace.remove_workspace) as remove,
+              mock.patch.object(workspace, "remove_checkouts", side_effect=check_removal),
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
-            self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]), [])
         hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
@@ -7559,7 +7567,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b"keep me")
         self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
         self.assertFalse(controller.run.owner_questions_blocked)
-        remove.assert_called_once_with(checkout.wt, [checkout])
+        remove.assert_called_once_with(checkout.wt, [checkout], by=controller.run.id)
         abort.assert_called_once_with(checkout.wt)
         push.assert_not_called()
 
@@ -7808,6 +7816,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.server = object.__new__(serve.Server)
         self.server.deploy_refusals = set()
         self.server.say = mock.Mock()
+        self.server.workspace_sweep = None
 
     def prepare_checkout(self, candidate):
         self.prepare_state()
@@ -8051,7 +8060,8 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.server.every_loop = self.server.live = []
         self.server.failing, self.server.logged = {}, {}
         actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dispatch", "approvals",
-                   "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks", "release_closed_when_due",
+                   "rotate_when_due", "prune_when_due", "sweep_when_due", "sweep_workspaces_when_due",
+                   "expire_asks", "release_closed_when_due",
                    "remind")
         with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
                                   **{action: mock.DEFAULT for action in actions}) as stages,
@@ -10697,8 +10707,8 @@ class MinerLifecycleTests(unittest.TestCase):
         self.prs = [{"html_url": self.URL, "pull_request": {}}]
         self.repo.parts = [config.Part("", self.repo.github)]
         self.layer.factory_path = "classic"
-        locks = self.root / "locks"
-        locks.mkdir()
+        self.enterContext(support.workspace_state(self.root))
+        db.migrate()
 
         def start_pipeline():
             with self.assertRaises(ReachedPipelineStart):
@@ -10706,7 +10716,6 @@ class MinerLifecycleTests(unittest.TestCase):
 
         with (
             mock.patch.multiple(pipeline.scratch, process_ids=set, service_labels=set),
-            mock.patch.multiple(pipeline.paths, LOCKS_DIR=locks, ensure_dirs=mock.DEFAULT),
             mock.patch.object(config, "load", return_value=self.cfg),
             mock.patch.object(pipeline, "pending_feedback", return_value=[]),
             mock.patch.multiple(pipeline.run_store, newest_whole_run=mock.Mock(return_value=None),
@@ -11336,7 +11345,8 @@ class MinerLifecycleTests(unittest.TestCase):
             self.assertEqual(commit.call_args.args[1], wt)
             self.assertIn(mock.call(["push", "-q", "--force-with-lease", "-u", "origin", self.BRANCH], wt, timeout=300),
                           git.call_args_list)
-            miner.workspace.remove_worktree.assert_called_once_with(self.repo, wt)
+            owner = miner.workspace.make_worktree.call_args.kwargs["owner"]
+            miner.workspace.remove_worktree.assert_called_once_with(self.repo, wt, owner=owner)
             gh.pr_create.assert_called_once()
             self.assertEqual(gh.pr_create.call_args.args[:3], (self.repo.github, self.BRANCH, "main"))
             self.assertEqual(gh.pr_create.call_args.kwargs["labels"], [miner.MINER_LABEL])

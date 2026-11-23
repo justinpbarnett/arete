@@ -71,6 +71,7 @@ from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import triage as triage_store
+from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
 
@@ -740,24 +741,37 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner | None:
-    earlier = workspace.owner_in(workspace.made_before(ws))
-    if run.alone:
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
+    row = workspaces.open_for(ws.name)
+    earlier = workspaces.owner_of(row) if row and (row["owner_run"] or row["legacy_owner"]) else None
+    if run.alone and earlier:
         return earlier
     created = earlier.created if earlier else ""
     return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
 
 
+def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
+    workspace.made_before(ws)
+    owner = workspace_owner(run, ws, checkouts)
+    workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
+    run.workspace = ws, checkouts
+
+
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
-    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
-                        excluded=run.closed_checkout_paths)
+    if run.closed_checkouts or run.catch_up_preserved:
+        workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
+                            excluded=run.closed_checkout_paths)
     if run.closed_checkouts:
         run.log(f"workspace kept at {ws}: it contains closed PR worktrees")
         return False
     if run.catch_up_preserved:
         run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
         return False
-    release = workspace.remove_workspace(ws, checkouts)
+    try:
+        release = workspace.remove_workspace(ws, checkouts, by=run.id)
+    except OSError as e:
+        run.log(f"workspace kept at {ws}: removal failed: {util.first_line(str(e), 300)}")
+        return False
     if release.state == "removed":
         return True
     names = release.held_by
@@ -1787,6 +1801,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     from .store import db
     from .store import zte as zte_store
 
+    db.migrate_on_demand()
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
         print(refusal)
@@ -1806,7 +1821,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = run_store.run_lock("pipeline", repo.name, tid)
-    with util.lock(lock) as got:
+    with workspaces.ticket_lock(repo.name, tid) as got:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -2035,7 +2050,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not zte_grant:
                 raise
             return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
-        pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
+        status, pr_url, passed, drive_entered, retaining_catch_up = "failed", "", None, False, False
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -2161,13 +2176,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace and not zte_grant:
-                if not (retaining_catch_up or run.catch_up_preserved) and (
-                        not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
-                    keep_edits(run)
-                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                    excluded=run.closed_checkout_paths)
-            slot.free()
+            try:
+                if run.workspace and not zte_grant:
+                    if not (retaining_catch_up or run.catch_up_preserved) and (
+                            not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
+                        keep_edits(run)
+                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
+                                        excluded=run.closed_checkout_paths)
+                    workspaces.keep(run.workspace[0], status)
+            finally:
+                slot.free()
         if run.catch_up_cleanup_park and (held := kept_heads(run)):
             try:
                 if parked := runlimits.metadata(run.id, "parked.json"):
@@ -2413,7 +2431,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     try:
         ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
                                                  main_layer.copy, preview_of=run.preview_of)
-        run.workspace = ws, checkouts
+        claim_workspace(run, ws, checkouts)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -4857,7 +4875,8 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
 
 
 def retry_scratch(days: float = 30) -> None:
-    for root in workspace.finalize_scratch():
+    pending_refresh: set[str] = set()
+    for root in workspace.finalize_scratch(pending_refresh=pending_refresh):
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained") and data["diagnostic"]:
@@ -4869,7 +4888,7 @@ def retry_scratch(days: float = 30) -> None:
     except OSError as e:
         print(f"verification scratch store unreadable: {e}")
     try:
-        for failure in scratch.settle(days):
+        for failure in scratch.settle(days, pending_refresh=pending_refresh):
             print(f"verification scratch settle failed: {failure}")
     except sandbox.ConfinementUnavailable:
         pass

@@ -30,6 +30,7 @@ from . import (
 )
 from .agent import READ_TOOLS, Result
 from .heartbeat import mark_loop, network_up_or_skip
+from .store import db
 from .store import insights as insights_store
 from .store import triage as triage_store
 
@@ -618,6 +619,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
             print(f"would research {todo[0]['ref'] if todo else 'nothing'}"
                   + (f"; {len(todo) - 1} more due after it" if len(todo) > 1 else ""))
             return 0
+        db.migrate_on_demand()
         tidy()
         if not network_up_or_skip("research", dry_run):
             return 1 if asked else 0
@@ -683,6 +685,7 @@ def run_now(ref: str, force: bool = False, dry_run: bool = False) -> int:
         if dry_run:
             print(f"would research {r['ref']}")
             return 0
+        db.migrate_on_demand()
         tidy()
         outcome, why = research(cfg, r, force=force, asked=True)
     print(f"{r['ref']}: {outcome}: {why}")

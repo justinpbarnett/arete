@@ -455,7 +455,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
             workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
         except workspace.RunFailed as e:
             return e.why
-    job.run.workspace = ws, made
+    pipeline.claim_workspace(job.run, ws, made)
     try:
         for c in made:
             if c.lease:
@@ -836,7 +836,7 @@ class Job:
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
                     raise workspace.RunFailed(why)
-        run.workspace = self.ws, self.checkouts
+        pipeline.claim_workspace(run, self.ws, self.checkouts)
         if stored and not reconciling_catch_up:
             opened(run, self.ticket)
             if not run.alone:
@@ -940,7 +940,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                 main_layer.copy, preview_of=run.preview_of, **exclusion)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
-        run.workspace = job.ws, checkouts
+        pipeline.claim_workspace(run, job.ws, checkouts)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind

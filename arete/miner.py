@@ -34,6 +34,7 @@ from .store import approvals as approvals_store
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import runs as runs_store
+from .store.db import migrate_on_demand
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -893,6 +894,7 @@ def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
 
 def file_rule(proposal_id: int) -> str:
     with util.lock(RULE_LOCK, wait=True):
+        migrate_on_demand()
         p = approvals_store.proposal(proposal_id)
         if not p or not approvals_store.move_proposal(proposal_id, ("approve", "filing"), "filing"):
             raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
@@ -909,9 +911,10 @@ def file_rule(proposal_id: int) -> str:
 
 def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
     base = gh.default_branch(repo.github)
-    wt = workspace.make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}")
+    run_id = p["run_id"]
+    wt = workspace.make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}", owner=run_id)
     try:
-        res = apply_in(cfg, p["run_id"], wt, [p])
+        res = apply_in(cfg, run_id, wt, [p])
         if not res.ok:
             raise RuntimeError(f"the apply step failed: {util.first_line(res.error)}")
         diff = diffguard.stage(wt)
@@ -925,7 +928,7 @@ def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
         git(["push", "-q", "origin", f"HEAD:{base}"], wt, timeout=300)
         return base
     finally:
-        workspace.remove_worktree(repo, wt)
+        workspace.remove_worktree(repo, wt, owner=run_id)
 
 
 def catch_up(repo: config.Repo, base: str) -> str:
@@ -944,7 +947,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
                branch: str) -> tuple[str, list[dict], str]:
     base = gh.default_branch(repo.github)
     resume = bool(gh.open_pr_url(repo.github, branch))
-    wt = workspace.make_worktree(repo, base, branch, "miner", resume=resume)
+    wt = workspace.make_worktree(repo, base, branch, "miner", resume=resume, owner=run_id)
     try:
         res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
@@ -982,12 +985,14 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
                             "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed, head
     finally:
-        workspace.remove_worktree(repo, wt)
+        workspace.remove_worktree(repo, wt, owner=run_id)
 
 
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
     paths.ensure_dirs()
     cfg = config.load()
+    if not dry_run:
+        migrate_on_demand()
     with util.lock(run_store.run_lock("miner")) as got:
         if not got:
             print("miner already running")

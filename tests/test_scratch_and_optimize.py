@@ -16,6 +16,8 @@ from unittest.mock import Mock, patch
 
 from arete import launchd, paths, poll, scratch, workspace
 from arete.lab import experiment, optimize
+from arete.store import workspaces
+from tests import support
 
 PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
@@ -170,12 +172,12 @@ class BundledXPCScratchTests(unittest.TestCase):
 
             (base / (selector + ".lease")).touch()
             with (patch.object(scratch, "registry", registry),
-                  patch.object(workspace, "made_record", return_value=base / "workspace-record"),
+                  support.workspace_state(base),
                   patch.object(scratch, "survey", return_value=scratch.View([], [], False)),
                   patch.object(scratch, "settle", return_value=[]), redirect_stdout(io.StringIO()) as output):
                 with registry() as (fd, key):
                     scratch.store(fd, key, data)
-                workspace.made_record(base).write_text(json.dumps({workspace.RETAINED_KEY: {"roots": [root.name]}}))
+                workspaces.create(base.name, retained={"roots": [root.name]})
                 with patch.dict(self.outputs, {"pid/20": "services = {\n}\n"}):
                     poll.retry_scratch()
                 retained = scratch.records()[0]
@@ -270,14 +272,13 @@ class AttemptScratchHoldersTests(ScratchRecordTests):
                                        diagnostic=scratch.holders_diagnostic(
                                            scratch.WAITING, [scratch.holder(worker, scratch.SUBMITTED)]))
                 ws = Path(attempt.workspace)
-                made = ws / "workspace-record"
-                made.write_text(json.dumps({workspace.RETAINED_KEY: {"roots": [Path(attempt.root).name]}}))
                 self.processes[worker.identity] = worker
                 with (patch.object(launchd.Table, "job", return_value=job),
                       patch.object(launchd, "sealed", return_value=True),
-                      patch.object(workspace, "made_record", return_value=made),
+                      support.workspace_state(self.base),
                       patch.object(scratch, "survey", return_value=scratch.View([], [], False)),
                       patch.object(scratch, "settle", return_value=[]), redirect_stdout(io.StringIO()) as output):
+                    workspaces.create(ws.name, retained={"roots": [Path(attempt.root).name]})
                     self.assertEqual(scratch.holders(self.record(attempt)), [])
                     self.processes[worker.identity] = replace(worker, uses_paths=True)
                     self.assertEqual(scratch.end(attempt, Path(attempt.run_dir))[2], [attempt.root])

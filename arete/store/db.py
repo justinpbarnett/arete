@@ -233,7 +233,12 @@ def migrate(contracts=True):
                 conn.close()
 
 
-def checked_connection(*, timeout: float | None = None):
+def _schema_key(identity):
+    return (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
+            getattr(identity, "st_birthtime", None), LATEST, NEEDED)
+
+
+def checked_connection(*, timeout: float | None = None, on_demand: bool = False):
     from .. import backup
 
     if backup.pending_restore():
@@ -241,7 +246,7 @@ def checked_connection(*, timeout: float | None = None):
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
-        if not paths.ISOLATED or timeout is not None:
+        if not on_demand and (not paths.ISOLATED or timeout is not None):
             raise missing_database() from None
         migrate()
         identity = paths.DB_FILE.stat()
@@ -254,10 +259,13 @@ def checked_connection(*, timeout: float | None = None):
             raise missing_database() from None
         raise
     try:
-        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
-               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
+        key = _schema_key(identity)
         if key not in _CHECKED:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if on_demand and version < NEEDED:
+                conn.close()
+                migrate()
+                return checked_connection()
             if paths.ISOLATED and version == 0 and timeout is None:
                 conn.close()
                 migrate()
@@ -441,6 +449,18 @@ def in_write():
 def ensure_schema() -> None:
     with db():
         pass
+
+
+def migrate_on_demand() -> None:
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        return
+    try:
+        if _schema_key(paths.DB_FILE.stat()) in _CHECKED:
+            return
+    except FileNotFoundError:
+        pass
+    checked_connection(on_demand=True).close()
 
 
 def quoted(name: str) -> str:
