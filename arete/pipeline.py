@@ -3807,6 +3807,10 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
     incoming_paths = {p for p in util.git_records(["diff", "--name-only", f"HEAD...{commit}"], c.wt)
                       if p not in conflict_paths and not denied(p)}
     supplemental = own | incoming_paths
+    added_paths = ["diff", "--no-renames", "--name-only", "--diff-filter=A"]
+    branch_additions = set(util.git_records([*added_paths, f"{commit}...HEAD"], c.wt))
+    branch_additions.intersection_update(util.git_records([*added_paths, commit, "HEAD"], c.wt))
+    move_sources = {p for p in branch_additions & (own | conflict_paths) if os.path.lexists(c.wt / p)}
     bash_rules = layer.builder_bash
     initialize_resolver_scratch(c.wt, bash_rules)
     scratch_markers = verification_scratch_markers(c.wt)
@@ -3815,6 +3819,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     restorations: set[str] = set()
+    move_destinations: set[str] = set()
     for n in range(1, tries + 1):
         scratch_roots = set(scratch_markers)
         untracked_before = workspace.untracked_files(c.wt)
@@ -3875,10 +3880,20 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
             made, names = parked
             tracked_edits.difference_update(names)
             tracked_edits.update(n for n in names if not workspace.recorded(made, c.wt, n, c.prefix))
-        touched = tracked_edits | new_untracked | changed_watched | restorations
-        if outside := sorted((touched - conflict_paths - supplemental) | invalidated_edits):
+        move_candidates = (new_untracked | move_destinations) & (untracked_after - scratch_after - parent_tracked)
+        move_candidates -= conflict_paths | supplemental | watched_before
+        deleted_in_folder = Counter(Path(p).parent for p in tracked_edits & move_sources
+                                    if not os.path.lexists(c.wt / p))
+        move_destinations = set()
+        for path in sorted(move_candidates):
+            folder = Path(path).parent
+            if deleted_in_folder[folder] and not path.endswith("/") and not denied(path):
+                move_destinations.add(path)
+                deleted_in_folder[folder] -= 1
+        touched = tracked_edits | new_untracked | changed_watched | restorations | move_candidates
+        if outside := sorted((touched - conflict_paths - supplemental - move_destinations) | invalidated_edits):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
-        if left := marked(c.wt, conflicts):
+        if left := marked(c.wt, [*conflicts, *sorted(move_destinations)]):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
             if n == tries:
                 raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
@@ -3886,6 +3901,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
             continue
         git(["add", "-u", "--", *conflicts, *sorted(tracked_edits & supplemental)], c.wt, env=literal_paths)
         additions = (touched & supplemental) - tracked_edits - (parent_tracked - restorations)
+        additions.update(move_destinations)
         ignored_restorations = additions & restorations & ignored_after
         if ignored_restorations:
             git(["add", "-f", "--", *sorted(ignored_restorations)], c.wt, env=literal_paths)
