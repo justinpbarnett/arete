@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from types import SimpleNamespace
+from uuid import uuid4
 
 from . import (
     alerts,
@@ -55,6 +57,7 @@ from . import (
     runner,
     sandbox,
     scratch,
+    scrub,
     slots,
     steps,
     tracker,
@@ -275,13 +278,25 @@ class AgentRun:
             run_lines.write(self.id, event, **fields)
 
     @contextmanager
-    def waiting(self, cause: str):
+    def waiting(self, cause: str, **detail):
         with ExitStack() as stack:
             if self.budget is not None:
                 stack.enter_context(self.budget.idling(cause))
-            if self.writes_lines:
-                stack.enter_context(run_lines.waiting(self.id, cause))
-            yield
+            if not self.writes_lines:
+                yield
+            elif detail:
+                since = util.iso()
+                self.write_line("wait", cause=cause, phase="start", at=since, **detail)
+                try:
+                    yield
+                finally:
+                    at = util.iso()
+                    seconds = (util.parse_iso(at) - util.parse_iso(since)).total_seconds()
+                    self.write_line("wait", cause=cause, phase="end", at=at, since=since,
+                                    minutes=round(max(0.0, seconds) / 60, 2), **detail)
+            else:
+                with run_lines.waiting(self.id, cause):
+                    yield
 
     def save(self, name: str, data) -> None:
         text = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
@@ -1146,22 +1161,54 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 
 @contextmanager
-def worker_suite_lane(layer: config.RepoLayer, run: AgentRun):
+def worker_suite_lane(layer: config.RepoLayer, run: AgentRun, suite: dict):
     with ExitStack() as stack:
         files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
         if not lanes.take_free(files):
-            run.log("checks: waiting for an agent's full suite run to finish")
-            with run.waiting("slot"):
+            with run.waiting("slot", resource="full-suite-lock", **suite):
+                run.log("checks: waiting for an agent's full suite run to finish")
                 while not lanes.take_free(files):
                     time.sleep(CHECK_LANE_POLL_SECONDS)
         yield
 
 
 @contextmanager
-def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with (slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
-          worker_suite_lane(layer, run)):
+def check_lane(layer: config.RepoLayer, run: AgentRun, suite: dict):
+    slot_run = SimpleNamespace(config=run.config, log=run.log,
+                               waiting=partial(run.waiting, resource="check-slot", **suite))
+    with (slots.check_slot(slot_run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
+          worker_suite_lane(layer, run, suite)):
         yield hold_fds
+
+
+def check_suite(run_id: str) -> dict:
+    suite = {"suite": f"{run_id}/checks/{uuid4().hex}"}
+    if calls := factory.inside(run_id):
+        suite.update(step=calls.step, **{"try": calls.n})
+    return suite
+
+
+def report_check_failures(run: AgentRun, attempt: str, failed: list[tuple[str, str, int]]) -> None:
+    if not failed or not isinstance(run, Run) or run.alone or run.dry_run:
+        return
+    from .store import orchestration, ticket_progress
+
+    try:
+        owner = run_store.run_get(run.id)
+        if (not owner or owner["kind"] != "pipeline" or not owner["repo"] or not owner["issue"]
+                or owner["only_step"] or owner["dry_run"] or owner["status"] == "dry-run"
+                or orchestration.find(run.id)):
+            return
+        evidence = []
+        hidden = scrub.secrets()
+        for name, command, code in failed:
+            name, command = json.loads(scrub.scrub(json.dumps([name, command], ensure_ascii=False), hidden))
+            cause = "check:" + orchestration.digest([name, command, code])
+            label = outbound.sanitize(outbound.screen(name), 100) or "Configured check"
+            evidence.append((cause, attempt, f"Check {label} failed again (exit {code})."))
+        ticket_progress.record(owner["repo"], owner["issue"], evidence=evidence)
+    except (OSError, sqlite3.Error, NoDatabase, IncompatibleSchema) as error:
+        run.log(f"could not record check progress: {type(error).__name__}")
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
@@ -1178,26 +1225,30 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
-    report, ok = [], True
+    suite = check_suite(run.id)
+    report, failed, ok = [], [], True
     cleanup_untracked = not defer_failed_cleanup
 
     def execute(items, hold_fds):
         nonlocal ok
         held = {"hold_fds": hold_fds} if hold_fds else {}
         for name, cmd in items:
-            with record.timed(run.id, "check", name=name, command=cmd) as check:
+            with record.timed(run.id, "check", name=name, command=cmd, **suite) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
-                check["exit"] = res.returncode
-            passed = res.returncode == 0
+                code = check["exit"] = res.returncode
+                if type(code) is int and code != 0:
+                    failed.append((name, cmd, code))
+            passed = code == 0
             ok = ok and passed
-            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
+            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {code})'}")
             if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
+                report.append(f"### {name} failed: `{cmd}` exit {code}\n```\n"
+                              f"{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
             else:
                 report.append(f"### {name} passed: `{cmd}`")
 
     try:
-        with check_lane(layer, run) as hold_fds:
+        with check_lane(layer, run, suite) as hold_fds:
             execute(quick, hold_fds)
             if slow and ok:
                 execute(slow, hold_fds)
@@ -1207,6 +1258,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             report.append("Targeted pass only; the full suite is still required before publication.")
         cleanup_untracked = cleanup_untracked or ok
     finally:
+        report_check_failures(run, suite["suite"], failed)
         if cleanup_untracked:
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)

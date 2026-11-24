@@ -65,6 +65,7 @@ TIMING_CATEGORIES = {
     "writing": "Writing", "checks": "Checks / verification", "review": "Review",
     "owner_wait": "Owner wait", "queue_wait": "Queue wait", "retry": "Retry",
 }
+CHECK_WAIT_BLOCKERS = {"check-slot": "A check slot is unavailable", "full-suite-lock": "The full-suite lock is in use"}
 
 
 class NotARunId(refusals.Invalid, ValueError):
@@ -209,7 +210,7 @@ def adaptive_activity(run_id: str) -> str:
     return " · ".join(stages)
 
 
-def running_activity(row: dict) -> tuple[str, str, str]:
+def running_activity(row: dict, blockers: list[dict]) -> tuple[str, str, str]:
     if row.get("stop_asked"):
         return "Stopping", "", "The run stops and records its result"
     try:
@@ -221,7 +222,8 @@ def running_activity(row: dict) -> tuple[str, str, str]:
         if line.get("carried"):
             continue
         event = line.get("event")
-        if event == "wait" and line.get("cause") in run_lines.WAIT_CAUSES:
+        if (event == "wait" and line.get("cause") in run_lines.WAIT_CAUSES
+                and not run_timing.check_wait_resource(line)):
             cause = line["cause"]
             if line.get("phase") == "start":
                 waits[cause] = line.get("at")
@@ -240,6 +242,10 @@ def running_activity(row: dict) -> tuple[str, str, str]:
             wait = "slot"
         elif slots.holding([row], "merge-wait"):
             return "Waiting", "The repository merge lease is in use", "The repository merge lease becomes available"
+        else:
+            for check_wait in reversed(blockers):
+                if check_wait["run_id"] == row["id"] and (label := CHECK_WAIT_BLOCKERS.get(check_wait.get("resource"))):
+                    return "Waiting", label, check_wait["next_event"]
     if wait:
         blocker, next_event = {
             "slot": ("A run slot is unavailable", "A run slot becomes available"),
@@ -267,10 +273,10 @@ def classic_tracker_question(run_id: str) -> str:
     return outbound.sanitize(str(question.get("summary") or ""), 300) or "An owner answer is needed"
 
 
-def ticket_activity(run: dict, queued: dict, recovery: dict) -> tuple[str, str, str]:
+def ticket_activity(run: dict, queued: dict, recovery: dict, blockers: list[dict]) -> tuple[str, str, str]:
     status = run.get("status")
     if status == "running":
-        return running_activity(run)
+        return running_activity(run, blockers)
     if status == "needs-info" and not run.get("stop_asked"):
         run_id = run["id"]
         asks = asks_store.asks_of(run_id, connect=foundation.reader)
@@ -328,10 +334,7 @@ def timing_lines(timing: dict) -> list[str]:
     return lines
 
 
-def lineage_timing(run_id: str, *, as_of: datetime) -> dict | None:
-    if not run_id:
-        return None
-    timing = run_timing.project(run_id, as_of=as_of)
+def lineage_timing(timing: dict | None) -> dict | None:
     if timing is None:
         return None
     keys = ("run_ids", "as_of", "elapsed_seconds", "elapsed_complete", "category_seconds",
@@ -345,24 +348,31 @@ def ticket_projection(repo: str, issue: str, *, queued: dict, recovery: dict, as
     if recorded_only and not saved:
         return None
     run = run_store.newest_live_whole_run(repo, issue) or {}
+    run_id = run.get("id", "")
+    timing_id = timing_run or run_id
+    timing = run_timing.project(timing_id, as_of=as_of) if timing_id else None
     if saved.get("active"):
         hold = saved["follow_up"]
-        activity = {"waiting": "Draft follow-up held", "verifying": "Verifying the draft follow-up",
-                    "owner-review": "Draft follow-up needs owner review"}[hold["state"]]
+        activity = {"waiting": "Draft waiting to retry verification", "verifying": "Verifying the draft follow-up",
+                    "owner-review": "Draft awaiting owner review after automatic retry"}[hold["state"]]
         causes = (saved.get("blocker") or {}).get("causes", {})
         blocker = "; ".join(causes.values())
         next_event = saved["next_event"]
     else:
-        activity, blocker, next_event = ticket_activity(run, queued, recovery)
+        current_timing = timing
+        if run.get("status") == "running" and timing_id != run_id and run_id not in (timing or {}).get("run_ids", ()):
+            current_timing = run_timing.project(run_id, as_of=as_of)
+        blockers = current_timing["blockers"] if current_timing else []
+        activity, blocker, next_event = ticket_activity(run, queued, recovery, blockers)
         prs = (run.get("pr_url") or "").split()
         hold = {"state": "pr", "prs": prs, "draft": None} if run.get("status") == "pr" and prs else None
-    return {"repo": repo, "issue": issue, "ticket": tracker.issue_name(repo, issue), "run": run.get("id", ""),
+    return {"repo": repo, "issue": issue, "ticket": tracker.issue_name(repo, issue), "run": run_id,
             "activity": activity, "blocker": blocker, "next_event": next_event,
             "since": queued.get("since", "") if activity == queued.get("activity") else "",
             "url": queued.get("url", ""), "follow_up": hold,
             "prerequisites": saved.get("prerequisites", []), "prerequisite_issues": saved.get("prerequisite_issues", {}),
             "updates": ticket_updates(repo, issue) if saved else [],
-            "timing": lineage_timing(timing_run or run.get("id", ""), as_of=as_of)}
+            "timing": lineage_timing(timing)}
 
 
 def classic_question_tickets() -> list[tuple[str, str]]:
@@ -386,11 +396,15 @@ def ticket_status(running: list[dict], *, as_of: datetime) -> list[dict]:
         queued = ticket_queue()
         recovery = {(row["repo"], row["ticket"]): row for row in recovery_queue()}
         recent = run_store.runs(kind="pipeline", limit=RECENT_RUNS, connect=foundation.reader)
-        holds = (row for repo in config.load_or_problem()[0].repos for row in run_store.environment_holds(repo.name))
+        repos = [repo.name for repo in config.load_or_problem()[0].repos]
+        holds = (ticket_identity(row) for repo in repos for row in run_store.environment_holds(repo)
+                 if not row["released"] and tracked_run(row))
+        reviews = (ticket_identity(row) for repo in repos for row in run_store.environment_owner_reviews(repo)
+                   if tracked_run(row))
+        declared = ((repo, issue) for repo in repos for issue in ticket_progress.declared_prerequisite_tickets(repo))
         asks = {(row["repo"], row["ticket"]) for row in asks_store.open_asks(connect=foundation.reader) if row["repo"]}
         current = dict.fromkeys([*(ticket_identity(row) for row in running if tracked_run(row)), *queued, *recovery,
-                                 *sorted(asks), *classic_question_tickets(),
-                                 *(ticket_identity(row) for row in holds if tracked_run(row))])
+                                 *sorted(asks), *classic_question_tickets(), *holds, *reviews, *declared])
         candidates = dict.fromkeys([*current, *(ticket_identity(row) for row in recent if tracked_run(row))])
         return [row for repo, issue in candidates
                 if (row := ticket_projection(repo, issue, queued=queued.get((repo, issue), {}),

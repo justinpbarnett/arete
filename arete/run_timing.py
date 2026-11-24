@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from stat import S_ISREG
 
-from . import paths, record, run_lines, runlimits, util
+from . import paths, pipeline, record, run_lines, runlimits, util
 from .store import asks, orchestration, runs, sources, unblock
 from .store.db import reader
 
@@ -18,7 +19,10 @@ WAITS = {"person": ("owner_wait", "Owner answers the outstanding question"),
          "limit": ("queue_wait", "The provider limit resets"),
          "ci": ("queue_wait", "CI reports a result"),
          "prerequisite": ("queue_wait", "Verification can retry after its prerequisites are ready"),
+         "owner-review": ("owner_wait", "Owner reviews the draft and decides how to unblock verification"),
          "unblock": ("retry", "Recovery resolves the blocker or routes it to the owner")}
+CHECK_RESOURCES = {"check-slot": "A check slot becomes available",
+                   "full-suite-lock": "The full-suite lock becomes available"}
 PARENT_FIELDS = {"route": "continues", "repair": "source", "recovery": "source", "answer": "asked_in"}
 
 
@@ -31,6 +35,9 @@ class Span:
     end: datetime | None
     source_id: str | None = None
     wait: bool = False
+    suite: str | None = None
+    resource: str | None = None
+    step_attempt: tuple[str, int] | None = None
 
     def active(self, at: datetime) -> bool:
         return self.start <= at and (self.end is None or at < self.end)
@@ -38,6 +45,14 @@ class Span:
     def identity(self) -> dict:
         return {"run_id": self.run_id, "category": self.category, "since": iso(self.start),
                 "source_id": self.source_id}
+
+    def blocker(self) -> dict:
+        detail = {**self.identity(), "cause": self.activity, "next_event": WAITS[self.activity][1]}
+        if self.resource:
+            detail.update(resource=self.resource, suite=self.suite, next_event=CHECK_RESOURCES[self.resource])
+            if self.step_attempt:
+                detail.update(step=self.step_attempt[0], **{"try": self.step_attempt[1]})
+        return detail
 
 
 @dataclass(frozen=True)
@@ -63,11 +78,6 @@ def timestamp(value) -> datetime | None:
 
 def iso(at: datetime) -> str:
     return at.isoformat().replace("+00:00", "Z")
-
-
-def eligible(row: dict) -> bool:
-    return (row["kind"] == "pipeline" and not row.get("only_step") and not row.get("dry_run")
-            and row["status"] != "dry-run")
 
 
 def read_lines(run_id: str) -> list[dict]:
@@ -145,8 +155,8 @@ def settled_at(c, row: dict, start: datetime, timeline: list[dict]) -> datetime 
     return at
 
 
-def action_spans(actions: list[dict], windows: dict[str, Window]) -> list[Span]:
-    spans = []
+def action_spans(actions: list[dict], windows: dict[str, Window]) -> dict[str, list[Span]]:
+    spans = defaultdict(list)
     for action in actions:
         op, timing = action["op"], action["timing"]
         label = GATES.get(op, op)
@@ -156,31 +166,36 @@ def action_spans(actions: list[dict], windows: dict[str, Window]) -> list[Span]:
                 category = "retry" if action["role"] in REPAIRS else "writing"
             elif action["role"] in ("verify", "review"):
                 category = STEPS[action["role"]]
-        if not category or not (window := windows.get(timing["run_id"])):
-            continue
-        if not (start := timestamp(timing.get("started_at"))):
+        if not category or not (window := windows.get(timing["run_id"])) or not (
+                start := timestamp(timing.get("started_at"))):
             continue
         start = max(window.start, start)
         end = window.cap(timestamp(timing.get("finished_at")))
         if (end is not None and start <= end) or (end is None and window.running and action["state"] == "running"):
-            spans.append(Span(window.run_id, category, label, start, end, action["id"]))
+            spans[window.run_id].append(Span(window.run_id, category, label, start, end, action["id"]))
     return spans
 
 
-def step_spans(log: list[dict], window: Window, gates: list[Span]) -> list[Span]:
+def step_attempt(line: dict, default: int | None = None) -> tuple[str, int] | None:
+    step, attempt = line.get("step"), line.get("try", default)
+    return (step, attempt) if isinstance(step, str) and step and type(attempt) is int else None
+
+
+def suite_id(line: dict) -> str | None:
+    suite = line.get("suite")
+    return suite if isinstance(suite, str) and suite else None
+
+
+def step_spans(log: list[dict], window: Window) -> list[Span]:
     spans, starts = [], {}
     for line in log:
-        event, step = line.get("event"), line.get("step")
-        if event not in ("step_start", "step_end") or not isinstance(step, str):
+        event = line.get("event")
+        if event not in ("step_start", "step_end") or not (key := step_attempt(line, 1)):
             continue
-        attempt = line.get("try", 1)
-        if type(attempt) is not int or not (at := timestamp(line.get("ts"))):
-            continue
-        key = (step, attempt)
-        if line.get("carried") or line.get("preflight") or at < window.start:
+        if line.get("carried") or line.get("preflight") or not (at := timestamp(line.get("ts"))) or at < window.start:
             continue
         if event == "step_start":
-            atom = line.get("atom")
+            step, atom = key[0], line.get("atom")
             repair = step in REPAIRS or (isinstance(atom, str) and atom in REPAIRS)
             activity = "review" if atom == "review" and not repair else step
             category = "retry" if repair else STEPS.get(activity)
@@ -189,14 +204,11 @@ def step_spans(log: list[dict], window: Window, gates: list[Span]) -> list[Span]
         elif key in starts:
             start, category, activity = starts.pop(key)
             if start <= (end := window.cap(at)):
-                spans.append(Span(window.run_id, category, activity, start, end))
+                spans.append(Span(window.run_id, category, activity, start, end, step_attempt=key))
     if window.running and window.end is None:
-        spans.extend(Span(window.run_id, category, activity, start, None)
-                     for start, category, activity in starts.values())
-    return [span for span in spans if not any(gate.activity == span.activity and gate.category == span.category
-                                             and gate.start <= span.start
-                                             and (gate.end is None or span.end is not None and span.end <= gate.end)
-                                             for gate in gates)]
+        spans.extend(Span(window.run_id, category, activity, start, None, step_attempt=key)
+                     for key, (start, category, activity) in starts.items())
+    return spans
 
 
 def check_spans(timeline: list[dict], window: Window) -> list[Span]:
@@ -213,12 +225,71 @@ def check_spans(timeline: list[dict], window: Window) -> list[Span]:
             continue
         start = max(at, window.start)
         if start < end:
-            spans.add(Span(window.run_id, "checks", "checks", start, end))
-    return sorted(spans, key=lambda span: (span.start, span.end))
+            spans.add(Span(window.run_id, "checks", "checks", start, end,
+                           suite=suite_id(mark), step_attempt=step_attempt(mark)))
+    return sorted(spans, key=lambda span: (span.start, span.end, span.suite or ""))
 
 
-def wait_span(run_id, cause, start, end, source_id=None) -> Span:
-    return Span(run_id, WAITS[cause][0], cause, start, end, source_id, wait=True)
+def covers(gate: Span, step: Span) -> bool:
+    return (gate.activity == step.activity and gate.category == step.category and gate.start <= step.start
+            and (gate.end is None or step.end is not None and step.end <= gate.end))
+
+
+def unpaused(span: Span, waits: list[Span]):
+    start = span.start
+    for wait in sorted(waits, key=lambda pause: pause.start):
+        if span.end is not None and span.end <= wait.start:
+            break
+        if wait.end is not None and wait.end <= start:
+            continue
+        if start < wait.start:
+            yield replace(span, start=start, end=wait.start)
+        if wait.end is None:
+            return
+        start = max(start, wait.end)
+    if span.end is None or start < span.end:
+        yield replace(span, start=start)
+
+
+def activity_spans(actions: list[Span], steps: list[Span], commands: list[Span], waits: list[Span]) -> list[Span]:
+    gates = [action for action in actions if action.activity in GATES.values()]
+    covered = {step: {gate for gate in gates if covers(gate, step)} for step in steps}
+    suites, pauses = defaultdict(list), defaultdict(list)
+    for command in commands:
+        if command.suite:
+            suites[command.suite].append(command)
+    for wait in waits:
+        for command in suites.get(wait.suite, ()):
+            pauses[command].append(wait)
+        if not (scope := wait.step_attempt):
+            continue
+        active_steps = [step for step in steps if step.category == "checks" and step.active(wait.start)]
+        matches = [step for step in active_steps if step.step_attempt == scope]
+        for step in matches:
+            pauses[step].append(wait)
+        covering = {gate for step in (matches or active_steps) for gate in covered[step]}
+        candidates = [gate for gate in gates if gate.category == "checks" and gate.active(wait.start)
+                      and (gate in covering if matches else gate.activity == scope[0] and gate not in covering)]
+        if len(candidates) == 1:
+            pauses[candidates[0]].append(wait)
+    independent_steps = [step for step in steps
+                         if not any(pauses.get(step) == pauses.get(gate) for gate in covered[step])]
+    return [part for span in (*actions, *independent_steps, *commands)
+            for part in (unpaused(span, pauses[span]) if span in pauses else (span,))]
+
+
+def wait_span(run_id, cause, start, end, source_id=None, **scope) -> Span:
+    return Span(run_id, WAITS[cause][0], cause, start, end, source_id, wait=True, **scope)
+
+
+def saved_reply_at(run_id: str) -> datetime | None:
+    try:
+        saved = (run_lines.path(run_id).parent / pipeline.ANSWER_FILE).stat()
+        if S_ISREG(saved.st_mode) and saved.st_size:
+            return datetime.fromtimestamp(saved.st_mtime, UTC)
+    except (OSError, ValueError, OverflowError):
+        pass
+    return None
 
 
 def ask_spans(row: dict, log: list[dict], latest: bool) -> list[Span]:
@@ -228,9 +299,7 @@ def ask_spans(row: dict, log: list[dict], latest: bool) -> list[Span]:
     spans = []
     for ask in items:
         start, end = timestamp(ask["asked"]), timestamp(ask["answered"])
-        if start is None or (end is None and (not latest or ask["status"] != "open")):
-            continue
-        if end is not None and end < start:
+        if start is None or (end < start if end is not None else not latest or ask["status"] != "open"):
             continue
         cause = "unblock" if ask["recovery_route"] == "unblock" else "person"
         if cause == "person" and notified and start < notified:
@@ -238,19 +307,67 @@ def ask_spans(row: dict, log: list[dict], latest: bool) -> list[Span]:
             start = notified
         if end is None or start <= end:
             spans.append(wait_span(rid, cause, start, end, ask["id"]))
-    if not items and latest and row["status"] == "needs-info":
-        question = next((line for line in reversed(log) if line.get("event") == "question"), {})
+    if not items and row["status"] == "needs-info":
+        question = next((line for line in reversed(log) if line.get("event") == "question" and not line.get("carried")),
+                        {})
         if start := timestamp(question.get("ts")):
             cause = "unblock" if question.get("recovery") else "person"
-            spans.append(wait_span(rid, cause, start, None))
+            end = saved_reply_at(rid) if cause == "person" and not question.get("ask_id") else None
+            if end and end < start:
+                end = None
+            if end or latest:
+                spans.append(wait_span(rid, cause, start, end))
     return spans
+
+
+def check_wait_resource(line: dict) -> str | None:
+    resource = line.get("resource")
+    if line.get("cause") == "slot" and isinstance(resource, str) and resource in CHECK_RESOURCES:
+        return resource
+    return None
+
+
+def check_wait_spans(log: list[dict], window: Window, commands: list[Span]) -> list[Span]:
+    scopes = defaultdict(set)
+    for command in commands:
+        if command.suite and command.step_attempt:
+            scopes[command.suite].add(command.step_attempt)
+    suite_scopes = {suite: next(iter(attempts)) for suite, attempts in scopes.items() if len(attempts) == 1}
+    pending, spans = {}, []
+    for line in log:
+        if line.get("event") != "wait" or line.get("run") != window.run_id:
+            continue
+        resource, suite, at = check_wait_resource(line), suite_id(line), timestamp(line.get("at"))
+        if not resource or not suite or not at or at < window.start:
+            continue
+        if line.get("phase") == "start":
+            pending.setdefault((suite, resource, at), wait_span(
+                window.run_id, "slot", at, None, suite, suite=suite, resource=resource, step_attempt=step_attempt(line)))
+        elif line.get("phase") == "end" and (since := timestamp(line.get("since"))) and since <= at:
+            if (start := pending.pop((suite, resource, since), None)) and start.start < (end := window.cap(at)):
+                spans.append(replace(start, end=end, step_attempt=start.step_attempt or step_attempt(line)))
+    if window.end is not None:
+        spans.extend(replace(start, end=window.end) for start in pending.values() if start.start < window.end)
+    elif window.running:
+        spans.extend(pending.values())
+    return [replace(span, step_attempt=suite_scopes[span.suite])
+            if span.step_attempt is None and span.suite in suite_scopes else span for span in spans]
+
+
+def already_recorded(ask: Span, run_id: str, cause: str, since: datetime, end: datetime) -> bool:
+    if ask.run_id == run_id or ask.activity != cause:
+        return False
+    if ask.source_id is None:
+        return ask.end is not None and ask.start == since
+    return ask.start < end and (ask.end is None or since < ask.end)
 
 
 def wait_spans(log: list[dict], window: Window, recorded_asks: list[Span]) -> list[Span]:
     starts, spans = set(), []
     for line in log:
         cause = line.get("cause")
-        if line.get("event") != "wait" or not isinstance(cause, str) or cause not in WAITS:
+        if (line.get("event") != "wait" or not isinstance(cause, str) or cause not in WAITS
+                or check_wait_resource(line)):
             continue
         at, since = timestamp(line.get("at")), timestamp(line.get("since"))
         if at and line.get("phase") == "start":
@@ -261,8 +378,7 @@ def wait_spans(log: list[dict], window: Window, recorded_asks: list[Span]) -> li
             if end < since:
                 continue
             if cause in ("person", "unblock") and since < window.start and any(
-                    ask.run_id != window.run_id and ask.source_id is not None and ask.activity == cause
-                    and ask.start < end and (ask.end is None or since < ask.end) for ask in recorded_asks):
+                    already_recorded(ask, window.run_id, cause, since, end) for ask in recorded_asks):
                 continue
             spans.append(wait_span(window.run_id, cause, since, end))
     if window.running and window.end is None:
@@ -271,23 +387,29 @@ def wait_spans(log: list[dict], window: Window, recorded_asks: list[Span]) -> li
     return spans
 
 
-def prerequisite_waits(windows: dict[str, Window], rows: dict, candidates: list[dict], latest: str) -> list[Span]:
-    retries = {parent: at for row in candidates if (parent := row.get("environment_retry_of")) in windows
-               and (at := timestamp(row["started"]))}
+def environment_waits(windows: dict[str, Window], rows: dict, latest: str) -> list[Span]:
     spans = []
     for rid, window in windows.items():
-        retry_at = retries.get(rid)
-        waiting = rid == latest and rows[rid]["status"] == "pr"
-        if window.end is None or (retry_at is None and not waiting):
-            continue
         hold = runs.environment_hold(rid)
         if not hold.get("heads"):
             continue
-        if retry_at is not None:
-            if window.end < retry_at:
-                spans.append(wait_span(rid, "prerequisite", window.end, retry_at))
-        elif not hold["released"]:
-            spans.append(wait_span(rid, "prerequisite", window.end, None))
+        retry_id = hold["retry_id"]
+        queue_end = min((at for field in ("retry_started_at", "released_at") if (at := timestamp(hold[field]))),
+                        default=None)
+        queued = not hold["released"] and not retry_id and rid == latest and rows[rid]["status"] == "pr"
+        if window.end is not None and (queued if queue_end is None else window.end < queue_end):
+            spans.append(wait_span(rid, "prerequisite", window.end, queue_end))
+
+        if hold["release_state"] != "owner-review" or retry_id not in windows:
+            continue
+        review_start = timestamp(hold["owner_review_started_at"])
+        if review_start is None or review_start < windows[retry_id].start:
+            continue
+        review_end = timestamp(hold["owner_review_ended_at"])
+        reviewing = (hold["owner_review_ended_at"] is None and retry_id == latest and hold["retry_status"] == "pr"
+                     and not rows[retry_id]["stop_asked"])
+        if reviewing or (review_end is not None and review_start < review_end):
+            spans.append(wait_span(retry_id, "owner-review", review_start, review_end))
     return spans
 
 
@@ -297,7 +419,7 @@ def summarize(spans: list[Span], start: datetime, end: datetime) -> dict:
         lower, upper = max(start, span.start), min(end, span.end or end)
         if lower < upper:
             check_run = span.run_id if span.activity == "checks" else ""
-            key = (span.category, span.wait, check_run)
+            key = (span.category, span.wait, check_run, (span.suite or "") if check_run else "")
             changes[lower][key] += 1
             changes[upper][key] -= 1
     totals = dict.fromkeys(CATEGORIES, 0.0)
@@ -306,8 +428,10 @@ def summarize(spans: list[Span], start: datetime, end: datetime) -> dict:
     for at in sorted(changes):
         seconds = (at - last).total_seconds()
         active = Counter()
-        for (category, wait, check_run), count in counts.items():
-            active[category] += 1 if wait or check_run else count
+        named_check_runs = {run for _, _, run, suite in counts if suite}
+        for (category, wait, check_run, suite), count in counts.items():
+            if suite or check_run not in named_check_runs:
+                active[category] += 1 if wait or check_run else count
         for category in active:
             totals[category] += seconds
         if not active:
@@ -327,7 +451,7 @@ def project(run_id: str, *, as_of: datetime) -> dict | None:
     as_of = as_of.astimezone(UTC)
     with reader() as c:
         row = runs.run_get(run_id)
-        if not row or not eligible(row) or not row["issue"]:
+        if not row or not row["issue"]:
             return None
         candidates = runs.ticket_runs(row["repo"], row["issue"], limit=-1, whole=True, live=True)
         starts = {item["id"]: start for item in candidates
@@ -346,29 +470,28 @@ def project(run_id: str, *, as_of: datetime) -> dict | None:
         latest, latest_ticket = linked[-1], next(reversed(rows))
         actions = action_spans([action for root in roots for action in orchestration.timed_actions(root)], windows)
         owner_waits = [span for rid in linked for span in ask_spans(rows[rid], logs[rid], rid == latest_ticket)]
-        spans = [*actions, *owner_waits, *prerequisite_waits(windows, rows, candidates, latest_ticket)]
+        spans = [*owner_waits, *environment_waits(windows, rows, latest_ticket)]
         for rid, window in windows.items():
-            gates = [span for span in actions if span.run_id == rid and span.activity in GATES.values()]
-            spans.extend(step_spans(logs[rid], window, gates))
-            spans.extend(check_spans(timelines[rid], window))
-            spans.extend(wait_spans(logs[rid], window, owner_waits))
+            log = logs[rid]
+            commands = check_spans(timelines[rid], window)
+            check_waits = check_wait_spans(log, window, commands)
+            spans.extend(activity_spans(actions[rid], step_spans(log, window), commands, check_waits))
+            spans.extend((*check_waits, *wait_spans(log, window, owner_waits)))
         if latest == latest_ticket and not windows[latest].running:
-            for item in sources.tickets_passed_over():
-                if item["repo"] == row["repo"] and str(item["issue"]) == str(row["issue"]):
-                    if (since := timestamp(item["since"])) and starts[latest] <= since <= as_of:
-                        spans.append(wait_span(latest, "slot", since, None))
-                    break
+            passed = next((item for item in sources.tickets_passed_over()
+                           if (item["repo"], str(item["issue"])) == (row["repo"], str(row["issue"]))), {})
+            if (since := timestamp(passed.get("since"))) and starts[latest] <= since <= as_of:
+                spans.append(wait_span(latest, "slot", since, None))
     visible = [span for span in spans if span.start <= as_of]
     start = min([*(window.start for window in windows.values()), *(span.start for span in visible)])
     ends = [window.end or (as_of if window.running else window.start) for window in windows.values()]
     through = min(as_of, max([*ends, *(span.end or as_of for span in visible)]))
     active = sorted((span for span in visible if span.active(as_of)),
-                    key=lambda span: (span.start, span.run_id, span.activity, span.source_id or ""))
+                    key=lambda span: (span.start, span.run_id, span.activity, span.source_id or "", span.resource or ""))
     blockers = {}
     for span in active:
         if span.wait:
-            blockers.setdefault((span.run_id, span.activity, span.source_id),
-                                {**span.identity(), "cause": span.activity, "next_event": WAITS[span.activity][1]})
+            blockers.setdefault((span.run_id, span.activity, span.source_id, span.resource), span.blocker())
     return {"run_ids": linked, "current_run_id": latest, "as_of": iso(as_of),
             "running_run_ids": [rid for rid, window in windows.items() if window.running],
             "started_at": iso(start), "through_at": iso(through), "elapsed_seconds": (through - start).total_seconds(),

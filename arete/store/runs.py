@@ -158,15 +158,48 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
+HOLD_RELEASED = "run.environment-hold.released"
+OWNER_REVIEW_ENDED = "run.environment-hold.owner-review-ended"
+HOLD_LINKS = f"""
+FROM environment_holds h JOIN runs r ON h.run_id = r.id
+LEFT JOIN runs retry ON retry.environment_retry_of = r.id AND retry.dry_run = 0 AND retry.status != 'dry-run'
+LEFT JOIN events_log rel ON rel.subject = 'run:' || r.id AND rel.kind = '{HOLD_RELEASED}'
+LEFT JOIN events_log ended ON ended.subject = 'run:' || r.id AND ended.kind = '{OWNER_REVIEW_ENDED}'
+LEFT JOIN events_log legacy ON h.released = 1 AND rel.seq IS NULL AND retry.id IS NOT NULL
+    AND legacy.seq = (SELECT MIN(p.seq) FROM events_log p
+        WHERE p.kind = 'ticket.progress' AND p.subject = 'ticket:' || r.repo || ':' || r.issue
+          AND json_extract(p.data, '$.run') = r.id AND json_extract(p.data, '$.attempt') = retry.id
+          AND json_extract(p.data, '$.follow_up.state') = 'owner-review')
+"""
+HOLD_LIFECYCLE = """
+    h.released, rel.at AS released_at,
+    COALESCE(json_extract(rel.data, '$.state'), CASE WHEN legacy.seq IS NOT NULL THEN 'owner-review'
+                                                    WHEN h.released = 1 THEN 'legacy' END) AS release_state,
+    retry.id AS retry_id, retry.status AS retry_status, retry.started AS retry_started_at,
+    COALESCE(json_extract(rel.data, '$.owner_review_started_at'), legacy.at) AS owner_review_started_at,
+    ended.at AS owner_review_ended_at
+"""
+
+
 def environment_holds(repo: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
-            "SELECT r.*, retry.id AS retry_id, retry.status AS retry_status "
-            "FROM environment_holds h JOIN runs r ON h.run_id = r.id "
-            "LEFT JOIN runs retry ON retry.environment_retry_of = r.id "
-            "AND retry.dry_run = 0 AND retry.status != 'dry-run' "
-            "WHERE r.repo = ? AND r.dry_run = 0 AND h.released = 0 AND (r.status = 'pr' OR retry.id IS NOT NULL) "
-            "ORDER BY r.started, r.id", (repo,))]
+            f"SELECT * FROM (SELECT r.*, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE r.repo = ? AND r.dry_run = 0) "
+            "WHERE (released = 0 AND status NOT IN ('running', 'dry-run')) "
+            "OR (release_state = 'owner-review' AND owner_review_ended_at IS NULL) ORDER BY started, id", (repo,))]
+
+
+def environment_owner_review_active(row: dict) -> bool:
+    if row["retry_status"] != "pr":
+        return False
+    newest = newest_live_whole_run(row["repo"], row["issue"]) or {}
+    return newest.get("id") == row["retry_id"] and not newest.get("stop_asked")
+
+
+def environment_owner_reviews(repo: str) -> list[dict]:
+    with reader():
+        return [row for row in environment_holds(repo) if row["release_state"] == "owner-review"
+                and environment_owner_review_active(row)]
 
 
 def save_environment_hold(run_id: str, prs: list[tuple[str, int, str, str]]) -> None:
@@ -186,7 +219,8 @@ def held_environment_branch(repo: str, issue: str) -> str:
 
 def environment_hold(run_id: str) -> dict:
     with reader() as c:
-        row = c.execute("SELECT * FROM environment_holds WHERE run_id = ?", (run_id,)).fetchone()
+        row = c.execute(f"SELECT h.run_id, h.waits, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE h.run_id = ?",
+                        (run_id,)).fetchone()
         if row is None:
             return {}
         heads = {r["url"]: r["head"] for r in c.execute(
@@ -200,9 +234,24 @@ def set_environment_waits(run_id: str, waits: dict[str, tuple[str, int]]) -> Non
                   (json.dumps(waits, sort_keys=True), run_id))
 
 
-def release_environment_hold(run_id: str) -> None:
+def release_environment_hold(run_id: str, state: str = "inactive") -> None:
     with db() as c:
-        c.execute("UPDATE environment_holds SET released = 1, waits = '{}' WHERE run_id = ?", (run_id,))
+        if not c.execute("UPDATE environment_holds SET released = 1 WHERE run_id = ? AND released = 0",
+                         (run_id,)).rowcount:
+            return
+        data = {"state": state}
+        if state == "owner-review":
+            retry = c.execute(f"SELECT finished FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}",
+                              (run_id,)).fetchone()
+            data["owner_review_started_at"] = (retry and retry["finished"]) or util.iso()
+        events.emit(HOLD_RELEASED, f"run:{run_id}", cls="durable", data=data)
+
+
+def end_environment_owner_review(run_id: str) -> None:
+    with db():
+        hold = environment_hold(run_id)
+        if hold.get("owner_review_started_at") and not hold["owner_review_ended_at"]:
+            events.emit(OWNER_REVIEW_ENDED, f"run:{run_id}", cls="durable", data={})
 
 
 def environment_waits(repo: str, issue: str) -> list[tuple[str, int]]:

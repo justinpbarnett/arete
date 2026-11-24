@@ -1,11 +1,12 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from arete import paths, record, run_lines, run_timing, util
+from arete import config, paths, pipeline, poll, record, run_lines, run_timing, util
 from arete.store import asks, db, orchestration, runs, sources
 from tests.support import workspace_state
 
@@ -49,6 +50,10 @@ class RunTimingTests(unittest.TestCase):
         with path.open("a") as stream:
             stream.write(json.dumps({"run": rid, "ts": stamp(seconds), "event": event, **fields}) + "\n")
 
+    def check_wait(self, rid, at, suite, resource, *, since=None, **fields):
+        phase = {"phase": "start"} if since is None else {"phase": "end", "since": stamp(since)}
+        self.log(rid, at, "wait", cause="slot", at=stamp(at), suite=suite, resource=resource, **phase, **fields)
+
     def accept(self, lease, at, *ops):
         self.at(at)
         turn = orchestration.begin(lease, {}, None)
@@ -60,8 +65,21 @@ class RunTimingTests(unittest.TestCase):
         self.at(at)
         return orchestration.transition(lease, aid, state, result)
 
-    def project(self, rid, at):
-        return run_timing.project(rid, as_of=clock(at))
+    def project(self, rid, at, *linked):
+        timing = run_timing.project(rid, as_of=clock(at))
+        for member in linked:
+            self.assertEqual(timing, self.project(member, at), member)
+        return timing
+
+    def assert_timing(self, actual, *, categories=None, **expected):
+        if categories is not None:
+            empty = dict(writing=0, checks=0, review=0, owner_wait=0, queue_wait=0, retry=0)
+            expected["category_seconds"] = empty | categories
+        self.assertEqual({key: actual[key] for key in expected}, expected)
+
+    def step(self, rid, step, start, end, *, atom=None, **fields):
+        self.log(rid, start, "step_start", step=step, atom=atom, **fields)
+        self.log(rid, end, "step_end", step=step, **fields)
 
     def test_parallel_builders_waits_repair_and_resume_share_one_wall_clock(self):
         self.run_row("first", 5)
@@ -77,10 +95,9 @@ class RunTimingTests(unittest.TestCase):
                       (stamp(10), '{"writing":true,"role":"build"}', lease.root, legacy))
         self.transition(lease, right, 12, "running", writing=True, role="build")
         live = self.project("first", 15)
-        self.assertEqual(live["running_run_ids"], ["first"])
         self.assertEqual({a["source_id"] for a in live["active"]}, {left, right})
-        self.assertEqual(live["blockers"], [])
-        self.assertEqual(live["overlap"], [{"activity": {"writing": 2}, "seconds": 3}])
+        self.assert_timing(live, running_run_ids=["first"], blockers=[],
+                           overlap=[{"activity": {"writing": 2}, "seconds": 3}])
         self.transition(lease, refused, 16, "failed", writing=True, role="build")
         self.transition(lease, left, 18, "succeeded")
         self.transition(lease, legacy, 20, "succeeded")
@@ -93,9 +110,8 @@ class RunTimingTests(unittest.TestCase):
 
         check, = self.accept(lease, 23, "checks.run")
         self.transition(lease, check, 24, "running")
-        self.log("first", 25, "step_start", step="checks", **{"try": 1})
+        self.step("first", "checks", 25, 28, **{"try": 1})
         record.mark("first", "check", at=stamp(26), name="unit", seconds=2.5, exit=0)
-        self.log("first", 28, "step_end", step="checks", **{"try": 1})
         self.transition(lease, check, 29, "succeeded")
         self.log("first", 30, "step_start", step="review", **{"try": 1})
         self.log("first", 31, "step_end", step="review", carried="other", **{"try": 1})
@@ -105,10 +121,10 @@ class RunTimingTests(unittest.TestCase):
         asks.ask_add("ask", "first", "arete", "964", "plan", "plan", "Need a decision", "", [], {})
         self.settle("first", 38, "needs-info")
         owner = self.project("first", 42)
-        self.assertEqual(owner["elapsed_seconds"], 42)
-        self.assertEqual(owner["blockers"], [{"run_id": "first", "category": "owner_wait", "cause": "person",
-                                              "since": stamp(35), "source_id": "ask",
-                                              "next_event": "Owner answers the outstanding question"}])
+        self.assert_timing(owner, elapsed_seconds=42, blockers=[{
+            "run_id": "first", "category": "owner_wait", "cause": "person", "since": stamp(35), "source_id": "ask",
+            "next_event": "Owner answers the outstanding question",
+        }])
         self.at(47)
         self.assertTrue(asks.ask_close("ask", "answered"))
         self.at(50)
@@ -137,8 +153,7 @@ class RunTimingTests(unittest.TestCase):
         self.transition(resume, verify, 72, "running")
         self.transition(resume, verify, 79, "succeeded")
         self.transition(resume, review, 80, "running")
-        self.log("resume", 81, "step_start", step="review2", atom="review")
-        self.log("resume", 84, "step_end", step="review2")
+        self.step("resume", "review2", 81, 84, atom="review")
         self.transition(resume, review, 85, "succeeded")
         self.settle("resume", 87, "pr")
         self.at(120)
@@ -147,119 +162,224 @@ class RunTimingTests(unittest.TestCase):
         self.log("specific-step", 121, "route", continues="resume")
         self.run_row("unrelated", 122)
         self.assertIsNone(self.project("specific-step", 150))
-        projected = self.project("resume", 150)
-        self.assertEqual(projected, self.project("first", 150))
-        self.assertEqual(projected, self.project("repair", 150))
-        self.assertEqual(projected["run_ids"], ["first", "repair", "resume"])
-        self.assertTrue(projected["elapsed_complete"])
-        self.assertEqual((projected["started_at"], projected["through_at"]), (stamp(0), stamp(87)))
-        self.assertEqual((projected["elapsed_seconds"], projected["unattributed_seconds"]), (87, 22))
-        self.assertEqual(projected["category_seconds"], {"writing": 15, "checks": 12, "review": 9, "owner_wait": 12,
-                                                         "queue_wait": 10, "retry": 7})
-        self.assertEqual(projected["overlap_seconds"], 6)
-        self.assertEqual(projected["overlap"], [{"activity": {"writing": 2}, "seconds": 6}])
-        self.assertEqual(projected["active"], [])
-        self.assertEqual(projected["blockers"], [])
+        projected = self.project("resume", 150, "first", "repair")
+        self.assert_timing(projected, run_ids=["first", "repair", "resume"], elapsed_complete=True,
+                           started_at=stamp(0), through_at=stamp(87), elapsed_seconds=87, unattributed_seconds=22,
+                           categories=dict(writing=15, checks=12, review=9, owner_wait=12, queue_wait=10, retry=7),
+                           overlap_seconds=6, overlap=[{"activity": {"writing": 2}, "seconds": 6}], active=[], blockers=[])
 
-    def test_prerequisite_hold_advances_until_retry_and_survives_release(self):
+    def hold_draft(self, start, end):
         url = "https://github.com/owner/arete/pull/52"
-        self.run_row("draft", 0, pr_url=url)
-        self.log("draft", 75, "step_start", step="verify")
-        self.at(89)
+        self.run_row("draft", start, pr_url=url)
+        self.at(end - 1)
         runs.save_environment_hold("draft", [("owner/arete", 52, url, "a" * 40)])
-        self.settle("draft", 90, "pr")
-        self.run_row("dry", 100, environment_retry_of="draft", dry_run=1)
-        held = self.project("draft", 14490)
-        self.assertEqual((held["elapsed_seconds"], held["through_at"]), (14490, stamp(14490)))
-        self.assertEqual(held["category_seconds"]["queue_wait"], 14400)
-        self.assertEqual(held["category_seconds"]["checks"], 0)
-        self.assertEqual(held["unattributed_seconds"], 90)
-        self.assertEqual(held["running_run_ids"], [])
-        self.assertEqual(held["active"], [])
-        self.assertEqual([(b["cause"], b["since"]) for b in held["blockers"]], [("prerequisite", stamp(90))])
+        self.settle("draft", end, "pr")
+        return url
 
-        self.run_row("retry", 14600, environment_retry_of="draft")
-        self.log("retry", 14600, "wait", cause="slot", phase="end", since=stamp(14590), at=stamp(14600))
-        self.log("retry", 14605, "step_start", step="verify")
-        verifying = self.project("retry", 14610)
-        self.assertEqual(verifying["category_seconds"]["queue_wait"], 14510)
-        self.assertEqual(verifying["category_seconds"]["checks"], 5)
-        self.assertEqual(verifying["blockers"], [])
-        self.log("retry", 14635, "step_end", step="verify")
-        self.settle("retry", 14645, "pr")
-        self.at(14700)
+    def test_manual_release_without_retry_preserves_queue_time_from_either_run(self):
+        self.run_row("first", 0)
+        self.settle("first", 10, "interrupted")
+        self.hold_draft(15, 30)
+        self.log("draft", 15, "route", continues="first")
+
+        held = self.project("draft", 50, "first")
+        self.assertEqual((held["elapsed_seconds"], held["category_seconds"]["queue_wait"]), (50, 20))
+        self.assertEqual([(b["cause"], b["since"]) for b in held["blockers"]], [("prerequisite", stamp(30))])
+
+        self.at(60)
         runs.release_environment_hold("draft")
-        self.assertTrue(runs.move("retry", "merged", ("pr",), finished=stamp(14700)))
-        settled = self.project("retry", 14800)
-        self.assertEqual(settled, self.project("draft", 14800))
-        self.assertEqual(held, self.project("draft", 14490))
-        self.assertEqual(settled["run_ids"], ["draft", "retry"])
-        self.assertTrue(settled["elapsed_complete"])
-        self.assertEqual((settled["elapsed_seconds"], settled["through_at"]), (14645, stamp(14645)))
-        self.assertEqual(settled["category_seconds"]["queue_wait"], 14510)
-        self.assertEqual(settled["category_seconds"]["checks"], 30)
-        self.assertEqual(settled["unattributed_seconds"], 105)
-        self.assertEqual(settled["overlap_seconds"], 0)
-        self.assertEqual(settled["blockers"], [])
+        released = self.project("draft", 120, "first")
+        self.assertEqual(held, self.project("draft", 50))
+        self.assert_timing(released, run_ids=["first", "draft"], through_at=stamp(60), elapsed_seconds=60,
+                           unattributed_seconds=30, blockers=[])
+        self.assertEqual(released["category_seconds"]["queue_wait"], 30)
 
-    def test_classic_checks_use_recorded_command_intervals_without_double_counting(self):
-        self.run_row("classic", 0)
-        for at, seconds, name, exit_code in ((2, 4.25, "lint", 0), (2, 4.25, "lint", 0), (6, 3, "unit", 1),
-                                             (14, 8, "unit", 0), (21, 4, "late", 0)):
-            record.mark("classic", "check", at=stamp(at), name=name, command=name, seconds=seconds, exit=exit_code)
-        self.settle("classic", 20, "pr")
-        timing = self.project("classic", 30)
-        self.assertEqual(timing["elapsed_seconds"], 20)
-        self.assertEqual(timing["category_seconds"]["checks"], 13)
-        self.assertEqual(timing["unattributed_seconds"], 7)
-        self.assertEqual(timing["overlap_seconds"], 0)
+        with db.tx() as c:
+            c.execute("DELETE FROM events_log WHERE subject = 'run:draft' AND kind = ?", (runs.HOLD_RELEASED,))
+        legacy = self.project("draft", 120, "first")
+        self.assert_timing(legacy, through_at=stamp(30), elapsed_seconds=30, blockers=[], categories={})
 
-    def test_classic_repeated_review_follows_the_recorded_atom(self):
-        self.run_row("classic", 0)
-        self.log("classic", 4, "step_start", step="review", atom="review")
-        self.log("classic", 9, "step_end", step="review")
-        self.log("classic", 10, "step_start", step="implement", atom="review_repair")
-        self.log("classic", 16, "step_end", step="implement")
-        self.log("classic", 18, "step_start", step="review2", atom="review")
-        self.log("classic", 19, "step_start", step="review3", atom="review", carried="other")
-        self.log("classic", 21, "step_end", step="review3", carried="other")
-        self.log("classic", 23, "step_end", step="review2")
-        self.log("classic", 24, "step_start", step="review4")
-        self.log("classic", 26, "step_end", step="review4")
-        self.settle("classic", 27, "pr")
-        timing = self.project("classic", 40)
-        self.assertEqual(timing["elapsed_seconds"], 27)
-        self.assertEqual(timing["category_seconds"]["review"], 10)
-        self.assertEqual(timing["category_seconds"]["retry"], 6)
-        self.assertEqual(timing["unattributed_seconds"], 11)
-        self.assertEqual(timing["overlap_seconds"], 0)
+    def test_prerequisite_queue_and_owner_review_are_separate_across_retry_lineage(self):
+        url = self.hold_draft(0, 20)
+        self.log("draft", 15, "step_start", step="verify")
+        self.run_row("dry", 30, environment_retry_of="draft", dry_run=1)
+        held = self.project("draft", 90)
+        self.assert_timing(held, through_at=stamp(90), elapsed_seconds=90, unattributed_seconds=20,
+                           running_run_ids=[], active=[], categories=dict(queue_wait=70))
+        self.assertEqual([(b["cause"], b["since"]) for b in held["blockers"]], [("prerequisite", stamp(20))])
+
+        self.run_row("retry", 100, environment_retry_of="draft", pr_url=url)
+        self.log("retry", 100, "wait", cause="slot", phase="end", since=stamp(95), at=stamp(100))
+        self.log("retry", 102, "step_start", step="verify")
+        verifying = self.project("retry", 110, "draft")
+        self.assert_timing(verifying, blockers=[], categories=dict(queue_wait=80, checks=8))
+        self.log("retry", 112, "step_end", step="verify")
+        self.step("retry", "review", 114, 118)
+        self.settle("retry", 120, "pr")
+        self.at(125)
+        runs.release_environment_hold("draft", "owner-review")
+
+        live = self.project("retry", 130, "draft")
+        self.assert_timing(live, through_at=stamp(130), elapsed_seconds=130, blockers=[{
+            "run_id": "retry", "cause": "owner-review", "category": "owner_wait", "since": stamp(120),
+            "source_id": None, "next_event": "Owner reviews the draft and decides how to unblock verification",
+        }], categories=dict(queue_wait=80, checks=10, review=4, owner_wait=10))
+
+        self.at(150)
+        self.assertTrue(runs.move("retry", "merged", ("pr",), finished=stamp(150)))
+        self.at(160)
+        runs.end_environment_owner_review("draft")
+        resolved = self.project("retry", 200, "draft")
+        self.assertEqual(held, self.project("draft", 90))
+        self.assertEqual(live, self.project("retry", 130))
+        self.assert_timing(resolved, run_ids=["draft", "retry"], elapsed_complete=True, through_at=stamp(160),
+                           elapsed_seconds=160, unattributed_seconds=26, overlap_seconds=0, blockers=[],
+                           categories=dict(checks=10, review=4, owner_wait=40, queue_wait=80))
+
+    def test_check_step_waits_pair_by_run_suite_resource_and_since(self):
+        rid, suite = "classic", "classic/checks/first"
+        self.run_row(rid, 0)
+        scope = {"step": "checks", "try": 2}
+        self.log(rid, 2, "step_start", **scope)
+        self.check_wait(rid, 5, suite, "check-slot", **scope)
+        for at, invalid in enumerate(({"run": "another-run"}, {"suite": "other-suite"},
+                                      {"resource": "full-suite-lock"}, {"since": 6}), 6):
+            fields = {"suite": suite, "resource": "check-slot", "since": 5, **scope, **invalid}
+            self.check_wait(rid, at, **fields)
+
+        slot = self.project(rid, 10)
+        self.assert_timing(slot, active=[], categories=dict(queue_wait=5, checks=3), blockers=[{
+            "run_id": rid, "cause": "slot", "category": "queue_wait", "resource": "check-slot",
+            "suite": suite, "source_id": suite, "since": stamp(5), "next_event": "A check slot becomes available",
+            **scope,
+        }])
+
+        self.check_wait(rid, 11, suite, "check-slot", since=5, **scope)
+        self.check_wait(rid, 11, suite, "full-suite-lock", **scope)
+        lock = self.project(rid, 12)
+        self.assert_timing(lock, categories=dict(queue_wait=7, checks=3))
+        blocker, = lock["blockers"]
+        self.assertEqual((blocker["cause"], blocker["resource"], blocker["since"], blocker["next_event"]),
+                         ("slot", "full-suite-lock", stamp(11), "The full-suite lock becomes available"))
+
+        self.check_wait(rid, 16, suite, "full-suite-lock", since=11, **scope)
+        record.mark(rid, "check", at=stamp(16), name="unit", seconds=5, exit=0, suite=suite, **scope)
+        self.log(rid, 24, "step_end", **scope)
+        self.settle(rid, 25, "pr")
+        self.assertEqual(self.project(rid, 12)["blockers"], lock["blockers"])
+        settled = self.project(rid, 30)
+        self.assert_timing(settled, elapsed_seconds=25, unattributed_seconds=3, overlap=[], blockers=[],
+                           categories=dict(checks=11, queue_wait=11))
+
+    def test_orchestrated_check_wait_scopes_the_pause_to_its_suite_and_gate(self):
+        rid, scope = "adaptive", {"step": "checks", "try": 3}
+        unknown, inferred, held, other = (f"{rid}/checks/{name}" for name in ("unknown", "inferred", "held", "other"))
+        self.run_row(rid, 0)
+        lease = orchestration.acquire(rid, "", {})
+        gate, builder = self.accept(lease, 1, "checks.run", "worker.start")
+        self.transition(lease, gate, 2, "running")
+        self.check_wait(rid, 3, unknown, "check-slot")
+        live = self.project(rid, 4)
+        self.assertEqual(live["overlap"], [{"activity": {"checks": 1, "queue_wait": 1}, "seconds": 1}])
+        self.assertEqual([span["source_id"] for span in live["active"]], [gate])
+        self.assertNotIn("step", live["blockers"][0])
+        self.check_wait(rid, 5, unknown, "check-slot", since=3)
+        record.mark(rid, "check", at=stamp(5), name="unscoped", seconds=1, exit=0, suite=unknown)
+        self.log(rid, 6, "step_start", **scope)
+        self.check_wait(rid, 7, inferred, "full-suite-lock")
+        self.check_wait(rid, 9, inferred, "full-suite-lock", since=7)
+        record.mark(rid, "check", at=stamp(9), name="inferred", seconds=1, exit=0, suite=inferred, **scope)
+        paused = self.project(rid, 8)
+        self.assert_timing(paused, active=[], categories=dict(checks=5, queue_wait=3))
+        blocker, = paused["blockers"]
+        self.assert_timing(blocker, suite=inferred, **scope)
+
+        self.check_wait(rid, 10, held, "full-suite-lock", **scope)
+        self.transition(lease, builder, 13, "running", writing=True, role="build")
+        for at, seconds, suite in ((15, 4, other), (16, 2, f"{other}/lint")):
+            record.mark(rid, "check", at=stamp(at), name=suite, seconds=seconds, exit=0, suite=suite, **scope)
+        self.assertEqual(self.project(rid, 14)["active"], [{"run_id": rid, "activity": "worker.start",
+                                                           "category": "writing", "since": stamp(13),
+                                                           "source_id": builder}])
+        active = self.project(rid, 17)
+        self.assert_timing(active, categories=dict(writing=4, checks=8, queue_wait=11), overlap=[
+            {"activity": {"checks": 1, "queue_wait": 1}, "seconds": 2},
+            {"activity": {"checks": 1, "queue_wait": 1, "writing": 1}, "seconds": 1},
+            {"activity": {"checks": 2, "queue_wait": 1, "writing": 1}, "seconds": 1},
+            {"activity": {"queue_wait": 1, "writing": 1}, "seconds": 2},
+        ])
+        self.assertEqual({(span["activity"], span["source_id"]) for span in active["active"]},
+                         {("checks", None), ("worker.start", builder)})
+
+        self.check_wait(rid, 21, held, "full-suite-lock", since=10, **scope)
+        record.mark(rid, "check", at=stamp(21), name="unit", seconds=4, exit=0, suite=held, **scope)
+        self.transition(lease, builder, 22, "succeeded")
+        self.log(rid, 26, "step_end", **scope)
+        self.transition(lease, gate, 27, "succeeded")
+        self.settle(rid, 29, "pr")
+        self.assertEqual(self.project(rid, 4), live)
+        self.assert_timing(self.project(rid, 30), elapsed_seconds=29, unattributed_seconds=4, overlap_seconds=11,
+                           blockers=[], categories=dict(writing=9, checks=16, queue_wait=15))
+
+    def test_classic_tracker_wait_ends_when_reply_is_saved_not_when_provider_allows_resume(self):
+        rid = "question"
+        self.run_row(rid, 0)
+        self.log(rid, 5, "question", summary="Which release should we target?")
+        self.settle(rid, 6, "needs-info")
+        self.assertEqual([blocker["cause"] for blocker in self.project(rid, 20)["blockers"]], ["person"])
+        repo = config.Repo("arete", paths.RUNS_DIR)
+        source = mock.Mock()
+        source.reply_since.return_value = "Target the next release."
+        self.at(30)
+        self.assertEqual(poll.tracker_reply(repo, source, "964", False, from_queue=False, from_feedback=False), "")
+        source.reply_since.assert_called_once_with("964", stamp(5))
+        reply = run_lines.path(rid).with_name(pipeline.ANSWER_FILE)
+        saved_at = clock(30).timestamp()
+        os.utime(reply, (saved_at, saved_at))
+        held = self.project(rid, 60)
+        self.assert_timing(held, through_at=stamp(30), elapsed_seconds=30, blockers=[], categories=dict(owner_wait=25))
+        self.assertEqual(self.project(rid, 120), {**held, "as_of": stamp(120)})
+        self.assertEqual([blocker["cause"] for blocker in self.project(rid, 29)["blockers"]], ["person"])
+
+        self.run_row("continuation", 150)
+        self.log("continuation", 150, "answer", asked_in=rid)
+        pipeline.opening_waits("continuation", runs.run_get(rid), "")
+        self.settle("continuation", 160, "pr")
+        self.assert_timing(self.project("continuation", 170), elapsed_seconds=160, unattributed_seconds=135,
+                           blockers=[], categories=dict(owner_wait=25))
+
+    def test_classic_timing_uses_review_atoms_and_command_intervals(self):
+        rid = "classic"
+        self.run_row(rid, 0)
+        self.step(rid, "review", 4, 9, atom="review")
+        self.step(rid, "implement", 10, 16, atom="review_repair")
+        self.step(rid, "review2", 18, 23, atom="review")
+        self.step(rid, "review3", 19, 21, atom="review", carried="other")
+        self.step(rid, "review4", 24, 26)
+        for at, seconds, name, exit_code in ((29, 4.25, "lint", 0), (29, 4.25, "lint", 0), (33, 3, "unit", 1),
+                                             (41, 8, "unit", 0), (48, 4, "late", 0)):
+            record.mark(rid, "check", at=stamp(at), name=name, command=name, seconds=seconds, exit=exit_code)
+        self.settle(rid, 47, "pr")
+        self.assert_timing(self.project(rid, 50), elapsed_seconds=47, unattributed_seconds=18, overlap_seconds=0,
+                           categories=dict(checks=13, review=10, retry=6))
 
     def test_missing_history_does_not_turn_pr_close_or_recovery_gap_into_work(self):
         self.run_row("pruned", 0, status="merged", finished=stamp(100))
-        self.assertFalse(self.project("pruned", 150)["elapsed_complete"])
-        self.assertEqual(self.project("pruned", 150)["elapsed_seconds"], 0)
+        self.assert_timing(self.project("pruned", 150), elapsed_complete=False, elapsed_seconds=0)
         self.run_row("continuation", 10, status="failed", finished=stamp(20))
         self.log("continuation", 10, "route", continues="pruned")
-        self.log("continuation", 12, "step_start", step="implement", atom="check_repair")
-        self.log("continuation", 15, "step_end", step="implement")
+        self.step("continuation", "implement", 12, 15, atom="check_repair")
         self.log("continuation", 16, "step_start", step="verify")
         self.run_row("environment", 28, status="failed", finished=stamp(30), environment_retry_of="continuation")
-        progress = self.project("pruned", 150)
-        self.assertEqual(progress, self.project("environment", 150))
-        self.assertFalse(progress["elapsed_complete"])
-        self.assertEqual((progress["elapsed_seconds"], progress["unattributed_seconds"]), (30, 27))
-        self.assertEqual(progress["category_seconds"]["retry"], 3)
-        self.assertEqual(progress["category_seconds"]["checks"], 0)
+        self.assert_timing(self.project("pruned", 150, "environment"), elapsed_complete=False, elapsed_seconds=30,
+                           unattributed_seconds=27, categories=dict(retry=3))
 
     def test_reopened_pr_without_settlement_keeps_its_close_time_unknown(self):
         self.run_row("reopened", 0, status="pr", finished=stamp(10))
-        self.log("reopened", 2, "step_start", step="verify")
-        self.log("reopened", 5, "step_end", step="verify")
+        self.step("reopened", "verify", 2, 5)
         self.at(100)
         self.assertTrue(runs.move("reopened", "rejected", ("pr",), finished=stamp(100)))
         self.at(120)
         self.assertTrue(runs.move("reopened", "pr", ("rejected",)))
-        progress = self.project("reopened", 150)
-        self.assertFalse(progress["elapsed_complete"])
-        self.assertEqual(progress["elapsed_seconds"], 5)
-        self.assertEqual(progress["category_seconds"]["checks"], 3)
+        self.assert_timing(self.project("reopened", 150), elapsed_complete=False, elapsed_seconds=5,
+                           categories=dict(checks=3))

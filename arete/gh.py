@@ -322,12 +322,22 @@ def issue_merge_commit(repo: str, number: int, base: str) -> str:
       merged baseRefName repository { nameWithOwner } mergeCommit { oid }
     }
     """
-    result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
-                      "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]) or {}
+    unreadable = f"Could not confirm closure of {repo}#{number}"
+    try:
+        result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+                          "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")])
+    except json.JSONDecodeError as error:
+        raise GhError(unreadable) from error
+    if not isinstance(result, dict) or result.get("errors"):
+        raise GhError(unreadable)
     issue = ((result.get("data") or {}).get("repository") or {}).get("issue") or {}
-    if (issue.get("state"), issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
+    if issue.get("state") not in ("OPEN", "CLOSED"):
+        raise GhError(unreadable)
+    if (issue["state"], issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
         return ""
-    events = (issue.get("timelineItems") or {}).get("nodes") or []
+    events = (issue.get("timelineItems") or {}).get("nodes")
+    if not isinstance(events, list):
+        raise GhError(unreadable)
     closer = ((events[-1] or {}).get("closer") or {}) if events else {}
     pulls = ([closer] if closer.get("__typename") == "PullRequest" else
              (closer.get("associatedPullRequests") or {}).get("nodes") or [])

@@ -24,9 +24,23 @@ def get(repo: str, ticket: str | int) -> dict:
         status = json.loads(row["data"])
         newest = runs.newest_live_whole_run(repo, ticket) or {}
         expected = {"waiting": "pr", "verifying": "running", "owner-review": "pr"}
+        state = status["follow_up"]["state"]
         live = (newest.get("id") == status["attempt"] and not newest.get("stop_asked")
-                and newest["status"] == expected.get(status["follow_up"]["state"]))
+                and newest["status"] == expected.get(state))
+        if live and (hold := runs.environment_hold(status["run"])) and hold["released"]:
+            live = (state == hold["release_state"] == "owner-review" and not hold["owner_review_ended_at"])
         return {**status, "active": live, "seq": row["seq"], "at": row["at"]}
+
+
+def declared_prerequisite_tickets(repo: str) -> list[str]:
+    prefix = f"ticket:{repo}:"
+    with db.reader() as c:
+        return [row[0] for row in c.execute("""
+            SELECT substr(e.subject, ?) AS ticket FROM events_log e
+            JOIN (SELECT MAX(seq) AS seq FROM events_log WHERE kind = ? AND substr(subject, 1, ?) = ?
+                  GROUP BY subject) latest ON latest.seq = e.seq
+            WHERE json_array_length(e.data, '$.declared_prerequisites') > 0 ORDER BY ticket
+        """, (len(prefix) + 1, KIND, len(prefix), prefix))]
 
 
 def prerequisite_state(previous: dict, reads: dict, deployed: dict, retained: dict) -> tuple[dict, list[dict]]:
@@ -48,7 +62,8 @@ def prerequisite_state(previous: dict, reads: dict, deployed: dict, retained: di
 
 
 def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence: Iterable[tuple[str, str, str]] = (),
-           prerequisite_reads: dict | None = None, only_current: bool = False, declared: bool = False) -> None:
+           prerequisite_reads: dict | None = None, only_current: bool = False, declared: bool = False,
+           declared_refs: Iterable[str] | None = None) -> None:
     with db.tx() as c:
         history = [json.loads(row["data"]) for row in rows(c, repo, ticket)]
         previous = history[0] if history else {}
@@ -70,6 +85,8 @@ def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence
                     return
                 retained = {ref: read for ref, read in refs.items() if ref not in old_declared}
                 current["declared_prerequisites"] = sorted(prerequisite_reads)
+            elif declared_refs or (declared_refs is not None and "declared_prerequisites" in prior):
+                current["declared_prerequisites"] = sorted(declared_refs)
             refs, prs = prerequisite_state(previous, prerequisite_reads, deployed, retained)
         current.update(prerequisite_issues=refs, prerequisites=prs)
         attempts: dict[str, set[str]] = {}
