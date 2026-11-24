@@ -943,6 +943,53 @@ assert not receipt(name).exists()
 """)
 
 
+class RegistryUncommittedPublicationTests(_SecretChildCase):
+    def test_read_agrees_with_committed_metadata_after_a_rolled_back_rotation(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'SAMPLE', 'sample-original', 'api_key', 'hand')
+reject_change(secretstore.put, 'SAMPLE', 'sample-replacement', 'api_key', 'u:operator')
+assert secretstore.get('global', 'SAMPLE') == row
+assert secretstore.read('global', 'SAMPLE') is None
+assert event_names('SAMPLE') == ['set']
+assert secretstore.check('global', 'SAMPLE')['check_ok']
+assert secretstore.read('global', 'SAMPLE') == b'sample-replacement'
+assert event_names('SAMPLE') == ['set', 'rotated', 'checked']
+""")
+
+    def test_a_pending_first_set_preserves_lost_key_evidence_across_all_addresses(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+read = secretstore.read_item
+def missing_key(ref, settings, **kwargs):
+    return None if ref.item == secretstore.KEY_ITEM else read(ref, settings, **kwargs)
+
+with (mock.patch.object(secretstore, 'read_item', side_effect=missing_key),
+      mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('unexpected replacement'))):
+    for operation in (secretstore.fingerprint_key,
+                      lambda: secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'hand')):
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            operation()
+assert receipt('FIRST').read_bytes() == before and not receipt('SECOND').exists()
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+""")
+
+    def test_switching_file_directories_before_the_first_commit_preserves_the_original_journal(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+other = Path.cwd() / 'alternate-store'
+settings = config.SecretsConfig(store='pve_store', store_dir=other)
+with mock.patch.object(config, 'secret_settings', return_value=settings):
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'u:operator')
+assert not other.exists() and receipt('FIRST').read_bytes() == before
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+assert secretstore.check('global', 'FIRST')['check_ok']
+assert secretstore.read('global', 'FIRST') == b'sample-original'
+""")
+
+
 class RegistryKeyContinuityTests(_SecretChildCase):
     def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
         self.run_secret_child(r"""
