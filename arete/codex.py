@@ -68,11 +68,15 @@ DISPLAY_FORMAT = re.compile(r"(?!-)(?:[^%]|%[%bsdi])*")
 SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
 SHELL_WORD_BREAKS = " \t\n;|&()<>"
 SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
-SED_SEARCH = re.compile(r"/(?:\\[^\n]|[^/\\\n])*/p")
-SED_LITERAL_SEARCH = re.compile(r"\s*/security/\s*(?:p|=|!d|,\s*\$\s*p|\{\s*p\s*;?\s*\})\s*")
+SED_PATTERN = r"/(?:\\[^\n]|[^/\\\n])*/"
+SED_ADDRESS = rf"(?:[0-9]+|\$|{SED_PATTERN})"
+SED_SEARCH = re.compile(SED_PATTERN + "p")
+SED_LITERAL_SEARCH = re.compile(rf"\s*(?:{SED_ADDRESS}[ \t]*,[ \t]*(?:{SED_ADDRESS}|\+[0-9]+)[ \t]*p"
+                                r"|/security/\s*(?:p|=|!d|\{\s*p\s*;?\s*\}))\s*")
 AWK_SEARCH = re.compile(r'(?:/security/|\$0[ \t]*~[ \t]*/security/|index\(\$0,[ \t]*"security"\))'
-                        r'(?:\s*\{\s*print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\}'
-                        r'|\s*\{\s*count\+\+\s*;?\s*\}\s*END\s*\{\s*print[ \t]+count\s*;?\s*\})?\s*')
+                        r'(?:\s*\{\s*(?:print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\}'
+                        r'|(?P<count>[A-Za-z_][A-Za-z_0-9]*)[ \t]*\+\+\s*;?\s*\}\s*;?\s*END\s*\{'
+                        r'\s*print[ \t]+(?P=count)(?:[ \t]*\+[ \t]*0)?\s*;?\s*\}))?\s*')
 BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
 ANSI_C_QUOTE = re.compile(r"\$'((?:\\[\s\S]|[^'\\])*)'")
 ANSI_C_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c(?:\\\\|[\x00-\x7f])|.)",
@@ -357,7 +361,7 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
 
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
             allowed_tools: list[str] | None = None, *, floor: guard.Floor | None = None,
-            temp_dir: Path | None = None) -> list[str]:
+            temp_dir: Path | None = None, authority: tuple[Path, ...] | None = None) -> list[str]:
     floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     name = WRITE_PROFILE if writing else READ_PROFILE
     granted = {path: "write" if writing else "read" for path in both(cwd)}
@@ -370,8 +374,12 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
                      timeout=10, env=agent_env(), inherit=False)
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
-    protected = [*hidden, *sandbox.authority_roots()]
-    table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
+    authority = sandbox.authority_roots() if authority is None else authority
+    protected = [*hidden, *authority]
+    denied = {grant_path(p) for root in authority for p in both(root)}
+    opened = {p: rule for p, rule in (granted | metadata).items()
+              if not any(grant_path(p).is_relative_to(root) for root in denied)}
+    table = {"extends": PROFILE_BASE[name], "filesystem": {**opened,
              **kept_out([cwd, *add_dirs], protected, floor),
              **executables(allowed_tools, [*protected, *floor.closed, *floor.files])},
              "network": {"enabled": False}}
@@ -480,6 +488,7 @@ def command(
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
     temp_dir: Path | None = None,
+    authority: tuple[Path, ...] | None = None,
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -504,7 +513,7 @@ def command(
     for key, value in SETTINGS.items():
         cmd += setting(key, value)
     cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools, floor=floor,
-                   temp_dir=temp_dir)
+                   temp_dir=temp_dir, authority=authority)
     shell_names = set(command_names(passing or [], extra_env)) - {
         k for server in servers.values() for k in (server.get("env") or {})}
     if temp_dir is not None:
@@ -536,7 +545,8 @@ def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
 
 def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
     auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
-    result = _run(*args, auth=auth, **kw)
+    with sandbox.WorkerLease() as activation:
+        result = _run(*args, auth=auth, activation=activation, **kw)
     result.auth_mode = auth.mode
     if auth.mode not in ("subscription", "api_key"):
         result.usage_limit = None
@@ -611,6 +621,7 @@ def _run(
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
     api_key: str = "",
+    activation: sandbox.WorkerLease,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -637,15 +648,17 @@ def _run(
     temp_dir = None
     try:
         try:
+            activation.acquire()
+            authority = sandbox.worker_authority(activation)
             if not writes(tools, allowed_tools) and verification_scratch.PRODUCING.get() is None:
                 temp_dir = Path(tempfile.mkdtemp(prefix="arete-codex-tmp-"))
-                if protected_temp_dir(temp_dir, (cwd, *(add_dirs or []), *sandbox.authority_roots())):
+                if protected_temp_dir(temp_dir, (cwd, *(add_dirs or []), *authority)):
                     remove_temp_dir(temp_dir)
                     temp_dir = None
             cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                           system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config,
                           instructions=instructions, judge=judge, passing=passing, extra_env=extra_env, hidden=hidden,
-                          scratch=scratch, floor=floor, temp_dir=temp_dir)
+                          scratch=scratch, floor=floor, temp_dir=temp_dir, authority=authority)
         except (ValueError, OSError) as e:
             return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
         if temp_dir is not None:
@@ -665,8 +678,8 @@ def _run(
             on_line(line)
 
         try:
-            proc = launch(cmd, cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch, add_dirs=add_dirs,
-                          mcp_config=mcp_config)
+            proc = launch(activation.command(cmd), cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch,
+                          add_dirs=add_dirs, mcp_config=mcp_config)
         except subprocess.TimeoutExpired:
             return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
                           provider=provider)

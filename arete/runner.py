@@ -365,7 +365,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
                 local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
                 if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
-                    after_attempt.callback(accounts.record_resolved, picked.auth, wait_for_activation=True)
+                    after_attempt.callback(enroll_after_attempt, picked)
             started = util.iso()
             with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
                 res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target,
@@ -399,6 +399,14 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
                                 picked.auth)
         say(f"{routing.hold_words({'why': why, 'until': limit.until})}, trying another route")
+
+
+def enroll_after_attempt(picked: Picked) -> None:
+    accounts.record_resolved(picked.auth, wait_for_activation=True)
+    if picked.selected:
+        for refreshed in picked.selected.refreshed_auths:
+            if not refreshed.identity:
+                accounts.record_resolved(refreshed, refresh_only=True, wait_for_activation=True)
 
 
 def unresumable(which: str, name: str, resume: Session) -> Result:

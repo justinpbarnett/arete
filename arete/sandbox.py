@@ -5,9 +5,14 @@ import fcntl
 import os
 import pwd
 import re
+import select
 import shutil
+import signal
+import socket
 import sqlite3
+import subprocess
 import sys
+import time
 from contextlib import ExitStack, closing, suppress
 from fnmatch import fnmatch
 from pathlib import Path
@@ -35,6 +40,113 @@ except KeyError:
 
 class ConfinementUnavailable(PermissionError):
     pass
+
+
+class WorkerLease(ExitStack):
+    active = False
+
+    def acquire(self) -> None:
+        if sys.platform == "linux":
+            from . import secretstore
+
+            self.enter_context(secretstore.credential_activation())
+            self.active = True
+            self.callback(setattr, self, "active", False)
+
+    def command(self, argv, descriptors=()):
+        if not self.active:
+            return argv
+        entry = (f"import os, sys; env = os.environ.copy(); sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                 "from arete.sandbox import linux_worker_relay; sys.exit(linux_worker_relay(env, *sys.argv[1:]))")
+        return [sys.executable, "-I", "-c", entry, str(os.getpid()), str(paths.STATE_DIR.resolve()),
+                ",".join(map(str, descriptors)), *argv]
+
+
+def worker_authority(lease: WorkerLease) -> tuple[Path, ...]:
+    roots = authority_roots()
+    if lease.active:
+        with suppress(OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error):
+            store, active = linux_store_policy(has_local=paths.FINGERPRINT_KEY_FILE.exists(), had_local=False)
+            if active and store in roots:
+                lease.close()
+    return roots
+
+
+def drain_worker_children(children: Path) -> None:
+    while True:
+        try:
+            if os.waitpid(-1, os.WNOHANG)[0]:
+                continue
+        except ChildProcessError:
+            return
+        try:
+            live = children.read_text().split()
+        except OSError:
+            os.waitpid(-1, 0)
+            continue
+        for pid in live:
+            with suppress(ProcessLookupError, PermissionError):
+                os.kill(int(pid), signal.SIGKILL)
+        time.sleep(0.02)
+
+
+def monitor_linux_worker(peer, descriptors, command, env) -> None:
+    from .check_process import PR_SET_CHILD_SUBREAPER
+
+    if ctypes.CDLL(None).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise ConfinementUnavailable("could not supervise the Linux worker's descendants")
+    children = Path(f"/proc/self/task/{os.getpid()}/children")
+    children.read_text()
+    if select.select([peer], [], [], 0)[0]:
+        return
+    proc = subprocess.Popen(command, env=env, pass_fds=descriptors, start_new_session=True)
+    try:
+        for fd in (0, 1, 2, *descriptors):
+            os.close(fd)
+        while proc.poll() is None and not select.select([peer], [], [], 0.05)[0]:
+            pass
+    finally:
+        with suppress(PermissionError):
+            proc.kill()
+        code = proc.wait()
+        drain_worker_children(children)
+    with suppress(BrokenPipeError):
+        peer.sendall(str(code if code >= 0 else 128 - code).encode())
+
+
+def linux_worker_relay(env, parent, state, descriptors, *command):
+    from . import secretstore
+
+    descriptors = tuple(map(int, descriptors.split(","))) if descriptors else ()
+    relay, peer = socket.socketpair()
+
+    def cancel(*_):
+        with suppress(OSError):
+            relay.shutdown(socket.SHUT_WR)
+
+    with relay, peer, secretstore.credential_activation(state=Path(state)):
+        signal.signal(signal.SIGTERM, cancel)
+        set_parent_death_signal = 1
+        if ctypes.CDLL(None).prctl(set_parent_death_signal, signal.SIGTERM, 0, 0, 0) or os.getppid() != int(parent):
+            return 125
+        launcher = os.fork()
+        if launcher == 0:
+            try:
+                relay.close()
+                os.setsid()
+                if os.fork() == 0:
+                    monitor_linux_worker(peer, descriptors, command, env)
+            except OSError as error:
+                with suppress(OSError):
+                    os.write(2, f"Linux worker supervision failed: {error}\n".encode())
+            finally:
+                os._exit(0)
+        peer.close()
+        os.waitpid(launcher, 0)
+        for fd in (0, 1, 2, *descriptors):
+            os.close(fd)
+        with relay.makefile("rb") as receipt:
+            return int(receipt.read() or b"125")
 
 
 def secret_path(p: Path | str) -> bool:
@@ -143,7 +255,7 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
 
 
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
-                       mount_lease: ExitStack | None = None, activation_lease: ExitStack | None = None) -> list[str]:
+                       mount_lease: ExitStack | None = None, activation_lease: WorkerLease | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
@@ -155,7 +267,7 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         info = linux_key_info(key)
         had_local = info is not None
         if activation_lease is not None:
-            activation_lease.enter_context(secretstore.credential_activation())
+            activation_lease.acquire()
             info = linux_key_info(key)
         if info is not None and mount_lease is not None:
             had_local = True

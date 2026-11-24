@@ -966,6 +966,62 @@ with db.reader() as c:
 """)
 
 
+    def test_confirmed_refresh_reconciles_after_the_worker_lease(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import json
+import os
+import subprocess
+from arete import sandbox
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+owner.write_text(json.dumps({provider: before}))
+route = pi.Route(provider, provider + '/fixture', first, owner=owner, using_login=True, view=Path.cwd())
+
+def stream(cmd, cwd, env, *_args, pass_fds):
+    paths.CONFIG_FILE.write_text(configured)
+    event = {'provider': provider, 'before': before, 'after': after}
+    writer, ack = pass_fds
+    os.write(writer, json.dumps(event).encode() + b'\n')
+    assert os.read(ack, 1) == b'1'
+    with db.tx(timeout=1) as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert secretstore.KEY_REF not in db.schema_metadata()
+    reply = {'type': 'agent_end', 'messages': [{'role': 'assistant', 'content': []}]}
+    return subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ''), ''
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(pi, 'stream', side_effect=stream),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi')):
+    result = pi.run('fixture', Path.cwd(), selected=route, persist=False)
+assert result.ok, result.error
+assert secretstore.KEY_REF in db.schema_metadata()
+with db.reader() as c:
+    refreshed, = map(dict, c.execute('SELECT * FROM accounts'))
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(latest) == refreshed
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
 SECRET_HTTP_FIXTURE = r"""
 import json
 from types import SimpleNamespace
@@ -1253,6 +1309,7 @@ def linux_claude(*, error=''):
     with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
           mock.patch.object(sandbox.shutil, 'which', return_value=bwrap) as which,
           mock.patch.object(claude, 'binary', return_value='/fixture/claude'),
+          mock.patch.object(sandbox.WorkerLease, 'command', lambda _, cmd: cmd),
           mock.patch.object(claude.child, 'stream', return_value=fixture) as stream):
         yield which, stream
 
@@ -1290,13 +1347,49 @@ with linux_claude(error='fixture: namespace unavailable') as (which, stream):
 """)
 
 
+    def test_codex_publication_waits_for_the_old_profile(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+from arete import codex
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+
+def launch(cmd, *_args, **_kwargs):
+    assert str(store) not in ' '.join(cmd)
+    paths.CONFIG_FILE.write_text(configured)
+    with case.assertRaises(secretstore.CredentialActivationBusy):
+        secretstore.fingerprint_key()
+    assert not store.exists()
+    return subprocess.CompletedProcess(cmd, 0, '{"type":"thread.started","thread_id":"fixture"}\n', '')
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(codex, 'launch', side_effect=launch),
+      mock.patch.object(codex, 'binary', return_value='/fixture/codex')):
+    assert codex.run('fixture', linux_checkout(), auth=accounts.Auth(), persist=False).ok
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux descendant supervision")
+    def test_keyless_claude_drains_background_work_before_publication(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+work = linux_checkout()
+argv = ['/bin/sh', '-c', 'sleep 60 & echo $! > child.pid; echo \'{"type":"result","session_id":"fixture"}\'']
+with mock.patch.object(claude, 'command', return_value=argv):
+    result = run_claude(work)
+assert result.ok and result.session.id == 'fixture'
+with case.assertRaises(ProcessLookupError):
+    os.kill(int((work / 'child.pid').read_text()), 0)
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+
 class AuthorityPrivatePiWorkerTests(_SecretChildCase):
     def test_private_worker_launch_denies_the_configured_file_store(self):
         self.run_secret_child(r"""
 import json
 import subprocess
 
-from arete import accounts, pi, sandbox
+from arete import accounts, guard, pi, sandbox
 
 secretstore.put('global', 'DEMO_KEY', 'synthetic-worker-value', 'api_key', 'hand')
 store = config.secret_settings().store_dir
@@ -1326,6 +1419,10 @@ assert f'(deny file-read* file-write* file-link (subpath (param "{hidden}")))' i
 protection = json.loads(env['ARETE_PI_GUARD_PATHS'])
 assert str(store) in protection['roots']
 assert protection['open'] == [str(checkout)] and protection['workspace'] == str(checkout)
+nested = store / db.schema_metadata()['instance_tag'] / 'global'
+floor = guard.floor('', checkout, [nested])
+protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['files'] and str(nested) not in protection['open']
 """)
 
 

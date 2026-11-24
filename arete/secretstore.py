@@ -369,17 +369,17 @@ def referenced_key(meta, settings, *, expected_store=None):
 
 
 @contextmanager
-def credential_activation(*, publishing: bool = False, wait: bool = False):
+def credential_activation(*, publishing: bool = False, wait: bool = False, state: Path | None = None):
     if sys.platform != "linux":
         yield
         return
-    with paths.directory_fd(paths.STATE_DIR.resolve(), create=True) as parent:
+    with paths.directory_fd(state or paths.STATE_DIR.resolve(), create=True) as parent:
         launch_lease.private_directory(parent)
         with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
             if not publishing or wait:
                 fcntl.flock(fd, fcntl.LOCK_EX if publishing else fcntl.LOCK_SH)
             elif not launch_lease.take(fd):
-                raise CredentialActivationBusy("Retry credential publication after the local Claude run exits.")
+                raise CredentialActivationBusy("Retry credential publication after the active Linux workers exit.")
             yield
 
 

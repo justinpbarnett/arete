@@ -247,9 +247,12 @@ def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigure
             except secretstore.CredentialActivationBusy:
                 if not wait_for_activation:
                     return True
-                # Wait outside the SQLite transaction so the running worker can finish.
+                if db.in_write():
+                    raise
                 with secretstore.credential_activation(publishing=True, wait=True):
                     pass
     except (OSError, secretstore.StoreMissing) as error:
+        if wait_for_activation:
+            raise
         LOG.warning("Could not record a resolved account (%s)", type(error).__name__)
         return False
