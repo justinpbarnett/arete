@@ -14,7 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +31,7 @@ KEY_ITEM = "global/FINGERPRINT_KEY"
 ACL_TYPE_EXTENDED = 0x100
 KEY_REF = "fingerprint_key_ref"
 KEY_LOCAL = "fingerprint_key_local"
+REGISTRY_SYNC = "secret_registry_sync"
 
 
 class StoreMissing(RuntimeError):
@@ -77,6 +78,21 @@ def address(scope: str, name: str) -> str:
 def validate_actor(actor):
     if not isinstance(actor, str) or not actor or actor == "owner" or "@" in actor:
         raise ValueError("secret events require a principal id")
+    try:
+        str.encode(actor)
+    except UnicodeEncodeError:
+        raise ValueError("secret actor must be valid UTF-8") from None
+
+
+def validate_provider(provider: str | None) -> None:
+    if provider is None:
+        return
+    if not isinstance(provider, str):
+        raise ValueError("invalid secret provider")
+    try:
+        provider.encode()
+    except UnicodeEncodeError:
+        raise ValueError("secret provider must be valid UTF-8") from None
 
 
 def validate_value(value: str, kind: str) -> None:
@@ -131,10 +147,14 @@ def registry_reference(c, row, item):
     return ref
 
 
-def store_settings():
-    settings = config.secret_settings()
+def require_store(settings: config.SecretsConfig) -> None:
     if settings.store is None:
         raise StoreMissing("secret_store_missing")
+
+
+def store_settings():
+    settings = config.secret_settings()
+    require_store(settings)
     return settings
 
 
@@ -192,21 +212,22 @@ def require_writable_entry(parent: int, name: str) -> None:
 
 
 @contextmanager
-def file_parent(path: Path, root: Path, *, create=False, private=False):
+def file_parent(path: Path, root: Path, *, create=False, private=False, durable=False):
     if paths.ISOLATED and (paths.confined(root) is None or
                            paths.scratch_root(root) != paths.scratch_root(paths.STATE_DIR)):
         raise StoreError("secret item must stay inside the instance's scratch folder")
-    with paths.directory_fd(root, create=create) as fd, ExitStack() as stack:
+    durable = create or durable
+    with paths.directory_fd(root, create=create, durable=durable) as fd, ExitStack() as stack:
         parent = path.parent.relative_to(root)
         if private:
             require_private_directory(fd)
             for part in parent.parts:
-                child = stack.enter_context(paths.directory_fd(Path(part), fd, create=create))
+                child = stack.enter_context(paths.directory_fd(Path(part), fd, create=create, durable=durable))
                 require_exact_entry(fd, part, writing=create)
                 require_private_directory(child)
                 fd = child
         else:
-            fd = stack.enter_context(paths.directory_fd(parent, fd, create=create))
+            fd = stack.enter_context(paths.directory_fd(parent, fd, create=create, durable=durable))
         yield fd
 
 
@@ -220,22 +241,29 @@ def require_private_file(fd: int) -> None:
     require_no_macos_acl(fd)
 
 
-def read_file_at(parent: int, name: str) -> bytes:
+def read_file_at(parent: int, name: str, *, durable=False) -> bytes:
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     try:
         require_private_file(fd)
+        if durable:
+            util.flush_fd(fd)
         with os.fdopen(fd, "rb", closefd=False) as file:
             return file.read()
     finally:
         os.close(fd)
 
 
-def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
+def read_file(path: Path, root: Path, *, private=False, durable=False) -> bytes | None:
     try:
-        with file_parent(path, root, private=private) as parent:
-            if private:
-                require_exact_entry(parent, path.name)
-            return read_file_at(parent, path.name)
+        with file_parent(path, root, private=private, durable=durable) as parent:
+            value = None
+            with suppress(FileNotFoundError):
+                if private:
+                    require_exact_entry(parent, path.name)
+                value = read_file_at(parent, path.name, durable=durable)
+            if durable:
+                os.fsync(parent)
+            return value
     except FileNotFoundError:
         return None
 
@@ -308,10 +336,11 @@ def file_location(ref: Reference, settings: config.SecretsConfig) -> tuple[Path,
     return root / ref.tag / ref.item, root
 
 
-def read_item(ref: Reference, settings: config.SecretsConfig) -> bytes | None:
+def read_item(ref: Reference, settings: config.SecretsConfig, *, durable=False) -> bytes | None:
     if ref.store == "keychain":
         return keychain_read(ref)
-    return read_file(*file_location(ref, settings), private=ref.store == "pve_store")
+    private = ref.store == "pve_store"
+    return read_file(*file_location(ref, settings), private=private, durable=private and durable)
 
 
 def write_item(ref: Reference, settings: config.SecretsConfig, value: bytes) -> None:
@@ -398,62 +427,91 @@ def local_key_mount_lease(local: Path):
                 retire_committed_local_key(local)
 
 
-def committed_key_metadata():
-    with db.reader(streaming=sys.platform == "linux") as c:
-        return db.metadata(c)
+def sync_before_cleanup(matches, cleanup, *, timeout=0):
+    with closing(db.checked_connection(timeout=timeout)) as c:
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA synchronous=EXTRA")
+        c.execute("PRAGMA fullfsync=ON")
+        c.execute("BEGIN IMMEDIATE")
+        if not matches(c):
+            return
+        c.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (REGISTRY_SYNC, secrets.token_hex(16)))
+        c.execute("COMMIT")
+        c.execute("BEGIN IMMEDIATE")
+        if matches(c):
+            cleanup(c)
 
 
 def retire_committed_local_key(local: Path) -> None:
-    with suppress(OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error):
-        if not local.exists():
-            return
-        meta = committed_key_metadata()
-        if reference := meta.get(KEY_REF):
-            settings = config.secret_settings()
-            if settings.store == "pve_store":
-                key = referenced_key(meta, settings, expected_store="pve_store")
-                retire_local_key(local, key, reference)
+    if db.in_write():
+        db.after_commit(lambda: retire_committed_local_key(local))
+        return
+    with suppress(OSError, ValueError, RuntimeError):
+        settings = config.secret_settings()
+        if settings.store == "pve_store":
+            retire_local_key(local, settings, wait_for_writer=sys.platform == "linux")
 
 
-def retire_local_key(local, key, reference):
-    with suppress(OSError, sqlite3.Error, db.NoDatabase), file_parent(local, local.parent) as parent:
-        if sys.platform == "linux":
-            fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if read_file_at(parent, local.name) == key and committed_key_metadata().get(KEY_REF) == reference:
-            os.unlink(local.name, dir_fd=parent)
-            os.fsync(parent)
+def retire_local_key(local, settings, reference=None, *, wait_for_writer=False):
+    def matches(c):
+        current = db.metadata(c).get(KEY_REF)
+        return local.exists() and current and (reference is None or reference == current)
+
+    def unlink(c):
+        with file_parent(local, local.parent) as parent:
+            if sys.platform == "linux":
+                fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            key = referenced_key(db.metadata(c), settings, expected_store=settings.store)
+            if read_file_at(parent, local.name) == key:
+                os.unlink(local.name, dir_fd=parent)
+                os.fsync(parent)
+
+    while True:
+        try:
+            if not local.exists():
+                return
+            sync_before_cleanup(matches, unlink, timeout=5 if wait_for_writer else 0)
+        except sqlite3.OperationalError as error:
+            # The last mount lease has closed. Wait for the writer without holding a lease or transaction.
+            if wait_for_writer and (getattr(error, "sqlite_errorcode", 0) & 0xff) == sqlite3.SQLITE_BUSY:
+                continue
+        except (OSError, ValueError, KeyError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
+            pass
+        return
 
 
-def ensure_key(c, settings, *, probe_local=None):
+def lookup_key(c, settings, local):
     meta = db.metadata(c)
-    local = local_key_path() if probe_local is None else probe_local
-    if reference := meta.get(KEY_REF):
-        key = referenced_key(meta, settings)
-        if meta.get(KEY_LOCAL) and local.exists():
-            if probe_local is not None:
-                return None
-            db.after_commit(lambda: retire_local_key(local, key, reference))
-        return key
-    if probe_local is not None:
-        fallback = read_file(local, local.parent) if not settings.store and meta.get(KEY_LOCAL) else None
-        return checked_key(fallback) if fallback is not None else None
-    fallback = read_file(local, local.parent)
+    if meta.get(KEY_REF):
+        return meta, referenced_key(meta, settings)
     if meta.get(KEY_LOCAL):
-        checked_key(fallback)
-    elif credentials.has_fingerprints(c):
+        return meta, checked_key(read_file(local, local.parent))
+    if credentials.has_fingerprints(c):
         raise FingerprintKeyMissing("fingerprint_key_missing")
+    return meta, None
+
+
+def ensure_key(c, settings, local, meta, key, *, recovering=False):
+    if reference := meta.get(KEY_REF):
+        if meta.get(KEY_LOCAL) and local.exists():
+            db.after_commit(lambda: retire_local_key(local, settings, reference))
+        return key
+    fallback = key if key is not None else read_file(local, local.parent, durable=True)
     ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM) if settings.store else None
-    stored = read_item(ref, settings) if ref else None
+    stored = read_item(ref, settings, durable=True) if ref else None
     if fallback is not None and stored is not None and fallback != stored:
         raise StoreError("local and configured fingerprint keys differ")
     key = stored if stored is not None else fallback
-    key = checked_key(secrets.token_bytes(32) if key is None else key)
+    if key is None and not recovering:
+        key = secrets.token_bytes(32)
+    key = checked_key(key)
     if ref:
         if stored is None:
             write_item(ref, settings, key)
         c.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?)", (KEY_REF, str(ref)))
         if fallback is not None:
-            db.after_commit(lambda: retire_local_key(local, key, str(ref)))
+            db.after_commit(lambda: retire_local_key(local, settings, str(ref)))
     else:
         if fallback is None:
             with credential_activation(publishing=True):
@@ -468,13 +526,18 @@ def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
     migrate_registry()
     try:
         with db.reader() as c:
-            if (key := ensure_key(c, settings, probe_local=local)) is not None:
+            meta, key = lookup_key(c, settings, local)
+            if meta.get(KEY_REF):
+                if not meta.get(KEY_LOCAL) or not local.exists():
+                    return key
+            elif key is not None and not settings.store:
                 return key
     except db.NoDatabase:
         if not paths.ISOLATED:
             raise
     with db.tx() as c:
-        return ensure_key(c, settings)
+        meta, key = lookup_key(c, settings, local)
+        return ensure_key(c, settings, local, meta, key)
 
 
 def digest(key: bytes, *values) -> str:
@@ -507,7 +570,14 @@ def history(scope, name):
     validate(scope, name)
     with registry() as c:
         row = credentials.secret(c, scope, name)
-        return credentials.history(c, row["id"]) if row else []
+        events = credentials.history(c, row["id"]) if row else []
+    for event in events:
+        if (detail := event["detail"]) and detail.startswith("{"):
+            # Schema 27 also permits arbitrary text in historical event details.
+            with suppress(json.JSONDecodeError, KeyError):
+                operation = json.loads(detail)
+                event.update(kind=operation["kind"], provider=operation["provider"], detail=operation["id"])
+    return events
 
 
 def read(scope, name) -> bytes | None:
@@ -530,6 +600,28 @@ def load_pending(item):
     return raw, json.loads(raw) if raw is not None else {}
 
 
+def pending_store_dir(ref, settings):
+    return str(settings.store_dir) if ref.store == "pve_store" else None
+
+
+def require_pending_backend(receipt, ref, settings):
+    if not receipt:
+        return
+    store_dir = pending_store_dir(ref, settings)
+    if store_dir is not None and "store_dir" not in receipt:
+        raise StoreError("pending secret operation has no recorded store directory")
+    if receipt.get("store_dir") != store_dir:
+        raise StoreError("pending secret operation belongs to a different store directory")
+    removal = receipt.get("removal")
+    operations = [*receipt.get("confirmed", ()), *receipt.get("sets", ())]
+    if removal is not None:
+        operations.append(removal)
+    for operation in operations:
+        if operation["reference"] != str(ref):
+            raise StoreError("pending secret operation belongs to another reference")
+        validate_actor(operation["actor"])
+
+
 def save_pending(item, record):
     raw = json.dumps(record).encode()
     write_file(*pending_path(item), raw, private=True)
@@ -541,12 +633,18 @@ def retire_pending(item, raw, expected):
         return
     scope, name = item.split("/")
 
+    def matches(c):
+        return credentials.secret(c, scope, name) == expected and read_file(*pending_path(item), private=True) == raw
+
     def committed():
-        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema), db.tx() as c:
-            if credentials.secret(c, scope, name) == expected and read_file(*pending_path(item), private=True) == raw:
-                remove_file(*pending_path(item), private=True)
+        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
+            sync_before_cleanup(matches, lambda _c: remove_file(*pending_path(item), private=True))
 
     db.after_commit(committed)
+
+
+def history_detail(kind, provider, operation_id=None):
+    return json.dumps(dict(id=operation_id, kind=kind, provider=provider))
 
 
 def save_change(c, scope, name, previous, ref, change):
@@ -560,7 +658,10 @@ def save_change(c, scope, name, previous, ref, change):
         row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
                                       actor, at, change["provider"], rotated=rotated)
         event = "rotated" if rotated else "set"
-    credentials.secret_event(c, row, event, actor, at, detail=change["id"])
+    kind, provider = row["kind"], row["provider"]
+    if event == "removed" and "provider" in change:
+        kind, provider = change["kind"], change["provider"]
+    credentials.secret_event(c, row, event, actor, at, detail=history_detail(kind, provider, change["id"]))
     credentials.secret_changed(c, row, actor)
     return row
 
@@ -572,8 +673,6 @@ def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
         return row is not None and credentials.change_recorded(c, row["id"], operation["id"])
 
     for change in receipt.get("sets", ()):
-        if change["reference"] != str(ref):
-            raise StoreError("pending write belongs to another reference")
         if change["fingerprint"] == fingerprint or recorded(change):
             confirmed.append(change)
             break
@@ -589,29 +688,35 @@ def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
     return row, confirmed, removal, recovered
 
 
-def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=None) -> dict:
+def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: str | None = None) -> dict:
     item = external_item(scope, name, changing_value=True)
     validate_actor(actor)
     validate_value(value, kind)
-    settings = store_settings()
-    key = fingerprint_key(settings)
+    validate_provider(provider)
+    settings = config.secret_settings()
+    local = local_key_path()
     with registry(write=True) as c:
-        ref = Reference(settings.store, db.metadata(c)["instance_tag"], item)
+        meta, key = lookup_key(c, settings, local)
+        require_store(settings)
+        ref = Reference(settings.store, meta["instance_tag"], item)
         row = credentials.secret(c, scope, name)
         if row:
             require_removable(item, row["store"])
             if row["reference"] != str(ref):
                 raise StoreError("secret is registered in a different store")
         _, receipt = load_pending(item)
-        stored = read_item(ref, settings)
+        require_pending_backend(receipt, ref, settings)
+        key = ensure_key(c, settings, local, meta, key, recovering=bool(receipt))
+        stored = read_item(ref, settings, durable=bool(receipt))
         fingerprint = item_digest(key, stored) if receipt.get("sets") and stored is not None else None
-        row, confirmed, removal, _ = recover_changes(c, scope, name, row, ref, receipt, fingerprint, absent=stored is None)
+        row, confirmed, removal, _ = recover_changes(
+            c, scope, name, row, ref, receipt, fingerprint, absent=stored is None)
         if removal:
             raise StoreError("secret removal is pending; retry the removal before setting a new value")
         change = dict(id=secrets.token_hex(16), reference=str(ref), kind=kind, actor=actor, at=util.iso(),
                       fingerprint=digest(key, value), provider=provider, rotated=stored is not None)
         # Keep earlier operations recoverable until the outer SQLite transaction commits.
-        raw = save_pending(item, {"confirmed": confirmed, "sets": [change]})
+        raw = save_pending(item, dict(store_dir=pending_store_dir(ref, settings), confirmed=confirmed, sets=[change]))
         data = value.encode()
         if stored != data:
             write_item(ref, settings, data)
@@ -631,8 +736,11 @@ def check(scope, name, actor="hand"):
 def reconcile(scope, name, actor, *, deleting=False):
     item = external_item(scope, name, changing_value=deleting)
     validate_actor(actor)
-    settings = store_settings()
+    settings = config.secret_settings()
+    local = local_key_path()
     with registry(write=True) as c:
+        meta, key = lookup_key(c, settings, local)
+        require_store(settings)
         row = credentials.secret(c, scope, name)
         if deleting and row:
             require_removable(item, row["store"])
@@ -644,15 +752,22 @@ def reconcile(scope, name, actor, *, deleting=False):
         ref = registry_reference(c, target, item)
         if deleting:
             require_removable(item, ref.store)
-        value = read_item(ref, settings)
-        sha = item_digest(fingerprint_key(settings), value) if value is not None and (pending or not deleting) else None
-        row, confirmed, removal, recovered = recover_changes(c, scope, name, row, ref, receipt, sha, absent=value is None)
+        if ref.store not in (settings.store, "owner_file"):
+            raise StoreError("secret is registered in a different store")
+        require_pending_backend(receipt, ref, settings)
+        key = ensure_key(c, settings, local, meta, key, recovering=bool(receipt))
+        value = read_item(ref, settings, durable=bool(receipt))
+        sha = item_digest(key, value) if value is not None and (pending or not deleting) else None
+        row, confirmed, removal, recovered = recover_changes(
+            c, scope, name, row, ref, receipt, sha, absent=value is None)
         if deleting:
             if removal is None and not (row and row["status"] == "missing" and value is None and
                                         credentials.last_lifecycle(c, row["id"]) == "removed"):
-                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=target["kind"], actor=actor,
-                               at=util.iso(), removed=True)
-                raw = save_pending(item, {"confirmed": confirmed, "removal": removal})
+                metadata = row or target
+                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=metadata["kind"],
+                               provider=metadata.get("provider"), actor=actor, at=util.iso(), removed=True)
+                raw = save_pending(item, dict(store_dir=pending_store_dir(ref, settings), confirmed=confirmed,
+                                              removal=removal))
             if removal is not None:
                 remove_item(ref, settings)
                 row = save_change(c, scope, name, row, ref, removal)
@@ -664,7 +779,8 @@ def reconcile(scope, name, actor, *, deleting=False):
             ok = sha is not None and row["fingerprint"] == sha
             at = util.iso()
             row = credentials.mark_checked(c, row, ok, at, recovered=recovered)
-            credentials.secret_event(c, row, "checked", actor, at, ok=ok)
+            credentials.secret_event(c, row, "checked", actor, at, ok=ok,
+                                     detail=history_detail(row["kind"], row["provider"]))
         if removal is None and (not pending or sha is None or recovered or row and row["fingerprint"] == sha):
             retire_pending(item, raw, row)
         return row
