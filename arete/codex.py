@@ -69,9 +69,10 @@ SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "wh
 SHELL_WORD_BREAKS = " \t\n;|&()<>"
 SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
 SED_SEARCH = re.compile(r"/(?:\\[^\n]|[^/\\\n])*/p")
-SED_LITERAL_SEARCH = re.compile(r"\s*/security/\s*(?:p|=|!d|\{\s*p\s*;?\s*\})\s*")
+SED_LITERAL_SEARCH = re.compile(r"\s*/security/\s*(?:p|=|!d|,\s*\$\s*p|\{\s*p\s*;?\s*\})\s*")
 AWK_SEARCH = re.compile(r'(?:/security/|\$0[ \t]*~[ \t]*/security/|index\(\$0,[ \t]*"security"\))'
-                        r'(?:\s*\{\s*print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\})?\s*')
+                        r'(?:\s*\{\s*print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\}'
+                        r'|\s*\{\s*count\+\+\s*;?\s*\}\s*END\s*\{\s*print[ \t]+count\s*;?\s*\})?\s*')
 BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
 ANSI_C_QUOTE = re.compile(r"\$'((?:\\[\s\S]|[^'\\])*)'")
 ANSI_C_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c(?:\\\\|[\x00-\x7f])|.)",

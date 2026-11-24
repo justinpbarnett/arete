@@ -17,6 +17,8 @@ for command, output in arithmetic.items():
 
 for command in (
     "sed -n '/security/p' README.md",
+    "sed -n '/security/,$p' notes.txt",
+    "awk '/security/ { count++ } END { print count }' notes.txt",
     "bash -lc \"sed -n '/security/p' README.md\"",
     "printf '%s\\n' ';' 'security' '$(security)' '`security`'",
     r"printf '%s\n' \; security",
