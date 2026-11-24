@@ -14,7 +14,6 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import time
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -370,21 +369,17 @@ def referenced_key(meta, settings, *, expected_store=None):
 
 
 @contextmanager
-def credential_activation(*, publishing: bool = False, deadline: float = 0):
+def credential_activation(*, publishing: bool = False, wait: bool = False):
     if sys.platform != "linux":
         yield
         return
     with paths.directory_fd(paths.STATE_DIR.resolve(), create=True) as parent:
         launch_lease.private_directory(parent)
         with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
-            if not publishing:
-                fcntl.flock(fd, fcntl.LOCK_SH)
-            else:
-                while not launch_lease.take(fd):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise CredentialActivationBusy("Retry credential publication after the local Claude run exits.")
-                    time.sleep(min(0.1, remaining))
+            if not publishing or wait:
+                fcntl.flock(fd, fcntl.LOCK_EX if publishing else fcntl.LOCK_SH)
+            elif not launch_lease.take(fd):
+                raise CredentialActivationBusy("Retry credential publication after the local Claude run exits.")
             yield
 
 

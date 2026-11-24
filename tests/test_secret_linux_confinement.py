@@ -52,7 +52,7 @@ waiting = Event()
 
 @contextmanager
 def observed(**options):
-    if options.get('deadline'):
+    if options.get('wait'):
         waiting.set()
     with activation(**options):
         yield
