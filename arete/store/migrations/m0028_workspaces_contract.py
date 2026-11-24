@@ -36,8 +36,9 @@ def snapshot_source(conn, explicit):
     if (meta.get("new_workspace_store") == "0" or not isinstance(marker, dict)
             or not meta.get("instance_id") or marker.get("instance_id") != meta["instance_id"]):
         return None
-    folder = paths.STATE_DIR / "workspaces"
-    if not folder.exists() and conn.execute("SELECT 1 FROM workspaces WHERE state != 'removed' AND legacy_mtime_ns > 0 LIMIT 1").fetchone():
+    folder = paths.STATE_DIR.resolve() / "workspaces"
+    if not folder.exists() and conn.execute(
+            "SELECT 1 FROM workspaces WHERE state != 'removed' AND legacy_mtime_ns > 0 LIMIT 1").fetchone():
         return None
     return folder
 

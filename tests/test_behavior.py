@@ -1399,11 +1399,10 @@ assert db.migrate(contracts=False)
 legacy.mkdir()
 snapshot = legacy / "sample.json"
 snapshot.write_text("{}")
-assert db.migrate()
+assert not db.migrate()
 with db.reader() as conn:
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
 assert snapshot.read_text() == "{}"
-assert not db.migrate(workspace_snapshots=legacy)
 """)
 
 
@@ -2000,7 +1999,7 @@ def read_health(handlers, cfg, port, inside_serve, host):
 
 with patch.object(tailnet, "serve", side_effect=read_health):
     dashboard.serve()
-assert schema_version() == 27
+assert schema_version() == db.LATEST
 """)
 
 
