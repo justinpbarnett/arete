@@ -624,9 +624,9 @@ class Controller(worker_turns.WorkerTurns):
         if not self.current("checks") or not self.data["evidence"]["checks"]["result"].get("full"):
             raise ValueError("run the full configured checks on the candidate before deciding findings")
         judged = code_review.disposition(report, request["decisions"], code_review.candidate_trees(self.job.checkouts))
+        self.stamp("review", judged.asdict())
         self.job.review = judged
         pipeline.note_review(self.run, judged, self.job.verified)
-        self.stamp("review", judged.asdict())
         return judged.asdict()
 
     def current(self, gate):
@@ -1097,7 +1097,9 @@ class Controller(worker_turns.WorkerTurns):
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
         if self.uses_code_review:
-            if not self.job.review.approved() or not code_review.completed(self.job.review):
+            recorded = self.data["evidence"]["review"]["result"]
+            if (recorded.get("verdict") != "approve" or not self.job.review.approved()
+                    or not code_review.completed(self.job.review)):
                 raise ValueError("review findings need an explicit orchestrator decision before publication")
             if (self.job.review.trees != code_review.candidate_trees(self.job.checkouts)
                     or self.job.review.asdict().get("bases") != code_review.bases(self.job.checkouts)):
