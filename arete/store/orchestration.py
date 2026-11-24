@@ -194,6 +194,14 @@ def actions(lease: Lease, connect=reader) -> list[dict]:
                                              (lease.root,))]
 
 
+def unlaunched_start(action):
+    return action["op"] == "worker.start" and "depends_on" in action.get("result", {})
+
+
+def queued_start(action):
+    return action["state"] == "accepted" and unlaunched_start(action)
+
+
 def transition(lease: Lease, action: str, state: str, result: dict, expected=("accepted", "running")) -> dict:
     with tx() as c:
         return transition_in(c, lease, action, state, result, expected)
@@ -207,7 +215,7 @@ def transition_in(c, lease, action, state, result, expected=("accepted", "runnin
     if row is None or row["state"] not in expected:
         raise Conflict(f"action {action} is not in an expected state")
     kept = decoded(row)["result"]
-    retained = ("pid", "identity", "writing", "role", "worker_id", "active_builders", "input_stamp")
+    retained = ("pid", "identity", "writing", "role", "worker_id", "active_builders", "input_stamp", "retry_of")
     result = {**{key: kept[key] for key in retained if key in kept},
               **result}
     c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",

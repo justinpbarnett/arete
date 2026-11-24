@@ -66,7 +66,7 @@ function orchestrationDetail(board, place) {
       return `Started ${action.id} alone. Dependent evidence must be refreshed before publication.`; }, { object: run });
   const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
     && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
-    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
+    && !a.result.depends_on && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return [el("h3", { text: "Orchestration" }),

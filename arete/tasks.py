@@ -772,6 +772,8 @@ def adaptive_action(row: dict, action: str) -> dict:
     if source:
         lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
         found = next((a for a in orchestration.actions(lease) if a["id"] == action), None)
+        if found and orchestration.unlaunched_start(found):
+            raise control.Refused("the action has no finished invocation to rerun")
         if found and source["data"].get("protocol") == 2:
             from .store import worker_exchange
 
