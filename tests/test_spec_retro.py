@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -8,7 +9,7 @@ from unittest import mock
 
 import support
 
-from arete import config, gh, jira, loop_run, loops, miner, paths, sources, spec_retro, util
+from arete import config, delivery, emits, gh, jira, loop_run, loops, miner, paths, sources, spec_retro, util
 from arete.store import insights, runs as run_store
 
 setUpModule = support.isolate_live_state
@@ -153,6 +154,28 @@ class SpecRetroTests(unittest.TestCase):
         emit.assert_called_once()
         self.assertEqual(emit.call_args.args[2][0]["repo"], self.repo.name)
 
+    def test_reviewed_jira_target_cannot_change_before_queue_render(self):
+        self.factory.tracker = "jira"
+        self.factory.jira_project = "SAME"
+        finding = {"title": "One", "summary": "A change", "repo": "arete", "fingerprint": "arete/one"}
+        with (mock.patch.object(paths, "STATE_DIR", self.folder),
+              mock.patch.dict(os.environ, JIRA_BASE_URL="https://first.example.com/"),
+              mock.patch.object(util, "lock", side_effect=lambda *a, **k: nullcontext()),
+              mock.patch.object(spec_retro, "assess", return_value=[finding]) as assess,
+              mock.patch.object(emits.Ticket, "execute") as publish):
+            findings = spec_retro.review(self.run, self.event, self.folder, {})
+            saved = json.loads(next(self.folder.rglob("*.json")).read_text())
+            self.assertEqual(saved["destinations"]["arete"]["site"], "https://first.example.com")
+            self.assertEqual(spec_retro.review(self.run, self.event, self.folder, {}), findings)
+            os.environ["JIRA_BASE_URL"] = "https://other.example.com"
+            with self.assertRaisesRegex(ValueError, "destination changed"):
+                delivery.deliver(self.loop, self.run.id, findings, {"trust": "internal"}, trial=False,
+                                 log=lambda *_: None, cfg=self.cfg)
+            with self.assertRaisesRegex(ValueError, "destination changed"):
+                spec_retro.review(self.run, self.event, self.folder, {})
+            publish.assert_not_called()
+            assess.assert_called_once()
+
     def test_validated_findings_are_saved_before_delivery_and_reused_after_failure(self):
         outcomes = [{"title": "One", "repo": "product", "fingerprint": "product/one"}]
         with (mock.patch.object(paths, "STATE_DIR", self.folder),
@@ -161,8 +184,82 @@ class SpecRetroTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not complete"):
                 spec_retro.review(self.run, self.event, self.folder, {})
             self.assertEqual(list(self.folder.rglob("*.json")), [])
-            self.assertEqual(spec_retro.review(self.run, self.event, self.folder, {}), outcomes)
+            reviewed = [{**outcomes[0], "_reviewed_destination": {"tracker": "github", "github": self.repo.github}}]
+            self.assertEqual(spec_retro.review(self.run, self.event, self.folder, {}), reviewed)
             self.run.id = "retry"
-            self.assertEqual(spec_retro.review(self.run, self.event, self.folder, {}), outcomes)
+            self.assertEqual(spec_retro.review(self.run, self.event, self.folder, {}), reviewed)
             self.assertEqual(assess.call_count, 2)
             self.assertEqual(json.loads(next(self.folder.rglob("*.json")).read_text())["findings"], outcomes)
+
+    def test_worker_roles_numbered_attempts_and_recovery_across_runs_on_one_child(self):
+        scope = [("product", "17"), ("product", "18")]
+        rows = {
+            "17": [{"id": "later", "status": "merged", "finished": "yes", "repair_calls": 1},
+                   {"id": "first", "status": "failed", "finished": "yes", "repair_calls": 0}],
+            "18": [{"id": "another", "status": "merged", "finished": "yes", "repair_calls": 0}],
+        }
+        def entry(name, ok=True, role="", attempt=1):
+            return {"step": name, "atom": role, "try": attempt, "ok": ok}
+        ledger = {"first": [entry("worker-a1", False, "build"), entry("worker-a1", True, "build", 2),
+                            entry("verify", False), entry("verify2"), entry("review"), entry("review2")],
+                  "later": [entry("worker-a2", True, "build"), entry("review_fix2", True, "review_repair"),
+                            entry("orchestrate-t1", True, "orchestrate"), entry("verify")],
+                  "another": [entry("review"), entry("review2")]}
+        def read(rid):
+            return {"id": rid, "issue": "17", "marks": [], "calls": ledger[rid], "failed_steps": []}
+        with (mock.patch.object(spec_retro, "ticket_scopes", return_value=scope),
+              mock.patch.object(run_store, "ticket_runs", side_effect=lambda n, ref, **kw: rows[ref]),
+              mock.patch.object(run_store, "steps", side_effect=lambda rid: ledger[rid]),
+              mock.patch.object(spec_retro.record, "read_run", side_effect=read),
+              mock.patch.object(miner, "run_digest", return_value={"items": []}),
+              mock.patch.object(miner, "signals_of", return_value=["retry"]),
+              mock.patch.object(insights, "ticket_feedback", return_value=[])):
+            _, totals, _, _ = spec_retro.observations(self.cfg, self.repo, self.event)
+        self.assertEqual(totals["runs_with_failed_stage"], {"build": 1, "verify": 1})
+        self.assertEqual(totals["runs_retrying_failed_call"], {"build": 1, "verify": 1})
+        self.assertEqual(totals["tickets_revisiting_failed_stage_in_later_run"], {"build": 1, "verify": 1})
+        self.assertEqual(totals["runs_with_repeated_stage"]["review"], 2)
+        self.assertEqual(totals["tickets_with_stage_in_multiple_runs"], {"build": 1, "verify": 1})
+        self.assertEqual(totals["tickets_rerun_after_failure"], 1)
+        self.assertEqual(totals["recorded_repair_calls"], 1)
+        self.assertEqual(totals["signals"], {"retry": 2})
+        self.assertEqual(spec_retro.stage_of(entry("worker-a91")), "delegate")
+        self.assertEqual(spec_retro.stage_of({"step": "publish", "call": "verify_fix2", "atom": "check_repair"}), "repair")
+        self.assertEqual(spec_retro.stage_of(entry("private-branch-name")), "")
+
+    def test_remote_role_directories_and_layer_questions_stay_separate(self):
+        from arete import devices
+
+        self.repo.layer = self.folder / "product-layer"
+        self.factory.layer = self.folder / "factory-layer"
+        self.repo.layer.mkdir()
+        self.factory.layer.mkdir()
+        (self.repo.layer / "retro.md").write_text("Which private UI checks repeated?\n" + "x" * 8192 + "past-the-limit")
+        (self.factory.layer / "retro.md").write_text("Which verification stage stalled?")
+        self.run.device = devices.Device("build", "ssh", host="example.invalid", dir="~/agent work")
+        prompts = {}
+        def respond(run, step, prompt, cwd, **kwargs):
+            prompts[step] = prompt, cwd
+            return SimpleNamespace(ok=True, structured={"findings": []})
+        with (mock.patch.object(loop_run, "run_command", return_value=(0, "")) as remote,
+              mock.patch.object(gh, "repo_private", return_value=True),
+              mock.patch.object(spec_retro, "observations", return_value=([], {"signals": {"retry": 1},
+                                                                               "owner_review_comments": 0}, "", 0)),
+              mock.patch.object(loop_run.LoopRun, "agent", autospec=True, side_effect=respond)):
+            self.assertEqual(spec_retro.assess(self.run, self.event, self.repo, self.run.device.dir, {}), [])
+        self.assertEqual(remote.call_count, 2)
+        for call in remote.call_args_list:
+            self.assertEqual(call.args[0][:4], ["mkdir", "-p", "-m", "0700"])
+            self.assertEqual(call.args[1], "~/agent work")
+            self.assertIs(call.kwargs["device"], self.run.device)
+        product, product_dir = prompts["retro-product"]
+        factory, factory_dir = prompts["retro-factory"]
+        self.assertNotEqual(product_dir, factory_dir)
+        self.assertTrue(factory_dir.startswith("~/agent work/.arete-retro-"))
+        self.assertIn("Which private UI checks repeated?", product)
+        self.assertNotIn("past-the-limit", product)
+        self.assertNotIn("private UI checks", factory)
+        self.assertIn("Which verification stage stalled?", factory)
+        self.assertNotIn("verification stage stalled", product)
+        self.assertIn("supported by this spec", product)
+        self.assertIn("supported by this spec", factory)

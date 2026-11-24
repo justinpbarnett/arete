@@ -208,6 +208,11 @@ The product review sees the parent and issue-scoped summaries, run observations,
 from its repository. Related child tickets in other enrolled repositories contribute delivery measurements.
 A separate factory review receives only stage and signal counts so it can propose Arete improvements
 without exposing private project details. Findings go to the relevant repository's configured tracker.
+The factory's aggregate distinguishes recorded failures and repairs from additional successful passes, and
+reports when a child ticket goes through another run. Each target's repository layer may supply optional
+review questions in `retro.md` (the first 8 KiB of a regular UTF-8 file). The product review reads the
+product's questions; the separate factory review reads Arete's own layer. The normal evidence and
+publication criteria apply to both. Local and remote reviews use separate working directories for each role.
 The spec link accompanies product findings. Findings do not inherit the spec label. A closure with no
 supported improvements can produce zero tickets.
 

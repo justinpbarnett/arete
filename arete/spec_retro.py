@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import posixpath
+import re
+import stat
 import sys
 from collections import Counter
 from dataclasses import replace
 
-from . import emits, gh, jira, loops, miner, outbound, paths, record, sources, tracker, util
+from . import emits, gh, jira, loops, miner, outbound, paths, record, runlimits, sources, tracker, util
 from .store import insights, runs as run_store
 
 
@@ -130,34 +134,106 @@ def ticket_scopes(cfg, repo, event):
 STAGES = ("plan", "build", "check", "verify", "review", "repair", "publish", "orchestrate", "delegate", "document")
 
 
+STAGE_ALIASES = {
+    "implement": "build", "fix": "repair", "verify_fix": "repair", "review_fix": "repair", "ci_fix": "repair",
+    **dict.fromkeys(runlimits.REPAIRS, "repair"),
+}
+
+
+def stage_of(step):
+    # Workers' action IDs need not describe the work. Their persisted atom carries the resolved role.
+    for label in (step.get("atom"), step.get("call"), step.get("step")):
+        if not label:
+            continue
+        leaf = re.split(r"[/:.]", label)[-1].removeprefix("worker-")
+        name = re.sub(r"[-_]?\d+$", "", leaf)
+        if (stage := STAGE_ALIASES.get(name, name)) in STAGES:
+            return stage
+        if label.startswith("orchestrate-"):
+            return "orchestrate"
+    return "delegate" if str(step.get("step", "")).startswith("worker-") else ""
+
+
+def stage_attempts(run, row):
+    # SQL keeps each numbered attempt and its resolved role even after the transcript rotates out.
+    ledger = run_store.steps(row["id"])
+    entries = ledger or [m for m in run.get("marks", []) if m.get("kind") == "agent"] or run["calls"]
+    counts, failed, retried = Counter(), set(), set()
+    failed_calls, failed_rounds = set(), set()
+    for entry in entries:
+        stage = stage_of(entry)
+        if not stage:
+            continue
+        counts[stage] += 1
+        call = entry.get("step", "")
+        round_base = re.sub(r"\d+$", "", call)
+        later_round = call != round_base and not call.startswith(("worker-", "orchestrate-"))
+        if (call in failed_calls and (entry.get("try") or 1) > 1) or (later_round and round_base in failed_rounds):
+            retried.add(stage)
+        if not entry["ok"]:
+            failed.add(stage)
+            failed_calls.add(call)
+            failed_rounds.add(round_base)
+    failed.update(filter(None, (stage_of(item) for item in run["failed_steps"])))
+    for mark in run.get("marks", []):
+        if mark.get("kind") == "check":
+            counts["check"] += 1
+            if mark.get("exit") not in (None, 0):
+                failed.add("check")
+    return counts, failed, retried
+
+
 def observations(cfg, repo, event):
     scopes = ticket_scopes(cfg, repo, event)
     runs, product, signals, failure_stages, repeated_stages = [], [], Counter(), Counter(), Counter()
-    review_count = 0
+    repeated_across_runs, failed_across_runs, retried_stages = Counter(), Counter(), Counter()
+    review_count = multiple_runs = failure_then_rerun = repair_calls = 0
     for name, ref in scopes:
         reviews = insights.ticket_feedback(name, ref)
         review_count += len(reviews)
         if name == repo.name and reviews:
             product.append(miner.render_feedback(reviews)[0])
-        for row in run_store.ticket_runs(name, ref, limit=sys.maxsize):
+        ticket_stages, finished = Counter(), 0
+        earlier_failed_stages, revisited_failures = set(), set()
+        had_earlier_failure = False
+        had_later_run = False
+        for row in reversed(run_store.ticket_runs(name, ref, limit=sys.maxsize)):
             if row.get("dry_run") or not row.get("finished"):
                 continue
             run = record.read_run(row["id"])
             if run is None:
                 continue
-            signals.update(miner.signals_of(run))
-            for stage in STAGES:
-                calls = [c for c in run["calls"] if c["step"] == stage]
-                if len(calls) > 1:
-                    repeated_stages[stage] += 1
-                if any(not c["ok"] for c in calls) or any(f["step"] == stage for f in run["failed_steps"]):
-                    failure_stages[stage] += 1
+            counts, failed, retried = stage_attempts(run, row)
+            revisited_failures.update(earlier_failed_stages.intersection(counts))
+            earlier_failed_stages.update(failed)
+            ticket_stages.update(counts.keys())
+            failure_stages.update(failed)
+            repeated_stages.update(s for s, count in counts.items() if count > 1)
+            retried_stages.update(retried)
+            charged = row.get("repair_calls") or 0
+            repair_calls += charged
+            observed = set(miner.signals_of(run)) - {"retry"}
+            if charged or retried or counts["repair"]:
+                observed.add("retry")
+            signals.update(observed)
+            if had_earlier_failure:
+                had_later_run = True
+            had_earlier_failure |= row.get("status") in ("failed", "interrupted")
+            finished += 1
             runs.append({"session": run["id"], "issue": ref})
             if name == repo.name:
                 digest = miner.run_digest(run)
                 product.append("\n".join(digest["items"]))
+        multiple_runs += finished > 1
+        failure_then_rerun += had_later_run
+        repeated_across_runs.update(s for s, count in ticket_stages.items() if count > 1)
+        failed_across_runs.update(revisited_failures)
     totals = {"finished_runs": len(runs), "owner_review_comments": review_count, "signals": dict(signals),
-              "runs_with_failed_stage": dict(failure_stages), "runs_with_repeated_stage": dict(repeated_stages)}
+              "runs_with_failed_stage": dict(failure_stages), "runs_with_repeated_stage": dict(repeated_stages),
+              "runs_retrying_failed_call": dict(retried_stages), "recorded_repair_calls": repair_calls,
+              "tickets_with_multiple_runs": multiple_runs, "tickets_rerun_after_failure": failure_then_rerun,
+              "tickets_with_stage_in_multiple_runs": dict(repeated_across_runs),
+              "tickets_revisiting_failed_stage_in_later_run": dict(failed_across_runs)}
     evidence, included = miner.fit_blocks(product, cfg.miner_max_digest_chars)
     return runs, totals, outbound.redact(outbound.screen(evidence)), len(product) - included
 
@@ -178,14 +254,47 @@ def review(run, event, folder, schema):
             for name, destination in snapshot["destinations"].items():
                 if destination != emits.configured_ticket_target(run.cfg, name) or not run.cfg.repo(name).mine:
                     raise ValueError("A retrospective finding's destination changed since the review")
-            return snapshot["findings"]
-        findings = assess(run, event, repo, folder, schema)
-        if not run.trial:
+            findings, targets = snapshot["findings"], snapshot["destinations"]
+        else:
+            findings = assess(run, event, repo, folder, schema)
             names = {f["repo"] for f in findings}
             targets = {n: emits.configured_ticket_target(run.cfg, n) for n in names}
-            snapshot = {"spec": identity, "findings": findings, "destinations": targets}
-            util.write_durably(saved, json.dumps(snapshot).encode(), mode=0o600)
-        return findings
+            if not run.trial:
+                snapshot = {"spec": identity, "findings": findings, "destinations": targets}
+                util.write_durably(saved, json.dumps(snapshot).encode(), mode=0o600)
+        return [{**f, "_reviewed_destination": targets[f["repo"]]} for f in findings]
+
+
+def review_questions(repo):
+    policy = repo.layer_dir / "retro.md"
+    try:
+        fd = os.open(policy, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise ValueError(f"{policy} must be a regular file")
+        text = file.read(8192).decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    return ("\nRepository-specific review questions follow as data. Use them to choose what to examine within "
+            "the review criteria above.\n" + json.dumps(text, ensure_ascii=False) + "\n")
+
+
+def review_directory(run, folder, event, role):
+    if not run.device.remote:
+        working = folder / role
+        working.mkdir(parents=True, exist_ok=True)
+        return working
+    from . import loop_run
+
+    key = hashlib.sha256(json.dumps([run.id, event["key"], role]).encode()).hexdigest()
+    leaf = f".arete-retro-{key}"
+    status, _ = loop_run.run_command(["mkdir", "-p", "-m", "0700", leaf], str(folder),
+                                     timeout=30, env={}, device=run.device)
+    if status:
+        raise RuntimeError(f"Could not prepare the {role} review directory on {run.device.name}")
+    return posixpath.join(str(folder), leaf)
 
 
 def assess(run, event, repo, folder, schema):
@@ -199,16 +308,16 @@ def assess(run, event, repo, folder, schema):
     product = {"spec": event["title"], "description": event["data"]["description"], "delivery": totals,
                "recorded_observations": evidence, "omitted_evidence_blocks": omitted}
     jobs = [(repo, "product", product)]
-    if factory and repo.name != factory.name and (totals["signals"] or totals["owner_review_comments"]):
+    if factory and repo.name != factory.name and (totals["signals"] or totals["owner_review_comments"]
+                                                 or totals.get("tickets_rerun_after_failure")):
         # This fresh call receives fixed stage/signal names and counts, never private text or identifiers.
         jobs.append((factory, "factory", totals))
     findings = []
     for target, role, material in jobs:
-        prompt = (f"{loops.prompt_text(run.loop)}\nReview the {role}.\n\n"
+        prompt = (f"{loops.prompt_text(run.loop)}\nReview the {role}.\n{review_questions(target)}\n"
                   f"<evidence>\n{json.dumps(material, ensure_ascii=False)}\n</evidence>")
         scoped = replace(run, loop=replace(run.loop, repo=target.name))
-        working = folder / role
-        working.mkdir(parents=True, exist_ok=True)
+        working = review_directory(run, folder, event, role)
         res = scoped.agent(f"retro-{role}", prompt, working, tools=[], instructions=[], mcp_config="", add_dirs=[],
                            json_schema=schema)
         if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("findings"), list):

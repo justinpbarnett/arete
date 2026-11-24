@@ -95,6 +95,19 @@ class ConfiguredTickets(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertEqual(post.call_args_list[0], post.call_args_list[1])
 
+    def test_old_receipt_cannot_change_the_destination_of_a_new_queue_item(self):
+        item = self.item()
+        self.enterContext(mock.patch.object(self.client, "find_task_marker", return_value=""))
+        post = self.enterContext(mock.patch.object(self.client, "create_task", side_effect=jira.JiraError("rejected", 400)))
+        with self.assertRaises(jira.JiraError):
+            self.send(item)
+        with mock.patch.dict(os.environ, JIRA_BASE_URL="https://other.example.com"):
+            rerendered = self.item()
+        self.assertEqual(item["publication_key"], rerendered["publication_key"])
+        with self.assertRaisesRegex(ValueError, "destination differs"):
+            self.send(rerendered)
+        post.assert_called_once()
+
     def test_configured_github_reconciles_ambiguous_write_at_original_destination(self):
         self.repo.tracker = "github"
         item = self.item()

@@ -115,7 +115,8 @@ def configured_ticket_target(cfg: config.Config, name: str) -> dict:
     if repo.tracker == "jira":
         project = repo.jira_project or cfg.jira.project
         if project:
-            return {"tracker": "jira", "project": project, "route": tracker.route_label(repo)}
+            return {"tracker": "jira", "project": project, "route": tracker.route_label(repo),
+                    "site": jira.site_url(cfg.jira.env_file)}
         raise ValueError(f"{repo.name} has no Jira project configured")
     raise ValueError(f"{repo.name} needs a configured GitHub or Jira destination")
 
@@ -140,6 +141,8 @@ def publish_configured_ticket(item: dict, cfg: config.Config, approval) -> str:
 
 def send_configured_ticket(item: dict, cfg: config.Config, receipt, approval) -> str:
     target = receipt.pending["destination"]
+    if target != item["destination"]:
+        raise ValueError("The queued ticket's destination differs from its earlier publication receipt")
     marker = "areteemit" + hashlib.sha256(receipt.marker.encode()).hexdigest()
     body = item["body"] + "\n\n" + marker
     if approval:
@@ -211,7 +214,7 @@ class Ticket(Emit):
         if spec.get("tracker") == "configured":
             try:
                 configured_ticket_target(cfg, spec.get("repo", ""))
-            except ValueError as error:
+            except (ValueError, jira.JiraError) as error:
                 return [str(error)]
             return []
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
@@ -227,8 +230,8 @@ class Ticket(Emit):
             spec = {**spec, "repo": name}
         if spec.get("tracker") == "configured":
             target = configured_ticket_target(cfg, name)
-            if target["tracker"] == "jira":
-                target["site"] = jira.site_url(cfg.jira.env_file)
+            if "_reviewed_destination" in findings[0] and findings[0]["_reviewed_destination"] != target:
+                raise ValueError("A retrospective finding's destination changed since the review")
             return {**spec, "repo": config_repo(cfg, name).name, "destination": target}
         return spec
 
