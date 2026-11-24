@@ -1200,13 +1200,13 @@ def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
 
 
 @factory.step("review")
-def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: int = 0) -> Outcome:
+def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: int = 0, code_review: bool = False) -> Outcome:
     job: Job = flow.ctx
     run = job.run
     attempt = 2 if second else attempt
     said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified,
                             pipeline.round_name("review", attempt), job.review if attempt > 1 else None,
-                            job.fix_reply)
+                            job.fix_reply, **({"skill": True, "spec": job.with_left(job.goal)} if code_review else {}))
     data = {"review": said.asdict(), "attempt": attempt, "story": run.story}
     if said.verdict != "request_changes":
         return Outcome("pass", data=data)

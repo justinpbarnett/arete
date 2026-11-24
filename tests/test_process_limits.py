@@ -1579,6 +1579,7 @@ class PolicyRestartLineageTests(Isolated):
         job = controller.job
         job.review = pipeline.Review.stored({"verdict": "approve", "summary": "old review", "problems": []})
         job.verified, job.reviews, job.ci_result = pipeline.verify.Verified("pass", "old verify"), 1, "old ci"
+        controller.data.pop("review_method", None)  # This saved lineage predates the Standards/Spec review.
         controller.data.update(evidence=evidence, checked={"tree": "old-tree"}, report="old checks",
                                policy_sha=self.OLD_POLICY)
         controller.persist()

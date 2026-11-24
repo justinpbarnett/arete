@@ -20,7 +20,7 @@ VERIFICATION_POLICY = (
     "Automated tests and committed test harnesses are not default deliverables.\n"
     "Add or extend them only when an explicit task or repository instruction requires coverage of a specific "
     "essential business rule; keep that coverage focused, deterministic and fast.\n"
-    "Keep existing check gates, independent review and verification in use.\n"
+    "Follow the workflow’s configured check, review and in-use verification requirements.\n"
     "Use disposable scratch helpers and run reports for behavioral evidence, not new ADRs or specification files, "
     "unless those documents are explicitly requested."
 )

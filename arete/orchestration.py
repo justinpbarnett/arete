@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from . import (
     builder_workspaces,
+    code_review,
     codebase,
     config,
     delegation,
@@ -46,6 +47,7 @@ from .verify import Verified
 
 CI_FAILURES = "ci:failures"
 MAX_CI_FAILURE_CHARS = 24000
+ACTION_GATES = {"checks.run": "checks", "verification.run": "verify", "review.run": "review", "review.decide": "review"}
 CATCH_UP_FAILURE = "catch-up:failure"
 MAX_CATCH_UP_FEEDBACK_CHARS = 12000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
@@ -115,8 +117,11 @@ class Controller(worker_turns.WorkerTurns):
                    and not pilot.is_pilot_task(tid) and not zte.reserved(tid))
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
-                                    {"protocol": protocol, "mode": self.run.path, "evidence": {}})
+                                    {"protocol": protocol, "mode": self.run.path, "evidence": {},
+                                     "review_method": code_review.METHOD if self.run.path == "orchestrate"
+                                     and not (pilot.is_pilot_task(tid) or zte.reserved(tid)) else "legacy"})
         self.data = ledger.snapshot(self.lease)["data"]
+        self.run.code_review = self.uses_code_review
         self.protocol = self.data.get("protocol")
         if self.protocol not in (PROTOCOL, WORKER_PROTOCOL) or self.data.get("mode") != self.run.path:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
@@ -583,6 +588,47 @@ class Controller(worker_turns.WorkerTurns):
             "acceptance": self.data["acceptance"], "producer": self.executing, "observed": util.iso()}
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
 
+    @property
+    def uses_code_review(self):
+        return self.data.get("review_method") == code_review.METHOD and not self.run.environment_release
+
+    def required_gates(self):
+        if self.uses_code_review and not code_review.requires_behavior(self.job.b):
+            return ("checks", "review")
+        return ("checks", "review", "verify")
+
+    def latest_code_review(self):
+        stale = set(self.data.get("stale_actions", ()))
+        return next((a for a in reversed(ledger.actions(self.lease))
+                     if a["op"] == "review.run" and a["id"] not in stale
+                     and a["state"] != "accepted" and a["id"] != self.executing
+                     and not a["result"].get("reused_review")), {})
+
+    def applicable_report(self, source):
+        stamp = source.get("result", {}).get("evidence", {})
+        report = stamp.get("result", {})
+        if (source.get("state") == "succeeded" and report.get("method") == code_review.METHOD
+                and stamp.get("acceptance") == self.data["acceptance"]
+                and self.matches_policy(stamp.get("policy"), self.policy_sha())
+                and report.get("bases") == code_review.bases(self.job.checkouts)):
+            return report
+        return {}
+
+    def decide_findings(self, request):
+        if not self.uses_code_review:
+            raise ValueError("this workflow uses the original independent review policy")
+        source = self.latest_code_review()
+        report = self.applicable_report(source)
+        if source.get("id") != request["review_id"] or report.get("verdict") != "pending":
+            raise ValueError("decisions require the latest completed review for this issue, base and policy")
+        if not self.current("checks") or not self.data["evidence"]["checks"]["result"].get("full"):
+            raise ValueError("run the full configured checks on the candidate before deciding findings")
+        judged = code_review.disposition(report, request["decisions"], code_review.candidate_trees(self.job.checkouts))
+        self.job.review = judged
+        pipeline.note_review(self.run, judged, self.job.verified)
+        self.stamp("review", judged.asdict())
+        return judged.asdict()
+
     def current(self, gate):
         if gate == "checks" and self.data.get("denied_feedback"):
             return False
@@ -599,7 +645,7 @@ class Controller(worker_turns.WorkerTurns):
         stale = set(self.data.get("stale_actions", ()))
         for action in ledger.actions(self.lease):
             result = action["result"]
-            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+            gate = ACTION_GATES.get(action["op"])
             old_gate = bool(gate) and action["id"] in stale
             if action["id"] == catch_up.get("action"):
                 self.data["evidence"] = {}
@@ -613,7 +659,8 @@ class Controller(worker_turns.WorkerTurns):
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
             if result.get("text") and not old_gate:
                 self.catalog.add_context(action["id"], result["text"])
-            if gate and not old_gate and action["state"] != "accepted":
+            if gate and not old_gate and action["state"] != "accepted" and not result.get("reused_review") and not (
+                    action["op"] == "review.decide" and action["state"] != "succeeded"):
                 self.data.setdefault("evidence", {}).pop(gate, None)
             if action["state"] == "succeeded":
                 if result.get("writing"):
@@ -625,7 +672,9 @@ class Controller(worker_turns.WorkerTurns):
                     if gate == "checks":
                         self.job.b.checked, self.job.b.report = result.get("checked", {}), result.get("report", "")
                     elif gate == "review":
-                        self.job.review = pipeline.Review.stored(result)
+                        self.job.review = pipeline.Review.stored(result["evidence"]["result"])
+                        if code_review.completed(self.job.review):
+                            self.run.facts["review"] = self.job.review.report()
                     else:
                         self.job.verified = Verified.stored(result)
         self.data["writes"] = max(self.data.get("writes", 0), sum(bool(a["result"].get("writing"))
@@ -656,6 +705,8 @@ class Controller(worker_turns.WorkerTurns):
                 "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 **({"serial_reason": self.data["serial_reason"]} if self.data.get("serial_reason") else {}),
+                "review_method": self.data.get("review_method", "legacy") if self.uses_code_review else "legacy",
+                "required_gates": self.required_gates(),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
@@ -1038,15 +1089,27 @@ class Controller(worker_turns.WorkerTurns):
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
-        needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
+        needed = [gate for gate in self.required_gates() if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
         if not self.data["evidence"]["checks"]["result"].get("full"):
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
+        if self.uses_code_review:
+            if not self.job.review.approved() or not code_review.completed(self.job.review):
+                raise ValueError("review findings need an explicit orchestrator decision before publication")
+            if (self.job.review.trees != code_review.candidate_trees(self.job.checkouts)
+                    or self.job.review.asdict().get("bases") != code_review.bases(self.job.checkouts)):
+                raise ValueError("the candidate or comparison base changed since the review decision")
+            if "verify" in self.required_gates() and not flows.retry_passed(self.job.verified):
+                raise ValueError("the configured behavioral check must pass")
+            if "verify" not in self.required_gates() and not self.current("verify"):
+                self.job.verified = code_review.unverified()
+            pipeline.note_review(self.run, self.job.review, self.job.verified)
         catch_up = self.data.get("catch_up_hold")
-        if catch_up and (not flows.retry_passed(self.job.verified) or not self.job.review.approved()):
+        if catch_up and (("verify" in self.required_gates() and not flows.retry_passed(self.job.verified))
+                         or not self.job.review.approved()):
             raise ValueError("publication after a catch-up hold requires passing verification and an approving review")
         measurement_section = (pipeline.unverified_measurement_section(unverified_measurement)
                                if unverified_measurement else "")
@@ -1626,6 +1689,15 @@ class Controller(worker_turns.WorkerTurns):
             if outcome.passed:
                 self.stamp("checks", outcome.data)
             return {"passed": outcome.passed, **outcome.data}
+        if op == "review.decide":
+            return self.decide_findings(args)
+        if op == "review.run" and self.uses_code_review:
+            source = self.latest_code_review()
+            report = self.applicable_report(source)
+            if report and (self.current("review") or
+                           (report["verdict"] == "pending" and self.job.review.verdict == "pending")):
+                return {"reused_review": source["id"], "findings": report["findings"],
+                        "next": "Use the source review ID to settle pending findings, or publish a settled review."}
         if op in ("verification.run", "review.run"):
             role = "verify" if op == "verification.run" else "review"
             self.data.setdefault("evidence", {}).pop(role, None)
@@ -1639,7 +1711,7 @@ class Controller(worker_turns.WorkerTurns):
             try:
                 with self.selected(setting):
                     outcome = self.atomic(role, **({"tree": str(self.job.ws), "single": True} if role == "verify"
-                                                   else {"attempt": self.job.reviews + 1}))
+                                                   else {"attempt": self.job.reviews + 1, **({"code_review": True} if self.uses_code_review else {})}))
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
@@ -1664,7 +1736,7 @@ class Controller(worker_turns.WorkerTurns):
                 published = self.data.get("published", {})
                 if (published.get("ending") not in ("done", "pr") or self.data.get("ci_failed")
                         or self.data.get("published_tree") != self.fingerprint()
-                        or not all(self.current(gate) for gate in ("checks", "verify", "review"))):
+                        or not all(self.current(gate) for gate in self.required_gates())):
                     raise ValueError("delivery has no successful current engine publication")
                 self.ending = (published["ending"], published.get("summary", ""),
                                " ".join(c.pr for c in self.job.with_prs))
@@ -1737,7 +1809,7 @@ class Controller(worker_turns.WorkerTurns):
             raise
         else:
             if result is not None and not (self.exchanged and action["op"] in ("worker.steer", "worker.reply", "worker.cancel")):
-                gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+                gate = ACTION_GATES.get(action["op"])
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
                 state = "failed" if action["op"] != "run.observe" and "error" in result else "succeeded"

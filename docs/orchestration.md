@@ -5,6 +5,21 @@ The controller chooses bounded actions and supervises delegates; Arete retains p
 A separate planner, learning pass and documentation pass are optional, not hidden prerequisites.
 An explicitly invoked fixed or custom script keeps its strategy.
 
+## Code review
+
+New orchestrated tickets finish with the repository’s full checks and a two-part code review.
+Two fresh read-only reviewers inspect the same staged candidate against its pinned base.
+Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
+This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
+
+A clean report can go straight to publication. With findings, the orchestrator decides which ones need work.
+It delegates repairs, runs full checks on the resulting candidate, then calls `review.decide` with the source review action ID
+and a `fixed` or `nonblocking` decision and reason for each finding. The action ledger retains the original findings
+and the delivery report includes the decisions. Repairs to those findings can proceed without a second full code review.
+A material scope or base change calls for a fresh review. Configured probes and explicit journey IDs require behavioral
+verification. The orchestrator can also request it for ticket acceptance or a specific uncertainty.
+Existing ticket lineages retain the policy under which they started.
+
 ## Select or revert
 
 Set the layer deliberately:

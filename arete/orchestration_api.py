@@ -82,6 +82,9 @@ OPERATIONS = {
                                    {"goal_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "review.run": Operation("One independent review of the current tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
+    "review.decide": Operation("Settle the latest code review after full checks. Give each finding ID a decision "
+                               "with status fixed or nonblocking and a reason. Delegate fixes before settling.",
+                               {"review_id": required(str), "decisions": required(dict)}),
     "owner.ask": Operation("Ask through the existing owner-question lifecycle. request must match its schema: "
                            "questions holds 1 to 4 questions and why says why you need the answer. "
                            "A rejected request names what to fix; send it again before finishing failed.",
