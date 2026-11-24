@@ -2264,6 +2264,26 @@ with db.tx() as c:
 """)
 
 
+class WorkspaceLegacyChildIdentityTests(_WorkspaceChildCase):
+    def test_a_legacy_pid_newer_than_its_heartbeat_file_can_be_released(self):
+        self.run_child(workspace_schema(27) + r"""
+import subprocess
+from arete import control
+
+beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+pid = os.getpid()
+util.write_json(beat, {"workspace_contract_children": [pid]})
+os.utime(beat, (946684800, 946684800))
+with patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout="")):
+    with db.reader() as c:
+        assert f"inherited child {pid}" in db.contract_blockers(c, 28)
+process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
+with patch.object(util, "sh", return_value=process):
+    with db.reader() as c:
+        assert f"inherited child {pid}" not in db.contract_blockers(c, 28)
+""")
+
+
 class WorkspaceProcessInventoryTests(_WorkspaceChildCase):
     def test_serve_records_the_current_child_identity_before_workspace_activation(self):
         self.run_child(workspace_schema(27) + r"""
