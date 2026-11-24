@@ -207,6 +207,11 @@ def inspect_pr_recovery(cfg, repo, source, t, row, held, existing) -> None:
     cause = pr_recovery.REASON
     key = unblock.digest(observed)
     baseline = held.get("decision") or ""
+    origin = ledger.for_run(row["id"])
+    admitted = origin.get("grant", {}).get("binding", {}).get("pr_recovery", {})
+    if (origin.get("repo"), origin.get("ticket"), admitted.get("refs", {}).get("url")) == (repo.name, t.id, held["pr"]):
+        if (decision := admitted.get("decision", "")).startswith(pr_recovery.DECISION_VERSION):
+            baseline = decision
     if not baseline.startswith(pr_recovery.DECISION_VERSION):
         saved = json.loads(existing.get("snapshot") or "{}")
         since = held.get("held_at") or row.get("finished")

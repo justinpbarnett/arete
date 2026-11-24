@@ -499,6 +499,12 @@ class CatchUpPathCollision(workspace.RunFailed):
         self.name = name
 
 
+@dataclass(frozen=True)
+class RecoveryDiscussion:
+    decision: str = ""
+    replies: list[dict] | None = None
+
+
 @dataclass(kw_only=True)
 class Run(AgentRun):
     tracker: tracker.Tracker
@@ -529,6 +535,23 @@ class Run(AgentRun):
     environment_release: str = ""
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
+    pr_recovery_cutoff: str = field(default="", init=False)
+    pr_recovery_discussion: dict[str, RecoveryDiscussion] = field(default_factory=dict, init=False)
+
+    def capture_pr_recovery_discussion(self, prs: list[str]) -> None:
+        self.pr_recovery_cutoff = util.iso()
+        prior = self.recovery.get("binding", {}).get("pr_recovery", {})
+        for pr in prs:
+            decision = prior.get("decision", "") if prior.get("refs", {}).get("url") == pr else ""
+            replies = None
+            try:
+                replies = pr_recovery.pr_replies(pr, self.repo.name, str(self.tid))
+                if not decision:
+                    decision = pr_recovery.decision_for(self.id, self.tracker, str(self.tid), pr, replies=replies)
+            except (*tracker.ERRORS, OSError, ValueError) as error:
+                detail = util.first_line(vault.hidden(str(error)), 300)
+                self.log(f"could not record the initial owner discussion on {pr}: {detail}")
+            self.pr_recovery_discussion[pr] = RecoveryDiscussion(decision, replies)
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -2384,16 +2407,10 @@ def hold_open_pr(run: Run, error: pr_recovery.Hold, kept: dict[str, tuple[str, s
     if before == failure["local"] and after:
         failure["local"] = after
         why += f" Arete kept the remaining edits at {after}."
-    failure["held_at"] = util.iso()
-    try:
-        replies = pr_recovery.pr_replies(failure["pr"], run.repo.name, str(run.tid))
-        decision = pr_recovery.decision_for(run.id, run.tracker, str(run.tid), failure["pr"], replies=replies)
-        failure["seen_replies"] = pr_recovery.reply_keys_since(replies, failure["held_at"])
-    except (*tracker.ERRORS, OSError, ValueError) as read_error:
-        prior = run.recovery.get("binding", {}).get("pr_recovery", {})
-        decision = prior.get("decision", "") if prior.get("refs", {}).get("url") == failure["pr"] else ""
-        run.log(f"could not record the current owner discussion: {util.first_line(vault.hidden(str(read_error)), 300)}")
-    run.failure = {"class": "environment", **failure, "decision": decision}
+    discussion = run.pr_recovery_discussion.get(failure["pr"], RecoveryDiscussion())
+    failure["held_at"] = run.pr_recovery_cutoff or util.iso()
+    failure["seen_replies"] = pr_recovery.reply_keys_since(discussion.replies or [], failure["held_at"])
+    run.failure = {"class": "environment", **failure, "decision": discussion.decision}
     run.log(f"held: {why}")
     run.enter(run.failed_state)
     if not run.dry_run and pr_recovery.notice(run.repo.name, str(run.tid), run.failure):

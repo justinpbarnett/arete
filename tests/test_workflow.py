@@ -1991,7 +1991,7 @@ class PublicationFixture(unittest.TestCase):
                                     workspace="fixture", tools=[], deny=[])
         self.controller.run = run
         self.controller.job = SimpleNamespace(b=self.build, checkouts=[self.checkout], verified=verify.Verified("pass"),
-                                              check_publication_targets=None)
+                                              check_publication_targets=None, recovery_publication=None)
         self.controller.lease, self.controller.ending, self.controller.workers = "fixture-lease", None, {}
         self.controller.data = {"acceptance": "task", "evidence": {"checks": {"result": {"full": True}}}}
         self.controller.current = mock.Mock(return_value=True)
@@ -2582,7 +2582,7 @@ class AutomaticCIRerunFixture:
                                          with_prs=[self.checkout], checkouts=[self.checkout], changed=[self.checkout],
                                          picked=list, verified=verify.Verified("pass"), review=Review("approve"),
                                          approval=None, draft_why="", build_summary="Fixture", run=self.run,
-                                         prepared_feedback_prs=[])
+                                         prepared_feedback_prs=[], recovery_publication=None)
         controller.data = {"evidence": {"checks": {"result": {"full": True}}}}
         controller.workers = {}
         controller.ending = None

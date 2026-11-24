@@ -357,7 +357,10 @@ class Controller(worker_turns.WorkerTurns):
                 goal += f"\n\n## Current ticket discussion\n\n{discussion}"
             known_replies = {(pipeline.feedback_key(f), f["body"]) for f in self.data.get("feedback", [])}
             for plan in self.job.pr_plans:
-                replies = pr_recovery.pr_replies(plan.inputs.checkout.pr, self.run.repo.name, str(self.run.tid))
+                pr = plan.inputs.checkout.pr
+                replies = self.run.pr_recovery_discussion[pr].replies
+                if replies is None:
+                    replies = pr_recovery.pr_replies(pr, self.run.repo.name, str(self.run.tid))
                 unseen = [row for row in replies if (pipeline.feedback_key(row), row["body"]) not in known_replies]
                 if unseen:
                     latest = sorted(unseen, key=lambda row: row["created"] or "")[-tracker.MAX_COMMENTS:]
@@ -457,6 +460,7 @@ class Controller(worker_turns.WorkerTurns):
                 raise factory.Refused("the ticket closed before the PR could be reconciled")
             self.job.ticket.comments = ticket.comments
             self.note_route()
+            self.run.capture_pr_recovery_discussion([checkout.pr for checkout in self.job.with_prs])
 
     def note_route(self):
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
@@ -522,6 +526,12 @@ class Controller(worker_turns.WorkerTurns):
                 if job.merge_moved_base("orchestrate", before_resolve=self.check_merged_policy):
                     self.check_merged_policy()
             return
+        if job.pr_plans:
+            self.check_merged_policy()
+            if self.run.answers_due:
+                self.run.kept_note = pipeline.kept_edits_note([c for c in job.checkouts if c.onto])
+            job.b.workspace = job.workspace
+            return
         deny = diffguard.denied_paths(job.layer)
         b = job.b
 
@@ -537,8 +547,6 @@ class Controller(worker_turns.WorkerTurns):
         saved_tracked = {}
 
         def remember_denied(checkout, head, tracked):
-            if job.pr_plans:
-                pr_recovery.check_base_ignore_changes(checkout, job.branch, head)
             repo = checkout.github
             denied_before[repo] = visible_denied(checkout)
             if tracked:
@@ -551,8 +559,6 @@ class Controller(worker_turns.WorkerTurns):
             checkout.resumes = True
             if not checkout.recovery_base:
                 workspace.fetch(checkout.src, checkout.base)
-        if job.pr_plans:
-            self.check_merged_policy()
         policy_dir = self.run.repo.layer or job.ws / ".agents"
         merge_order = sorted((c for c in prs if not c.recovery_base),
                              key=lambda c: -len(c.wt.parts) if policy_dir.is_relative_to(c.wt) else 0)

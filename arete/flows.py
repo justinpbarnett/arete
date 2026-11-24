@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import (
@@ -780,10 +780,7 @@ class Job:
                 head = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], c.src, check=False).strip() or remote
             if (attached and self.before_pr_recovery and not self.run.workspace and c.pr
                     and (c.recovery_head or expected and remote != expected)):
-                self.before_pr_recovery()
-                recorded = workspace.head_recorded(workspace.made_before(self.ws), c)
-                self.pr_plans.append(pr_recovery.plan(c, branch, expected, head, remote, runs, self.run.id,
-                                                       recorded, diffguard.denied_paths(self.layer)))
+                self.plan_pr_recovery(c, expected, head, remote, runs)
                 return ""
             if remote:
                 workspace.fetch(c.src, branch)
@@ -849,12 +846,41 @@ class Job:
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
                     raise workspace.RunFailed(why)
+            if self.pr_plans:
+                self.plan_sibling_prs(runs)
             self.install_pr_plans()
         pipeline.claim_workspace(run, self.ws, self.checkouts)
         if stored and not reconciling_catch_up:
             opened(run, self.ticket)
             if not run.alone:
                 run.enter("running")
+
+    def plan_pr_recovery(self, c: workspace.Checkout, expected: str, head: str, remote: str,
+                         runs: set[str]) -> pr_recovery.Plan:
+        if self.before_pr_recovery:
+            self.before_pr_recovery()
+        recorded = workspace.head_recorded(workspace.made_before(self.ws), c)
+        plan = pr_recovery.plan(c, self.branch, expected, head, remote, runs, self.run.id,
+                                recorded, diffguard.denied_paths(self.layer))
+        self.pr_plans.append(plan)
+        return plan
+
+    def plan_sibling_prs(self, runs: set[str]) -> None:
+        planned = {p.inputs.checkout.github for p in self.pr_plans}
+        for c in self.with_prs:
+            if c.github in planned:
+                continue
+            expected = pr_recovery.expected_inputs(c, self.branch, "")
+            refs = pr_recovery.observe(c, self.branch)
+            if (refs == expected.refs and refs.base and refs.target_matches(c, self.branch)
+                    and pipeline.base_of_head(c, check=False) == refs.base):
+                c.resumes = True
+                continue
+            head = pr_recovery.current_head(c)
+            plan = self.plan_pr_recovery(c, c.lease, head, refs.origin, runs)
+            if plan.inputs.refs.head == c.lease:
+                base = replace(c, base_commit=plan.inputs.refs.base)
+                pr_recovery.check_base_ignore_changes(base, self.branch, head)
 
     def install_pr_plans(self) -> None:
         for plan in self.pr_plans:

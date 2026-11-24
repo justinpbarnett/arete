@@ -180,7 +180,7 @@ def fresh_feedback_after_hold(row: dict, held: dict, feedback: list[dict]) -> bo
         return False
     fresh = [r for r in feedback if r["pr_url"] == held["pr"] and r["pr_state"] == "OPEN"
              and r["status"] == "new" and r["run_id"] is None and is_reply(r["body"] or "")]
-    return any(key not in held.get("seen_replies", ()) for key in reply_keys_since(fresh, since))
+    return bool(reply_keys_since(fresh, since))
 
 
 def decision(run_id: str, _display_comments: str) -> str:
@@ -264,17 +264,37 @@ def affected_retained(wt: Path, dirs: set[Path]) -> dict[str, bool]:
             for name in names if under_rules(name, dirs)}
 
 
-def check_ignore_changes(i: Inputs, wt: Path, affected: dict[str, bool]) -> None:
+def retained_excludes(wt: Path) -> Path | None:
+    result = util.sh(["git", "config", "--null", "--path", "--get", "core.excludesFile"], cwd=wt)
+    if result.returncode not in (0, 1):
+        raise RuntimeError("could not read the retained worktree's Git exclude settings")
+    value = result.stdout.removesuffix("\0")
+    return wt.absolute() / value if value else None
+
+
+def changes_excludes(wt: Path, excludes: Path, changed: list[str]) -> bool:
+    roots = {wt.absolute(), wt.resolve()}
+    files = {Path(str(p).casefold()) for p in (excludes, excludes.resolve())}
+    possible_changes = files | {parent for path in files for parent in path.parents}
+    return any(Path(str(root / name).casefold()) in possible_changes for root in roots for name in changed)
+
+
+def check_ignore_changes(i: Inputs, wt: Path, affected: dict[str, bool], excludes: Path | None,
+                         *, excludes_changed: bool) -> None:
     if not affected:
         return
     retained = i.checkout.wt
     retained_rules = rule_dirs(set(workspace.uncommitted(retained)) | workspace.ignored_file_paths(retained))
-    result = util.sh(["git", "check-ignore", "--no-index", "-z", "--stdin"], cwd=wt,
+    git_dir = util.git(["rev-parse", "--absolute-git-dir"], retained).rstrip("\n")
+    override = ["-c", f"core.excludesFile={excludes}"] if excludes is not None else []
+    result = util.sh(["git", f"--git-dir={git_dir}", f"--work-tree={wt}", *override,
+                     "check-ignore", "--no-index", "-z", "--stdin"], cwd=wt,
                      input="\0".join(sorted(affected)) + "\0")
     ignored = set(result.stdout.split("\0")) - {""}
     hidden, exposed = [], []
     for name, was_ignored in sorted(affected.items()):
-        if (result.returncode not in (0, 1) or under_rules(name, retained_rules) or (name in ignored) != was_ignored):
+        if (excludes_changed or result.returncode not in (0, 1) or under_rules(name, retained_rules)
+                or (name in ignored) != was_ignored):
             (exposed if was_ignored else hidden).append(name)
     if hidden or exposed:
         i.recheck(during="during isolated reconciliation")
@@ -385,9 +405,12 @@ def plan(c: workspace.Checkout, branch: str, accepted: str, local: str, remote: 
             if diff.denied:
                 raise i.hold(f"the candidate differs from the PR base in protected files: {', '.join(map(repr, diff.denied))}",
                              "Have the owner reconcile the protected paths on the PR before resuming")
-            dirs = incoming_ignore_dirs(wt, local, candidate)
+            changed = util.git_records(["diff", "--no-renames", "--name-only", local, candidate], wt)
+            excludes = retained_excludes(c.wt)
+            excludes_changed = excludes is not None and changes_excludes(c.wt, excludes, changed)
+            dirs = {Path(".")} if excludes_changed else rule_dirs(changed)
             affected = affected_retained(c.wt, dirs)
-            check_ignore_changes(i, wt, affected)
+            check_ignore_changes(i, wt, affected, excludes, excludes_changed=excludes_changed)
         finally:
             with util.repo_lock(c.src):
                 util.git([*NO_HOOKS, "worktree", "remove", "--force", str(wt)], c.src)

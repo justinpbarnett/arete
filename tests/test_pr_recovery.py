@@ -1,3 +1,4 @@
+import os
 import signal
 import tempfile
 import unittest
@@ -34,6 +35,10 @@ class RecoveryFixture(unittest.TestCase):
     def setUp(self):
         self.root = root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(support.workspace_state(root))
+        git_env = self.enterContext(patch.dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                                               GIT_CONFIG_COUNT="0", GIT_ALLOW_PROTOCOL="file", GIT_TERMINAL_PROMPT="0"))
+        git_env.pop("GIT_CONFIG_PARAMETERS", None)
+        self.enterContext(patch.object(util, "wait_for_network", side_effect=AssertionError("unexpected network wait")))
         db.migrate()
         src, layer = root / "sources", root / "policy"
         src.mkdir()
@@ -99,9 +104,9 @@ class RecoveryFixture(unittest.TestCase):
 
     def pr(self, url, **kw):
         remote = self.remotes[url]
+        head, base = self.git(remote, "rev-parse", "refs/heads/topic", "refs/heads/main").splitlines()
         return {"url": url, "state": "OPEN", "headRefName": "topic", "isCrossRepository": False,
-                "headRefOid": self.git(remote, "rev-parse", "refs/heads/topic"),
-                "baseRefName": "main", "baseRefOid": self.git(remote, "rev-parse", "refs/heads/main")}
+                "headRefOid": head, "baseRefName": "main", "baseRefOid": base}
 
     def advance(self, file="other.txt", value="second session\n"):
         head = self.commit(self.other, file, value)
@@ -563,7 +568,83 @@ class OpenPRRecoveryResumeTests(ResumeFixture):
         self.spawn.assert_not_called()
 
 
-class MultiCheckoutRecoveryTests(ResumeFixture):
+class SettlementReplyRecoveryTests(ResumeFixture):
+    def resume_with_settlement_reply(self, previous, reply_id, *, recovery=""):
+        drive = flows.driven
+
+        def reply_after_hold(*args):
+            try:
+                return drive(*args)
+            except pr_recovery.Hold:
+                self.pr_comments.append({"id": reply_id, "user": {"login": "keeper"},
+                                         "body": "Keep both versions for my review.", "created_at": util.iso()})
+                raise
+
+        with patch.object(flows, "driven", side_effect=reply_after_hold):
+            return self.resume(previous, recovery=recovery)
+
+    def test_enrolled_hold_does_not_consume_a_reply_received_during_settlement(self):
+        local = self.keep("shared.txt")
+        remote = self.advance("shared.txt")
+        self.seed()
+        held = self.resume(self.previous)
+        self.assertEqual(self.watch()["phase"], "needs_owner")
+        self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "Keep the upstream wording."})
+        self.watch()
+        attempt, = self.launched
+
+        child = self.resume_with_settlement_reply(held["id"], 2, recovery=attempt)
+        self.assert_held(child)
+        self.assertEqual(ledger.attempt_of(attempt)["child"], child["id"])
+        self.watch()
+        first, next_attempt = self.launched
+        self.assertEqual(first, attempt)
+        self.assertNotEqual(next_attempt, first)
+
+        retried = self.resume(child["id"], recovery=next_attempt)
+        self.assert_held(retried)
+        self.assertEqual(ledger.attempt_of(next_attempt)["child"], retried["id"])
+        baseline = self.watch()
+        self.assertEqual(baseline["phase"], "needs_owner")
+        self.assertEqual(self.watch()["generation"], baseline["generation"])
+        self.assertEqual(self.spawn.call_count, 2)
+        self.assertEqual(len(self.notices()), 3)
+        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.remote_head(), remote)
+        self.decide.assert_not_called()
+        self.model.assert_not_called()
+
+    def test_feedback_poll_sees_a_trusted_reply_received_during_settlement(self):
+        self.cfg.unblock_repos = ()
+        self.keep("shared.txt")
+        self.advance("shared.txt")
+        self.seed()
+        with patch.object(util, "now", return_value=util.now()):
+            held = self.resume_with_settlement_reply(self.previous, 1)
+        self.assert_held(held)
+        insights_store.add_feedback(outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid))
+        layer = config.load_layer(self.repo.layer_dir)
+        discovery = poll.routing.Discovery(self.cfg, self.repo, priced=False, layer=layer)
+        queue = poll.RepoQueue(self.repo, self.source, set(), layer, discovery)
+        skips = pipeline.SkipLog({})
+
+        def spawn_feedback(repo, tid, readmission):
+            self.assertEqual(pipeline.run_command(repo, tid)[-2:], ["--continue", held["id"]])
+            self.assert_held(self.resume(held["id"]))
+            return True
+
+        with (patch.object(pipeline, "FEEDBACK_QUIET_MINUTES", 0),
+              patch.object(poll, "spawn_unparked", side_effect=spawn_feedback) as start):
+            pick = poll.next_pick(self.repo, self.source, skips, set())
+            self.assertTrue(pick.from_feedback)
+            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
+            self.assertIsNone(poll.next_pick(self.repo, self.source, skips, set()))
+            start.assert_called_once()
+        self.decide.assert_not_called()
+        self.model.assert_not_called()
+
+
+class MultiCheckoutFixture(ResumeFixture):
     part = "first"
 
     def sibling(self, *, ignore=""):
@@ -576,6 +657,40 @@ class MultiCheckoutRecoveryTests(ResumeFixture):
         head = self.commit(other, name, "new sibling remote head\n")
         self.git(other, "push", "origin", "topic")
         return head
+
+
+class MultiCheckoutRecoveryTests(MultiCheckoutFixture):
+    def test_unchanged_sibling_head_with_a_conflicting_base_holds_before_installing(self):
+        side, other = self.sibling()
+        name = "shared.txt"
+        retained = self.commit(side.wt, name, "retained sibling edit\n", owner=self.previous)
+        local = self.keep()
+        external = self.advance()
+        self.seed()
+        base = self.commit(side.src, name, "new base edit\n")
+        self.git(side.src, "push", "origin", "main")
+
+        row = self.resume(self.previous)
+        held = self.assert_held(row)
+        self.assertEqual((held["github"], held["local"]), (side.github, retained))
+        self.assertEqual((held["refs"]["head"], held["refs"]["base"]), (side.lease, base))
+        for text in (repr(name), retained, base, "Resolve the named files in a separate checkout"):
+            self.assertIn(text, row["summary"])
+        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), retained)
+        self.assertEqual(self.git(side.wt, "status", "--porcelain"), "")
+        self.assertEqual((side.wt / name).read_text(), "retained sibling edit\n")
+        self.assertEqual(self.git(side.src, "show", f"{base}:{name}"), "new base edit")
+        remote = self.pr(side.pr)
+        self.assertEqual((remote["headRefOid"], remote["baseRefOid"]), (side.lease, base))
+        self.assertEqual(self.git(other, "rev-parse", "HEAD"), side.lease)
+        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.remote_head(), external)
+        self.assertEqual(self.watch()["phase"], "needs_owner")
+        self.assertEqual(self.watch()["phase"], "needs_owner")
+        self.assertEqual(len(self.notices()), 1)
+        self.spawn.assert_not_called()
+        self.decide.assert_not_called()
+        self.model.assert_not_called()
 
     def test_sibling_base_ignore_change_does_not_expose_retained_file(self):
         name = "side-private.txt"
@@ -642,6 +757,8 @@ class MultiCheckoutRecoveryTests(ResumeFixture):
         self.model.assert_not_called()
         self.decide.assert_called_once()
 
+
+class MultiCheckoutPublicationRaceTests(MultiCheckoutFixture):
     def test_second_pass_pre_push_race_reports_first_pass(self):
         self.check_second_pass_race("pre-push")
 
@@ -776,6 +893,8 @@ class MultiCheckoutRecoveryTests(ResumeFixture):
         self.watch()
         self.spawn.assert_not_called()
 
+
+class MultiCheckoutInstallTests(MultiCheckoutFixture):
     def test_later_install_failure_keeps_successful_checkout_provenance_for_next_resume(self):
         side, other = self.sibling()
         self.checkout.onto = self.accepted
