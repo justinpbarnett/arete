@@ -614,7 +614,7 @@ def lookup_key(c, settings, local, meta):
             raise FingerprintKeyMissing("fingerprint_key_missing")
         initialization = KeyInitialization(meta["instance_id"])
         value = read_file(local, local.parent)
-        if value is None and not db.in_write():
+        if value is None and not paths.ISOLATED and not db.in_write():
             # The WAL reader can outlive publication of the same key in the configured store.
             with closing(db.read_connection()) as latest, db.read_snapshot(latest):
                 published = db.metadata(latest)
