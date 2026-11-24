@@ -23,6 +23,7 @@ SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
 LOGIN_DIR = paths.STATE_DIR / "pi-login"
 KEY_DIR = paths.STATE_DIR / "pi-key"
+LINUX_SHM = Path("/dev/shm")
 TEMPORARY_ROOTS = ("/private/tmp", "/private/var/folders")
 WRITABLE_ALWAYS = (*TEMPORARY_ROOTS, "/dev")
 WRITABLE_DEVICES = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/dtracehelper", "/dev/tty")
@@ -254,14 +255,55 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
+def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> list[Path]:
+    from .store import db, workspaces
+
+    base = paths.WORKTREES_DIR.resolve()
+    requested: dict[str, list[Path]] = {}
+    for root in checkouts:
+        if base in root.parents:
+            requested.setdefault(root.relative_to(base).parts[0], []).append(root)
+    metadata = []
+    if requested:
+        with suppress(db.NoDatabase), db.reader() as conn:
+            if not db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
+                return []
+            for name, roots in requested.items():
+                if not (row := workspaces.open_for(name)):
+                    continue
+                for checkout in workspaces.owner_of(row).checkouts:
+                    if not any(checkout.wt.resolve().is_relative_to(root) for root in roots):
+                        continue
+                    git_dir = Path(os.path.abspath(checkout.src)) / ".git"
+                    if LINUX_SHM in git_dir.parents and git_dir.resolve() == git_dir and git_dir.is_dir():
+                        metadata.append(git_dir)
+    return metadata
+
+
+def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None) -> list[str]:
+    roots = checkouts + (paths.STATE_DIR.resolve(),) + ((profile,) if profile is not None else ())
+    if any(root in (LINUX_SHM, LINUX_SHM.parent) for root in roots):
+        raise ConfinementUnavailable("Claude cannot restore a shared device directory")
+    if profile is not None and LINUX_SHM in profile.parents and not profile.is_dir():
+        with paths.directory_fd(profile, create=True):
+            pass
+    restored = {root for root in (*roots, *linux_checkout_metadata(checkouts)) if LINUX_SHM in root.parents}
+    return [arg for root in sorted(restored) if restored.isdisjoint(root.parents)
+            for arg in ("--bind", str(root), str(root))]
+
+
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
-                       mount_lease: ExitStack | None = None, activation_lease: WorkerLease | None = None) -> list[str]:
+                       profile: Path | None = None, mount_lease: ExitStack | None = None,
+                       activation_lease: WorkerLease | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
         return command
     from . import secretstore
 
+    launcher = shutil.which("bwrap", path=os.defpath)
+    if not launcher:
+        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
     try:
         key = secretstore.local_key_path()
         info = linux_key_info(key)
@@ -275,21 +317,20 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         store, activated = linux_store_policy(has_local=info is not None, had_local=had_local)
         if activated and activation_lease is not None:
             activation_lease.close()
-        if info is None and store is None:
-            return command
         work = Path(cwd).resolve()
-        masks = linux_fingerprint_mounts(key, info, (work, *opened)) if info is not None else []
+        checkouts = (work, *(Path(root).resolve() for root in opened))
+        profile = (work / profile).resolve() if profile is not None else None
+        targets = checkouts + ((profile,) if profile is not None else ())
+        if store is not None and any(root.is_relative_to(store) for root in targets):
+            raise ConfinementUnavailable("Claude cannot start inside the secret store")
+        masks = linux_fingerprint_mounts(key, info, targets) if info is not None else []
+        restored = linux_claude_mounts(checkouts, profile)
     except ConfinementUnavailable:
         raise
     except secretstore.FingerprintKeyMissing as error:
         raise ConfinementUnavailable(str(error)) from error
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
         raise ConfinementUnavailable("Claude could not determine Linux secret confinement paths") from error
-    launcher = shutil.which("bwrap", path=os.defpath)
-    if not launcher:
-        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
-    if store is not None and work.is_relative_to(store):
-        raise ConfinementUnavailable("Claude cannot start inside the secret store")
     if store is not None:
         try:
             with secretstore.file_parent(store / "mount", store, create=True, private=True):
@@ -299,7 +340,7 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         masks += ["--tmpfs", str(store), "--remount-ro", str(store)]
     return [launcher, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL",
             "--die-with-parent", "--new-session", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-            *masks, "--chdir", str(work), "--", *command]
+            *restored, *masks, "--chdir", str(work), "--", *command]
 
 
 def linux_key_info(key: Path) -> os.stat_result | None:

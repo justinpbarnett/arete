@@ -2,8 +2,12 @@ from tests.test_behavior import SECRET_LINUX_CLAUDE_FIXTURE, _SecretChildCase
 
 
 class AuthorityLinuxFingerprintTests(_SecretChildCase):
-    def test_fresh_routed_login_starts_and_defers_publication_until_claude_exits(self):
-        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+    def test_fresh_routed_login_requires_confinement_and_enrolls_after_the_attempt(self):
+        for confinement in ("usable", "missing", "refused"):
+            with self.subTest(confinement=confinement):
+                self.run_secret_child(f"confinement = {confinement!r}\n" + SECRET_LINUX_CLAUDE_FIXTURE + r"""
+import json
+
 from arete import routing, runner
 
 configured = paths.CONFIG_FILE.read_text()
@@ -15,29 +19,48 @@ candidate = routing.Candidate(0, model, 'claude', 'anthropic', 'cli_login', 'fre
 picked = runner.Picked(candidate, auth, None, model, '', {auth}, None)
 
 def active(cmd, cwd, prompt, env, timeout, on_line):
-    assert cmd[0] == '/fixture/claude' and not key.exists()
-    on_line('{"type":"system"}\n')
+    assert cmd[0] == bwrap and not key.exists() and not store.exists()
+    if confinement == 'refused':
+        return subprocess.CompletedProcess(cmd, 1, '', 'bwrap: fixture namespace unavailable')
+    assert cwd == str(checkout) and prompt == 'fixture prompt'
+    assert json.loads(cmd[cmd.index('--settings') + 1])['hooks']['PreToolUse']
+    session = cmd[cmd.index('--session-id') + 1]
+    on_line(json.dumps({'type': 'system', 'session_id': session}) + '\n')
     with case.assertRaisesRegex(secretstore.StoreError, 'Retry credential publication'):
         secretstore.fingerprint_key()
     paths.CONFIG_FILE.write_text(configured)
     with case.assertRaisesRegex(secretstore.StoreError, 'Retry credential publication'):
         secretstore.put('global', 'DEMO', 'synthetic-value', 'api_key', 'hand')
     assert not key.exists() and not store.exists()
-    return subprocess.CompletedProcess(cmd, 0, '{"type":"result","result":"fixture"}', '')
+    return subprocess.CompletedProcess(cmd, 0, json.dumps({
+        'type': 'result', 'result': 'fixture', 'session_id': session,
+    }), '')
 
 with (linux_claude() as (which, stream), mock.patch.object(runner, 'pick', return_value=(picked, [])),
       mock.patch.object(runner.util, 'github_token', return_value='')):
-    which.return_value, stream.side_effect = None, active
-    result = runner.run('fixture prompt', checkout, runner='claude', model=model, cfg=config.Config(), tools=[])
-    assert result.ok, result.error
-    which.assert_not_called()
-    stream.assert_called_once()
+    which.return_value = None if confinement == 'missing' else bwrap
+    stream.side_effect = active
+    result = runner.run('fixture prompt', checkout, runner='claude', model=model, cfg=config.Config(), tools=['Read'])
+    if confinement == 'missing':
+        assert not result.ok and 'requires bubblewrap' in result.error
+        stream.assert_not_called()
+    else:
+        stream.assert_called_once()
+        assert_mounts(stream, checkout)
+        if confinement == 'refused':
+            assert not result.ok and 'namespace unavailable' in result.error
+        else:
+            assert result.ok and result.text == 'fixture', result.error
+            argv = stream.call_args.args[0]
+            assert result.session.id == argv[argv.index('--session-id') + 1]
     with db.reader() as c:
         account, = c.execute("SELECT id, holder FROM accounts")
         assert account['id'] == 'anthropic:subscription' and account['holder'].startswith('u:')
-    assert secretstore.KEY_REF in db.schema_metadata() and not key.exists()
-
-    assert secretstore.put('global', 'DEMO', 'synthetic-value', 'api_key', 'hand')['status'] == 'set'
+    if confinement == 'usable':
+        assert secretstore.KEY_REF in db.schema_metadata() and not key.exists()
+        assert secretstore.put('global', 'DEMO', 'synthetic-value', 'api_key', 'hand')['status'] == 'set'
+    else:
+        assert secretstore.KEY_LOCAL in db.schema_metadata() and key.exists() and not store.exists()
 """)
 
     def test_busy_account_enrollment_retries_after_the_last_worker_exits(self):
@@ -79,6 +102,92 @@ with linux_claude(error='fixture: namespace unavailable') as (_, stream):
     assert not result.ok and 'namespace unavailable' in result.error
     stream.assert_called_once()
     assert_mounts(stream, checkout, *key_mask)
+""")
+
+
+class AuthorityLinuxCheckoutMountTests(_SecretChildCase):
+    def test_shared_memory_checkout_mount_preserves_fresh_devices_and_credential_masks(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+checkout = Path('/dev/shm') / Path.cwd().name / 'checkout'
+secretstore.write_file(key, key.parent, b'F' * 32)
+with linux_claude() as (_, stream):
+    assert run_claude(checkout).ok
+    stream.assert_called_once()
+    checkout_mount = ['--bind', str(checkout), str(checkout)]
+    assert_mounts(stream, checkout, *checkout_mount, *key_mask, *store_mask)
+""")
+
+    def test_linked_and_secondary_checkouts_with_redirected_session_and_hook_state(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+import json
+from io import StringIO
+
+from arete import tool_events, workspace
+from arete.store import workspaces
+
+shm = Path.cwd().resolve()
+source, secondary, profile = (shm / name for name in ('source', 'secondary', 'profile'))
+checkout = paths.WORKTREES_DIR / 'linked'
+
+def git(cwd, *argv):
+    return subprocess.run(['git', '-C', str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+
+for repo, text in ((source, 'original'), (secondary, 'secondary checkout')):
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    (repo / 'notes.txt').write_text(text + '\n')
+    git(repo, 'add', 'notes.txt')
+    git(repo, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture', 'commit', '-qm', 'fixture')
+linked = workspace.Checkout('', 'fixture/source', source, checkout, '')
+workspace.add_worktree(linked, 'fixture-linked', 'HEAD')
+(checkout / 'notes.txt').write_text('linked edit\n')
+secretstore.write_file(key, key.parent, b'F' * 32)
+
+def binds(*roots):
+    return [arg for p in sorted(roots) for arg in ('--bind', str(p), str(p))]
+
+def worker(cmd, cwd, prompt, env, timeout, on_line):
+    masks = [*binds(checkout, secondary, source / '.git', profile, state), *key_mask, *store_mask]
+    assert cmd[cmd.index('--bind'):cmd.index('--') + 2] == linux_mounts(checkout, *masks)
+    assert cmd[cmd.index('--add-dir') + 1] == str(secondary)
+    assert git(cwd, 'status', '--short') == ' M notes.txt\n'
+    assert '+linked edit' in git(cwd, 'diff', '--', 'notes.txt')
+    assert git(secondary, 'show', 'HEAD:notes.txt') == 'secondary checkout\n'
+
+    resumed = '--resume' in cmd
+    session = cmd[cmd.index('--resume' if resumed else '--session-id') + 1]
+    assert Path(env['CLAUDE_CONFIG_DIR']) == profile and profile.is_dir()
+    project = profile / 'projects' / 'fixture'
+    project.mkdir(parents=True, exist_ok=True)
+    transcript = project / (session + '.jsonl')
+    if resumed:
+        assert json.loads(transcript.read_text()) == {'session_id': session}
+    else:
+        transcript.write_text(json.dumps({'session_id': session}) + '\n')
+    payload = {'hook_event_name': 'PostToolUse', 'tool_name': 'Skill', 'tool_input': {'skill': 'fixture'},
+               'session_id': session, 'cwd': cwd}
+    assert Path(env['ARETE_STATE_DIR']) == paths.EVENTS_FILE.parent
+    with mock.patch.object(tool_events.sys, 'stdin', StringIO(json.dumps(payload))):
+        assert tool_events.main() == 0
+    result = json.dumps({'type': 'result', 'result': 'fixture', 'session_id': session})
+    on_line(result + '\n')
+    return subprocess.CompletedProcess(cmd, 0, result, '')
+
+options = {'auth': accounts.Auth(), 'passing': [], 'add_dirs': [secondary],
+           'extra_env': {'CLAUDE_CONFIG_DIR': str(profile)}}
+with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream):
+    # A Git link alone does not authorize an external mount.
+    assert sandbox.linux_claude_mounts((checkout,), None) == binds(checkout, state)
+    with case.assertRaisesRegex(sandbox.ConfinementUnavailable, 'shared device directory'):
+        sandbox.linux_claude_mounts((shm,), None)
+    workspaces.claim(checkout, 'fixture', '', '', checkouts=[linked])
+    stream.side_effect = worker
+    first = claude.run('fixture', checkout, **options)
+    assert first.ok and first.session.id, first.error
+    again = claude.run('fixture', checkout, resume=first.session, **options)
+    assert again.ok and again.session.id == first.session.id, again.error
+    assert stream.call_count == 2
+    assert [e['session'] for e in tool_events.read_events()] == [first.session.id] * 2
 """)
 
 

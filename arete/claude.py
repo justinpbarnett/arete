@@ -232,9 +232,7 @@ def _run(
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
-            opened = tuple(add_dirs or ())
-            if openrouter_config is not None:
-                opened += (openrouter_config,)
+            profile = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME") or paths.HOME) / ".claude")
             mounts = ExitStack()
             release_lock = Lock()
 
@@ -248,8 +246,16 @@ def _run(
 
             with sandbox.WorkerLease() as activation:
                 try:
-                    cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts, activation_lease=activation)
-                    proc = child.stream(activation.command(cmd), str(cwd), prompt, env, timeout, after_mounts)
+                    confined = sandbox.claude_confinement(
+                        cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,
+                        activation_lease=activation)
+                    try:
+                        proc = child.stream(activation.command(confined), str(cwd), prompt, env, timeout, after_mounts)
+                    except OSError as e:
+                        if confined is cmd:
+                            raise
+                        raise sandbox.ConfinementUnavailable(
+                            f"Claude could not start Linux secret confinement: {e.strerror or e}") from e
                 finally:
                     release_mount_lease()
     except sandbox.ConfinementUnavailable as e:
