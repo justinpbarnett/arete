@@ -954,6 +954,14 @@ def path_uses_system_sh(search_path: str) -> bool:
     return False
 
 
+def preserves_shell_lookup(words: list[str]) -> bool:
+    if words[0] == "printf":
+        return len(words) > 1 and DISPLAY_FORMAT.fullmatch(words[1]) is not None
+    if words[0] == "set":
+        return all(re.fullmatch(r"[-+][eufx]+", flag) for flag in words[1:]) or words[1:] == ["-o", "pipefail"]
+    return words[0] in (":", "echo", "true", "false", "pwd") or words == ["cd", "."]
+
+
 class KeychainShell:
     def __init__(self, source: str, *, shell: str = "bash"):
         self.source = source
@@ -1171,7 +1179,7 @@ class KeychainShell:
         pipeline: list[list[str]] = []
         docs: list[tuple[str, bool, bool, list[list[str]]]] = []
         needs_consumer = False
-        arithmetic = self.shell in ("bash", "/bin/sh")
+        arithmetic = self.shell in ("bash", "zsh", "/bin/sh")
 
         def finish() -> None:
             nonlocal needs_consumer, initial_path
@@ -1181,8 +1189,7 @@ class KeychainShell:
                     if initial_path and words[0] == "sh" and path_uses_system_sh(initial_path):
                         command[0] = "/bin/sh"
                     pipeline.append(command)
-                fmt = words[1] if len(words) > 1 else ""
-                if words[0] not in (":", "echo") and not (words[0] == "printf" and DISPLAY_FORMAT.fullmatch(fmt)):
+                if not preserves_shell_lookup(words):
                     initial_path = ""
                 self.refusal = self.refusal or denied_keychain(command, depth, self.shell)
                 needs_consumer = False

@@ -22,6 +22,9 @@ if sys.platform == 'darwin':
     child = 'sh -c ' + shlex.quote(loop)
     allowed.update({child: '1\n2\n4\n', "printf 'ready\\n'; " + child: 'ready\n1\n2\n4\n',
                     '/bin/sh -c ' + shlex.quote(show): '8\n'})
+    for setup in ("set -e", "set -eu", "set -o pipefail", "cd ."):
+        allowed[f"{setup}; {child}"] = '1\n2\n4\n'
+    allowed['/bin/zsh -f -c ' + shlex.quote(show)] = '8\n'
 nested = header.replace('<<1', '<<$(security -i)') + body
 malformed = (header[:-1] + body, standalone[:-2])
 credential, unparsed = 'security keychain items', 'unparsed shell command'

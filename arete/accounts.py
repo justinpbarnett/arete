@@ -211,19 +211,22 @@ def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = Fal
         if holder is None:
             return None
         key = secretstore.fingerprint_key()
+        digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
         if not auth.identity and secret_id is None and auth.mode == "subscription":
             login = scope(auth, "")
-            aliases = devices.linked_scopes(login, devices.refresh_links(c))
+            refreshes = devices.refresh_links(c)
+            aliases = devices.linked_scopes(login, refreshes)
             identities = {s: secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, s)
                           for s in aliases}
             existing = credentials.reconcile_logins(c, auth.provider, auth.mode, identities.values(), holder)
             if refresh_only and existing is None:
                 return None
-            identity = existing or identities[login]
+            identity = existing["identity"] if existing else identities[login]
+            if existing and any(before == auth.generation and after != before for before, after, _, _ in refreshes):
+                digest = existing["fingerprint"]
         else:
             identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
                                           auth.identity or (secret_id if secret_id is not None else who))
-        digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
         return credentials.save_account(c, label, auth.provider, auth.mode, holder, "personal", identity, digest,
                                         secret_id)
 

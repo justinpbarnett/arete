@@ -90,7 +90,7 @@ def account_rows(c):
 
 def reconcile_logins(c, provider, mode, identities, holder):
     rows = c.execute("""
-        SELECT id, identity, version FROM accounts WHERE provider = ? AND mode = ? AND secret_id IS NULL
+        SELECT id, identity, fingerprint, version FROM accounts WHERE provider = ? AND mode = ? AND secret_id IS NULL
           AND identity IN (SELECT value FROM json_each(?)) ORDER BY created, rowid
         """, (provider, mode, json.dumps(list(identities)))).fetchall()
     if not rows:
@@ -104,7 +104,7 @@ def reconcile_logins(c, provider, mode, identities, holder):
         c.execute("DELETE FROM accounts WHERE id = ?", (duplicate["id"],))
         events.emit("credential.changed", f"account:{duplicate['id']}", cls="durable", ver=duplicate["version"] + 1,
                     data={"id": duplicate["id"], "fingerprint": None}, connection=c)
-    return kept["identity"]
+    return kept
 
 
 def save_account(c, label, provider, mode, holder, usage, identity, fingerprint, secret_id):

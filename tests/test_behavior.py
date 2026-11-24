@@ -936,6 +936,36 @@ assert 'fingerprint_key_ref' not in db.schema_metadata()
 """, keychain=True)
 
 
+class AuthorityAccountRefreshTests(_SecretChildCase):
+    def test_two_workers_and_a_pinned_retry_keep_one_confirmed_login(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+route = pi.Route(provider, 'fixture', first, owner=owner)
+pi.observed_refresh(route, {'provider': provider, 'before': before, 'after': after})
+refreshed = accounts.record(latest)
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
 SECRET_HTTP_FIXTURE = r"""
 import json
 from types import SimpleNamespace
