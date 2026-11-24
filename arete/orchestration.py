@@ -354,6 +354,9 @@ class Controller(worker_turns.WorkerTurns):
         self.data["limits"] = self.configured_limits()
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
+        if (self.flow.continues and self.default_code_review and not self.run.environment_release
+                and not self.uses_code_review):
+            self.adopt_code_review()
         self.recover()
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
@@ -639,22 +642,24 @@ class Controller(worker_turns.WorkerTurns):
                     and self.matches_policy(found["policy"], self.policy_sha())
                     and found.get("acceptance") == self.data["acceptance"])
 
+    def adopt_code_review(self):
+        stale = set(self.data.get("stale_actions", ()))
+        stale.update(a["id"] for a in ledger.actions(self.lease)
+                     if ACTION_GATES.get(a["op"]) == "review" and a["state"] != "accepted")
+        self.data["stale_actions"] = sorted(stale)
+        self.data.setdefault("evidence", {}).pop("review", None)
+        self.job.review, self.job.reviews = pipeline.Review(), 0
+        self.data["review_method"] = code_review.METHOD
+        self.run.code_review = True
+        self.run.log("Adopted Standards and Spec code review for this continuation.")
+
     def recover(self):
         self.quiescent()
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         catch_up = self.data.get("catch_up_hold", {})
-        actions = ledger.actions(self.lease)
         stale = set(self.data.get("stale_actions", ()))
-        if self.default_code_review and not self.run.environment_release and not self.uses_code_review:
-            stale.update(a["id"] for a in actions if ACTION_GATES.get(a["op"]) == "review" and a["state"] != "accepted")
-            self.data["stale_actions"] = sorted(stale)
-            self.data.setdefault("evidence", {}).pop("review", None)
-            self.job.review, self.job.reviews = pipeline.Review(), 0
-            self.data["review_method"] = code_review.METHOD
-            self.run.code_review = True
-            self.run.log("Adopted Standards and Spec code review for this continuation.")
-        for action in actions:
+        for action in ledger.actions(self.lease):
             result = action["result"]
             gate = ACTION_GATES.get(action["op"])
             old_gate = bool(gate) and action["id"] in stale

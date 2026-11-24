@@ -1559,7 +1559,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.enterContext(mock.patch.object(ctl, "fingerprint", return_value="tree"))
         self.enterContext(mock.patch.object(ctl, "current", return_value=True))
         self.enterContext(mock.patch.object(ctl, "validate_publication_diff"))
-        ctl.data["evidence"] = {"checks": {"result": {"full": True}}}
         staged = pipeline.Staged(changed=[c], counts={"file.txt": 1})
         fresh = staged if fresh_edit else pipeline.Staged()
         self.enterContext(mock.patch.object(self.job.b, "restage", side_effect=[fresh, staged]))
@@ -1576,6 +1575,12 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         self.enterContext(mock.patch.object(util, "git", return_value="new-head"))
         self.enterContext(mock.patch.object(pipeline, "git", side_effect=publication_git))
+
+        review = {"method": "code-review", "verdict": "approve", "trees": {c.prefix: "tree"},
+                  "bases": {c.prefix: "new-head"}}
+        self.enterContext(mock.patch.object(orchestration.code_review, "candidate_trees", return_value=review["trees"]))
+        self.job.review = Review.stored(review)
+        ctl.data["evidence"] = {"checks": {"result": {"full": True}}, "review": {"result": review}}
 
     def unpushed_merge_publication(self):
         ctl = self.controller
