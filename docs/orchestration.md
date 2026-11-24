@@ -183,6 +183,7 @@ Recursive secret exclusions remain active while ordinary directory creation and 
 Reads are limited to the granted workspace/directories, the installed Arete/Python/Node/uv runtimes and operating-system-managed tool/library/configuration roots, not arbitrary host directories.
 Hard-linked regular files in granted workspaces and mutable runtime read roots are excluded and commands cannot create hard links; hard-link-dependent fixtures are unsupported on this route.
 Owner-configured `[agent] read_roots` in a repository layer can admit absolute paths for additional read-only command runtimes, such as a verification wrapper outside the workspace.
+Private builder shell commands use the candidate and standard command runtimes. The independent verifier can use the additional read-only roots.
 These roots receive the same recursive-secret, hard-link and protected-path restrictions, never a write grant or trusted cleanup authority.
 They are part of the pinned layer policy and cannot be supplied by a model's shell request.
 Runtime roots must be outside all agent-writable trees, including shared temporary and runner-support directories; their canonical targets are pinned before model execution and a changed target is refused.

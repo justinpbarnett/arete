@@ -146,6 +146,19 @@ export default function (pi) {
             tracked.add(store);
         });
     }
+    // Only denied metadata can use the launcher's pinned alias. Every requested
+    // path and every open root must still resolve inside the current sandbox.
+    const deniedPaths = path => {
+        const pinned = metadata.workspace && metadata.denied_aliases?.[path];
+        try {
+            return [resolve(path), canonical(path), ...(pinned ? [pinned] : [])];
+        } catch (error) {
+            if (pinned && isAbsolute(pinned) && ["EACCES", "EPERM"].includes(error.code)) {
+                return [resolve(path), pinned];
+            }
+            throw error;
+        }
+    };
     pi.on("tool_call", (event, ctx) => {
         if (event.toolName === "ask_owner" || (metadata.shell_tool && event.toolName === metadata.shell_tool)) {
             return undefined;
@@ -155,8 +168,8 @@ export default function (pi) {
             const writing = event.toolName === "edit" || event.toolName === "write";
             const directories = [...metadata.roots, ...(writing ? metadata.write_roots : [])];
             const files = [...metadata.files, ...(writing ? metadata.write_files : [])];
-            const roots = directories.flatMap(path => [resolve(path), canonical(path)]);
-            const protectedFiles = files.flatMap(path => [resolve(path), canonical(path)]);
+            const roots = directories.flatMap(deniedPaths);
+            const protectedFiles = files.flatMap(deniedPaths);
             const opened = metadata.open.flatMap(path => [resolve(path), canonical(path)]);
             const depth = (paths, path) => Math.max(-1, ...paths.filter(root => within(root, path))
                 .map(root => root.split(sep).length));
