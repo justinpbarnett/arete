@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-from arete import dbstats, paths, sandbox
+from arete import config, dbstats, paths, sandbox
 from arete.store import db as foundation
 
 
@@ -20,15 +20,18 @@ def workspace_state(root):
 
 
 def isolate_live_state():
-    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
+    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
     unittest.addModuleCleanup(folder.cleanup)
     root = Path(folder.name).resolve()
+    store = config.SecretsConfig("pve_store", root / "store")
     for patch in (mock.patch.object(dbstats.Timing, "finished"),
+                  mock.patch.object(config, "secret_settings", return_value=store),
                   mock.patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
                   mock.patch.object(paths, "CONFIG_DIR", root / "config"),
                   mock.patch.object(paths, "CONFIG_FILE", root / "config/config.toml"),
                   mock.patch.object(paths, "PI_KEYS_FILE", root / "config/pi.env"),
                   mock.patch.object(paths, "STATE_DIR", root / "state"),
+                  mock.patch.object(paths, "FINGERPRINT_KEY_FILE", root / "state" / "fingerprint-fixture"),
                   mock.patch.object(paths, "TOKEN_CLIENT_DIR", root / "state/client"),
                   mock.patch.object(paths, "LOCKS_DIR", root / "state" / "locks"),
                   mock.patch.object(paths, "WORKTREES_DIR", root / "worktrees"),
