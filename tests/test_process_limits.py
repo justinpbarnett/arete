@@ -1553,7 +1553,7 @@ class PolicyRestartLineageTests(Isolated):
             ledger.transition(lease, action["id"], state, result)
         return action
 
-    def saved(self):
+    def saved(self, *, policy_changed=True):
         controller = self.controller()
         prepared = factory.Outcome("pass", data={
             "layer": str(self.repo.layer_dir), "checkouts": [self.checkout.to_row()],
@@ -1568,20 +1568,24 @@ class PolicyRestartLineageTests(Isolated):
         with patch.object(controller, "atomic", side_effect=prepare_step):
             self.assertIsNone(controller.prepare())
         evidence, produced = {}, {}
+        policy = self.OLD_POLICY if policy_changed else controller.policy_sha()
+        tree = "old-tree" if policy_changed else controller.fingerprint()
         args = {"checks": {"scope": "full"}, "verify": {"route_id": "verify", "effort": "low"},
                 "review": {"route_id": "review", "effort": "low"}}
         for op, gate in self.GATES:
-            evidence[gate] = {"tree": "old-tree", "policy": self.OLD_POLICY, "result": {"summary": f"old {gate}"},
+            evidence[gate] = {"tree": tree, "policy": policy, "result": {"summary": f"old {gate}"},
                               "acceptance": controller.data["acceptance"], "producer": "d0000-0",
                               "observed": "2026-11-20T00:00:00Z"}
-            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate])
+            details = {"verdict": "pass"} if gate == "verify" else {}
+            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate],
+                                 **details)
             produced[gate] = action["id"]
         job = controller.job
         job.review = pipeline.Review.stored({"verdict": "approve", "summary": "old review", "problems": []})
         job.verified, job.reviews, job.ci_result = pipeline.verify.Verified("pass", "old verify"), 1, "old ci"
         controller.data.pop("review_method", None)  # This saved lineage predates the Standards/Spec review.
         controller.data.update(evidence=evidence, checked={"tree": "old-tree"}, report="old checks",
-                               policy_sha=self.OLD_POLICY)
+                               policy_sha=policy)
         controller.persist()
         record.move(controller.run.id, "failed", ("running",))
         return controller, produced
@@ -1605,6 +1609,40 @@ class PolicyRestartLineageTests(Isolated):
                 self.assertIsNone(controller.dispatch(done))
         return atomic_calls
 
+    def test_legacy_continuation_replaces_only_its_review_and_preserves_the_new_review_on_resume(self):
+        prior, produced = self.saved(policy_changed=False)
+        resumed = self.controller(prior.run.id)
+        self.assertIsNone(resumed.prepare())
+        self.assertTrue(resumed.run.code_review)
+        self.assertEqual(resumed.data["stale_actions"], [produced["review"]])
+        self.assertTrue(resumed.current("checks"))
+        self.assertTrue(resumed.current("verify"))
+        self.assertFalse(resumed.current("review"))
+        self.assertIsNone(resumed.job.review.verdict)
+        self.assertEqual(resumed.latest_code_review(), {})
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: review$"):
+            resumed.publish()
+
+        report = {"method": "code-review", "verdict": "pending", "summary": "fresh finding", "problems": [],
+                  "findings": [{"id": "spec-1", "axis": "Spec", "file": "example.py", "finding": "Missing case"}]}
+        outcome = factory.Outcome("pass", data={"review": report, "attempt": 1})
+        fresh = self.action(resumed, "review.run", {"route_id": "review", "effort": "low"})
+
+        def review_step(name, **kwargs):
+            self.assertTrue(kwargs["code_review"])
+            resumed.job.take(name, outcome, stored=False)
+            return outcome
+
+        with (patch.object(resumed, "atomic", side_effect=review_step),
+              patch.object(orchestration.Catalog, "route", return_value=SimpleNamespace(step="review"))):
+            self.assertIsNone(resumed.dispatch(fresh))
+        record.move(resumed.run.id, "stopped", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(repeated.data["evidence"]["review"]["producer"], fresh["id"])
+        self.assertEqual(repeated.job.review.verdict, "pending")
+        self.assertTrue(repeated.current("review"))
+
     def test_changed_policy_at_a_decision_boundary_reruns_every_gate_before_the_merge_gate(self):
         prior, produced = self.saved()
         resumed = self.controller(prior.run.id)
@@ -1621,7 +1659,7 @@ class PolicyRestartLineageTests(Isolated):
         for gate in produced:
             self.assertFalse(resumed.current(gate))
             self.assertNotIn(produced[gate], resumed.catalog.context)
-        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review, verify"):
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review$"):
             resumed.publish()
 
         fresh = {
@@ -1629,8 +1667,8 @@ class PolicyRestartLineageTests(Isolated):
                                                     "checked": {"tree": "fresh-tree", "commands": {}}}),
             "verify": factory.Outcome("pass", data={"verified": {"verdict": "pass", "summary": "fresh verify"},
                                                     "names": []}),
-            "review": factory.Outcome("pass", data={"review": {"verdict": "approve", "summary": "fresh review",
-                                                               "problems": []}, "attempt": 1}),
+            "review": factory.Outcome("pass", data={"review": {"method": "code-review", "verdict": "approve",
+                                                               "summary": "fresh review", "problems": []}, "attempt": 1}),
         }
         self.assertEqual(self.rerun_gates(resumed, fresh), ["checks", "verify", "review"])
         for gate, old_action in produced.items():

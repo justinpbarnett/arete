@@ -7,7 +7,7 @@ An explicitly invoked fixed or custom script keeps its strategy.
 
 ## Code review
 
-New orchestrated tickets finish with the repository’s full checks and a two-part code review.
+New and resumed orchestrated tickets finish with the repository’s full checks and a two-part code review.
 Two fresh read-only reviewers inspect the same staged candidate against its pinned base.
 Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
 This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
@@ -18,7 +18,9 @@ and a `fixed` or `nonblocking` decision and reason for each finding. The action 
 and the delivery report includes the decisions. Repairs to those findings can proceed without a second full code review.
 A material scope or base change calls for a fresh review. Configured probes and explicit journey IDs require behavioral
 verification. The orchestrator can also request it for ticket acceptance or a specific uncertainty.
-Existing ticket lineages retain the policy under which they started.
+When an older ticket resumes, its next publication requires a fresh Standards and Spec review.
+Its previous reviews remain in the action history. Current checks, retained work and owner decisions carry forward.
+A release-specific verification retry uses its original evidence requirements.
 
 ## Select or revert
 

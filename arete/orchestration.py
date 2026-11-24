@@ -112,14 +112,11 @@ class Controller(worker_turns.WorkerTurns):
         configured = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
         if max_builders is not None:
             configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
-        tid = str(getattr(self.run, "tid", ""))
-        private = (configured.max_builders and self.run.path == "orchestrate"
-                   and not pilot.is_pilot_task(tid) and not zte.reserved(tid))
+        private = configured.max_builders and self.default_code_review
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
                                     {"protocol": protocol, "mode": self.run.path, "evidence": {},
-                                     "review_method": code_review.METHOD if self.run.path == "orchestrate"
-                                     and not (pilot.is_pilot_task(tid) or zte.reserved(tid)) else "legacy"})
+                                     "review_method": code_review.METHOD if self.default_code_review else "legacy"})
         self.data = ledger.snapshot(self.lease)["data"]
         self.run.code_review = self.uses_code_review
         self.protocol = self.data.get("protocol")
@@ -357,6 +354,9 @@ class Controller(worker_turns.WorkerTurns):
         self.data["limits"] = self.configured_limits()
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
+        if (self.flow.continues and self.default_code_review and not self.run.environment_release
+                and not self.uses_code_review):
+            self.adopt_code_review()
         self.recover()
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
@@ -589,6 +589,11 @@ class Controller(worker_turns.WorkerTurns):
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
 
     @property
+    def default_code_review(self):
+        tid = str(getattr(self.run, "tid", ""))
+        return self.run.path == "orchestrate" and not (pilot.is_pilot_task(tid) or zte.reserved(tid))
+
+    @property
     def uses_code_review(self):
         return self.data.get("review_method") == code_review.METHOD and not self.run.environment_release
 
@@ -636,6 +641,17 @@ class Controller(worker_turns.WorkerTurns):
         return bool(found and found["tree"] == self.fingerprint()
                     and self.matches_policy(found["policy"], self.policy_sha())
                     and found.get("acceptance") == self.data["acceptance"])
+
+    def adopt_code_review(self):
+        stale = set(self.data.get("stale_actions", ()))
+        stale.update(a["id"] for a in ledger.actions(self.lease)
+                     if ACTION_GATES.get(a["op"]) == "review" and a["state"] != "accepted")
+        self.data["stale_actions"] = sorted(stale)
+        self.data.setdefault("evidence", {}).pop("review", None)
+        self.job.review, self.job.reviews = pipeline.Review(), 0
+        self.data["review_method"] = code_review.METHOD
+        self.run.code_review = True
+        self.run.log("Adopted Standards and Spec code review for this continuation.")
 
     def recover(self):
         self.quiescent()
