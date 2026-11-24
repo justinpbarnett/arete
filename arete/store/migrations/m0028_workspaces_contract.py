@@ -359,5 +359,5 @@ def apply(conn, folder=None):
                 verify_snapshot(conn, ws, folder, fd, version)
     conn.execute("ALTER TABLE workspaces DROP COLUMN legacy_mtime_ns")
     conn.execute("ALTER TABLE workspaces DROP COLUMN legacy_owner")
-    conn.execute("UPDATE schema_meta SET value = '27' WHERE key = 'oldest_writer'")
+    conn.execute("UPDATE schema_meta SET value = '28' WHERE key = 'oldest_writer'")
     conn.execute("DELETE FROM schema_meta WHERE key = 'new_workspace_store'")

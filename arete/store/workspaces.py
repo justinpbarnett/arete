@@ -298,7 +298,7 @@ def retire_quarantine(name: str) -> None:
 
 
 def retry_quarantine(name: str, folder: Path) -> None:
-    from .migrations import m0027_workspaces_contract as handoff
+    from .migrations import m0028_workspaces_contract as handoff
 
     if name in ("", ".", "..") or "/" in name or "\0" in name:
         raise ValueError("supply a workspace name from Health")

@@ -118,12 +118,14 @@ _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
-WORKSPACE_CONTRACT_SCHEMA = 27
+SECRET_REGISTRY_SCHEMA = 27
+WORKSPACE_CONTRACT_SCHEMA = 28
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] workspace_snapshots "
                      "or from arete migrate --workspace-snapshots DIR")
 # Each capability migrates at its own entry point. Unrelated writers can use older databases.
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA))
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
+             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -225,7 +227,7 @@ def new_workspace_store(conn):
 
 
 def workspace_handoff_ready(snapshots: Path | None) -> bool:
-    from .migrations.m0027_workspaces_contract import snapshot_directory
+    from .migrations.m0028_workspaces_contract import snapshot_directory
 
     if snapshots is None:
         with reader() as conn:

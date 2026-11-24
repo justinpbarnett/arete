@@ -535,7 +535,7 @@ class WorkspaceMigrationTests(_WorkspaceChildCase):
 ws = paths.WORKTREES_DIR / "sample"
 with case.assertRaisesRegex(db.IncompatibleSchema, "--workspace-snapshots"):
     workspace.made_before(ws)
-assert schema_version() == 26
+assert schema_version() == 27
 legacy = paths.STATE_DIR / "workspaces"
 legacy.mkdir()
 assert not db.migrate(workspace_snapshots=legacy)
@@ -556,7 +556,7 @@ snapshot = legacy / "sample.json"
 snapshot.write_text("{}")
 assert db.migrate()
 with db.reader() as conn:
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 26
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
 assert snapshot.read_text() == "{}"
 """)
 
@@ -704,7 +704,7 @@ for source in root.rglob("*.py"):
         if isinstance(node, ast.Constant):
             assert node.value != "held-workspaces.json", source
             if node.value == "\0owner":
-                assert source.name == "m0027_workspaces_contract.py", source
+                assert source.name == "m0028_workspaces_contract.py", source
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath":
             assert not (ast.unparse(node.func.value).split(".")[-1] == "STATE_DIR" and node.args
                         and isinstance(node.args[0], ast.Constant) and node.args[0].value == "workspaces"), source
@@ -1202,7 +1202,7 @@ def legacy_record(ws, c, rid, snapshot):
 
 class WorkspaceCutoverGateTests(_WorkspaceChildCase):
     def test_live_pre_expand_loop_defers_handoff_scheduling_and_workspace_access(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -1235,7 +1235,7 @@ with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read(
         dashboard.assert_called_once()
         restart.assert_not_called()
     assert serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT)["healthy"]
-    assert schema_version() == 26
+    assert schema_version() == 27
     with case.assertRaises(db.IncompatibleSchema):
         workspaces.sweep(cfg)
     with case.assertRaises(db.IncompatibleSchema):
@@ -1251,7 +1251,7 @@ with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read(
     legacy_record(ws, c, rid, {workspace.head_key(c): head})
     record.settle(loop, "done", end_line="done")
     assert child.poll() is None and db.migrate()
-    assert schema_version() == 26
+    assert schema_version() == 27
     child.communicate(timeout=5)
 
 with patch.object(server, "guard", return_value={}) as stage:
@@ -1263,7 +1263,7 @@ assert workspace.head_recorded(workspace.made_before(ws), c) == head
 """)
 
     def test_unregistered_inherited_pipeline_blocks_separate_migration(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 import subprocess
 import sys
 from arete import control
@@ -1275,14 +1275,14 @@ with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read(
     with db.reader() as conn:
         assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         with patch.dict(os.environ, {db.INHERITED_SERVE_CHILDREN: str(child.pid)}):
-            assert db.contract_blockers(conn, db.LATEST) == [f"inherited child {child.pid}"]
-    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 26
+            assert db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA) == [f"inherited child {child.pid}"]
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
     child.communicate(timeout=5)
 assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
 """)
 
     def test_detached_pipeline_lease_blocks_handoff_until_exit(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 import subprocess
 import sys
 from arete import launch_lease
@@ -1296,8 +1296,8 @@ with child:
         assert os.getsid(child.pid) == child.pid
         with db.reader() as conn:
             assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
-            assert db.contract_blockers(conn, db.LATEST) == [f"launch lease {launch_lease.filename('sample', '7')}"]
-        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 26
+            assert db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA) == [f"launch lease {launch_lease.filename('sample', '7')}"]
+        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
     finally:
         child.communicate(timeout=3)
 assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
@@ -1306,7 +1306,7 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LAT
 
 class WorkspaceContractRollbackTests(_WorkspaceChildCase):
     def test_contract_prevents_incompatible_startup_rollback(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from arete import install, serve_guard
 
 checkout = Path.cwd() / "checkout"
@@ -1330,7 +1330,7 @@ assert schema_version() == db.LATEST
 
 class WorkspaceCutoverInputTests(_WorkspaceChildCase):
     def test_existing_install_schedules_after_checking_its_declared_absent_snapshot_directory(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from types import SimpleNamespace
 from arete import serve, serve_guard
 
@@ -1354,7 +1354,7 @@ with (patch.object(server, "guard", side_effect=handle) as stage,
       patch.object(serve_guard, "at_tip", return_value=True)):
     server.acknowledge_deploy(server.tick())
     assert not serve_guard.read(receipt_path)["healthy"]
-    assert server.contracts_waiting and schema_version() == 26
+    assert server.contracts_waiting and schema_version() == 27
     assert [call.args[0] for call in stage.call_args_list] == ["tick:load"]
 
     paths.CONFIG_FILE.write_text(f"[serve]\nworkspace_snapshots = {json.dumps(str(legacy))}\n")
@@ -1366,7 +1366,7 @@ assert schema_version() == db.LATEST and not legacy.exists()
 """)
 
     def test_receipt_for_another_checkout_does_not_block_handoff(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from arete import serve_guard
 
 legacy.mkdir()
@@ -1380,7 +1380,7 @@ assert serve_guard.read(receipt_path) == vars(receipt)
 """)
 
     def test_receipt_for_older_tip_does_not_block_handoff(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from arete import serve_guard
 
 legacy.mkdir()
@@ -1405,7 +1405,7 @@ snapshot = legacy / "sample.json"
 snapshot.write_text("{}")
 assert db.migrate()
 with db.reader() as conn:
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 26
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
 assert snapshot.read_text() == "{}"
 assert not db.migrate(workspace_snapshots=legacy)
 """)
@@ -1413,7 +1413,7 @@ assert not db.migrate(workspace_snapshots=legacy)
 
 class WorkspaceLegacyHandoffTests(_WorkspaceChildCase):
     def test_json_only_local_commit_can_resume_after_handoff(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 onto = util.git(["rev-parse", "HEAD"], ws).strip()
 util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "parked commit"], ws)
@@ -1430,7 +1430,7 @@ assert workspace.kept_or_cleared(ws, [c], src, [], "fixture-7") == {str(ws): ont
 """)
 
     def test_newer_legacy_snapshot_cancels_stale_release(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=24)
 head = util.git(["rev-parse", "HEAD"], ws).strip()
@@ -1460,7 +1460,7 @@ assert workspaces.files(row["id"]) == {".venv/": digest}
 """)
 
     def test_resumed_claim_preserves_owner_and_selection_with_previous_snapshot(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 expected = {}
 for ticket in ("7", "8"):
     ws, c = add_checkout(ticket)
@@ -1491,7 +1491,7 @@ for ticket, (rid, head) in expected.items():
 
 class WorkspaceReconciliationHandoffTests(_WorkspaceChildCase):
     def test_missing_and_stable_malformed_records_revoke_fingerprints(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 for ticket in ("7", "8"):
     ws, c = add_checkout(ticket)
     rid = record.start("pipeline", repo=repo.name, issue=ticket, status="failed", schema_version=25)
@@ -1517,7 +1517,7 @@ for ticket in ("7", "8"):
 """)
 
     def test_recorded_legacy_owner_newer_snapshot_cancels_release(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
 old = legacy_record(ws, c, rid, {workspace.head_key(c): "old"})
@@ -1541,7 +1541,7 @@ assert registered(ws) and workspace.kept_onto(ws, [c], "fixture-7") == {str(ws):
 
 class WorkspaceLegacyScratchHandoffTests(_WorkspaceChildCase):
     def test_poll_refreshes_fingerprints_for_json_only_scratch_snapshot(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + SCRATCH_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + SCRATCH_RECORD + r"""
 from arete import poll
 
 cfg.repos = [replace(repo, tracker="local")]
@@ -1574,7 +1574,7 @@ assert not workspace.kept_work(ws, [c], src, [])
 
 class WorkspaceHandoffSafetyTests(_WorkspaceChildCase):
     def test_changed_snapshot_retains_unknown_and_earlier_single_step_owners(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 earlier = record.start("pipeline", repo=repo.name, issue="8", status="failed", schema_version=24)
 for ticket, owner in (("7", "missing-run"), ("8", earlier)):
     ws, c = add_checkout(ticket)
@@ -1594,7 +1594,7 @@ for ticket, owner in (("7", "missing-run"), ("8", earlier)):
 """)
 
     def test_conflicting_malformed_and_nonregular_snapshots_only_hold_their_own_workspaces(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 head = util.git(["rev-parse", "HEAD"], ws).strip()
 rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
@@ -1635,7 +1635,7 @@ assert workspaces.open_for("healthy")["state"] == "kept"
 
 class WorkspaceUnreadableSnapshotTests(_WorkspaceChildCase):
     def test_unreadable_snapshots_hold_their_workspaces_and_allow_other_rows_to_proceed(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 head = util.git(["rev-parse", "HEAD"], ws).strip()
 rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
@@ -1692,7 +1692,7 @@ assert workspace.held_summary()["blocked"] == 3
 
 class WorkspaceQuarantineRecoveryTests(_WorkspaceChildCase):
     def test_recovery_requires_an_idle_and_vacant_original_path(self):
-        self.run_child(workspace_schema(26) + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from arete import cli
 from arete.store import runs
 
@@ -1736,7 +1736,7 @@ assert workspaces.claim(vacant, "sample", "9", "next") != row["id"]
 
 class WorkspaceRetrySnapshotTests(_WorkspaceChildCase):
     def test_retry_restores_repaired_snapshot_without_moving_checkout(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 from arete import cli
 from arete.store import runs
 
@@ -1778,7 +1778,7 @@ with patch.object(json, "load", side_effect=AssertionError("unexpected snapshot 
 """)
 
     def test_retry_identifies_unowned_quarantine_before_taking_ticket_lock(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 from arete.store import runs
 
 ws, c = add_checkout("7")
@@ -1805,7 +1805,7 @@ assert workspace.head_recorded(workspace.made_before(ws), c) == head
 
 class WorkspaceHandoffReplacementTests(_WorkspaceChildCase):
     def test_stale_snapshot_cannot_revive_removed_waiting_workspace(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 from arete import flows, tasks
 from arete.store import runs, tasks as task_store
 
@@ -1833,7 +1833,7 @@ assert registered(ws) and util.git(["rev-parse", "HEAD"], ws) == replacement
 """)
 
     def test_removal_cutoff_only_accepts_a_newer_snapshot_from_a_newer_run(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 for ticket in ("7", "8"):
     ws, c = add_checkout(ticket)
     head = util.git(["rev-parse", "HEAD"], ws).strip()
@@ -1856,7 +1856,7 @@ assert registered(paths.WORKTREES_DIR / "sample-7") and registered(ws)
 """)
 
     def test_ownerless_snapshot_does_not_attach_to_an_active_replacement(self):
-        self.run_child(workspace_schema(26) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 ws, c = add_checkout("7")
 old = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
 current = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=25)
@@ -1876,6 +1876,48 @@ assert workspaces.open_for(ws.name)["owner_run"] == current
 assert workspace.made_before(ws) == {}
 assert "not on origin" in workspace.kept_work(ws, [c], src, [])
 assert registered(ws)
+""")
+
+
+class SecretRegistryExpansionTests(_WorkspaceChildCase):
+    def test_expand_preserves_existing_rows_and_is_idempotent(self):
+        self.run_child(workspace_schema(26) + """
+tables = ("workspaces", "orchestration_workers", "orchestration_messages")
+
+def snapshot(c):
+    return {name: [tuple(row) for row in c.execute(f"SELECT * FROM {name}")] for name in tables}
+
+with db.tx() as c:
+    c.execute("INSERT INTO workspaces (name, state, made_at) VALUES ('sample-7', 'kept', '2026-01-01T00:00:00Z')")
+    c.execute("INSERT INTO orchestration_workers VALUES ('sample-run', 'w', 'w.1', 1, 'integrated', '{}')")
+    c.execute("INSERT INTO orchestration_messages (root, id, worker, kind, body, reply_to, action, state, attempt, history) VALUES "
+              "('sample-run', 'm', 'w', 'steer', 'fixture', '', 'step', 'acknowledged', 'w.1', '[]')")
+    before = snapshot(c)
+    oldest = db.metadata(c)['oldest_writer']
+
+with patch.object(db.migrations, 'load', return_value=chain[:db.SECRET_REGISTRY_SCHEMA]):
+    for _ in range(2):
+        db.migrate()
+        with db.reader() as c:
+            assert schema_version() == db.SECRET_REGISTRY_SCHEMA
+            assert snapshot(c) == before and db.metadata(c)['oldest_writer'] == oldest
+            strict = {r['name']: r['strict'] for r in c.execute('PRAGMA table_list')}
+            for name in ('secrets', 'secret_events', 'accounts'):
+                assert strict[name] and c.execute(f'SELECT count(*) FROM {name}').fetchone()[0] == 0
+            assert not c.execute('PRAGMA foreign_key_check').fetchall()
+""")
+
+    def test_subscription_accounts_require_a_personal_holder_and_unique_identity(self):
+        self.run_child(workspace_schema(27) + """
+with db.tx() as c:
+    insert = ("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES (?, 'sample', 'fixture', 'subscription', ?, ?, 'fixture', '2026-01-01T00:00:00Z')")
+    for holder, usage in (('u:fixture', 'workspace'), ('hand', 'personal')):
+        with case.assertRaises(sqlite3.IntegrityError):
+            c.execute(insert, ('sample:subscription', holder, usage))
+    c.execute(insert, ('sample:subscription', 'u:fixture', 'personal'))
+    with case.assertRaises(sqlite3.IntegrityError):
+        c.execute(insert, ('sample:subscription:2', 'u:fixture', 'personal'))
 """)
 
 
@@ -1962,7 +2004,7 @@ def read_health(handlers, cfg, port, inside_serve, host):
 
 with patch.object(tailnet, "serve", side_effect=read_health):
     dashboard.serve()
-assert schema_version() == 26
+assert schema_version() == 27
 """)
 
 

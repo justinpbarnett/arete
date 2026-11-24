@@ -137,9 +137,9 @@ def rollback_schema_refusal(state: Path, checkout: Path, previous: str) -> str:
         if not db.stat().st_size:
             return ""
         with closing(sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)) as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] < 27:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < 28:
                 return ""
-            contracts = list(conn.execute("SELECT name, sha256 FROM schema_migrations WHERE n >= 27 "
+            contracts = list(conn.execute("SELECT name, sha256 FROM schema_migrations WHERE n >= 28 "
                                           "AND phase = 'contract'"))
     except FileNotFoundError:
         return ""
