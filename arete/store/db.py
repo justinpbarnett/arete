@@ -117,8 +117,10 @@ _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
+SECRET_REGISTRY_SCHEMA = 27
 # Each capability migrates at its own entry point. Unrelated writers can use older databases.
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA))
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
+             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
