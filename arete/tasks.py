@@ -233,6 +233,10 @@ def reap_pending() -> None:
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
     global PENDING_REAPER
 
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
     with PENDING_LOCK, launch_lease.acquiring(repo_name, tid) as lease:
         before = set(run_ids(repo_name, tid))
         proc = spawn()
@@ -567,14 +571,27 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.R
         checkouts = None
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
-        row, imported = workspaces.import_legacy(ws)
-        if row and row["state"] == "removed":
+        row = workspaces.open_for(ws.name)
+        if not row:
             return None if os.path.lexists(ws) else workspace.Release("removed")
-        if imported:
-            checkouts = checkouts or workspaces.owner_of(row).checkouts or workspace.registered_root_checkout(ws)
-        if checkouts is None:
+        if row["owner_run"] != run_id or row["kept_reason"] == workspaces.LEGACY_RESUME:
             return None
+        if not checkouts:
+            checkouts = workspaces.owner_of(row).checkouts
+            if not checkouts and os.path.lexists(ws):
+                return None
+            made = workspace.made_before(ws)
+            for c in checkouts:
+                attached, unsafe = workspace.checkout_attachment(ws, c.wt)
+                if unsafe is not None or (attached and not saved_checkout_head(made, c)):
+                    return None
         return workspace.remove_workspace(ws, checkouts, edits=True)
+
+
+def saved_checkout_head(made: dict, checkout: workspace.Checkout) -> bool:
+    head = workspace.head_recorded(made, checkout)
+    return bool(head and util.git(["symbolic-ref", "-q", "HEAD"], checkout.wt, check=False).strip()
+                and util.git(["rev-parse", "HEAD"], checkout.wt, check=False).strip() == head)
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
@@ -593,7 +610,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         folder = "its work folder was left in place"
         try:
             release = kept_folder_removed(repo, tid, run_id) if latest else None
-        except (OSError, sqlite3.Error, migrations.Refused, workspaces.SnapshotUnavailable) as e:
+        except (OSError, sqlite3.Error, foundation.IncompatibleSchema, migrations.Refused) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
             if release and release.state == "removed":

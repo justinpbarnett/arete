@@ -1800,7 +1800,18 @@ class RestoredPRRevisionTests(unittest.TestCase):
         ctl = self.controller
         state = self.ws.parent / "poll-state"
         state.mkdir()
-        self.ws = self.job.ws = state / "worktrees" / "fixture-7"
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
+                                              RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
+                                              WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
+        paths.ensure_dirs()
+        uri = f"file:{state.as_posix()}?mode=memory&cache=shared"
+        self.enterContext(closing(sqlite3.connect(uri, uri=True)))
+        paths.DB_FILE.touch()
+        self.enterContext(mock.patch.object(dbstats.Timing, "finished"))
+        self.enterContext(mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        self.ws = self.job.ws = paths.WORKTREES_DIR / "fixture-7"
         self.checkout = c = self.add_checkout("primary", 7)
         ctl.data["prepared"]["checkouts"] = [c.to_row()]
         sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
@@ -1844,23 +1855,12 @@ class RestoredPRRevisionTests(unittest.TestCase):
             labels.difference_update(remove)
             labels.update(add)
 
-        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
-                                              RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
-                                              WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
         self.enterContext(mock.patch.multiple(gh, issue=issue, issue_labels=edit_labels, issue_comment=mock.DEFAULT,
                                               find_issue_comment_marker=mock.Mock(return_value=""),
                                               ensure_label=mock.Mock(return_value=""),
                                               issues=lambda r, label, **kw: [issue(r, 7)] if label in labels else []))
         self.enterContext(mock.patch.object(codebase, "STAMP", "same-engine"))
         self.enterContext(mock.patch.object(pipeline, "write_report"))
-        paths.ensure_dirs()
-        uri = f"file:{state.as_posix()}?mode=memory&cache=shared"
-        self.enterContext(closing(sqlite3.connect(uri, uri=True)))
-        paths.DB_FILE.touch()
-        self.enterContext(mock.patch.object(dbstats.Timing, "finished"))
-        self.enterContext(mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)))
-        with redirect_stdout(StringIO()):
-            db.migrate()
         record.start("pipeline", run_id="prior-run", repo=repo.name, issue=self.run.tid)
         self.run.repairs = "repair-source"
         record.start("pipeline", run_id=self.run.repairs, repo=repo.name, issue=self.run.tid)
@@ -2317,12 +2317,12 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
         self.assertEqual(self.git("status", "--porcelain"), "")
         made = workspace.made_before(self.wt)
         self.assertEqual(workspace.head_recorded(made, self.checkout), head)
-        self.assertEqual(workspace.owner_in(made).run, run_id)
+        self.assertEqual(workspaces.open_for(self.wt.name)["owner_run"], run_id)
 
     def assert_not_kept(self, case, gate=""):
         run_id = self.run_case(case)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.initial_head)
-        self.assertFalse(workspace.made_record(self.wt).exists())
+        self.assertEqual(workspace.made_before(self.wt), {})
         self.assertEqual((self.wt / "file.txt").read_text(), "tracked edit\n")
         self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
         if gate:
@@ -2343,7 +2343,7 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
     def test_signal_preserves_checkouts_excluded_from_the_final_save(self):
         workspaces.claim(self.wt, "fixture", "1", "previous-run", checkouts=[self.checkout])
         workspace.note_made(self.wt, [self.checkout])
-        original_record = workspace.made_record(self.wt).read_bytes()
+        original_snapshot = workspace.made_before(self.wt)
         cases = (
             ("collision", self.root, "??", "collision.txt", "preexisting file\n"),
             ("reconcile", self.make_checkout(), "??", "personal.txt", "added between runs\n"),
@@ -2359,12 +2359,9 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
                     self.assertEqual(util.git(["rev-parse", "HEAD"], wt, env=env).strip(), self.initial_head)
                     self.assertEqual(util.git(["status", "--porcelain"], wt, env=env), f"{status} {name}\n")
                     self.assertEqual((wt / name).read_text(), contents)
-                    with mock.patch.object(paths, "STATE_DIR", root / "state"):
-                        made = workspace.made_record(wt)
-                        if case == "collision":
-                            self.assertEqual(made.read_bytes(), original_record)
-                        else:
-                            self.assertFalse(made.exists())
+                    with mock.patch.multiple(paths, STATE_DIR=root / "state", DB_FILE=root / "state/arete.db"):
+                        expected = original_snapshot if case == "collision" else {}
+                        self.assertEqual(workspace.made_before(wt), expected)
 
     def test_unwind_error_blocks_release_and_keeping(self):
         self.assert_not_kept("unwind", "the termination exception did not survive unwinding")
@@ -2374,7 +2371,7 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
         run_id = self.run_case("park")
         self.assertFalse((self.state / "runs" / run_id / "parked.json").exists())
         self.assertIn(f"wip: edits of arete run {run_id},", self.git("log", "-1", "--format=%s"))
-        self.assertFalse(workspace.made_record(self.wt).exists())
+        self.assertEqual(workspace.made_before(self.wt), {})
         self.assertIn("1 commit that are not on origin", workspace.kept_checkout(self.wt, self.checkout, self.source, []))
 
     def test_stop_signal_during_finalization_handler_reset_keeps_nothing(self):
@@ -4447,6 +4444,7 @@ class SingleWorkerPublicationTests(PublicationFixture):
 class ClosedPRPublicationTests(PublicationFixture):
     def test_closed_pr_rerun_publishes_with_the_remote_only_lease(self):
         other = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(other / "runtime"))
         self.git("clone", "-q", "--shared", str(self.root), str(other))
         (other / "file.txt").write_text("old closed PR\n")
         util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
@@ -4485,6 +4483,7 @@ class ClosedPRPublicationTests(PublicationFixture):
               mock.patch.object(gh, "pr_create", return_value=pr) as create,
               mock.patch.object(gh, "pr_body", return_value="Fixture PR"),
               mock.patch.object(gh, "pr_edit_body")):
+            self.assertFalse(db.migrate())
             ws, checkouts = workspace.make_workspace(controller.run.id, repo, "main", branch, "7", [])
             self.checkout = c = checkouts[0]
             b.checkouts, b.ws = checkouts, ws
@@ -7776,6 +7775,11 @@ class MeasurementCatchUpPublicationTests(MovedBasePublicationFixture, unittest.T
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(support.workspace_state(root))
+        db.migrate()
+
     def test_conflict_after_a_rerun_passes_reaches_catch_up(self):
         controller, checkout = self.controller()
         clean = {"state": "OPEN", "headRefOid": checkout.lease, "mergeable": "MERGEABLE"}
@@ -7981,7 +7985,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_bytes(b"owner's file")
         (checkout.wt / ".git").touch()
-        for file in (path, checkout.wt / ".git", root / "workspaces" / "checkout.json"):
+        for file in (path, checkout.wt / ".git"):
             self.addCleanup(file.unlink, missing_ok=True)
         refs = {"state": "OPEN", "isDraft": False, "headRefOid": "head", "baseRefName": "main",
                 "baseRefOid": "moved-base"}
@@ -8014,11 +8018,14 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
               mock.patch.object(pipeline.record, "timed", return_value=nullcontext({})),
               mock.patch.object(pipeline, "abort_merge"), mock.patch.object(util, "git_as_owner") as merge,
-              mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
+              mock.patch.object(workspace, "scratch_left", return_value=[]),
               mock.patch.object(workspace, "remove_workspace", side_effect=remove_checkout) as remove,
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
-            self.assertEqual(controller.publish()["ending"], "pr")
+            try:
+                self.assertEqual(controller.publish()["ending"], "pr")
+            finally:
+                controller.release_merge_lease()
             self.assertEqual(path.read_bytes(), b"owner's file")
             self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]),
                              ["ignored/" if kind == "ignored" else "ignored/data.txt"])
@@ -8030,7 +8037,6 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_resolver_question_cleans_its_ignored_file_and_names_moved_base(self):
         controller, checkout = self.controller()
         root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.enterContext(support.workspace_state(root))
         checkout.wt = controller.job.ws = root / "checkout"
         ignored = checkout.wt / "ignored"
         ignored.mkdir(parents=True)
@@ -8060,8 +8066,9 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                 return ["!! ignored/"]
             return [f"?? {name}" for name in names] if "--untracked-files=all" in args else []
 
-        def check_removal(ws, checkouts, made, *, excluded, force):
-            self.assertEqual(workspace.workspace_blockers(ws, checkouts, made=made, excluded=excluded, force=force), [])
+        def check_removal(ws, checkouts, made, *, excluded, force, edits):
+            self.assertEqual(
+                workspace.workspace_blockers(ws, checkouts, edits=edits, made=made, excluded=excluded, force=force), [])
             return workspace.Release("removed")
 
         with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
@@ -9632,6 +9639,8 @@ class ServeTicketCountsTests(unittest.TestCase):
         server.db_lock = threading.Lock()
         server.db_future = None
         server.db_health = {}
+        server.contracts_waiting = False
+        server.workspace_contract_children = set()
         server.every_loop = server.live = []
         server.failing = server.errors = {}
         server.started = util.now()
@@ -9682,6 +9691,11 @@ class SavedRunPolicyTests(unittest.TestCase):
             source = Path(file.name)
             source.write_text(original)
             controller.job.layer = run.layer = config.load_layer(repo.layer_dir, source_file=source)
+            self.assertEqual(controller.lineage()[0]["policy_sha"], saved_policy)
+            source.write_text('[serve]\nworkspace_snapshots = "/fixture/legacy"\n')
+            migration_input = config.load(source).workspace_snapshots
+            self.assertEqual(migration_input, Path("/fixture/legacy"))
+            controller.job.cfg.workspace_snapshots = migration_input
             self.assertEqual(controller.lineage()[0]["policy_sha"], saved_policy)
 
             for changed in ("[limits]\nmax_diff_lines = 201\n",

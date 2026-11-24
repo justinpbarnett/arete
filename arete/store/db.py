@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 
 from .. import dbstats, paths, util
@@ -117,6 +118,10 @@ _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
+WORKSPACE_CONTRACT_SCHEMA = 27
+INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] workspace_snapshots "
+                     "or from arete migrate --workspace-snapshots DIR")
 # Each capability migrates at its own entry point. Unrelated writers can use older databases.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
@@ -148,19 +153,85 @@ def missing_database():
 
 
 def contract_blockers(conn, n):
-    from .. import control, record
+    from .. import control, launch_lease, record
 
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
+    workspace_contract = n == WORKSPACE_CONTRACT_SCHEMA
+    blockers = [f"launch lease {name}" for name in launch_lease.held_launches()] if workspace_contract else []
+    statuses = "(status = 'running' OR pid IS NOT NULL)" if workspace_contract else "status = 'running'"
+    for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "
                             "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
         row = dict(row)
+        if workspace_contract and run_process_alive(row):
+            blockers.append(row["id"])
+            continue
+        if row["status"] != "running":
+            continue
         with record.dead(row) as gone:
             if not gone:
                 blockers.append(row["id"])
     beat = control.database_beat()
+    if workspace_contract:
+        children = set(beat.get("workspace_contract_children", [])) | inherited_serve_children()
+        blockers.extend(f"inherited child {pid}" for pid in sorted(children) if util.pid_alive(pid))
     if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
         blockers.append(f"serve {beat.get('pid')}")
     return blockers
+
+
+def inherited_serve_children():
+    return {int(pid) for pid in os.environ.get(INHERITED_SERVE_CHILDREN, "").split(",") if pid}
+
+
+def run_process_alive(row):
+    pid = row["pid"]
+    if not util.pid_alive(pid):
+        return False
+    if row["status"] == "running":
+        return True
+    if pid == os.getpid():
+        return False
+    try:
+        found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C"})
+        if not found.stdout.strip():
+            return util.pid_alive(pid)
+        state, started = found.stdout.strip().split(maxsplit=1)
+        when = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y").astimezone()
+        last_started = util.parse_iso(row["finished"] or row["started"])
+        return not state.startswith("Z") and when.timestamp() <= last_started.timestamp()
+    except (OSError, ValueError):
+        return util.pid_alive(pid)
+
+
+def workspace_handoff_blockers(conn, snapshots):
+    from .. import control, serve_guard
+
+    blockers = contract_blockers(conn, WORKSPACE_CONTRACT_SCHEMA)
+    status = control.database_beat()
+    if util.lock_is_held("serve"):
+        lock_pid = int((paths.LOCKS_DIR / "serve.lock").read_text())
+        if lock_pid != status.get("pid"):
+            blockers.append(f"serve {lock_pid} has not reported its schema")
+    receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
+    if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
+        blockers.append("deploy health acknowledgement")
+    if snapshots is None and not new_workspace_store(conn):
+        blockers.append(WORKSPACE_HANDOFF)
+    return blockers
+
+
+def new_workspace_store(conn):
+    return (conn.execute("SELECT 1 FROM schema_meta WHERE key = 'new_workspace_store'").fetchone() is not None
+            and workspace_store_is_new())
+
+
+def workspace_handoff_ready(snapshots: Path | None) -> bool:
+    from .migrations.m0027_workspaces_contract import snapshot_directory
+
+    if snapshots is None:
+        with reader() as conn:
+            return new_workspace_store(conn)
+    with snapshot_directory(snapshots):
+        return True
 
 
 def execute_statements(conn, sql):
@@ -174,8 +245,20 @@ def execute_statements(conn, sql):
         conn.execute(pending)
 
 
-def migrate(contracts=True):
-    from .. import backup
+def workspace_store_is_new():
+    from .. import install, serve_guard
+
+    scaffolding = {paths.DB_FILE, paths.RUNS_DIR, paths.WORKTREES_DIR, paths.LOCKS_DIR, paths.LOG_DIR,
+                   paths.DB_FILE.with_name(paths.SERVE_BEAT_FILE.name), paths.SERVER_FILE, paths.backups_dir(),
+                   paths.DB_FILE.parent / serve_guard.RECEIPT, install.serve_guard_file(),
+                   *(paths.DB_FILE.with_name(paths.DB_FILE.name + suffix) for suffix in ("-wal", "-shm", "-journal"))}
+    expected = {path.absolute() for path in scaffolding}
+    return (all(entry.absolute() in expected for entry in paths.STATE_DIR.iterdir())
+            and not any(paths.RUNS_DIR.iterdir()) and not any(paths.WORKTREES_DIR.iterdir()))
+
+
+def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
+    from .. import backup, config
 
     chain = migrations.load()
     paths.ensure_dirs()
@@ -188,6 +271,8 @@ def migrate(contracts=True):
             migrations.validate(conn, chain, version)
             conn.close()
             conn = None
+            fresh_workspaces = (version == 0 and chain[-1].n >= WORKSPACE_CONTRACT_SCHEMA
+                                and workspace_store_is_new())
             snapshot = None
             started_chain = False
             for migration in chain:
@@ -196,10 +281,13 @@ def migrate(contracts=True):
                 if migration.phase == "contract":
                     if not contracts:
                         return True
+                    if migration.n == WORKSPACE_CONTRACT_SCHEMA and workspace_snapshots is None:
+                        workspace_snapshots = config.load_or_problem()[0].workspace_snapshots
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
                     try:
-                        blockers = contract_blockers(conn, migration.n)
+                        blockers = (workspace_handoff_blockers(conn, workspace_snapshots)
+                                    if migration.n == WORKSPACE_CONTRACT_SCHEMA else contract_blockers(conn, migration.n))
                     finally:
                         conn.close()
                         conn = None
@@ -214,10 +302,21 @@ def migrate(contracts=True):
                 try:
                     timing = dbstats.Timing(paths.DB_FILE, "write")
                     with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
-                        if migration.sql is not None:
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA:
+                            if blockers := workspace_handoff_blockers(writer, workspace_snapshots):
+                                print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
+                                return True
+                            from .. import install
+
+                            if paths.DB_FILE.parent == paths.STATE_DIR and install.serve_guard_file().exists():
+                                install.write_serve_guard()
+                            migration.apply(writer, workspace_snapshots)
+                        elif migration.sql is not None:
                             execute_statements(writer, migration.sql)
                         else:
                             migration.apply(writer)
+                        if migration.n == 1 and fresh_workspaces:
+                            writer.execute("INSERT INTO schema_meta (key, value) VALUES ('new_workspace_store', '1')")
                         writer.execute("INSERT INTO schema_migrations "
                                        "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
                                        (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
@@ -274,12 +373,15 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
                 conn.close()
                 migrate()
                 return checked_connection(needed=needed)
-            deadline = time.monotonic() + (MIGRATE_WAIT_SECONDS if timeout is None else 0)
+            deadline = time.monotonic() + (
+                MIGRATE_WAIT_SECONDS if timeout is None and needed != WORKSPACE_CONTRACT_SCHEMA else 0)
             if version < needed:
                 print(f"schema {version} waits for schema {needed}; run arete serve or arete migrate", flush=True)
             while version < needed:
                 if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {needed}; run arete serve or arete migrate")
+                    action = (f"supply {WORKSPACE_HANDOFF}" if needed == WORKSPACE_CONTRACT_SCHEMA
+                              else "run arete serve or arete migrate")
+                    raise IncompatibleSchema(f"schema {version} needs {needed}; {action}")
                 time.sleep(0.5)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
             oldest = conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0]
@@ -466,6 +568,15 @@ def migrate_on_demand(needed: int = WORKSPACE_SNAPSHOT_SCHEMA) -> None:
     except FileNotFoundError:
         pass
     checked_connection(on_demand=True, needed=needed).close()
+
+
+def require_workspace_contract() -> None:
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        if active[2].execute("PRAGMA user_version").fetchone()[0] < WORKSPACE_CONTRACT_SCHEMA:
+            raise IncompatibleSchema(f"workspace access waits for schema {WORKSPACE_CONTRACT_SCHEMA}")
+    else:
+        migrate_on_demand(WORKSPACE_CONTRACT_SCHEMA)
 
 
 def quoted(name: str) -> str:

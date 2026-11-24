@@ -72,6 +72,7 @@ from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
 from arete.store import zte as zte_store
 from arete.zte_github import Identity, IssueApp
+from tests import support
 from tests.harness import set_task_body
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -3379,8 +3380,13 @@ class ParkedRetryBudgetTests(Isolated):
 class DeniedWorkerEditsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
-        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
+        root = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
+        with support.workspace_state(root):
+            foundation.migrate()
+            cls.workspace_db_seed = paths.DB_FILE.read_bytes()
+        cls.base = root / "repo"
+        cls.base.mkdir()
         (cls.base / "guarded.txt").write_text("base\n")
         (cls.base / "removed.txt").write_text("base\n")
         util.git(["init", "-q", "-b", "main", "--template="], cls.base)
@@ -3390,6 +3396,9 @@ class DeniedWorkerEditsTests(unittest.TestCase):
     def prepare_controller(self):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(support.workspace_state(root))
+        paths.ensure_dirs()
+        paths.DB_FILE.write_bytes(self.workspace_db_seed)
         self.wt = root / "repo"
         shutil.copytree(self.base, self.wt)
         repo = config.Repo("fixture/repo", self.wt, tracker="local")
@@ -3397,14 +3406,13 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                                       deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
                                       checks={"goal": 'test "$(cat goal.txt)" = reached'})
         cfg = config.Config(replay=config.ReplayConfig(all=True))
-        run_dir = root / "runs" / "fixture"
+        run_dir = paths.RUNS_DIR / "fixture"
         run_dir.mkdir(parents=True)
         self.run_fixture = pipeline.Run(id="fixture", repo=repo, dir=run_dir, tracker=tracker.LocalTracker(repo),
                                         tid="1", path="orchestrate")
         job = flows.Job(cfg, self.run_fixture, self.wt, ticket=tracker.Ticket("1", "#1", "Fixture goal"),
                         checkouts=[workspace.Checkout("", repo.name, repo.path, self.wt, "main")])
         self.run_fixture.workspace = self.wt, job.checkouts
-        self.enterContext(patch.object(paths, "RUNS_DIR", run_dir.parent))
         self.enterContext(patch.object(paths, "CHECK_LOCKS_DIR", root / "check-locks"))
         self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
         self.enterContext(patch.multiple(record, mark=Mock(), note=Mock()))

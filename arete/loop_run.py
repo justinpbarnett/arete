@@ -400,6 +400,10 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
     with util.lock_file(loop_store.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
