@@ -172,7 +172,9 @@ def worker(cmd, cwd, prompt, env, timeout, on_line):
     on_line(result + '\n')
     return subprocess.CompletedProcess(cmd, 0, result, '')
 
-options = {'auth': accounts.Auth(), 'passing': [], 'add_dirs': [secondary],
+alias = shm / 'secondary-link'
+alias.symlink_to(secondary, target_is_directory=True)
+options = {'auth': accounts.Auth(), 'passing': [], 'add_dirs': [alias],
            'extra_env': {'CLAUDE_CONFIG_DIR': str(profile)}}
 with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream):
     # A Git link alone does not authorize an external mount.
@@ -187,6 +189,57 @@ with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream)
     assert again.ok and again.session.id == first.session.id, again.error
     assert stream.call_count == 2
     assert [e['session'] for e in tool_events.read_events()] == [first.session.id] * 2
+""")
+
+    def test_bare_and_linked_sources_restore_only_independently_authorized_metadata(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+import json
+
+from arete import workspace
+from arete.store import workspaces
+
+shm = Path.cwd().resolve()
+main, bare, linked_source, profile = (shm / name for name in ('main', 'mirror.git', 'linked-source', 'profile'))
+linked_checkout, bare_checkout = (paths.WORKTREES_DIR / name for name in ('linked', 'bare'))
+
+def git(cwd, *argv):
+    return subprocess.run(['git', '-C', str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+
+main.mkdir()
+git(main, 'init', '-q')
+(main / 'notes.txt').write_text('fixture\n')
+git(main, 'add', 'notes.txt')
+git(main, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture', 'commit', '-qm', 'fixture')
+git(shm, 'clone', '-q', '--bare', str(main), str(bare))
+workspace.add_worktree(workspace.Checkout('', 'fixture/main', main, linked_source, ''), 'fixture-source', 'HEAD')
+for source, checkout in ((bare, bare_checkout), (linked_source, linked_checkout)):
+    entry = workspace.Checkout('', 'fixture/source', source, checkout, '')
+    workspace.add_worktree(entry, 'fixture-' + checkout.name, 'HEAD')
+    workspaces.claim(checkout, 'fixture', '', '', checkouts=[entry])
+secretstore.write_file(key, key.parent, b'F' * 32)
+
+options = {'add_dirs': [linked_checkout], 'extra_env': {'CLAUDE_CONFIG_DIR': str(profile)}}
+
+def check_mounts(stream, *metadata):
+    argv, _, _, env, *_ = stream.call_args.args
+    assert_linux_policy(argv, env, bare_checkout, [*key_mask, *store_mask], extra=metadata)
+
+with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream):
+    assert run_claude(bare_checkout, **options).ok
+    check_mounts(stream, bare)
+
+    with paths.CONFIG_FILE.open('a') as file:
+        file.write(f'\n[[repo]]\nname = "fixture-main"\npath = {json.dumps(str(main))}\n')
+
+    def worker(cmd, cwd, prompt, env, timeout, on_line):
+        for checkout in (Path(cwd), Path(cmd[cmd.index('--add-dir') + 1])):
+            assert git(checkout, 'status', '--short') == ''
+            assert git(checkout, 'show', 'HEAD:notes.txt') == 'fixture\n'
+        return subprocess.CompletedProcess(cmd, 0, '{"type":"result","result":"fixture"}', '')
+
+    stream.side_effect = worker
+    assert run_claude(bare_checkout, **options).ok
+    check_mounts(stream, bare, main / '.git')
 """)
 
 

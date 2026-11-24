@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -204,6 +205,11 @@ def _run(
 ) -> Result:
     openrouter = openrouter_config is not None
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
+    if not remote and sys.platform == "linux" and add_dirs:
+        try:
+            add_dirs = [Path(root).resolve() for root in add_dirs]
+        except (OSError, RuntimeError, ValueError):
+            return Result(ok=False, session=resume, error="Claude could not resolve Linux additional workspace paths")
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
                   resume=resume, fresh_session=fresh_session, system=system,

@@ -255,7 +255,48 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
-def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> list[Path]:
+def linux_git_metadata(source: Path) -> tuple[Path, bool] | None:
+    source = Path(os.path.abspath(source))
+    marker = source / ".git"
+    if source.resolve() != source or marker.is_symlink():
+        return None
+    if marker.is_dir():
+        return marker, False
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--is-bare-repository"],
+            cwd=source, env={"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    fields = os.fsdecode(probe.stdout).removesuffix("\n").split("\n")
+    if probe.returncode or len(fields) != 3:
+        return None
+    git_dir, common = (Path(p) for p in fields[:2])
+    if not common.is_absolute() or common.resolve() != common:
+        return None
+    if not marker.exists() and git_dir == common == source and fields[2] == "true":
+        return common, False
+    if marker.is_file() and git_dir.parent == common / "worktrees" and git_dir.resolve() == git_dir:
+        return common, True
+    return None
+
+
+def linux_authorized_common_dirs(linked: set[Path], sources: set[Path]) -> set[Path]:
+    from . import config
+
+    configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
+                  for part in ([p.dir for p in repo.parts] or [""])}
+    anchors = sources | configured
+    return {common for common in linked if (
+        (common in anchors and linux_git_metadata(common) == (common, False))
+        or (common.name == ".git" and common.parent in anchors
+            and linux_git_metadata(common.parent) == (common, False))
+    )}
+
+
+def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> set[Path]:
     from .store import db, workspaces
 
     base = paths.WORKTREES_DIR.resolve()
@@ -263,20 +304,26 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> list[Path]:
     for root in checkouts:
         if base in root.parents:
             requested.setdefault(root.relative_to(base).parts[0], []).append(root)
-    metadata = []
+    sources, selected = set(), set()
     if requested:
         with suppress(db.NoDatabase), db.reader() as conn:
             if not db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
-                return []
+                return set()
             for name, roots in requested.items():
                 if not (row := workspaces.open_for(name)):
                     continue
                 for checkout in workspaces.owner_of(row).checkouts:
-                    if not any(checkout.wt.resolve().is_relative_to(root) for root in roots):
-                        continue
-                    git_dir = Path(os.path.abspath(checkout.src)) / ".git"
-                    if git_dir.resolve() == git_dir and git_dir.is_dir():
-                        metadata.append(git_dir)
+                    source = Path(os.path.abspath(checkout.src))
+                    sources.add(source)
+                    if any(checkout.wt.resolve().is_relative_to(root) for root in roots):
+                        selected.add(source)
+    metadata, linked = set(), set()
+    for source in selected:
+        if result := linux_git_metadata(source):
+            common, needs_anchor = result
+            (linked if needs_anchor else metadata).add(common)
+    if linked - metadata:
+        metadata |= linux_authorized_common_dirs(linked - metadata, sources)
     return metadata
 
 

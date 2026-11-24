@@ -141,7 +141,12 @@ def worker_hook_sink(env):
                 if not line.endswith(b"\n") or len(line) > MAX_HOOK_EVENT:
                     return
                 event = json.loads(line)
-                if not isinstance(event, dict) or event.get("hook") not in ("PostToolUse", "PostToolUseFailure", "StopFailure"):
+                fields = {"ts", "hook", "tool", "session", "cwd", "kind", "cls", "detail"}
+                if (not isinstance(event, dict) or set(event) - fields - {"agent", "error"}
+                        or type(event.get("agent")) is not bool
+                        or not all(isinstance(event.get(k), str) for k in fields)
+                        or not isinstance(event.get("error", ""), str)
+                        or event["hook"] not in ("PostToolUse", "PostToolUseFailure", "StopFailure")):
                     return
                 append_hook_event(event)
                 self.wfile.write(b"1")
