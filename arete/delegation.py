@@ -246,12 +246,12 @@ def main() -> None:
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]))
-        if launch["step"] == "unblock":
+        if launch["step"] == "orchestrate-monitor":
             from . import unblock
 
             if launch["role"] != "orchestrate" or repo.name not in cfg.unblock_repos:
                 raise PolicyChanged("unblock role or repository is no longer eligible")
-            _, run.resolved_settings["orchestrate"] = unblock.setting_for(cfg, repo)
+            _, run.resolved_settings["orchestrate"] = unblock.setting_for(cfg, repo, launch["kind"])
         kept = Session(**launch["session"])
         if kept.id:
             run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept
@@ -264,9 +264,16 @@ def main() -> None:
             return grant.get("limits")
 
         run.launch_gate = admission
+        goal = {}
+        if ticket := launch.get("goal_ticket"):
+            from . import issue_goal, unblock
+
+            if launch["role"] != "orchestrate" or not unblock.active(cfg, repo.name, ticket):
+                raise PolicyChanged("issue orchestrator is no longer enabled")
+            goal = {"issue_session": (issue_goal.identity(repo.name, ticket), launch["goal_event"])}
         result = run.agent(launch["step"], launch["prompt"], Path(launch["cwd"]), role=launch["role"],
                            allowed_tools=launch["rules"], disallowed_tools=routing.NO_GIT_WRITES,
-                           wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"])
+                           wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"], **goal)
         send(channel, {"event": "result", "ok": result.ok, "text": result.text[:65536],
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
                        "cost_usd": run.cost, "paid_usd": run.paid, "turns": result.turns,

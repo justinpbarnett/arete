@@ -81,14 +81,12 @@ def lineage_ids(run_id: str, ids) -> list[str]:
 
 
 def family(run_id: str, *, repairs: bool = False) -> list[str]:
-    found, todo, dropped = [], [run_id] if run_id else [], set()
+    found, todo, dropped = {}, [run_id] if run_id else [], set()
     while todo:
         rid = todo.pop()
         if rid in found:
             continue
-        if len(found) >= 1000:
-            raise ValueError("the repair chain exceeds 1000 runs")
-        found.append(rid)
+        found[rid] = None
         saved = metadata(rid, "budget.json")
         if saved:
             if saved.get("version") != 1:
@@ -366,12 +364,15 @@ idle_waits = budget_legacy.idle_waits
 
 
 class Budget:
+    issue_goal = False
+
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
-                 *, pending_specification: bool = False, repair_previous: str | None = None,
+                 *, pending_specification: bool = False, issue_goal: bool = False, repair_previous: str | None = None,
                  answered_runs: tuple[str, ...] = (),
                  wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
                  checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = (), started: float | None = None) -> None:
         recovery = getattr(run, "recovery", {})
+        self.issue_goal = issue_goal
         self.base_policy = policy
         self.recovery = recovery.get("allowance", {})
         policy = replace(policy, **{k: getattr(policy, k) + self.recovery[k]
@@ -427,7 +428,7 @@ class Budget:
         self.verify_started = None
         self.started = time.monotonic() - active_seconds(run.id, own_row) if started is None else started
         inherited_seconds = 0 if self.pending_specification else self.prior_seconds
-        self.deadline = self.started + policy.max_run_minutes * 60 - inherited_seconds
+        self.deadline = math.inf if issue_goal else self.started + policy.max_run_minutes * 60 - inherited_seconds
         self.verify_deadline = None
         self.specification = current or next(
             (found for rid in self.parents if (found := recorded_specification(rid))), None)
@@ -613,7 +614,7 @@ class Budget:
 
     @contextmanager
     def verifying(self):
-        remaining = self.policy.max_verify_minutes * 60 - self.verify_seconds
+        remaining = math.inf if self.issue_goal else self.policy.max_verify_minutes * 60 - self.verify_seconds
         if remaining <= 0:
             raise Parked(f"verification reached its cumulative {self.policy.max_verify_minutes:g} minute budget")
         with self.lock:
@@ -640,7 +641,7 @@ class Budget:
                 self.arm()
 
     def repair_limit_reason(self) -> str:
-        if self.prior_repairs + self.repair_calls >= self.policy.max_repair_cycles:
+        if not self.issue_goal and self.prior_repairs + self.repair_calls >= self.policy.max_repair_cycles:
             return f"the repair chain used its {self.policy.max_repair_cycles} repair cycles"
         return ""
 

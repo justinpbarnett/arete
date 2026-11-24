@@ -29,10 +29,12 @@ Built-in orchestration resolves from the installation even when the configured c
 There is no silent fallback to a fixed strategy after orchestration starts.
 
 The `orchestrate` role inherits planning settings unless explicitly configured under `[steps.orchestrate]`.
-Its effective tools, instructions, MCP servers and additional directories are empty, with a fresh session for each decision.
+Its effective tools, instructions, MCP servers and additional directories are empty.
+For repositories enrolled in [durable issue orchestration](../README.md#durable-issue-orchestration), live issue decisions and monitor turns use one Pi Durable conversation across runs.
+Every other controller decision uses a fresh session.
 Pi's controller profile uses `--no-tools`, `--no-context-files`, `--no-skills`, `--no-extensions`, `--no-prompt-templates` and `--no-mcp`.
 Only the engine's guard extension is explicitly loaded.
-Controller calls use a fresh, nonpersistent session with internal retry, compaction and cache warming disabled.
+The CLI controller profile uses a fresh, nonpersistent session with internal retry, compaction and cache warming disabled.
 The guard records the actual tool/context inventory and exits before a second provider request or any unexpected capability can execute.
 Ordinary Pi workers retain their existing tool and session behavior.
 Claude and Codex remain worker-only: the current Claude profile does not disable instruction auto-discovery, and Codex has no verified tool-free profile.
@@ -99,7 +101,9 @@ Catalog prices that are unavailable remain unknown rather than zero.
 
 Read-only delegates may overlap within `max_workers`; implementation and mutation-capable gates serialize.
 Every provider launch requests parent admission, including route fallback.
-The controller records all inference launches and charges fallback launches against the launch ceiling.
+The controller records all inference launches.
+Issue goals have unlimited cumulative decisions, actions, verification time, active runtime and repair cycles.
+Other runs charge fallback launches against the launch ceiling.
 An exempt wait releases one launch charge, and malformed responses consume admitted work.
 Writing again consumes a semantic repair allowance regardless of the worker's name.
 Existing run/verification deadlines, data/payment policy and device/run admission remain authoritative.

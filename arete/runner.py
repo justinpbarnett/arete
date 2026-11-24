@@ -742,7 +742,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if target.remote:
         kw["remote"] = target
     else:
-        supervisor = getattr(getattr(trip, "settings", None), "step", "") == "unblock" or trace[1] == "unblock"
+        supervisor = getattr(getattr(trip, "settings", None), "step", "") == "unblock" or trace[1] == "orchestrate-monitor"
         kw["passing"] = [] if supervisor else environment.passed(cfg, repo)
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
