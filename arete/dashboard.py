@@ -848,13 +848,6 @@ class Handler(BaseHTTPRequestHandler):
             self.parsed_body = api_http.json_object(api_http.read_body(self.rfile, self.content_size, api_http.MAX_JSON_BYTES))
         return self.parsed_body
 
-    def text_body(self) -> str:
-        data = api_http.read_body(self.rfile, self.content_size, api_http.MAX_JSON_BYTES)
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            raise contract.Problem("invalid_input", "The value must be valid UTF-8.") from None
-
     def send_json(self, status: int, data, retry_after: int = 0, *, conditional=False, tag=None) -> None:
         kind = "application/json"
         if status >= 400 and canonical_path(getattr(self, "api_path", "")):

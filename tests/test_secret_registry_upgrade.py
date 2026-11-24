@@ -1,49 +1,15 @@
-import subprocess
-import tempfile
-import unittest
-from pathlib import Path
-from textwrap import indent
-
-from arete import api_check
-from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
-from tests.test_behavior import SECRET_HTTP_FIXTURE
-
-BOOTSTRAP = """
-from arete.store import db
-from unittest import mock
-
-chain = [migration for migration in db.migrations.load() if migration.n <= 26]
-with mock.patch.object(db.migrations, 'load', return_value=chain):
-    db.migrate()
+from tests.test_behavior import SECRET_HTTP_FIXTURE, _SecretChildCase
 
 
-def assert_schema(version):
-    with db.reader() as conn:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == version
-        assert conn.execute('SELECT MAX(n) FROM schema_migrations').fetchone()[0] == version
-        exists = conn.execute("SELECT 1 FROM sqlite_schema WHERE name = 'secrets'").fetchone()
-        assert bool(exists) == (version >= 27)
-"""
-
-
-class SecretRegistryUpgradeTests(unittest.TestCase):
+class SecretRegistryUpgradeTests(_SecretChildCase):
     def run_schema_26(self, entry):
-        with tempfile.TemporaryDirectory(prefix="arete-secret-upgrade-", dir=Path("/tmp").resolve()) as directory:
-            root = Path(directory)
-            env = {**api_check.isolated_env(root), "ARETE_DRIVE_FLUSH": "0"}
-            (root / "config/config.toml").write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
-            script = "from arete import api_check\nwith api_check.offline():\n" + indent(
-                BOOTSTRAP + SECRET_HTTP_FIXTURE + "\nassert_schema(26)\n" + entry, "    ")
-            done = subprocess.run(api_check.child_command(api_check.SOURCE, script), cwd=root, env=env,
-                                  capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.run_secret_child(SECRET_HTTP_FIXTURE + '\nassert_schema(26)\n' + entry, schema=26)
 
     def test_first_direct_registry_get_upgrades_schema_26(self):
         self.run_schema_26("""
-status, headers, result = request('GET', root, token=bearer)
-assert status == 200, result
+headers, result = request('GET', root, token=bearer)
 assert_schema(27)
-contract.validate(result, contract.BY_NAME['secret.list']['result'])
+assert_shape('secret.list', result)
 assert result['secrets'] == []
 assert result['seq'] == headers['Arete-Seq']
 """)
@@ -59,8 +25,7 @@ payload = json.dumps({'requests': [{'operation': op} for op in ('meta.get', 'sec
 class ScratchHandler(dashboard.Handler):
     verify_controls = SimpleNamespace(poll=lambda *_: None)
 
-status, _, refused = request('POST', route, payload, handler=ScratchHandler)
-assert (status, refused['code']) == (401, 'unauthenticated'), refused
+request('POST', route, payload, handler=ScratchHandler, status=401, code='unauthenticated')
 assert_schema(26)
 
 db.enable_wal()
@@ -74,10 +39,9 @@ def read_during_commit(*args):
     return result
 
 with mock.patch.object(api, 'secret_read', side_effect=read_during_commit):
-    status, headers, result = request('POST', route, payload, token=bearer)
-assert status == 200, result
+    headers, result = request('POST', route, payload, token=bearer)
 assert_schema(27)
-contract.validate(result, contract.BY_NAME['batch.run']['result'])
+assert_shape('batch.run', result)
 first, registry, last = result['results']
 assert registry['secrets'] == []
 assert first['schema']['version'] == 27

@@ -1,68 +1,42 @@
-from tests.test_behavior import _SecretChildCase
+from tests.test_behavior import SECRET_LINUX_CLAUDE_FIXTURE, _SecretChildCase
 
 
 class AuthorityClaudeConfinementTests(_SecretChildCase):
-    def test_linux_masks_fingerprint_state_without_requiring_a_store(self):
-        self.run_secret_child(r"""
-import subprocess
-
-from arete import accounts, claude, sandbox
-
+    def test_linux_masks_only_the_fingerprint_file_without_requiring_a_store(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
-state = paths.STATE_DIR.resolve()
-key = paths.FINGERPRINT_KEY_FILE
-checkout = state / 'worktrees' / 'checkout'
-checkout.mkdir(parents=True)
+checkout = linux_checkout()
 extra = state / 'additional'
 extra.mkdir()
-ordinary = checkout / 'control.txt'
+ordinary, state_control = checkout / 'control.txt', state / 'control.txt'
 ordinary.write_text('ordinary fixture')
-options = dict(auth=accounts.Auth(), tools=['Bash'], passing=[], persist=False, add_dirs=[extra])
-fixture = subprocess.CompletedProcess([], 0, '{"type":"result","result":"fixture"}', '')
-with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
-      mock.patch.object(sandbox.shutil, 'which', return_value=None) as which,
-      mock.patch.object(claude, 'binary', return_value='/fixture/claude'),
-      mock.patch.object(claude.child, 'stream', return_value=fixture) as stream):
-    refused = claude.run('fixture', checkout, **options)
-    assert not refused.ok and 'requires bubblewrap' in refused.error
-    stream.assert_not_called()
-    which.return_value = '/usr/bin/bwrap'
+state_control.write_text('unrelated state fixture')
+options = dict(add_dirs=[extra], tools=['Bash'])
+with linux_claude() as (which, stream):
+    assert_missing_bwrap(which, stream, checkout, **options)
     for present in (False, True):
         with case.subTest(key_present=present):
-            if present:
-                key.write_bytes(b'F' * 32)
-                key.chmod(0o600)
-            assert claude.run('fixture', checkout, **options).ok
-            argv = stream.call_args.args[0]
-            assert argv[0] == '/usr/bin/bwrap'
-            assert argv[argv.index('--tmpfs'):argv.index('--') + 2] == [
-                '--tmpfs', str(state), '--bind', str(checkout), str(checkout), '--bind', str(extra), str(extra),
-                '--remount-ro', str(state), '--chdir', str(checkout), '--', '/fixture/claude',
-            ]
             assert key.exists() == present
+            assert run_claude(checkout, **options).ok
+            assert_mounts(stream, checkout, *key_mask)
             assert ordinary.read_text() == 'ordinary fixture'
-    assert key.read_bytes() == b'F' * 32
+            assert state_control.read_text() == 'unrelated state fixture'
+            if not present:
+                original = key.read_bytes()
+                assert len(original) == 32 and key.stat().st_mode & 0o777 == 0o600
+            assert key.read_bytes() == original
+    assert stream.call_count == 2
 """)
 
     def test_linux_keeps_store_mask_during_fallback_transition(self):
-        self.run_secret_child(r"""
-from arete import sandbox
-
-store = config.secret_settings().store_dir
-state = paths.STATE_DIR.resolve()
-checkout = paths.WORKTREES_DIR.resolve() / 'checkout'
-checkout.mkdir()
-key = paths.FINGERPRINT_KEY_FILE
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+checkout = linux_checkout()
 key.write_bytes(b'F' * 32)
 key.chmod(0o600)
-with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
-      mock.patch.object(sandbox.shutil, 'which', return_value='/usr/bin/bwrap')):
-    argv = sandbox.claude_confinement(['/fixture/claude'], checkout)
-assert argv[argv.index('--tmpfs'):] == [
-    '--tmpfs', str(state), '--remount-ro', str(state), '--tmpfs', str(store), '--remount-ro', str(store),
-    '--chdir', str(checkout), '--', '/fixture/claude',
-]
-assert (store.stat().st_mode & 0o777) == 0o700
+with linux_claude() as (_, stream):
+    assert run_claude(checkout, tools=['Bash']).ok
+    stream.assert_called_once()
+    assert_mounts(stream, checkout, *key_mask, *store_mask)
 assert key.read_bytes() == b'F' * 32
 """)
 

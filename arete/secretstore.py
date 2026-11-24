@@ -14,8 +14,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, paths, util
-from .store import credentials, db
+from . import config, launch_lease, paths, util
+from .store import credentials, db, writes
 
 NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 SCOPE = re.compile(r"global|(?:repo|line|device|connector):[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -56,9 +56,13 @@ def validate_account_id(label: str) -> None:
         raise ValueError("invalid account id")
 
 
-def address(scope: str, name: str) -> str:
+def item_path(scope, name):
     validate(scope, name)
-    return f"secret:{scope}/{name}"
+    return f"{scope}/{name}"
+
+
+def address(scope: str, name: str) -> str:
+    return "secret:" + item_path(scope, name)
 
 
 def validate_actor(actor):
@@ -111,17 +115,27 @@ def parse_reference(text: str, tag: str) -> Reference:
     return Reference(store, tag, location.removeprefix(prefix))
 
 
-def registry_reference(text, tag, item):
-    ref = parse_reference(text, tag)
+def registry_reference(c, row, item):
+    ref = parse_reference(row["reference"], db.metadata(c)["instance_tag"])
     if ref.store != "owner_file" and ref.item != item:
         raise StoreError("secret reference does not match its address")
     return ref
 
 
-def configured(settings):
+def store_settings():
+    settings = config.secret_settings()
     if settings.store is None:
         raise StoreMissing("secret_store_missing")
-    return settings.store
+    return settings
+
+
+def migrate_registry():
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
+
+
+def registry(*, write=False):
+    migrate_registry()
+    return writes.atomic() if write else db.reader()
 
 
 @contextmanager
@@ -137,14 +151,16 @@ def file_parent(path: Path, root: Path, *, create=False, private=False):
             yield parent
 
 
+def private_file(info: os.stat_result) -> bool:
+    return stat.S_IMODE(info.st_mode) == 0o600 and launch_lease.plain(info)
+
+
 def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
     try:
         with file_parent(path, root, private=private) as parent:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
-                info = os.fstat(fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
-                        or stat.S_IMODE(info.st_mode) != 0o600):
+                if not private_file(os.fstat(fd)):
                     raise StoreError("secret item must be a private regular file with mode 0600")
                 with os.fdopen(fd, "rb", closefd=False) as file:
                     return file.read()
@@ -235,6 +251,14 @@ def write_item(ref: Reference, settings: config.SecretsConfig, value: bytes) -> 
         raise InternalSecret("This secret is managed by its owning service.")
 
 
+def external_item(scope, name, *, changing_value=False):
+    item = item_path(scope, name)
+    if item == KEY_ITEM:
+        owner = "its owning service" if changing_value else "Arete"
+        raise InternalSecret(f"This secret is managed by {owner}.")
+    return item
+
+
 def require_removable(item, store=None):
     if item == KEY_ITEM or store == "owner_file":
         raise InternalSecret("This secret is managed by its owning service.")
@@ -257,9 +281,10 @@ def checked_key(value: bytes | None) -> bytes:
     return value
 
 
-def referenced_key(meta, settings):
-    ref = parse_reference(meta[KEY_REF], meta["instance_tag"])
-    if ref.item != KEY_ITEM or ref.store == "owner_file":
+def referenced_key(meta, settings, *, expected_store=None):
+    ref = (Reference(expected_store, meta.get("instance_tag", ""), KEY_ITEM) if expected_store else
+           parse_reference(meta[KEY_REF], meta["instance_tag"]))
+    if ref.item != KEY_ITEM or ref.store == "owner_file" or (expected_store and str(ref) != meta[KEY_REF]):
         raise FingerprintKeyMissing("invalid fingerprint key reference")
     try:
         return checked_key(read_item(ref, settings))
@@ -273,29 +298,35 @@ def retire_local_key(local, key, reference):
             remove_file(local, local.parent)
 
 
-def ensure_key(c, settings):
+def has_fingerprints(c) -> bool:
+    return bool(c.execute("SELECT EXISTS (SELECT 1 FROM accounts UNION ALL "
+                          "SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
+
+
+def ensure_key(c, settings, *, probe_local=None):
     meta = db.metadata(c)
-    local = local_key_path()
+    local = local_key_path() if probe_local is None else probe_local
     if reference := meta.get(KEY_REF):
         key = referenced_key(meta, settings)
         if meta.get(KEY_LOCAL) and local.exists():
+            if probe_local is not None:
+                return None
             db.after_commit(lambda: retire_local_key(local, key, reference))
         return key
+    if probe_local is not None:
+        fallback = read_file(local, local.parent) if not settings.store and meta.get(KEY_LOCAL) else None
+        return checked_key(fallback) if fallback is not None else None
     fallback = read_file(local, local.parent)
     if meta.get(KEY_LOCAL):
         checked_key(fallback)
-    elif c.execute("""
-        SELECT EXISTS (SELECT 1 FROM accounts UNION ALL SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)
-        """).fetchone()[0]:
+    elif has_fingerprints(c):
         raise FingerprintKeyMissing("fingerprint_key_missing")
     ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM) if settings.store else None
     stored = read_item(ref, settings) if ref else None
     if fallback is not None and stored is not None and fallback != stored:
         raise StoreError("local and configured fingerprint keys differ")
     key = stored if stored is not None else fallback
-    if key is None:
-        key = secrets.token_bytes(32)
-    key = checked_key(key)
+    key = checked_key(secrets.token_bytes(32) if key is None else key)
     if ref:
         if stored is None:
             write_item(ref, settings, key)
@@ -312,17 +343,11 @@ def ensure_key(c, settings):
 def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
     settings = config.secret_settings() if settings is None else settings
     local = local_key_path()
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
+    migrate_registry()
     try:
         with db.reader() as c:
-            meta = db.metadata(c)
-            if meta.get(KEY_REF):
-                key = referenced_key(meta, settings)
-                if not (meta.get(KEY_LOCAL) and local.exists()):
-                    return key
-            elif not settings.store and meta.get(KEY_LOCAL):
-                if (key := read_file(local, local.parent)) is not None:
-                    return checked_key(key)
+            if (key := ensure_key(c, settings, probe_local=local)) is not None:
+                return key
     except db.NoDatabase:
         if not paths.ISOLATED:
             raise
@@ -347,53 +372,30 @@ def item_digest(key: bytes, value: bytes) -> str:
 
 def get(scope, name):
     validate(scope, name)
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
-    with db.reader() as c:
+    with registry() as c:
         return credentials.secret(c, scope, name)
 
 
 def items():
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
-    with db.reader() as c:
+    with registry() as c:
         return credentials.secrets(c)
 
 
 def history(scope, name):
     validate(scope, name)
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
-    with db.reader() as c:
+    with registry() as c:
         row = credentials.secret(c, scope, name)
         return credentials.history(c, row["id"]) if row else []
 
 
 def read(scope, name) -> bytes | None:
-    validate(scope, name)
-    item = f"{scope}/{name}"
-    if item == KEY_ITEM:
-        raise InternalSecret("This secret is managed by Arete.")
-    settings = config.secret_settings()
-    configured(settings)
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
-    with db.reader() as c:
+    item = external_item(scope, name)
+    settings = store_settings()
+    with registry() as c:
         row = credentials.secret(c, scope, name)
         if row and row["status"] == "set":
-            ref = registry_reference(row["reference"], db.metadata(c)["instance_tag"], item)
-            return read_item(ref, settings)
+            return read_item(registry_reference(c, row, item), settings)
     return None
-
-
-@contextmanager
-def registry_write():
-    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
-    with db.tx() as c:
-        c.execute("SAVEPOINT secret_registry")
-        try:
-            yield c
-        except BaseException:
-            c.execute("ROLLBACK TO secret_registry")
-            raise
-        finally:
-            c.execute("RELEASE secret_registry")
 
 
 def pending_path(item):
@@ -401,10 +403,16 @@ def pending_path(item):
     return root / item, root
 
 
-def pending_write(item):
+def load_pending(item):
     raw = read_file(*pending_path(item), private=True)
     saved = json.loads(raw) if raw is not None else {}
     return raw, saved.get("sets", []), saved.get("removal")
+
+
+def save_pending(item, record):
+    raw = json.dumps(record).encode()
+    write_file(*pending_path(item), raw, private=True)
+    return raw
 
 
 def matching_set(pending, ref, fingerprint):
@@ -425,21 +433,18 @@ def retire_pending(item, raw, expected):
     db.after_commit(committed)
 
 
-def save_set(c, scope, name, previous, ref, change):
+def save_change(c, scope, name, previous, ref, change, *, removing=False):
     actor, at = change["actor"], change["at"]
-    rotated = change.get("rotated", bool(previous and previous["status"] == "set"))
-    row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
-                                  actor, at, change["provider"], rotated=rotated)
-    credentials.secret_event(c, row, "rotated" if rotated else "set", actor, at)
-    credentials.secret_changed(c, row, actor)
-    return row
-
-
-def save_removal(c, scope, name, previous, ref, change):
-    actor, at = change["actor"], change["at"]
-    row = (credentials.mark_removed(c, previous, at) if previous else
-           credentials.removed_secret(c, scope, name, change["kind"], ref.store, str(ref), at))
-    credentials.secret_event(c, row, "removed", actor, at, detail=change["id"])
+    if removing:
+        row = (credentials.mark_removed(c, previous, at) if previous else
+               credentials.removed_secret(c, scope, name, change["kind"], ref.store, str(ref), at))
+        event, detail = "removed", change["id"]
+    else:
+        rotated = change.get("rotated", bool(previous and previous["status"] == "set"))
+        row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
+                                      actor, at, change["provider"], rotated=rotated)
+        event, detail = "rotated" if rotated else "set", None
+    credentials.secret_event(c, row, event, actor, at, detail=detail)
     credentials.secret_changed(c, row, actor)
     return row
 
@@ -449,22 +454,19 @@ def unresolved_removal(c, row, removal):
 
 
 def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=None) -> dict:
-    validate(scope, name)
-    item = f"{scope}/{name}"
-    require_removable(item)
+    item = external_item(scope, name, changing_value=True)
     validate_actor(actor)
     validate_value(value, kind)
-    settings = config.secret_settings()
-    store = configured(settings)
+    settings = store_settings()
     key = fingerprint_key(settings)
-    with registry_write() as c:
-        ref = Reference(store, db.metadata(c)["instance_tag"], item)
+    with registry(write=True) as c:
+        ref = Reference(settings.store, db.metadata(c)["instance_tag"], item)
         row = credentials.secret(c, scope, name)
         if row:
             require_removable(item, row["store"])
             if row["reference"] != str(ref):
                 raise StoreError("secret is registered in a different store")
-        _, pending, removal = pending_write(item)
+        _, pending, removal = load_pending(item)
         if unresolved_removal(c, row, removal):
             raise StoreError("secret removal is pending; retry the removal before setting a new value")
         stored = read_item(ref, settings)
@@ -472,70 +474,56 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=No
         change = dict(reference=str(ref), kind=kind, actor=actor, at=util.iso(), fingerprint=digest(key, value),
                       provider=provider, rotated=stored is not None)
         recoverable = [change, previous] if previous and previous["fingerprint"] != change["fingerprint"] else [change]
-        raw = json.dumps({"id": secrets.token_hex(16), "sets": recoverable}).encode()
-        write_file(*pending_path(item), raw, private=True)
+        raw = save_pending(item, {"id": secrets.token_hex(16), "sets": recoverable})
         write_item(ref, settings, value.encode())
-        row = save_set(c, scope, name, row, ref, change)
+        row = save_change(c, scope, name, row, ref, change)
         retire_pending(item, raw, row)
         return row
 
 
 def remove(scope, name, actor):
-    validate(scope, name)
-    item = f"{scope}/{name}"
-    require_removable(item)
-    validate_actor(actor)
-    settings = config.secret_settings()
-    configured(settings)
-    with registry_write() as c:
-        row = credentials.secret(c, scope, name)
-        if row:
-            require_removable(item, row["store"])
-        raw, pending, removal = pending_write(item)
-        target = row or removal or (pending[0] if pending else None)
-        if target is None:
-            return None
-        ref = registry_reference(target["reference"], db.metadata(c)["instance_tag"], item)
-        require_removable(item, ref.store)
-        if not unresolved_removal(c, row, removal):
-            if (row and row["status"] == "missing" and credentials.last_lifecycle(c, row["id"]) == "removed"
-                    and read_item(ref, settings) is None):
-                retire_pending(item, raw, row)
-                return row
-            removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=target["kind"], actor=actor, at=util.iso())
-            raw = json.dumps({"sets": pending, "removal": removal}).encode()
-            write_file(*pending_path(item), raw, private=True)
-        remove_item(ref, settings)
-        row = save_removal(c, scope, name, row, ref, removal)
-        retire_pending(item, raw, row)
-        return row
+    return reconcile(scope, name, actor, deleting=True)
 
 
 def check(scope, name, actor="hand"):
-    validate(scope, name)
-    item = f"{scope}/{name}"
-    if item == KEY_ITEM:
-        raise InternalSecret("This secret is managed by Arete.")
+    return reconcile(scope, name, actor)
+
+
+def reconcile(scope, name, actor, *, deleting=False):
+    item = external_item(scope, name, changing_value=deleting)
     validate_actor(actor)
-    settings = config.secret_settings()
-    configured(settings)
-    with registry_write() as c:
+    settings = store_settings()
+    with registry(write=True) as c:
         row = credentials.secret(c, scope, name)
-        raw, pending, removal = pending_write(item)
+        if deleting and row:
+            require_removable(item, row["store"])
+        raw, pending, removal = load_pending(item)
         target = row or removal or (pending[0] if pending else None)
         if target is None:
             return None
-        ref = registry_reference(target["reference"], db.metadata(c)["instance_tag"], item)
+        ref = registry_reference(c, target, item)
+        if deleting:
+            require_removable(item, ref.store)
+            removal = removal if unresolved_removal(c, row, removal) else None
+            if removal is None and not (row and row["status"] == "missing" and
+                    credentials.last_lifecycle(c, row["id"]) == "removed" and read_item(ref, settings) is None):
+                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=target["kind"], actor=actor, at=util.iso())
+                raw = save_pending(item, {"sets": pending, "removal": removal})
+            if removal is not None:
+                remove_item(ref, settings)
+                row = save_change(c, scope, name, row, ref, removal, removing=True)
+            retire_pending(item, raw, row)
+            return row
         value = read_item(ref, settings)
         removing = unresolved_removal(c, row, removal)
         if removing and value is None:
-            row = save_removal(c, scope, name, row, ref, removal)
+            row = save_change(c, scope, name, row, ref, removal, removing=True)
             removing = False
         sha = item_digest(fingerprint_key(settings), value) if value is not None else None
         change = matching_set(pending, ref, sha)
         recovered = change is not None and (row is None or row["fingerprint"] != sha or row["status"] != "set")
         if recovered:
-            row = save_set(c, scope, name, row, ref, change)
+            row = save_change(c, scope, name, row, ref, change)
         if row is None and sha is not None:
             raise StoreError("secret item does not match its recovery record")
         if row is not None:

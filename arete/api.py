@@ -4,7 +4,7 @@ from collections import Counter
 from urllib.parse import unquote
 
 from . import (
-    board, codebase, config, configitems, contract, control, credential_http, events, pi, record,
+    api_http, board, codebase, config, configitems, contract, control, credential_http, events, pi, record,
     refusals, secretstore, settings, tasks, tool_events, triage, util,
 )
 from .store import chats, credentials, insights, principals, runs
@@ -110,63 +110,62 @@ def secret_view(row):
             "check_ok": None if row["check_ok"] is None else bool(row["check_ok"])}
 
 
+def secret_result(scope, name, row):
+    return {"secret": secret_view(needed(row, secretstore.address(scope, name)))}
+
+
 def secret_read(operation, values):
     if operation == "secret.list":
         return {"secrets": [secret_view(row) for row in secretstore.items()]}
     scope, name = values["scope"], values["name"]
-    row = needed(secretstore.get(scope, name), secretstore.address(scope, name))
-    result = {"secret": secret_view(row)}
+    result = secret_result(scope, name, secretstore.get(scope, name))
     if operation == "secret.history":
         result["history"] = [serialize({**event, "ok": bool(event["ok"])}, contract.SECRET_HISTORY)
                              for event in secretstore.history(scope, name)]
     return result
 
 
-def secret_kind(scope, name):
+def secret_set_options(scope, name):
     row = secretstore.get(scope, name)
-    try:
-        secretstore.require_removable(f"{scope}/{name}", row["store"] if row else None)
-    except secretstore.InternalSecret as error:
-        raise contract.Problem("secret_internal", str(error)) from None
-    if row:
-        return row["kind"]
-    if scope == "global" and name == "GITHUB_APP_PRIVATE_KEY":
-        return "app_private_key"
-    if scope.startswith("repo:"):
-        return "repo_answer"
-    if scope.startswith("line:") and name == "WEBHOOK_SECRET":
-        return "webhook_secret"
-    return "api_key"
-
-
-def secret_provider(scope, name):
-    if scope.startswith("line:") and name == "WEBHOOK_SECRET":
-        return "webhook"
+    secretstore.require_removable(f"{scope}/{name}", row["store"] if row else None)
+    kind, provider = "api_key", None
     if scope == "global":
         if name == "GITHUB_APP_PRIVATE_KEY":
-            return "github"
-        if name == "JIRA_API_TOKEN":
-            return "jira"
-        return next((provider for provider, key in pi.KEY_NAMES.items() if key == name), None)
-    return None
-
-
-def secret_write(operation, values, raw):
-    scope, name = values["scope"], values["name"]
-    actor = principals.current()
-    try:
-        if operation == "secret.set":
-            row = secretstore.put(scope, name, raw, secret_kind(scope, name), actor,
-                                  provider=secret_provider(scope, name))
-        elif operation == "secret.remove":
-            row = secretstore.remove(scope, name, actor)
+            kind, provider = "app_private_key", "github"
+        elif name == "JIRA_API_TOKEN":
+            provider = "jira"
         else:
-            row = secretstore.check(scope, name, actor)
-    except secretstore.InternalSecret as error:
-        raise contract.Problem("secret_internal", str(error)) from None
-    except secretstore.StoreMissing:
-        raise credential_http.problem("secret_store_missing") from None
-    return {"secret": secret_view(needed(row, secretstore.address(scope, name)))}
+            provider = next((p for p, key in pi.KEY_NAMES.items() if key == name), None)
+    elif scope.startswith("line:") and name == "WEBHOOK_SECRET":
+        kind, provider = "webhook_secret", "webhook"
+    elif scope.startswith("repo:"):
+        kind = "repo_answer"
+    return row["kind"] if row else kind, provider
+
+
+def secret_input(validate, *args):
+    try:
+        validate(*args)
+    except ValueError as error:
+        raise contract.Problem("invalid_input", str(error)) from None
+
+
+def set_secret(handler, op, target):
+    scope, name = target["scope"], target["name"]
+    try:
+        value = api_http.read_body(handler.rfile, handler.content_size, api_http.MAX_JSON_BYTES).decode("utf-8")
+    except UnicodeDecodeError:
+        raise contract.Problem("invalid_input", "The value must be valid UTF-8.") from None
+    kind, _ = secret_set_options(scope, name)
+    secret_input(secretstore.validate_value, value, kind)
+
+    def change():
+        kind, provider = secret_set_options(scope, name)
+        row = secretstore.put(scope, name, value, kind, principals.current(), provider=provider)
+        return with_seq(secret_result(scope, name, row))
+
+    return handler.keyed_action(op["method"], op["path"], target, change, atomic=True, status=op["success_status"],
+                                hash_body={"fingerprint": secretstore.fingerprint(value)})
 
 
 def prepare(name, values):
@@ -175,10 +174,7 @@ def prepare(name, values):
     if name.startswith("secret."):
         credential_http.secret_access(values.get("scope", ""))
         if "name" in values:
-            try:
-                secretstore.validate(values["scope"], values["name"])
-            except ValueError as error:
-                raise contract.Problem("invalid_input", str(error)) from None
+            secret_input(secretstore.validate, values["scope"], values["name"])
     if name == "hook.ingest":
         for i, event in enumerate(values["events"]):
             event_timestamp(event["ts"], f"input.events[{i}].ts")
@@ -209,7 +205,7 @@ def execute(name, values, handler=None):
         return dashboard.record_usage(handler, values)
     reads = values["requests"] if name == "batch.run" else ()
     if credential_http.registry_operation(name) or any(credential_http.registry_operation(r["operation"]) for r in reads):
-        foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
+        secretstore.migrate_registry()
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
         if name == "batch.run":
@@ -315,9 +311,8 @@ def dispatch(handler, op, path_values, query):
     identity = {k: unquote(v) for k, v in path_values.items()}
     values = {**query, **identity}
     write = contract.keyed_write(op)
-    plain = op.get("body_media") == "text/plain"
     if method != "GET":
-        body = {} if plain else handler.body()
+        body = {} if name == "secret.set" else handler.body()
         if write and (query or identity.keys() & body.keys()):
             raise contract.Problem("invalid_input", "Send the target in the URL and writable fields in the body")
         values = {**body, **identity}
@@ -325,46 +320,44 @@ def dispatch(handler, op, path_values, query):
         if write:
             prepare(name, values)
             if credential_http.registry_operation(name):
-                foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
-            raw, hash_body = None, None
-            if plain:
-                raw = handler.text_body()
-                try:
-                    secretstore.validate_value(raw, secret_kind(**identity))
-                except ValueError as error:
-                    raise contract.Problem("invalid_input", str(error)) from None
-                hash_body = {"fingerprint": secretstore.fingerprint(raw)}
-            result = command(handler, op, values, identity if name.startswith("secret.") else path_values,
-                             raw=raw, hash_body=hash_body)
+                secretstore.migrate_registry()
+            if name == "secret.set":
+                return set_secret(handler, op, identity)
+            result = command(handler, op, values, identity if name.startswith("secret.") else path_values)
             if name == "pairing.claim":
                 credential_http.finish_pairing_claim(handler)
             elif name == "session.end":
                 handler.set_cookie = credential_http.session_cookie("", 0)
             return result
         return execute(name, values, handler)
+    except secretstore.InternalSecret as error:
+        raise contract.Problem("secret_internal", str(error)) from None
+    except secretstore.StoreMissing:
+        raise credential_http.problem("secret_store_missing") from None
     except refusals.Refusal as error:
         if not getattr(error, "code", None) and error.status in (400, 404):
             raise contract.Problem("not_found" if error.status == 404 else "invalid_input", str(error)) from error
         raise
 
 
-def command(handler, op, values, path_values, *, claim=None, raw=None, hash_body=None):
+def command(handler, op, values, path_values, *, claim=None):
     name = op["name"]
     read_only = op["method"] == "GET" or name == "batch.run"
-    action = (lambda: mutation(name, values, handler, raw)) if contract.keyed_write(op) else (
+    action = (lambda: mutation(name, values, handler)) if contract.keyed_write(op) else (
         lambda: execute(name, values, handler))
     return handler.keyed_action(op["method"], op["path"], path_values, action,
                                 atomic=not read_only and name not in ("run.stop", "serve.install"),
                                 status=op["success_status"],
-                                redact=name in ("token.issue", "token.rotate"), claim=claim, read_only=read_only,
-                                hash_body=hash_body)
+                                redact=name in ("token.issue", "token.rotate"), claim=claim, read_only=read_only)
 
 
-def mutation(name, values, handler, raw=None):
+def mutation(name, values, handler):
     from . import dashboard
 
-    if name.startswith("secret."):
-        result = secret_write(name, values, raw)
+    if name in ("secret.remove", "secret.check"):
+        scope, secret = values["scope"], values["name"]
+        change = secretstore.remove if name == "secret.remove" else secretstore.check
+        result = secret_result(scope, secret, change(scope, secret, principals.current()))
     elif name.startswith(("token.", "pairing.")) or name in ("principal.revoke", "session.end"):
         result = credential_http.write_operation(name, values, handler)
     elif name.startswith("task.") or name == "comment.create":
@@ -389,6 +382,10 @@ def mutation(name, values, handler, raw=None):
                                                  values["offset"], values["events"])}
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
+    return with_seq(result)
+
+
+def with_seq(result):
     with foundation.reader() as conn:
         return {"seq": events.metadata(conn)["head"], **result}
 

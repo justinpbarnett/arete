@@ -63,6 +63,7 @@ KEYCHAIN_COMMAND = re.compile(r"(?<![\w.-])security(?![\w.-])", re.IGNORECASE)
 REDIRECT = re.compile(r"[0-9]*(?:<<<|<<-|<<|<>|<&|>>|>\||>&|[<>])|&>>?")
 ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
 SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
+SHELL_WORD_BREAKS = " \t\n;|&()<>"
 SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
 SED_SEARCH = re.compile(r"/(?:\\[^\n]|[^/\\\n])*/p")
 BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
@@ -815,10 +816,6 @@ def login(env: dict | None = None) -> tuple[bool, str, str]:
 
 
 def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str:
-    return shell_refusal(command, lambda words: denied_git(words, rules), depth)
-
-
-def shell_refusal(command: str | list[str], deny, depth: int = 0) -> str:
     if depth > 12:
         return "nested shell command"
     if isinstance(command, list):
@@ -840,11 +837,10 @@ def shell_refusal(command: str | list[str], deny, depth: int = 0) -> str:
             words = words[1:]
         if not words:
             continue
-        if Path(words[0]).name in SHELL_WORDS:
-            if (script := inline_shell(words[1:])) is not None:
-                if found := shell_refusal(script, deny, depth + 1):
-                    return found
-        if denied := deny(words):
+        if Path(words[0]).name in SHELL_WORDS and (script := inline_shell(words[1:])) is not None:
+            if found := git_write(script, rules, depth + 1):
+                return found
+        if denied := denied_git(words, rules):
             return denied
     return ""
 
@@ -1013,6 +1009,41 @@ class KeychainShell:
                 self.pos += 1
         raise ValueError("unclosed arithmetic expansion")
 
+    def skip_blanks(self) -> None:
+        while self.char() in (" ", "\t") or self.starts("\\\n"):
+            self.pos += 2 if self.char() == "\\" else 1
+
+    def take_literal_word(self, literal: str) -> bool:
+        start = self.pos
+        for ch in literal:
+            if self.char() != ch:
+                break
+            self.pos += 1
+            while self.starts("\\\n"):
+                self.escaped()
+        else:
+            if not (tail := self.char()) or tail in SHELL_WORD_BREAKS:
+                return True
+        self.pos = start
+        return False
+
+    def scan_prefixed_arithmetic(self, depth: int, prefix: str) -> bool:
+        start = self.pos
+        self.skip_blanks()
+        for_loop = prefix == "for"
+        if prefix == "time":
+            if self.take_literal_word("-p"):
+                self.skip_blanks()
+            for_loop = self.take_literal_word("for")
+            if for_loop:
+                self.skip_blanks()
+        if self.scan_arithmetic(depth, "(("):
+            return True
+        if for_loop and self.starts("(("):
+            raise ValueError("unclosed arithmetic for header")
+        self.pos = start
+        return False
+
     def ansi_quoted(self) -> str:
         if not (match := ANSI_C_QUOTE.match(self.source, self.pos)):
             raise ValueError("unclosed ANSI-C quote")
@@ -1056,7 +1087,7 @@ class KeychainShell:
                 value.append(self.quoted(depth, delimiter))
             elif ch == "\\":
                 value.append(self.escaped())
-            elif ch in " \t\n;|&()<>":
+            elif ch in SHELL_WORD_BREAKS:
                 break
             else:
                 value.append(ch)
@@ -1126,14 +1157,13 @@ class KeychainShell:
 
         while ch := self.char():
             if ch in " \t" or self.starts("\\\n"):
-                self.pos += 2 if ch == "\\" else 1
+                self.skip_blanks()
             elif ch == "#":
                 end = self.source.find("\n", self.pos)
                 self.pos = end if end >= 0 else len(self.source)
             elif not (self.starts("<(") or self.starts(">(")) and (redirect := REDIRECT.match(self.source, self.pos)):
                 self.pos = redirect.end()
-                while self.char() in (" ", "\t") or self.starts("\\\n"):
-                    self.pos += 2 if self.char() == "\\" else 1
+                self.skip_blanks()
                 operation = redirect[0].lstrip("0123456789")
                 heredoc = operation in ("<<", "<<-")
                 start = self.pos
@@ -1171,7 +1201,11 @@ class KeychainShell:
                 start = self.pos
                 word = self.word(depth)
                 raw = self.source[start:self.pos].replace("\\\n", "")
-                if words or (raw not in SHELL_PREFIX and not ASSIGNMENT.match(raw)):
+                if (not words and self.shell == "bash" and raw in ("for", "time")
+                        and self.scan_prefixed_arithmetic(depth + 1, raw)):
+                    pipeline.append([])
+                    needs_consumer = False
+                elif words or (raw not in SHELL_PREFIX and not ASSIGNMENT.match(raw)):
                     words.append(word)
         if closing or docs:
             raise ValueError("unclosed shell group or heredoc")

@@ -6,7 +6,9 @@ import os
 import pwd
 import re
 import shutil
+import sqlite3
 import sys
+from contextlib import suppress
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -151,7 +153,10 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         settings = config.secret_settings()
         store = settings.store_dir
         key = secretstore.local_key_path()
-        protect_fallback = settings.store is None or key.exists()
+        protect_fallback = settings.store is None
+        with suppress(FileNotFoundError):
+            key.lstat()
+            protect_fallback = True
         work = Path(cwd).resolve()
         roots = tuple(dict.fromkeys((work, *(Path(p).resolve() for p in opened))))
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
@@ -163,7 +168,7 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
     if store is not None and work.is_relative_to(store):
         raise ConfinementUnavailable("Claude cannot start inside the secret store")
-    masks = linux_fingerprint_mounts(key, roots) if protect_fallback else []
+    masks = linux_fingerprint_mounts(key, roots, settings, required=protect_fallback)
     if store is not None:
         try:
             with secretstore.file_parent(store / "mount", store, create=True, private=True):
@@ -176,21 +181,46 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
             *masks, "--chdir", str(work), "--", *command]
 
 
-def linux_fingerprint_mounts(key: Path, opened: tuple[Path, ...]) -> list[str]:
-    state = key.parent
-    if state == Path("/") or any(p == state or p.is_relative_to(key) for p in opened):
-        raise ConfinementUnavailable("Claude cannot open the instance state directory as a workspace")
+def linux_fingerprint_mounts(key: Path, opened: tuple[Path, ...], settings, *, required: bool) -> list[str]:
+    from . import secretstore
+
+    if not required and settings.store != "pve_store":
+        return []
+    if any(root.is_relative_to(key) for root in opened):
+        raise ConfinementUnavailable("Claude cannot open the instance fingerprint key as a workspace")
     try:
-        with paths.directory_fd(state, create=True):
-            pass
-    except OSError as error:
+        try:
+            info = key.lstat()
+        except FileNotFoundError:
+            if settings.store == "pve_store":
+                check_linux_stored_key(settings, required)
+                return []
+            if settings.store is not None:
+                raise
+            secretstore.fingerprint_key(settings)
+            info = key.lstat()
+    except secretstore.FingerprintKeyMissing as error:
+        raise ConfinementUnavailable(str(error)) from error
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         raise ConfinementUnavailable("Claude could not prepare the Linux fingerprint key mask") from error
-    mounts = ["--tmpfs", str(state)]
-    inside = tuple(p for p in opened if p.is_relative_to(state))
-    for root in inside:
-        if not any(parent != root and root.is_relative_to(parent) for parent in inside):
-            mounts += ["--bind", str(root), str(root)]
-    return [*mounts, "--remount-ro", str(state)]
+    if not secretstore.private_file(info) or info.st_size != 32:
+        raise ConfinementUnavailable("Claude requires a private regular fingerprint key file for confinement")
+    return ["--ro-bind", os.devnull, str(key)]
+
+
+def check_linux_stored_key(settings, required: bool) -> None:
+    from . import secretstore
+    from .store import db
+
+    with suppress(db.NoDatabase), db.reader() as c:
+        meta = db.metadata(c)
+        if secretstore.KEY_REF in meta:
+            secretstore.referenced_key(meta, settings, expected_store="pve_store")
+            return
+        required = required or secretstore.KEY_LOCAL in meta or (
+            db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c) and secretstore.has_fingerprints(c))
+    if required:
+        raise secretstore.FingerprintKeyMissing("fingerprint_key_missing")
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
