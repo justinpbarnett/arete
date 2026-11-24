@@ -6651,6 +6651,20 @@ class WaitReconnectTests(unittest.TestCase):
 
 
 class DashboardSnapshotTests(unittest.TestCase):
+    def test_explicit_hold_removes_only_the_held_ticket_from_the_inbox(self):
+        repo = config.Repo("fixture", Path("."), github="example/fixture")
+        source = triage.GitHubSource(repo.github, [repo])
+        candidates = [triage.Candidate(f"fixture#{n}", str(n), f"Ticket {n}", "", "") for n in (1, 2)]
+        rows = [triage.row(source, c, repo=repo.name, kind=triage.FEATURE, ready=1, code=1) for c in candidates]
+        view = {"rows": rows, "sent": [], "research": {}}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(triage, "sources", return_value=[source]), \
+                mock.patch.object(triage, "META_FILE", Path(directory) / "triage.json"):
+            for held, expected in [([], ["fixture#1", "fixture#2"]), (["fixture#1"], ["fixture#2"]),
+                                   ([], ["fixture#1", "fixture#2"])]:
+                util.write_json(triage.META_FILE, {"label_holds": {source.name: held}})
+                ready = dashboard.board.ready_in_one_click(view)
+                self.assertEqual([r["ref"] for r in ready], expected)
+
     def test_event_client_surface(self):
         web = Path(__file__).resolve().parents[1] / "arete" / "web"
         source = (web / "ui-events.js").read_text() + (web / "ui-live.js").read_text()
