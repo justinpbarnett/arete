@@ -173,10 +173,16 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             ledger.mark(existing, "cancelled", "The ticket is no longer approved")
         return
     prior = existing or ledger.get(repo.name, tid)
+    prs = unblock.prs_of(row)
+    if all_merged(prs):
+        if prior.get("phase") != "resolved":
+            case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
+            issue_goal.lifecycle(repo.name, tid, "finish")
+            ledger.mark(case, "resolved", "The issue's pull requests merged")
+        return
     reopen = prior.get("phase") in ("resolved", "cancelled")
     if not cfg.replay.all and (reopen or not issue_goal.exists(repo.name, tid)):
-        if not (row.get("pr_url") and all_merged(unblock.prs_of(row))):
-            issue_goal.lifecycle(repo.name, tid, "start")
+        issue_goal.lifecycle(repo.name, tid, "start")
     attempt = ledger.latest_attempt(existing) if existing else {}
     if (row and attempt.get("child") == row["id"]
             and attempt["grant"].get("binding", {}).get("spec") == runlimits.specification(t)):
@@ -196,7 +202,6 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
         return
     asks = unblock.asks_of(row)
     saved = runlimits.metadata(row["id"], "parked.json") if row else {}
-    prs = unblock.prs_of(row)
     cause, limit = blocker(row, saved, asks, prs, cycle)
     if not cause and attempt.get("grant") and not attempt.get("child") and row.get("status") == "needs-info":
         cause = "ask" if not any(a["status"] == "open" for a in asks) else ""
@@ -204,11 +209,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
         if not existing and not row:
             return
         case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
-        if all_merged(prs):
-            issue_goal.lifecycle(repo.name, tid, "finish")
-            ledger.mark(case, "resolved", "The issue's pull requests merged")
-        else:
-            ledger.mark(case, "waiting", "Monitoring until tracker closure or PR merge", unblock.RECHECK)
+        ledger.mark(case, "waiting", "Monitoring until tracker closure or PR merge", unblock.RECHECK)
         return
     binding = unblock.snapshot(cfg, repo, source, t, row, prs=prs)
     if attempt.get("grant", {}).get("binding") == binding and not attempt["child"]:
