@@ -3881,15 +3881,41 @@ class RepairVerificationSelectionTests(RepairWorkflowFixture):
             self.assertEqual(b.in_use_repair_hold(edited), key)
 
 
-class HeldRepairDraftTests(RepairWorkflowFixture):
-    def prepare_held_draft(self):
+class HeldRepairDraftFixture(RepairWorkflowFixture):
+    pr_url = "https://github.com/fixture/repo/pull/1"
+
+    def prepare_draft_publication(self, *, existing_pr=False):
         self.prepare_controller()
+        self.enterContext(patch.object(record, "metered_spent", return_value=0.0))
+        self.enterContext(patch.object(gh, "gh", side_effect=AssertionError("Unexpected GitHub call")))
         ctl = self.controller
         job, flow = ctl.job, ctl.flow
         job.run.repo.parts = [config.Part("", job.run.repo.name)]
         job.branch = "fixture-branch"
+        c, = job.checkouts
+        self.prepare_branch(job, c, self.pr_url if existing_pr else "")
         flow.run = lambda name, _args, kw: factory.STEPS[name](flow, **kw)
         self.write("goal.txt", "reached\n")
+        return job, flow
+
+    def prepare_branch(self, job, c, pr):
+        util.git(["update-ref", f"refs/remotes/{c.origin_base}", "HEAD"], c.wt)
+        util.git(["switch", "-q", "-c", job.branch], c.wt)
+        if pr:
+            (c.wt / "revision.txt").write_text("1 blue\n")
+            util.git(["add", "revision.txt"], c.wt)
+            util.git([*util.ARETE_IDENTITY, "commit", "-qm", f"Earlier update\n\nArete-Run: {job.run.id}"], c.wt)
+            util.git(["update-ref", f"refs/remotes/origin/{job.branch}", "HEAD"], c.wt)
+            c.pr = pr
+            c.note_pushed_head(util.git(["rev-parse", "HEAD"], c.wt).strip())
+
+    def prepare_held_draft(self, *, existing_pr=False):
+        job, flow = self.prepare_draft_publication(existing_pr=existing_pr)
+        self.exhaust_focused_review(job)
+        return job, flow
+
+    def exhaust_focused_review(self, job):
+        ctl = self.controller
         self.layer.targeted_commands["rollback"] = 'test -f rollback-passes.txt'
         self.assertTrue(self.perform("checks.run")["full"])
         ctl.stamp("verify", asdict(job.verified))
@@ -3900,12 +3926,11 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
         self.assertFalse(outcome.passed)
         self.assertTrue(job.review_exhausted)
         ctl.stamp("review", job.review.asdict())
-        return job, flow
 
     def publish_held_draft(self, publish):
         with (patch.object(gh, "open_pr_url", return_value=""),
-              patch.object(gh, "pr_create", return_value="https://github.com/fixture/repo/pull/1") as create,
-              patch.object(pipeline.Build, "push") as push, patch.object(flows, "report", return_value="Fixture report"),
+              patch.object(gh, "pr_create", return_value=self.pr_url) as create,
+              patch.object(pipeline.Build, "push") as push,
               patch.object(pipeline, "evidence_images", return_value={}),
               patch.object(pipeline, "sync_pr_bodies", return_value=[]), patch.object(pipeline, "set_draft") as draft):
             result = publish()
@@ -3915,18 +3940,20 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
         draft.assert_not_called()
         return result
 
+
+class HeldRepairDraftTests(HeldRepairDraftFixture):
     def test_scripted_last_review_can_publish_only_a_held_draft(self):
         job, flow = self.prepare_held_draft()
         job.review_exhausted = False
         with self.assertRaisesRegex(workspace.RunFailed, "needs current focused repair evidence"):
             flows.pr(flow, tree=str(job.ws))
         job.review_exhausted = True
-        with (patch.object(gh, "open_pr_url", return_value="https://github.com/fixture/repo/pull/1"),
-              patch.object(gh, "pr_view", return_value={"state": "OPEN", "headRefName": job.branch}),
-              patch.object(pipeline, "own_draft_state", return_value=None),
-              patch.object(pipeline.Build, "push") as push):
+        with (patch.object(gh, "open_pr_url", return_value=self.pr_url),
+              patch.object(gh, "pr_draft_and_head", return_value=(False, self.git("rev-parse", "HEAD"))),
+              patch.object(gh, "pr_set_draft") as draft, patch.object(pipeline.Build, "push") as push):
             with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
                 flows.pr(flow, tree=str(job.ws))
+            draft.assert_not_called()
             push.assert_not_called()
         job.checkouts[0].pr = ""
         outcome = self.publish_held_draft(lambda: flows.pr(flow, tree=str(job.ws)))
@@ -3950,26 +3977,27 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
         self.assertIn("Focused repair evidence is still required", published["draft_why"])
 
     def test_controller_exhaustion_cannot_convert_or_push_to_a_replacement_head(self):
-        job, _ = self.prepare_held_draft()
+        job, _ = self.prepare_held_draft(existing_pr=True)
         job.review_exhausted = False
         self.run_fixture.budget.repair_calls = self.layer.max_repair_cycles
         c = job.checkouts[0]
-        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
-        with (patch.object(gh, "pr_draft_and_head", return_value=(False, "replacement-head")),
+        replacement = self.git("rev-parse", c.origin_base)
+        with (patch.object(gh, "pr_draft_and_head", return_value=(False, replacement)) as read,
               patch.object(gh, "pr_set_draft") as draft, patch.object(pipeline.Build, "push") as push):
             with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
                 self.perform("publication.request")
+            read.assert_called_once_with(c.pr)
             draft.assert_not_called()
             push.assert_not_called()
 
     def test_scripted_held_update_converts_owned_ready_pr_and_rechecks_before_push(self):
-        job, flow = self.prepare_held_draft()
+        job, flow = self.prepare_held_draft(existing_pr=True)
         c = job.checkouts[0]
-        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
         state = False, c.lease
         events = []
 
-        def read(_):
+        def read(url):
+            self.assertEqual(url, c.pr)
             events.append(state)
             return state
 
@@ -3994,10 +4022,10 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
         self.assertIn("Focused repair evidence is still required", outcome.data["draft_why"])
 
     def test_scripted_held_update_does_not_push_when_draft_conversion_is_unconfirmed(self):
-        job, flow = self.prepare_held_draft()
+        job, flow = self.prepare_held_draft(existing_pr=True)
         c = job.checkouts[0]
-        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
-        for after in ((False, c.lease), (True, "replacement-head")):
+        replacement = self.git("rev-parse", c.origin_base)
+        for after in ((False, c.lease), (True, replacement)):
             with (self.subTest(after_conversion=after),
                   patch.object(gh, "pr_draft_and_head", side_effect=[(False, c.lease), after]),
                   patch.object(gh, "pr_set_draft") as draft, patch.object(pipeline.Build, "push") as push):
@@ -4007,9 +4035,8 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
                 push.assert_not_called()
 
     def test_classic_feedback_with_pending_focused_evidence_does_not_update_a_ready_pr(self):
-        job, _ = self.prepare_held_draft()
+        job, _ = self.prepare_held_draft(existing_pr=True)
         c = job.checkouts[0]
-        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
         job.run.feedback = [{"pr_url": c.pr}]
         self.assertTrue(job.b.focused_hold())
         job.b.restage()
@@ -4019,6 +4046,138 @@ class HeldRepairDraftTests(RepairWorkflowFixture):
                 pipeline.push_classic_candidate(job.b, job.branch, "Fixture update", require_draft=True)
             draft.assert_not_called()
             push.assert_not_called()
+
+
+class HeldSiblingDraftTests(HeldRepairDraftFixture):
+    def check_held_update(self, *, already_committed):
+        job, flow = self.prepare_draft_publication(existing_pr=True)
+        c, = job.checkouts
+        path = self.wt.with_name("sibling")
+        shutil.copytree(self.base, path)
+        sibling = workspace.Checkout("sibling", "fixture/sibling", path, path, "main")
+        self.prepare_branch(job, sibling, "https://github.com/fixture/sibling/pull/1")
+        job.checkouts.append(sibling)
+        job.run.repo.parts.append(config.Part(sibling.dir, sibling.github))
+        job.b.from_base = True
+        if already_committed:
+            self.git("add", "goal.txt")
+            self.git(*util.ARETE_IDENTITY, "commit", "-qm", f"Unpushed update\n\nArete-Run: {job.run.id}")
+        self.exhaust_focused_review(job)
+        ctl = self.controller
+        job.run.budget.repair_calls = self.layer.max_repair_cycles
+        states = {checkout.pr: (False, checkout.lease) for checkout in job.with_prs}
+        events = []
+
+        def read(url):
+            events.append((url, states[url]))
+            return states[url]
+
+        def convert(url, draft):
+            events.append((url, "convert"))
+            states[url] = draft, states[url][1]
+
+        def push(checkouts, changed, _branch, _message, *, check_targets, **kwargs):
+            self.assertEqual(checkouts, [c, sibling])
+            self.assertEqual(changed, [c])
+            check_targets()
+            events.append("push")
+
+        with (patch.object(workspace, "remote_head", side_effect=lambda src, _: c.lease if src == c.src else sibling.lease),
+              patch.object(gh, "pr_draft_and_head", side_effect=read),
+              patch.object(gh, "pr_set_draft", side_effect=convert) as draft,
+              patch.object(pipeline, "commit_and_push", side_effect=push) as pushed,
+              patch.object(pipeline, "sync_pr_bodies", return_value=[]),
+              patch.object(pipeline, "evidence_images", return_value={}),
+              patch.object(ctl, "publication_ci", return_value=None),
+              patch.object(ctl, "finish_publication", side_effect=lambda: ctl.data["publication"])):
+            published = (self.perform("publication.request") if already_committed
+                         else flows.pr(flow, tree=str(job.ws)).data)
+        pushed.assert_called_once()
+        draft.assert_called_once_with(c.pr, True)
+        self.assertEqual(events, [(c.pr, (False, c.lease)), (c.pr, "convert"), (c.pr, (True, c.lease)),
+                                  (c.pr, (True, c.lease)), "push", (c.pr, (True, c.lease))])
+        self.assertIn(sibling.github, published["changed"])
+        self.assertEqual(states[sibling.pr], (False, sibling.lease))
+        self.assertEqual(published["drafted"], [c.github])
+        self.assertEqual(published["pushed"], [c.github])
+        self.assertIn("Focused repair evidence is still required", published["draft_why"])
+
+    def test_scripted_held_update_leaves_an_unchanged_sibling_ready(self):
+        self.check_held_update(already_committed=False)
+
+    def test_orchestrated_held_unpushed_commit_leaves_an_unchanged_sibling_ready(self):
+        self.check_held_update(already_committed=True)
+
+
+class FeedbackInUseDraftTests(HeldRepairDraftFixture):
+    def prepare_feedback_requiring_in_use(self):
+        job, flow = self.prepare_draft_publication(existing_pr=True)
+        c, = job.checkouts
+        job.run.feedback = [{"pr_url": c.pr}]
+        b = job.b
+        acceptance = "Reload settings and read revision 1 with value blue."
+        b.carry_review(pipeline.Review("request_changes", problems=[{
+            "problem": "The settings page shows the wrong revision.", "severity": "blocker",
+            "verification": "in_use", "acceptance": acceptance,
+        }]), "repair")
+        self.assertTrue(self.perform("checks.run")["full"])
+        trees = pipeline.verification_trees(b)
+        job.review = pipeline.Review("approve", trees=trees)
+        job.verified = pipeline.verify.Verified("pass", observed_trees=trees, checks=[{
+            "what": "General smoke check", "how": "Read goal.txt", "saw": "reached", "passed": True,
+        }])
+        self.controller.stamp("review", job.review.asdict())
+        self.controller.stamp("verify", asdict(job.verified))
+        self.assertEqual(b.focused_hold(), "")
+        self.assertEqual(b.in_use_repair_hold(job.verified), "repair:B1")
+        self.enterContext(patch.object(gh, "pr_view", return_value={"state": "OPEN", "headRefName": job.branch}))
+        self.enterContext(patch.object(pipeline, "sync_pr_bodies", return_value=[]))
+        self.enterContext(patch.object(pipeline, "evidence_images", return_value={}))
+        return job, flow, c
+
+    def test_orchestrated_feedback_cannot_push_a_ready_pr_without_required_in_use_evidence(self):
+        _, _, c = self.prepare_feedback_requiring_in_use()
+        ctl = self.controller
+        with (patch.object(gh, "pr_draft_and_head", return_value=(False, c.lease)) as read,
+              patch.object(gh, "pr_set_draft") as draft,
+              patch.object(pipeline.Build, "push") as push,
+              patch.object(ctl, "publication_ci", return_value=None),
+              patch.object(ctl, "finish_publication", side_effect=lambda: ctl.data["publication"])):
+            with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft") as refused:
+                self.perform("publication.request")
+        self.assertIn("Requires independent in use", refused.exception.detail)
+        read.assert_called_once_with(c.pr)
+        draft.assert_not_called()
+        push.assert_not_called()
+
+    def test_scripted_feedback_needs_the_same_draft_at_push_time_when_in_use_evidence_is_missing(self):
+        job, flow, c = self.prepare_feedback_requiring_in_use()
+        replacement = self.git("rev-parse", c.origin_base)
+        job.check_publication_targets = Mock()
+        pushed_head = Mock()
+
+        def push(*_, check_targets, **kwargs):
+            check_targets()
+            pushed_head()
+
+        for after in ((False, c.lease), (True, replacement), (True, c.lease)):
+            with (self.subTest(at_push=after),
+                  patch.object(gh, "pr_draft_and_head", side_effect=[(True, c.lease), after]) as read,
+                  patch.object(gh, "pr_set_draft") as draft,
+                  patch.object(pipeline.Build, "push", side_effect=push)):
+                if after != (True, c.lease):
+                    with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
+                        flows.pr(flow, tree=str(job.ws))
+                    pushed_head.assert_not_called()
+                else:
+                    outcome = flows.pr(flow, tree=str(job.ws))
+                    self.assertTrue(outcome.passed)
+                    self.assertIn("Independent in-use evidence is still required for repair:B1", outcome.data["draft_why"])
+                    pushed_head.assert_called_once()
+                self.assertEqual(read.call_count, 2)
+                self.assertEqual(job.check_publication_targets.call_count, 2)
+                job.check_publication_targets.reset_mock()
+                draft.assert_not_called()
 
 
 class LaterRepairFixture(RepairWorkflowFixture):

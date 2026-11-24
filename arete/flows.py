@@ -1344,8 +1344,8 @@ def refuse_changed_prs(job: Job) -> None:
                                      f"pushed nothing for {reason}")
 
 
-def settle_unpushed_checkouts(job: Job, before_push=None, *, check_targets=None):
-    b, run = job.b, job.run
+def settle_unpushed_checkouts(job: Job):
+    b = job.b
     fresh = b.restage(from_base=False)
     staged = b.restage(from_base=True) if fresh.empty or b.from_base else fresh
     staged, size, outcome = change(job, staged)
@@ -1360,15 +1360,30 @@ def settle_unpushed_checkouts(job: Job, before_push=None, *, check_targets=None)
         else:
             raise workspace.RunFailed(f"nothing was left to push in {c.github}, and its checkout of "
                                      f"{job.branch} does not match origin")
-    if unpushed:
-        publishing(run, job.branch, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, "",
-                                                                     before_push=before_push,
-                                                                     check_targets=check_targets or job.check_publication_targets))
     return fresh, staged, size, outcome, unpushed
+
+
+def held_push_check(job: Job, targets: list[workspace.Checkout]) -> Callable[[], None]:
+    check_targets = job.check_publication_targets
+
+    def check_held_targets(*, convert=False):
+        if check_targets:
+            check_targets()
+        try:
+            for c in targets:
+                pipeline.require_held_pr(job.run, c, convert=convert)
+        except workspace.RunFailed as e:
+            raise workspace.RunFailed(e.why, job.b.repair_feedback()) from e
+
+    check_held_targets(convert=not (job.run.feedback or job.prepared_feedback_prs))
+    return check_held_targets
 
 
 def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, focused_draft="", check_targets=None):
     b, run, t = job.b, job.run, job.ticket
+    if unpushed:
+        publishing(run, job.branch, lambda: pipeline.commit_and_push(
+            job.checkouts, unpushed, job.branch, "", before_push=before_push, check_targets=check_targets))
     if fresh.empty:
         b.committed_lines = max(b.committed_lines, staged.lines)
     committed = not fresh.empty or bool(unpushed)
@@ -1380,7 +1395,7 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, focus
         b.staged = fresh
         publishing(run, job.branch, lambda: b.push(
             job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}",
-            before_push=before_push, check_targets=check_targets or job.check_publication_targets))
+            before_push=before_push, check_targets=check_targets))
         b.staged = staged
     return subject, draft_why, committed
 
@@ -1406,7 +1421,7 @@ def report(job: Job, size: str, images: dict, held: str, *, measurement_section:
 
 
 def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
-                        before_push=None, *, measurement_section: str = "") -> Outcome:
+                        before_push=None, *, updated: list[workspace.Checkout], measurement_section: str = "") -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
     report_body = report(job, size, images, draft_why, measurement_section=measurement_section)
@@ -1430,16 +1445,16 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
                 raise workspace.RunFailed("GitHub created a PR with a different head; inspect it before any merge")
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
-            run.log(f"pushed to {c.pr}" if committed else f"checked {c.pr} again, nothing new to push")
+            run.log(f"pushed to {c.pr}" if c in updated else f"checked {c.pr} again, nothing new to push")
     standing = [c for c in staged.changed if c not in opened]
-    pushed = standing if committed else []
+    pushed = [c for c in standing if c in updated]
     with_prs = job.with_prs
     pipeline.note_prs(run, job.branch, with_prs)
     ci_stopped = [c for c in found if stops[c.github]]
     ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
                                          job.left_for_a_person, link, stops, committed,
                                          measurement_section=measurement_section)
-    drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
+    drafted = pipeline.hold_pushed(run, pushed + [c for c in found if c in updated], ci_stopped, draft_why)
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
 
@@ -1476,20 +1491,6 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
     found = adopt_open_prs(job)
     refuse_changed_prs(job)
     before_push = None
-    check_targets = job.check_publication_targets
-    if focused_draft:
-        if check_targets:
-            check_targets()
-        for c in job.with_prs:
-            pipeline.require_held_pr(run, c, convert=True)
-
-        def check_held_targets():
-            if job.check_publication_targets:
-                job.check_publication_targets()
-            for c in job.with_prs:
-                pipeline.require_held_pr(run, c)
-
-        check_targets = check_held_targets
     if pilot.is_pilot_task(str(run.tid)):
         if (len(job.checkouts) != 1 or run.feedback or run.repairs or found
                 or any(c.resumes or c.lease or c.pr for c in job.checkouts)
@@ -1502,7 +1503,11 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
             except pilot.Held as error:
                 raise workspace.RunFailed(str(error)) from error
 
-    fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job, before_push, check_targets=check_targets)
+    fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
+    updated = unpushed + fresh.changed
+    check_targets = job.check_publication_targets
+    if focused_draft or job.b.in_use_repair_hold(job.verified):
+        check_targets = held_push_check(job, [c for c in updated if c.pr])
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push,
                                                   focused_draft=focused_draft, check_targets=check_targets)
     if not job.run.repo.parts:
@@ -1512,7 +1517,7 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push,
-                               measurement_section=measurement_section)
+                               updated=updated, measurement_section=measurement_section)
 
 
 def with_stop(text: str, stop: str) -> str:

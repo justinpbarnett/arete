@@ -488,10 +488,11 @@ class CatchUpNeedsInput(workspace.RunFailed):
 
 class CatchUpGateHold(workspace.RunFailed):
     def __init__(self, gate: str, why: str, head: str, report: str,
-                 verified: verify.Verified | None = None, review: Review | None = None):
+                 verified: verify.Verified | None = None, review: Review | None = None, *, repair_tree: str = ""):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
+        self.repair_tree = repair_tree
         self.candidate_restored = True
 
 
@@ -528,6 +529,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_owns_checkout: bool = field(default=False, init=False)
+    catch_up_repair_held: bool = field(default=False, init=False)
     catch_up_preserved: set[str] = field(default_factory=set)
     catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
@@ -790,11 +792,12 @@ def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
     try:
-        if run.closed_checkouts or run.catch_up_preserved:
+        if run.closed_checkouts or run.catch_up_preserved or run.catch_up_repair_held:
             workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
                                 excluded=run.closed_checkout_paths)
-            why = ("it contains closed PR worktrees" if run.closed_checkouts
-                   else "it contains files that existed before catch-up")
+            why = ("it contains closed PR worktrees" if run.closed_checkouts else
+                   "it contains an unpublished catch-up repair" if run.catch_up_repair_held else
+                   "it contains files that existed before catch-up")
             run.log(f"workspace kept at {ws}: {why}")
             return False
         release = workspace.remove_workspace(ws, checkouts, by=run.id)
@@ -1347,9 +1350,13 @@ class Build(TicketWork):
                                         and not f["test_class"]))
                 and not self.repair_receipts.get(key, {}).get("command_sha")}
 
-    def resolve_repair_selectors(self, staged: Staged) -> None:
-        missing = self.unresolved_repair_selectors()
-        if not missing or not (trees := verification_trees(self)):
+    def resolve_repair_selectors(self, staged: Staged, pending: list[str], *, baseline: bool) -> None:
+        unresolved = self.unresolved_repair_selectors()
+        if not unresolved or not (trees := verification_trees(self)):
+            return
+        missing = {key: unresolved[key] for key in pending if key in unresolved
+                   and (not baseline or unresolved[key]["reviewed_trees"] == trees)}
+        if not missing:
             return
         names = prompt_loader.code_list(sorted(self.repair_commands())) or "None configured."
         text = prompt_loader.task_prompt(
@@ -1449,8 +1456,8 @@ class Build(TicketWork):
         if not pending:
             return self.focused_hold()
         staged = self.restage()
-        if not baseline and not (staged.denied or staged.earlier_denied or self.denied_feedback):
-            self.resolve_repair_selectors(staged)
+        if not (staged.denied or staged.earlier_denied or self.denied_feedback):
+            self.resolve_repair_selectors(staged, pending, baseline=baseline)
         for key in pending:
             finding = self.repair_findings[key]
             if finding["verification"] != "check":
@@ -1496,7 +1503,8 @@ class Build(TicketWork):
     def focused_repair_limit(self) -> str:
         return self.run.budget.repair_limit_reason() if self.run.budget else ""
 
-    def retry_focused_repairs(self, producer: str, reply: str, *, hold_at_limit: bool = False) -> tuple[bool, str]:
+    def retry_focused_repairs(self, producer: str, reply: str, *, hold_at_limit: bool = False,
+                              after_worker: Callable[[], None] | None = None) -> tuple[bool, str]:
         if not self.check_repair_findings(producer=producer):
             return True, reply
         tries = self.run.settings("check_repair").tries
@@ -1505,6 +1513,8 @@ class Build(TicketWork):
                 return False, reason
             step, result = self.repair_focused()
             reply = result.text
+            if after_worker:
+                after_worker()
             if not result.ok:
                 break
             if not self.check_repair_findings(producer=step):
@@ -1698,15 +1708,18 @@ class Build(TicketWork):
         step_name = step_name or (lambda n: self.next_step("check_repair"))
         attempts, tries = 1, self.run.settings("check_repair").tries
         while True:
-            ok = self.check(after=after)
-            if ok and focused and (pending := self.check_repair_findings(producer=focused, fresh=True)):
-                if attempts < tries and not self.focused_repair_limit():
-                    focused, result = self.repair_focused()
-                    attempts += 1
-                    if result.ok:
-                        continue
-                raise CiFixFocusedHold(f"focused review regressions did not pass after {after}: {pending}",
-                                       self.repair_feedback())
+            staged = self.restage() if focused and self.repair_findings else None
+            if staged is not None and not (staged.denied or self.denied_feedback):
+                if pending := self.check_repair_findings(producer=focused, fresh=True):
+                    if attempts < tries and not self.focused_repair_limit():
+                        focused, result = self.repair_focused()
+                        attempts += 1
+                        if result.ok:
+                            continue
+                    raise CiFixFocusedHold(f"focused review regressions did not pass after {after}: {pending}",
+                                           self.repair_feedback())
+                staged = self.staged
+            ok = self.check(after=after, staged=staged)
             if ok or attempts >= tries:
                 return ok, attempts
             self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
@@ -2396,6 +2409,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         def keep_edits_blocker() -> str:
             if run.catch_up_preserved:
                 return "catch-up left files in place"
+            if run.catch_up_repair_held and run.catch_up_owns_checkout:
+                return "the held catch-up repair did not finish cleanup"
             if retaining_catch_up:
                 return "the catch-up checkout is retained for reconciliation"
             if run.environment_release and not ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
@@ -3393,12 +3408,15 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         check_files = catch_up_paths(c.wt)
-        if not b.check(staged=b.staged, defer_failed_cleanup=True):
-            raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
+        if repair_focused and b.repair_findings:
+            head = repair_caught_up_head(b, c, head)
+        else:
+            if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
+                raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback())
+            if not b.check(staged=b.staged, defer_failed_cleanup=True):
+                raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
-        if repair_focused:
-            head = repair_caught_up_head(b, c, head)
         verified = check_in_use(b, goal, b.build_summary)
         if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
             raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback(), verified)
@@ -3425,6 +3443,9 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         log_catch_up_failure(run, "failed", error)
         gate_hold = error if isinstance(error, CatchUpGateHold) else None
+        repair_tree = gate_hold.repair_tree if gate_hold else ""
+        if gate_hold and (repair_tree or gate_hold.head != c.merge):
+            run.catch_up_repair_held = True
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
             run.catch_up_preserved.add(c.prefix + error.name)
@@ -3444,6 +3465,12 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                                               workspace.untracked_files(c.wt))
         except Exception as failed:
             log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
+        if tracked_restored and repair_tree:
+            try:
+                git(["restore", f"--source={repair_tree}", "--staged", "--worktree", "--", "."], c.wt)
+            except Exception as failed:
+                tracked_restored = False
+                log_catch_up_failure(run, "cleanup could not restore the repair edits", failed)
         if gate_hold:
             gate_hold.candidate_restored = tracked_restored and paths_restored
         else:
@@ -3462,19 +3489,39 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     return verified, review
 
 
+def catch_up_repair_tree(b: Build, c: workspace.Checkout, base_tree: str) -> str:
+    staged = b.restage(from_base=True)
+    tree = git(["write-tree"], c.wt).strip()
+    denied = {name.removeprefix(c.prefix) for name in staged.denied + staged.earlier_denied}
+    denied.update(staged.fatal_restores.get(c.github, []))
+    if denied:
+        allowed = sorted(name for name in changed_tree_paths(c.wt, base_tree, tree) if not any(
+            name == path or name.startswith(path + "/") or path.startswith(name + "/") for path in denied))
+        tree = factory.tree_with_paths(c.wt, base_tree, tree, allowed, remove_missing=set(allowed))
+    return tree if tree != base_tree else ""
+
+
 def repair_caught_up_head(b: Build, c: workspace.Checkout, head: str) -> str:
-    if not b.repair_findings:
-        return head
-    passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True)
+    base_tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+    repair_tree = ""
+
+    def checkpoint():
+        nonlocal repair_tree
+        repair_tree = catch_up_repair_tree(b, c, base_tree)
+
+    passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True, after_worker=checkpoint)
     if not passed:
         raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
-                                 "\n\n".join(filter(None, (b.repair_feedback(), reply))))
+                                 "\n\n".join(filter(None, (b.repair_feedback(), reply))), repair_tree=repair_tree)
     trees = verification_trees(b)
-    if trees == {c.prefix: git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()}:
-        return head
-    b.require_valid_diff("repairing the moved base", from_base=True)
+    repaired = trees != {c.prefix: base_tree}
+    if repaired:
+        b.require_valid_diff("repairing the moved base", from_base=True)
     if not b.check(staged=b.staged, defer_failed_cleanup=True) or not b.full_checks_current(trees):
-        raise CatchUpGateHold("checks", "the layer's local checks failed after the focused repair", head, b.report)
+        why = "the layer's local checks failed" + (" after the focused repair" if repaired else "")
+        raise CatchUpGateHold("checks", why, head, b.report, repair_tree=repair_tree)
+    if not repaired:
+        return head
     if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
         raise workspace.RunFailed("the catch-up repair changed after the checks")
     util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
@@ -4095,7 +4142,7 @@ def verify_ci_fix(b: Build, goal: str, trees: dict[str, str]) -> verify.Verified
         return (verify.not_configured(b.layer.dir, b.ws) if not b.layer.verify else
                 verify.Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`."))
     verified = check_in_use(b, goal, b.build_summary)
-    if not b.repair_findings and verified.verdict == "blocked" and not verification_refused(verified):
+    if not needed and verified.verdict == "blocked" and not verification_refused(verified):
         return verified
     if (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks
             or verified.observed_trees != trees or b.in_use_repair_hold(verified)):
