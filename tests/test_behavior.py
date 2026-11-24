@@ -430,6 +430,62 @@ with mock.patch.object(paths, 'read_confined', side_effect=read_fixture):
     assert secretstore.read_item(ref, settings) == value
 """)
 
+    def test_store_location_rejects_protected_directory_identity_aliases(self):
+        self.run_secret_child(r"""
+from contextlib import nullcontext
+
+root = Path.cwd()
+alias = Path('/System/Volumes/Data') / root.relative_to('/')
+try:
+    native_alias = paths.ON_MAC and alias.samefile(root) and alias.resolve() != root
+except OSError:
+    native_alias = False
+
+alias_fixture = nullcontext()
+if not native_alias:
+    alias = root / 'fixture-alias'
+    original_stat = Path.stat
+
+    def alias_stat(path, **kwargs):
+        if path.is_relative_to(alias):
+            path = root / path.relative_to(alias)
+        return original_stat(path, **kwargs)
+
+    alias_fixture = mock.patch.object(Path, 'stat', alias_stat)
+
+(paths.STATE_DIR / 'existing-store').mkdir()
+logs = root / 'future-logs' / 'nested'
+ref = secretstore.Reference('pve_store', '1234abcd', 'global/DEMO_KEY')
+value = b'synthetic location fixture\x00\xff'
+
+# Exercise the owner file-store policy; config, state and subprocesses remain isolated fixtures.
+with (alias_fixture, mock.patch.multiple(paths, ISOLATED=False, LOG_DIR=logs),
+      mock.patch.object(secretstore.subprocess, 'run', side_effect=AssertionError('unexpected subprocess'))):
+    deny_io = mock.Mock(side_effect=AssertionError('unexpected file-store item I/O'))
+    with mock.patch.multiple(secretstore, read_file=deny_io, write_file=deny_io, remove_file=deny_io):
+        for directory in (alias / 'state/existing-store', alias / 'state/new/store', alias / 'future-logs'):
+            settings = config.SecretsConfig('pve_store', directory)
+            paths.CONFIG_FILE.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
+            for check, args in ((config.load, ()), (config.secret_settings, ()),
+                                (secretstore.read_item, (ref, settings)),
+                                (secretstore.write_item, (ref, settings, value)),
+                                (secretstore.remove_item, (ref, settings))):
+                with (case.subTest(directory=directory, check=check),
+                      case.assertRaisesRegex(ValueError, 'must be separate')):
+                    check(*args)
+
+    directory = root / 'future-logs' / 'external-store'
+    paths.CONFIG_FILE.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
+    config.load()
+    settings = config.secret_settings()
+    assert settings.store_dir == directory
+    secretstore.write_item(ref, settings, value)
+    assert secretstore.read_item(ref, settings) == value
+    secretstore.remove_item(ref, settings)
+    assert secretstore.read_item(ref, settings) is None
+""")
+
+
 class SecretBackendPrimitivesTests(_SecretChildCase):
     adapter_only = True
 
