@@ -113,13 +113,12 @@ class Controller(worker_turns.WorkerTurns):
         if max_builders is not None:
             configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
         tid = str(getattr(self.run, "tid", ""))
-        private = (configured.max_builders and self.run.path == "orchestrate"
-                   and not pilot.is_pilot_task(tid) and not zte.reserved(tid))
+        self.default_code_review = self.run.path == "orchestrate" and not (pilot.is_pilot_task(tid) or zte.reserved(tid))
+        private = configured.max_builders and self.default_code_review
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
                                     {"protocol": protocol, "mode": self.run.path, "evidence": {},
-                                     "review_method": code_review.METHOD if self.run.path == "orchestrate"
-                                     and not (pilot.is_pilot_task(tid) or zte.reserved(tid)) else "legacy"})
+                                     "review_method": code_review.METHOD if self.default_code_review else "legacy"})
         self.data = ledger.snapshot(self.lease)["data"]
         self.run.code_review = self.uses_code_review
         self.protocol = self.data.get("protocol")
@@ -642,8 +641,17 @@ class Controller(worker_turns.WorkerTurns):
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         catch_up = self.data.get("catch_up_hold", {})
+        actions = ledger.actions(self.lease)
         stale = set(self.data.get("stale_actions", ()))
-        for action in ledger.actions(self.lease):
+        if self.default_code_review and not self.run.environment_release and not self.uses_code_review:
+            stale.update(a["id"] for a in actions if ACTION_GATES.get(a["op"]) == "review" and a["state"] != "accepted")
+            self.data["stale_actions"] = sorted(stale)
+            self.data.setdefault("evidence", {}).pop("review", None)
+            self.job.review, self.job.reviews = pipeline.Review(), 0
+            self.data["review_method"] = code_review.METHOD
+            self.run.code_review = True
+            self.run.log("Adopted Standards and Spec code review for this continuation.")
+        for action in actions:
             result = action["result"]
             gate = ACTION_GATES.get(action["op"])
             old_gate = bool(gate) and action["id"] in stale

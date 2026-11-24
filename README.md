@@ -1319,9 +1319,9 @@ Disable new supervised admissions by removing the repository from `repos` or set
 
 ### Pipeline auto-merge
 
-New orchestrated tickets require passing full local checks and a settled Standards and Spec review on the delivery candidate.
+New and resumed orchestrated tickets require passing full local checks and a settled Standards and Spec review on the delivery candidate.
 The orchestrator can fix a finding or explain why it can ship. Ticket-specific journey checks and configured probes still require behavioral verification.
-Earlier ticket lineages, fixed workflows and the bounded README delivery lanes retain their original evidence requirements.
+Fixed workflows and the bounded README delivery lanes use their own evidence requirements.
 See [the review and finding decisions](docs/orchestration.md#code-review).
 GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
 JEV must complete its risk screen on the diff.
