@@ -1313,9 +1313,13 @@ Disable new supervised admissions by removing the repository from `repos` or set
 
 Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
 GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
-JEV must complete its risk screen on the diff and not hold it.
+JEV must complete its risk screen on the diff.
+For approved issues enrolled in durable orchestration on an `automerge` repo, the issue orchestrator decides whether to merge, request revisions or wait.
+It receives the risk assessment, verified behavior, review and diff for the exact head and base. Its decision and reason are recorded with the issue.
+The host rechecks authorization, GitHub readiness and CI before performing an approved squash merge.
+On other delivery paths a JEV risk hold leaves the merge with a person.
 Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
-It never arms a later merge and leaves changes spanning repositories for a person.
+The durable monitor can pick up a verified PR when its checks turn green. Changes spanning repositories require separate merge coordination.
 Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
 #### One-shot delivery pilot with owner merge
@@ -2325,7 +2329,7 @@ auto_per_refresh = 50
 
 `auto` defaults to false and allows ready owner-authored GitHub issues and assigned Jira tickets into their configured pipeline repos.
 It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receives its repository route label.
-`agent:auto` preserves the requirement for a person to merge even if label publication succeeds before the local approval record is saved.
+`agent:auto` records automatic admission even if label publication succeeds before the local approval record is saved.
 JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
 `no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
 Issues labelled `loop` stay with their dedicated loop-intake workflow.
@@ -2336,7 +2340,7 @@ Research and person work stay on their existing routes rather than acquiring `ag
 The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
 Existing `[jira] auto = true` remains supported and retains its own `auto_per_refresh` limit and sprint scope, including when the new general switch is on.
 Automatic admission never increases concurrency, bypasses dependencies or changes run budgets.
-A PR from automatic triage never automerges, whatever the repo's trust level.
+For enrolled issues in an `automerge` repo, the durable issue orchestrator reviews the assumptions and checks from triage before deciding whether to merge. On other paths, a person merges PRs from automatic triage.
 Sent tickets remain on the board for seven days with their pipeline status and PR.
 
 `route_fixes` defaults to false and independently enables classification of already-approved issues before scheduling or direct execution.

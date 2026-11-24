@@ -18,6 +18,7 @@ from . import (
     flows,
     gh,
     journeys,
+    merge_review,
     outbound,
     owner_asks,
     pilot,
@@ -37,6 +38,7 @@ from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, 
 from .store import asks as ask_store
 from .store import insights as insights_store
 from .store import orchestration as ledger
+from .store import triage as triage_store
 from .verify import Verified
 
 CI_FAILURES = "ci:failures"
@@ -194,6 +196,13 @@ class Controller:
         if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
+            if self.run.recovery.get("merge_verification"):
+                ticket = self.run.tracker.get(self.run.tid)
+                prepared["ticket"] = asdict(ticket)
+                prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
+                self.data["goal_base"] = f"Check the issue and owner's answers in use:\n{ticket.title}\n{ticket.body}"
+                if feedback := self.data.get("feedback"):
+                    self.data["goal_base"] += f"\n\nCheck the owner's PR feedback:\n{pipeline.feedback_markdown(feedback)}"
             layer_dir, source_file = Path(prepared["layer"]), None
             if not layer_dir.exists():
                 for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
@@ -316,10 +325,10 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.run.environment_release:
+        if self.run.environment_release or self.run.recovery.get("merge_verification"):
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
-        elif restore_prs:
+        if restore_prs:
             try:
                 self.merge_restored_bases()
             except delegation.PolicyChanged as error:
@@ -919,7 +928,8 @@ class Controller:
                 util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
                 for c in checkouts
             ):
-                if (self.run.environment_release and not self.data.get("ci_failed")
+                merge_verification = self.run.recovery.get("merge_verification")
+                if ((self.run.environment_release or merge_verification) and not self.data.get("ci_failed")
                         and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
                     whole = staged if b.from_base else b.restage(from_base=True)
                     return b.validate_diff(whole, after, from_base=True)
@@ -1207,7 +1217,7 @@ class Controller:
                             return failure
                         self.run.retry_gate_evidence()
                         continue
-                elif hold and self.data.get("catch_up_hold"):
+                elif hold and hold != merge_review.PENDING and self.data.get("catch_up_hold"):
                     return {"park": True, "error": hold}
                 pipeline.report_automerge(self.run, checkout, hold)
                 self.clear_catch_up_hold()

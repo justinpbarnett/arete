@@ -3,7 +3,7 @@ as you need, and change nothing.
 
 A ready code ticket goes to a build pipeline that plans the change, builds it in one repository, tests it and opens a
 pull request. It cannot ask anyone a question on the way. It can make the small choices a careful engineer would
-make, and it lists them in the pull request, where the owner checks them before anything merges. A research ticket
+make, and it lists them in the pull request for the merge decision. A research ticket
 goes to a research agent that writes a report for the owner.
 
 ## Repositories

@@ -592,9 +592,9 @@ class BaseTipChanged(str):
 
 def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True,
                      watch_checks: bool = False) -> dict:
-    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title,reviewDecision"
     if watch_checks:
-        fields += ",reviewDecision,statusCheckRollup"
+        fields += ",statusCheckRollup"
     args = ["pr", "view", pr, "--json", fields]
     if repo:
         args += ["--repo", repo]
@@ -665,6 +665,8 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
         row = pr_merge_details(str(number), repo)
         if hold := merge_ref_hold(row, head, base):
             return "", hold
+        if row.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            return "", f"GitHub review is {row['reviewDecision']}"
         state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
         if track_moved_base and state in MOVED_BASE_STATES:
             return "", MovedBaseHold(f"GitHub reports merge state {state}, mergeable {mergeable}")
@@ -691,8 +693,10 @@ def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha:
     return ""
 
 
-def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False) -> str:
-    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base)
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False,
+                  required: dict | None = None) -> str:
+    options = {"required": required} if required else {}
+    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base, **options)
     if hold:
         return hold
     payload = {"sha": head, "merge_method": "squash"}

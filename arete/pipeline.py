@@ -2065,7 +2065,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 **(script.run_fields if script else {}))
             if run.recovery:
                 run_lines.write(run.id, "recovery", grant=recovery["id"], source=recovery_case["source"],
-                                allowance=run.recovery["allowance"], action=recovery["decision"]["action"],
+                                allowance=run.recovery.get("allowance", {}), action=recovery["decision"]["action"],
                                 direction=run.recovery.get("direction", ""))
             if not script and run.answering and not dry_run:
                 run.answers_due = asks_store.asks_due([run.answering["id"]])
@@ -2963,10 +2963,13 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
 
 
 def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
+    from . import merge_review
+
     run = b.run
     if draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
         return False
-    if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
+    triaged = (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels
+    if triaged and not merge_review.enrolled(run):
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         run.log(f"automerge left off: {run.facts['merge_held']}")
         return False
@@ -2988,10 +2991,15 @@ def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, re
 
 
 def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
+    from . import merge_review
+
     if not hold:
         run.log(f"automerged {c.pr} at {c.lease}")
         return
     run.facts["merge_held"] = hold
+    if hold == merge_review.PENDING or (merge_review.enrolled(run) and hold != merge_review.MULTIPLE):
+        run.log(f"{c.pr}: {hold}")
+        return
     run.log(f"automerge left {c.pr} for a person: {hold}")
     try:
         gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
@@ -3206,8 +3214,10 @@ def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Ver
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                track_moved_base: bool = False) -> str:
+    from . import merge_review
+
     if len(b.checkouts) != 1:
-        return "a change spanning repositories cannot be merged atomically"
+        return merge_review.MULTIPLE
     head = c.lease
     if hold := merge_evidence_hold(b, c, verified, review, head):
         return hold
@@ -3217,6 +3227,10 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     if not has_merge_base(c, head, base_sha):
         hold = "the checked head does not contain the target base"
         return gh.MovedBaseHold(hold) if track_moved_base else hold
+    if merge_review.enrolled(b.run):
+        if b.cfg.replay.all or paths.ISOLATED:
+            return "Live issue merge decisions require a live delivery"
+        return merge_review.nominate(b, c, verified, review, base_sha, about)
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base)
