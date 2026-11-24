@@ -105,6 +105,14 @@ def open_for(name: str) -> dict | None:
         return _decode(c.execute("SELECT * FROM workspaces WHERE name = ? AND state != 'removed'", (name,)).fetchone())
 
 
+def retained_rows(c) -> list[dict]:
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'workspaces' AND type = 'table'").fetchone():
+        return []
+    return [{**r, "held_by": json.loads(r["held_by"])} for r in c.execute(
+        "SELECT name, owner_run, state, kept_reason, made_at, bytes, last_sweep_error, held_by "
+        "FROM workspaces WHERE state IN ('kept', 'held') ORDER BY released_at, id")]
+
+
 def by_state(*states: str) -> list[dict]:
     migrate_on_demand()
     with reader() as c:
@@ -816,24 +824,3 @@ def sweep(cfg: config.Config) -> None:
                 _sweep_unowned(cfg, folder, cutoff)
     finally:
         workspace.prune_repos(cfg)
-
-
-def held_entry(row: dict) -> dict:
-    run_id = row["owner_run"]
-    run = runs.run_get(run_id) if run_id else None
-    run = run or {}
-    status = run.get("status") or row["kept_reason"]
-    why = row["last_sweep_error"]
-    blocked = row["state"] == "held" or bool(why)
-    if not why:
-        if blocked:
-            why = "workspace removal blocked"
-            if row["held_by"]:
-                why += f" ({', '.join(row['held_by'][:5])})"
-        elif row["onto"] or row["kept_reason"] == LEGACY_RESUME:
-            why = "the workspace holds edits and waits for a resume"
-        else:
-            why = f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket"
-    return dict(name=row["name"], path=str(paths.WORKTREES_DIR / row["name"]), repo=row["repo"], ticket=row["ticket"],
-                run=run_id, status=status, since=run.get("finished") or run.get("started") or row["made_at"],
-                bytes=row["bytes"], blocked=blocked, why=why, names=row["held_by"][:10])
