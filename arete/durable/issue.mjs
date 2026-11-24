@@ -33,6 +33,8 @@ const monitor = defineTask({
     }), ctx),
 });
 
+let inferred = false;
+
 async function modelAccess() {
     if (operation !== "turn") return createModels();
     const view = process.env.PI_CODING_AGENT_DIR;
@@ -42,16 +44,15 @@ async function modelAccess() {
     });
     observeRefresh(models.credentials.store);
     const stream = models.streamSimple.bind(models);
-    let admitted = true;
     models.streamSimple = (model, request, options) => {
         const latest = request.messages.findLast(message => message.role === "user");
         const text = typeof latest?.content === "string" ? latest.content :
             latest?.content?.filter(part => part.type === "text").map(part => part.text).join("");
-        if (!admitted || model.provider !== provider || model.id !== modelId || text !== prompt
+        if (inferred || model.provider !== provider || model.id !== modelId || text !== prompt
             || request.tools?.length || request.messages.some(message => message.tools?.length)) {
             throw new Error("Durable inference differs from the admitted issue turn");
         }
-        admitted = false;
+        inferred = true;
         // Each observation already carries the current task, ledger and evidence. Keep recent dialogue in context.
         const conversation = request.messages.filter(message => ["user", "assistant"].includes(message.role));
         const system = request.messages.filter(message => message.role === "system").at(-1);
@@ -106,10 +107,10 @@ try {
         const settled = await submission.wait(context);
         if (settled.status !== "done") throw new Error("Issue decision " + (settled.reason ?? settled.status));
         const entry = await root.commit(tx => tx.entry(AssistantEntry, settled.answer), context);
-        const message = entry.model[0];
+        const message = inferred ? entry.model[0] : { ...entry.model[0], usage: {} };
         console.log(JSON.stringify({ type: "session", id: basename(directory) }));
         console.log(JSON.stringify({ type: "message_end", message }));
-        console.log(JSON.stringify({ type: "agent_end", messages: [message] }));
+        console.log(JSON.stringify({ type: "agent_end", messages: [message], durableReplay: !inferred }));
     }
 } finally {
     await harness.close(context);

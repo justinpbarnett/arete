@@ -40,6 +40,8 @@ def executable(name):
 
 
 def runtime():
+    if paths.ISOLATED:
+        raise ValueError("Native issue goals require a trusted serve state directory")
     digest = hashlib.sha256()
     for name in BUNDLE:
         digest.update((SOURCE / name).read_bytes())
@@ -65,6 +67,8 @@ def runtime():
 
 
 def lifecycle(repo, ticket, state):
+    if paths.ISOLATED:
+        return
     key = identity(repo, ticket)
     folder = directory(key)
     if state != "start" and not (folder / "issue.sqlite").exists():

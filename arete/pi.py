@@ -984,7 +984,7 @@ def cut_short(proc: subprocess.CompletedProcess, resume: Session, model: str, re
                if e.get("type") == "message_end" and (e.get("message") or {}).get("role") == "assistant"]
     totals = usage_totals([m.get("usage") or {} for m in replies])
     return Result(ok=False, session=session_after(stream, resume, totals["cost_usd"]), error=reason,
-                  turns=len(replies), runner="pi", model=model, first_context_tokens=first_context_tokens(proc.stdout),
+                  turns=0 if end.get("durableReplay") is True else len(replies), runner="pi", model=model, first_context_tokens=first_context_tokens(proc.stdout),
                   **totals)
 
 
@@ -1094,7 +1094,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         text=text,
         session=session_after(stream, resume, totals["cost_usd"]),
         structured=json_from_text(text) if json_schema is not None and not failed else None,
-        turns=len(replies),
+        turns=0 if end.get("durableReplay") is True else len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
         usage_limit=limit,

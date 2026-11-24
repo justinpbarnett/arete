@@ -145,6 +145,10 @@ def correct_dependency(repo, source, t, case, attempt, binding, decision):
         ledger.mark(case, "waiting", "Corrected the owner-confirmed declaration; waiting for normal admission")
 
 
+def all_merged(prs):
+    return bool(prs) and all(pr["state"] == "MERGED" for pr in prs.values())
+
+
 def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if not unblock.active(cfg, repo.name, tid) or unblock.exclude(repo.name, tid):
         if existing:
@@ -168,8 +172,11 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "The ticket is no longer approved")
         return
-    if not cfg.replay.all and not issue_goal.exists(repo.name, tid):
-        issue_goal.lifecycle(repo.name, tid, "start")
+    prior = existing or ledger.get(repo.name, tid)
+    reopen = prior.get("phase") in ("resolved", "cancelled")
+    if not cfg.replay.all and (reopen or not issue_goal.exists(repo.name, tid)):
+        if not (row.get("pr_url") and all_merged(unblock.prs_of(row))):
+            issue_goal.lifecycle(repo.name, tid, "start")
     attempt = ledger.latest_attempt(existing) if existing else {}
     if (row and attempt.get("child") == row["id"]
             and attempt["grant"].get("binding", {}).get("spec") == runlimits.specification(t)):
@@ -197,7 +204,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
         if not existing and not row:
             return
         case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
-        if prs and all(pr["state"] == "MERGED" for pr in prs.values()):
+        if all_merged(prs):
             issue_goal.lifecycle(repo.name, tid, "finish")
             ledger.mark(case, "resolved", "The issue's pull requests merged")
         else:
