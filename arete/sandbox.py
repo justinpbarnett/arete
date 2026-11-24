@@ -255,13 +255,13 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
-def linux_git_metadata(source: Path) -> tuple[Path, bool] | None:
+def linux_git_metadata(source: Path) -> Path | None:
     source = Path(os.path.abspath(source))
     marker = source / ".git"
     if source.resolve() != source or marker.is_symlink():
         return None
     if marker.is_dir():
-        return marker, False
+        return marker
     try:
         probe = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--is-bare-repository"],
@@ -277,26 +277,31 @@ def linux_git_metadata(source: Path) -> tuple[Path, bool] | None:
     if not common.is_absolute() or common.resolve() != common:
         return None
     if not marker.exists() and git_dir == common == source and fields[2] == "true":
-        return common, False
+        return common
     if marker.is_file() and git_dir.parent == common / "worktrees" and git_dir.resolve() == git_dir:
-        return common, True
+        from . import workspace
+
+        backlink = git_dir / "gitdir"
+        if (backlink.is_file() and not backlink.is_symlink() and backlink.stat().st_size <= 4096
+                and workspace.registered_root_checkout(source)):
+            return common
     return None
 
 
-def linux_authorized_common_dirs(linked: set[Path], sources: set[Path]) -> set[Path]:
+def linux_repository_roots(checkouts: tuple[Path, ...]) -> set[Path]:
+    repositories = set()
+    for checkout in checkouts:
+        for parent in (checkout, *checkout.parents):
+            if parent == LINUX_SHM or parent == parent.parent:
+                break
+            if (parent / ".git").exists():
+                repositories.add(parent)
+                break
+    return repositories
+
+
+def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path]) -> set[Path]:
     from . import config
-
-    configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
-                  for part in ([p.dir for p in repo.parts] or [""])}
-    anchors = sources | configured
-    return {common for common in linked if (
-        (common in anchors and linux_git_metadata(common) == (common, False))
-        or (common.name == ".git" and common.parent in anchors
-            and linux_git_metadata(common.parent) == (common, False))
-    )}
-
-
-def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> set[Path]:
     from .store import db, workspaces
 
     base = paths.WORKTREES_DIR.resolve()
@@ -304,26 +309,22 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> set[Path]:
     for root in checkouts:
         if base in root.parents:
             requested.setdefault(root.relative_to(base).parts[0], []).append(root)
-    sources, selected = set(), set()
+    selected = set()
     if requested:
         with suppress(db.NoDatabase), db.reader() as conn:
-            if not db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
-                return set()
-            for name, roots in requested.items():
-                if not (row := workspaces.open_for(name)):
-                    continue
-                for checkout in workspaces.owner_of(row).checkouts:
-                    source = Path(os.path.abspath(checkout.src))
-                    sources.add(source)
-                    if any(checkout.wt.resolve().is_relative_to(root) for root in roots):
-                        selected.add(source)
-    metadata, linked = set(), set()
-    for source in selected:
-        if result := linux_git_metadata(source):
-            common, needs_anchor = result
-            (linked if needs_anchor else metadata).add(common)
+            if db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
+                for name, roots in requested.items():
+                    if row := workspaces.open_for(name):
+                        for checkout in workspaces.owner_of(row).checkouts:
+                            worktree = checkout.wt.resolve()
+                            if any(worktree.is_relative_to(root) or root.is_relative_to(worktree) for root in roots):
+                                selected.add(checkout.src)
+    metadata = {common for source in selected if (common := linux_git_metadata(source))}
+    linked = {common for root in repositories if (root / ".git").is_file() and (common := linux_git_metadata(root))}
     if linked - metadata:
-        metadata |= linux_authorized_common_dirs(linked - metadata, sources)
+        # A session worktree can belong to a configured repository without a pipeline workspace row.
+        sources = (repo.path / part for repo in config.load().repos for part in ["", *(p.dir for p in repo.parts)])
+        metadata.update(linked.intersection(common for source in sources if (common := linux_git_metadata(source))))
     return metadata
 
 
@@ -336,7 +337,8 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
     worktrees = paths.WORKTREES_DIR.resolve()
     run_dirs = guard.run_folders(run_id)
     protected = (state, config_root, store) if store else (state, config_root)
-    writable = set(checkouts) | set(linux_checkout_metadata(checkouts))
+    repositories = linux_repository_roots(checkouts)
+    writable = set(checkouts) | linux_checkout_metadata(checkouts, repositories)
     writable.update(p.resolve() for p in run_dirs)
     if profile is not None:
         writable.add(profile)
@@ -357,6 +359,9 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
         with paths.directory_fd(path.absolute(), create=True):
             pass
     mounts = ["--ro-bind", str(state), str(state)] if state.is_dir() else []
+    for repo in sorted(repositories - writable):
+        if LINUX_SHM in repo.parents and not any(repo.is_relative_to(p) or p.is_relative_to(repo) for p in protected):
+            mounts += ["--ro-bind", str(repo), str(repo)]
     if temporary is not None and LINUX_SHM in temporary.parents:
         address = str(temporary.parent / "hook")
         mounts += ["--ro-bind", address, address]

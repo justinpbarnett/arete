@@ -191,7 +191,7 @@ with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream)
     assert [e['session'] for e in tool_events.read_events()] == [first.session.id] * 2
 """)
 
-    def test_bare_and_linked_sources_restore_only_independently_authorized_metadata(self):
+    def test_bare_and_registered_linked_sources_restore_their_git_metadata(self):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 import json
 
@@ -226,7 +226,7 @@ def check_mounts(stream, *metadata):
 
 with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream):
     assert run_claude(bare_checkout, **options).ok
-    check_mounts(stream, bare)
+    check_mounts(stream, bare, main / '.git')
 
     with paths.CONFIG_FILE.open('a') as file:
         file.write(f'\n[[repo]]\nname = "fixture-main"\npath = {json.dumps(str(main))}\n')
