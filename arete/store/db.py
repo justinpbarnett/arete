@@ -4,6 +4,7 @@ import fcntl
 import os
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -227,12 +228,15 @@ def workspace_handoff_blockers(conn, source, *, explicit=False):
         lock_pid = int((paths.LOCKS_DIR / "serve.lock").read_text())
         if lock_pid != status.get("pid"):
             blockers.append(f"serve {lock_pid} has not reported its schema")
-    receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
-    if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
-        contract = next(m for m in _CHAIN if m.n == WORKSPACE_CONTRACT_SCHEMA)
-        if reason := serve_guard.unsupported_contract(paths.PACKAGE_DIR.parent, receipt.previous,
-                                                      [(contract.name, contract.sha256)]):
-            blockers.append(f"deploy a compatible workspace rollback release first: {reason}")
+    try:
+        receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
+        if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
+            contract = next(m for m in _CHAIN if m.n == WORKSPACE_CONTRACT_SCHEMA)
+            if reason := serve_guard.unsupported_contract(paths.PACKAGE_DIR.parent, receipt.previous,
+                                                          [(contract.name, contract.sha256)]):
+                blockers.append(f"deploy a compatible workspace rollback release first: {reason}")
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        blockers.append(f"cannot verify the pending workspace deployment: {error}")
     if problem := workspace_source_blocker(conn, source, explicit=explicit):
         blockers.append(problem)
     return blockers

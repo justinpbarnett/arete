@@ -1238,6 +1238,7 @@ with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read(
         dashboard.assert_not_called()
         restart.assert_not_called()
     assert not serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT)["healthy"]
+    (paths.STATE_DIR / serve_guard.RECEIPT).unlink()
     assert schema_version() == 27
     with case.assertRaises(db.IncompatibleSchema):
         workspaces.sweep(cfg)
