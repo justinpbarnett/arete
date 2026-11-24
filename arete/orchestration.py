@@ -83,6 +83,7 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     effective = config.policy_dict(layer)
     effective.pop("factory_path")
     effective["orchestration"].pop("max_builders", None)
+    effective["orchestration"].pop("private_worker_model", None)
     if layer.required_check is None:
         effective.pop("required_check")
     if layer.verify:
@@ -148,6 +149,8 @@ class Controller(worker_turns.WorkerTurns):
         limits = asdict(self.policy)
         if not self.exchanged:
             limits.pop("max_builders", None)
+        if not self.exchanged or not self.policy.private_worker_model:
+            limits.pop("private_worker_model", None)
         return limits
 
     def persist(self):
@@ -530,7 +533,7 @@ class Controller(worker_turns.WorkerTurns):
         tid = str(getattr(self.run, "tid", ""))
         pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
         restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
-        self.catalog = Catalog(self.job, self.protocol) if self.exchanged else Catalog(self.job)
+        self.catalog = Catalog(self.job, self.protocol, self.policy.private_worker_model) if self.exchanged else Catalog(self.job)
         policy = self.policy_sha()
         saved_policy = self.data.get("policy_sha")
         if saved_policy is not None and self.matches_policy(saved_policy, policy):
@@ -796,7 +799,8 @@ class Controller(worker_turns.WorkerTurns):
         if role != setting.step:
             setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, role, self.run.kind,
                                              {"runner": setting.runner, "model": setting.model,
-                                              "provider": setting.provider, "effort": setting.effort})
+                                              "provider": setting.provider, "effort": setting.effort,
+                                              **(self.catalog.private_route if assignment else {})})
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
@@ -842,6 +846,8 @@ class Controller(worker_turns.WorkerTurns):
         request = delegation.request(self.job, action["id"], prompt, setting, tools,
                                      prompt_loader.bash_rules(self.job.builder_bash) if writing else [], session)
         if assignment:
+            if self.catalog.private_route:
+                request["overrides"].update(self.catalog.private_route)
             request.update(cwd=str(private), private_worker=True, offered_ids=[m["id"] for m in messages],
                            evidence_refs=args["context_refs"], closed_context=[
                 *self.run.closed_context, str(self.job.ws), *(str(c.src) for c in self.job.checkouts)])

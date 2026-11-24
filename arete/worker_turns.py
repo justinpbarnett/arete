@@ -11,7 +11,8 @@ from .store import worker_exchange as exchange
 from .store.db import reader
 
 WORKER_INSTRUCTIONS = """
-Use only your private working directory. Keep edits within the listed write paths.
+Use only your private working directory. Read the repository instructions that apply to your paths before editing.
+Keep edits within the listed write paths.
 Run the focused acceptance check when feasible. The engine runs the final gates.
 For a decision or a larger scope, stop this invocation with a question. Report a finding for routing with handoff.
 Return exactly one JSON object as your final response. version is 2, outcome is done, question or handoff,
@@ -32,7 +33,7 @@ class WorkerTurns:
             return "this workspace needs shared copy inputs or contains a closed checkout"
         if not self.job.cfg.replay.all:
             routes = self.run.settings("build").chain
-            if not sandbox.can_confine(False) or not any(link.runner == "pi" for link in routes):
+            if not sandbox.can_confine(False) or not (self.policy.private_worker_model or any(link.runner == "pi" for link in routes)):
                 return "private workers require local Pi with macOS confinement"
         for c in self.job.checkouts:
             if c.wt.resolve() != self.job.ws.resolve() / c.dir:

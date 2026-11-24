@@ -121,15 +121,24 @@ def operations(protocol):
 class Catalog:
     protocol = PROTOCOL
 
-    def __init__(self, job, protocol=PROTOCOL):
+    private_route = {}
+
+    def __init__(self, job, protocol=PROTOCOL, private_worker_model=""):
         self.protocol = protocol
+        self.private_route = ({"runner": "pi", "provider": private_worker_model.partition("/")[0],
+                               "model": private_worker_model, "instructions": [], "mcp": []}
+                              if protocol == WORKER_PROTOCOL and private_worker_model else {})
         self.job, self.entries, self.settings = job, {}, {}
         for role in ("plan", "build", "check_repair", "review_repair", "ci_repair", "verify", "review"):
             setting = job.run.settings(role)
-            for n, link in enumerate(setting.chain):
+            private = self.private_route if role not in ("review", "verify") else {}
+            for n, link in enumerate(setting.chain[:1] if private else setting.chain):
+                if protocol == WORKER_PROTOCOL and role not in ("review", "verify") and not job.cfg.replay.all:
+                    if not private and link.runner != "pi":
+                        continue
                 overrides = {**job.run.overrides, **job.run.step_overrides.get(role, {}),
                              "runner": link.runner, "provider": link.provider, "model": link.model,
-                             "effort": link.effort}
+                             "effort": link.effort, **private}
                 try:
                     selected = steps.resolve(job.cfg, job.layer, role, job.run.kind, overrides,
                                              job.run.step_overrides.get(config.INHERITS.get(role, ""), {}))
@@ -218,7 +227,7 @@ class Catalog:
         resolved = steps.resolve(self.job.cfg, self.job.layer, setting.step, self.job.run.kind,
                                  {**self.job.run.overrides, **self.job.run.step_overrides.get(setting.step, {}),
                                   "runner": setting.runner, "provider": setting.provider, "model": setting.model,
-                                  "effort": effort},
+                                  "effort": effort, **(self.private_route if setting.step not in ("verify", "review") else {})},
                                  self.job.run.step_overrides.get(config.INHERITS.get(setting.step, ""), {}))
         return replace(resolved, requires=replace(resolved.requires, gated_launches=setting.requires.gated_launches))
 

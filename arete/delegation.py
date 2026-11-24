@@ -197,6 +197,7 @@ def worker_settings_digest(value, serialize, *, include_check_limit: bool = Fals
             data.pop("max_parallel_checks", None)
     if isinstance(value, config.RepoLayer):
         data.get("orchestration", {}).pop("max_builders", None)
+        data.get("orchestration", {}).pop("private_worker_model", None)
         if serialize is explicit and not data.get("orchestration"):
             data.pop("orchestration", None)
     return settings_digest(data)

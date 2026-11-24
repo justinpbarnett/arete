@@ -60,6 +60,11 @@ max_workers = 3
 max_builders = 2
 ```
 
+Layers using a different runner for ordinary build or plan steps can select a local Pi model specifically for
+private workers with `private_worker_model = "openai/gpt-6.2-sol"` under `[orchestration]`. The route is
+pinned per lineage. Private workers read repository instructions inside their checkout and run with Pi's fresh
+session, without external instruction files or MCP servers. Provider admission and layer payment policy apply.
+
 Both limits take integers from 1 through 10000. Each active worker occupies a worker slot.
 The builder ceiling is the smaller limit. The controller can use fewer slots.
 Omitting `max_builders` selects the original protocol and its exclusive writer. Setting it to one keeps the

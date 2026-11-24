@@ -81,6 +81,7 @@ class Orchestration:
     max_workers: int = 3
     progress_seconds: int = 30
     max_builders: int | None = None
+    private_worker_model: str = ""
 
     @property
     def builder_limit(self) -> int:
@@ -94,10 +95,14 @@ def orchestration_table(data) -> Orchestration:
         raise ValueError(message)
     only(data, layer_schema("orchestration"), "[orchestration]", message=message)
     values = {name: data.get(name, getattr(defaults, name)) for name in defaults.__dataclass_fields__}
+    model = values.pop("private_worker_model")
+    if "private_worker_model" in data and (not isinstance(model, str) or len(model) > 200
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9][A-Za-z0-9._:/-]*", model)):
+        raise ValueError("[orchestration] private_worker_model requires a provider/model name")
     if any(type(value) is not int or not 0 < value <= 10000 for name, value in values.items()
            if name != "max_builders" or name in data):
         raise ValueError("[orchestration] limits must be integers between 1 and 10000")
-    return Orchestration(**values)
+    return Orchestration(**values, private_worker_model=model)
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 
 
@@ -414,6 +419,8 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
         data = asdict(value)
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
+    if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
+        data["orchestration"].pop("private_worker_model", None)
     routing = data.pop("routing", {})
     if sparse and isinstance(value, Config):
         if value.routing.payment_modes == PAYMENT_MODES:
