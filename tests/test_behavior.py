@@ -1043,6 +1043,27 @@ with mock.patch.object(secretstore, 'require_private_file', side_effect=retire_a
 """)
 
 
+@unittest.skipUnless(sys.platform == "darwin", "confined SQLite runs on macOS")
+class RegistryIsolatedReadTests(_SecretChildCase):
+    adapter_only = True
+
+    def test_missing_local_binding_reports_the_named_error_from_an_isolated_reader(self):
+        self.run_secret_child(r"""
+from arete.store import credentials
+
+db.migrate()
+with db.tx() as c:
+    c.execute("INSERT INTO schema_meta (key,value) VALUES (?,?)", (secretstore.KEY_LOCAL, "0" * 64))
+    ref = secretstore.Reference('owner_file', db.metadata(c)['instance_tag'], 'sample.txt')
+    credentials.save_secret(c, 'global', 'COLOR', 'sample', ref.store, str(ref), '1' * 64,
+                            'hand', 'fixture', None)
+for read in (lambda: secretstore.fingerprint('sample'), lambda: secretstore.read('global', 'COLOR')):
+    with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+        read()
+assert not paths.FINGERPRINT_KEY_FILE.exists()
+""")
+
+
 class RegistryKeyContinuityTests(_SecretChildCase):
     def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
         self.run_secret_child(r"""
