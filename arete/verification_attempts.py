@@ -79,6 +79,8 @@ def plan(source, requested, host_id, tools):
         if requested:
             raise Refused("focused verification needs a current baseline; use verification.run without requirements")
         return Scope(None, [], [], False)
+    if prior.verdict == "fail":
+        return Scope(prior, [], [], True)
 
     environment_id = environment(host_id, tools)
     same = source.get("verification_environment") == environment_id
@@ -100,7 +102,7 @@ def plan(source, requested, host_id, tools):
         # A new scenario can still be measured while an unrelated fixture remains unavailable.
         unavailable = {name.casefold() for name in gaps} - {name.casefold() for name in unattempted}
         pending = [name for name in pending if name.casefold() not in unavailable]
-    reuse = (prior.verdict == "fail" or prior.verdict == "blocked" and not improved and not pending
+    reuse = (prior.verdict == "blocked" and not improved and not pending
              or prior.verdict == "pass" and same and not pending)
     return Scope(prior, pending, [], reuse)
 

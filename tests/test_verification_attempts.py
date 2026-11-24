@@ -149,7 +149,11 @@ class VerificationAttemptsTests(unittest.TestCase):
         self.assertNotIn("verify", self.ctrl.required_gates())
 
     def test_product_failure_survives_owner_answer_without_allowing_unrelated_fresh_pass(self):
-        self.run_verifier(Verified("fail", checks=[check("drag card", passed=False, cause="change")]))
+        self.ctrl.catalog.settings["primary"].tools = ["OriginalInput"]
+        self.run_verifier(Verified("fail", missing_tools=["Wheel"],
+                                   checks=[check("drag card", passed=False, cause="change")]))
+        self.assertEqual(self.run_verifier(route="gesture")["reused_verification"], "action-1")
+        self.assertEqual(len(self.attempts), 1)
         self.ctrl.data["acceptance"] = "owner answered"
         self.assertIn("verify", self.ctrl.required_gates())
         result = self.run_verifier(Verified("pass", checks=[check("board loads")]))
