@@ -320,7 +320,7 @@ def linux_fingerprint_mounts(key: Path, info: os.stat_result, opened: tuple[Path
 
 def linux_store_policy(*, has_local: bool, had_local: bool) -> tuple[Path | None, bool]:
     from . import config, secretstore
-    from .store import db
+    from .store import credentials, db
 
     meta = {}
     required = had_local
@@ -328,7 +328,7 @@ def linux_store_policy(*, has_local: bool, had_local: bool) -> tuple[Path | None
         meta = db.metadata(c)
         required = required or secretstore.KEY_LOCAL in meta or (
             not has_local and bool(meta) and db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c)
-            and secretstore.has_fingerprints(c))
+            and credentials.has_fingerprints(c))
     settings = config.secret_settings()
     activated = secretstore.KEY_REF in meta
     if activated and settings.store == "pve_store":

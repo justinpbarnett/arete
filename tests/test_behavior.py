@@ -244,6 +244,92 @@ assert removed['status'] == 'missing' and removed['missing_since'] and secretsto
 assert event_names('FIRST_SET')[-1] == 'removed'
 """)
 
+
+class RegistryReceiptTests(_SecretChildCase):
+    def test_same_bytes_recover_metadata_after_rollback(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'METADATA', 'fixture-original'
+actor = 'u:1234abcd'
+old = secretstore.put('global', name, value, 'api_key', 'hand', provider='fixture-old')
+
+def replace_metadata(scope, name):
+    secretstore.put(scope, name, value, 'app_private_key', actor, provider='fixture-new')
+
+reject_change(replace_metadata, name)
+assert secretstore.get('global', name) == old and event_names(name) == ['set']
+assert receipt(name).exists()
+row = secretstore.check('global', name)
+assert row['kind'] == 'app_private_key' and row['provider'] == 'fixture-new' and row['set_by'] == actor
+assert row['fingerprint'] == old['fingerprint'] and row['version'] == old['version'] + 1
+assert row['status'] == 'set' and row['check_ok'] and row['rotated_at'] == row['set_at']
+assert event_names(name) == ['set', 'rotated', 'checked']
+assert secretstore.history('global', name)[1]['actor'] == actor
+assert not receipt(name).exists()
+""")
+
+    def test_committed_receipt_is_not_replayed_after_drift_and_restoration(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'RESTORED', 'fixture-current'
+secretstore.put('global', name, 'fixture-original', 'api_key', 'hand')
+settings = config.secret_settings()
+with mock.patch.object(secretstore, 'remove_file', side_effect=OSError('injected cleanup failure')):
+    published = secretstore.put('global', name, value, 'app_private_key', 'u:1234abcd')
+    assert receipt(name).exists()
+    ref = item_reference(published)
+    secretstore.write_item(ref, settings, b'fixture-drift')
+    drifted = secretstore.check('global', name)
+    assert drifted['status'] == 'missing' and receipt(name).exists()
+secretstore.write_item(ref, settings, value.encode())
+restored = secretstore.check('global', name)
+assert restored['status'] == 'set' and restored['check_ok']
+assert restored['version'] == drifted['version'] + 1
+assert restored['set_at'] == published['set_at'] and restored['set_by'] == published['set_by']
+assert event_names(name) == ['set', 'rotated', 'checked', 'checked']
+assert not receipt(name).exists()
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM events_log WHERE kind = 'credential.changed' AND subject = ?",
+                     ('secret:global/' + name,)).fetchone()[0] == 2
+""")
+
+    def test_same_byte_retry_stopped_before_intent_keeps_original_attribution(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value, actor = 'SAME_RETRY', 'fixture-first-value', 'u:1234abcd'
+reject_change(secretstore.put, name, value, 'api_key', actor)
+assert secretstore.get('global', name) is None and event_names(name) == []
+with (mock.patch.object(secretstore, 'save_pending', side_effect=OSError('injected intent failure')) as write,
+      case.assertRaisesRegex(OSError, 'injected intent failure')):
+    secretstore.put('global', name, value, 'app_private_key', 'hand', provider='fixture-retry')
+write.assert_called_once()
+row = secretstore.check('global', name)
+assert row['kind'] == 'api_key' and row['provider'] is None and row['set_by'] == actor
+assert row['fingerprint'] == secretstore.fingerprint(value) and row['check_ok']
+assert event_names(name) == ['set', 'checked'] and secretstore.history('global', name)[0]['actor'] == actor
+assert not receipt(name).exists()
+""")
+
+
+class RegistryReceiptChainTests(_SecretChildCase):
+    def test_rollback_preserves_two_operators_and_a_later_value(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, first, last = 'CHAIN', 'synthetic-first', 'synthetic-later'
+with case.assertRaisesRegex(RuntimeError, 'outer rollback'):
+    with db.tx():
+        secretstore.put('global', name, first, 'api_key', 'hand')
+        with mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('unchanged bytes')):
+            secretstore.put('global', name, first, 'app_private_key', 'u:operator', provider='demo')
+        secretstore.put('global', name, last, 'api_key', 'hand')
+        raise RuntimeError('outer rollback')
+assert secretstore.get('global', name) is None
+row = secretstore.check('global', name)
+assert row['version'] == 3 and row['check_ok'] and row['fingerprint'] == secretstore.fingerprint(last)
+for _ in range(2):
+    changes = [(e['event'], e['actor']) for e in secretstore.history('global', name) if e['event'] != 'checked']
+    assert changes == [('set', 'hand'), ('rotated', 'u:operator'), ('rotated', 'hand')]
+    secretstore.check('global', name)
+""")
+
+
+class RegistryRemovalTests(_SecretChildCase):
     def test_removal_records_existing_bytes_and_recovers_after_rollback(self):
         self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
 actor, retry_actor = 'u:1234abcd', 'hand'
@@ -714,6 +800,23 @@ for directory, expected in (('../state/store', 'must be separate'), ('inner-stor
 """)
 
 
+class RegistryKeyContinuityTests(_SecretChildCase):
+    def test_an_account_fingerprint_without_a_key_requires_reconciliation(self):
+        self.run_secret_child(r"""
+with db.tx() as c:
+    account = tuple(c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+                              "VALUES ('demo:subscription', 'demo', 'sample', 'subscription', 'u:demo', 'personal', "
+                              "'fixture-fingerprint', 'fixture-time') RETURNING *").fetchone())
+with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+    secretstore.fingerprint('fixture-input')
+with db.reader() as c:
+    assert tuple(c.execute('SELECT * FROM accounts').fetchone()) == account
+    assert not c.execute('SELECT 1 FROM secrets').fetchone()
+assert secretstore.KEY_REF not in db.schema_metadata() and not paths.FINGERPRINT_KEY_FILE.exists()
+assert not Path('store').exists()
+""")
+
+
 class SecretFingerprintTests(_SecretChildCase):
     def test_fingerprints_are_per_instance_and_a_lost_key_cannot_be_reminted(self):
         self.run_secret_child(r"""
@@ -735,6 +838,11 @@ key.unlink()
 with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
     secretstore.fingerprint(value)
 assert not key.exists() and db.schema_metadata()['fingerprint_key_ref'] == meta['fingerprint_key_ref']
+with db.tx() as c:
+    c.execute('DELETE FROM schema_meta WHERE key = ?', (secretstore.KEY_REF,))
+with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+    secretstore.fingerprint(value)
+assert not key.exists() and secretstore.KEY_REF not in db.schema_metadata()
 """)
 
     def test_local_key_moves_to_store_only_after_reference_commits(self):
