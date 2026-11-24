@@ -2868,7 +2868,8 @@ class AutomaticCIRerunTests(AutomaticCIRerunFixture, unittest.TestCase):
         self.build.layer.trust_level = "automerge"
         review, verified = Review("approve"), verify.Verified("pass")
 
-        def catch_up(*_args):
+        def catch_up(*_args, repair_focused):
+            self.assertTrue(repair_focused)
             self.checkout.note_pushed_head("caught-up-head")
             return verified, review
 
@@ -6606,7 +6607,8 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                 job.b.catch_ups = 0
                 refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
 
-                def catch_up(*_):
+                def catch_up(*_, repair_focused):
+                    self.assertTrue(repair_focused)
                     checkout.note_pushed_head("caught-up")
                     return job.verified, job.review
 
@@ -6718,14 +6720,15 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
             self.assertEqual(args, ["rev-parse", "origin/main"])
             return local_bases[wt]
 
-        def catch_up(build, checkout, branch, base_sha, *args, before_push=None):
+        def catch_up(build, checkout, branch, base_sha, *args, before_push=None, repair_focused=False):
             self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
             controller = first if build.run is first.run else second
             self.assertIsNotNone(controller.job.slot.held)
             self.assertLessEqual(len(slots.runs_in_slots()), 2)
             if build.run is first.run and base_sha == "main-external" and ci_after_base_move == "pending":
                 self.assertIn("still running", first.job.ci_result)
-            if build.run is second.run and fixed:
+            self.assertEqual(repair_focused, build.run is second.run and fixed)
+            if repair_focused:
                 self.assertEqual((branch, *args[:2]), ("run-2", "verify changes", "make a change"))
             head = f"head-{build.run.tid}-caught-up-{build.catch_ups}"
             evidence = verify.Verified("pass"), Review("approve")

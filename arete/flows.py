@@ -1478,12 +1478,16 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
     before_push = None
     check_targets = job.check_publication_targets
     if focused_draft:
-        require_held_drafts(job)
+        if check_targets:
+            check_targets()
+        for c in job.with_prs:
+            pipeline.require_held_pr(run, c, convert=True)
 
         def check_held_targets():
             if job.check_publication_targets:
                 job.check_publication_targets()
-            require_held_drafts(job)
+            for c in job.with_prs:
+                pipeline.require_held_pr(run, c)
 
         check_targets = check_held_targets
     if pilot.is_pilot_task(str(run.tid)):
@@ -1509,12 +1513,6 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
         return publication_outcome(job, staged, outcome, committed)
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push,
                                measurement_section=measurement_section)
-
-
-def require_held_drafts(job: Job) -> None:
-    for c in job.with_prs:
-        if pipeline.own_draft_state(job.run, c) is not True:
-            raise workspace.RunFailed(f"{c.pr} is not a confirmed draft at this run's head; focused repair evidence is required")
 
 
 def with_stop(text: str, stop: str) -> str:

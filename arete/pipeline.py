@@ -495,6 +495,14 @@ class CatchUpGateHold(workspace.RunFailed):
         self.candidate_restored = True
 
 
+class CatchUpFocusedHold(CatchUpGateHold):
+    pass
+
+
+class CiFixFocusedHold(workspace.RunFailed):
+    pass
+
+
 class CatchUpPushUnconfirmed(workspace.RunFailed):
     def __init__(self, why: str, detail: str, *, retryable: bool):
         super().__init__(why, detail)
@@ -1479,15 +1487,23 @@ class Build(TicketWork):
                 break
         return self.focused_hold()
 
-    def retry_focused_repairs(self, producer: str, reply: str) -> tuple[bool, str]:
+    def repair_focused(self) -> tuple[str, Result]:
+        step = self.next_step("review_regression_fix")
+        prompt = prompt_loader.prompt("review_fix", problems=self.repair_feedback(), notes="None.",
+                                      denied=prompt_loader.code_list(self.deny))
+        return step, self.resume(step, prompt, role="review_repair")
+
+    def focused_repair_limit(self) -> str:
+        return self.run.budget.repair_limit_reason() if self.run.budget else ""
+
+    def retry_focused_repairs(self, producer: str, reply: str, *, hold_at_limit: bool = False) -> tuple[bool, str]:
         if not self.check_repair_findings(producer=producer):
             return True, reply
         tries = self.run.settings("check_repair").tries
         for _ in range(1, tries):
-            step = self.next_step("review_regression_fix")
-            prompt = prompt_loader.prompt("review_fix", problems=self.repair_feedback(), notes="None.",
-                                          denied=prompt_loader.code_list(self.deny))
-            result = self.resume(step, prompt, role="review_repair")
+            if hold_at_limit and (reason := self.focused_repair_limit()):
+                return False, reason
+            step, result = self.repair_focused()
             reply = result.text
             if not result.ok:
                 break
@@ -1678,18 +1694,26 @@ class Build(TicketWork):
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None, *,
-                           after: str = "the build and its fixes") -> tuple[bool, int]:
+                           after: str = "the build and its fixes", focused: str = "") -> tuple[bool, int]:
         step_name = step_name or (lambda n: self.next_step("check_repair"))
         attempts, tries = 1, self.run.settings("check_repair").tries
-        ok = self.check(after=after)
-        while not ok and attempts < tries:
+        while True:
+            ok = self.check(after=after)
+            if ok and focused and (pending := self.check_repair_findings(producer=focused, fresh=True)):
+                if attempts < tries and not self.focused_repair_limit():
+                    focused, result = self.repair_focused()
+                    attempts += 1
+                    if result.ok:
+                        continue
+                raise CiFixFocusedHold(f"focused review regressions did not pass after {after}: {pending}",
+                                       self.repair_feedback())
+            if ok or attempts >= tries:
+                return ok, attempts
             self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
             attempts += 1
             self.resume(step_name(attempts),
                         prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
                                checks=self.check_commands, denied=prompt_loader.code_list(self.deny)), role="check_repair")
-            ok = self.check(after=after)
-        return ok, attempts
 
     def recheck(self, after: str) -> None:
         if not self.check_with_repairs(after=after)[0]:
@@ -2980,8 +3004,9 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         review = _review(b, plan_to_review, verified, round_name("review", n), review, reply)
         note_review(run, review, verified)
     draft_why = draft_reason(review, verified, n)
-    if pending := b.in_use_repair_hold(verified):
-        draft_why = draft_why or f"Independent in-use evidence is still required for {pending}."
+    in_use_pending = b.in_use_repair_hold(verified)
+    if in_use_pending:
+        draft_why = draft_why or f"Independent in-use evidence is still required for {in_use_pending}."
     note_review(run, review, verified)
     run.facts["held"] = draft_why
     _learn(run, ws, layer.expertise_file, t.title, apply=True)
@@ -2989,8 +3014,9 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     size = change_size(staged)
     outcome = f"{size}, review {review.verdict}, in use {verified.verdict}"
     written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
-    if review.approved() and (pending := b.focused_hold()):
-        return _fail(run, f"publication needs current focused repair evidence: {pending}", detail=b.repair_feedback())
+    focused_pending = b.focused_hold()
+    if review.approved() and focused_pending:
+        return _fail(run, f"publication needs current focused repair evidence: {focused_pending}", detail=b.repair_feedback())
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
@@ -3009,7 +3035,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
-    b.push(branch, message)
+    push_classic_candidate(b, branch, message, require_draft=bool(focused_pending or in_use_pending))
     opened: list[workspace.Checkout] = []
     for c in staged.changed:
         if not c.pr:
@@ -3058,6 +3084,18 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
+
+
+def push_classic_candidate(b: Build, branch: str, message: str, *, require_draft: bool) -> None:
+    held_targets = [c for c in b.staged.changed if c.pr] if require_draft else []
+    for c in held_targets:
+        require_held_pr(b.run, c, convert=not b.run.feedback)
+
+    def check_held_targets():
+        for c in held_targets:
+            require_held_pr(b.run, c)
+
+    b.push(branch, message, **({"check_targets": check_held_targets} if held_targets else {}))
 
 
 def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> str:
@@ -3194,7 +3232,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                     if hold:
                         break
                     b.catch_ups += 1
-                    verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review)
+                    verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review, repair_focused=True)
                     note_review(run, review, verified)
                     publish_gate_evidence(run, b.ticket, c, verified, review)
                     max_rounds = run.settings("ci_repair").tries
@@ -3205,6 +3243,8 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                 except CatchUpPushUnconfirmed:
                     raise
                 except (workspace.RunFailed, RuntimeError, OSError) as e:
+                    if isinstance(e, CatchUpFocusedHold) and own_draft_state(run, c) is False:
+                        set_draft(run, c, True, "automerge")
                     reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
                     hold = f"catch-up to `{c.base}` did not complete: {public_text(run, reason)}"
                     break
@@ -3329,7 +3369,7 @@ def remove_new_paths(run: AgentRun, wt: Path, before: set[str], after: set[str],
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None] | None = None,
-                  check_targets: Callable[[], None] | None = None) -> tuple[verify.Verified, Review]:
+                  check_targets: Callable[[], None] | None = None, repair_focused: bool = False) -> tuple[verify.Verified, Review]:
     run = b.run
     run.catch_up_owns_checkout = True
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
@@ -3357,13 +3397,22 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
+        if repair_focused:
+            head = repair_caught_up_head(b, c, head)
         verified = check_in_use(b, goal, b.build_summary)
         if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
             raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback(), verified)
         if pending := b.in_use_repair_hold(verified):
             raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head,
                                   b.report, verified)
-        review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
+        if head != c.merge:
+            b.restage(from_base=True)
+            review_plan = (f"{plan}\n\nThe previously approved head `{c.lease}` caught up to base `{base_sha}` in "
+                           f"`{c.merge}`. Review the resulting tree, including the focused repair in `{c.merge}..{head}` "
+                           "and its interaction with the moved base.")
+            review = _review(b, review_plan, verified, step=b.next_step("review"), before=prior_review)
+        else:
+            review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
         if problem := merge_evidence_problem(b, c, verified, review, head):
             gate, why = problem
             raise CatchUpGateHold(gate, why, head, b.report, verified, review)
@@ -3411,6 +3460,28 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     push_caught_up_head(b, c, branch, head, **target_check)
     run.catch_up_owns_checkout = False
     return verified, review
+
+
+def repair_caught_up_head(b: Build, c: workspace.Checkout, head: str) -> str:
+    if not b.repair_findings:
+        return head
+    passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True)
+    if not passed:
+        raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
+                                 "\n\n".join(filter(None, (b.repair_feedback(), reply))))
+    trees = verification_trees(b)
+    if trees == {c.prefix: git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()}:
+        return head
+    b.require_valid_diff("repairing the moved base", from_base=True)
+    if not b.check(staged=b.staged, defer_failed_cleanup=True) or not b.full_checks_current(trees):
+        raise CatchUpGateHold("checks", "the layer's local checks failed after the focused repair", head, b.report)
+    if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
+        raise workspace.RunFailed("the catch-up repair changed after the checks")
+    util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
+    repaired = git(["rev-parse", "HEAD"], c.wt).strip()
+    if git(["rev-parse", f"{repaired}^{{tree}}"], c.wt).strip() != trees[c.prefix] or workspace.uncommitted(c.wt):
+        raise workspace.RunFailed("the catch-up repair committed a different candidate than the checks covered")
+    return repaired
 
 
 def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str, *,
@@ -3718,7 +3789,11 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
         raise
     except Exception as e:
         failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
-        drafted = [c for c in with_prs if set_draft(run, c, True)]
+        if isinstance(failed, CiFixFocusedHold):
+            drafted = [c for c in with_prs if (state := own_draft_state(run, c)) is True
+                       or (state is False and set_draft(run, c, True))]
+        else:
+            drafted = [c for c in with_prs if set_draft(run, c, True)]
         ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
         publish_ci(run, b.ticket, with_prs, ci.section(rounds, max_rounds, ending))
         if failed is e:
@@ -3774,6 +3849,14 @@ def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
                 "checked again, so someone changed it after the run started")
         return None
     return draft
+
+
+def require_held_pr(run: AgentRun, c: workspace.Checkout, *, convert: bool = False) -> None:
+    draft = own_draft_state(run, c)
+    if draft is False and convert and set_draft(run, c, True, "pr"):
+        draft = own_draft_state(run, c)
+    if draft is not True:
+        raise workspace.RunFailed(f"{c.pr} is not a confirmed draft at this run's head; focused repair evidence is required")
 
 
 def hold_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
@@ -3969,7 +4052,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise workspace.RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
-    if not b.check_with_repairs(after="the CI fix")[0]:
+    if not b.check_with_repairs(after="the CI fix", focused=f"ci-fix:{n}")[0]:
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
         raise workspace.RunFailed("the checks failed after the CI fix",
@@ -3979,10 +4062,10 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     trees = verification_trees(b)
     if not b.full_checks_current(trees):
         raise workspace.RunFailed("the CI fix lacks current full check evidence")
-    if pending := b.check_repair_findings(producer=f"ci-fix:{n}", fresh=True):
-        raise workspace.RunFailed(f"focused review regressions did not pass after the CI fix: {pending}", b.repair_feedback())
     b.restage(from_base=True)
     verified = verify_ci_fix(b, goal, trees)
+    if trees != verification_trees(b) or b.focused_hold():
+        raise workspace.RunFailed("the CI fix changed during in-use verification", b.repair_feedback())
     plan = b.plan_text + (f"\n\n{NOT_CHECKED_LEFT_FOR_A_PERSON}{b.left_for_a_person}" if b.left_for_a_person else "")
     reviewed = _review(b, plan, verified, step=b.next_step("review_ci_fix"), before=review)
     b.run.save(f"ci-repair-round{n}.json", {"trees": trees, "checked": checked, "verified": asdict(verified),
@@ -4012,6 +4095,8 @@ def verify_ci_fix(b: Build, goal: str, trees: dict[str, str]) -> verify.Verified
         return (verify.not_configured(b.layer.dir, b.ws) if not b.layer.verify else
                 verify.Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`."))
     verified = check_in_use(b, goal, b.build_summary)
+    if not b.repair_findings and verified.verdict == "blocked" and not verification_refused(verified):
+        return verified
     if (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks
             or verified.observed_trees != trees or b.in_use_repair_hold(verified)):
         raise workspace.RunFailed("the CI fix lacks a current in-use pass", verified.markdown())
@@ -5148,10 +5233,13 @@ def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) 
     return images
 
 
+def verification_refused(verified: verify.Verified) -> bool:
+    return bool(REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}"))
+
+
 def draft_reason(review: Review, verified: verify.Verified, reviews: int = 0) -> str:
     approved = review.approved()
-    refused = REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}")
-    if verified.verdict == "blocked" and (not approved or refused):
+    if verified.verdict == "blocked" and (not approved or verification_refused(verified)):
         return "the check in use was blocked"
     if approved:
         return ""

@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
+    ci,
     codebase,
     config,
     dbstats,
@@ -3376,7 +3377,7 @@ class ParkedRetryBudgetTests(Isolated):
         self.assert_fresh_retry()
 
 
-class DeniedWorkerEditsTests(unittest.TestCase):
+class RepairWorkflowFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
@@ -3428,17 +3429,6 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.controller = orchestration.Controller(flow)
         self.controller.catalog = Catalog(job)
 
-    def test_each_pipeline_writing_prompt_renders_denied_paths(self):
-        writing = {name for name, (_, writes) in PROMPTS.items() if writes}
-        writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
-                    "apply", "oncall_repair"}
-        denied = "`guarded.txt`, `restricted/**`"
-        for name in sorted(writing):
-            with self.subTest(prompt=name):
-                identifiers = prompt_loader.template(name).get_identifiers()
-                inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
-                rendered = prompt_loader.prompt(name, **inputs)
-                self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
     def git(self, *args):
         return util.git(list(args), self.wt).strip()
 
@@ -3478,6 +3468,20 @@ class DeniedWorkerEditsTests(unittest.TestCase):
             self.assertTrue(controller.collect())
             return worker.call_args.args[2]["role"]
 
+
+class DeniedWorkerEditsTests(RepairWorkflowFixture):
+    def test_each_pipeline_writing_prompt_renders_denied_paths(self):
+        writing = {name for name, (_, writes) in PROMPTS.items() if writes}
+        writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
+                    "apply", "oncall_repair"}
+        denied = "`guarded.txt`, `restricted/**`"
+        for name in sorted(writing):
+            with self.subTest(prompt=name):
+                identifiers = prompt_loader.template(name).get_identifiers()
+                inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
+                rendered = prompt_loader.prompt(name, **inputs)
+                self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
+
     def test_second_worker_passes_checks_without_the_denied_paths(self):
         self.prepare_controller()
 
@@ -3510,6 +3514,53 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.assertIn("goal passed", passed["report"])
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt\ngoal.txt")
 
+    def test_denied_edit_on_last_repair_parks_with_the_path(self):
+        self.prepare_controller()
+        self.controller.data["writes"] = 1
+        self.assertEqual(self.worker(lambda: self.write("guarded.txt", "last attempt\n")), "check_repair")
+        with self.assertRaises(runlimits.Parked) as parked:
+            self.perform("checks.run")
+        status, _, _ = pipeline.park_run(self.run_fixture, str(parked.exception))
+        self.assertEqual(status, "failed")
+        reason = runlimits.metadata(self.run_fixture.id, "parked.json")["reason"]
+        self.assertIn("the repair chain used its 1 repair cycles", reason)
+        self.assertIn("guarded.txt", reason)
+        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
+
+    def test_staged_secret_fails_with_the_existing_message(self):
+        self.prepare_controller()
+        sample = "fixture-vault-value-728"
+        self.stored.return_value = [("FIXTURE_TOKEN", sample)]
+        self.assert_fatal_worker_edit(lambda: self.write("payload.txt", sample + "\n"),
+                                      "payload.txt (holds the stored value of FIXTURE_TOKEN)")
+        self.assertFalse((self.wt / "payload.txt").exists())
+        pipeline.keep_edits(self.run_fixture)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("diff", "HEAD^", "HEAD", "--name-only"), "goal.txt")
+
+    def test_workflow_edit_mixed_with_a_layer_denied_edit_is_fatal(self):
+        self.prepare_controller()
+
+        def edit():
+            self.write("guarded.txt", "worker edit\n")
+            self.write(".github/workflows/fixture.yml", "name: fixture\n")
+
+        self.assert_fatal_worker_edit(edit, ".github/workflows/fixture.yml, guarded.txt")
+        self.assertFalse((self.wt / ".github/workflows/fixture.yml").exists())
+        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
+
+    def assert_fatal_worker_edit(self, edit, paths_in_message):
+        edit()
+        self.write("goal.txt", "reached\n")
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.perform("checks.run")
+        self.assertEqual(failed.exception.why, f"the build and its fixes touched denied paths: {paths_in_message}")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "goal.txt")
+
+
+class SettingsRollbackFixture(RepairWorkflowFixture):
     def settings_rollback_fixture(self):
         self.layer.verify = config.Verify(url="")
         self.layer.targeted_commands["classes"] = f"{shlex.quote(sys.executable)} -B -m unittest"
@@ -3544,6 +3595,8 @@ class SettingsRollbackTests(unittest.TestCase):
                       "roll back and immediately read blue with only revision 1.")
         return settings, test_class, acceptance
 
+
+class FocusedRollbackTests(SettingsRollbackFixture):
     def test_settings_rollback_regression_returns_to_repair_until_current_pass(self):
         self.prepare_controller(max_repair_cycles=2)
         controller = self.controller
@@ -3642,6 +3695,8 @@ class SettingsRollbackTests(unittest.TestCase):
         saved = json.loads((self.run_fixture.dir / "repair-checks.json").read_text())
         self.assertEqual(saved["receipts"][key], fresh)
 
+
+class ScriptedLateRollbackFixture(SettingsRollbackFixture):
     def scripted_late_rollback(self, late_repair, tries):
         self.prepare_controller()
         job = self.controller.job
@@ -3734,16 +3789,22 @@ class SettingsRollbackTests(unittest.TestCase):
             delivered.assert_not_called()
             self.assertEqual((len(repairs), len(reviewed), feedback), (2, 2, []))
 
+
+class ScriptedFullCheckRepairTests(ScriptedLateRollbackFixture):
     def test_scripted_full_check_repair_returns_late_focused_failure_within_review_budget(self):
         for tries in (3, 2):
             with self.subTest(review_tries=tries):
                 self.scripted_late_rollback("checks", tries)
 
+
+class ScriptedInUseRepairTests(ScriptedLateRollbackFixture):
     def test_scripted_in_use_repair_returns_late_focused_failure_within_review_budget(self):
         for tries in (3, 2):
             with self.subTest(review_tries=tries):
                 self.scripted_late_rollback("in_use", tries)
 
+
+class RepairVerificationSelectionTests(RepairWorkflowFixture):
     def test_focused_repair_only_runs_approved_names_and_exposes_alternate_evidence(self):
         self.prepare_controller()
         self.layer.targeted_commands["classes"] = f"{shlex.quote(sys.executable)} -B -m unittest"
@@ -3819,6 +3880,8 @@ class SettingsRollbackTests(unittest.TestCase):
             self.assertEqual(edited.repair_observations, {})
             self.assertEqual(b.in_use_repair_hold(edited), key)
 
+
+class HeldRepairDraftTests(RepairWorkflowFixture):
     def prepare_held_draft(self):
         self.prepare_controller()
         ctl = self.controller
@@ -3860,7 +3923,7 @@ class SettingsRollbackTests(unittest.TestCase):
         job.review_exhausted = True
         with (patch.object(gh, "open_pr_url", return_value="https://github.com/fixture/repo/pull/1"),
               patch.object(gh, "pr_view", return_value={"state": "OPEN", "headRefName": job.branch}),
-              patch.object(pipeline, "own_draft_state", return_value=False),
+              patch.object(pipeline, "own_draft_state", return_value=None),
               patch.object(pipeline.Build, "push") as push):
             with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
                 flows.pr(flow, tree=str(job.ws))
@@ -3886,87 +3949,341 @@ class SettingsRollbackTests(unittest.TestCase):
             published = self.publish_held_draft(lambda: self.perform("publication.request"))
         self.assertIn("Focused repair evidence is still required", published["draft_why"])
 
-    def test_controller_exhaustion_cannot_update_a_ready_pr_with_pending_focused_evidence(self):
+    def test_controller_exhaustion_cannot_convert_or_push_to_a_replacement_head(self):
         job, _ = self.prepare_held_draft()
         job.review_exhausted = False
         self.run_fixture.budget.repair_calls = self.layer.max_repair_cycles
-        job.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
-        with (patch.object(pipeline, "own_draft_state", return_value=False),
-              patch.object(pipeline.Build, "push") as push):
+        c = job.checkouts[0]
+        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
+        with (patch.object(gh, "pr_draft_and_head", return_value=(False, "replacement-head")),
+              patch.object(gh, "pr_set_draft") as draft, patch.object(pipeline.Build, "push") as push):
             with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
                 self.perform("publication.request")
+            draft.assert_not_called()
             push.assert_not_called()
 
-    def test_ci_fix_cannot_push_a_ready_pr_when_targeted_regression_fails(self):
-        self.prepare_controller()
-        b = self.controller.job.b
-        b.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
-        self.layer.targeted_commands["rollback"] = 'test "$(cat revision.txt)" = "1 blue"'
+    def test_scripted_held_update_converts_owned_ready_pr_and_rechecks_before_push(self):
+        job, flow = self.prepare_held_draft()
+        c = job.checkouts[0]
+        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
+        state = False, c.lease
+        events = []
+
+        def read(_):
+            events.append(state)
+            return state
+
+        def convert(url, draft):
+            nonlocal state
+            self.assertEqual((url, draft), (c.pr, True))
+            state = True, c.lease
+            events.append("convert")
+
+        def push(*_, check_targets, **__):
+            check_targets()
+            events.append("push")
+
+        with (patch.object(gh, "pr_draft_and_head", side_effect=read),
+              patch.object(gh, "pr_set_draft", side_effect=convert),
+              patch.object(pipeline.Build, "push", side_effect=push),
+              patch.object(pipeline, "hold_pushed", return_value=[c]),
+              patch.object(pipeline, "sync_pr_bodies", return_value=[]),
+              patch.object(pipeline, "evidence_images", return_value={})):
+            outcome = flows.pr(flow, tree=str(job.ws))
+        self.assertEqual(events, [(False, c.lease), "convert", (True, c.lease), (True, c.lease), "push"])
+        self.assertIn("Focused repair evidence is still required", outcome.data["draft_why"])
+
+    def test_scripted_held_update_does_not_push_when_draft_conversion_is_unconfirmed(self):
+        job, flow = self.prepare_held_draft()
+        c = job.checkouts[0]
+        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
+        for after in ((False, c.lease), (True, "replacement-head")):
+            with (self.subTest(after_conversion=after),
+                  patch.object(gh, "pr_draft_and_head", side_effect=[(False, c.lease), after]),
+                  patch.object(gh, "pr_set_draft") as draft, patch.object(pipeline.Build, "push") as push):
+                with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
+                    flows.pr(flow, tree=str(job.ws))
+                draft.assert_called_once_with(c.pr, True)
+                push.assert_not_called()
+
+    def test_classic_feedback_with_pending_focused_evidence_does_not_update_a_ready_pr(self):
+        job, _ = self.prepare_held_draft()
+        c = job.checkouts[0]
+        c.pr, c.lease = "https://github.com/fixture/repo/pull/1", "expected-head"
+        job.run.feedback = [{"pr_url": c.pr}]
+        self.assertTrue(job.b.focused_hold())
+        job.b.restage()
+        with (patch.object(gh, "pr_draft_and_head", return_value=(False, c.lease)),
+              patch.object(gh, "pr_set_draft") as draft, patch.object(job.b, "push") as push):
+            with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft"):
+                pipeline.push_classic_candidate(job.b, job.branch, "Fixture update", require_draft=True)
+            draft.assert_not_called()
+            push.assert_not_called()
+
+
+class LaterRepairFixture(RepairWorkflowFixture):
+    acceptance = "Read revision 1 with value blue."
+    producer = "repair:B1"
+
+    def carry_rollback(self, b):
+        self.layer.targeted_commands["rollback"] = 'saw=$(cat revision.txt); echo "saw $saw"; test "$saw" = "1 blue"'
         b.carry_review(pipeline.Review("request_changes", problems=[{
             "problem": "Rollback leaves the wrong revision.", "severity": "blocker",
-            "verification": "check", "check": "rollback", "acceptance": "Read revision 1 with value blue.",
+            "verification": "check", "check": "rollback", "acceptance": self.acceptance,
         }]), "repair")
+        self.assertEqual(b.check_repair_findings(producer="before-repair"), "")
+        return b.repair_receipts[self.producer]["tree"]
+
+    def repair_revision(self, b, step, prompt, *, role):
+        self.assertEqual((step, role), ("review_regression_fix", "review_repair"))
+        self.assertEqual(b.repair_receipts[self.producer]["outcome"], "fail")
+        for expected in (self.producer, "Rollback leaves the wrong revision.", self.acceptance, "saw 2 green"):
+            self.assertIn(expected, prompt)
+        b.run.budget.charge(step, role)
+        self.write("revision.txt", "1 blue\n")
+        self.write("retained.txt", "repair changed the final tree\n")
+        return Result(True)
+
+    def observe_current_repair(self, b):
+        trees = pipeline.verification_trees(b)
+        self.assertEqual(b.repair_receipts[self.producer]["tree"], trees)
+        self.assertEqual(b.repair_receipts[self.producer]["outcome"], "pass")
+        self.assertTrue(b.full_checks_current(trees))
+        return pipeline.verify.Verified("pass", checks=[{"what": self.acceptance, "how": "Read revision.txt",
+                                                        "saw": "1 blue", "passed": True}],
+                                        native_trees=trees, observed_trees=trees)
+
+
+class CiFixFocusedRegressionTests(LaterRepairFixture):
+    def prepare_ci_fix(self, tries):
+        self.prepare_controller()
+        b = self.controller.job.b
+        b.run.step_overrides.update(check_repair={"tries": tries}, ci_repair={"tries": 2})
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        b.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
         self.write("goal.txt", "reached\n")
         self.write("revision.txt", "1 blue\n")
-        self.assertEqual(b.check_repair_findings(producer="before-ci"), "")
-        before = b.repair_receipts["repair:B1"]["tree"]
+        before = self.carry_rollback(b)
         self.write("revision.txt", "2 green\n")
-        with (patch.object(b, "push") as push, patch.object(pipeline, "_review") as review,
-              patch.object(pipeline, "check_in_use") as in_use):
+        return b, before
+
+    def test_ci_fix_cannot_push_a_ready_pr_when_targeted_regression_fails(self):
+        for tries, spent in ((1, False), (2, True)):
+            with self.subTest(tries=tries, repair_budget_spent=spent):
+                self.ci_fix_held(tries, spent)
+
+    def ci_fix_held(self, tries, spent):
+        b, before = self.prepare_ci_fix(tries)
+        if spent:
+            b.run.budget.repair_calls = self.layer.max_repair_cycles
+        c = b.checkouts[0]
+        c.lease = "published-head"
+        check = gh.Check("fixture", "fail")
+        target = pipeline.ci_target(c)
+        watched = ci.Watched(target, {check.key: check}, reds=[ci.Red(target, check, None, "")])
+
+        def judge(_, reds, *__):
+            reds[0].caused = True
+            return "Changed the fixture."
+
+        with (patch.object(pipeline, "watch_checkout_ci", return_value=watched),
+              patch.object(pipeline, "judge_ci", side_effect=judge),
+              patch.object(pipeline, "classic_ci_reruns", return_value=pipeline.AutomaticCIReruns(set())),
+              patch.object(pipeline, "publish_ci"), patch.object(pipeline, "stopped_by_ci", return_value=False),
+              patch.object(b.run, "waiting", return_value=contextlib.nullcontext()),
+              patch.object(b, "resume") as resume, patch.object(b, "push") as push,
+              patch.object(pipeline, "_review") as review, patch.object(pipeline, "check_in_use") as in_use,
+              patch.object(gh, "pr_draft_and_head", return_value=(False, c.lease)),
+              patch.object(pipeline, "set_draft", return_value=True) as draft):
             with self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass"):
-                pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
+                pipeline.watch_ci(b, Mock(), "fixture-branch", [c], [c], "")
+            resume.assert_not_called()
             push.assert_not_called()
             review.assert_not_called()
             in_use.assert_not_called()
-        receipt = b.repair_receipts["repair:B1"]
+            draft.assert_called_once_with(b.run, c, True)
+        receipt = b.repair_receipts[self.producer]
         self.assertEqual((receipt["outcome"], receipt["exit"], receipt["producer"]), ("fail", 1, "ci-fix:1"))
         self.assertNotEqual(receipt["tree"], before)
         self.assertEqual(b.checked["tree"], factory.fingerprint(self.wt))
 
-    def test_denied_edit_on_last_repair_parks_with_the_path(self):
+    def test_ci_fix_retries_the_regression_then_reviews_and_pushes_only_the_current_tree(self):
+        b, before = self.prepare_ci_fix(2)
+        self.layer.verify = config.Verify()
+        events = []
+
+        def repair(step, prompt, **kwargs):
+            events.append("repair")
+            return self.repair_revision(b, step, prompt, **kwargs)
+
+        def observe(*_):
+            events.append("verify")
+            return self.observe_current_repair(b)
+
+        def review(_, _plan, verified, **kw):
+            events.append("review")
+            return pipeline.Review("approve", trees=verified.observed_trees)
+
+        def push(*_, **__):
+            events.append("push")
+            self.assertNotEqual(pipeline.verification_trees(b), before)
+
+        with (patch.object(b, "resume", side_effect=repair), patch.object(b, "push", side_effect=push),
+              patch.object(pipeline, "_review", side_effect=review), patch.object(pipeline, "check_in_use", side_effect=observe)):
+            pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
+        self.assertEqual(events, ["repair", "verify", "review", "push"])
+        self.assertEqual(b.run.budget.repair_calls, 1)
+
+    def test_full_and_focused_ci_repairs_share_the_configured_attempts(self):
+        b, _ = self.prepare_ci_fix(2)
+        self.layer.max_repair_cycles = 2
+        b.run.budget = runlimits.Budget(b.run, runlimits.Policy.of(self.layer), "")
+        self.layer.checks["ready"] = "test -f ready.txt"
+
+        def repair(step, _prompt, *, role):
+            self.assertEqual((step, role), ("check_repair", "check_repair"))
+            b.run.budget.charge(step, role)
+            self.write("ready.txt", "ready\n")
+            return Result(True)
+
+        with (patch.object(b, "resume", side_effect=repair) as worker, patch.object(b, "push") as push,
+              patch.object(pipeline, "_review") as review):
+            with self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass"):
+                pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
+            worker.assert_called_once()
+            review.assert_not_called()
+            push.assert_not_called()
+
+    def test_ci_fix_preserves_unverified_environment_gap_only_without_carried_findings(self):
         self.prepare_controller()
-        self.controller.data["writes"] = 1
-        self.assertEqual(self.worker(lambda: self.write("guarded.txt", "last attempt\n")), "check_repair")
-        with self.assertRaises(runlimits.Parked) as parked:
-            self.perform("checks.run")
-        status, _, _ = pipeline.park_run(self.run_fixture, str(parked.exception))
-        self.assertEqual(status, "failed")
-        reason = runlimits.metadata(self.run_fixture.id, "parked.json")["reason"]
-        self.assertIn("the repair chain used its 1 repair cycles", reason)
-        self.assertIn("guarded.txt", reason)
-        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
-        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
-
-    def test_staged_secret_fails_with_the_existing_message(self):
-        self.prepare_controller()
-        sample = "fixture-vault-value-728"
-        self.stored.return_value = [("FIXTURE_TOKEN", sample)]
-        self.assert_fatal_worker_edit(lambda: self.write("payload.txt", sample + "\n"),
-                                      "payload.txt (holds the stored value of FIXTURE_TOKEN)")
-        self.assertFalse((self.wt / "payload.txt").exists())
-        pipeline.keep_edits(self.run_fixture)
-        self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.git("diff", "HEAD^", "HEAD", "--name-only"), "goal.txt")
-
-    def test_workflow_edit_mixed_with_a_layer_denied_edit_is_fatal(self):
-        self.prepare_controller()
-
-        def edit():
-            self.write("guarded.txt", "worker edit\n")
-            self.write(".github/workflows/fixture.yml", "name: fixture\n")
-
-        self.assert_fatal_worker_edit(edit, ".github/workflows/fixture.yml, guarded.txt")
-        self.assertFalse((self.wt / ".github/workflows/fixture.yml").exists())
-        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
-
-    def assert_fatal_worker_edit(self, edit, paths_in_message):
-        edit()
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        b = self.controller.job.b
+        b.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
         self.write("goal.txt", "reached\n")
-        with self.assertRaises(workspace.RunFailed) as failed:
-            self.perform("checks.run")
-        self.assertEqual(failed.exception.why, f"the build and its fixes touched denied paths: {paths_in_message}")
-        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
-        self.assertEqual(self.git("diff", "--cached", "--name-only"), "goal.txt")
+        self.layer.verify = config.Verify()
+        gap = pipeline.verify.Verified("blocked", "Fixture service unavailable.", blocked_by="test app not installed",
+                                       finished=False, behavior_reached=False)
+
+        def review(_, _plan, verified, **kw):
+            self.assertEqual(verified, gap)
+            return pipeline.Review("approve", trees=pipeline.verification_trees(b))
+
+        with (patch.object(pipeline, "check_in_use", return_value=gap), patch.object(pipeline, "_review", side_effect=review) as checked,
+              patch.object(b, "push") as push):
+            pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
+            push.assert_called_once()
+            checked.assert_called_once()
+            saved = json.loads((b.run.dir / "ci-repair-round1.json").read_text())
+            self.assertEqual(saved["verified"], asdict(gap))
+            push.reset_mock()
+            checked.reset_mock()
+            b.carry_review(pipeline.Review("request_changes", problems=[{
+                "problem": "Confirm preserved revision.", "severity": "blocker", "verification": "review",
+                "acceptance": self.acceptance,
+            }]), "repair")
+            with self.assertRaisesRegex(workspace.RunFailed, "lacks a current in-use pass"):
+                pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 2)
+            push.assert_not_called()
+            checked.assert_not_called()
+
+
+class FixedCatchUpFocusedRegressionTests(LaterRepairFixture):
+    def prepare_catch_up(self, tries):
+        self.prepare_controller()
+        b = self.controller.job.b
+        b.run.path = "feature"
+        b.run.step_overrides["check_repair"] = {"tries": tries}
+        self.layer.trust_level, self.layer.verify = "automerge", config.Verify()
+        c = b.checkouts[0]
+        c.pr = "https://github.com/fixture/repo/pull/1"
+        self.write("revision.txt", "1 blue\n")
+        self.git("add", "revision.txt")
+        self.git(*util.ARETE_IDENTITY, "commit", "-qm", "Settings base")
+        self.git("switch", "-qc", "fixture-branch")
+        self.write("goal.txt", "reached\n")
+        self.git("add", "goal.txt")
+        self.git(*util.ARETE_IDENTITY, "commit", "-qm", "Published goal")
+        c.note_pushed_head(self.git("rev-parse", "HEAD"))
+        approved_tree = self.carry_rollback(b)
+        self.git("switch", "-q", "main")
+        self.write("revision.txt", "2 green\n")
+        self.git("add", "revision.txt")
+        self.git(*util.ARETE_IDENTITY, "commit", "-qm", "Moved base reintroduces regression")
+        base = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        self.git("switch", "-q", "fixture-branch")
+        return b, c, base, pipeline.Review("approve", trees=approved_tree)
+
+    def catch_up(self, b, c, review):
+        return pipeline.automerge(b, None, "", pipeline.verify.Verified("pass"), review, [c], "Fixture",
+                                  slot=Mock(), branch="fixture-branch", goal=self.acceptance, plan="Repair rollback.")
+
+    def test_fixed_base_catch_up_repairs_before_review_and_pushes_only_after_current_gates(self):
+        b, c, base, prior = self.prepare_catch_up(2)
+        published = c.lease
+        events = []
+
+        def repair(step, prompt, **kwargs):
+            events.append("repair")
+            return self.repair_revision(b, step, prompt, **kwargs)
+
+        def observe(*_):
+            events.append("verify")
+            return self.observe_current_repair(b)
+
+        def review(_, _plan, verified, **kw):
+            events.append("review")
+            return pipeline.Review("approve", trees=verified.native_trees)
+
+        def push(_, checkout, branch, head):
+            events.append("push")
+            self.assertEqual((checkout, branch, c.lease), (c, "fixture-branch", published))
+            self.assertEqual(self.git("merge-base", base, head), base)
+            self.assertEqual(self.git("show", f"{head}:revision.txt"), "1 blue")
+            self.assertEqual(self.git("show", f"{head}:retained.txt"), "repair changed the final tree")
+            self.assertEqual(self.git("rev-parse", f"{head}^{{tree}}"), b.repair_receipts[self.producer]["tree"][""])
+            c.note_pushed_head(head)
+
+        def watch(*_):
+            events.append("CI")
+            self.assertNotEqual(c.lease, published)
+            check = gh.Check("fixture", "pass")
+            return [ci.Round(1, [ci.Watched(pipeline.ci_target(c), {check.key: check})])]
+
+        refs = {"state": "OPEN", "isDraft": False, "headRefOid": published, "baseRefName": c.base}
+        with (patch.object(slots, "take_merge_lease", return_value=contextlib.nullcontext()),
+              patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              patch.object(pipeline, "catch_up_target", return_value=(base, "")),
+              patch.object(gh, "pr_merge_details", return_value=refs),
+              patch.object(b, "resume", side_effect=repair), patch.object(pipeline, "_review", side_effect=review),
+              patch.object(pipeline, "check_in_use", side_effect=observe),
+              patch.object(pipeline, "push_caught_up_head", side_effect=push),
+              patch.object(pipeline, "publish_gate_evidence"), patch.object(pipeline, "comment_catch_up_ci"),
+              patch.object(pipeline, "watch_publication_ci", side_effect=watch)):
+            self.catch_up(b, c, prior)
+        self.assertEqual(events, ["repair", "verify", "review", "push", "CI"])
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(merge.call_args.args[3].trees, b.repair_receipts[self.producer]["tree"])
+        self.assertEqual(b.run.budget.repair_calls, 1)
+
+    def test_fixed_base_catch_up_exhaustion_holds_the_original_head_without_review_or_push(self):
+        b, c, base, prior = self.prepare_catch_up(1)
+        published = c.lease
+        with (patch.object(slots, "take_merge_lease", return_value=contextlib.nullcontext()),
+              patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")) as merge,
+              patch.object(pipeline, "catch_up_target", return_value=(base, "")),
+              patch.object(b, "resume") as repair, patch.object(pipeline, "_review") as review,
+              patch.object(pipeline, "check_in_use") as observe, patch.object(pipeline, "push_caught_up_head") as push,
+              patch.object(gh, "pr_draft_and_head", return_value=(False, published)),
+              patch.object(gh, "pr_set_draft") as draft, patch.object(gh, "pr_comment")):
+            self.catch_up(b, c, prior)
+        for action in (repair, review, observe, push):
+            action.assert_not_called()
+        merge.assert_called_once()
+        draft.assert_called_once_with(c.pr, True)
+        self.assertEqual(c.lease, published)
+        self.assertEqual(b.repair_receipts[self.producer]["outcome"], "fail")
+        self.assertIn("focused regressions need repair", b.run.facts["merge_held"])
 
 
 class OrchestratedFinishBudgetTests(PollFixture):
