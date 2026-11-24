@@ -38,7 +38,8 @@ from .store import triage as triage_store
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
 SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
-AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
+HOLD_LABELS = {"no-agent", "agent:hold"}
+AUTO_SKIP_LABELS = {*HOLD_LABELS, "duplicate", "invalid", "wontfix",
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
 PER_SOURCE = 50
@@ -103,6 +104,7 @@ class Candidate:
     updated: str
     in_sprint: bool | None = None
     parent: str = ""
+    on_hold: bool = False
 
 
 @dataclass
@@ -185,7 +187,8 @@ class JiraSource(Source):
             f = i.get("fields") or {}
             if tracker.LABEL not in (f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
-                                     f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or ""))
+                                     f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or "",
+                                     on_hold=not HOLD_LABELS.isdisjoint(f.get("labels") or [])))
         if self.jira_cfg.sprint_only:
             scoped = {i["key"] for i in client.search(f"{mine} AND ({SPRINT_JQL}) ORDER BY updated DESC", ["updated"],
                                                       limit=PER_SOURCE)}
@@ -264,7 +267,7 @@ class GitHubSource(Source):
             if names & SKIP_LABELS or not tk.by_owner(i):
                 continue
             out.append(Candidate(f"{tk.repo.name}#{i['number']}", str(i["number"]), i["title"].strip(),
-                                 i.get("url", ""), i.get("updatedAt") or ""))
+                                 i.get("url", ""), i.get("updatedAt") or "", on_hold=bool(names & HOLD_LABELS)))
         return out
 
     def ticket(self, c: Candidate) -> TicketText:
@@ -569,7 +572,11 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     prune_records()
     triaged.waiting += [r["ref"] for r in old.values() if r["source"] not in read
                         and (changed_policy or r["ref"] in retry)]
-    meta.update(refreshed=util.iso(), policy=policy, errors=errors, waiting=triaged.waiting,
+    previous_holds = meta.get("label_holds", {})
+    label_holds = {src.name: previous_holds.get(src.name, []) for src in srcs}
+    for source, candidates in read.items():
+        label_holds[source] = [c.ref for c in candidates if c.on_hold]
+    meta.update(refreshed=util.iso(), policy=policy, errors=errors, label_holds=label_holds, waiting=triaged.waiting,
                 failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
@@ -755,6 +762,8 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
         sent_row = {**r, "repo": repo.name, "route": src.route(repo.name)}
         now = read_send_ticket(src, r)
         require_send_revision(now, r)
+        if not HOLD_LABELS.isdisjoint(now.labels):
+            raise NotSendable(f"{ref} has a hold label. Release it on the tracker before sending.")
         screen_send(cfg, r, repo, sent_row, now)
         pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
         comment = answers_comment(pairs) if pairs else ""
