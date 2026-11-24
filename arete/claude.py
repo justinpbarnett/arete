@@ -246,10 +246,10 @@ def _run(
                 release_mount_lease()
                 on_line(line)
 
-            with ExitStack() as activation:
+            with sandbox.WorkerLease() as activation:
                 try:
                     cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts, activation_lease=activation)
-                    proc = child.stream(cmd, str(cwd), prompt, env, timeout, after_mounts)
+                    proc = child.stream(activation.command(cmd), str(cwd), prompt, env, timeout, after_mounts)
                 finally:
                     release_mount_lease()
     except sandbox.ConfinementUnavailable as e:

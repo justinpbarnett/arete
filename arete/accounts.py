@@ -22,7 +22,6 @@ CACHE_SECONDS = 300
 CACHE_SIZE = 128
 PI_SUBSCRIPTIONS = frozenset({"openai", "openai-codex", "github-copilot", "xai", "kimi-coding", "meta"})
 LOG = logging.getLogger(__name__)
-ENROLLMENT_WAIT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -240,7 +239,6 @@ def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = Fal
 def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigured: bool = False,
                     wait_for_activation: bool = False) -> bool:
     """Return true when the provider attempt should retry enrollment after its child exits."""
-    deadline = time.monotonic() + ENROLLMENT_WAIT_SECONDS if wait_for_activation else 0
     try:
         while True:
             try:
@@ -249,11 +247,12 @@ def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigure
             except secretstore.CredentialActivationBusy:
                 if not wait_for_activation:
                     return True
-                # Wait outside the SQLite transaction so the running worker can finish.
-                with secretstore.credential_activation(publishing=True, deadline=deadline):
-                    pass
-                if time.monotonic() >= deadline:
+                if db.in_write():
                     raise
+                with secretstore.credential_activation(publishing=True, deadline=float("inf")):
+                    pass
     except (OSError, secretstore.StoreMissing) as error:
+        if wait_for_activation:
+            raise
         LOG.warning("Could not record a resolved account (%s)", type(error).__name__)
         return False

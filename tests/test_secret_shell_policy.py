@@ -6,6 +6,11 @@ class AuthoritySecretShellPolicyTests(_SecretChildCase):
         self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
 import subprocess
 
+searches = (
+    "awk '/security/ { count++ } END { print count + 0 }'",
+    "sed -n '/security/,+3p'",
+    "sed -n '/security/,/^$/p'",
+)
 arithmetic = {
     "printf '%s\\n' $((((2 << 3) >> 1) + $((1 << 1))))": '10\n',
     "(( counter = (2 << 3) >> 1 )); printf '%s\\n' \"$counter\"": '8\n',
@@ -16,6 +21,7 @@ for command, output in arithmetic.items():
     assert result.stdout == output, command
 
 for command in (
+    *(f'{search} README.md' for search in searches),
     "sed -n '/security/p' README.md",
     "bash -lc \"sed -n '/security/p' README.md\"",
     "printf '%s\\n' ';' 'security' '$(security)' '`security`'",
@@ -41,6 +47,14 @@ for command in (
               mock.patch.object(pi_shell.Shell, 'profile', side_effect=RuntimeError('admitted'))):
             with case.assertRaisesRegex(RuntimeError, 'admitted'):
                 shell.execute({'command': command}, Event())
+for search in searches:
+    assert codex.keychain_refusal(f'{search} -f program') == guard.reach('security keychain items'), search
+    command = f"{search} {paths.CONFIG_DIR / 'config.toml'}"
+    assert check('Bash', command=command) == 'deny', command
+    assert 'config.toml' in codex_check(command), command
+    with mock.patch.object(pi_shell.Shell, 'profile', side_effect=AssertionError('denial required')):
+        with case.assertRaisesRegex(ValueError, r'config\.toml'):
+            shell.execute({'command': command}, Event())
 assert codex.KeychainShell(r"pre$'it\'s\040ok\q'post").word(0) == "preit's ok\\qpost"
 """)
 

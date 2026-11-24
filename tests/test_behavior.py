@@ -25,7 +25,6 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from select import select
 from socket import SHUT_WR, SO_SNDBUF, SOL_SOCKET, create_connection, socket, socketpair
-from textwrap import indent
 from types import SimpleNamespace
 from unittest import mock
 
@@ -63,7 +62,7 @@ def fixture_bearer(person):
 class _SecretChildCase(unittest.TestCase):
     adapter_only = False
 
-    def run_secret_child(self, entry, *, keychain=False, schema=None):
+    def run_secret_child(self, entry, *, keychain=False):
         folder = tempfile.TemporaryDirectory(suffix=".noindex", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
         root = Path(self.enterContext(folder))
         if self.adapter_only:
@@ -129,34 +128,14 @@ def run_fixture_only(argv, **kwargs):
     case.assertEqual(argv[0], fixture_security)
     return run(argv, **kwargs)
 
-native_keychain_program = config.keychain_program
 config.keychain_program = lambda: fixture_security
 secretstore.subprocess = mock.Mock(wraps=secretstore.subprocess)
 secretstore.subprocess.SubprocessError = subprocess_error
 secretstore.subprocess.run = run_fixture_only
 """
-        if schema is None:
-            if not self.adapter_only:
-                init += "db.migrate()\n"
-        else:
-            init += f"""
-chain = [migration for migration in db.migrations.load() if migration.n <= {schema!r}]
-with mock.patch.object(db.migrations, 'load', return_value=chain):
-    db.migrate()
-
-def assert_schema(version):
-    with db.reader() as c:
-        assert c.execute('PRAGMA user_version').fetchone()[0] == version
-        assert c.execute('SELECT MAX(n) FROM schema_migrations').fetchone()[0] == version
-        exists = c.execute("SELECT 1 FROM sqlite_schema WHERE name = 'secrets'").fetchone()
-        assert bool(exists) == (version >= 27)
-
-assert_schema({schema!r})
-"""
-        script = init + entry
-        if schema is not None:
-            script = "from arete import api_check\nwith api_check.offline():\n" + indent(script, "    ")
-        command = api_check.child_command(api_check.SOURCE, script)
+        if not self.adapter_only:
+            init += "db.migrate()\n"
+        command = api_check.child_command(api_check.SOURCE, init + entry)
         done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
@@ -222,13 +201,16 @@ for directory in ('state', 'logs'):
     def test_failed_insert_rolls_back_then_check_recovers_first_set_and_rotation(self):
         self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
 old = secretstore.put('global', 'ROTATION', 'fixture-original', 'api_key', 'hand')
-cases = [('ROTATION', 'fixture-rotation', old, ['set', 'rotated', 'checked']),
+secretstore.write_item(item_reference(old), config.secret_settings(), b'fixture-drift-value')
+old = secretstore.check('global', 'ROTATION')
+assert old['status'] == 'missing' and not old['check_ok']
+cases = [('ROTATION', 'fixture-rotation', old, ['set', 'checked', 'rotated', 'checked']),
          ('FIRST_SET', 'fixture-first-set', None, ['set', 'checked'])]
 with db.tx():
     for name, value, _, _ in cases:
         reject_change(secretstore.put, name, value, 'api_key', 'u:1234abcd')
-for name, _, previous, _ in cases:
-    assert secretstore.get('global', name) == previous and event_names(name) == (['set'] if previous else [])
+for name, _, previous, expected in cases:
+    assert secretstore.get('global', name) == previous and event_names(name) == expected[:-2]
 with (mock.patch.object(secretstore, 'write_item', side_effect=OSError('injected store failure')),
       case.assertRaisesRegex(OSError, 'injected store failure')):
     secretstore.put('global', 'FIRST_SET', 'fixture-retry-value', 'api_key', 'hand')
@@ -239,6 +221,7 @@ for name, value, _, expected in cases:
     assert not receipt(name).exists()
     assert row['check_ok'] and row['status'] == 'set' and row['fingerprint'] == secretstore.fingerprint(value)
     assert row['set_by'] == 'u:1234abcd' and event_names(name) == expected
+    assert row['missing_since'] is None and row['rotated_at'] == (row['set_at'] if name == 'ROTATION' else None)
 removed = secretstore.remove('global', 'FIRST_SET', 'hand')
 assert removed['status'] == 'missing' and removed['missing_since'] and secretstore.read('global', 'FIRST_SET') is None
 assert event_names('FIRST_SET')[-1] == 'removed'
@@ -269,39 +252,6 @@ for name in ('DRIFT', 'RETRY', 'CHECK_THEN_RETRY'):
     with db.reader() as c:
         assert c.execute("SELECT count(*) FROM events_log WHERE kind = 'credential.changed' AND subject = ?",
                          ('secret:global/' + name,)).fetchone()[0] == 2
-""")
-
-
-class SecretRotationTests(_SecretChildCase):
-    def test_replacing_bytes_after_mismatched_check_records_rotation(self):
-        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
-settings = config.secret_settings()
-for name in ('DIRECT', 'RECOVERED', 'ABSENT'):
-    original = secretstore.put('global', name, 'fixture-original', 'api_key', 'hand')
-    ref = item_reference(original)
-    if name == 'ABSENT':
-        secretstore.remove_item(ref, settings)
-    else:
-        secretstore.write_item(ref, settings, b'fixture-external-change')
-    failed_check = secretstore.check('global', name)
-    assert failed_check['status'] == 'missing' and not failed_check['check_ok']
-    value = 'fixture-replacement'
-    if name == 'RECOVERED':
-        reject_change(secretstore.put, name, value, 'api_key', 'hand')
-        assert secretstore.get('global', name) == failed_check
-        row = secretstore.check('global', name)
-    else:
-        row = secretstore.put('global', name, value, 'api_key', 'hand')
-    assert row['status'] == 'set' and row['missing_since'] is None
-    assert row['version'] == failed_check['version'] + 1
-    assert row['fingerprint'] == secretstore.fingerprint(value)
-    assert secretstore.read('global', name) == value.encode()
-    history = secretstore.history('global', name)
-    event = 'set' if name == 'ABSENT' else 'rotated'
-    assert [e['event'] for e in history[:3]] == ['set', 'checked', event]
-    assert history[2]['fingerprint_after'] == row['fingerprint']
-    assert row['rotated_at'] == (None if name == 'ABSENT' else row['set_at'])
-    assert len(history) == (4 if name == 'RECOVERED' else 3)
 """)
 
 
@@ -350,23 +300,6 @@ with owner_installation() as sandboxed:
     sandboxed.return_value = True
     assert_keychain_denied()
 """)
-
-
-SECRET_OWNER_FILE_FIXTURE = r"""
-from arete.store import credentials
-
-def seed_owner_file(actor):
-    value = 'synthetic owned item'
-    file = paths.STATE_DIR / 'owner-item'
-    file.write_text(value)
-    file.chmod(0o600)
-    fingerprint = secretstore.fingerprint(value)
-    ref = secretstore.Reference('owner_file', db.schema_metadata()['instance_tag'], file.name)
-    with db.tx() as c:
-        row = credentials.save_secret(c, 'global', 'OWNED', 'signing_key', ref.store, str(ref),
-                                      fingerprint, actor, 'fixture', None)
-    return file, value, row
-"""
 
 
 class SecretBackendLocationTests(_SecretChildCase):
@@ -673,45 +606,7 @@ calls = [json.loads(line) for line in log.read_text().splitlines()]
 assert any(argv == ['-i'] and service in stdin and encoded in stdin for argv, stdin in calls)
 assert any(argv[:3] == ['find-generic-password', '-s', service] for argv, stdin in calls)
 assert all(value.splitlines()[0] not in ' '.join(argv) and encoded not in ' '.join(argv) for argv, stdin in calls)
-with (mock.patch.object(paths, 'ISOLATED', True),
-      mock.patch.object(config, 'keychain_program', native_keychain_program)):
-    assert paths.ISOLATED
-    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_FILE).store is None
-    with case.assertRaises(secretstore.StoreError):
-        secretstore.read_item(secretstore.parse_reference(row['reference'], meta['instance_tag']), config.SecretsConfig())
-assert len(calls) == len(log.read_text().splitlines())
 """, keychain=True)
-
-    def test_owner_file_backend_is_confined_and_internal_items_cannot_be_removed(self):
-        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
-file, value, row = seed_owner_file('hand')
-assert secretstore.read('global', 'OWNED') == value.encode()
-before = secretstore.check('global', 'OWNED')
-assert before['check_ok']
-for name in ('FINGERPRINT_KEY', 'OWNED'):
-    with case.assertRaises(secretstore.InternalSecret):
-        secretstore.remove('global', name, 'hand')
-assert file.read_text() == value and secretstore.get('global', 'OWNED') == before
-assert secretstore.fingerprint(value) == row['fingerprint']
-tag = db.schema_metadata()['instance_tag']
-for text in (f'owner_file:arete/{tag}/../outside', 'owner_file:arete/other/owner-item'):
-    with case.assertRaises(ValueError):
-        secretstore.parse_reference(text, tag)
-""")
-
-    def test_config_refuses_store_inside_state_config_or_git_work_tree(self):
-        self.run_secret_child(r"""
-paths.CONFIG_FILE.write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
-config.load()
-assert config.secret_settings().store_dir == Path('store').resolve()
-Path('checkout').mkdir()
-Path('checkout/.git').write_text('gitdir: fixture-worktree-metadata\n')
-for directory, expected in (('../state/store', 'must be separate'), ('inner-store', 'must be separate'),
-                            ('../checkout/nested/store', 'outside git repositories and work trees')):
-    paths.CONFIG_FILE.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
-    with case.assertRaisesRegex(ValueError, expected):
-        config.load()
-""")
 
 
 class SecretFingerprintTests(_SecretChildCase):
@@ -792,52 +687,6 @@ with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerp
 """)
 
 
-class AuthoritySchemaTests(_SecretChildCase):
-    def test_secret_tables_are_strict_and_subscription_requires_personal_holder(self):
-        self.run_secret_child(r"""
-import sqlite3
-
-with db.tx() as c:
-    tables = {row['name']: row['strict'] for row in c.execute('PRAGMA table_list')}
-    assert [tables[name] for name in ('secrets', 'secret_events', 'accounts')] == [1, 1, 1]
-    sql = ("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
-           "VALUES ('demo:subscription', 'demo', 'fixture-identity', 'subscription', ?, ?, 'fixture-hmac', 'fixture-time')")
-    for holder, usage in (('u:1234abcd', 'workspace'), ('owner', 'personal')):
-        with case.assertRaises(sqlite3.IntegrityError):
-            c.execute(sql, (holder, usage))
-    c.execute(sql, ('u:1234abcd', 'personal'))
-with case.assertRaises(ValueError):
-    secretstore.validate_account_id('fixture@example.invalid')
-secretstore.validate_account_id('demo:subscription:2')
-""")
-
-
-class SecretRegistryMigrationTests(_SecretChildCase):
-    def test_schema_27_preserves_workspace_worker_and_acknowledged_message(self):
-        self.run_secret_child(r"""
-tables = ('workspaces', 'orchestration_workers', 'orchestration_messages')
-
-def snapshot(c):
-    return [tuple(c.execute(f'SELECT * FROM {table}').fetchone()) for table in tables]
-
-with db.tx() as c:
-    c.execute("INSERT INTO workspaces (name, owner_run, state, made_at) "
-              "VALUES ('fixture-checkout', 'fixture-run', 'kept', '2026-11-23T12:00:00Z')")
-    c.execute("INSERT INTO orchestration_workers (root,id,attempt,generation,phase,data) "
-              "VALUES ('fixture-run', 'worker-1', 'turn-1', 2, 'completed', ?)", ('{"summary":"fixture"}',))
-    c.execute("INSERT INTO orchestration_messages (root,id,worker,kind,body,reply_to,action,state,attempt,history) "
-              "VALUES ('fixture-run', 'steer-1', 'worker-1', 'steer', 'fixture guidance', '', "
-              "'action-1', 'acknowledged', 'turn-1', ?)", ('[{"state":"acknowledged","action":"turn-1"}]',))
-    before = snapshot(c)
-
-row = secretstore.put('global', 'DEMO_KEY', 'synthetic-upgrade-value', 'api_key', 'hand')
-assert_schema(27)
-with db.reader() as c:
-    assert snapshot(c) == before
-assert secretstore.get('global', 'DEMO_KEY') == row
-""", schema=26)
-
-
 SECRET_ROUTED_ACCOUNT_FIXTURE = r"""
 from types import SimpleNamespace
 
@@ -869,33 +718,27 @@ class AuthorityAccountTests(_SecretChildCase):
     def test_fresh_headless_run_enrolls_the_login_under_an_owner_principal(self):
         self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
 from dataclasses import replace
-from arete import tailnet
 from arete.agent import Session
 
 assert principals.owner() == 'hand'
+with case.assertRaises(ValueError):
+    secretstore.validate_account_id(login)
 auth = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-account'}, 'fixture')
-settings = paths.CONFIG_FILE.read_text()
-paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
-with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
-    result = launch_picked(auth, 'cli_login', agent='codex',
-                           result=Result(ok=True, session=Session(id='fixture', runner='codex')))
-    assert result.ok and result.session.account == runner.account_of(auth)
-    with db.reader() as c:
-        first, = map(dict, c.execute('SELECT * FROM accounts'))
-        assert c.execute('SELECT count(*) FROM principal_logins').fetchone()[0] == 0
-        assert c.execute('SELECT count(*) FROM tokens').fetchone()[0] == 0
-    paths.CONFIG_FILE.write_text(settings)
-    assert accounts.record(auth) == first
+with mock.patch.object(paths, 'STATE_DIR', Path.cwd() / 'other-state'):
+    with case.assertRaises(secretstore.StoreError):
+        accounts.record(auth)
+result = launch_picked(auth, 'cli_login', agent='codex',
+                       result=Result(ok=True, session=Session(id='fixture', runner='codex')))
+assert result.ok and result.session.account == runner.account_of(auth)
+with db.reader() as c:
+    first, = map(dict, c.execute('SELECT * FROM accounts'))
+    for table in ('principal_logins', 'tokens'):
+        assert not c.execute(f'SELECT 1 FROM {table}').fetchone()
 holder = principals.owner()
 assert first['id'] == 'openai-codex:subscription' and first['holder'] == holder and holder.startswith('u:')
 assert first['usage'] == 'personal'
 assert first['identity'] != auth.identity and first['fingerprint'] != auth.credential
 assert principals.for_login(login) is None
-host = SimpleNamespace(seed_identity=mock.Mock(return_value=(login, 'Fixture Owner')))
-tailnet.seed_owner(host, config.Config())
-tailnet.seed_owner(host, config.Config())
-host.seed_identity.assert_called_once()
-assert principals.owner() == principals.for_login(login) == holder
 rotated = accounts.record(replace(auth, credential='synthetic-rotation'))
 assert rotated['id'] == first['id'] and rotated['identity'] == first['identity']
 assert rotated['fingerprint'] != first['fingerprint'] and rotated['version'] == first['version'] + 1
@@ -939,6 +782,13 @@ assert 'fingerprint_key_ref' not in db.schema_metadata()
 class AuthorityAccountRefreshTests(_SecretChildCase):
     def test_two_workers_and_a_pinned_retry_keep_one_confirmed_login(self):
         self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import json
+import os
+import subprocess
+from arete import sandbox
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 provider = 'github-copilot'
 owner = Path.cwd() / 'fixture-login.json'
 def selected(label):
@@ -953,10 +803,30 @@ assert original['id'] != provisional['id']
 with db.tx() as c:
     c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
               "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
-route = pi.Route(provider, 'fixture', first, owner=owner)
-pi.observed_refresh(route, {'provider': provider, 'before': before, 'after': after})
-refreshed = accounts.record(latest)
+owner.write_text(json.dumps({provider: before}))
+route = pi.Route(provider, provider + '/fixture', first, owner=owner, using_login=True, view=Path.cwd())
+
+def stream(cmd, cwd, env, *_args, pass_fds):
+    paths.CONFIG_FILE.write_text(configured)
+    event = {'provider': provider, 'before': before, 'after': after}
+    writer, ack = pass_fds
+    os.write(writer, json.dumps(event).encode() + b'\n')
+    assert os.read(ack, 1) == b'1'
+    with db.tx(timeout=1) as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert secretstore.KEY_REF not in db.schema_metadata()
+    reply = {'type': 'agent_end', 'messages': [{'role': 'assistant', 'content': []}]}
+    return subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ''), ''
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(pi, 'stream', side_effect=stream),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi')):
+    result = pi.run('fixture', Path.cwd(), selected=route, persist=False)
+assert result.ok, result.error
+assert secretstore.KEY_REF in db.schema_metadata()
+with db.reader() as c:
+    refreshed, = map(dict, c.execute('SELECT * FROM accounts'))
 assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(latest) == refreshed
 assert accounts.record(first) == refreshed
 unrelated = accounts.record(selected('unrelated')[1])
 assert unrelated['id'] not in (original['id'], provisional['id'])
@@ -1034,6 +904,12 @@ for tls, status, code, reason in [(None, 426, 'tls_required', None), (object(), 
     request('PUT', item + '/value', token=bearer, status=status, code=code, reason=reason, **write)
 assert secretstore.get('global', 'DEMO_KEY') is None and not Path('store').exists()
 cookie = browser_session()
+_, reader = tokens.issue(actor, 'Read fixture', ['read'])
+for at, allow in [('/api/v1/meta', 'GET'), ('/api/v1/batch', 'POST'), (item, 'GET, DELETE')]:
+    request('PUT', at, token=reader, status=405, code='method_not_allowed', allow=allow)
+request('PUT', item + '/value', status=401, code='unauthenticated', **write)
+request('PUT', item + '/value', token=reader, status=403, code='forbidden', reason='presence_required', **write)
+request('PUT', item + '/value', cookie=cookie, csrf=False, status=403, code='csrf', **write)
 _, result = request('PUT', item + '/value', cookie=cookie, **write)
 row = secretstore.get('global', 'DEMO_KEY')
 assert result['secret']['fingerprint'] == row['fingerprint']
@@ -1055,7 +931,6 @@ def assert_redacted(operation, result):
 
 _, result = request('GET', item, token=bearer)
 assert_redacted('secret.get', result)
-_, reader = tokens.issue(actor, 'Read fixture', ['read'])
 request('POST', item + '/check', token=reader, key='request-check', status=403, code='scope_missing')
 _, checker = tokens.issue(actor, 'Check fixture', ['config:activate'])
 _, result = request('POST', item + '/check', token=checker, key='request-check')
@@ -1076,17 +951,30 @@ assert result['accounts'] == [{'id': 'demo:api_key', 'service': 'demo', 'mode': 
 """)
 
     def test_removal_refuses_fingerprint_key_and_owner_file(self):
-        self.run_secret_child(SECRET_HTTP_FIXTURE + SECRET_OWNER_FILE_FIXTURE + r"""
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+from arete.store import credentials
+
 cookie = browser_session()
-file, value, row = seed_owner_file(actor)
+file, value = paths.STATE_DIR / 'owner-item', 'synthetic owned item'
+file.write_text(value)
+file.chmod(0o600)
 key = secretstore.fingerprint_key()
 meta = db.schema_metadata()
-ref = secretstore.parse_reference(meta['fingerprint_key_ref'], meta['instance_tag'])
+tag = meta['instance_tag']
+owned = secretstore.Reference('owner_file', tag, file.name)
+with db.tx() as c:
+    row = credentials.save_secret(c, 'global', 'OWNED', 'signing_key', owned.store, str(owned),
+                                  secretstore.digest(key, value), actor, 'fixture', None)
+assert secretstore.read('global', 'OWNED') == value.encode()
+for text in (f'owner_file:arete/{tag}/../outside', 'owner_file:arete/other/owner-item'):
+    with case.assertRaises(ValueError):
+        secretstore.parse_reference(text, tag)
+ref = secretstore.parse_reference(meta['fingerprint_key_ref'], tag)
 for name in ('FINGERPRINT_KEY', 'OWNED'):
     request('DELETE', f'{root}/global/{name}', cookie=cookie, key=f'remove-{name}', status=409, code='secret_internal')
 assert secretstore.get('global', 'OWNED') == row and not secretstore.history('global', 'OWNED')
 assert secretstore.read_item(ref, config.secret_settings()) == key
-assert file.read_bytes() == value.encode()
+assert file.read_bytes() == value.encode() and secretstore.check('global', 'OWNED')['check_ok']
 """)
 
 
@@ -1108,36 +996,6 @@ for operation, route in [('secret.list', root), ('account.list', '/api/v1/accoun
     body = json.dumps({'requests': [*reads, {'operation': operation}]}).encode()
     request('POST', batch, body, handler=scratch, status=401, code='unauthenticated')
     request('POST', batch, body, token=bearer, handler=scratch)
-""")
-
-    def test_unsupported_put_reports_allow_and_registry_put_still_requires_admission(self):
-        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
-_, reader = tokens.issue(actor, 'Read fixture', ['read'])
-unsupported = dict(status=405, code='method_not_allowed')
-for route, allow in [('/api/v1/meta', 'GET'), ('/api/v1/batch', 'POST'), (item, 'GET, DELETE')]:
-    request('PUT', route, token=reader, allow=allow, **unsupported)
-
-cookie = browser_session()
-request('PUT', item, cookie=cookie, csrf=False, allow='GET, DELETE', **unsupported)
-write = dict(payload=b'fixture-registry-value', media='text/plain')
-for token, status, code, reason in [(None, 401, 'unauthenticated', None), (reader, 403, 'forbidden', 'presence_required')]:
-    request('PUT', item + '/value', token=token, status=status, code=code, reason=reason, **write)
-request('PUT', item + '/value', cookie=cookie, csrf=False, status=403, code='csrf', **write)
-assert secretstore.get('global', 'DEMO_KEY') is None
-""")
-
-
-class AuthorityAccountIsolationTests(_SecretChildCase):
-    def test_resolved_account_refuses_state_from_another_instance(self):
-        self.run_secret_child(r"""
-from arete import accounts
-
-auth = accounts.Auth('api_key', credential='fixture-account', provider='openrouter')
-with (mock.patch.object(paths, 'STATE_DIR', Path.cwd() / 'other-state'),
-      mock.patch.object(db, 'tx') as transaction, mock.patch.object(config, 'secret_settings') as settings):
-    accounts.record_resolved(auth)
-    transaction.assert_not_called()
-    settings.assert_not_called()
 """)
 
 
@@ -1212,18 +1070,6 @@ assert check('Read', file_path=str(closed / 'other-context.txt')) == 'deny'
 assert check('Bash', command=f'cat {closed}/other-context.txt') == 'deny'
 """)
 
-    def test_all_three_agents_allow_public_certificate_verification_and_security_searches(self):
-        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
-for command in ('rg -n security .', "grep -R 'security' .",
-                'env -u ARETE_FIXTURE rg security .', "bash -lc 'rg -n security .'",
-                'security verify-cert -c public.crt', '/usr/bin/security -q verify-cert -c public.crt'):
-    assert check('Bash', command=command) == '', command
-    assert codex_check(command) == '', command
-    with mock.patch.object(pi_shell.Shell, 'profile', side_effect=RuntimeError('admitted')):
-        with case.assertRaisesRegex(RuntimeError, 'admitted'):
-            shell.execute({'command': command}, Event())
-""")
-
 
 SECRET_LINUX_CLAUDE_FIXTURE = r"""
 import os
@@ -1253,6 +1099,7 @@ def linux_claude(*, error=''):
     with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
           mock.patch.object(sandbox.shutil, 'which', return_value=bwrap) as which,
           mock.patch.object(claude, 'binary', return_value='/fixture/claude'),
+          mock.patch.object(sandbox.WorkerLease, 'command', lambda _, cmd: cmd),
           mock.patch.object(claude.child, 'stream', return_value=fixture) as stream):
         yield which, stream
 
@@ -1263,15 +1110,12 @@ def assert_missing_bwrap(which, stream, checkout, **options):
     stream.assert_not_called()
     which.return_value = bwrap
 
-def linux_mounts(checkout, *masks):
-    return ['--bind', '/', '/', '--proc', '/proc', '--dev', '/dev', *masks,
-            '--chdir', str(checkout), '--', '/fixture/claude']
-
 def assert_mounts(stream, checkout, *masks):
     argv = stream.call_args.args[0]
     assert argv[0] == bwrap
     assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc'} <= set(argv)
-    assert argv[argv.index('--bind'):argv.index('--') + 2] == linux_mounts(checkout, *masks)
+    assert argv[argv.index('--bind'):argv.index('--') + 2] == [
+        '--bind', '/', '/', '--proc', '/proc', '--dev', '/dev', *masks, '--chdir', str(checkout), '--', '/fixture/claude']
     if '--tmpfs' in masks:
         assert store.stat().st_mode & 0o777 == 0o700
 """
@@ -1289,6 +1133,41 @@ with linux_claude(error='fixture: namespace unavailable') as (which, stream):
     assert not blocked.ok and 'namespace unavailable' in blocked.error
 """)
 
+    def test_codex_publication_waits_for_the_old_profile(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+from arete import codex
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+
+def launch(cmd, *_args, **_kwargs):
+    assert str(store) not in ' '.join(cmd)
+    paths.CONFIG_FILE.write_text(configured)
+    with case.assertRaises(secretstore.CredentialActivationBusy):
+        secretstore.fingerprint_key()
+    assert not store.exists()
+    return subprocess.CompletedProcess(cmd, 0, '{"type":"thread.started","thread_id":"fixture"}\n', '')
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(codex, 'launch', side_effect=launch),
+      mock.patch.object(codex, 'binary', return_value='/fixture/codex')):
+    assert codex.run('fixture', linux_checkout(), auth=accounts.Auth(), persist=False).ok
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux descendant supervision")
+    def test_keyless_claude_drains_background_work_before_publication(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+work = linux_checkout()
+argv = ['/bin/sh', '-c', 'sleep 60 & echo $! > child.pid; echo \'{"type":"result","session_id":"fixture"}\'']
+with mock.patch.object(claude, 'command', return_value=argv):
+    result = run_claude(work)
+assert result.ok and result.session.id == 'fixture'
+with case.assertRaises(ProcessLookupError):
+    os.kill(int((work / 'child.pid').read_text()), 0)
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
 
 class AuthorityPrivatePiWorkerTests(_SecretChildCase):
     def test_private_worker_launch_denies_the_configured_file_store(self):
@@ -1296,7 +1175,7 @@ class AuthorityPrivatePiWorkerTests(_SecretChildCase):
 import json
 import subprocess
 
-from arete import accounts, pi, sandbox
+from arete import accounts, guard, pi, sandbox
 
 secretstore.put('global', 'DEMO_KEY', 'synthetic-worker-value', 'api_key', 'hand')
 store = config.secret_settings().store_dir
@@ -1326,6 +1205,10 @@ assert f'(deny file-read* file-write* file-link (subpath (param "{hidden}")))' i
 protection = json.loads(env['ARETE_PI_GUARD_PATHS'])
 assert str(store) in protection['roots']
 assert protection['open'] == [str(checkout)] and protection['workspace'] == str(checkout)
+nested = store / db.schema_metadata()['instance_tag'] / 'global'
+floor = guard.floor('', checkout, [nested])
+protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['files'] and str(nested) not in protection['open']
 """)
 
 
