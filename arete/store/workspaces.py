@@ -96,6 +96,14 @@ def open_for(name: str) -> dict | None:
         return _decode(c.execute("SELECT * FROM workspaces WHERE name = ? AND state != 'removed'", (name,)).fetchone())
 
 
+def retained_rows(c) -> list[dict]:
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'workspaces' AND type = 'table'").fetchone():
+        return []
+    return [{**r, "held_by": json.loads(r["held_by"])} for r in c.execute(
+        "SELECT name, owner_run, state, kept_reason, made_at, bytes, last_sweep_error, held_by "
+        "FROM workspaces WHERE state IN ('kept', 'held') ORDER BY released_at, id")]
+
+
 def by_state(*states: str) -> list[dict]:
     require_workspace_contract()
     with reader() as c:
