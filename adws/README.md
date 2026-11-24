@@ -167,6 +167,11 @@ just adw-wait RUN2
 | `step` | a run of one step alone (`just adw-step`); look at that step's `step_end` |
 | `dry-run` | a dry run ended after `learn`, or after `document` when it is on |
 
+For an orchestrated run, open Actions in either dashboard to follow a worker ID through its attempts,
+question, delivery receipts, and integration. The controller answers worker questions. When it needs an
+owner decision, the ordinary answer and wait commands follow the successor run. The repository layer sets
+the builder ceiling for new lineages. [Worker communication and limits](../docs/orchestration.md)
+
 ## On a question
 
 Read `summary` and `question`. Answer only from what the person or the task already settled. When neither did, ask the person and pass their words on with `just adw-answer`. Never guess a requirement.

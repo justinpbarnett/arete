@@ -3,13 +3,16 @@
 const FEED_KEEP_LINES = 2000;
 let feedOf = { id: "", epoch: null, after: 0, lines: [] };
 let feedRequest = 0;
+let messagePage = { run: "", after: 0 };
 let sessionSending = false;
 const talkDrafts = new Map();
 
 async function loadRunDetail(id) {
   const request = ++feedRequest;
   if (feedOf.id !== id) feedOf = { id, epoch: null, after: 0, lines: [] };
-  const board = await call(`/api/runs/${encodeURIComponent(id)}`);
+  if (messagePage.run !== id) messagePage = { run: id, after: 0 };
+  const messages = messagePage.after ? `?messages_after=${messagePage.after}` : "";
+  const board = await call(`/api/runs/${encodeURIComponent(id)}${messages}`);
   if (board.lines_from === "feed") {
     let after = feedOf.id === id ? feedOf.after : 0;
     let data = await call(`/api/feed/${encodeURIComponent(id)}?after=${after}`);
@@ -62,10 +65,22 @@ function orchestrationDetail(board, place) {
     (result) => { if (result.run) go(detailHash("run", result.run), "action");
       return `Started ${action.id} alone. Dependent evidence must be refreshed before publication.`; }, { object: run });
   const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
+    && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
+    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return [el("h3", { text: "Orchestration" }),
     el("p", { text: `${data.mode} · ${data.decisions} decisions · ${data.launches} controller launches · generation ${data.generation}` }),
+    ...(data.capacity ? [
+      el("h4", { text: "Workers" }),
+      el("p", { text: `${data.capacity.active_builders} active builders · limit ${data.capacity.effective_builders} (${data.capacity.configured_builders} configured)` }),
+      table("", [["Worker"], ["Current attempt"], ["State"], ["Question or disposition"]], data.workers.map(w =>
+        el("tr", {}, cell(w.id), cell(w.attempt), cell(w.phase), cell(w.reason || w.question || ""))), { stack: true }),
+      ...data.messages.map(m => foldText(`message:${run.id}:${m.id}`, `${m.kind} · ${m.worker} · ${m.state}`,
+        [m.body, m.id, m.reply_to, ...m.history.map(e => `${e.at}  ${e.state}  ${e.action}`)].filter(Boolean).join("\n"))),
+      ...(data.more_messages || messagePage.after ? [button(data.more_messages ? "Next messages" : "First messages",
+        "message-page", () => { messagePage.after = data.more_messages ? data.message_cursor : 0; refresh(); })] : []),
+    ] : []),
     table("", [["Action"], ["Operation"], ["State"], ["Result"], [""]], data.actions.map((a) => el("tr", {},
       cell(a.id), cell(a.op), cell(a.state),
       cell(foldText(`action:${run.id}:${a.id}`, "Inspect result and requested settings", JSON.stringify({ request: a.request, result: a.result }, null, 2))),

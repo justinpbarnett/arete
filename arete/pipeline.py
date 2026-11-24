@@ -2073,7 +2073,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 with handoff_io():
                     run.dir.mkdir(parents=True, exist_ok=True)
                     run_lines.write(run.id, "execution", path=run.path or "classic",
-                                    protocol=1 if run.path == "orchestrate" else 0,
+                                    **({} if run.path == "orchestrate" else {"protocol": 0}),
                                     **({"environment_release": run.environment_release} if run.environment_release else {}))
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                 if not zte_grant:
