@@ -943,6 +943,53 @@ assert not receipt(name).exists()
 """)
 
 
+class RegistryUncommittedPublicationTests(_SecretChildCase):
+    def test_read_agrees_with_committed_metadata_after_a_rolled_back_rotation(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'SAMPLE', 'sample-original', 'api_key', 'hand')
+reject_change(secretstore.put, 'SAMPLE', 'sample-replacement', 'api_key', 'u:operator')
+assert secretstore.get('global', 'SAMPLE') == row
+assert secretstore.read('global', 'SAMPLE') is None
+assert event_names('SAMPLE') == ['set']
+assert secretstore.check('global', 'SAMPLE')['check_ok']
+assert secretstore.read('global', 'SAMPLE') == b'sample-replacement'
+assert event_names('SAMPLE') == ['set', 'rotated', 'checked']
+""")
+
+    def test_a_pending_first_set_preserves_lost_key_evidence_across_all_addresses(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+read = secretstore.read_item
+def missing_key(ref, settings, **kwargs):
+    return None if ref.item == secretstore.KEY_ITEM else read(ref, settings, **kwargs)
+
+with (mock.patch.object(secretstore, 'read_item', side_effect=missing_key),
+      mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('unexpected replacement'))):
+    for operation in (secretstore.fingerprint_key,
+                      lambda: secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'hand')):
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            operation()
+assert receipt('FIRST').read_bytes() == before and not receipt('SECOND').exists()
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+""")
+
+    def test_switching_file_directories_before_the_first_commit_preserves_the_original_journal(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+other = Path.cwd() / 'alternate-store'
+settings = config.SecretsConfig(store='pve_store', store_dir=other)
+with mock.patch.object(config, 'secret_settings', return_value=settings):
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'u:operator')
+assert not other.exists() and receipt('FIRST').read_bytes() == before
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+assert secretstore.check('global', 'FIRST')['check_ok']
+assert secretstore.read('global', 'FIRST') == b'sample-original'
+""")
+
+
 class RegistryKeyContinuityTests(_SecretChildCase):
     def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
         self.run_secret_child(r"""
@@ -1804,6 +1851,43 @@ class _WorkspaceChildCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class WorkspaceRollbackProtocolTests(_WorkspaceChildCase):
+    def test_bridge_keeps_legacy_writes_until_a_fresh_process_observes_the_contract(self):
+        self.run_child(r"""
+import subprocess
+import sys
+
+db.migrate()
+with db.one_read() as conn:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+workspaces.create("parked", state="held", held_by=["operator-note"], kept_reason="operator")
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir(exist_ok=True)
+contract = db.migrations.load()[-1]
+with db.tx() as conn:
+    contract.apply(conn, legacy)
+    conn.execute("INSERT INTO schema_migrations (n,name,area,phase,sha256,applied,backup,seconds) "
+                 "VALUES (?,?,?,?,?,?,'',0)", (contract.n, contract.name, contract.area, contract.phase,
+                                                  contract.sha256, util.iso()))
+    conn.execute("UPDATE schema_meta SET value = '28' WHERE key = 'schema_version'")
+    conn.execute("PRAGMA user_version = 28")
+with case.assertRaises(db.IncompatibleSchema):
+    db.migrate()
+
+code = '''from arete import workspace
+from arete.store import db, workspaces
+assert db.LATEST == 28 and not db.migrate()
+assert workspace.held_summary()["rows"][0]["names"] == ["operator-note"]
+row = workspaces.open_for("parked")
+assert workspaces.change(row, kept_reason="retained after rollback")["version"] == row["version"] + 1
+'''
+result = subprocess.run([sys.executable, "-IB", "-c",
+                         "import sys; sys.path.insert(0, sys.argv[1]); " + code, str(paths.PACKAGE_DIR.parent)],
+                        text=True, capture_output=True, timeout=5)
+assert result.returncode == 0, result.stderr
+""")
+
+
 class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
     def test_owner_rows_match_legacy_records_and_single_step_keeps_owner(self):
         self.run_child(r"""
@@ -2236,7 +2320,7 @@ assert not ws.exists() and not registered(clean.wt)
 
 
 class WorkspaceSweepErrorTests(_WorkspaceChildCase):
-    def test_sweep_errors_count_kept_and_released_workspaces_as_blocked(self):
+    def test_sweep_retries_kept_and_released_workspaces_after_errors(self):
         self.run_child(WORKSPACE_REPO + r"""
 kept, kept_checkout, _, kept_id = checkout("7", "done")
 workspaces.keep(kept, "done")
@@ -2248,13 +2332,14 @@ workspaces.release(released, [c])
 util.git(["worktree", "lock", str(released)], src)
 workspaces.sweep(cfg)
 summary = workspace.held_summary()
-assert summary["blocked"] == 2, summary
-entries = {entry["name"]: entry for entry in summary["rows"]}
-for ws, wid, state, error in ((kept, kept_id, "kept", "index"), (released, released_id, "released", "locked")):
+assert summary["blocked"] == 0, summary
+entry, = summary["rows"]
+assert entry["name"] == kept.name and not entry["blocked"]
+assert entry["why"] == workspaces.get(kept_id)["last_sweep_error"]
+for wid, state, error in ((kept_id, "kept", "index"), (released_id, "released", "locked")):
     row = workspaces.get(wid)
-    entry = entries[ws.name]
     assert row["state"] == state and row["sweep_attempts"] == 1, row
-    assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+    assert error in row["last_sweep_error"], row
 
 index.write_bytes(original_index)
 util.git(["worktree", "unlock", str(released)], src)
@@ -2283,16 +2368,18 @@ def sweep():
 
 def check_failures(error):
     summary = dashboard.get_health(None, [], {})["workspaces"]["rows"]
-    assert summary["blocked"] == len(rows), summary
+    assert summary["blocked"] == 0, summary
     entries = {entry["name"]: entry for entry in summary["rows"]}
     for ws, wid, state in rows:
         row = workspaces.get(wid)
         assert row["state"] == state and row["sweep_attempts"] == 1 and row["last_sweep_at"], row
-        entry = entries[ws.name]
-        assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        if state == "kept":
+            entry = entries[ws.name]
+            assert not entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        else:
+            assert ws.name not in entries
         assert ws.is_dir() and registered(ws)
-    check = heartbeat.check_workspaces()[0]
-    assert not check.ok and f"{len(rows)} blocked" in check.detail and error in check.detail, check
+    assert heartbeat.check_workspaces()[0].ok
 
 def check_retry():
     sweep()
@@ -2447,7 +2534,7 @@ workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "released" and row["sweep_attempts"] == 1
 assert "locked" in row["last_sweep_error"] and registered(ws), row
-assert not heartbeat.check_workspaces()[0].ok
+assert heartbeat.check_workspaces()[0].detail == "none held"
 
 util.git(["worktree", "unlock", str(ws)], src)
 workspaces.sweep(cfg)
@@ -3023,6 +3110,103 @@ with scratch_records():
     util.git(["worktree", "unlock", str(ws)], src)
     workspaces.sweep(cfg)
     assert workspaces.get(wid)["state"] == "removed" and not registered(ws), workspaces.get(wid)
+""")
+
+
+class WorkspaceHealthSummaryTests(_WorkspaceChildCase):
+    def test_summary_reads_kept_and_held_without_writes(self):
+        self.run_child(r"""
+from arete import heartbeat
+
+db.migrate()
+assert heartbeat.check_workspaces() == [heartbeat.Check("workspaces:held", True, "none held", "warn")]
+older, newer = "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"
+workspaces.create("obstructed", state="held", bytes=3_000_000, made_at=newer,
+                  held_by=["manual.txt"], last_sweep_error="cannot inspect checkout")
+workspaces.create("retained", state="kept", bytes=2_000_000, made_at=older, kept_reason="operator")
+workspaces.create("released", state="released", bytes=8_000_000, made_at=older, last_sweep_error="locked")
+
+connect = db.connect_db
+def readonly(path, readonly=False, **kwargs):
+    assert readonly, "workspace health opened a writable connection"
+    return connect(path, readonly=readonly, **kwargs)
+
+with (patch.object(db, "migrate_on_demand", side_effect=AssertionError("health must not migrate")),
+      patch.object(db, "connect_db", side_effect=readonly) as opened):
+    summary = workspace.held_summary()
+    assert opened.called
+assert summary == dict(count=2, bytes=5_000_000, oldest=older, oldest_name="retained", blocked=1, rows=[
+    dict(name="retained", path=str(paths.WORKTREES_DIR / "retained"), run="", status="operator",
+         since=older, bytes=2_000_000, blocked=False, why="operator", names=[]),
+    dict(name="obstructed", path=str(paths.WORKTREES_DIR / "obstructed"), run="", status="",
+         since=newer, bytes=3_000_000, blocked=True, why="cannot inspect checkout", names=["manual.txt"]),
+]), summary
+
+for row in workspaces.by_state("held"):
+    workspaces.change(row, state="removed")
+with patch.object(util, "now", return_value=util.parse_iso(newer)):
+    assert heartbeat.check_workspaces() == [heartbeat.Check(
+        "workspaces:held", True, "1 held, 2 MB, oldest 24 h ago (retained)", "warn")]
+""")
+
+    def test_heartbeat_reads_schema_24_workspace_without_migrating(self):
+        self.run_child(workspace_schema() + r"""
+from arete import heartbeat
+
+t = util.iso(util.parse_iso("2026-01-01T00:00:00+00:00"))
+rid = record.start("pipeline", started=t, finished=t, status="failed")
+with db.tx() as c:
+    c.execute("INSERT INTO workspaces (name, state, kept_reason, owner_run, made_at) VALUES (?,?,?,?,?)",
+              ("saved", "kept", "failed", rid, t))
+
+connect = db.connect_db
+def readonly(path, readonly=False, **kwargs):
+    assert readonly, "standalone heartbeat opened a writable connection"
+    return connect(path, readonly=readonly, **kwargs)
+
+with (patch.object(db, "connect_db", side_effect=readonly),
+      patch.object(util, "now", return_value=util.parse_iso(t))):
+    assert heartbeat.check_workspaces() == [heartbeat.Check(
+        "workspaces:held", True, "1 held, 0 MB, oldest 0 h ago (saved)", "warn")]
+assert schema_version() == 24
+""")
+
+
+class WorkspaceScratchHealthTests(_WorkspaceChildCase):
+    def test_done_workspace_with_pending_scratch_warns_in_health(self):
+        self.run_child(WORKSPACE_REPO + WORKSPACE_FLOW + SCRATCH_RECORD + r"""
+from contextlib import ExitStack
+
+from arete import board, heartbeat
+
+with scratch_records(), ExitStack() as leases:
+    def finish(flow, ws):
+        write_workspace_output(ws, "before scratch settled")
+        root, lease = pending_scratch(ws, flow.ctx.run.id)
+        leases.callback(os.close, lease)
+        root.mkdir()
+        return flows.finish(flow, "done", summary="finished with scratch pending")
+
+    code, ws, run = run_local_workflow(finish)
+    assert code == 0 and run["status"] == "done", (code, run)
+    row = workspaces.open_for(ws.name)
+    assert row["state"] == "held" and any(name.startswith(paths.SCRATCH_PREFIX) for name in row["held_by"]), row
+    with (patch.object(util, "now", return_value=util.parse_iso(run["finished"])),
+          patch.object(board.control, "serve_beat", return_value={}),
+          patch.object(board.control, "fleet", return_value=[])):
+        blocked_by = ", ".join(row["held_by"])
+        detail = f"1 held, {heartbeat.size_words(row['bytes'])}, oldest 0 h ago ({ws.name})"
+        checks = heartbeat.check_workspaces()
+        assert checks == [heartbeat.Check(
+            "workspaces:held", False, f"{detail}; 1 blocked: {ws.name}: held by {blocked_by}", "warn")], checks
+        panel = board.health_board()["workspaces"]
+        assert panel["held"] == 1, panel
+        panel = panel["rows"]
+        assert panel["count"] == panel["blocked"] == 1, panel
+        entry, = panel["rows"]
+        assert (entry["name"], entry["run"], entry["status"], entry["since"], entry["names"]) == (
+            ws.name, run["id"], "done", run["finished"], row["held_by"]), entry
+        assert entry["why"] == f"workspace removal blocked ({blocked_by})", entry
 """)
 
 

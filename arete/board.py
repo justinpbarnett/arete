@@ -351,11 +351,14 @@ def incident_board(text: str) -> dict:
                 "cancel": oncall.live_repair(r) is not None}}}
 
 
-def health_board() -> dict:
+def health_board(*, include_held: bool = True) -> dict:
     beat = control.serve_beat()
     found = checks_and_alerts()
+    workspaces = panel(workspace.held_summary)
+    if include_held and "rows" in workspaces:
+        workspaces["held"] = workspaces["rows"]["count"]
     return {**found, "now": util.iso(), "serve": beat, "state": health_word(beat, found),
-            "devices": panel(control.fleet), "workspaces": panel(workspace.held_summary)}
+            "devices": panel(control.fleet), "workspaces": workspaces}
 
 
 def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:

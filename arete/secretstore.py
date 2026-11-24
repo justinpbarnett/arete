@@ -30,6 +30,8 @@ SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
 ACL_TYPE_EXTENDED = 0x100
 KEY_REF = "fingerprint_key_ref"
+KEY_PROOF = "fingerprint_key_proof"
+KEY_STORE_DIR = "fingerprint_key_store_dir"
 KEY_LOCAL = "fingerprint_key_local"
 REGISTRY_SYNC = "secret_registry_sync"
 
@@ -152,12 +154,6 @@ def require_store(settings: config.SecretsConfig) -> None:
         raise StoreMissing("secret_store_missing")
 
 
-def store_settings():
-    settings = config.secret_settings()
-    require_store(settings)
-    return settings
-
-
 def migrate_registry():
     db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
 
@@ -211,13 +207,17 @@ def require_writable_entry(parent: int, name: str) -> None:
     require_exact_entry(parent, name, writing=True)
 
 
-@contextmanager
-def file_parent(path: Path, root: Path, *, create=False, private=False, durable=False):
+def confined_directory(root: Path, *, create=False, durable=False):
     if paths.ISOLATED and (paths.confined(root) is None or
                            paths.scratch_root(root) != paths.scratch_root(paths.STATE_DIR)):
         raise StoreError("secret item must stay inside the instance's scratch folder")
+    return paths.directory_fd(root, create=create, durable=durable)
+
+
+@contextmanager
+def file_parent(path: Path, root: Path, *, create=False, private=False, durable=False):
     durable = create or durable
-    with paths.directory_fd(root, create=create, durable=durable) as fd, ExitStack() as stack:
+    with confined_directory(root, create=create, durable=durable) as fd, ExitStack() as stack:
         parent = path.parent.relative_to(root)
         if private:
             require_private_directory(fd)
@@ -386,15 +386,51 @@ def checked_key(value: bytes | None) -> bytes:
     return value
 
 
-def referenced_key(meta, settings, *, expected_store=None):
-    ref = (Reference(expected_store, meta.get("instance_tag", ""), KEY_ITEM) if expected_store else
-           parse_reference(meta[KEY_REF], meta["instance_tag"]))
-    if ref.item != KEY_ITEM or ref.store == "owner_file" or (expected_store and str(ref) != meta[KEY_REF]):
-        raise FingerprintKeyMissing("invalid fingerprint key reference")
+def store_directory(ref, settings):
+    if ref.store == "pve_store" and settings.store_dir is not None:
+        return str(settings.store_dir.absolute())
+    return None
+
+
+def key_proof(key, ref, directory):
+    identity = json.dumps([str(ref), directory]).encode()
+    return hmac.digest(key, b"arete/fingerprint-key-provenance/v1\0" + identity, "sha256").hex()
+
+
+def checked_proof(proof):
+    if not isinstance(proof, str) or not re.fullmatch(r"[0-9a-f]{64}", proof):
+        raise FingerprintKeyMissing("fingerprint_key_missing")
+    return proof
+
+
+def verify_proof(expected, proof):
+    if not hmac.compare_digest(expected, checked_proof(proof)):
+        raise StoreError("fingerprint key does not match its recorded provenance")
+
+
+def verify_key_proof(key, ref, directory, proof):
+    verify_proof(key_proof(key, ref, directory), proof)
+
+
+def referenced_key(meta, settings):
+    if settings.store is None or KEY_PROOF not in meta or KEY_STORE_DIR not in meta:
+        raise FingerprintKeyMissing("fingerprint_key_missing")
+    ref = parse_reference(meta[KEY_REF], meta["instance_tag"])
+    if ref.item != KEY_ITEM or ref.store == "owner_file":
+        raise FingerprintKeyMissing("fingerprint_key_missing")
+    if ref.store != settings.store:
+        raise StoreError("fingerprint key belongs to a different store backend")
+    directory = store_directory(ref, settings)
+    if ref.store == "pve_store" and directory is None:
+        raise FingerprintKeyMissing("fingerprint_key_missing")
+    if meta[KEY_STORE_DIR] != (directory or ""):
+        raise StoreError("fingerprint key belongs to a different store directory")
     try:
-        return checked_key(read_item(ref, settings))
+        key = checked_key(read_item(ref, settings))
     except StoreMissing:
         raise FingerprintKeyMissing("fingerprint_key_missing") from None
+    verify_key_proof(key, ref, directory, meta[KEY_PROOF])
+    return key
 
 
 @contextmanager
@@ -402,7 +438,8 @@ def credential_activation(*, publishing: bool = False, wait: bool = False, state
     if sys.platform != "linux":
         yield
         return
-    with paths.directory_fd(state or paths.STATE_DIR.resolve(), create=True) as parent:
+    root = state or (paths.STATE_DIR if paths.ISOLATED else paths.STATE_DIR.resolve())
+    with confined_directory(root, create=True) as parent:
         launch_lease.private_directory(parent)
         with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
             if not publishing or wait:
@@ -454,15 +491,27 @@ def retire_committed_local_key(local: Path) -> None:
 
 
 def retire_local_key(local, settings, reference=None, *, wait_for_writer=False):
-    def matches(c):
-        current = db.metadata(c).get(KEY_REF)
-        return local.exists() and current and (reference is None or reference == current)
+    key = None
 
-    def unlink(c):
+    def matches(c):
+        nonlocal key
+        meta = db.metadata(c)
+        current = meta.get(KEY_REF)
+        if not local.exists() or not current or (reference is not None and reference != current):
+            return False
+        try:
+            active = config.secret_settings()
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+            return False
+        if active != settings:
+            return False
+        key = referenced_key(meta, active)
+        return read_file(local, local.parent) == key
+
+    def unlink(_c):
         with file_parent(local, local.parent) as parent:
             if sys.platform == "linux":
                 fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            key = referenced_key(db.metadata(c), settings, expected_store=settings.store)
             if read_file_at(parent, local.name) == key:
                 os.unlink(local.name, dir_fd=parent)
                 os.fsync(parent)
@@ -481,42 +530,163 @@ def retire_local_key(local, settings, reference=None, *, wait_for_writer=False):
         return
 
 
-def lookup_key(c, settings, local):
-    meta = db.metadata(c)
+def key_initialization_path(*, configured):
+    root = pending_root()
+    return root / ("key-store" if configured else "key-local"), root
+
+
+@dataclass(frozen=True)
+class KeyInitialization:
+    instance_id: str
+    reference: str | None = None
+    directory: str | None = None
+
+    @property
+    def identity(self):
+        return [self.instance_id, self.reference, self.directory]
+
+    @property
+    def location(self):
+        return key_initialization_path(configured=self.reference is not None)
+
+    def proof(self, key):
+        return hmac.digest(key, b"arete/fingerprint-key-initialization/v1\0" + json.dumps(self.identity).encode(),
+                           "sha256").hex()
+
+    def verify(self, value, proof):
+        key = checked_key(value)
+        verify_proof(self.proof(key), proof)
+        return key
+
+    def receipt(self, proof):
+        return json.dumps([self.identity, proof]).encode()
+
+    def pending(self):
+        raw = read_file(*self.location, private=True, durable=True)
+        if raw is None:
+            return None
+        try:
+            identity, proof = json.loads(raw)
+        except (ValueError, TypeError):
+            raise StoreError("invalid fingerprint key initialization receipt") from None
+        if identity != self.identity:
+            raise StoreError("pending fingerprint key initialization belongs to a different installation or store")
+        return checked_proof(proof)
+
+    def record(self, key):
+        proof = self.proof(key)
+        write_file(*self.location, self.receipt(proof), private=True)
+        return proof
+
+    def retire(self, key, binding):
+        location = self.location
+        try:
+            if not location[0].exists():
+                return
+        except OSError:
+            return
+        raw = self.receipt(self.proof(key))
+
+        def matches(c):
+            meta = db.metadata(c)
+            return (meta.get("instance_id") == self.instance_id
+                    and all(meta.get(field) == value for field, value in binding.items())
+                    and read_file(*location, private=True) == raw)
+
+        def committed():
+            with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
+                sync_before_cleanup(matches, lambda _c: remove_file(*location, private=True))
+
+        db.after_commit(committed)
+
+
+def lookup_key(c, settings, local, meta):
     if meta.get(KEY_REF):
-        return meta, referenced_key(meta, settings)
-    if meta.get(KEY_LOCAL):
-        return meta, checked_key(read_file(local, local.parent))
+        return referenced_key(meta, settings)
+    if KEY_REF in meta or KEY_PROOF in meta or KEY_STORE_DIR in meta:
+        raise FingerprintKeyMissing("fingerprint_key_missing")
+    if KEY_LOCAL in meta:
+        if c.execute("SELECT 1 FROM secrets WHERE store != 'owner_file' "
+                     "AND fingerprint IS NOT NULL LIMIT 1").fetchone():
+            raise FingerprintKeyMissing("fingerprint_key_missing")
+        return KeyInitialization(meta["instance_id"]).verify(read_file(local, local.parent), meta[KEY_LOCAL])
     if credentials.has_fingerprints(c):
         raise FingerprintKeyMissing("fingerprint_key_missing")
-    return meta, None
+    return None
+
+
+def key_context(c, settings, local):
+    meta = db.metadata(c)
+    pending = pending_journals(meta["instance_tag"], settings)
+    key = lookup_key(c, settings, local, meta)
+    if pending:
+        ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM)
+        if not meta.get(KEY_REF):
+            stored = checked_key(read_item(ref, settings, durable=db.in_write()))
+            if key is not None and not hmac.compare_digest(key, stored):
+                raise StoreError("local and configured fingerprint keys differ")
+            key = stored
+        directory = store_directory(ref, settings)
+        for _, receipt in pending.values():
+            verify_key_proof(key, ref, directory, receipt.get("key_proof"))
+    return meta, key, pending
 
 
 def ensure_key(c, settings, local, meta, key, *, recovering=False):
     if reference := meta.get(KEY_REF):
+        initialization = KeyInitialization(meta["instance_id"], reference, meta[KEY_STORE_DIR] or None)
+        initialization.retire(key, {field: meta[field] for field in (KEY_REF, KEY_STORE_DIR, KEY_PROOF)})
         if meta.get(KEY_LOCAL) and local.exists():
             db.after_commit(lambda: retire_local_key(local, settings, reference))
         return key
-    fallback = key if key is not None else read_file(local, local.parent, durable=True)
-    ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM) if settings.store else None
-    stored = read_item(ref, settings, durable=True) if ref else None
-    if fallback is not None and stored is not None and fallback != stored:
-        raise StoreError("local and configured fingerprint keys differ")
-    key = stored if stored is not None else fallback
-    if key is None and not recovering:
-        key = secrets.token_bytes(32)
-    key = checked_key(key)
-    if ref:
+    local_init = KeyInitialization(meta["instance_id"])
+    local_proof = meta[KEY_LOCAL] if KEY_LOCAL in meta else local_init.pending()
+    fallback = read_file(local, local.parent, durable=True)
+    if fallback is not None and local_proof is None:
+        raise StoreError("local fingerprint key has no provenance; operator reconciliation is required")
+    if fallback is not None or KEY_LOCAL in meta:
+        fallback = local_init.verify(fallback, local_proof)
+
+    binding = {}
+    if settings.store:
+        ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM)
+        directory = store_directory(ref, settings)
+        initialization = KeyInitialization(meta["instance_id"], str(ref), directory)
+        proof = initialization.pending()
+        stored = key if recovering else read_item(ref, settings, durable=True)
+        if stored is not None and proof is None and not recovering:
+            raise StoreError("configured fingerprint key has no provenance; operator reconciliation is required")
+        if stored is not None and fallback is not None and not hmac.compare_digest(stored, fallback):
+            raise StoreError("local and configured fingerprint keys differ")
+        key = stored if stored is not None else fallback
+        if key is None:
+            key = secrets.token_bytes(32)
+            proof = None
+        elif proof is not None:
+            key = initialization.verify(key, proof)
         if stored is None:
+            if proof is None:
+                initialization.record(key)
             write_item(ref, settings, key)
-        c.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?)", (KEY_REF, str(ref)))
+        binding.update({KEY_REF: str(ref), KEY_STORE_DIR: directory or "", KEY_PROOF: key_proof(key, ref, directory)})
+        initialization.retire(key, binding.copy())
         if fallback is not None:
             db.after_commit(lambda: retire_local_key(local, settings, str(ref)))
     else:
+        if read_file(*key_initialization_path(configured=True), private=True) is not None:
+            raise FingerprintKeyMissing("fingerprint_key_missing")
         if fallback is None:
             with credential_activation(publishing=True):
-                write_file(local, local.parent, key)
-        c.execute("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, '1')", (KEY_LOCAL,))
+                fallback = secrets.token_bytes(32)
+                local_proof = local_init.record(fallback)
+                write_file(local, local.parent, fallback)
+        key = fallback
+
+    if fallback is not None:
+        if KEY_LOCAL not in meta:
+            binding[KEY_LOCAL] = local_proof
+        local_init.retire(fallback, {KEY_LOCAL: local_proof})
+    c.executemany("INSERT INTO schema_meta (key, value) VALUES (?, ?)", binding.items())
     return key
 
 
@@ -526,7 +696,7 @@ def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
     migrate_registry()
     try:
         with db.reader() as c:
-            meta, key = lookup_key(c, settings, local)
+            meta, key, _ = key_context(c, settings, local)
             if meta.get(KEY_REF):
                 if not meta.get(KEY_LOCAL) or not local.exists():
                     return key
@@ -536,8 +706,8 @@ def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
         if not paths.ISOLATED:
             raise
     with db.tx() as c:
-        meta, key = lookup_key(c, settings, local)
-        return ensure_key(c, settings, local, meta, key)
+        meta, key, pending = key_context(c, settings, local)
+        return ensure_key(c, settings, local, meta, key, recovering=bool(pending))
 
 
 def digest(key: bytes, *values) -> str:
@@ -582,32 +752,65 @@ def history(scope, name):
 
 def read(scope, name) -> bytes | None:
     item = external_item(scope, name)
-    settings = store_settings()
+    settings = config.secret_settings()
     with registry() as c:
         row = credentials.secret(c, scope, name)
-        if row and row["status"] == "set":
-            return read_item(registry_reference(c, row, item), settings)
+        meta = db.metadata(c)
+        key = lookup_key(c, settings, local_key_path(), meta) if row and row["fingerprint"] is not None else None
+        require_store(settings)
+        if key is None or row["status"] != "set":
+            return None
+        ref = registry_reference(c, row, item)
+        if ref.store not in (settings.store, "owner_file"):
+            raise StoreError("secret is registered in a different store")
+        value = read_item(ref, settings)
+        if value is not None and item_digest(key, value) == row["fingerprint"]:
+            return value
     return None
 
 
+def pending_root():
+    return paths.STATE_DIR.resolve() / "secret-writes"
+
+
 def pending_path(item):
-    root = paths.STATE_DIR.resolve() / "secret-writes"
+    root = pending_root()
     return root / item, root
 
 
-def load_pending(item):
-    raw = read_file(*pending_path(item), private=True)
-    return raw, json.loads(raw) if raw is not None else {}
-
-
-def pending_store_dir(ref, settings):
-    return str(settings.store_dir) if ref.store == "pve_store" else None
+def pending_journals(tag, settings):
+    journals = {}
+    with ExitStack() as stack:
+        try:
+            parent = stack.enter_context(confined_directory(pending_root()))
+        except FileNotFoundError:
+            return journals
+        require_private_directory(parent)
+        for scope in os.listdir(parent):
+            if not SCOPE.fullmatch(scope):
+                continue
+            with paths.directory_fd(Path(scope), parent) as directory:
+                require_private_directory(directory)
+                for name in os.listdir(directory):
+                    if not NAME.fullmatch(name):
+                        continue
+                    try:
+                        raw = read_file_at(directory, name)
+                    except FileNotFoundError:
+                        continue
+                    if settings.store is None:
+                        raise FingerprintKeyMissing("fingerprint_key_missing")
+                    item = f"{scope}/{name}"
+                    receipt = json.loads(raw)
+                    require_pending_backend(receipt, Reference(settings.store, tag, item), settings)
+                    journals[item] = raw, receipt
+    return journals
 
 
 def require_pending_backend(receipt, ref, settings):
     if not receipt:
         return
-    store_dir = pending_store_dir(ref, settings)
+    store_dir = store_directory(ref, settings)
     if store_dir is not None and "store_dir" not in receipt:
         raise StoreError("pending secret operation has no recorded store directory")
     if receipt.get("store_dir") != store_dir:
@@ -626,6 +829,12 @@ def save_pending(item, record):
     raw = json.dumps(record).encode()
     write_file(*pending_path(item), raw, private=True)
     return raw
+
+
+def pending_binding(ref, settings, key):
+    directory = store_directory(ref, settings)
+    key_ref = Reference(ref.store, ref.tag, KEY_ITEM)
+    return dict(store_dir=directory, key_proof=key_proof(key, key_ref, directory))
 
 
 def retire_pending(item, raw, expected):
@@ -696,7 +905,7 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
     settings = config.secret_settings()
     local = local_key_path()
     with registry(write=True) as c:
-        meta, key = lookup_key(c, settings, local)
+        meta, key, journals = key_context(c, settings, local)
         require_store(settings)
         ref = Reference(settings.store, meta["instance_tag"], item)
         row = credentials.secret(c, scope, name)
@@ -704,9 +913,8 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
             require_removable(item, row["store"])
             if row["reference"] != str(ref):
                 raise StoreError("secret is registered in a different store")
-        _, receipt = load_pending(item)
-        require_pending_backend(receipt, ref, settings)
-        key = ensure_key(c, settings, local, meta, key, recovering=bool(receipt))
+        _, receipt = journals.get(item, (None, {}))
+        key = ensure_key(c, settings, local, meta, key, recovering=bool(journals))
         stored = read_item(ref, settings, durable=bool(receipt))
         fingerprint = item_digest(key, stored) if receipt.get("sets") and stored is not None else None
         row, confirmed, removal, _ = recover_changes(
@@ -716,7 +924,7 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
         change = dict(id=secrets.token_hex(16), reference=str(ref), kind=kind, actor=actor, at=util.iso(),
                       fingerprint=digest(key, value), provider=provider, rotated=stored is not None)
         # Keep earlier operations recoverable until the outer SQLite transaction commits.
-        raw = save_pending(item, dict(store_dir=pending_store_dir(ref, settings), confirmed=confirmed, sets=[change]))
+        raw = save_pending(item, dict(pending_binding(ref, settings, key), confirmed=confirmed, sets=[change]))
         data = value.encode()
         if stored != data:
             write_item(ref, settings, data)
@@ -742,9 +950,9 @@ def reconcile(scope, name, actor, *, deleting=False):
         row = credentials.secret(c, scope, name)
         if deleting and row and settings.store is not None:
             require_removable(item, row["store"])
-        meta, key = lookup_key(c, settings, local)
+        meta, key, journals = key_context(c, settings, local)
         require_store(settings)
-        raw, receipt = load_pending(item)
+        raw, receipt = journals.get(item, (None, {}))
         pending = receipt.get("sets", [])
         target = row or receipt.get("removal") or (pending[0] if pending else None)
         if target is None:
@@ -755,7 +963,7 @@ def reconcile(scope, name, actor, *, deleting=False):
         if ref.store not in (settings.store, "owner_file"):
             raise StoreError("secret is registered in a different store")
         require_pending_backend(receipt, ref, settings)
-        key = ensure_key(c, settings, local, meta, key, recovering=bool(receipt))
+        key = ensure_key(c, settings, local, meta, key, recovering=bool(journals))
         value = read_item(ref, settings, durable=bool(receipt))
         sha = item_digest(key, value) if value is not None and (pending or not deleting) else None
         row, confirmed, removal, recovered = recover_changes(
@@ -766,7 +974,7 @@ def reconcile(scope, name, actor, *, deleting=False):
                 metadata = row or target
                 removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=metadata["kind"],
                                provider=metadata.get("provider"), actor=actor, at=util.iso(), removed=True)
-                raw = save_pending(item, dict(store_dir=pending_store_dir(ref, settings), confirmed=confirmed,
+                raw = save_pending(item, dict(pending_binding(ref, settings, key), confirmed=confirmed,
                                               removal=removal))
             if removal is not None:
                 remove_item(ref, settings)

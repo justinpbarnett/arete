@@ -243,7 +243,7 @@ def read(name, values, handler):
     if name.startswith("config."):
         return read_config(name.removeprefix("config."), values)
     if name == "health.get":
-        return {"health": board.health_board()}
+        return {"health": board.health_board(include_held=False)}
     if name == "hook_event.list":
         since = values.get("since")
         cutoff = event_timestamp(since, "since") if since is not None else None

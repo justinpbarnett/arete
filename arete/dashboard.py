@@ -1089,7 +1089,7 @@ def get_asks(handler, rest, query):
 
 
 def get_health(handler, rest, query):
-    return board.health_board()
+    return board.health_board(include_held=False)
 
 
 def get_triage(handler, rest, query):
