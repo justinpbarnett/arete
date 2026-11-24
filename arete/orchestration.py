@@ -112,8 +112,6 @@ class Controller(worker_turns.WorkerTurns):
         configured = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
         if max_builders is not None:
             configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
-        tid = str(getattr(self.run, "tid", ""))
-        self.default_code_review = self.run.path == "orchestrate" and not (pilot.is_pilot_task(tid) or zte.reserved(tid))
         private = configured.max_builders and self.default_code_review
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
@@ -586,6 +584,11 @@ class Controller(worker_turns.WorkerTurns):
         self.data.setdefault("evidence", {})[gate] = {"tree": tree, "policy": self.policy_sha(), "result": result,
             "acceptance": self.data["acceptance"], "producer": self.executing, "observed": util.iso()}
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
+
+    @property
+    def default_code_review(self):
+        tid = str(getattr(self.run, "tid", ""))
+        return self.run.path == "orchestrate" and not (pilot.is_pilot_task(tid) or zte.reserved(tid))
 
     @property
     def uses_code_review(self):
