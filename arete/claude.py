@@ -9,6 +9,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
 from threading import Lock
@@ -53,6 +54,7 @@ OPENROUTER_WITHHELD = frozenset({
     "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
 })
 UNRECOGNIZED_MODEL = "[claude-code:unrecognized_model]"
+SESSION_CHECKOUT: ContextVar[tuple[Path, Path] | None] = ContextVar("claude_session_checkout", default=None)
 
 
 def binary() -> str:
@@ -255,7 +257,7 @@ def _run(
                     confined = sandbox.claude_confinement(
                         cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,
                         activation_lease=activation, run_id=env.get("ARETE_RUN_ID", ""), temporary=temporary,
-                        managed_profile=openrouter_config is not None)
+                        managed_profile=openrouter_config is not None, session_checkout=SESSION_CHECKOUT.get())
                     try:
                         proc = child.stream(activation.command(confined), str(cwd), prompt, env, timeout, after_mounts)
                     except OSError as e:

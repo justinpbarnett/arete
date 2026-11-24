@@ -292,7 +292,7 @@ def linux_repository_roots(checkouts: tuple[Path, ...]) -> set[Path]:
     repositories = set()
     for checkout in checkouts:
         for parent in (checkout, *checkout.parents):
-            if parent == LINUX_SHM or parent == parent.parent:
+            if parent in (LINUX_SHM, paths.WORKTREES_DIR.resolve(), parent.parent):
                 break
             if (parent / ".git").exists():
                 repositories.add(parent)
@@ -300,7 +300,7 @@ def linux_repository_roots(checkouts: tuple[Path, ...]) -> set[Path]:
     return repositories
 
 
-def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path]) -> set[Path]:
+def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path], session_checkout) -> set[Path]:
     from . import config
     from .store import db, workspaces
 
@@ -310,6 +310,11 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path]
         if base in root.parents:
             requested.setdefault(root.relative_to(base).parts[0], []).append(root)
     selected = set()
+    if session_checkout:
+        worktree, source = session_checkout
+        expected = base / worktree.name
+        if worktree.parent.resolve() == base and expected in repositories and checkouts[0].is_relative_to(expected):
+            selected.add((expected, source))
     if requested:
         with suppress(db.NoDatabase), db.reader() as conn:
             if db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
@@ -317,19 +322,25 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path]
                     if row := workspaces.open_for(name):
                         for checkout in workspaces.owner_of(row).checkouts:
                             worktree = checkout.wt.resolve()
-                            if any(worktree.is_relative_to(root) or root.is_relative_to(worktree) for root in roots):
-                                selected.add(checkout.src)
-    metadata = {common for source in selected if (common := linux_git_metadata(source))}
-    linked = {common for root in repositories if (root / ".git").is_file() and (common := linux_git_metadata(root))}
-    if linked - metadata:
-        # A session worktree can belong to a configured repository without a pipeline workspace row.
-        sources = (repo.path / part for repo in config.load().repos for part in ["", *(p.dir for p in repo.parts)])
-        metadata.update(linked.intersection(common for source in sources if (common := linux_git_metadata(source))))
+                            if worktree.is_relative_to(base / name) and any(
+                                    worktree.is_relative_to(root) or root.is_relative_to(worktree) for root in roots):
+                                selected.add((worktree, checkout.src))
+    # A configured linked checkout can also be selected directly.
+    linked = {repo for repo in repositories if (repo / ".git").is_file()}
+    if linked:
+        configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
+                      for part in ["", *(p.dir for p in repo.parts)]}
+        selected.update((repo, repo) for repo in linked & configured)
+    metadata = set()
+    for worktree, source in selected:
+        common = linux_git_metadata(worktree)
+        if common is not None and common == linux_git_metadata(source):
+            metadata.add(common)
     return metadata
 
 
 def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, run_id="", temporary=None,
-                       store=None, managed_profile=False):
+                       store=None, managed_profile=False, session_checkout=None):
     from . import guard
 
     state = paths.STATE_DIR.resolve()
@@ -338,7 +349,7 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
     run_dirs = guard.run_folders(run_id)
     protected = (state, config_root, store) if store else (state, config_root)
     repositories = linux_repository_roots(checkouts)
-    writable = set(checkouts) | linux_checkout_metadata(checkouts, repositories)
+    writable = set(checkouts) | linux_checkout_metadata(checkouts, repositories, session_checkout)
     writable.update(p.resolve() for p in run_dirs)
     if profile is not None:
         writable.add(profile)
@@ -374,7 +385,8 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
                        profile: Path | None = None, mount_lease: ExitStack | None = None,
                        activation_lease: WorkerLease | None = None, run_id: str = "",
-                       temporary: Path | None = None, managed_profile: bool = False) -> list[str]:
+                       temporary: Path | None = None, managed_profile: bool = False,
+                       session_checkout: tuple[Path, Path] | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
@@ -405,7 +417,7 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
             raise ConfinementUnavailable("Claude cannot start inside the secret store")
         masks = linux_fingerprint_mounts(key, info, targets) if info is not None else []
         restored = linux_claude_mounts(checkouts, profile, run_id=run_id, temporary=temporary,
-                                      store=store, managed_profile=managed_profile)
+                                      store=store, managed_profile=managed_profile, session_checkout=session_checkout)
     except ConfinementUnavailable:
         raise
     except secretstore.FingerprintKeyMissing as error:

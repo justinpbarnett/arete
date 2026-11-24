@@ -243,6 +243,76 @@ with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream)
 """)
 
 
+class AuthorityLinuxCheckoutLaunchTests(_SecretChildCase):
+    def test_nested_checkout_and_owner_session_keep_git_without_a_session_ledger_row(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+import json
+
+from arete import devices, record, routing, runner, sessions
+from arete.agent import NO_SESSION
+from arete.store import workspaces
+
+shm = Path.cwd().resolve()
+source, profile = shm / 'source', shm / 'profile'
+nested = source / 'sub'
+nested.mkdir(parents=True)
+
+def git(cwd, *argv):
+    return subprocess.run(['git', '-C', str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+
+def binds(*roots):
+    return [arg for root in sorted(roots) for arg in ('--bind', str(root), str(root))]
+
+git(source, 'init', '-q')
+(nested / 'notes.txt').write_text('original\n')
+git(source, 'add', 'sub/notes.txt')
+git(source, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture', 'commit', '-qm', 'fixture')
+with paths.CONFIG_FILE.open('a') as file:
+    file.write(f'\n[[repo]]\nname = "fixture"\npath = {json.dumps(str(source))}\n')
+cfg = config.load()
+model = 'sonnet'
+spec = sessions.Spec('ses-fixture', 'fixture', model=model, runner='claude', repo='fixture', tools=['Read'])
+with mock.patch.object(runner.util, 'github_token', return_value=''):
+    sessions.workspace(spec, devices.LOCAL, cfg.repo('fixture'))
+    sessions.save_spec(spec)
+    record.start('session', run_id=spec.id, repo=spec.repo, runner=spec.runner, model=model, device='local')
+spec = sessions.load_spec(spec.id)
+checkout = Path(spec.cwd)
+assert workspaces.open_for(checkout.name) is None
+(nested / 'notes.txt').write_text('nested edit\n')
+(checkout / 'sub/notes.txt').write_text('session edit\n')
+secretstore.write_file(key, key.parent, b'F' * 32)
+
+candidate = routing.Candidate(0, model, 'claude', 'anthropic', 'cli_login', 'free', '', 0, True, '', (), None, 'ready', '')
+picked = runner.Picked(candidate, accounts.Auth(), None, model, '', set(), None)
+expected = {str(nested): ((), '+nested edit'), str(checkout): ((source / '.git',), '+session edit')}
+
+def worker(cmd, cwd, prompt, env, timeout, on_line):
+    extra, edit = expected[cwd]
+    assert_linux_policy(cmd, env, Path(cwd), [*key_mask, *store_mask], extra=extra)
+    if Path(cwd) == nested:
+        assert any(cmd[i:i+3] == ['--ro-bind', str(source), str(source)] for i in range(len(cmd)))
+    assert git(cwd, 'status', '--porcelain') == ' M sub/notes.txt\n'
+    assert edit in git(cwd, 'diff')
+    session = cmd[cmd.index('--session-id') + 1] if '--session-id' in cmd else 'fixture'
+    result = json.dumps({'type': 'result', 'result': 'fixture', 'session_id': session})
+    on_line(result + '\n')
+    return subprocess.CompletedProcess(cmd, 0, result, '')
+
+with (mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream),
+      mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(profile)}),
+      mock.patch.object(runner, 'pick', return_value=(picked, [])),
+      mock.patch.object(runner.util, 'github_token', return_value='')):
+    stream.side_effect = worker
+    run = runner.run('fixture', nested, runner='claude', model=model, cfg=cfg, tools=['Read'], persist=False)
+    assert run.ok, run.error
+    session = sessions.take_turn(spec, cfg, devices.LOCAL, spec.prompt, 1, NO_SESSION)
+    assert session.id and not spec.turn_error, spec.turn_error
+    assert stream.call_count == 2
+    assert sandbox.linux_claude_mounts((checkout,), None) == ['--ro-bind', str(state), str(state), *binds(checkout)]
+""")
+
+
 class AuthorityLinuxFingerprintMigrationTests(_SecretChildCase):
     def test_retired_fallback_requires_a_committed_valid_store_key(self):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
