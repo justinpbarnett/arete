@@ -59,6 +59,14 @@
       },
       "additionalProperties": false
     },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "store": {"type": "string", "enum": ["", "keychain", "pve_store"]},
+        "store_dir": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
     "models": {"$ref": "models.json"},
     "pricing": {"$ref": "prices.json#/$defs/pricing"},
     "serve": {"$ref": "budgets.json"},

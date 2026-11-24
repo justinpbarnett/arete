@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
+import pwd
 import re
 import shlex
 import tomllib
@@ -223,6 +225,12 @@ class Retention:
 @dataclass(frozen=True)
 class BackupConfig:
     copy_to: str = ""
+
+
+@dataclass(frozen=True)
+class SecretsConfig:
+    store: str | None = None
+    store_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +773,110 @@ def backup_table(data) -> BackupConfig:
     return BackupConfig(copy_to=copy_to)
 
 
+def store_path_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts) if paths.ON_MAC else path.parts
+
+
+def store_path_lineage(path: Path) -> list[tuple[int, int, tuple[str, ...]]]:
+    top, *descendants = (*reversed(path.parents), path)
+    info = top.stat()
+    device, inode = info.st_dev, info.st_ino
+    missing_tail: tuple[str, ...] = ()
+    lineage = [(device, inode, missing_tail)]
+    for descendant in descendants:
+        try:
+            info = descendant.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            name = descendant.name
+            missing_tail += (name.casefold() if paths.ON_MAC else name,)
+        else:
+            device, inode, missing_tail = info.st_dev, info.st_ino, ()
+        lineage.append((device, inode, missing_tail))
+    return lineage
+
+
+def store_locations_overlap(directory: Path, protected: tuple[Path, ...]) -> bool:
+    parts = store_path_parts(directory)
+    for root in map(store_path_parts, protected):
+        if parts[:len(root)] == root or root[:len(parts)] == parts:
+            return True
+    lineage = store_path_lineage(directory)
+    for root in protected:
+        protected_lineage = store_path_lineage(root)
+        if protected_lineage[-1] in lineage or lineage[-1] in protected_lineage:
+            return True
+    return False
+
+
+def validate_store_location(directory: Path, config_file: Path, repo_paths=()) -> None:
+    directory = directory.resolve()
+    protected = (config_file.parent, config_file.resolve().parent, paths.CONFIG_DIR,
+                 paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR, *repo_paths)
+    if store_locations_overlap(directory, tuple(path.resolve() for path in protected)):
+        raise ValueError("[secrets] store_dir must be separate from config, state, logs, worktrees and repositories")
+    for parent in (directory, *directory.parents):
+        try:
+            (parent / ".git").lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            if not ((parent / "HEAD").is_file() and (parent / "objects").is_dir() and (parent / "refs").is_dir()):
+                continue
+        raise ValueError("[secrets] store_dir must be outside git repositories and work trees")
+
+
+def keychain_program() -> str | None:
+    if not paths.ON_MAC or paths.ISOLATED:
+        return None
+    from . import sandbox
+
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        config_dir, state_dir = paths.CONFIG_DIR.resolve(), paths.STATE_DIR.resolve()
+        if paths.HOME.resolve() != home or sandbox.sandboxed():
+            return None
+        if (config_dir, state_dir) != (home / ".config/arete", home / ".local/share/arete"):
+            return None
+        if paths.CONFIG_FILE.is_symlink() or paths.CONFIG_FILE.resolve() != config_dir / "config.toml":
+            return None
+    except (AttributeError, KeyError, OSError, RuntimeError):
+        return None
+    return "/usr/bin/security"
+
+
+def secrets_table(data, config_file: Path, *, repo_paths=()) -> SecretsConfig:
+    if not isinstance(data, dict):
+        raise ValueError("[secrets] must be a table")
+    table = only(data, root_schema("secrets"), "[secrets]")
+    store = table.get("store", "keychain")
+    if store not in ("", "keychain", "pve_store"):
+        raise ValueError("[secrets] store must be keychain, pve_store or empty")
+    if store == "keychain" and not keychain_program():
+        store = ""
+    if "store_dir" not in table:
+        if store == "pve_store":
+            raise ValueError("[secrets] pve_store requires store_dir")
+        return SecretsConfig(store or None)
+    raw = table["store_dir"]
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        raise ValueError("[secrets] store_dir must be a directory path")
+    directory = config_file.parent / paths.expand(raw)
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("[secrets] store_dir must be a plain directory")
+    if paths.ISOLATED and (paths.confined(directory) is None or
+                           paths.scratch_root(directory) != paths.scratch_root(paths.STATE_DIR)):
+        raise ValueError("[secrets] store_dir must be inside the instance's scratch folder")
+    validate_store_location(directory, config_file, repo_paths)
+    return SecretsConfig(store or None, directory.resolve())
+
+
+def secret_settings() -> SecretsConfig:
+    try:
+        data = read_data()
+    except FileNotFoundError:
+        data = {}
+    return secrets_table(data.get("secrets", {}), paths.CONFIG_FILE,
+                         repo_paths=(paths.expand(repo["path"]) for repo in data.get("repo", ())))
+
+
 def chat_table(data, ignored: list[str] | None = None) -> ChatConfig:
     table = only(table_of(data, "chat"), root_schema("chat"), "[chat]", ignored=ignored)
     tokens = table.get("context_tokens", ChatConfig.context_tokens)
@@ -1199,6 +1311,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
+    secrets_table(data.get("secrets", {}), path, repo_paths=(repo.path for repo in cfg.repos))
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent, ignored)
