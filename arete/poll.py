@@ -363,13 +363,6 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
     return queues, reached_clients
 
 
-def bind_provider_skip(skips: pipeline.SkipLog, name: str, run_id: str) -> None:
-    current = skips.current[name]
-    current["answer_run"] = run_id
-    if skips.before.get(name, {}).get("answer_run") != run_id:
-        current["since"] = util.iso()
-
-
 def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
     from . import tasks
@@ -388,8 +381,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         return "skipped"
     reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
-    answering = answered is not None
-    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
+    if answered is None and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
@@ -411,10 +403,13 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             blocked = route_blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
-        if not dry_run and route_blocked:
+        if route_blocked and not dry_run:
             waiting = answered or run_store.newest_live_whole_run(repo.name, tid) or {}
             if waiting.get("status") == "needs-info" and (answered or pipeline.answer_text(waiting["id"])):
-                bind_provider_skip(skips, name, waiting["id"])
+                rid = waiting["id"]
+                skips.current[name]["answer_run"] = rid
+                if skips.before.get(name, {}).get("answer_run") != rid:
+                    skips.current[name]["since"] = util.iso()
         print(f"{util.iso()} {name}: {blocked}")
         return "blocked"
     print(f"{util.iso()} {name}: {pick.why}" + (" (dry run, not started)" if dry_run else ""))
@@ -487,8 +482,9 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
         repo = queue.repo
         for row in run_store.environment_holds(repo.name):
             try:
-                can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
-                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
+                slot_blocker = held_back(cfg, repo.name, going, slots - started)
+                can_start = started < MAX_STARTS_PER_POLL and not slot_blocker
+                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start, slot_blocker=slot_blocker):
                     queue.selected.add(str(row["issue"]))
                     going[repo.name] += 1
                     started += 1
@@ -510,21 +506,28 @@ def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira
         skips.keep_project(project)
 
 
-def sync_pr_outcomes(cfg: config.Config) -> None:
-    outcomes.sync_outcomes(cfg)
-    repos = {repo.name for repo in cfg.repos}
-    rows = (row for row in run_store.ticket_attention_runs()
-            if row["repo"] in repos and not zte.reserved(str(row["issue"])))
-    for row, draft in run_timing.pending_draft_reviews(rows):
-        try:
-            ready = draft.prs and all(isinstance(pr := gh.pr_merge_details(url, timeout=15, retry=False), dict)
-                                      and (pr.get("state") in ("MERGED", "CLOSED") or pr.get("state") == "OPEN"
-                                           and pr.get("isDraft") is False) for url in dict.fromkeys(draft.prs))
-        except (gh.GhError, ValueError):
-            continue
-        if ready:
-            run_store.confirm_draft_review_ready(row["id"], row["pr_url"])
+def pr_ready(url: str) -> bool | None:
+    try:
+        pr = gh.pr_merge_details(url, timeout=15, retry=False)
+    except (gh.GhError, ValueError):
+        return None
+    if not isinstance(pr, dict):
+        return None
+    state, draft = pr.get("state"), pr.get("isDraft")
+    if state in ("MERGED", "CLOSED"):
+        return True
+    return not draft if state == "OPEN" and type(draft) is bool else None
 
+def observe_drafts(cfg: config.Config) -> None:
+    repos, states = {repo.name for repo in cfg.repos}, {}
+    for row in run_store.ticket_attention_runs():
+        if (row["repo"] in repos and not zte.reserved(str(row["issue"]))
+                and run_timing.draft_report(row, run_timing.read_log(rid := row["id"]))):
+            urls = set(row["pr_url"].split())
+            states.update((url, pr_ready(url)) for url in sorted(urls - states.keys()))
+            observed = {states[url] for url in urls}
+            if observed == {True} or False in observed:
+                run_store.note_draft_review(rid, row["pr_url"], ready=observed == {True})
 
 def save_skips(skips: pipeline.SkipLog) -> None:
     now = util.iso()
@@ -551,7 +554,8 @@ def poll(dry_run: bool = False) -> int:
         errors: list[str] = []
         if not dry_run:
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
-            guard(errors, "syncing PR outcomes", lambda: sync_pr_outcomes(cfg))
+            guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
+            guard(errors, "observing draft status", lambda: observe_drafts(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)

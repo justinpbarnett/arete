@@ -285,17 +285,17 @@ export class RunFocus extends Component {
   componentDidMount() {
     focus = this;
     this.sync();
-    let before, wasDraft, wasMissing;
+    let before, wasListed, wasMissing;
     this.unwatchProgress = effect(() => {
       const { id, detail } = runView.value;
       const rows = snapshot.value.live?.ticket_progress?.rows;
       if (id !== this.props.view.id || !detail?.ticket_progress) return;
       const current = liveProgress(rows, detail.run);
-      const missing = rows && !current && (wasDraft || detail.ticket_progress.follow_up?.draft);
+      const missing = rows && !current && (wasListed || detail.ticket_progress.follow_up?.draft);
       const ended = before?.run.status === "running" && detail.run.status !== "running"
         && detail.ticket_progress === before.ticket_progress;
       const refresh = ended || missing && !wasMissing;
-      if (rows) [wasDraft, wasMissing] = [current?.follow_up?.draft, missing];
+      if (rows) [wasListed, wasMissing] = [Boolean(current), missing];
       before = detail;
       if (refresh) this.props.retry();
     });

@@ -173,7 +173,7 @@ async function snapshots() {
   const snapshots = () => reads("live").length + reads("runs").length + reads("run").length + reads("/api/v1/runs").length;
   const running = () => runs.filter((run) => run.status === "running");
   let progress;
-  const live = () => ({ waiting, ticket_progress: { rows: progress?.follow_up.draft ? [progress] : [] }, live: { rows: { slots, max_parallel: 3,
+  const live = () => ({ waiting, live: { rows: { slots, max_parallel: 3,
     runs: running().map(({ status, ...row }) => ({ ...row, slot: row.id === notedRun ? slotNote : "" })) } } });
   const sidebar = () => ({ running: running().length, needs_you: needsYou, health, serve });
   globalThis.fetch = async (path, options) => {
@@ -190,7 +190,8 @@ async function snapshots() {
     }
     let position = seq;
     let payload;
-    if (view === "live") payload = { sidebar: sidebar(), asks, view: live() };
+    if (view === "live") payload = { sidebar: sidebar(), asks,
+      view: { ...live(), ticket_progress: { rows: progress?.follow_up.draft ? [progress] : [] } } };
     else if (view === "runs") {
       payload = { view: { runs: runs.slice(0, 25).map(({ version, ...row }) => row), more: true } };
     } else if (view === "run") {
@@ -485,6 +486,7 @@ async function snapshots() {
       "404 falls back to legacy shell and Health while the stream drops the run subscription");
     assert.equal(ui.screenReads.value.health.error, null);
     assert.equal(reads("/api/sidebar").length, 1);
+    assert.equal(settings.snapshot.value.live.ticket_progress, undefined);
     last().open();
     last().send(event("6.3", "run.started", { id: "new", status: "running", version: 1 }));
     assert.equal(settings.snapshot.value.running, 1);
@@ -503,6 +505,7 @@ async function snapshots() {
     const oldRun = ui.live("run", "past-29");
     await until(() => ui.runView.value.detail?.ticket_progress?.blocker
       && last().url.searchParams.get("turns") === "past-29", "the old run shows the held draft");
+    assert.deepEqual(oldRun.snapshot.value.live.ticket_progress.rows, [progress]);
     last().open();
     const focus = new RunFocus({ view: ui.runView.value, retry: oldRun.retry });
     focus.componentDidMount();

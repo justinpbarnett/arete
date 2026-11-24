@@ -159,39 +159,34 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
 
 
 DRAFT_READY = "run.draft-review.ready"
-DRAFT_READY_RECEIPT = """
-SELECT e.at FROM events_log e WHERE e.subject = 'run:' || r.id AND e.kind = ?
-    AND json_extract(e.data, '$.pr_url') = r.pr_url
-"""
+DRAFT_OBSERVED = "run.draft-review.observed"
+DRAFT_RECEIPT = ("SELECT e.at FROM events_log e WHERE e.subject = 'run:' || r.id AND e.kind = ? "
+                 "AND json_extract(e.data, '$.pr_url') = r.pr_url")
 
 
-def ticket_attention_runs(*, questions: bool = False, ticket: tuple[str, str] | None = None) -> list[dict]:
-    where = "AND r.repo = ? AND r.issue = ?" if ticket else ""
+def ticket_attention_runs(*, questions: bool = False) -> list[dict]:
     with reader() as c:
         return [dict(row) for row in c.execute(f"""
-            SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.issue != '' AND r.repo != '' {where}
+            SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.issue != '' AND r.repo != ''
                 AND COALESCE(r.stop_asked, '') = '' AND {WHOLE_RUN} AND {LIVE_RUN}
                 AND ((r.status = 'pr' AND r.pr_url != '' AND COALESCE(r.environment_retry_of, '') = ''
-                    AND NOT EXISTS ({DRAFT_READY_RECEIPT})) OR (? AND r.status = 'needs-info'
-                    AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
-                        AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
-                        AND (later.started, later.rowid) > (r.started, r.rowid))))
-            ORDER BY r.started DESC, r.rowid DESC
-        """, (*(ticket or ()), DRAFT_READY, questions))]
+                      AND NOT EXISTS ({DRAFT_RECEIPT})) OR (? AND r.status = 'needs-info' AND NOT EXISTS (
+                    SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
+                      AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
+                      AND (later.started, later.rowid) > (r.started, r.rowid)))) ORDER BY r.started DESC, r.rowid DESC
+        """, (DRAFT_READY, questions))]
 
-
-def draft_review_ready_at(run_id: str) -> str | None:
+def draft_review_at(run_id: str, receipt: str = DRAFT_READY) -> str | None:
     with reader() as c:
-        row = c.execute(f"SELECT ({DRAFT_READY_RECEIPT} ORDER BY e.seq LIMIT 1) FROM runs r WHERE r.id = ?",
-                        (DRAFT_READY, run_id)).fetchone()
+        row = c.execute(f"SELECT ({DRAFT_RECEIPT} ORDER BY e.seq LIMIT 1) FROM runs r WHERE r.id = ?",
+                        (receipt, run_id)).fetchone()
         return row[0] if row else None
 
-
-def run_change_at(run_id: str, status: str, *, pr_url: str = "") -> str | None:
+def superseded_at(run_id: str) -> str | None:
     with reader() as c:
         row = c.execute("SELECT at FROM events_log WHERE subject = ? AND kind = 'run.changed' "
-                        "AND json_extract(data, '$.status') = ? AND (? = '' OR json_extract(data, '$.pr_url') = ?) "
-                        "ORDER BY ver LIMIT 1", (f"run:{run_id}", status, pr_url, pr_url)).fetchone()
+                        "AND json_extract(data, '$.status') = 'superseded' ORDER BY ver LIMIT 1",
+                        (f"run:{run_id}",)).fetchone()
         return row[0] if row else None
 
 
@@ -201,19 +196,18 @@ def execution_finished(row: dict) -> tuple[str | None, str | None]:
         ended, rejected = c.execute("""
             SELECT (SELECT json_extract(data, '$.finished') FROM events_log
                     WHERE subject = :run AND kind = 'run.ended' ORDER BY ver LIMIT 1),
-                   CASE WHEN :status = 'pr' THEN EXISTS (
-                       SELECT 1 FROM events_log WHERE subject = :run AND kind = 'run.changed'
-                       AND json_extract(data, '$.status') = 'rejected' AND json_extract(data, '$.finished') = :finished)
-                   END
+                   (:status = 'pr' AND EXISTS (SELECT 1 FROM events_log WHERE subject = :run AND kind = 'run.changed'
+                       AND json_extract(data, '$.status') = 'rejected' AND json_extract(data, '$.finished') = :finished))
         """, {"run": subject, "status": status, "finished": finished}).fetchone()
     return ended, None if rejected or status in ("merged", "rejected") else finished
 
-
-def confirm_draft_review_ready(run_id: str, pr_url: str) -> None:
+def note_draft_review(run_id: str, pr_url: str, *, ready: bool) -> None:
+    kind = DRAFT_READY if ready else DRAFT_OBSERVED
     with tx() as c:
         if c.execute(f"SELECT 1 FROM runs r WHERE id = ? AND status = 'pr' AND pr_url = ? "
-                     f"AND NOT EXISTS ({DRAFT_READY_RECEIPT})", (run_id, pr_url, DRAFT_READY)).fetchone():
-            events.emit(DRAFT_READY, f"run:{run_id}", cls="durable", data={"pr_url": pr_url})
+                     f"AND NOT EXISTS ({DRAFT_RECEIPT}) AND NOT EXISTS ({DRAFT_RECEIPT})",
+                     (run_id, pr_url, DRAFT_READY, kind)).fetchone():
+            events.emit(kind, f"run:{run_id}", cls="durable", data={"pr_url": pr_url})
 
 
 HOLD_RELEASED = "run.environment-hold.released"
@@ -223,28 +217,36 @@ FROM environment_holds h JOIN runs r ON h.run_id = r.id
 LEFT JOIN runs retry ON retry.environment_retry_of = r.id AND retry.dry_run = 0 AND retry.status != 'dry-run'
 LEFT JOIN events_log rel ON rel.subject = 'run:' || r.id AND rel.kind = '{HOLD_RELEASED}'
 LEFT JOIN events_log ended ON ended.subject = 'run:' || r.id AND ended.kind = '{OWNER_REVIEW_ENDED}'
-LEFT JOIN events_log legacy ON h.released = 1 AND rel.seq IS NULL AND retry.id IS NOT NULL
-    AND legacy.seq = (SELECT MIN(p.seq) FROM events_log p
-        WHERE p.kind = 'ticket.progress' AND p.subject = 'ticket:' || r.repo || ':' || r.issue
-          AND json_extract(p.data, '$.run') = r.id AND json_extract(p.data, '$.attempt') = retry.id
-          AND json_extract(p.data, '$.follow_up.state') = 'owner-review')
 """
 HOLD_LIFECYCLE = """
     h.released, rel.at AS released_at,
-    COALESCE(json_extract(rel.data, '$.state'), CASE WHEN legacy.seq IS NOT NULL THEN 'owner-review'
-                                                    WHEN h.released = 1 THEN 'legacy' END) AS release_state,
+    COALESCE(json_extract(rel.data, '$.state'), CASE WHEN h.released = 1 THEN 'legacy' END) AS release_state,
     retry.id AS retry_id, retry.status AS retry_status, retry.started AS retry_started_at,
-    COALESCE(json_extract(rel.data, '$.owner_review_started_at'), legacy.at) AS owner_review_started_at,
+    json_extract(rel.data, '$.owner_review_started_at') AS owner_review_started_at,
     ended.at AS owner_review_ended_at
 """
 
 
+def _restore_legacy_owner_review(hold: dict, repo: str, issue: str, run_id: str) -> dict:
+    if hold["released"] == 1 and hold["released_at"] is None and (retry_id := hold["retry_id"]):
+        from . import ticket_progress
+
+        if started_at := ticket_progress.owner_review_started_at(repo, issue, run_id, retry_id):
+            hold.update(release_state="owner-review", owner_review_started_at=started_at)
+    return hold
+
+
 def environment_holds(repo: str) -> list[dict]:
     with reader() as c:
-        return [dict(r) for r in c.execute(
-            f"SELECT * FROM (SELECT r.*, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE r.repo = ? AND r.dry_run = 0) "
-            "WHERE (released = 0 AND status NOT IN ('running', 'dry-run')) "
-            "OR (release_state = 'owner-review' AND owner_review_ended_at IS NULL) ORDER BY started, id", (repo,))]
+        rows = c.execute(f"""
+            SELECT * FROM (SELECT r.*, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE r.repo = ? AND r.dry_run = 0)
+            WHERE (released = 0 AND status NOT IN ('running', 'dry-run'))
+               OR (owner_review_ended_at IS NULL AND (release_state = 'owner-review'
+                    OR (released = 1 AND released_at IS NULL AND retry_id IS NOT NULL)))
+            ORDER BY started, id
+        """, (repo,))
+        holds = (_restore_legacy_owner_review(dict(row), repo, row["issue"], row["id"]) for row in rows)
+        return [hold for hold in holds if not hold["released"] or hold["release_state"] == "owner-review"]
 
 
 def environment_owner_review_active(row: dict) -> bool:
@@ -252,12 +254,6 @@ def environment_owner_review_active(row: dict) -> bool:
         return False
     newest = newest_live_whole_run(row["repo"], row["issue"]) or {}
     return newest.get("id") == row["retry_id"] and not newest.get("stop_asked")
-
-
-def environment_owner_reviews(repo: str) -> list[dict]:
-    with reader():
-        return [row for row in environment_holds(repo) if row["release_state"] == "owner-review"
-                and environment_owner_review_active(row)]
 
 
 def save_environment_hold(run_id: str, prs: list[tuple[str, int, str, str]]) -> None:
@@ -277,13 +273,15 @@ def held_environment_branch(repo: str, issue: str) -> str:
 
 def environment_hold(run_id: str) -> dict:
     with reader() as c:
-        row = c.execute(f"SELECT h.run_id, h.waits, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE h.run_id = ?",
+        row = c.execute(f"SELECT h.run_id, h.waits, r.repo, r.issue, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE h.run_id = ?",
                         (run_id,)).fetchone()
         if row is None:
             return {}
         heads = {r["url"]: r["head"] for r in c.execute(
             "SELECT url, head FROM environment_hold_prs WHERE run_id = ? ORDER BY repo, number", (run_id,))}
-        return {**dict(row), "heads": heads, "waits": json.loads(row["waits"])}
+        hold = dict(row)
+        hold = _restore_legacy_owner_review(hold, hold.pop("repo"), hold.pop("issue"), run_id)
+        return {**hold, "heads": heads, "waits": json.loads(hold["waits"])}
 
 
 def set_environment_waits(run_id: str, waits: dict[str, tuple[str, int]]) -> None:

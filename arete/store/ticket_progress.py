@@ -7,15 +7,27 @@ from collections.abc import Iterable
 from . import db, events, runs
 
 KIND = "ticket.progress"
+INTERRUPTED_RETRY_STATUSES = ("interrupted", "stopped")
 
 
 def subject(repo: str, ticket: str | int) -> str:
     return f"ticket:{repo}:{ticket}"
 
 
-def rows(c, repo: str, ticket: str | int):
-    return c.execute("SELECT seq, at, data FROM events_log WHERE subject = ? AND kind = ? "
-                     "ORDER BY seq DESC", (subject(repo, ticket), KIND))
+def rows(c, repo: str, ticket: str | int, *, newest_first: bool = True):
+    order = "DESC" if newest_first else "ASC"
+    return c.execute("SELECT seq, at, data FROM events_log WHERE subject = ? AND kind = ? AND class = 'durable' "
+                     f"ORDER BY seq {order}", (subject(repo, ticket), KIND))
+
+
+def owner_review_started_at(repo: str, issue: str | int, run_id: str, attempt_id: str, *,
+                            connect=db.reader) -> str | None:
+    with connect() as c:
+        for row in rows(c, repo, issue, newest_first=False):
+            data = json.loads(row["data"])
+            if (data["run"], data["attempt"], data["follow_up"]["state"]) == (run_id, attempt_id, "owner-review"):
+                return row["at"]
+    return None
 
 
 def get(repo: str, ticket: str | int) -> dict:
@@ -26,9 +38,14 @@ def get(repo: str, ticket: str | int) -> dict:
         newest = runs.newest_live_whole_run(repo, ticket) or {}
         state = status["follow_up"]["state"]
         expected = {"waiting": "pr", "verifying": "running", "owner-review": "pr"}.get(state)
-        live = newest.get("id") == status["attempt"] and newest["status"] == expected and not newest.get("stop_asked")
-        if live and (hold := runs.environment_hold(status["run"])) and hold["released"]:
-            live = (state == hold["release_state"] == "owner-review" and not hold["owner_review_ended_at"])
+        live = newest.get("id") == status["attempt"]
+        if live and state == "owner-review" and (status["blocker"] or {}).get("kind") == "retry-interrupted":
+            hold = runs.environment_hold(status["run"])
+            live = (newest["status"] in INTERRUPTED_RETRY_STATUSES and hold.get("released") == 0
+                    and hold["retry_id"] == status["attempt"])
+        elif (live := live and newest["status"] == expected and not newest.get("stop_asked")):
+            if (hold := runs.environment_hold(status["run"])) and hold["released"]:
+                live = state == hold["release_state"] == "owner-review" and not hold["owner_review_ended_at"]
         return {**status, "active": live, "seq": row["seq"], "at": row["at"]}
 
 

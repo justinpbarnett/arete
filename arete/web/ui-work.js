@@ -1,6 +1,7 @@
-import { Component } from "./vendor-preact.js";
+import { Component, h } from "./vendor-preact.js";
 import { runHash, taskHash } from "./ui-data.js";
 import { Decisions, DetailLink, Panel, Read, Rows, Text, html } from "./ui-operations.js";
+import { ticketProgressParts } from "./ui-progress.js";
 import { Empty, Fault, Gate } from "./ui-states.js";
 
 const states = { "needs-info": "Needs you", recovering: "Recovering", failed: "Failed", running: "Running", pr: "In review", todo: "To do", done: "Done", closed: "Closed" };
@@ -65,23 +66,10 @@ export function FloorQueue({ snapshot, retry }) {
 
 export function TicketProgress({ progress }) {
   if (!progress) return null;
-  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing } = progress;
-  const unread = Object.entries(prerequisite_issues ?? {}).filter(([, read]) => !read).map(([ref]) => ref);
-  return html`<div data-ticket-progress="">
-    <p>${activity}${progress.since ? html` <small>· since ${stamp(progress.since)}</small>` : null}</p>
-    ${blocker ? html`<p><strong>Blocker:</strong> ${blocker}</p>` : null}
-    ${next_event ? html`<p><strong>Next:</strong> ${next_event}</p>` : null}
-    ${timing ? html`<section aria-label="Run lineage timing">${timing.lines.map((line) => html`<p key=${line}>${line}</p>`)}</section>` : null}
-    ${prerequisites?.length ? html`<ul>${prerequisites.map((pr) => html`<li key=${pr.key}>
-      ${pr.deployed_release ? "Deployed prerequisite" : pr.state === "merged"
-    ? "Merged prerequisite (deployment not confirmed)" : `Prerequisite (${pr.state})`}:
-      <${DetailLink} href=${pr.url}>${pr.key}<//></li>`)}</ul>` : null}
-    ${unread.length ? html`<p>Prerequisite lookup not confirmed: ${unread.join(", ")}</p>` : null}
-    ${follow_up?.prs?.length ? html`<p><strong>${follow_up.draft ? "Draft follow-up" : "Follow-up PR"}:</strong>
-      ${follow_up.prs.map((url) => html` <${DetailLink} key=${url} href=${url}>${url}<//>`)}</p>` : null}
-    ${updates?.length ? html`<ul aria-label="Recent ticket updates">${updates.map((update, index) => html`
-      <li key=${`${update.seq}:${index}`}><small>${stamp(update.at)}</small> ${update.message}</li>`)}</ul>` : null}
-  </div>`;
+  const link = (href, text) => h(DetailLink, { href }, text);
+  return h("div", { "data-ticket-progress": "" }, ticketProgressParts(progress, {
+    element: h, stamp, link, pullLinks: (urls) => urls.flatMap((url) => [link(url, url), " "]),
+  }));
 }
 
 export function FloorFocus({ snapshot, retry }) {

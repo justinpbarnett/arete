@@ -461,6 +461,13 @@ def finish_retry(row: dict, hold: Hold, reads: dict, declared: list[tuple[str, i
         progress(row, hold, "verifying", "Automatic verification finishes", reads=reads, declared=declared)
         return
     retry = run_store.run_get(row["retry_id"]) or {}
+    if (ending := retry.get("status")) in ticket_progress.INTERRUPTED_RETRY_STATUSES:
+        newest = run_store.newest_live_whole_run(row["repo"], row["issue"]) or {}
+        if newest.get("id") == row["retry_id"]:
+            blocker = {"kind": "retry-interrupted", "causes": {"retry": f"Automatic verification retry was {ending}"}}
+            event = "Owner reviews the draft and decides whether to verify it manually or take over the PR"
+            progress(row, hold, "owner-review", event, blocker=blocker, reads=reads, declared=declared)
+        return
     owner_review = (retry.get("status") == "pr" and set((retry.get("pr_url") or "").split()) == hold.heads.keys()
                     and run_store.environment_owner_review_active(row))
     state = "owner-review" if owner_review else "retry-finished"
@@ -501,7 +508,8 @@ def next_hold_event(blocker: str, scope: str, numbers: list[int], reads: dict, r
     return "Closure by fixes on the live release can be confirmed"
 
 
-def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, can_start: bool) -> bool:
+def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, can_start: bool,
+           slot_blocker: str = "") -> bool:
     from . import flows, oncall, pilot, runlimits, slots, tasks, workspace, zte
 
     run_id, tid = row["id"], str(row["issue"])
@@ -582,29 +590,42 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
             ready = release_contains_fixes(release, numbers, sha)
         except gh.GhError:
             ready = None
-    workspace_blocker = ""
+    gate, reason = "workspace", ""
     if ready:
         try:
             flows.check_environment_workspace(repo, row, hold.heads)
         except workspace.RunFailed as error:
-            workspace_blocker = util.first_line(safe_text(error.why), 300) or "The saved workspace cannot be restored"
-            print(f"{util.iso()} {run_id}: verify retry still waiting for its workspace: {workspace_blocker}")
-    if not dry_run:
-        reads = prerequisite_reads(release, set(declared) | set(waits.values()), hold.heads, sha)
-        event = ("The saved workspace becomes restorable or the owner takes over the draft" if workspace_blocker else
-                 next_hold_event(blocker, scope, numbers, reads, ready))
-        detail = {"kind": "retry-workspace", "causes": {"workspace": workspace_blocker}} if workspace_blocker else None
-        progress(row, hold, "waiting", event, reads=reads, declared=declared, blocker=detail)
-    if not can_start or not ready or workspace_blocker:
-        return False
-    layer = config.load_layer(repo.layer_dir)
-    if runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False).reason:
-        return False
-    if not dry_run:
-        try:
-            tasks.resume(run_id, "verify", row["version"], environment_release=sha)
-        except (slots.NoFreeSlot, control.Busy):
+            reason = util.first_line(safe_text(error.why), 300) or "The saved workspace cannot be restored"
+            print(f"{util.iso()} {run_id}: verify retry still waiting for its workspace: {reason}")
+    reads = {} if dry_run else prerequisite_reads(release, set(declared) | set(waits.values()), hold.heads, sha)
+    try:
+        if not ready or reason or not (can_start or slot_blocker):
             return False
+        layer = config.load_layer(repo.layer_dir)
+        gate, reason = "admission", runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False).reason
+        if reason:
+            return False
+        gate, reason = "slot", "" if can_start else slot_blocker
+        if reason:
+            return False
+        if not dry_run and tasks.resume(run_id, "verify", row["version"], environment_release=sha).get("state") == "queued":
+            reason = tasks.NO_SLOT_AT_START
+            return False
+    except slots.NoFreeSlot as error:
+        gate, reason = "slot", str(error) or slots.no_free_slot(cfg.max_parallel)
+        return False
+    except control.Busy:
+        return False
+    finally:
+        if not dry_run:
+            if reason:
+                event = {"slot": "A run slot becomes available",
+                         "workspace": "The saved workspace becomes restorable or the owner takes over the draft",
+                         "admission": "The run budget hold clears or the owner takes over the draft"}[gate]
+                detail = {"kind": f"retry-{gate}", "causes": {gate: reason if gate == "workspace" else safe_text(reason)}}
+            else:
+                event, detail = next_hold_event(blocker, scope, numbers, reads, ready), None
+            progress(row, hold, "waiting", event, reads=reads, declared=declared, blocker=detail)
     refs = displayed_refs(repo.github, release.github, numbers)
     print(f"{util.iso()} {repo.name}#{tid}: {'would resume' if dry_run else 'resuming'} {run_id} from verify "
           f"because {refs} merged and live release {sha[:12]} contains the fix")

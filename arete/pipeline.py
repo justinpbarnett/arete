@@ -285,19 +285,16 @@ class AgentRun:
         with self.budget.idling(cause) if self.budget is not None else nullcontext():
             if not self.writes_lines:
                 yield
-            elif detail:
-                since = util.iso()
-                self.write_line("wait", cause=cause, phase="start", at=since, **detail)
-                try:
-                    yield
-                finally:
-                    at = util.iso()
-                    seconds = (util.parse_iso(at) - util.parse_iso(since)).total_seconds()
-                    self.write_line("wait", cause=cause, phase="end", at=at, since=since,
-                                    minutes=round(max(0.0, seconds) / 60, 2), **detail)
-            else:
-                with run_lines.waiting(self.id, cause):
-                    yield
+                return
+            since = util.iso()
+            self.write_line("wait", cause=cause, phase="start", at=since, **detail)
+            try:
+                yield
+            finally:
+                at = util.iso()
+                seconds = (util.parse_iso(at) - util.parse_iso(since)).total_seconds()
+                self.write_line("wait", cause=cause, phase="end", at=at, since=since,
+                                minutes=round(max(0.0, seconds) / 60, 2), **detail)
 
     def save(self, name: str, data) -> None:
         text = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
@@ -1148,18 +1145,34 @@ def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
     return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
+CHECK_NUMBER = r"\d+(?:\.\d+)?(?:e[+-]?\d+)?"
+CHECK_LOAD = rf"(?:{CHECK_NUMBER}|unavailable)"
+CHECK_RUNNER_NORMALIZATION = (
+    (rf"^[\w.]+: (?:waiting for host load to fall from {CHECK_NUMBER} to \d+ or less|"
+     rf"starting alone at host load {CHECK_LOAD} after waiting {CHECK_NUMBER}s)$\n?", ""),
+    (r"^(?:Worker reports and output retained in: .+|\.\.\. \d+ earlier output lines dropped; "
+     r"all of them are in .+ \.\.\.)$\n?", ""),
+    (rf"^Slowest classes:\n(?:  {CHECK_NUMBER}s [\w.]+ \(\d+ tests\)\n)+"
+     rf"(?=(?:Failed classes: .+\n)?Ran \d+ tests in {CHECK_NUMBER}s: (?:OK|FAILED)\b)", ""),
+    (rf"^(Ran \d+ tests?) in {CHECK_NUMBER}s(?=$|: (?:OK|FAILED)(?: |$))", r"\1"),
+    (rf"^([\w.]+: \d+ tests, (?:ok|FAIL)) \({CHECK_NUMBER}s\)$", r"\1"),
+    (rf"^([\w.]+: (?:failed|ran past its deadline) on its first run), "
+     rf"(?:ran past its deadline alone at host load {CHECK_NUMBER}, )?then passed alone"
+     rf"(?: at host load {CHECK_LOAD})? within three times its deadline in {CHECK_NUMBER}s$",
+     r"\1, then passed alone within three times its deadline"),
+    (rf"^class exceeded {CHECK_NUMBER}s \(deadline ({CHECK_NUMBER})s x load {CHECK_NUMBER}\)$", r"class exceeded \1s"),
+)
+
+
 def check_diagnostic_fingerprint(stdout: str, stderr: str) -> str:
-    hidden = scrub.secrets()
-    diagnostics = [scrub.replaced(CHECK_COLOR.sub("", stream), hidden).replace("\r\n", "\n").strip()
-                   for stream in (stdout, stderr)]
+    hidden, diagnostics = scrub.secrets(), []
+    for stream in (stdout, stderr):
+        text = scrub.replaced(CHECK_COLOR.sub("", stream), hidden).replace("\r\n", "\n")
+        for pattern, replacement in CHECK_RUNNER_NORMALIZATION:
+            text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+        diagnostics.append(text.strip())
     return (orchestration_store.digest(diagnostics)
             if any(stream.replace(vault.REDACTED, "").strip() for stream in diagnostics) else "")
-
-
-def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
-    stdout_room = n - min(len(stderr), n // 2)
-    stderr_room = n - min(len(stdout), n // 2)
-    return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
 
 
 def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
@@ -1224,12 +1237,15 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     report, ok = [], True
     cleanup_untracked = not defer_failed_cleanup
 
-    def execute(items, hold_fds):
+    def execute(items, hold_fds, first=1):
         nonlocal ok
         held = {"hold_fds": hold_fds} if hold_fds else {}
-        for name, cmd in items:
-            with record.timed(run.id, "check", name=name, command=cmd, **suite) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
+        for check_no, (name, cmd) in enumerate(items, first):
+            cfg, limit = run.config, run.time_for(timeout)
+            fields = {**suite, "name": name, "check_no": check_no}
+            record.mark(run.id, "check_start", **fields)
+            with record.timed(run.id, "check", command=cmd, **fields) as check:
+                res = environment.sh(cmd, cfg, run.repo, cwd=cwd, timeout=limit, **held)
                 code = check["exit"] = res.returncode
                 if code and (fingerprint := check_diagnostic_fingerprint(res.stdout, res.stderr)):
                     check["diagnostic_sha"] = fingerprint
@@ -1237,8 +1253,9 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {code})'}")
             if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {code}\n```\n"
-                              f"{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
+                out, err = res.stdout, res.stderr
+                tail = util.tail(out, 6000 - min(len(err), 3000)) + util.tail(err, 6000 - min(len(out), 3000))
+                report.append(f"### {name} failed: `{cmd}` exit {code}\n```\n{tail}\n```")
             else:
                 report.append(f"### {name} passed: `{cmd}`")
 
@@ -1246,7 +1263,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
         with check_lane(layer, run, suite) as hold_fds:
             execute(quick, hold_fds)
             if slow and ok:
-                execute(slow, hold_fds)
+                execute(slow, hold_fds, len(quick) + 1)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):
