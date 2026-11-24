@@ -454,7 +454,7 @@ def linux_store_policy(*, has_local: bool, had_local: bool) -> tuple[Path | None
     settings = config.secret_settings()
     activated = secretstore.KEY_REF in meta
     if activated and settings.store == "pve_store":
-        secretstore.referenced_key(meta, settings, expected_store="pve_store")
+        secretstore.referenced_key(meta, settings)
     elif activated or (required and not has_local):
         raise secretstore.FingerprintKeyMissing("fingerprint_key_missing")
     return settings.store_dir, activated

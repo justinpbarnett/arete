@@ -13,7 +13,7 @@ key_file.unlink()
 
 route = root + '/global/OWNED'
 with (mock.patch.object(secretstore, 'lookup_key', wraps=secretstore.lookup_key) as lookup,
-      mock.patch.object(secretstore, 'load_pending', wraps=secretstore.load_pending) as pending):
+      mock.patch.object(secretstore, 'pending_journals', wraps=secretstore.pending_journals) as pending):
     request('DELETE', route, token=bearer, key='cli-removal', status=403, reason='presence_required')
     request('DELETE', route, cookie=cookie, key='owner-removal', status=409, code='secret_internal')
     lookup.assert_not_called()

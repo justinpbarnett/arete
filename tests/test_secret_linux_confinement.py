@@ -248,10 +248,9 @@ class AuthorityLinuxFingerprintMigrationTests(_SecretChildCase):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 configured = paths.CONFIG_FILE.read_text()
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
-original = b'F' * 32
-secretstore.write_file(key, key.parent, original)
 move_key = secretstore.fingerprint_key
-assert move_key() == original
+original = move_key()
+assert len(original) == 32 and key.read_bytes() == original
 paths.CONFIG_FILE.write_text(configured)
 settings = config.secret_settings()
 ref = secretstore.Reference('pve_store', db.schema_metadata()['instance_tag'], secretstore.KEY_ITEM)
