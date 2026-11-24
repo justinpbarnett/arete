@@ -752,14 +752,18 @@ UNREADABLE_WARNED: dict[str, tuple] = {}
 
 
 def read_json(p: Path, default):
+    return read_json_snapshot(p, default)[0]
+
+
+def read_json_snapshot(p: Path, default):
     try:
         with open(p, "rb") as f:
             seen = os.fstat(f.fileno())
             raw = f.read()
     except FileNotFoundError:
-        return default
+        return default, None
     try:
-        return json.loads(raw.decode())
+        return json.loads(raw.decode()), seen
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         version = (seen.st_dev, seen.st_ino, seen.st_ctime_ns, seen.st_mtime_ns, seen.st_size,
                    hashlib.sha256(raw).digest())
@@ -767,7 +771,7 @@ def read_json(p: Path, default):
         if UNREADABLE_WARNED.get(key) != version:
             UNREADABLE_WARNED[key] = version
             print(f"{paths.short_path(p)} is not valid JSON, using the default: {e}", file=sys.stderr)
-        return default
+        return default, seen
 
 
 def flush_fd(fd: int) -> None:
