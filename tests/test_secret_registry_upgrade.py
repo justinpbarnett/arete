@@ -44,7 +44,7 @@ assert_schema(db.LATEST)
 assert_shape('batch.run', result)
 first, registry, last = result['results']
 assert registry['secrets'] == []
-assert first['schema']['version'] == 27
+assert first['schema']['version'] == db.LATEST
 assert first == last
 assert first['stream']['head'] == first['seq'] == registry['seq'] == result['seq'] == headers['Arete-Seq']
 with db.reader() as conn:
