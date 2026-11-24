@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
+import errno
 import os
 import re
 import secrets
 import stat
 import subprocess
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +21,7 @@ KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
+ACL_TYPE_EXTENDED = 0x100
 
 
 class StoreMissing(RuntimeError):
@@ -90,28 +93,85 @@ def parse_reference(text: str, tag: str) -> Reference:
     return Reference(store, tag, location.removeprefix(prefix))
 
 
+def require_no_macos_acl(fd: int) -> None:
+    if not paths.ON_MAC:
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl, free_acl = libc.acl_get_fd_np, libc.acl_free
+        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+        get_acl.restype = ctypes.c_void_p
+        free_acl.argtypes = (ctypes.c_void_p,)
+        free_acl.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        raise StoreError("could not verify macOS ACL privacy for the secret store") from None
+    ctypes.set_errno(0)
+    acl = get_acl(fd, ACL_TYPE_EXTENDED)
+    if acl is not None:
+        free_acl(acl)
+        raise StoreError("secret store files and directories must not have macOS ACLs")
+    if ctypes.get_errno() != errno.ENOENT:
+        raise StoreError("could not verify macOS ACL privacy for the secret store")
+
+
+def require_private_directory(fd: int) -> None:
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise StoreError("secret store directory must have mode 0700 and belong to this user")
+    require_no_macos_acl(fd)
+
+
+def require_private_file(fd: int) -> None:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise StoreError("secret item must be a private regular file with mode 0600")
+    require_no_macos_acl(fd)
+
+
+def require_exact_entry(parent: int, name: str, *, writing=False) -> None:
+    if name in os.listdir(parent):
+        return
+    if writing:
+        raise StoreError("secret store entry conflicts with a differently spelled name")
+    raise FileNotFoundError(name)
+
+
+def require_writable_entry(parent: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    require_exact_entry(parent, name, writing=True)
+
+
 @contextmanager
 def file_parent(path: Path, root: Path, *, create=False, private=False):
     if paths.ISOLATED and (paths.confined(root) is None or
                            paths.scratch_root(root) != paths.scratch_root(paths.STATE_DIR)):
         raise StoreError("secret item must stay inside the instance's scratch folder")
-    with paths.directory_fd(root, create=create) as fd:
-        info = os.fstat(fd)
-        if private and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
-            raise StoreError("secret store directory must have mode 0700 and belong to this user")
-        with paths.directory_fd(path.parent.relative_to(root), fd, create=create) as parent:
-            yield parent
+    with paths.directory_fd(root, create=create) as fd, ExitStack() as stack:
+        parent = path.parent.relative_to(root)
+        if private:
+            require_private_directory(fd)
+            for part in parent.parts:
+                child = stack.enter_context(paths.directory_fd(Path(part), fd, create=create))
+                require_exact_entry(fd, part, writing=create)
+                require_private_directory(child)
+                fd = child
+        else:
+            fd = stack.enter_context(paths.directory_fd(parent, fd, create=create))
+        yield fd
 
 
 def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
     try:
         with file_parent(path, root, private=private) as parent:
+            if private:
+                require_exact_entry(parent, path.name)
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
-                info = os.fstat(fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
-                        or stat.S_IMODE(info.st_mode) != 0o600):
-                    raise StoreError("secret item must be a private regular file with mode 0600")
+                require_private_file(fd)
                 with os.fdopen(fd, "rb", closefd=False) as file:
                     return file.read()
             finally:
@@ -122,11 +182,14 @@ def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
 
 def write_file(path: Path, root: Path, value: bytes, *, private=False) -> None:
     with file_parent(path, root, create=True, private=private) as parent:
+        if private:
+            require_writable_entry(parent, path.name)
         temporary = f".item-{secrets.token_hex(16)}"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
         try:
             with os.fdopen(fd, "wb") as file:
                 os.fchmod(file.fileno(), 0o600)
+                require_private_file(file.fileno())
                 file.write(value)
                 file.flush()
                 util.flush_fd(file.fileno())
@@ -139,6 +202,8 @@ def write_file(path: Path, root: Path, value: bytes, *, private=False) -> None:
 
 def remove_file(path: Path, root: Path, *, private=False) -> None:
     with suppress(FileNotFoundError), file_parent(path, root, private=private) as parent:
+        if private:
+            require_exact_entry(parent, path.name)
         os.unlink(path.name, dir_fd=parent)
         os.fsync(parent)
 
@@ -179,7 +244,7 @@ def file_location(ref: Reference, settings: config.SecretsConfig) -> tuple[Path,
     root = settings.store_dir
     if root is None:
         raise StoreMissing("pve_store is not configured")
-    config.validate_store_location(root, paths.CONFIG_FILE.parent)
+    config.validate_store_location(root, paths.CONFIG_FILE)
     return root / ref.tag / ref.item, root
 
 
