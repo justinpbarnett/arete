@@ -25,7 +25,7 @@ ACTOR = "rule:unblock"
 OWNER_DIRECTIVE = "Arete owner action: "
 DEPENDENCY_DIRECTIVE = "Arete dependency correction: remove "
 EXCLUDED_LABELS = {"no-agent", "agent:hold", tracker.ZTE_LABEL}
-ACTIONS = {"retry": {"direction", "limit"}, "clarify": {"direction", "limit"}, "answer": {"answers"},
+ACTIONS = {"retry": {"direction", "limit"}, "clarify": {"direction", "limit"}, "answer": {"answers"}, "merge": {"head", "base"},
            "wait_for": set(), "needs_owner": {"asks"}}
 
 
@@ -40,6 +40,13 @@ def exclude(repo: str, ticket: str) -> bool:
 
 def safe(text, limit=4000) -> str:
     return outbound.plain(outbound.screen(vault.hidden(str(text or ""))), limit)
+
+
+def issue_description(body: str) -> str:
+    clean = safe(body, max(len(body) * 2, 32000))
+    if len(clean) <= 32000:
+        return clean
+    return clean[:16000] + "\n[intervening issue text omitted]\n" + clean[-16000:]
 
 
 def digest(data) -> str:
@@ -91,7 +98,7 @@ def prs_of(row: dict) -> dict:
         pr = gh.pr_merge_details(url, timeout=20, retry=False, watch_checks=True)
         if not pr.get("headRefOid") or not pr.get("state"):
             raise ValueError("the current PR could not be confirmed")
-        out[url] = {k: pr.get(k) for k in ("state", "isDraft", "headRefOid", "baseRefOid", "mergeable",
+        out[url] = {k: pr.get(k) for k in ("state", "isDraft", "headRefOid", "baseRefOid", "baseRefName", "mergeable",
                                           "mergeStateStatus", "reviewDecision")}
         out[url]["failing_checks"] = sorted(check.get("name") or check.get("context") or "check"
                                             for check in pr.get("statusCheckRollup") or ()
@@ -126,7 +133,9 @@ def ask_binding(asks: list[dict]) -> str:
 
 
 def policy(cfg, repo) -> str:
-    return digest([delegation.settings_sha(cfg), delegation.settings_sha(config.load_layer(repo.layer_dir))])
+    from . import merge_review
+
+    return merge_review.policy(cfg, config.load_layer(repo.layer_dir))
 
 
 def snapshot(cfg, repo, source, t, row, *, prs=None) -> dict:
@@ -144,7 +153,7 @@ def snapshot(cfg, repo, source, t, row, *, prs=None) -> dict:
 
 
 def evidence_for(t, row, saved, asks, prs, cycle) -> dict:
-    packet = {"ticket": {"id": t.id, "kind": t.kind, "title": safe(t.title, 300), "description": safe(t.body, 6000)},
+    packet = {"ticket": {"id": t.id, "kind": t.kind, "title": safe(t.title, 300), "description": issue_description(t.body)},
               "comments": safe(t.comments, 4000)}
     if cycle:
         packet["dependencies"] = {"cycle": cycle}
@@ -188,6 +197,11 @@ def decision_of(raw, evidence: dict, limit: str) -> dict:
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1600:
         raise ValueError("recovery requires a bounded reason")
     result = {**raw, "reason": safe(reason, 1600)}
+    if action == "merge":
+        candidate = evidence.get("merge_candidate")
+        if (not candidate or "merge_candidate" not in refs or not all(
+                raw[key] == candidate[key] and re.fullmatch(r"[0-9a-f]{40}", raw[key]) for key in ("head", "base"))):
+            raise ValueError("merge requires the exact head and base of this verified candidate")
     if action in ("retry", "clarify"):
         if raw["limit"] != limit or not isinstance(raw["direction"], str) or not raw["direction"].strip():
             raise ValueError("recovery must address the recorded blocker with a concrete direction")
@@ -213,7 +227,8 @@ def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict |
     run.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     place = run.dir / "controller"
     place.mkdir(mode=0o700)
-    prompt = prompt_loader.prompt("unblock", observation=json.dumps({"exhausted_limit": limit, "evidence": evidence}),
+    observation = {"exhausted_limit": limit, "allowed_evidence_keys": list(evidence), "evidence": evidence}
+    prompt = prompt_loader.prompt("unblock", observation=json.dumps(observation),
                                   verification_policy=prompt_loader.VERIFICATION_POLICY)
     request = delegation.request(SimpleNamespace(run=run, cfg=cfg, layer=layer, ws=place), "unblock", prompt,
                                  setting, (), [])

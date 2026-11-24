@@ -592,9 +592,7 @@ class Server:
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
         if not root or Path(root).resolve() != src:
             return
-        required = config.load_layer(repo.layer_dir).required_check
-        if required is None and repo.name == cfg.arete_repo:
-            required = pilot.CHECK
+        required = pilot.required_check(cfg, repo, config.load_layer(repo.layer_dir))
         if required is not None:
             self.deploy_checkout(repo, src, required)
 
