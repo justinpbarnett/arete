@@ -59,6 +59,157 @@ def fixture_bearer(person):
     return "Bearer " + text
 
 
+class _SecretChildCase(unittest.TestCase):
+    def run_secret_child(self, entry, *, keychain=False):
+        folder = tempfile.TemporaryDirectory(suffix=".noindex", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
+        root = Path(self.enterContext(folder))
+        env = api_check.isolated_env(root)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        store = "keychain" if keychain else "pve_store"
+        (root / "config/config.toml").write_text(f'[secrets]\nstore = "{store}"\nstore_dir = "../store"\n')
+        if keychain:
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+            security = bin_dir / "security"
+            security.write_text(f"#!{sys.executable}\n" + r"""
+import json
+import shlex
+import sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+stdin = sys.stdin.read() if argv == ['-i'] else ''
+with Path('security-calls.jsonl').open('a') as log:
+    log.write(json.dumps([argv, stdin]) + '\n')
+args = shlex.split(stdin) if stdin else argv
+database = Path('fake-keychain.json')
+items = json.loads(database.read_text()) if database.exists() else {}
+item = args[args.index('-s') + 1] + '/' + args[args.index('-a') + 1]
+if args[0] == 'add-generic-password':
+    items[item] = args[args.index('-w') + 1]
+    database.write_text(json.dumps(items))
+elif item not in items:
+    sys.exit(44)
+elif args[0] == 'find-generic-password':
+    print(items[item])
+else:
+    assert args[0] == 'delete-generic-password'
+    del items[item]
+    database.write_text(json.dumps(items))
+""")
+            security.chmod(0o700)
+        init = """
+import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from unittest import mock
+
+from arete import config, paths, secretstore
+
+case = unittest.TestCase()
+"""
+        if keychain:
+            init += """
+fixture_security = str(Path.cwd() / 'bin/security')
+config.keychain_program = lambda: None if paths.ISOLATED else fixture_security
+"""
+        command = api_check.child_command(api_check.SOURCE, init + entry)
+        done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+SECRET_KEYCHAIN_SELECTION_FIXTURE = r"""
+@contextmanager
+def owner_installation(*, native=False):
+    home = paths.HOME
+    roots = dict(CONFIG_DIR=home / '.config/arete', STATE_DIR=home / '.local/share/arete') if native else {}
+    with (mock.patch.multiple(paths, ON_MAC=True, ISOLATED=False, **roots),
+          mock.patch.object(config.pwd, 'getpwuid', return_value=mock.Mock(pw_dir=str(home))),
+          mock.patch('arete.sandbox.sandboxed', return_value=False) as sandboxed,
+          mock.patch.object(secretstore.subprocess, 'run') as command):
+        yield sandboxed
+    command.assert_not_called()
+"""
+
+
+class SecretRedirectedKeychainTests(_SecretChildCase):
+    def test_redirected_roots_cannot_select_or_call_the_host_keychain(self):
+        self.run_secret_child(SECRET_KEYCHAIN_SELECTION_FIXTURE + r"""
+with owner_installation():
+    for settings in ({}, {'store': 'keychain'}):
+        assert config.secrets_table(settings, paths.CONFIG_DIR).store is None
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.security('test-only')
+""")
+
+    def test_only_the_native_owner_installation_selects_keychain(self):
+        self.run_secret_child(SECRET_KEYCHAIN_SELECTION_FIXTURE + r"""
+with owner_installation(native=True) as sandboxed:
+    assert config.secrets_table({}, paths.CONFIG_DIR).store == 'keychain'
+    sandboxed.return_value = True
+    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_DIR).store is None
+""")
+
+
+class SecretBackendPrimitivesTests(_SecretChildCase):
+    def test_config_refuses_store_inside_state_config_or_git_work_tree(self):
+        self.run_secret_child(r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
+config.load()
+assert config.secret_settings().store_dir == Path('store').resolve()
+Path('checkout').mkdir()
+Path('checkout/.git').write_text('gitdir: fixture-worktree-metadata\n')
+for directory, expected in (('../state/store', 'must be separate'), ('inner-store', 'must be separate'),
+                            ('../checkout/nested/store', 'outside git work trees')):
+    paths.CONFIG_FILE.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
+    with case.assertRaisesRegex(ValueError, expected):
+        config.load()
+""")
+
+
+    def test_file_store_round_trip_and_protected_owner_references(self):
+        self.run_secret_child(r"""
+settings = config.secret_settings()
+ref = secretstore.parse_reference('pve_store:arete/1234abcd/global/DEMO_KEY', '1234abcd')
+value = b'synthetic file-store fixture'
+secretstore.write_item(ref, settings, value)
+assert secretstore.read_item(ref, settings) == value
+file, root = secretstore.file_location(ref, settings)
+assert file == root / '1234abcd/global/DEMO_KEY'
+assert root.stat().st_mode & 0o777 == 0o700 and file.stat().st_mode & 0o777 == 0o600
+secretstore.remove_item(ref, settings)
+assert secretstore.read_item(ref, settings) is None
+owned = secretstore.Reference('owner_file', ref.tag, 'fixture-owner-file')
+file = paths.STATE_DIR / owned.item
+file.write_bytes(value)
+file.chmod(0o600)
+assert secretstore.read_item(owned, settings) == value
+for protected in (owned, secretstore.Reference('pve_store', ref.tag, secretstore.KEY_ITEM)):
+    with case.assertRaises(secretstore.InternalSecret):
+        secretstore.remove_item(protected, settings)
+assert file.read_bytes() == value
+""")
+
+    def test_fake_keychain_receives_multiline_values_only_on_stdin(self):
+        self.run_secret_child(r"""
+import base64
+import json
+
+settings = config.secret_settings()
+ref = secretstore.Reference('keychain', '1234abcd', 'global/FIXTURE_PEM')
+value = b'synthetic credential fixture\nsecond line'
+secretstore.write_item(ref, settings, value)
+assert secretstore.read_item(ref, settings) == value
+secretstore.remove_item(ref, settings)
+assert secretstore.read_item(ref, settings) is None
+calls = [json.loads(line) for line in Path('security-calls.jsonl').read_text().splitlines()]
+encoded = base64.b64encode(value).decode()
+assert any(argv == ['-i'] and ref.service in stdin and ref.item in stdin and encoded in stdin for argv, stdin in calls)
+assert all(encoded not in ' '.join(argv) and value.splitlines()[0].decode() not in ' '.join(argv) for argv, _ in calls)
+""", keychain=True)
+
+
 WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
                           "-c", "commit.gpgsign=false"]
 
