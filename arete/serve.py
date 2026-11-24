@@ -1226,10 +1226,10 @@ def cleanup_legacy() -> None:
 
 
 def startup_beat() -> foundation.ServeChildren:
-    beat = util.read_json(control.BEAT_FILE, {})
+    beat, seen = util.read_json_snapshot(control.BEAT_FILE, {})
     if not isinstance(beat, dict):
         beat = {}
-    inherited = foundation.heartbeat_serve_children(beat) | foundation.inherited_serve_children()
+    inherited = foundation.heartbeat_serve_children(beat, seen) | foundation.inherited_serve_children()
     children = foundation.live_serve_children(inherited)
     if beat.get("pid") != os.getpid():
         beat = {}

@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -182,17 +182,19 @@ def contract_blockers(conn, n):
                     blockers.append(row["id"])
         elif workspace_contract and settled_run_process_alive(row):
             blockers.append(row["id"])
-    beat = control.database_beat()
     if workspace_contract:
+        beat, seen = util.read_json_snapshot(paths.DB_FILE.with_name(control.BEAT_FILE.name), {})
         if not isinstance(beat, dict):
             beat = {}
-        children = live_serve_children(heartbeat_serve_children(beat) | inherited_serve_children())
+        children = live_serve_children(heartbeat_serve_children(beat, seen) | inherited_serve_children())
         blockers.extend(f"inherited child {pid}" for pid in sorted({pid for pid, _ in children}))
         blockers.extend(workspace_admission_blockers())
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
-    elif util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
+    else:
+        beat = control.database_beat()
+        if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
+            blockers.append(f"serve {beat.get('pid')}")
     return blockers
 
 
@@ -228,13 +230,18 @@ def child_identity(value) -> ProcessIdentity | None:
     return None
 
 
-def heartbeat_serve_children(beat) -> ServeChildren:
+def heartbeat_serve_children(beat, seen=None) -> ServeChildren:
     pids = beat.get(WORKSPACE_CHILD_PIDS)
     identities = beat.get(WORKSPACE_CHILD_IDENTITIES)
     if not isinstance(identities, dict):
         identities = {}
-    return {(pid, child_identity(identities.get(str(pid)))) for pid in pids
-            if type(pid) is int and 0 < pid <= 2**31 - 1} if isinstance(pids, list) else set()
+    children = set()
+    for pid in pids if isinstance(pids, list) else ():
+        if type(pid) is int and 0 < pid <= 2**31 - 1:
+            identity = child_identity(identities.get(str(pid)))
+            if identity is not None or seen is None or process_existed_by(pid, seen.st_mtime):
+                children.add((pid, identity))
+    return children
 
 
 def inherited_serve_children() -> ServeChildren:
@@ -274,20 +281,28 @@ def workspace_child_fields(children: ServeChildren) -> dict:
     return {WORKSPACE_CHILD_PIDS: sorted(grouped), WORKSPACE_CHILD_IDENTITIES: identities}
 
 
-def settled_run_process_alive(row):
-    pid = row["pid"]
-    if not util.pid_alive(pid) or pid == os.getpid():
+def process_existed_by(pid, at):
+    if not util.pid_alive(pid):
         return False
     try:
-        found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C"})
+        found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C", "TZ": "UTC"})
         if not found.stdout.strip():
             return util.pid_alive(pid)
         state, started = found.stdout.strip().split(maxsplit=1)
-        when = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y").astimezone()
-        last_started = util.parse_iso(row["finished"] or row["started"])
-        return not state.startswith("Z") and when.timestamp() <= last_started.timestamp()
+        when = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y").replace(tzinfo=UTC)
+        return not state.startswith("Z") and when.timestamp() <= at
     except (OSError, ValueError):
         return util.pid_alive(pid)
+
+
+def settled_run_process_alive(row):
+    if row["pid"] == os.getpid():
+        return False
+    try:
+        at = util.parse_iso(row["finished"] or row["started"]).timestamp()
+    except (ValueError, TypeError):
+        return util.pid_alive(row["pid"])
+    return process_existed_by(row["pid"], at)
 
 
 def workspace_serve_blocker(beat, n):
