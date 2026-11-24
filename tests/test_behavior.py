@@ -1117,7 +1117,10 @@ class SecretRegistryMigrationTests(_SecretChildCase):
 tables = ('workspaces', 'orchestration_workers', 'orchestration_messages')
 
 def snapshot(c):
-    return [tuple(c.execute(f'SELECT * FROM {table}').fetchone()) for table in tables]
+    rows = [dict(c.execute(f'SELECT * FROM {table}').fetchone()) for table in tables]
+    for legacy_column in ('legacy_mtime_ns', 'legacy_owner'):
+        rows[0].pop(legacy_column, None)
+    return rows
 
 with db.tx() as c:
     c.execute("INSERT INTO workspaces (name, owner_run, state, made_at) "
@@ -1130,7 +1133,7 @@ with db.tx() as c:
     before = snapshot(c)
 
 row = secretstore.put('global', 'DEMO_KEY', 'synthetic-upgrade-value', 'api_key', 'hand')
-assert_schema(27)
+assert_schema(db.LATEST)
 with db.reader() as c:
     assert snapshot(c) == before
 assert secretstore.get('global', 'DEMO_KEY') == row
