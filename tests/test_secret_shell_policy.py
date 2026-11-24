@@ -7,6 +7,7 @@ class AuthoritySecretShellPolicyTests(_SecretChildCase):
 import subprocess
 
 searches = (
+    "awk '/security/ { print $1 }'",
     "awk '/security/ { count++ } END { print count }'",
     "sed -n '/security/,$p'",
     "awk '/security/ { count++ } END { print count + 0 }'",

@@ -74,7 +74,7 @@ SED_SEARCH = re.compile(SED_PATTERN + "p")
 SED_LITERAL_SEARCH = re.compile(rf"\s*(?:{SED_ADDRESS}[ \t]*,[ \t]*(?:{SED_ADDRESS}|\+[0-9]+)[ \t]*p"
                                 r"|/security/\s*(?:p|=|!d|\{\s*p\s*;?\s*\}))\s*")
 AWK_SEARCH = re.compile(r'(?:/security/|\$0[ \t]*~[ \t]*/security/|index\(\$0,[ \t]*"security"\))'
-                        r'(?:\s*\{\s*(?:print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\}'
+                        r'(?:\s*\{\s*(?:print(?:[ \t]+(?:\$[0-9]+|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$[0-9]+)?))?\s*;?\s*\}'
                         r'|(?P<count>[A-Za-z_][A-Za-z_0-9]*)[ \t]*\+\+\s*;?\s*\}\s*;?\s*END\s*\{'
                         r'\s*print[ \t]+(?P=count)(?:[ \t]*\+[ \t]*0)?\s*;?\s*\}))?\s*')
 BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
