@@ -1602,8 +1602,8 @@ class PolicyRestartLineageTests(Isolated):
             return results[name]
 
         with (patch.object(controller, "atomic", side_effect=atomic),
-              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: SimpleNamespace(step=roles[0]))):
-            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "verify", "effort": "low"},
+              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: controller.run.settings(roles[0]))):
+            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "model:verify:0", "effort": "low"},
                                                      {"route_id": "review", "effort": "low"})):
                 done = self.action(controller, op, args)
                 self.assertIsNone(controller.dispatch(done))
@@ -3467,7 +3467,7 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         util.git(["add", "."], cls.base)
         util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
 
-    def prepare_controller(self):
+    def prepare_controller(self, *, real_ledger=False):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         self.enterContext(support.workspace_state(root))
@@ -3500,9 +3500,10 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.enterContext(patch.multiple(workspace, note_made=Mock(), kept_work=Mock(return_value=""),
                                          scratch_left=Mock(return_value=[]), drop_untracked_bytecode=Mock()))
         self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
-        self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
-                                         save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
-                                             "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
+        if not real_ledger:
+            self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
+                                             save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
+                                                 "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
         job.use_layer(self.layer)
         self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
         flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
@@ -3556,6 +3557,84 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                          route_id="model:build:0", effort=model.effort or "low")
             self.assertTrue(controller.collect())
             return worker.call_args.args[2]["role"]
+
+    def test_failed_test_runs_before_full_suite_on_the_final_candidate(self):
+        self.prepare_controller(real_ledger=True)
+        ctl = self.controller
+        ctl.data["acceptance"] = "fixture"
+
+        def check(**args):
+            turn = ledger.begin(ctl.lease, {}, 100)
+            action, = ledger.accept(ctl.lease, turn, ledger.snapshot(ctl.lease)["version"], {"calls": [{
+                "op": "checks.run", "args": OPERATIONS["checks.run"].arguments(args)}]}, 100)
+            self.assertIsNone(ctl.dispatch(action))
+            return ledger.actions(ctl.lease)[-1]["result"]
+
+        selector = "test_order.OrderTests.test_rollback"
+        script = self.wt.parent / "check.py"
+        script.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "if Path('goal.txt').read_text().strip() != 'fixed':\n"
+            "    if sys.argv[1:] or Path('goal.txt').read_text().strip() != 'class only':\n"
+            "        print('test_rollback (test_order.OrderTests.test_rollback)')\n"
+            "    print('AssertionError: wrong order')\n"
+            "    print('Failed classes: test_order.OrderTests')\n"
+            "    print('Ran 3 tests in 0.04s: FAILED')\n"
+            "    sys.exit(1)\n"
+            "if sys.argv[1:] not in ([], ['test_order.OrderTests.test_rollback']): sys.exit(2)\n")
+        self.layer.checks = {"lint": "true", "behavior": shlex.join([sys.executable, str(script)])}
+        self.layer.targeted_commands = {"classes": self.layer.checks["behavior"]}
+
+        self.write("goal.txt", "class only")
+        failed = check()
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["remaining_checks"], [{"name": "behavior", "selectors": ["test_order.OrderTests"]}])
+        self.assertFalse(failed["runner_blocked"])
+
+        narrowed = check()
+        self.assertEqual(narrowed["remaining_checks"], [{"name": "behavior", "selectors": [selector]}])
+        reproduced = check()
+        self.assertEqual((reproduced["scope"], reproduced["checks_executed"]), ("failed", ["behavior"]))
+        repeated = check()
+        self.assertEqual(repeated["reused_checks"], ledger.actions(ctl.lease)[-2]["id"])
+        self.assertEqual(repeated["checks_executed"], [])
+        ctl.recover()
+        self.assertFalse(ctl.current("checks"))
+        self.assertEqual(check()["reused_checks"], repeated["reused_checks"])
+
+        self.write("goal.txt", "fixed")
+        first = check()
+        self.assertEqual((first["scope"], first["passed"], first["full"]), ("failed", True, False))
+        self.assertEqual(first["checks_executed"], ["behavior"])
+        self.assertIn(selector, first["report"])
+        self.write("another.txt", "later integration")
+        self.assertEqual(check()["scope"], "failed")
+
+        final = check(scope="quick")
+        self.assertEqual((final["scope"], final["passed"], final["full"]), ("full", True, True))
+        self.assertEqual(final["checks_executed"], ["lint", "behavior"])
+        self.assertEqual(final["remaining_checks"], [])
+
+        producer = ctl.data["evidence"]["checks"]["producer"]
+        self.assertEqual(check()["reused_checks"], producer)
+        ctl.recover()
+        self.assertTrue(ctl.current("checks"))
+        self.assertEqual(check(scope="quick")["reused_checks"], producer)
+        with patch.object(ctl.run, "action", producer):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["acceptance"] = "owner confirmed the runner is ready"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["ci_failed"] = True
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data.pop("ci_failed")
+        with patch.object(ctl.run, "environment_release", "new release"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        with patch.object(ctl.run, "path", "pilot"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        self.layer.checks["new"] = "true"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
+        self.write("another.txt", "changed again")
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
 
     def test_second_worker_passes_checks_without_the_denied_paths(self):
         self.prepare_controller()

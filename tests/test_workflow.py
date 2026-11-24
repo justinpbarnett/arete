@@ -9905,6 +9905,18 @@ class JourneyVerificationTests(unittest.TestCase):
                 else:
                     self.assertNotIn("verify-fault", prompt)
 
+    def test_focused_verification_skips_only_previously_observed_configured_commands(self):
+        self.work.layer.verify.probes = {"existing": "kept-command", "new": "new-command"}
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "fixed clock", "how": "view timeline", "saw": "expected time", "passed": True}]
+        with mock.patch.object(verify, "run_probes", return_value=verify.Verified(
+            "pass", checks=[{"what": "new", "how": "new-command", "saw": "ok", "passed": True}])) as probes:
+            result = pipeline.use_product(self.work, "verify", "verify", goal="Check fixed clock", summary="", diff="",
+                                          covered_commands=("existing", "journey:verifier-prompt-inputs"))
+        self.assertEqual(probes.call_args.args[0].probes, {"new": "new-command"})
+        self.assertEqual(probes.call_args.kwargs["journey_drivers"], {})
+        self.assertEqual(result.verdict, "pass")
+
     def test_passing_driver_cannot_supply_missing_verifier_checks(self):
         self.ticket.body = "Also inspect the catalog."
         self.work.layer.trust_level = "automerge"

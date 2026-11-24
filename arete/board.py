@@ -31,6 +31,7 @@ from .store import approvals as approvals_store
 from .store import asks as asks_store
 from .store import db as foundation
 from .store import devices as devices_store
+from .store import gate_metrics
 from .store import incidents as incident_store
 from .store import insights as insights_store
 from .store import loops as loop_store
@@ -444,7 +445,8 @@ def find() -> dict:
 
 def outcomes() -> dict:
     figures = trend_figures()
-    return {**figures, "decisions": decisions(figures["since"])}
+    return {**figures, "decisions": decisions(figures["since"]),
+            "check_verification": gate_metrics.check_verification(figures["since"])}
 
 
 def decisions(since: str) -> dict:

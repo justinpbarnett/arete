@@ -22,6 +22,28 @@ When an older ticket resumes, its next publication requires a fresh Standards an
 Its previous reviews remain in the action history. Current checks, retained work and owner decisions carry forward.
 A release-specific verification retry uses its original evidence requirements.
 
+## Check repairs and verification retries
+
+After a configured check fails, the next check run exercises the failed command on the repaired candidate.
+For an Arete Python test run with identifiable failures, it runs the named methods or classes first.
+A focused pass is evidence for the repair. Publication still requires the full suite on the final integrated tree.
+Repeated requests can reuse that full pass or an identical focused failure on unchanged inputs. An explicit
+operator rerun executes the checks again.
+When every failure points to the same macOS sandbox profile installation problem, the owner sees one runner
+question listing the affected tickets. Confirming readiness releases the eligible tickets to retry independently.
+
+Behavioral verification records the scenarios observed, the remaining requirements and the missing capability.
+The controller can request a follow-up by exact requirement name. Compatible evidence carries forward, and
+switching models on the same blocked tool surface reuses the recorded result. For a required behavior, the
+controller can select an approved runner with the missing capability or request the fixture or access it needs.
+For a supplemental scenario the verifier identified as advisory, the controller can record its reason to proceed
+with `verification.decide`. The PR retains the gap and decision. Each required behavior still needs evidence.
+
+The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
+runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
+a comparable runner fingerprint appear as unclassified. When an existing run needs new behavioral evidence
+and its last report predates environment tracking, it takes one fresh baseline before a focused follow-up.
+
 ## Select or revert
 
 Set the layer deliberately:

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import replace
 
-from . import factory, journeys, prompt_loader, util
+from . import factory, journeys, prompt_loader, util, verification_attempts
 from .review import Review
 from .verify import Verified
 
@@ -32,7 +32,9 @@ Cite the requirement and the changed path for each finding.""",
 
 def requires_behavior(build):
     policy = build.layer.verify
-    return bool(policy and (policy.probes or journeys.requested(policy.feature_map, build.ticket.title, build.ticket.body)))
+    ticket = getattr(build, "ticket", None)
+    return bool(policy and (policy.probes or ticket and journeys.requested(policy.feature_map, ticket.title, ticket.body))
+                or ticket and verification_attempts.REQUIRED_IN_USE.search(ticket.body))
 
 
 def unverified():
