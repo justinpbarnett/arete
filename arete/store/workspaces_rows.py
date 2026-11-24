@@ -11,7 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .. import config, paths, util
-from .. import workspace_rows as workspace
+from .. import workspace
 from . import asks, events, runs, writes
 from .db import reader, require_workspace_contract
 
