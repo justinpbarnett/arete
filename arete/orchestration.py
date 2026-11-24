@@ -317,6 +317,7 @@ class Controller(worker_turns.WorkerTurns):
                 self.data["repair_source"] = found.run_id
                 self.run.story.append(f"Review findings to repair:\n{found.review.findings()}")
                 self.job.plan_text, self.job.review = found.plan, found.review
+                self.job.b.restore_repair_state(found.repair_state)
                 self.job.reviews = 1
                 self.job.goal += f"\n\nCheck the saved review findings are fixed:\n{found.review.findings()}"
                 self.job.left_for_a_person = found.left_for_a_person

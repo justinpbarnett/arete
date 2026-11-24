@@ -591,8 +591,8 @@ class Job:
     def held_reason(self) -> str:
         if self.run.environment_release and not retry_passed(self.verified):
             return "verification did not pass on the live release"
-        if self.verified.verdict == "blocked" and (self.patch_mode or patching.specification_refusal(self.ticket)
-                or patching.sensitive_files(self.layer.patch, self.b.staged.files)):
+        if self.verified.verdict == "blocked" and self.b.requires_behavioral_evidence(
+                self.b.staged.files, patch_mode=self.patch_mode):
             return "the check in use was blocked; this change requires behavioral evidence"
         why = pipeline.draft_reason(self.review, self.verified, self.reviews)
         if not why and (pending := self.b.in_use_repair_hold(self.verified)):
@@ -1206,7 +1206,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
     b = job.b
     b.restore_repair_state(found.repair_state)
     b.carry_review(found.review, restored=True)
-    b.check_repair_findings(producer="repair:before", baseline=True)
+    b.capture_repair_baselines("repair:before")
     res = run.agent("repair", job.brief.prompt(
         "repair", plan=found.plan, source=found.run_id, findings=b.repair_feedback() or findings, checks=job.checks),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
@@ -1245,7 +1245,7 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
     b = job.b
     denied = prompt_loader.code_list(b.deny)
     if round.startswith(REVIEW_FIX):
-        b.check_repair_findings(producer=f"{round}:before", baseline=True)
+        b.capture_repair_baselines(f"{round}:before")
         problems = "\n\n".join(filter(None, (feedback, b.repair_feedback())))
         prompt = prompt_loader.prompt(REVIEW_FIX, problems=problems, notes=job.review.fix_notes(), denied=denied)
     else:
@@ -1620,9 +1620,9 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
     held_at_head = []
     feedback_prs = run.feedback_prs + job.prepared_feedback_prs
     if run.repo.parts and draft_why and (repair_hold or not feedback_prs):
-        ordinary_recheck = job.continues and len(staged.changed) == 1 and not (updated or run.repairs or repair_hold)
+        ordinary_recheck = job.continues and not (updated or run.repairs or repair_hold)
         held_at_head = [c for c in staged.changed if c.pr and c not in updated
-                        and (ordinary_recheck or c in found or (c.revision and c.lease != c.revision)
+                        and (c in found or (c.revision and (ordinary_recheck or c.lease != c.revision))
                              or (repair_hold and c.pr in feedback_prs))]
     check_targets = job.check_publication_targets
     if repair_hold or held_at_head:
@@ -1661,7 +1661,7 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
         draft = draft or "a standalone review does not clear the publication hold"
     try:
         result = pipeline.watch_ci(b, job.slot, job.branch, job.picked(job.changed), job.with_prs, draft,
-                                   fix=fix, review=job.review, goal=job.with_left(job.goal))
+                                   fix=fix, review=job.review, goal=job.with_left(job.goal), patch_mode=job.patch_mode)
     except workspace.RunFailed as e:
         detail = e.detail
         if not run.feedback:

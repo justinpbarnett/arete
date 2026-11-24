@@ -15,11 +15,15 @@ The reviewer also left notes. Fix a note only when the fix is small and inside t
 
 $notes
 
-Exercise each listed acceptance condition. Reuse the named regression or add only the case it needs under the
-approved check; do not change check policy. Read the output and exit code. Arete rechecks recorded regressions
-before another full review, and still requires the full suite and applicable in-use verification on the final tree.
-Do not duplicate the full suite in this repair step.
-Name exactly what you ran and any environmental limitation; never report an unrun check as passed.
+Exercise each acceptance condition. For repeatable findings, reuse a focused regression or, if none fits, use
+a disposable, non-sensitive scratch regression outside the patch. Use the approved checked-command path or
+report the gap; do not change check policy. Approval to run a check does not authorize permanent coverage.
+Add or extend it only if an explicit task or repository instruction requires coverage of a specific essential
+business rule; keep it focused, deterministic and fast. Read the output and exit code; report the finding, candidate, command,
+outcome, and any environmental limitation. Never report an unrun check as passed.
+
+Arete rechecks recorded regressions before another full review, and still requires the full suite and applicable
+in-use verification on the final tree. Do not duplicate the full suite in this repair step.
 
 Do not expand scope beyond the issue. End with one line per blocker id: `B1 fixed: how` or `B1 left open: why`. The
 next reviewer reads it.

@@ -162,6 +162,9 @@ class Review:
     def judged(cls, said: dict, earlier: list[dict], waived: list[dict], trees: dict) -> Review:
         answered = settled(earlier, said.get("earlier"))
         problems = [{k: v for k, v in p.items() if k != "finding"} for p in review_problems(said.get("problems"))]
+        for problem in problems:
+            if problem["severity"] not in NOTE_SEVERITIES:
+                problem.setdefault("verification", "check")
         found = cls.stored({**said, "problems": problems, "earlier": answered, "trees": trees,
                             "waived": waived + [e for e in answered if e["status"] == "waived"]})
         found.verdict = "request_changes" if found.blocking() else "approve"

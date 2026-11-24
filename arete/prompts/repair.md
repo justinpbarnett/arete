@@ -37,9 +37,12 @@ Denied paths: $denied.
   Do not duplicate the full suite here; leave it to the checks step.
   Run the test classes for the files you changed by name, for example `$test_classes`;
   a full suite run here waits for a free check lane.
-  Exercise each listed acceptance condition. Reuse the named regression or add only the case it needs under the
-  approved check. Report what you actually ran, any missing baseline, and any required independent observation
-  you could not make. Do not change check policy or work around a sandbox refusal.
+  Exercise each acceptance condition. For repeatable findings, reuse a focused regression or, if none fits, use
+  a disposable, non-sensitive scratch regression outside the patch. Use the approved checked-command path or report
+  the gap; do not change policy or bypass a refusal. Approval to run a check does not authorize permanent coverage.
+  Add or extend it only if an explicit task or repository instruction requires coverage of a specific essential
+  business rule, and keep it focused, deterministic and fast. Report the finding, candidate tested, command and its
+  outcome, any missing baseline, and any required independent observation you could not make.
 - Shell commands you may run: $commands. Others are refused. If a finding needs one, change nothing for it and say
   in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and pushes, and deletes the

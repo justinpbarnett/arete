@@ -135,6 +135,7 @@ def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
     if not trees:
         return missing_evidence, None
     if trees != checked_trees:
+        checked_by_verification = job.b.full_checks_current(trees)
         if not (checked := final_checks(flow, ws)).passed:
             return "the verification repairs did not converge with review", checked
         if pipeline.verification_trees(job.b) != trees:
@@ -145,7 +146,9 @@ def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
             if pipeline.verification_trees(job.b) != trees:
                 return missing_evidence, None
             allowed_gap = patching.allowed_gap(job.layer, job.ticket, job.verified)
-        if not allowed_gap and (job.verified.verdict != "pass" or job.verified.observed_trees != trees):
+        observed = job.verified.verdict == "pass" and job.verified.observed_trees == trees
+        blocked = checked_by_verification and job.verified.verdict == "blocked"
+        if not (allowed_gap or observed or blocked):
             return missing_evidence, None
         if not job.b.full_checks_current(trees):
             return "the verification repairs lack current full checks", None

@@ -52,9 +52,11 @@ def saved_review(run_id: str) -> tuple[Review, str, dict]:
         raise Refused(f"run {run_id}: its last review approved the change, so nothing is left to repair")
     if review.verdict != "request_changes" or not review.blocking():
         raise Refused(f"run {run_id} requested changes but saved no findings to repair")
-    keys = {p["finding"] for p in review.blocking()}
+    state = restored["repair_state"]
+    keys = {p["finding"] for p in review.blocking()} | {
+        key for key, finding in state.get("findings", {}).items() if finding.get("verification") == "check"}
     state = {name: {key: value for key, value in rows.items() if key in keys}
-             for name, rows in restored["repair_state"].items() if name in ("findings", "receipts", "in_use_waivers")}
+             for name, rows in state.items() if name in ("findings", "receipts", "baselines", "in_use_waivers")}
     line = restored["line"]
     return review, f"the {line['event']} line of run {line['run']} (seq {run_lines.seq_of(line)})", state
 

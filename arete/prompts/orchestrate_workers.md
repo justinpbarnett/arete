@@ -18,8 +18,11 @@ When `repair_findings` appears in the observation, read its reference. Run `chec
 an unchanged reviewed candidate before the first repair when the regression is already runnable. If it did not
 reproduce or could not run, report that honestly. The engine appends findings, observable acceptance and any
 focused failures to writing assignments. Delegate a repair for a failure before requesting another full review;
-rerun focused checks after integration or other edits. Reuse an approved named regression, or add just the case
-needed under an existing approved check. Never invent a command or treat an unrelated exit code as reproduction.
+rerun focused checks after integration or other edits. Reuse a focused regression or, if none fits, delegate a
+disposable, non-sensitive scratch regression outside the patch. Use the approved checked-command path or report
+why it cannot run; never invent commands or count unrelated results. Check approval does not authorize permanent
+coverage. Delegate it only when an explicit task or repository instruction requires coverage of a specific
+essential business rule; keep it focused, deterministic and fast.
 An alternate independent review or in-use requirement is not a focused pass. Focused passes never replace the
 full checks, independent review or applicable in-use verification on the final integrated tree.
 Use the existing held-draft dispositions for genuine blockers, never turn blocked into pass.
