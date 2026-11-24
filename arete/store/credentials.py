@@ -34,8 +34,9 @@ def change_recorded(c, secret_id, receipt):
         """, (secret_id, receipt)).fetchone() is not None
 
 
-def has_secret_fingerprints(c):
-    return bool(c.execute("SELECT EXISTS (SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
+def has_fingerprints(c):
+    return bool(c.execute("SELECT EXISTS (SELECT 1 FROM accounts UNION ALL "
+                          "SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
 
 
 def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider, *, rotated=False):

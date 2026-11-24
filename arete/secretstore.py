@@ -440,7 +440,7 @@ def ensure_key(c, settings, *, probe_local=None):
     fallback = read_file(local, local.parent)
     if meta.get(KEY_LOCAL):
         checked_key(fallback)
-    elif credentials.has_secret_fingerprints(c):
+    elif credentials.has_fingerprints(c):
         raise FingerprintKeyMissing("fingerprint_key_missing")
     ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM) if settings.store else None
     stored = read_item(ref, settings) if ref else None
@@ -525,27 +525,15 @@ def pending_path(item):
     return root / item, root
 
 
-def load_pending(c, item, row):
+def load_pending(item):
     raw = read_file(*pending_path(item), private=True)
-    receipt = json.loads(raw) if raw is not None else {}
-    if row:
-        removal = receipt.get("removal")
-        if removal and credentials.change_recorded(c, row["id"], removal["id"]):
-            return raw, {}
-        if (receipt_id := receipt.get("id")) and credentials.change_recorded(c, row["id"], receipt_id):
-            receipt.pop("sets", None)
-    return raw, receipt
+    return raw, json.loads(raw) if raw is not None else {}
 
 
 def save_pending(item, record):
     raw = json.dumps(record).encode()
     write_file(*pending_path(item), raw, private=True)
     return raw
-
-
-def matching_set(pending, ref, fingerprint):
-    return next((record for record in pending if record["reference"] == str(ref)
-                 and record["fingerprint"] == fingerprint), None)
 
 
 def retire_pending(item, raw, expected):
@@ -561,9 +549,9 @@ def retire_pending(item, raw, expected):
     db.after_commit(committed)
 
 
-def save_change(c, scope, name, previous, ref, change, receipt_id, *, removing=False):
+def save_change(c, scope, name, previous, ref, change):
     actor, at = change["actor"], change["at"]
-    if removing:
+    if change.get("removed"):
         row = (credentials.mark_removed(c, previous, at) if previous else
                credentials.removed_secret(c, scope, name, change["kind"], ref.store, str(ref), at))
         event = "removed"
@@ -572,9 +560,33 @@ def save_change(c, scope, name, previous, ref, change, receipt_id, *, removing=F
         row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
                                       actor, at, change["provider"], rotated=rotated)
         event = "rotated" if rotated else "set"
-    credentials.secret_event(c, row, event, actor, at, detail=receipt_id)
+    credentials.secret_event(c, row, event, actor, at, detail=change["id"])
     credentials.secret_changed(c, row, actor)
     return row
+
+
+def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
+    confirmed = list(receipt.get("confirmed", ()))
+
+    def recorded(operation):
+        return row is not None and credentials.change_recorded(c, row["id"], operation["id"])
+
+    for change in receipt.get("sets", ()):
+        if change["reference"] != str(ref):
+            raise StoreError("pending write belongs to another reference")
+        if change["fingerprint"] == fingerprint or recorded(change):
+            confirmed.append(change)
+            break
+    removal = receipt.get("removal")
+    if removal and (absent or recorded(removal)):
+        confirmed.append(removal)
+        removal = None
+    recovered = False
+    for operation in confirmed:
+        if not recorded(operation):
+            row = save_change(c, scope, name, row, ref, operation)
+            recovered = True
+    return row, confirmed, removal, recovered
 
 
 def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=None) -> dict:
@@ -590,24 +602,20 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=No
             require_removable(item, row["store"])
             if row["reference"] != str(ref):
                 raise StoreError("secret is registered in a different store")
-        _, pending = load_pending(c, item, row)
-        if pending.get("removal"):
-            raise StoreError("secret removal is pending; retry the removal before setting a new value")
+        _, receipt = load_pending(item)
         stored = read_item(ref, settings)
+        fingerprint = item_digest(key, stored) if receipt.get("sets") and stored is not None else None
+        row, confirmed, removal, _ = recover_changes(c, scope, name, row, ref, receipt, fingerprint, absent=stored is None)
+        if removal:
+            raise StoreError("secret removal is pending; retry the removal before setting a new value")
+        change = dict(id=secrets.token_hex(16), reference=str(ref), kind=kind, actor=actor, at=util.iso(),
+                      fingerprint=digest(key, value), provider=provider, rotated=stored is not None)
+        # Keep earlier operations recoverable until the outer SQLite transaction commits.
+        raw = save_pending(item, {"confirmed": confirmed, "sets": [change]})
         data = value.encode()
-        change = dict(reference=str(ref), kind=kind, actor=actor, at=util.iso(), fingerprint=digest(key, value),
-                      provider=provider, rotated=stored is not None)
-        receipt_id = secrets.token_hex(16)
-        if stored == data:
-            # Identical bytes cannot prove a retry wrote anything; keep the old receipt until it does.
+        if stored != data:
             write_item(ref, settings, data)
-            raw = save_pending(item, {"id": receipt_id, "sets": [change]})
-        else:
-            sets = pending.get("sets", [])
-            previous = matching_set(sets, ref, item_digest(key, stored)) if sets and stored is not None else None
-            raw = save_pending(item, {"id": receipt_id, "sets": [change, previous] if previous else [change]})
-            write_item(ref, settings, data)
-        row = save_change(c, scope, name, row, ref, change, receipt_id)
+        row = save_change(c, scope, name, row, ref, change)
         retire_pending(item, raw, row)
         return row
 
@@ -628,38 +636,35 @@ def reconcile(scope, name, actor, *, deleting=False):
         row = credentials.secret(c, scope, name)
         if deleting and row:
             require_removable(item, row["store"])
-        raw, receipt = load_pending(c, item, row)
-        pending, removal = receipt.get("sets", []), receipt.get("removal")
-        target = row or removal or (pending[0] if pending else None)
+        raw, receipt = load_pending(item)
+        pending = receipt.get("sets", [])
+        target = row or receipt.get("removal") or (pending[0] if pending else None)
         if target is None:
             return None
         ref = registry_reference(c, target, item)
         if deleting:
             require_removable(item, ref.store)
-            if removal is None and not (row and row["status"] == "missing" and
-                    credentials.last_lifecycle(c, row["id"]) == "removed" and read_item(ref, settings) is None):
-                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=target["kind"], actor=actor, at=util.iso())
-                raw = save_pending(item, {**receipt, "removal": removal})
+        value = read_item(ref, settings)
+        sha = item_digest(fingerprint_key(settings), value) if value is not None and (pending or not deleting) else None
+        row, confirmed, removal, recovered = recover_changes(c, scope, name, row, ref, receipt, sha, absent=value is None)
+        if deleting:
+            if removal is None and not (row and row["status"] == "missing" and value is None and
+                                        credentials.last_lifecycle(c, row["id"]) == "removed"):
+                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=target["kind"], actor=actor,
+                               at=util.iso(), removed=True)
+                raw = save_pending(item, {"confirmed": confirmed, "removal": removal})
             if removal is not None:
                 remove_item(ref, settings)
-                row = save_change(c, scope, name, row, ref, removal, removal["id"], removing=True)
+                row = save_change(c, scope, name, row, ref, removal)
             retire_pending(item, raw, row)
             return row
-        value = read_item(ref, settings)
-        if removal is not None and value is None:
-            row = save_change(c, scope, name, row, ref, removal, removal["id"], removing=True)
-            removal = None
-        sha = item_digest(fingerprint_key(settings), value) if value is not None else None
-        change = matching_set(pending, ref, sha)
-        if change is not None:
-            row = save_change(c, scope, name, row, ref, change, receipt.get("id"))
         if row is None and sha is not None:
             raise StoreError("secret item does not match its recovery record")
         if row is not None:
             ok = sha is not None and row["fingerprint"] == sha
             at = util.iso()
-            row = credentials.mark_checked(c, row, ok, at, recovered=change is not None)
+            row = credentials.mark_checked(c, row, ok, at, recovered=recovered)
             credentials.secret_event(c, row, "checked", actor, at, ok=ok)
-        if removal is None and (not pending or sha is None or change or row and row["fingerprint"] == sha):
+        if removal is None and (not pending or sha is None or recovered or row and row["fingerprint"] == sha):
             retire_pending(item, raw, row)
         return row
