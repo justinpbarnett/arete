@@ -3688,7 +3688,8 @@ beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
 pid = os.getpid()
 util.write_json(beat, {"workspace_contract_children": [pid]})
 os.utime(beat, (946684800, 946684800))
-with patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout="")):
+with (patch.object(db.check_process.DarwinProcesses, "info", return_value=None),
+      patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout=""))):
     with db.reader() as c:
         assert f"inherited child {pid}" in db.contract_blockers(c, 28)
 process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
