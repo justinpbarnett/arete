@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from .. import dbstats, paths, util
+from .. import check_process, dbstats, paths, util
 from . import migrations
 from .migrations import m0002_foundation_time_shape as time_shape
 
@@ -294,6 +294,11 @@ def process_existed_by(pid, at):
     if not util.pid_alive(pid):
         return False
     try:
+        if paths.ON_MAC:
+            info = check_process.DarwinProcesses().info(pid)
+            if info is None:
+                return util.pid_alive(pid)
+            return info.status != check_process.SZOMB and info.seconds <= int(at)
         found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C", "TZ": "UTC"})
         if not found.stdout.strip():
             return util.pid_alive(pid)
