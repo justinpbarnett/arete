@@ -178,10 +178,11 @@ def remove_file(path: Path, root: Path, *, private=False) -> None:
 
 
 def security(*args, input=None):
-    if paths.ISOLATED:
-        raise StoreError("the Keychain is unavailable in isolation")
+    program = config.keychain_program()
+    if not program:
+        raise StoreError("the Keychain is unavailable for this installation")
     try:
-        return subprocess.run(["security", *args], input=input, capture_output=True, timeout=10, check=False)
+        return subprocess.run([program, *args], input=input, capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         raise StoreError("Keychain command failed") from None
 

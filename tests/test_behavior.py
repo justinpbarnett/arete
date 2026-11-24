@@ -108,8 +108,13 @@ from arete import config, paths, secretstore
 from arete.store import db
 
 case = unittest.TestCase()
-db.migrate()
 """
+        if keychain:
+            init += """
+fixture_security = str(Path.cwd() / 'bin/security')
+config.keychain_program = lambda: None if paths.ISOLATED else fixture_security
+"""
+        init += "db.migrate()\n"
         command = api_check.child_command(Path(__file__).resolve().parents[1], init + entry)
         done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -257,6 +262,40 @@ for name in ('DIRECT', 'RECOVERED', 'ABSENT'):
     assert history[2]['fingerprint_after'] == row['fingerprint']
     assert row['rotated_at'] == (None if name == 'ABSENT' else row['set_at'])
     assert len(history) == (4 if name == 'RECOVERED' else 3)
+""")
+
+
+class SecretRedirectedKeychainTests(_SecretChildCase):
+    def test_redirected_roots_cannot_select_or_call_the_host_keychain(self):
+        self.run_secret_child(r"""
+with (mock.patch.object(paths, 'ISOLATED', False),
+      mock.patch.object(paths, 'ON_MAC', True),
+      mock.patch('arete.sandbox.sandboxed', return_value=False),
+      mock.patch.object(secretstore.subprocess, 'run') as command):
+    for settings in ({}, {'store': 'keychain'}):
+        assert config.secrets_table(settings, paths.CONFIG_DIR).store is None
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.security('test-only')
+    command.assert_not_called()
+""")
+
+    def test_only_the_native_owner_installation_selects_keychain(self):
+        self.run_secret_child(r"""
+import os
+import pwd
+
+home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+with (mock.patch.object(paths, 'ON_MAC', True),
+      mock.patch.object(paths, 'ISOLATED', False),
+      mock.patch.object(paths, 'HOME', home),
+      mock.patch.object(paths, 'CONFIG_DIR', home / '.config/arete'),
+      mock.patch.object(paths, 'STATE_DIR', home / '.local/share/arete'),
+      mock.patch('arete.sandbox.sandboxed', return_value=False) as sandboxed,
+      mock.patch.object(secretstore.subprocess, 'run') as command):
+    assert config.secrets_table({}, paths.CONFIG_DIR).store == 'keychain'
+    sandboxed.return_value = True
+    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_DIR).store is None
+    command.assert_not_called()
 """)
 
 

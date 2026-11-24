@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
+import pwd
 import re
 import shlex
 import tomllib
@@ -789,14 +791,31 @@ def validate_store_location(directory: Path, folder: Path, repo_paths=()) -> Non
         raise ValueError("[secrets] store_dir must be outside git work trees")
 
 
+def keychain_program() -> str | None:
+    if not paths.ON_MAC or paths.ISOLATED:
+        return None
+    from . import sandbox
+
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        config_dir, state_dir = paths.CONFIG_DIR.resolve(), paths.STATE_DIR.resolve()
+        if paths.HOME.resolve() != home or sandbox.sandboxed():
+            return None
+        if (config_dir, state_dir) != (home / ".config/arete", home / ".local/share/arete"):
+            return None
+    except (AttributeError, KeyError, OSError, RuntimeError):
+        return None
+    return "/usr/bin/security"
+
+
 def secrets_table(data, folder: Path, *, repo_paths=()) -> SecretsConfig:
     if not isinstance(data, dict):
         raise ValueError("[secrets] must be a table")
     table = only(data, root_schema("secrets"), "[secrets]")
-    store = table.get("store", "keychain" if paths.ON_MAC and not paths.ISOLATED else "")
+    store = table.get("store", "keychain")
     if store not in ("", "keychain", "pve_store"):
         raise ValueError("[secrets] store must be keychain, pve_store or empty")
-    if store == "keychain" and paths.ISOLATED:
+    if store == "keychain" and not keychain_program():
         store = ""
     if "store_dir" not in table:
         if store == "pve_store":

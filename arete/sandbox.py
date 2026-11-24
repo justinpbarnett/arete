@@ -83,7 +83,7 @@ def can_confine(remote: bool) -> bool:
 def sandboxed() -> bool:
     lib = ctypes.CDLL(None)
     lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    return lib.sandbox_check(os.getpid(), None, 0) == 1
+    return lib.sandbox_check(os.getpid(), None, 0) != 0
 
 
 def secret_store_roots() -> tuple[Path, ...]:

@@ -4,6 +4,17 @@ from tests.test_behavior import SECRET_GUARD_FIXTURE, _SecretChildCase
 class AuthoritySecretShellPolicyTests(_SecretChildCase):
     def test_searches_comments_and_literal_data_are_admitted(self):
         self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+import subprocess
+
+arithmetic = {
+    "printf '%s\\n' $((((2 << 3) >> 1) + $((1 << 1))))": '10\n',
+    "(( counter = (2 << 3) >> 1 )); printf '%s\\n' \"$counter\"": '8\n',
+}
+for command, output in arithmetic.items():
+    result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', command],
+                            env={'HOME': str(Path.home())}, capture_output=True, text=True, check=True, timeout=5)
+    assert result.stdout == output, command
+
 for command in (
     "sed -n '/security/p' README.md",
     "bash -lc \"sed -n '/security/p' README.md\"",
@@ -15,9 +26,11 @@ for command in (
     "cat <<< 'security -i'",
     r"$'pr\x69ntf' '%s\n' $'\073' security",
     "$'security' $'verify-cert' -c public.crt",
+    'security find-certificate -a -p',
+    '/usr/bin/security -q find-certificate -c fixture -p',
     "printf '%s\\n' \"$'security'\"",
     "printf '%s\\n' \"$((2 << 3))\"",
-    "printf '%s\\n' $(((2 << 3) >> 1) + $((1 << 1)))",
+    *arithmetic,
     "printf '%s\\n' \"$((2 << $(printf 3)))\"",
     "cat <<TEXT\n$((2 << 3))\nTEXT",
 ):

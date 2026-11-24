@@ -903,7 +903,7 @@ def sed_search(args: list[str]) -> bool:
     return bool(args and SED_SEARCH.fullmatch(args[0]) and all(not arg.startswith("-") for arg in args[1:]))
 
 
-def denied_keychain(words: list[str], depth: int) -> str:
+def denied_keychain(words: list[str], depth: int, shell: str) -> str:
     if not words:
         return ""
     if depth > 12:
@@ -913,15 +913,17 @@ def denied_keychain(words: list[str], depth: int) -> str:
     if program == "security":
         while args and args[0] in ("-q", "-v"):
             args = args[1:]
-        return "" if args[:1] == ["verify-cert"] else guard.reach("security keychain items")
+        if args and args[0] in ("verify-cert", "find-certificate"):
+            return ""
+        return guard.reach("security keychain items")
     if program in SHELL_WORDS and (script := inline_shell(args, skip_values=True)) is not None:
-        return keychain_refusal(script, depth + 1)
+        return keychain_refusal(script, depth + 1, shell=program)
     if tool == "eval":
-        return keychain_refusal(" ".join(args), depth + 1)
+        return keychain_refusal(" ".join(args), depth + 1, shell=shell)
     if program == "find":
         for index, arg in enumerate(args[:-1]):
             if arg in ("-exec", "-execdir", "-ok", "-okdir"):
-                if reason := denied_keychain(command_words(args[index + 1:]), depth + 1):
+                if reason := denied_keychain(command_words(args[index + 1:]), depth + 1, shell):
                     return reason
     if program in SCRIPT_TOOLS and not (program == "sed" and sed_search(args)):
         if any(KEYCHAIN_COMMAND.search(word) for word in words):
@@ -945,8 +947,9 @@ def ansi_c_escape(match: re.Match[bytes]) -> bytes:
 
 
 class KeychainShell:
-    def __init__(self, source: str):
+    def __init__(self, source: str, *, shell: str = "bash"):
         self.source = source
+        self.shell = shell
         self.pos = 0
         self.refusal = ""
 
@@ -973,17 +976,19 @@ class KeychainShell:
                 raise ValueError("unclosed backtick")
             self.pos = match.end()
             script = re.sub(r"\\([$`\\])", r"\1", match[1])
-            self.refusal = self.refusal or keychain_refusal(script, depth + 1)
-        elif not self.starts("$((") or not self.scan_arithmetic(depth + 1):
+            self.refusal = self.refusal or keychain_refusal(script, depth + 1, shell=self.shell)
+        elif not self.scan_arithmetic(depth + 1, "$(("):
             self.pos += 2
             self.commands(depth + 1, closing=True)
         return self.source[start:self.pos]
 
-    def scan_arithmetic(self, depth: int) -> bool:
+    def scan_arithmetic(self, depth: int, opening: str) -> bool:
+        if not self.starts(opening):
+            return False
         if depth > 12:
             raise ValueError("nested shell command")
         start, refusal = self.pos, self.refusal
-        self.pos += 3
+        self.pos += len(opening)
         parens = 0
         while ch := self.char():
             if ch == "`" or self.starts("$("):
@@ -1085,7 +1090,7 @@ class KeychainShell:
         for delimiter, strip_tabs, expand, pipeline in docs:
             body = self.heredoc(delimiter, strip_tabs, expand)
             if expand:
-                scanner = KeychainShell(body)
+                scanner = KeychainShell(body, shell=self.shell)
                 while match := HEREDOC_EXPANSION.search(body, scanner.pos):
                     scanner.pos = match.start()
                     if scanner.char() == "\\":
@@ -1096,7 +1101,8 @@ class KeychainShell:
             for words in pipeline or [[]]:
                 program = Path(words[0]).name.casefold() if words else ""
                 if program in SHELL_WORDS or program in ("", ".", "source", "eval"):
-                    self.refusal = self.refusal or keychain_refusal(body, depth + 1)
+                    shell = program if program in SHELL_WORDS else self.shell
+                    self.refusal = self.refusal or keychain_refusal(body, depth + 1, shell=shell)
                 elif program in SCRIPT_TOOLS and not (program == "sed" and sed_search(words[1:])):
                     if KEYCHAIN_COMMAND.search(body):
                         self.refusal = self.refusal or guard.reach("security keychain items")
@@ -1115,7 +1121,7 @@ class KeychainShell:
                 command = command_words(words)
                 if command:
                     pipeline.append(command)
-                self.refusal = self.refusal or denied_keychain(command, depth)
+                self.refusal = self.refusal or denied_keychain(command, depth, self.shell)
                 needs_consumer = False
 
         while ch := self.char():
@@ -1135,6 +1141,9 @@ class KeychainShell:
                 if heredoc:
                     raw = self.source[start:self.pos].replace("\\\n", "")
                     docs.append((target, operation == "<<-", raw == target, pipeline))
+            elif not words and self.shell == "bash" and self.scan_arithmetic(depth + 1, "(("):
+                pipeline.append([])
+                needs_consumer = False
             elif ch in ";|&\n()":
                 finish()
                 words = []
@@ -1169,13 +1178,13 @@ class KeychainShell:
         finish()
 
 
-def keychain_refusal(command: str, depth: int = 0) -> str:
-    shell = KeychainShell(command)
+def keychain_refusal(command: str, depth: int = 0, *, shell: str = "bash") -> str:
+    scanner = KeychainShell(command, shell=shell)
     try:
-        shell.commands(depth)
+        scanner.commands(depth)
     except ValueError:
-        return shell.refusal or "unparsed shell command"
-    return shell.refusal
+        return scanner.refusal or "unparsed shell command"
+    return scanner.refusal
 
 
 def denied_git(words: list[str], rules: list[str]) -> str:
