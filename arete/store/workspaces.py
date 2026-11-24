@@ -725,7 +725,7 @@ def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
         _change_current(row, state="held", held_by=blockers(ws, names), bytes=workspace.tree_bytes(ws),
                         last_sweep_error=util.first_line(str(e), 300))
     except (OSError, RuntimeError, sqlite3.Error) as e:
-        _change_current(row, last_sweep_error=util.first_line(str(e), 300))
+        _change_current(row, bytes=workspace.tree_bytes(ws), last_sweep_error=util.first_line(str(e), 300))
 
 
 def _sweep_owned(cfg: config.Config, ws: Path, row: dict) -> None:
