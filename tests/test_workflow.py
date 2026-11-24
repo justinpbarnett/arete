@@ -9632,6 +9632,8 @@ class ServeTicketCountsTests(unittest.TestCase):
         server.db_lock = threading.Lock()
         server.db_future = None
         server.db_health = {}
+        server.contracts_waiting = False
+        server.workspace_contract_children = set()
         server.every_loop = server.live = []
         server.failing = server.errors = {}
         server.started = util.now()

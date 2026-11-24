@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 import stat
@@ -9,7 +10,9 @@ import time
 from collections.abc import Callable
 from contextlib import ExitStack, closing, contextmanager, suppress
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 from .. import dbstats, paths, util
 from . import migrations
@@ -114,6 +117,14 @@ TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["ru
 TIME_GLOB = time_shape.TIME_GLOB
 
 WORKSPACE_CONTRACT_SCHEMA = 28
+INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
+WORKSPACE_CHILD_PIDS = "workspace_contract_children"
+WORKSPACE_CHILD_IDENTITIES = "workspace_contract_child_identities"
+type ProcessIdentity = tuple[str, int]
+type ServeChildren = set[tuple[int, ProcessIdentity | None]]
+WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] workspace_snapshots "
+                     "or from arete migrate --workspace-snapshots DIR")
 
 
 def workspace_rows_installed():
@@ -166,19 +177,169 @@ def missing_database():
 
 
 def contract_blockers(conn, n):
-    from .. import control, record
+    from .. import control, launch_lease, record
 
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
+    workspace_contract = n == WORKSPACE_CONTRACT_SCHEMA
+    blockers = [f"launch lease {name}" for name in launch_lease.held_launches()] if workspace_contract else []
+    statuses = "(status = 'running' OR pid IS NOT NULL)" if workspace_contract else "status = 'running'"
+    for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "
                             "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
         row = dict(row)
-        with record.dead(row) as gone:
-            if not gone:
-                blockers.append(row["id"])
-    beat = control.database_beat()
-    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
+        if row["status"] == "running":
+            with record.dead(row) as gone:
+                if not gone:
+                    blockers.append(row["id"])
+        elif workspace_contract and settled_run_process_alive(row):
+            blockers.append(row["id"])
+    if workspace_contract:
+        beat, seen = util.read_json_snapshot(paths.DB_FILE.with_name(control.BEAT_FILE.name), {})
+        if not isinstance(beat, dict):
+            beat = {}
+        children = live_serve_children(heartbeat_serve_children(beat, seen) | inherited_serve_children())
+        blockers.extend(f"inherited child {pid}" for pid in sorted({pid for pid, _ in children}))
+        blockers.extend(workspace_admission_blockers())
+        if problem := workspace_serve_blocker(beat, n):
+            blockers.append(problem)
+    else:
+        beat = control.database_beat()
+        if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
+            blockers.append(f"serve {beat.get('pid')}")
     return blockers
+
+
+def workspace_admission_blockers():
+    for file in sorted(paths.LOCKS_DIR.iterdir()):
+        name = file.stem
+        if (file.suffix == ".lock" and (name == "file-rule" or name.startswith(("run-", "loop-")))
+                and util.lock_is_held(name)):
+            yield f"held lock {name}"
+
+
+def process_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        if paths.ON_MAC:
+            from .. import scratch
+
+            boot, serial = scratch.boot_session(), scratch.identity_of(pid)
+        else:
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            serial = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        if boot and serial is not None:
+            return UUID(boot).hex, serial
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def child_identity(value) -> ProcessIdentity | None:
+    if (isinstance(value, list) and len(value) == 2 and isinstance(value[0], str)
+            and type(value[1]) is int and value[1] >= 0):
+        with suppress(ValueError):
+            return UUID(value[0]).hex, value[1]
+    return None
+
+
+def heartbeat_serve_children(beat, seen=None) -> ServeChildren:
+    pids = beat.get(WORKSPACE_CHILD_PIDS)
+    identities = beat.get(WORKSPACE_CHILD_IDENTITIES)
+    if not isinstance(identities, dict):
+        identities = {}
+    children = set()
+    for pid in pids if isinstance(pids, list) else ():
+        if type(pid) is int and 0 < pid <= 2**31 - 1:
+            identity = child_identity(identities.get(str(pid)))
+            if identity is not None or seen is None or process_existed_by(pid, seen.st_mtime):
+                children.add((pid, identity))
+    return children
+
+
+def inherited_serve_children() -> ServeChildren:
+    pids = [int(pid) for pid in os.environ.get(INHERITED_SERVE_CHILDREN, "").split(",") if pid]
+    try:
+        identities = json.loads(os.environ.get(INHERITED_SERVE_IDENTITIES, "{}"))
+    except ValueError:
+        identities = {}
+    inherited = heartbeat_serve_children({WORKSPACE_CHILD_PIDS: pids, WORKSPACE_CHILD_IDENTITIES: identities})
+    children = set()
+    for pid, identity in inherited:
+        if identity is not None and process_identity(pid) not in (None, identity) and has_live_child(pid):
+            identity = None
+        children.add((pid, identity))
+    return children
+
+
+def has_live_child(pid: int) -> bool:
+    try:
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None
+    except ChildProcessError:
+        return False
+    except OSError:
+        return True
+
+
+def live_serve_children(children: ServeChildren) -> ServeChildren:
+    return {(pid, identity) for pid, identity in children if util.pid_alive(pid)
+            and (identity is None or process_identity(pid) in (None, identity))}
+
+
+def workspace_child_fields(children: ServeChildren) -> dict:
+    grouped = {}
+    for pid, identity in children:
+        grouped.setdefault(pid, set()).add(identity)
+    identities = {str(pid): next(iter(found)) for pid, found in grouped.items() if len(found) == 1 and None not in found}
+    return {WORKSPACE_CHILD_PIDS: sorted(grouped), WORKSPACE_CHILD_IDENTITIES: identities}
+
+
+def process_existed_by(pid, at):
+    if not util.pid_alive(pid):
+        return False
+    try:
+        found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C", "TZ": "UTC"})
+        if not found.stdout.strip():
+            return util.pid_alive(pid)
+        state, started = found.stdout.strip().split(maxsplit=1)
+        when = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y").replace(tzinfo=UTC)
+        return not state.startswith("Z") and when.timestamp() <= at
+    except (OSError, ValueError):
+        return util.pid_alive(pid)
+
+
+def settled_run_process_alive(row):
+    if row["pid"] == os.getpid():
+        return False
+    try:
+        at = util.parse_iso(row["finished"] or row["started"]).timestamp()
+    except (ValueError, TypeError):
+        return util.pid_alive(row["pid"])
+    return process_existed_by(row["pid"], at)
+
+
+def workspace_serve_blocker(beat, n):
+    from .. import control
+
+    if not util.lock_is_held("serve"):
+        if (paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve() and util.pid_alive(beat.get("pid"))
+                and (type(beat.get("schema")) is not int or beat["schema"] < n)):
+            return f"serve {beat.get('pid')}"
+        return ""
+    try:
+        with (paths.LOCKS_DIR / "serve.lock").open() as lock:
+            lock_pid = int(lock.read())
+            lock_written = os.fstat(lock.fileno()).st_mtime_ns
+    except (OSError, ValueError):
+        return "serve lock holder has not reported its schema"
+    unreported = f"serve {lock_pid} has not reported its schema"
+    try:
+        beat_written = paths.DB_FILE.with_name(control.BEAT_FILE.name).stat().st_mtime_ns
+    except FileNotFoundError:
+        return unreported
+    status = control.database_beat()
+    if (lock_pid <= 0 or not util.pid_alive(lock_pid) or not isinstance(status, dict)
+            or status.get("pid") != lock_pid or type(status.get("schema")) is not int):
+        return unreported
+    if status["schema"] < n:
+        return f"serve {lock_pid}"
+    return unreported if beat_written < lock_written else ""
 
 
 def execute_statements(conn, sql):
