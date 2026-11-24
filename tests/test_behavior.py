@@ -173,7 +173,7 @@ with owner_installation() as sandboxed:
 """)
 
 
-class SecretBackendPrimitivesTests(_SecretChildCase):
+class SecretBackendLocationTests(_SecretChildCase):
     def test_config_validates_store_choice_and_location(self):
         self.run_secret_child(r"""
 config.load()
@@ -287,6 +287,8 @@ with (alias_fixture, mock.patch.multiple(paths, ISOLATED=False, LOG_DIR=logs),
     assert secretstore.read_item(ref, settings) is None
 """)
 
+
+class SecretBackendPrimitivesTests(_SecretChildCase):
     def test_file_store_does_not_cross_scope_case_aliases(self):
         self.run_secret_child(r"""
 settings = config.secret_settings()
@@ -349,6 +351,33 @@ for protected in (owned, fingerprint):
     assert secretstore.read_item(protected, settings) == value
 """)
 
+    def test_fake_keychain_receives_multiline_values_only_on_stdin(self):
+        self.run_secret_child(r"""
+import base64
+import json
+import shlex
+
+settings = config.secret_settings()
+assert settings.store == 'keychain'
+ref = secretstore.Reference('keychain', '1234abcd', 'global/FIXTURE_PEM')
+value = b'synthetic credential fixture\n\x00\xffsecond line'
+secretstore.write_item(ref, settings, value)
+assert secretstore.read_item(ref, settings) == value
+secretstore.remove_item(ref, settings)
+assert secretstore.read_item(ref, settings) is None
+calls = [json.loads(line) for line in Path('security-calls.jsonl').read_text().splitlines()]
+encoded = base64.b64encode(value).decode()
+account = ['-s', 'arete/1234abcd', '-a', 'global/FIXTURE_PEM']
+assert calls[0][0] == ['-i']
+assert shlex.split(calls[0][1]) == ['add-generic-password', '-U', *account, '-w', encoded]
+find = ['find-generic-password', *account, '-w']
+delete = ['delete-generic-password', *account]
+assert [find, ''] in calls and [delete, ''] in calls
+assert all(argv in (find, delete) and stdin == '' for argv, stdin in calls[1:])
+""", keychain=True)
+
+
+class SecretBackendAclTests(_SecretChildCase):
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS filesystem ACLs")
     def test_file_store_rejects_macos_acls(self):
         self.run_secret_child(r"""
@@ -421,31 +450,6 @@ for acl, error, message in ((123, 0, 'must not have macOS ACLs'),
         case.assertEqual(os.fstat(retained[0]).st_size, 0)
         case.assertEqual(list(file.parent.iterdir()), [])
 """)
-
-    def test_fake_keychain_receives_multiline_values_only_on_stdin(self):
-        self.run_secret_child(r"""
-import base64
-import json
-import shlex
-
-settings = config.secret_settings()
-assert settings.store == 'keychain'
-ref = secretstore.Reference('keychain', '1234abcd', 'global/FIXTURE_PEM')
-value = b'synthetic credential fixture\n\x00\xffsecond line'
-secretstore.write_item(ref, settings, value)
-assert secretstore.read_item(ref, settings) == value
-secretstore.remove_item(ref, settings)
-assert secretstore.read_item(ref, settings) is None
-calls = [json.loads(line) for line in Path('security-calls.jsonl').read_text().splitlines()]
-encoded = base64.b64encode(value).decode()
-account = ['-s', 'arete/1234abcd', '-a', 'global/FIXTURE_PEM']
-assert calls[0][0] == ['-i']
-assert shlex.split(calls[0][1]) == ['add-generic-password', '-U', *account, '-w', encoded]
-find = ['find-generic-password', *account, '-w']
-delete = ['delete-generic-password', *account]
-assert [find, ''] in calls and [delete, ''] in calls
-assert all(argv in (find, delete) and stdin == '' for argv, stdin in calls[1:])
-""", keychain=True)
 
 
 WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
