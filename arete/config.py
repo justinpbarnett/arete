@@ -773,9 +773,10 @@ def backup_table(data) -> BackupConfig:
     return BackupConfig(copy_to=copy_to)
 
 
-def validate_store_location(directory: Path, folder: Path, repo_paths=()) -> None:
+def validate_store_location(directory: Path, config_file: Path, repo_paths=()) -> None:
     directory = directory.resolve()
-    protected = (folder, paths.CONFIG_DIR, paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR, *repo_paths)
+    protected = (config_file.parent, config_file.resolve().parent, paths.CONFIG_DIR,
+                 paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR, *repo_paths)
     parts = tuple(part.casefold() for part in directory.parts) if paths.ON_MAC else directory.parts
     for path in protected:
         root = path.resolve().parts
@@ -811,7 +812,7 @@ def keychain_program() -> str | None:
     return "/usr/bin/security"
 
 
-def secrets_table(data, folder: Path, *, repo_paths=()) -> SecretsConfig:
+def secrets_table(data, config_file: Path, *, repo_paths=()) -> SecretsConfig:
     if not isinstance(data, dict):
         raise ValueError("[secrets] must be a table")
     table = only(data, root_schema("secrets"), "[secrets]")
@@ -827,13 +828,13 @@ def secrets_table(data, folder: Path, *, repo_paths=()) -> SecretsConfig:
     raw = table["store_dir"]
     if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
         raise ValueError("[secrets] store_dir must be a directory path")
-    directory = folder / paths.expand(raw)
+    directory = config_file.parent / paths.expand(raw)
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise ValueError("[secrets] store_dir must be a plain directory")
     if paths.ISOLATED and (paths.confined(directory) is None or
                            paths.scratch_root(directory) != paths.scratch_root(paths.STATE_DIR)):
         raise ValueError("[secrets] store_dir must be inside the instance's scratch folder")
-    validate_store_location(directory, folder, repo_paths)
+    validate_store_location(directory, config_file, repo_paths)
     return SecretsConfig(store or None, directory.resolve())
 
 
@@ -842,7 +843,7 @@ def secret_settings() -> SecretsConfig:
         data = read_data()
     except FileNotFoundError:
         data = {}
-    return secrets_table(data.get("secrets", {}), paths.CONFIG_FILE.parent,
+    return secrets_table(data.get("secrets", {}), paths.CONFIG_FILE,
                          repo_paths=(paths.expand(repo["path"]) for repo in data.get("repo", ())))
 
 
@@ -1280,7 +1281,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
-    secrets_table(data.get("secrets", {}), path.parent, repo_paths=(repo.path for repo in cfg.repos))
+    secrets_table(data.get("secrets", {}), path, repo_paths=(repo.path for repo in cfg.repos))
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent, ignored)

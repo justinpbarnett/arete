@@ -169,6 +169,22 @@ def require_private_directory(fd: int) -> None:
     require_no_macos_acl(fd)
 
 
+def require_exact_entry(parent: int, name: str, *, writing=False) -> None:
+    if name in os.listdir(parent):
+        return
+    if writing:
+        raise StoreError("secret store entry conflicts with a differently spelled name")
+    raise FileNotFoundError(name)
+
+
+def require_writable_entry(parent: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    require_exact_entry(parent, name, writing=True)
+
+
 @contextmanager
 def file_parent(path: Path, root: Path, *, create=False, private=False):
     if paths.ISOLATED and (paths.confined(root) is None or
@@ -179,8 +195,10 @@ def file_parent(path: Path, root: Path, *, create=False, private=False):
         if private:
             require_private_directory(fd)
             for part in parent.parts:
-                fd = stack.enter_context(paths.directory_fd(Path(part), fd, create=create))
-                require_private_directory(fd)
+                child = stack.enter_context(paths.directory_fd(Path(part), fd, create=create))
+                require_exact_entry(fd, part, writing=create)
+                require_private_directory(child)
+                fd = child
         else:
             fd = stack.enter_context(paths.directory_fd(parent, fd, create=create))
         yield fd
@@ -199,6 +217,8 @@ def require_private_file(fd: int) -> None:
 def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
     try:
         with file_parent(path, root, private=private) as parent:
+            if private:
+                require_exact_entry(parent, path.name)
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
                 require_private_file(fd)
@@ -212,6 +232,8 @@ def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
 
 def write_file(path: Path, root: Path, value: bytes, *, private=False) -> None:
     with file_parent(path, root, create=True, private=private) as parent:
+        if private:
+            require_writable_entry(parent, path.name)
         temporary = f".item-{secrets.token_hex(16)}"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
         try:
@@ -230,6 +252,8 @@ def write_file(path: Path, root: Path, value: bytes, *, private=False) -> None:
 
 def remove_file(path: Path, root: Path, *, private=False) -> None:
     with suppress(FileNotFoundError), file_parent(path, root, private=private) as parent:
+        if private:
+            require_exact_entry(parent, path.name)
         os.unlink(path.name, dir_fd=parent)
         os.fsync(parent)
 
@@ -270,7 +294,7 @@ def file_location(ref: Reference, settings: config.SecretsConfig) -> tuple[Path,
     root = settings.store_dir
     if root is None:
         raise StoreMissing("pve_store is not configured")
-    config.validate_store_location(root, paths.CONFIG_FILE.parent)
+    config.validate_store_location(root, paths.CONFIG_FILE)
     return root / ref.tag / ref.item, root
 
 

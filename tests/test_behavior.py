@@ -323,7 +323,7 @@ def assert_keychain_denied():
     with case.assertRaises(secretstore.StoreError):
         secretstore.security('test-only')
     for settings in ({}, {'store': 'keychain'}):
-        assert config.secrets_table(settings, paths.CONFIG_DIR).store is None
+        assert config.secrets_table(settings, paths.CONFIG_FILE).store is None
 """
 
 
@@ -346,7 +346,7 @@ with owner_installation():
     def test_native_owner_selection_is_rechecked_at_the_sandbox_boundary(self):
         self.run_secret_child(SECRET_KEYCHAIN_SELECTION_FIXTURE + r"""
 with owner_installation() as sandboxed:
-    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_DIR).store == 'keychain'
+    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_FILE).store == 'keychain'
     sandboxed.return_value = True
     assert_keychain_denied()
 """)
@@ -369,7 +369,7 @@ def seed_owner_file(actor):
 """
 
 
-class SecretBackendPrimitivesTests(_SecretChildCase):
+class SecretBackendLocationTests(_SecretChildCase):
     adapter_only = True
 
     def test_config_validates_store_choice_and_location(self):
@@ -396,6 +396,66 @@ for directory in (*protected, *repositories):
     expected = 'must be separate' if directory in protected else 'outside git repositories and work trees'
     with case.subTest(directory=directory), case.assertRaisesRegex(ValueError, expected):
         config.load()
+""")
+
+    def test_symlinked_config_protects_both_config_directories(self):
+        self.run_secret_child(r"""
+target = Path('active/nested/config.toml').absolute()
+target.parent.mkdir(parents=True)
+paths.CONFIG_FILE.unlink()
+paths.CONFIG_FILE.symlink_to(target)
+ref = secretstore.Reference('pve_store', '1234abcd', 'global/DEMO_KEY')
+
+
+def read_fixture(path):
+    # The scratch reader rejects symlinks; exercise the owner config policy with this fixture link only.
+    assert path == paths.CONFIG_FILE and path.resolve() == target
+    return path.read_bytes()
+
+
+with mock.patch.object(paths, 'read_confined', side_effect=read_fixture):
+    for directory in (paths.CONFIG_FILE.parent / 'store', target.parent / 'store'):
+        target.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
+        for validate in (config.load, config.secret_settings):
+            with case.subTest(directory=directory, validate=validate), case.assertRaisesRegex(ValueError, 'must be separate'):
+                validate()
+        with case.assertRaisesRegex(ValueError, 'must be separate'):
+            secretstore.file_location(ref, config.SecretsConfig('pve_store', directory))
+    target.write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
+    config.load()
+    settings = config.secret_settings()
+    assert settings.store_dir == Path('store').resolve()
+    value = b'synthetic external store\x00\xff'
+    secretstore.write_item(ref, settings, value)
+    assert secretstore.read_item(ref, settings) == value
+""")
+
+class SecretBackendPrimitivesTests(_SecretChildCase):
+    adapter_only = True
+
+    def test_file_store_does_not_cross_scope_case_aliases(self):
+        self.run_secret_child(r"""
+settings = config.secret_settings()
+first = secretstore.Reference('pve_store', '1234abcd', 'repo:API/DEMO_KEY')
+second = secretstore.Reference('pve_store', first.tag, 'repo:api/DEMO_KEY')
+first_value, second_value = b'synthetic first\x00\xff', b'synthetic second\x00\xff'
+secretstore.write_item(first, settings, first_value)
+second_file, _ = secretstore.file_location(second, settings)
+assert secretstore.read_item(second, settings) is None
+secretstore.remove_item(second, settings)
+assert secretstore.read_item(first, settings) == first_value
+if second_file.parent.exists():
+    with case.assertRaisesRegex(secretstore.StoreError, 'differently spelled name'):
+        secretstore.write_item(second, settings, second_value)
+    assert secretstore.read_item(second, settings) is None
+    assert secretstore.read_item(first, settings) == first_value
+else:
+    secretstore.write_item(second, settings, second_value)
+    assert secretstore.read_item(first, settings) == first_value
+    assert secretstore.read_item(second, settings) == second_value
+    secretstore.remove_item(first, settings)
+    assert secretstore.read_item(first, settings) is None
+    assert secretstore.read_item(second, settings) == second_value
 """)
 
     def test_file_store_round_trip_and_protected_owner_references(self):
@@ -560,7 +620,7 @@ assert all(value.splitlines()[0] not in ' '.join(argv) and encoded not in ' '.jo
 with (mock.patch.object(paths, 'ISOLATED', True),
       mock.patch.object(config, 'keychain_program', native_keychain_program)):
     assert paths.ISOLATED
-    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_DIR).store is None
+    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_FILE).store is None
     with case.assertRaises(secretstore.StoreError):
         secretstore.read_item(secretstore.parse_reference(row['reference'], meta['instance_tag']), config.SecretsConfig())
 assert len(calls) == len(log.read_text().splitlines())
