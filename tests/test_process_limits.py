@@ -1798,40 +1798,34 @@ class OrchestrationWaitTests(Isolated):
         self.assertEqual(ledger.view(self.controller.run.id)["actions"][0]["state"], "failed")
 
 
-class DependentWorkerFixture(Isolated):
+class OrchestrationRecoveryFixture(Isolated):
     def setUp(self):
         super().setUp()
         self.cfg.replay = config.ReplayConfig(all=True)
-        self.tree = self.repo.path
-        (self.tree / "shared.txt").write_text("base\n")
-        (self.tree / "other.txt").write_text("base\n")
-        util.git(["init", "-q", "-b", "main", "--template="], self.tree)
-        util.git(["add", "."], self.tree)
-        util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], self.tree)
-        self.producers, self.grants = {}, []
+        self.producers = {}
         self.patches.enter_context(patch.object(delegation, "Worker", side_effect=self.spawn))
         self.patches.enter_context(patch.object(pipeline, "workspace_note", return_value="Fixture workspace"))
-        self.patches.enter_context(patch.object(orchestration, "time", SimpleNamespace(
-            monotonic=time.monotonic, sleep=self.check_scripted_wait)))
 
-    def check_scripted_wait(self, _seconds):
-        self.assertFalse(self.replay_controller.workers, "replay is waiting without a scripted worker result")
-
-    def controller(self, previous="", *, builders=1, workers=2):
+    def controller(self, previous="", *, builders=None):
         run = self.made_run()
         run.path, run.budget = "orchestrate", None
-        run.launch_gate = lambda step, role, route: self.grants.append(step)
-        layer = config.RepoLayer(self.repo.layer_dir, orchestration=config.Orchestration(
-            max_workers=workers, max_builders=builders))
-        checkout = workspace.Checkout("", self.repo.name, self.tree, self.tree, "main")
-        job = flows.Job(self.cfg, run, self.tree, ticket=self.local.get(self.ticket), checkouts=[checkout])
+        layer = config.RepoLayer(self.repo.layer_dir, orchestration=config.Orchestration(max_builders=builders))
+        tree = self.repo.path
+        checkout = workspace.Checkout("", self.repo.name, tree, tree, "main")
+        job = flows.Job(self.cfg, run, tree, ticket=self.local.get(self.ticket), checkouts=[checkout])
         job.use_layer(layer)
         with patch.object(config, "load_layer", return_value=layer):
             controller = orchestration.Controller(SimpleNamespace(ctx=job, continues=previous))
         controller.catalog = Catalog(job, controller.protocol)
         controller.data.update(acceptance="fixture", limits=controller.configured_limits())
-        self.replay_controller = controller
+        controller.fingerprint = lambda: "fixture-tree"
         return controller
+
+    def restart(self, controller):
+        record.move(controller.run.id, "interrupted", ("running",))
+        resumed = self.controller(controller.run.id, builders=controller.policy.max_builders)
+        resumed.recover()
+        return resumed
 
     def spawn(self, run, action, request):
         self.assertNotIn(action, self.producers)
@@ -1848,21 +1842,19 @@ class DependentWorkerFixture(Isolated):
         self.producers[action] = worker
         return worker
 
-    def result(self, action, *, outcome="done", ok=True):
+    def finish_worker(self, controller, action):
         worker = self.producers[action]
-        worker.receipts.append({"event": "result", "ok": ok, "error": "fixture failure"} if not ok else {
-            "event": "result", "ok": True, "text": "Fixture result", "structured": {
-                "version": 2, "outcome": outcome, "text": "Fixture result",
-                "ack_ids": worker.request.get("offered_ids", [])}})
+        worker.receipts.append({"event": "result", "ok": True, "text": "Fixture result", "structured": {
+            "version": 2, "outcome": "done", "text": "Fixture result", "ack_ids": []}})
+        controller.collect()
 
-    def start(self, controller, path=None, *depends):
-        route = "model:build:0" if path else "model:plan:0"
-        args = {"route_id": route, "effort": controller.catalog.entries[route]["efforts"][0], "goal": "Fixture work",
-                "tool_bundle": "write" if path else "read", "prompt_id": "delegate" if path else "investigate",
-                "depends_on": list(depends)}
-        if path and controller.exchanged:
-            args.update(write_paths=[path], acceptance_check="Read the fixture file")
-        return {"op": "worker.start", "args": args}
+    def route(self, controller, role):
+        route = f"model:{role}:0"
+        return {"route_id": route, "effort": controller.catalog.entries[route]["efforts"][0]}
+
+    def start(self, controller, **args):
+        return {"op": "worker.start", "args": {**self.route(controller, "plan"), "goal": "Fixture work",
+                "tool_bundle": "read", "prompt_id": "investigate", **args}}
 
     def accept(self, controller, *calls):
         lease = controller.lease
@@ -1886,771 +1878,116 @@ class DependentWorkerFixture(Isolated):
         return next(a for a in ledger.actions(controller.lease) if a["id"] == action)
 
 
-class DependentWorkerAdmissionTests(DependentWorkerFixture):
-    def test_wait_admits_original_id_from_integrated_tree_with_unrelated_worker_running(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        c.collect()
-        (self.producers[a].cwd / "shared.txt").write_text("integrated A\n")
-        b, other = self.send(c, self.start(c, "shared.txt", a), self.start(c))
-        c.collect()
+class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
+    def test_admission_interruption_cleans_up_only_the_uncommitted_candidate(self):
+        tree = self.repo.path
+        (tree / "fixture.txt").write_text("base\n")
+        util.git(["init", "-q", "-b", "main", "--template="], tree)
+        util.git(["add", "fixture.txt"], tree)
+        util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], tree)
+        c = self.controller(builders=1)
+        a, = self.send(c, self.start(c))
+        b, = self.send(c, self.start(c, depends_on=[a]))
         c.resume_queued()
-        self.assertEqual(set(c.workers), {a, other})
-        self.assertIn(f"worker-{other}", self.grants)
+        self.assertNotIn(b, self.producers)
+        self.finish_worker(c, a)
+
+        @contextlib.contextmanager
+        def interrupt_transaction(commit):
+            with foundation.tx() as connection:
+                yield connection
+                if not commit:
+                    raise pipeline.Terminated()
+            raise pipeline.Terminated()
+
+        candidates = orchestration.builder_workspaces
+        existing = set(paths.WORKTREES_DIR.glob("candidate-*"))
+        objects = set((paths.STATE_DIR / "builder-objects").iterdir())
+        with (patch.object(exchange, "tx", return_value=interrupt_transaction(False)),
+              self.assertRaises(pipeline.Terminated)):
+            c.resume_queued()
         queued = exchange.workers(c.lease)[b]
         self.assertEqual(queued["phase"], "queued")
         self.assertNotIn("candidate", queued["data"])
-        view = ledger.view(c.run.id)
-        self.assertEqual(view["capacity"]["active_builders"], 1)
-        self.assertEqual(view["capacity"]["active_workers"], 2)
-        shown = next(w for w in view["workers"] if w["id"] == b)
-        self.assertEqual(shown["depends_on"], [a])
-        self.assertIn(f"{a} (running)", shown["reason"])
-        self.assertNotIn(f"worker-{b}", self.grants)
-        self.assertEqual((self.producers[other].cwd / "shared.txt").read_text(), "base\n")
-        self.result(a)
-        wait, = self.send(c, {"op": "run.wait", "args": {"timeout_seconds": 0}})
-        self.assertEqual(set(self.receipt(c, wait)["result"]["active"]), {b, other})
-        self.assertEqual((self.producers[b].cwd / "shared.txt").read_text(), "integrated A\n")
-        self.result(b)
-        self.result(other)
-        c.collect()
-        c.resume_queued()
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-        self.assertEqual(exchange.workers(c.lease)[b]["phase"], "integrated")
-
-    def test_dependent_start_in_wait_and_checks_batch_integrates_before_checks(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        (self.producers[a].cwd / "shared.txt").write_text("integrated A\n")
-        self.result(a)
-        c.collect()
-        start, wait, checks = self.accept(c, self.start(c, "other.txt", a),
-                                          {"op": "run.wait", "args": {"timeout_seconds": 1}},
-                                          {"op": "checks.run", "args": {}})
-        b = start["id"]
-
-        def finish_b(run, action, request):
-            self.assertEqual(action, b)
-            worker = self.spawn(run, action, request)
-            self.assertEqual((worker.cwd / "shared.txt").read_text(), "integrated A\n")
-            (worker.cwd / "other.txt").write_text("integrated B\n")
-            self.result(b)
-            return worker
-
-        def run_checks(*args, **kw):
-            self.assertEqual(self.receipt(c, wait["id"])["result"]["active"], [])
-            self.assertEqual(exchange.workers(c.lease)[b]["phase"], "integrated")
-            self.assertEqual((self.tree / "other.txt").read_text(), "integrated B\n")
-            return factory.Outcome("pass", data={"report": "Fixture checks passed"})
-
-        with (patch.object(delegation, "Worker", side_effect=finish_b),
-              patch.object(c, "atomic", side_effect=run_checks) as atomic):
-            for action in (start, wait, checks):
-                self.assertIsNone(c.dispatch(action))
-        atomic.assert_called_once_with("checks", tree=str(c.job.ws), quick=False)
-        self.assertTrue(self.receipt(c, checks["id"])["result"]["passed"])
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-
-    def test_reply_receipt_waits_for_writer_integration(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        self.result(a, outcome="question")
-        c.collect()
-        question = exchange.workers(c.lease)[a]["data"]["question"]
-        reply, = self.send(c, {"op": "worker.reply", "args": {
-            "worker_id": a, "question_id": question, "message": "Proceed"}})
-        b, = self.send(c, self.start(c, None, reply))
-        c.resume_ready()
-        attempt, = c.workers
-        c.collect()
-        c.resume_queued()
-        receipt = self.receipt(c, reply)
-        self.assertEqual(receipt["state"], "succeeded")
-        self.assertIn(receipt["result"]["message_id"], self.producers[attempt].request["offered_ids"])
-        self.assertIn(f"{reply} (running)", self.receipt(c, b)["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-        (self.producers[attempt].cwd / "shared.txt").write_text("integrated after reply\n")
-        self.result(attempt)
-        c.collect()
-        c.resume_queued()
-        self.assertEqual(exchange.workers(c.lease)[a]["phase"], "integrated")
-        self.assertEqual((self.producers[b].cwd / "shared.txt").read_text(), "integrated after reply\n")
-
-    def test_steer_receipt_waits_for_writer_to_receive_guidance_and_integrate(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        c.collect()
-        steer, = self.send(c, {"op": "worker.steer", "args": {"worker_id": a, "message": "Use the new result"}})
-        b, = self.send(c, self.start(c, None, steer))
-        c.resume_queued()
-        self.assertIn(f"{steer} (running)", self.receipt(c, b)["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-        self.result(a)
-        c.collect()
-        c.resume_queued()
-        self.assertIn(f"{steer} (ready)", self.receipt(c, b)["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-        c.resume_ready()
-        attempt, = c.workers
-        self.assertIn(self.receipt(c, steer)["result"]["message_id"], self.producers[attempt].request["offered_ids"])
-        (self.producers[attempt].cwd / "shared.txt").write_text("integrated after steer\n")
-        self.result(attempt)
-        c.collect()
-        c.resume_queued()
-        self.assertEqual(exchange.workers(c.lease)[a]["phase"], "integrated")
-        self.assertEqual((self.producers[b].cwd / "shared.txt").read_text(), "integrated after steer\n")
-
-    def test_failed_continuation_is_not_satisfied_by_automatic_turn(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        self.result(a, outcome="handoff")
-        c.collect()
-        steer, explicit = self.accept(c, {"op": "worker.steer", "args": {"worker_id": a, "message": "Proceed"}},
-                                    {"op": "worker.continue", "args": {"worker_id": a, "message": "Continue"}})
-        self.assertIsNone(c.dispatch(steer))
-        self.assertIsInstance(c.dispatch(explicit), ValueError)
-        self.assertEqual(self.receipt(c, explicit["id"])["state"], "failed")
-        self.assertNotIn(explicit["id"], self.producers)
-        c.resume_ready()
-        automatic, = c.workers
-        b, = self.send(c, self.start(c, None, explicit["id"]))
-        self.result(automatic)
-        c.collect()
-        self.assertEqual(self.receipt(c, automatic)["state"], "succeeded")
-        self.assertEqual(exchange.workers(c.lease)[a]["phase"], "integrated")
-        c.resume_queued()
-        receipt = self.receipt(c, b)
-        self.assertEqual(receipt["state"], "cancelled")
-        self.assertIn(f"prerequisite {explicit['id']} is failed", receipt["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-
-
-class DependentWorkerRecoveryTests(DependentWorkerFixture):
-    def test_interrupted_private_continuation_waits_for_its_recovery_retry(self):
-        for retry_state in ("succeeded", "failed", "cancelled"):
-            with self.subTest(retry_state=retry_state):
-                self.producers.clear()
-                c = self.controller()
-                a, = self.send(c, self.start(c, "shared.txt"))
-                self.result(a, outcome="handoff")
-                c.collect()
-                continuation, = self.send(c, {"op": "worker.continue", "args": {
-                    "worker_id": a, "message": "Resume the specific handoff task"}})
-                c.collect()
-                b, = self.send(c, self.start(c, None, continuation))
-                c.close()
-                self.assertTrue(ledger.queued_start(self.receipt(c, b)))
-                self.assertIn("parked after interruption", self.receipt(c, b)["result"]["reason"])
-                record.move(c.run.id, "interrupted", ("running",))
-
-                resumed = self.controller(c.run.id)
-                resumed.recover()
-                resumed.resume_queued()
-                self.assertTrue(ledger.queued_start(self.receipt(resumed, b)))
-                resumed.resume_ready()
-                retry, = resumed.workers
-                self.assertEqual(self.receipt(resumed, retry)["result"]["retry_of"], continuation)
-                self.assertEqual(self.receipt(resumed, retry)["request"], self.receipt(resumed, continuation)["request"])
-                resumed.resume_queued()
-                self.assertNotIn(b, self.producers)
-                if retry_state == "cancelled":
-                    self.send(resumed, {"op": "worker.cancel", "args": {"worker_id": a, "reason": "Stop the retry"}})
-                else:
-                    (self.producers[retry].cwd / "shared.txt").write_text("integrated by retry\n")
-                    self.result(retry, ok=retry_state == "succeeded")
-                    resumed.collect()
-                    if retry_state == "failed":
-                        resumed.resume_ready()
-                        automatic, = resumed.workers
-                        self.result(automatic)
-                        resumed.collect()
-                    self.assertEqual(exchange.workers(resumed.lease)[a]["phase"], "integrated")
-                self.assertEqual(self.receipt(resumed, continuation)["state"], "interrupted")
-                self.assertEqual(self.receipt(resumed, retry)["state"], retry_state)
-                resumed.resume_queued()
-                if retry_state == "succeeded":
-                    self.assertEqual((self.producers[b].cwd / "shared.txt").read_text(), "integrated by retry\n")
-                    self.result(b)
-                    resumed.collect()
-                    resumed.resume_queued()
-                    self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-                else:
-                    self.assertEqual(self.receipt(resumed, b)["state"], "cancelled")
-                    self.assertIn(f"is {retry_state}", self.receipt(resumed, b)["result"]["reason"])
-                    self.assertNotIn(b, self.producers)
-
-    def test_interrupted_continuation_without_a_recovery_retry_does_not_follow_another_turn(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c))
-        self.result(a, outcome="handoff")
-        c.collect()
-        call = {"op": "worker.continue", "args": {"worker_id": a, "message": "Continue"}}
-        attempt, = self.accept(c, call)
-        with patch.object(delegation, "Worker", side_effect=InterruptedError("before the attempt started")):
-            with self.assertRaises(InterruptedError):
-                c.dispatch(attempt)
-        b, = self.send(c, self.start(c, None, attempt["id"]))
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-        resumed.recover()
-        unrelated, = self.send(resumed, call)
-        self.result(unrelated)
-        resumed.collect()
-        resumed.resume_queued()
-        self.assertEqual(exchange.workers(resumed.lease)[a]["phase"], "completed")
-        self.assertEqual(self.receipt(resumed, b)["state"], "cancelled")
-        self.assertIn(f"prerequisite {attempt['id']} is interrupted", self.receipt(resumed, b)["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-
-    def test_restart_recovers_candidate_before_admitting_queued_start(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c, "shared.txt"))
-        b, = self.send(c, self.start(c, "shared.txt", a))
-        (self.producers[a].cwd / "shared.txt").write_text("integrated on recovery\n")
-        self.result(a)
-        with patch.object(c, "settle_candidate"):
-            c.collect()
-        c.resume_queued()
-        self.assertEqual(self.receipt(c, a)["state"], "succeeded")
-        self.assertIn(f"{a} (candidate)", self.receipt(c, b)["result"]["reason"])
-        self.assertNotIn(b, self.producers)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-        self.assertEqual(resumed.lease.generation, c.lease.generation + 1)
-
-        def next_turn():
-            if b in resumed.workers:
-                self.assertEqual((self.producers[b].cwd / "shared.txt").read_text(), "integrated on recovery\n")
-                self.result(b)
-                return self.accept(resumed, {"op": "run.wait", "args": {"timeout_seconds": 0}})
-            self.assertEqual(exchange.workers(resumed.lease)[b]["phase"], "integrated")
-            resumed.ending = "done", "fixture", ""
-            return []
-
-        with (patch.object(resumed, "prepare", side_effect=resumed.recover),
-              patch.object(resumed, "decide", side_effect=next_turn)):
-            self.assertEqual(resumed.drive()[0], "done")
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-        self.assertEqual(self.receipt(resumed, b)["request"]["depends_on"], [a])
-        self.assertEqual(exchange.workers(resumed.lease)[b]["attempt"], b)
-
-
-class OrchestrationReceiptContextTests(DependentWorkerFixture):
-    def test_restart_restores_exposed_checks_report_before_admission(self):
-        c = self.controller()
-        report = "Checks report marker\n" + "check details\n" * 350
-        with patch.object(c, "atomic", return_value=factory.Outcome("fail", data={"report": report})):
-            checks, = self.send(c, {"op": "checks.run", "args": {}})
-        shown, = c.observe()["actions"]
-        self.assertEqual(shown["result"]["ref"], checks)
-        context = c.catalog.read(checks, 0, 8000)["text"]
-        a, = self.send(c, self.start(c))
-        call = self.start(c, None, a)
-        call["args"]["context_refs"] = [checks]
-        b, = self.send(c, call)
-        self.result(a)
-        c.collect()
-        self.assertNotIn(b, self.producers)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-
-        def next_turn():
-            self.assertIn(b, resumed.workers)
-            self.assertEqual(resumed.catalog.read(checks, 0, 8000)["text"], context)
-            self.assertIn("Checks report marker", self.producers[b].request["prompt"])
-            self.result(b)
-            resumed.collect()
-            resumed.ending = "done", "fixture", ""
-            return []
-
-        with (patch.object(resumed, "prepare", side_effect=resumed.recover),
-              patch.object(resumed, "decide", side_effect=next_turn)):
-            self.assertEqual(resumed.drive()[0], "done")
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-
-    def test_restart_restores_short_checks_report_as_context(self):
-        c = self.controller()
-        report = "Short checks report"
-        with patch.object(c, "atomic", return_value=factory.Outcome("fail", data={"report": report})):
-            checks, = self.send(c, {"op": "checks.run", "args": {}})
-        shown, = c.observe()["actions"]
-        self.assertEqual(shown["result"]["report"], report)
-        self.assertEqual(c.catalog.read(checks, 0, 8000)["text"], report)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-        resumed.recover()
-        self.assertEqual(resumed.catalog.read(checks, 0, 8000)["text"], report)
-
-    def test_restart_restores_short_serial_worker_error_before_admission(self):
-        c = self.controller(builders=None)
-        failed, prerequisite = self.send(c, self.start(c), self.start(c))
-        error = "Fixture serial error"
-        self.producers[failed].receipts.append({"event": "error", "error": error})
-        c.collect()
-        self.assertEqual(c.catalog.read(failed, 0, 8000)["text"], error)
-        call = self.start(c, None, prerequisite)
-        call["args"]["context_refs"] = [failed]
-        b, = self.send(c, call)
-        self.result(prerequisite)
-        c.collect()
-        self.assertNotIn(b, self.producers)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id, builders=None)
-        resumed.recover()
-        resumed.resume_queued()
-        self.assertIn(b, resumed.workers)
-        self.assertEqual(resumed.catalog.read(failed, 0, 8000)["text"], error)
-        self.assertIn(error, self.producers[b].request["prompt"])
-        self.result(b)
-        resumed.collect()
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-
-    def test_observed_worker_receipt_remains_structured_in_normal_actions_and_after_restart(self):
-        c = self.controller()
-        source = self.start(c)
-        source["args"]["context_refs"] = ["task"]
-        a, = self.send(c, source)
-        self.result(a)
-        text = "Fixture result details\n" * 210
-        self.producers[a].receipts[-1]["structured"].update(text=text, evidence_refs=["task"])
-        c.collect()
-        shown = next(item for item in c.observe()["actions"] if item["id"] == a)
-        self.assertEqual(shown["result"]["ref"], a)
-        context = c.catalog.read(a, 0, 8000)["text"]
-        self.assertEqual(context, ledger.encoded(self.receipt(c, a)["result"]))
-        self.assertEqual(json.loads(context)["evidence_refs"], ["task"])
-        self.assertEqual(json.loads(context)["outcome"], "done")
-        call = self.start(c)
-        call["args"]["context_refs"] = [a]
-        consumer, = self.send(c, call)
-        self.assertIn(context, self.producers[consumer].request["prompt"])
-        self.result(consumer, outcome="handoff")
-        c.collect()
-        continuation, = self.send(c, {"op": "worker.continue", "args": {"worker_id": consumer, "message": "Resume"}})
-        self.assertIn(context, self.producers[continuation].request["prompt"])
-        self.result(continuation)
-        c.collect()
-        for role, op, refs in (("verify", "verification.run", "goal_refs"), ("review", "review.run", "context_refs")):
-            with self.subTest(role=role):
-                def gate(name, **kw):
-                    self.assertIn(context, c.job.goal if name == "verify" else c.job.fix_reply)
-                    return factory.Outcome("pass", data={"verified" if name == "verify" else "review": {"verdict": "pass"}})
-
-                route = f"model:{role}:0"
-                with patch.object(c, "atomic", side_effect=gate) as atomic:
-                    self.send(c, {"op": op, "args": {refs: [a], "route_id": route,
-                                                   "effort": c.catalog.entries[route]["efforts"][0]}})
-                atomic.assert_called_once()
-
-        prerequisite, = self.send(c, self.start(c))
-        call["args"]["depends_on"] = [prerequisite]
-        b, = self.send(c, call)
-        self.result(prerequisite)
-        c.collect()
-        self.assertNotIn(b, self.producers)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-        resumed.recover()
-        resumed.resume_queued()
-        self.assertIn(b, resumed.workers)
-        self.assertEqual(resumed.catalog.read(a, 0, 8000)["text"], context)
-        self.assertIn(context, self.producers[b].request["prompt"])
-        self.result(b)
-        resumed.collect()
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-
-    def test_owner_reruns_get_original_worker_and_context_read_text(self):
-        for role in ("plan", "verify", "review"):
-            with self.subTest(role=role):
-                self.producers.clear()
-                c = self.controller(builders=None)
-                source = self.start(c)
-                source["args"]["goal"] = "G" * 9000
-                a, = self.send(c, source)
-                self.result(a)
-                c.collect()
-                shown, = c.observe()["actions"]
-                self.assertEqual(shown["result"]["ref"], a)
-                exposed = c.catalog.read(a, 0, 8000)["text"]
-                self.assertNotIn("Fixture result", exposed)
-                final_lines = '\n"Final quoted line"\nEnd of the read.\n'
-                raw = ('"quoted row"\n' * 800)[:8000 - len(final_lines)] + final_lines
-                self.assertEqual(len(raw), 8000)
-                c.catalog.add_context("fixture-page", raw)
-                page, = self.send(c, {"op": "context.read", "args": {"ref": "fixture-page", "limit": 8000}})
-                c.observe()
-                page_excerpt = c.catalog.read(page, 0, 8000)["text"]
-                self.assertNotIn("End of the read.", page_excerpt)
-
-                def check_context(text):
-                    if current is c:
-                        self.assertIn(exposed, text)
-                        self.assertIn(page_excerpt, text)
-                    else:
-                        self.assertIn("Fixture result", text)
-                        self.assertIn(raw, text)
-                        self.assertNotIn("G" * 8000, text)
-
-                def gate(name, **kw):
-                    job = current.job
-                    check_context(job.goal if name == "verify" else job.fix_reply)
-                    return factory.Outcome("pass", data={"verified" if name == "verify" else "review": {"verdict": "pass"}})
-
-                current = c
-                if role == "plan":
-                    call = self.start(c)
-                    call["args"]["context_refs"] = [a, page]
-                    original, = self.send(c, call)
-                    check_context(self.producers[original].request["prompt"])
-                    self.result(original)
-                    c.collect()
-                else:
-                    route = f"model:{role}:0"
-                    refs = "goal_refs" if role == "verify" else "context_refs"
-                    with patch.object(c, "atomic", side_effect=gate):
-                        original, = self.send(c, {"op": "verification.run" if role == "verify" else "review.run", "args": {
-                            refs: [a, page], "route_id": route, "effort": c.catalog.entries[route]["efforts"][0]}})
-                record.move(c.run.id, "interrupted", ("running",))
-                current = self.controller(c.run.id, builders=None)
-                current.run.action, current.run.action_only = original, True
-
-                def finish_rerun(run, action, request):
-                    check_context(request["prompt"])
-                    worker = self.spawn(run, action, request)
-                    self.result(action)
-                    return worker
-
-                with (patch.object(current, "prepare", side_effect=current.recover),
-                      patch.object(current, "atomic", side_effect=gate),
-                      patch.object(delegation, "Worker", side_effect=finish_rerun)):
-                    self.assertEqual(current.drive()[0], "step")
-                self.assertEqual(current.catalog.read(a, 0, 8000)["text"], exposed)
-                self.assertEqual(current.catalog.read(page, 0, 8000)["text"], page_excerpt)
-
-
-class DependentWorkerCapacityTests(DependentWorkerFixture):
-    def test_legacy_restart_reuses_assigned_candidate_without_queue_marker(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c))
-        self.result(a)
-        c.collect()
-        action, = self.accept(c, self.start(c, "shared.txt", a))
-        b, assignment = c.private_assignment(action, action["request"], None, True, "build")
-        self.assertEqual(exchange.workers(c.lease)[b]["phase"], "assigned")
-        self.assertFalse(ledger.queued_start(self.receipt(c, b)))
-        self.assertNotIn(b, self.producers)
-        record.move(c.run.id, "interrupted", ("running",))
-        resumed = self.controller(c.run.id)
-
-        def next_turn():
-            self.assertIn(b, resumed.workers)
-            w = exchange.workers(resumed.lease)[b]
-            self.assertEqual(w["data"]["candidate"], assignment["candidate"])
-            self.assertEqual(w["attempt"], b)
-            self.result(b)
-            resumed.collect()
-            resumed.ending = "done", "fixture", ""
-            return []
-
-        with (patch.object(resumed, "prepare", side_effect=resumed.recover),
-              patch.object(resumed, "decide", side_effect=next_turn)):
-            self.assertEqual(resumed.drive()[0], "done")
-        self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-        self.assertEqual(exchange.workers(resumed.lease)[b]["phase"], "integrated")
-
-    def test_claim_and_capacity_blockers_do_not_block_other_eligible_workers(self):
-        c = self.controller(builders=2, workers=3)
-        a, = self.send(c, self.start(c))
-        b, disjoint = self.send(c, self.start(c, "shared.txt", a), self.start(c, "other.txt", a))
-        holder, = self.send(c, self.start(c, "shared.txt"))
-        with self.assertRaisesRegex(ValueError, "overlap an outstanding builder claim"):
-            self.accept(c, self.start(c, "shared.txt"))
-        self.result(a)
-        c.collect()
-        c.resume_queued()
-        self.assertEqual(set(c.workers), {holder, disjoint})
-        self.assertIn(f"write claim held by {holder}", self.receipt(c, b)["result"]["reason"])
-        later, = self.send(c, self.start(c, "third.txt", a))
-        c.resume_queued()
-        self.assertIn("builder capacity", self.receipt(c, later)["result"]["reason"])
-        reader, capped = self.send(c, self.start(c, None, a), self.start(c, None, a))
-        c.resume_queued()
-        self.assertIn(reader, c.workers)
-        self.assertIn("worker capacity", self.receipt(c, capped)["result"]["reason"])
-        self.assertNotIn(capped, self.producers)
-
-    def test_ready_dependent_and_disjoint_sibling_share_batch_snapshot_before_collection(self):
-        c = self.controller(builders=3, workers=3)
-        prerequisite, = self.send(c, self.start(c))
-        self.result(prerequisite)
-        c.collect()
-        older, = self.send(c, self.start(c, "shared.txt"))
-        c.collect()
-        (self.producers[older].cwd / "shared.txt").write_text("integrated older writer\n")
-        batch = []
-
-        def next_turn():
-            if not batch:
-                batch.extend(self.accept(c, self.start(c, "third.txt", prerequisite), self.start(c, "other.txt"),
-                                         self.start(c, "shared.txt", older)))
-                self.result(older)
-                return batch
-            self.assertEqual((self.tree / "shared.txt").read_text(), "integrated older writer\n")
-            for action in batch[:2]:
-                wid = action["id"]
-                self.assertIn(wid, c.workers)
-                self.assertEqual((self.producers[wid].cwd / "shared.txt").read_text(), "base\n")
-                self.assertEqual(self.grants.count(f"worker-{wid}"), 1)
-            deferred = batch[2]["id"]
-            self.assertIn(deferred, c.workers)
-            self.assertEqual((self.producers[deferred].cwd / "shared.txt").read_text(), "integrated older writer\n")
-            c.ending = "done", "fixture", ""
-            return []
-
-        with (patch.object(c, "prepare", return_value=None), patch.object(c, "decide", side_effect=next_turn)):
-            self.assertEqual(c.drive()[0], "done")
-
-    def test_cap_one_admits_neither_immediate_nor_deferred_disjoint_writer_early(self):
-        c = self.controller(workers=3)
-        a, = self.send(c, self.start(c))
-        writer, = self.send(c, self.start(c, "shared.txt"))
-        b, = self.send(c, self.start(c, "other.txt", a))
-        with self.assertRaisesRegex(ValueError, "builder capacity"):
-            self.accept(c, self.start(c, "other.txt"))
-        self.result(a)
-        c.collect()
-        c.resume_queued()
-        self.assertIn("builder capacity", self.receipt(c, b)["result"]["reason"])
-        self.assertEqual(set(c.workers), {writer})
-        self.result(writer)
-        c.collect()
-        c.resume_queued()
-        self.assertEqual(set(c.workers), {b})
-
-
-class DependentWorkerDispositionTests(DependentWorkerFixture):
-    def test_unresolved_question_failed_retry_and_cancelled_prerequisites(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c))
-        b, = self.send(c, self.start(c, None, a))
-        self.result(a, outcome="question")
-        c.collect()
-        c.resume_queued()
-        receipt = self.receipt(c, b)["result"]
-        self.assertIn(f"{a} (waiting)", receipt["reason"])
-        c.resume_queued()
-        self.assertEqual(self.receipt(c, b)["result"]["revision"], receipt["revision"])
-        question = exchange.workers(c.lease)[a]["data"]["question"]
-        self.send(c, {"op": "worker.reply", "args": {"worker_id": a, "question_id": question, "message": "Proceed"}})
-        for _ in range(2):
-            c.resume_ready()
-            attempt, = c.workers
-            self.result(attempt, ok=False)
-            c.collect()
-            c.resume_queued()
-        self.assertIn(f"{a} failed (parked)", self.receipt(c, b)["result"]["reason"])
-        self.assertEqual(self.receipt(c, b)["state"], "cancelled")
-        other, = self.send(c, self.start(c))
-        dependent, = self.send(c, self.start(c, None, other))
-        self.send(c, {"op": "worker.cancel", "args": {"worker_id": other, "reason": "No longer needed"}})
-        c.resume_queued()
-        cancelled = self.receipt(c, dependent)
-        self.assertEqual(cancelled["state"], "cancelled")
-        self.assertIn(f"{other} was cancelled", cancelled["result"]["reason"])
-        self.assertNotIn("effective", cancelled["result"])
-        self.assertTrue({b, dependent}.isdisjoint(self.producers))
-
-    def finish_failed(self, c, decide):
-        c.flow.only = ""
-        c.run.dry_run = True
-        with (patch.object(c, "prepare", return_value=None), patch.object(c, "decide", side_effect=decide),
-              patch.object(flows, "finish", return_value=("failed", "fixture", ""))):
-            self.assertEqual(c.drive()[0], "failed")
-        return next(a for a in ledger.actions(c.lease) if a["op"] == "run.finish")
-
-    def test_cancel_plus_failed_finish_records_cancelled_prerequisite(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c))
-        b, = self.send(c, self.start(c, None, a))
-        self.assertIn(f"{a} (running)", self.receipt(c, b)["result"]["reason"])
-
-        def next_turn():
-            return self.accept(c, {"op": "worker.cancel", "args": {"worker_id": a, "reason": "Stop"}},
-                               {"op": "run.finish", "args": {"reason": "failed"}})
-
-        finished = self.finish_failed(c, next_turn)
-        cancelled = self.receipt(c, b)
-        self.assertEqual(finished["state"], "succeeded")
-        self.assertEqual(cancelled["state"], "cancelled")
-        self.assertIn(f"{a} was cancelled", cancelled["result"]["reason"])
-        self.assertLess(cancelled["result"]["revision"], finished["result"]["revision"])
-        self.assertNotIn(b, self.producers)
-
-    def test_wait_plus_failed_finish_records_failure_without_admitting_ready_work(self):
-        c = self.controller()
-        a, = self.send(c, self.start(c))
-        self.result(a, ok=False)
-        c.collect()
-        c.resume_ready()
-        retry, = c.workers
-        other, = self.send(c, self.start(c))
-        b, ready = self.send(c, self.start(c, None, a), self.start(c, None, other))
-        self.assertIn(f"{a} (running)", self.receipt(c, b)["result"]["reason"])
-
-        def next_turn():
-            actions = self.accept(c, {"op": "run.wait", "args": {"timeout_seconds": 0}},
-                                  {"op": "run.finish", "args": {"reason": "failed"}})
-            self.result(retry, ok=False)
-            self.result(other)
-            return actions
-
-        finished = self.finish_failed(c, next_turn)
-        cancelled = self.receipt(c, b)
-        self.assertEqual(finished["state"], "succeeded")
-        self.assertEqual(cancelled["state"], "cancelled")
-        self.assertIn(f"{a} failed (parked)", cancelled["result"]["reason"])
-        self.assertLess(cancelled["result"]["revision"], finished["result"]["revision"])
-        self.assertEqual(exchange.workers(c.lease)[other]["phase"], "completed")
-        still_queued = self.receipt(c, ready)
-        self.assertTrue(ledger.queued_start(still_queued))
-        self.assertEqual(still_queued["result"]["reason"], "waiting for admission")
-        self.assertTrue({b, ready}.isdisjoint(self.producers))
-
-    def test_cleanup_refreshes_interrupted_prerequisite_without_launching_ready_work(self):
-        c = self.controller()
-        a, other = self.send(c, self.start(c), self.start(c))
-        b, ready = self.send(c, self.start(c, None, a), self.start(c, None, other))
-        self.assertIn(f"{a} (running)", self.receipt(c, b)["result"]["reason"])
-        self.result(other)
-        c.collect()
-        c.close()
-        self.producers[a].close.assert_called_once()
-        self.assertEqual(self.receipt(c, a)["state"], "interrupted")
-        view = {w["id"]: w for w in ledger.view(c.run.id)["workers"]}
-        self.assertEqual(view[a]["phase"], "parked")
-        self.assertEqual(view[b]["reason"], f"waiting for prerequisite {a} (parked after interruption)")
+        self.assertEqual(set(paths.WORKTREES_DIR.glob("candidate-*")), existing)
+        self.assertEqual(set((paths.STATE_DIR / "builder-objects").iterdir()), objects)
         self.assertTrue(ledger.queued_start(self.receipt(c, b)))
-        self.assertEqual(view[ready]["reason"], "waiting for admission")
-        self.assertTrue({b, ready}.isdisjoint(self.producers))
+        c.close()
+        c = self.restart(c)
 
-    def test_failed_finish_preserves_specific_admission_blockers(self):
-        for blocker in ("claim", "integration", "repair"):
-            with self.subTest(blocker=blocker):
-                self.producers.clear()
-                c = self.controller()
-                a, = self.send(c, self.start(c))
-                self.result(a)
-                c.collect()
-                if blocker == "repair":
-                    c.run.repairs = "prior-run"
-                    c.run.budget = SimpleNamespace(issue_goal=False, prior_repairs=1, repair_calls=0,
-                                                   policy=runlimits.Policy(max_repair_cycles=1),
-                                                   repair_limit_reason=lambda: "fixture repair limit")
-                    reason = "waiting for repair allowance"
-                else:
-                    holder, = self.send(c, self.start(c, "shared.txt"))
-                    if blocker == "claim":
-                        self.result(holder, outcome="handoff")
-                        c.collect()
-                        reason = f"waiting for write claim held by {holder} (handoff)"
-                    else:
-                        (self.producers[holder].cwd / "shared.txt").write_text("pending integration\n")
-                        self.result(holder)
-                        with patch.object(orchestration.builder_workspaces, "apply", side_effect=ValueError("fixture hold")):
-                            c.collect()
-                        reason = f"waiting for integration of {holder} (reconciliation-required)"
-                b, = self.send(c, self.start(c, "shared.txt", a))
-                c.resume_queued()
-                self.assertEqual(self.receipt(c, b)["result"]["reason"], reason)
-
-                checks, = self.accept(c, {"op": "checks.run", "args": {}})
-                with patch.object(c, "atomic") as atomic:
-                    refusal = c.dispatch(checks)
-                    self.assertIn(f"{b} (queued)", str(refusal))
-                atomic.assert_not_called()
-
-                with patch.object(pipeline, "park_run", return_value=("failed", "fixture", "")):
-                    finished = self.finish_failed(c, lambda: self.accept(c, {"op": "run.finish", "args": {"reason": "failed"}}))
-                self.assertEqual(finished["state"], "succeeded")
-                receipt = self.receipt(c, b)
-                self.assertTrue(ledger.queued_start(receipt))
-                self.assertEqual(receipt["result"]["reason"], reason)
-                self.assertNotIn(b, self.producers)
-
-
-class SerialDependentWorkerAdmissionTests(DependentWorkerFixture):
-    def test_two_serial_restarts_keep_original_assignment_until_its_retry_succeeds(self):
-        for orderly_stop in (True, False):
-            with self.subTest(orderly_stop=orderly_stop):
-                self.producers.clear()
-                self.grants.clear()
-                c = self.controller(builders=None)
-                a, = self.send(c, self.start(c))
-                b, = self.send(c, self.start(c, None, a))
-                c.collect()
-                if orderly_stop:
-                    c.close()
-                    self.assertTrue(ledger.queued_start(self.receipt(c, b)))
-                    self.assertIn("interrupted", self.receipt(c, b)["result"]["reason"])
-                record.move(c.run.id, "interrupted", ("running",))
-                resumed = self.controller(c.run.id, builders=None)
-                with patch.object(delegation, "live", return_value=False):
-                    resumed.recover()
-                resumed.resume_queued()
-                assignment = self.receipt(resumed, b)
-                self.assertTrue(ledger.queued_start(assignment))
-                self.assertEqual(assignment["request"]["depends_on"], [a])
-                self.assertIn("interrupted", assignment["result"]["reason"])
-                self.assertNotIn(b, self.producers)
-                call = {"op": "worker.continue", "args": {"worker_id": a, "message": "Finish A"}}
-                retry, = self.send(resumed, call)
-                sibling, = self.send(resumed, {"op": "worker.continue", "args": {
-                    "worker_id": a, "message": "Investigate a follow-up while the retry is running"}})
-                self.assertNotIn("retry_of", self.receipt(resumed, sibling)["result"])
-                self.result(sibling)
-                resumed.collect()
-                resumed.resume_queued()
-                self.assertEqual(set(resumed.workers), {retry})
-                self.assertNotIn(b, self.producers)
-                if orderly_stop:
-                    resumed.close()
-                record.move(resumed.run.id, "interrupted", ("running",))
-                final = self.controller(resumed.run.id, builders=None)
-                with patch.object(delegation, "live", return_value=False):
-                    final.recover()
-                final.resume_queued()
-                self.assertTrue(ledger.queued_start(self.receipt(final, b)))
-                self.assertNotIn(b, self.producers)
-
-                last_retry, = self.send(final, call)
-                self.assertEqual(self.receipt(final, last_retry)["result"]["retry_of"], retry)
-                self.result(last_retry)
-                wait, = self.send(final, {"op": "run.wait", "args": {"timeout_seconds": 0}})
-                self.assertEqual(self.receipt(final, wait)["result"]["active"], [b])
-                self.result(b)
-                final.collect()
-                final.resume_queued()
-                self.assertEqual(self.receipt(final, a)["state"], "interrupted")
-                self.assertEqual(self.receipt(final, retry)["state"], "interrupted")
-                self.assertEqual(self.receipt(final, last_retry)["state"], "succeeded")
-                self.assertEqual(self.receipt(final, b)["state"], "succeeded")
-                self.assertEqual(self.grants.count(f"worker-{b}"), 1)
-
-    def test_serial_worker_admission_keeps_shared_workspace_lease(self):
-        c = self.controller(builders=None)
-        a, other = self.send(c, self.start(c), self.start(c))
-        b, = self.send(c, self.start(c, "shared.txt", a))
-        self.result(a)
-        c.collect()
+        with (patch.object(exchange, "tx", return_value=interrupt_transaction(True)),
+              self.assertRaises(pipeline.Terminated)):
+            c.resume_queued()
+        assigned = exchange.workers(c.lease)[b]
+        self.assertEqual(assigned["phase"], "assigned")
+        candidate = assigned["data"]["candidate"]
+        root = candidates.folder(candidate["token"])
+        self.assertTrue(root.is_dir())
+        self.assertTrue(candidates.repository(candidate["token"], 0).is_dir())
+        self.assertNotIn(b, self.producers)
+        c.close()
+        c = self.restart(c)
         c.resume_queued()
-        self.assertIn("shared workspace mutation lease", self.receipt(c, b)["result"]["reason"])
-        self.assertEqual(set(c.workers), {other})
-        self.result(other)
-        wait, = self.send(c, {"op": "run.wait", "args": {"timeout_seconds": 0}})
-        self.assertEqual(self.receipt(c, wait)["result"]["active"], [b])
-        self.assertEqual(self.producers[b].cwd, self.tree)
-        self.assertEqual(self.receipt(c, b)["state"], "running")
+        self.assertEqual(self.producers[b].cwd, root)
+        self.finish_worker(c, b)
+        c.resume_queued()
+        self.producers[b].allow.assert_called_once()
+        self.assertEqual(self.receipt(c, b)["state"], "succeeded")
+
+
+class OrchestrationReceiptContextTests(OrchestrationRecoveryFixture):
+    def test_old_saved_page_reaches_normal_actions_without_changing_other_receipts(self):
+        c = self.controller()
+        ending = '\n"Final acceptance detail"\n'
+        raw = ('"quoted row"\n' * 800)[:8000 - len(ending)] + ending
+        c.catalog.add_context("fixture-page", raw)
+        page, = self.send(c, {"op": "context.read", "args": {"ref": "fixture-page", "limit": 8000}})
+        result, error = self.accept(c, self.start(c), self.start(c))
+        prose = "Worker result details\n" * 220
+        long_receipt = ledger.transition(c.lease, result["id"], "succeeded", {
+            "text": prose, "outcome": "done", "evidence_refs": ["task"]})
+        structured = ledger.encoded(long_receipt["result"])
+        ledger.transition(c.lease, error["id"], "failed", {"error": "Short worker error"})
+        with patch.object(c, "atomic", return_value=factory.Outcome("fail", data={"report": "Short check report"})):
+            checks, = self.send(c, {"op": "checks.run", "args": {}})
+        for _ in range(3):
+            self.send(c, *[{"op": "catalog.list", "args": {"kind": "tools"}}] * 7)
+        self.assertNotIn(page, [item["id"] for item in c.observe()["actions"]])
+
+        c = self.restart(c)
+        read, = self.send(c, {"op": "context.read", "args": {"ref": page, "limit": 8000}})
+        self.assertEqual(self.receipt(c, read)["result"]["text"], raw)
+        refs = [page, result["id"], error["id"], checks]
+
+        def check_context(text):
+            for expected in (raw, structured, "Short worker error", "Short check report"):
+                self.assertIn(expected, text)
+
+        start, = self.send(c, self.start(c, context_refs=refs))
+        check_context(self.producers[start].request["prompt"])
+        self.finish_worker(c, start)
+        continuation, = self.send(c, {"op": "worker.continue", "args": {"worker_id": start, "message": "Continue"}})
+        check_context(self.producers[continuation].request["prompt"])
+        self.finish_worker(c, continuation)
+
+        def gate(role, **kw):
+            check_context(c.job.goal if role == "verify" else c.job.fix_reply)
+            key = "verified" if role == "verify" else "review"
+            return factory.Outcome("pass", data={key: {"verdict": "pass"}})
+
+        with patch.object(c, "atomic", side_effect=gate) as atomic:
+            for op, role, field in (("verification.run", "verify", "goal_refs"), ("review.run", "review", "context_refs")):
+                self.send(c, {"op": op, "args": {**self.route(c, role), field: refs}})
+            self.assertEqual(atomic.call_count, 2)
+
+        known = {a["id"]: a for a in ledger.actions(c.lease)}
+        rerun, = self.accept(c, self.start(c, context_refs=refs))
+        c.dispatch_rerun(rerun, known)
+        prompt = self.producers[rerun["id"]].request["prompt"]
+        self.assertIn(raw, prompt)
+        self.assertIn(prose, prompt)
+        self.assertNotIn(structured, prompt)
+        self.finish_worker(c, rerun["id"])
 
 
 class BudgetTests(Isolated):

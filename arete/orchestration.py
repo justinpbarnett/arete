@@ -684,7 +684,7 @@ class Controller(worker_turns.WorkerTurns):
                 "error": self.data.get("error", "")}
 
     def restore_result_context(self, action):
-        if (text := receipt_text(action)) is not None:
+        if action["op"] != "context.read" and (text := receipt_text(action)) is not None:
             self.catalog.add_context(action["id"], text)
         self.excerpt(action)
 
@@ -694,14 +694,17 @@ class Controller(worker_turns.WorkerTurns):
         return self.catalog.read(ref, 0, 8000)["text"]
 
     def excerpt(self, action):
-        text = ledger.encoded(action["result"])
+        ref, result = action["id"], action["result"]
+        text = ledger.encoded(result)
+        if action["op"] == "context.read" and isinstance(page := result.get("text"), str):
+            self.catalog.add_context(ref, page)
+        elif len(text) > 4000:
+            self.catalog.add_context(ref, text)
+        elif isinstance(report := result.get("report"), str) and report and ref not in self.catalog.context:
+            self.catalog.add_context(ref, report)
         if len(text) <= 4000:
-            report = action["result"].get("report")
-            if isinstance(report, str) and report and action["id"] not in self.catalog.context:
-                self.catalog.add_context(action["id"], report)
-            return action["result"]
-        self.catalog.add_context(action["id"], text)
-        return {"ref": action["id"], "excerpt": text[:2000], "characters": len(text)}
+            return result
+        return {"ref": ref, "excerpt": text[:2000], "characters": len(text)}
 
     def controller_turn(self, turn, request, retried):
         controller = delegation.Worker(self.run, turn, request)

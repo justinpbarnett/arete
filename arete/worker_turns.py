@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 from . import builder_workspaces as candidates
 from . import delegation, factory, run_lines, runlimits, sandbox, util
@@ -159,6 +160,23 @@ class WorkerTurns:
                     return candidate
         return None
 
+    @contextmanager
+    def assigning_candidate(self, wid, pinned):
+        candidate = None
+        try:
+            candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=pinned)
+            yield candidate
+        except BaseException as error:
+            if candidate is not None:
+                try:
+                    worker = exchange.workers(self.lease).get(wid)
+                    recorded = worker["data"].get("candidate") if worker else None
+                    if recorded is None or recorded["token"] != candidate["token"]:
+                        candidates.release(candidate)
+                except Exception as cleanup_error:
+                    error.add_note(f"Could not confirm or clean up an unassigned candidate: {cleanup_error}")
+            raise
+
     def private_assignment(self, action, args, prior, writing, role, *, same_batch=False):
         ws = exchange.workers(self.lease)
         wid = action["request"]["worker_id"] if prior else action["id"]
@@ -168,12 +186,8 @@ class WorkerTurns:
                 candidates.validate_claims(args["write_paths"], self.job.layer, self.job.checkouts)
             role = self.assignment_role(args, writing, role, ws)
             pinned = self.batch_snapshot(action, ws) if same_batch else None
-            candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=pinned)
-            try:
+            with self.assigning_candidate(wid, pinned) as candidate:
                 return wid, exchange.admit(self.lease, wid, candidate, role, batch_snapshot=same_batch)
-            except BaseException:
-                candidates.release(candidate)
-                raise
         if w:
             if w["phase"] not in {"assigned", "conflict", "handoff", "parked"}:
                 raise ValueError(f"worker {wid} is {w['phase']}")
@@ -187,14 +201,10 @@ class WorkerTurns:
             return wid, data
         self.preflight([{"op": "worker.start", "args": args}])
         role = self.assignment_role(args, writing, role, ws)
-        candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=self.batch_snapshot(action, ws))
-        data = {"effective": args, "role": role, "writing": writing, "write_paths": args["write_paths"],
-                "turn": action["turn"], "candidate": candidate}
-        try:
+        with self.assigning_candidate(wid, self.batch_snapshot(action, ws)) as candidate:
+            data = {"effective": args, "role": role, "writing": writing, "write_paths": args["write_paths"],
+                    "turn": action["turn"], "candidate": candidate}
             exchange.assign(self.lease, wid, data)
-        except Exception:
-            candidates.release(candidate)
-            raise
         return wid, data
 
     def settle_candidate(self, w):
