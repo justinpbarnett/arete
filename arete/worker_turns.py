@@ -28,6 +28,97 @@ def latest_retry(prior, retries):
     return prior
 
 
+def attempted_continuation(action):
+    if action["op"] != "worker.continue":
+        return False
+    state, result = action["state"], action["result"]
+    if state == "failed":
+        return bool(result.get("worker_id") or result.get("pid") or result.get("phase") in {"ready", "parked"})
+    return state == "interrupted" and (bool(result.get("pid")) or "effective" in result)
+
+
+def dependency_retries(known):
+    retries = {}
+    for action in known.values():
+        if retry_of := action["result"].get("retry_of"):
+            retries.setdefault(retry_of, action)
+    return retries
+
+
+def interrupted_dependency(prior, workers, *, private):
+    if not private:
+        if prior["op"] in {"worker.start", "worker.continue"} and "effective" in prior["result"]:
+            return "interrupted; needs continuation"
+        return ""
+    if prior["op"] == "worker.continue":
+        w = workers.get(prior["request"]["worker_id"])
+        if w and w["attempt"] == prior["id"]:
+            if w["phase"] == "parked" and w["data"].get("resume_interrupted"):
+                return "parked after interruption"
+            if w["phase"] == "ready" and w["data"].get("retry_of") == prior["id"]:
+                return "ready to retry after interruption"
+    return ""
+
+
+def dependency_blocker(action, known, retries, workers, *, private):
+    waiting = ""
+    for dep in action["request"]["depends_on"]:
+        prior = known[dep]
+        if not (private and prior["op"] == "worker.start"):
+            prior = latest_retry(prior, retries)
+        op, phase, result = prior["op"], prior["state"], prior["result"]
+        owner = None
+        if private:
+            if op == "worker.start" and (phase != "failed" or result.get("worker_id")
+                                         or result.get("phase") == "ready"):
+                owner = prior["id"]
+            elif (phase == "succeeded" and op in {"worker.steer", "worker.reply", "worker.continue"}
+                  or attempted_continuation(prior)):
+                owner = result.get("worker_id") or prior["request"]["worker_id"]
+        w = workers.get(owner)
+        if w:
+            phase = w["phase"]
+            if phase == ("integrated" if w["data"]["writing"] else "completed"):
+                continue
+            if phase == "cancelled":
+                return True, f"prerequisite {dep} was cancelled"
+            if phase == "parked":
+                state = known[w["attempt"]]["state"]
+                if state == "failed":
+                    return True, f"prerequisite {dep} failed ({phase})"
+                if state == "interrupted":
+                    phase = "parked after interruption"
+        elif phase == "succeeded":
+            if owner is None:
+                continue
+            phase = "worker receipt missing"
+        elif phase in ledger.TERMINAL:
+            interrupted = interrupted_dependency(prior, workers, private=private) if phase == "interrupted" else ""
+            if not interrupted:
+                return True, f"prerequisite {dep} is {phase}"
+            phase = interrupted
+        if not waiting:
+            waiting = f"waiting for prerequisite {dep} ({phase})"
+    return False, waiting
+
+
+def private_rerun_blocked(known, workers):
+    outstanding = {wid for wid, w in workers.items() if w["phase"] not in exchange.CLOSED}
+    if not outstanding or any(workers[wid]["phase"] != "queued" for wid in outstanding):
+        return bool(outstanding)
+    projected = workers.copy()
+    retries = dependency_retries(known)
+    for action in known.values():
+        wid = action["id"]
+        if wid in outstanding and ledger.queued_start(action):
+            cancelled, _ = dependency_blocker(action, known, retries, projected, private=True)
+            if not cancelled:
+                return True
+            outstanding.remove(wid)
+            projected[wid] = {**workers[wid], "phase": "cancelled"}
+    return bool(outstanding)
+
+
 class WorkerTurns:
     protocol = 1
     has_queued_starts = False
@@ -284,65 +375,7 @@ class WorkerTurns:
 
     def dependency_receipts(self):
         known = {a["id"]: a for a in ledger.actions(self.lease)}
-        retries = {}
-        for action in known.values():
-            if retry_of := action["result"].get("retry_of"):
-                retries.setdefault(retry_of, action)
-        return known, retries
-
-    def interrupted_dependency(self, prior, workers):
-        if not self.exchanged:
-            if prior["op"] in {"worker.start", "worker.continue"} and "effective" in prior["result"]:
-                return "interrupted; needs continuation"
-            return ""
-        if prior["op"] == "worker.continue":
-            w = workers.get(prior["request"]["worker_id"])
-            if w and w["attempt"] == prior["id"]:
-                if w["phase"] == "parked" and w["data"].get("resume_interrupted"):
-                    return "parked after interruption"
-                if w["phase"] == "ready" and w["data"].get("retry_of") == prior["id"]:
-                    return "ready to retry after interruption"
-        return ""
-
-    def dependency_blocker(self, action, known, retries, workers):
-        waiting = ""
-        for dep in action["request"]["depends_on"]:
-            prior = known[dep]
-            if not self.exchanged and prior["op"] == "worker.steer" and prior["state"] == "succeeded":
-                prior = known[prior["request"]["worker_id"]]
-            if not (self.exchanged and prior["op"] == "worker.start"):
-                prior = latest_retry(prior, retries)
-            op, phase = prior["op"], prior["state"]
-            owner = None
-            if self.exchanged and op == "worker.start" and (phase != "failed" or prior["result"].get("phase") == "ready"):
-                owner = prior["id"]
-            if self.exchanged and phase == "succeeded" and op in {"worker.steer", "worker.reply", "worker.continue"}:
-                owner = prior["result"].get("worker_id") or prior["request"]["worker_id"]
-            w = workers.get(owner)
-            if w:
-                phase = w["phase"]
-                if phase == ("integrated" if w["data"]["writing"] else "completed"):
-                    continue
-                if phase == "cancelled":
-                    return True, f"prerequisite {dep} was cancelled"
-                if phase == "parked":
-                    state = known[w["attempt"]]["state"]
-                    if state == "failed":
-                        return True, f"prerequisite {dep} failed ({phase})"
-                    if state == "interrupted":
-                        phase = "parked after interruption"
-            elif phase == "succeeded":
-                if owner is None:
-                    continue
-                phase = "worker receipt missing"
-            elif phase in ledger.TERMINAL:
-                interrupted = self.interrupted_dependency(prior, workers) if phase == "interrupted" else ""
-                if not interrupted:
-                    return True, f"prerequisite {dep} is {phase}"
-                phase = interrupted
-            if not waiting:
-                waiting = f"waiting for prerequisite {dep} ({phase})"
-        return False, waiting
+        return known, dependency_retries(known)
 
     def defer_start(self, action):
         args = action["request"]
@@ -350,7 +383,7 @@ class WorkerTurns:
         writing = writing and args["tool_bundle"] == "write"
         known, retries = self.dependency_receipts()
         workers = exchange.workers(self.lease) if self.exchanged else {}
-        _, reason = self.dependency_blocker(action, known, retries, workers)
+        _, reason = dependency_blocker(action, known, retries, workers, private=self.exchanged)
         data = None
         if self.exchanged:
             self.preflight([{"op": "worker.start", "args": args}])
@@ -386,7 +419,7 @@ class WorkerTurns:
                 return "waiting for repair allowance"
         return ""
 
-    def resume_queued(self, *, launch=True, wait_turn=None, batch=None):
+    def resume_queued(self, *, launch=True, wait_turn=None, batch=None, rerun_id=None):
         if not self.has_queued_starts:
             return
         known, retries = self.dependency_receipts()
@@ -394,16 +427,20 @@ class WorkerTurns:
         if not pending:
             self.has_queued_starts = False
             return
-        if launch and any(
+        if rerun_id is not None:
+            pending = [a for a in pending if a["id"] == rerun_id]
+        elif launch and any(
                 a["state"] == "accepted" and not ledger.queued_start(a)
-                and (a["turn"] != wait_turn or (a["op"] == "run.finish" and a["request"]["reason"] == "failed"))
+                and (a["turn"] != wait_turn or a["op"] == "worker.continue"
+                     or (a["op"] == "worker.start" and not a["request"].get("depends_on"))
+                     or (a["op"] == "run.finish" and a["request"]["reason"] == "failed"))
                 for a in known.values()):
             return
         workers = exchange.workers(self.lease) if self.exchanged else {}
         for action in pending:
             if batch is not None and action["id"] not in batch:
                 continue
-            cancelled, reason = self.dependency_blocker(action, known, retries, workers)
+            cancelled, reason = dependency_blocker(action, known, retries, workers, private=self.exchanged)
             if not reason:
                 reason = self.admission_blocker(action, workers)
             if not reason and not launch:
@@ -418,6 +455,7 @@ class WorkerTurns:
             known, retries = self.dependency_receipts()
             if self.exchanged:
                 workers = exchange.workers(self.lease)
+        self.has_queued_starts = any(ledger.queued_start(a) for a in known.values())
 
     def resume_ready(self):
         workers = exchange.workers(self.lease).values()
@@ -434,6 +472,7 @@ class WorkerTurns:
             self.dispatch(action)
 
     def worker_barrier(self):
+        self.resume_queued(launch=False)
         if self.exchanged:
             pending = [f"{w['id']} ({w['phase']})" for w in exchange.workers(self.lease).values()
                        if w["phase"] not in exchange.CLOSED]

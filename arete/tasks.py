@@ -766,24 +766,26 @@ def repair(run_id: str, base_version=None) -> dict:
 
 
 def adaptive_action(row: dict, action: str) -> dict:
-    from .store import orchestration
+    from . import worker_turns
+    from .orchestration_api import WORKER_PROTOCOL
+    from .store import orchestration, worker_exchange
 
-    source = orchestration.find(row["id"])
-    if source:
-        lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
-        found = next((a for a in orchestration.actions(lease) if a["id"] == action), None)
-        if found and orchestration.unlaunched_start(found):
-            raise control.Refused("the action has no finished invocation to rerun")
-        if found and source["data"].get("protocol") == 2:
-            from .store import worker_exchange
-
-            if any(w["phase"] not in worker_exchange.CLOSED for w in worker_exchange.workers(lease).values()):
-                raise control.Refused("resume the controller to settle outstanding workers before rerunning an action")
-            if found["state"] not in orchestration.TERMINAL or (
-                    found["op"] in ("worker.start", "worker.continue") and not found["result"].get("effective")):
+    with foundation.reader() as connection:
+        source = orchestration.find(row["id"])
+        if source:
+            lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
+            known = {a["id"]: a for a in orchestration.actions(lease)}
+            found = known.get(action)
+            if found and orchestration.unlaunched_start(found):
                 raise control.Refused("the action has no finished invocation to rerun")
-        if found and found["op"] in ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"):
-            return found
+            if found and source["data"].get("protocol") == WORKER_PROTOCOL:
+                if worker_turns.private_rerun_blocked(known, worker_exchange.workers(lease, connection)):
+                    raise control.Refused("resume the controller to settle outstanding workers before rerunning an action")
+                if found["state"] not in orchestration.TERMINAL or (
+                        found["op"] in ("worker.start", "worker.continue") and not found["result"].get("effective")):
+                    raise control.Refused("the action has no finished invocation to rerun")
+            if found and found["op"] in ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"):
+                return found
     raise control.Refused("adaptive controls require a worker/check/review/verification action ID from run details, "
                           "not a phase name or publication action")
 

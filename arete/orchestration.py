@@ -53,6 +53,7 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
                 "ci_stopped", "changed", "ci_result", "committed")
 REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 CONTROLLER_STALL = "controller-stall"
+SAVED_GATE_OPS = ("checks.run", "verification.run", "review.run")
 
 
 def stall_routes(setting):
@@ -76,6 +77,12 @@ def receipt_text(action):
         if "error" in result or result.get("event") in {"result", "error"}:
             return result.get("error", "")
     return text
+
+
+class WorkerSetupFailed(ValueError):
+    def __init__(self, error: ValueError, effective: dict):
+        super().__init__(str(error))
+        self.effective = effective
 
 
 class UnchangedPushedHead(ValueError):
@@ -664,8 +671,10 @@ class Controller(worker_turns.WorkerTurns):
         for worker in self.workers.values():
             self.progress[worker.action] = worker.observations()
             self.reported[worker.action] = worker.report[0]
-        return {**(self.worker_observation(outstanding=True) if self.exchanged else {}),
-                "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
+        work = self.worker_observation(outstanding=True) if self.exchanged else {
+            "queued_starts": [{"id": a["id"], **{k: a["result"][k] for k in ("phase", "depends_on", "reason")}}
+                              for a in all_actions if ledger.queued_start(a)]}
+        return {**work, "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 **({"serial_reason": self.data["serial_reason"]} if self.data.get("serial_reason") else {}),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
@@ -684,8 +693,10 @@ class Controller(worker_turns.WorkerTurns):
                 "error": self.data.get("error", "")}
 
     def restore_result_context(self, action):
-        if action["op"] != "context.read" and (text := receipt_text(action)) is not None:
+        if (text := receipt_text(action)) is not None:
             self.catalog.add_context(action["id"], text)
+            if action["op"] in {"worker.start", "worker.continue", "context.read"}:
+                return
         self.excerpt(action)
 
     def context_for_action(self, ref):
@@ -696,15 +707,14 @@ class Controller(worker_turns.WorkerTurns):
     def excerpt(self, action):
         ref, result = action["id"], action["result"]
         text = ledger.encoded(result)
+        if len(text) > 4000:
+            self.catalog.add_context(ref, text)
+            return {"ref": ref, "excerpt": text[:2000], "characters": len(text)}
         if action["op"] == "context.read" and isinstance(page := result.get("text"), str):
             self.catalog.add_context(ref, page)
-        elif len(text) > 4000:
-            self.catalog.add_context(ref, text)
         elif isinstance(report := result.get("report"), str) and report and ref not in self.catalog.context:
             self.catalog.add_context(ref, report)
-        if len(text) <= 4000:
-            return result
-        return {"ref": ref, "excerpt": text[:2000], "characters": len(text)}
+        return result
 
     def controller_turn(self, turn, request, retried):
         controller = delegation.Worker(self.run, turn, request)
@@ -871,22 +881,20 @@ class Controller(worker_turns.WorkerTurns):
             request.update(cwd=str(private), private_worker=True, offered_ids=[m["id"] for m in messages],
                            evidence_refs=args["context_refs"], closed_context=[
                 *self.run.closed_context, str(self.job.ws), *(str(c.src) for c in self.job.checkouts)])
-        if writing:
-            b = self.job.b
-            if not b.worker_trees and not denied_feedback:
-                b.worker_trees = {c.github: factory.fingerprint(c.wt) for c in b.checkouts}
-                if not all(b.worker_trees.values()):
-                    b.worker_trees.clear()
-                    raise ValueError("the workspace could not be recorded before the writing worker")
-                self.data["worker_trees"] = b.worker_trees
-                self.persist()
         retry_of = None
         if not assignment and prior and prior["state"] == "interrupted":
             _, retries = self.dependency_receipts()
             attempt = worker_turns.latest_retry(prior, retries)
             if attempt["state"] == "interrupted":
                 retry_of = attempt["id"]
-        worker = delegation.Worker(self.run, action["id"], request)
+        try:
+            if writing and not denied_feedback:
+                self.record_worker_trees()
+            worker = delegation.Worker(self.run, action["id"], request)
+        except ValueError as error:
+            if not self.exchanged and ledger.queued_start(action):
+                raise WorkerSetupFailed(error, args) from error
+            raise
         worker.writing, worker.effective = writing, args
         try:
             receipt = {"pid": worker.pid, "identity": worker.identity, "effective": args, "writing": writing, "role": role}
@@ -904,6 +912,17 @@ class Controller(worker_turns.WorkerTurns):
         self.workers[action["id"]] = worker
         if writing:
             self.data["writes"] = self.data.get("writes", 0) + 1
+
+    def record_worker_trees(self):
+        b = self.job.b
+        if b.worker_trees:
+            return
+        b.worker_trees = {c.github: factory.fingerprint(c.wt) for c in b.checkouts}
+        if not all(b.worker_trees.values()):
+            b.worker_trees.clear()
+            raise ValueError("the workspace could not be recorded before the writing worker")
+        self.data["worker_trees"] = b.worker_trees
+        self.persist()
 
     def collect(self):
         changed = False
@@ -1581,6 +1600,17 @@ class Controller(worker_turns.WorkerTurns):
         finally:
             self.run.say = say
 
+    def serial_gate_rerun(self, action):
+        if (self.exchanged or not self.has_queued_starts or action["op"] not in SAVED_GATE_OPS
+                or not (turn := action.get("turn"))):
+            return False
+        with ledger.reader() as connection:
+            ledger.fenced(connection, self.lease)
+            row = connection.execute(
+                "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
+                (self.lease.root, turn)).fetchone()
+        return bool(ledger.decoded(row).get("response", {}).get("serial_gate_rerun"))
+
     def perform(self, action):
         args, op = action["request"], action["op"]
         if op == "worker.start":
@@ -1642,7 +1672,8 @@ class Controller(worker_turns.WorkerTurns):
         if op == "run.wait":
             return self.wait_workers(args["timeout_seconds"], turn=action["turn"])
         self.barrier()
-        if op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed"):
+        if (op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed")
+                and not self.serial_gate_rerun(action)):
             self.worker_barrier()
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
@@ -1763,18 +1794,20 @@ class Controller(worker_turns.WorkerTurns):
         except ValueError as error:
             refusal = error
             result = {"error": str(error)[:2000]}
-            if admit:
-                exchange.update_admission(self.lease, action, result["error"], private=self.exchanged, cancelled=True)
-                run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="cancelled")
-                if isinstance(error, prompt_loader.MissingInputs):
-                    raise
-                return refusal
             if self.exchanged and action["op"] in ("worker.start", "worker.continue"):
                 wid = action["request"].get("worker_id", action["id"])
                 found = exchange.workers(self.lease).get(wid)
                 if found and found["phase"] == "assigned" and found["attempt"] == action["id"]:
                     exchange.change(self.lease, wid, "parked", reason=result["error"])
                     result.update(worker_id=wid, effective=found["data"]["effective"])
+            elif isinstance(error, WorkerSetupFailed):
+                result["effective"] = error.effective
+            if admit and "effective" not in result:
+                exchange.update_admission(self.lease, action, result["error"], private=self.exchanged, cancelled=True)
+                run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="cancelled")
+                if isinstance(error, prompt_loader.MissingInputs):
+                    raise
+                return refusal
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
             if defer or admit or action["id"] in self.workers:
@@ -1820,7 +1853,7 @@ class Controller(worker_turns.WorkerTurns):
         try:
             self.dispatch(action)
             if action["op"] == "worker.start" and action["request"].get("depends_on"):
-                self.resume_queued()
+                self.resume_queued(rerun_id=action["id"])
         finally:
             self.rerun_context = None
 
@@ -1834,26 +1867,30 @@ class Controller(worker_turns.WorkerTurns):
                 known = {action["id"]: action for action in ledger.actions(self.lease)}
                 prior = known.get(self.run.action)
                 allowed = (("verification.run",) if self.run.environment_release else
-                           ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"))
+                           ("worker.start", "worker.continue", *SAVED_GATE_OPS))
                 if (prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL
                         or ledger.unlaunched_start(prior)):
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
+                call = {"op": prior["op"], "args": prior["request"]}
+                if prior["op"] in ("worker.start", "worker.continue"):
+                    self.barrier()
+                    if self.exchanged:
+                        self.worker_barrier()
+                        known = {a["id"]: a for a in ledger.actions(self.lease)}
+                        call = {"op": "worker.start", "args": prior["result"]["effective"]}
                 snapshot = ledger.snapshot(self.lease)
                 turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.decision_limit)
                 requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
                 response = {"version": self.protocol, "decision_id": turn, "state_version": snapshot["version"],
-                            "rationale": f"{requester} of {prior['id']}",
-                            "calls": [{"op": prior["op"], "args": prior["request"]}]}
-                if prior["op"] in ("worker.start", "worker.continue"):
-                    self.worker_barrier()
-                    if self.exchanged:
-                        response["calls"] = [{"op": "worker.start", "args": prior["result"]["effective"]}]
+                            "rationale": f"{requester} of {prior['id']}", "calls": [call]}
                 try:
                     response = self.catalog.validate(response, turn, snapshot["version"], known,
                                                      enforce_size_limit=False)
                 except (ValueError, TypeError) as error:
                     ledger.reject(self.lease, turn, str(error)[:2000])
                     raise factory.Refused(f"cannot rerun {prior['id']} under the current catalog: {error}") from error
+                if not self.exchanged and call["op"] in SAVED_GATE_OPS:
+                    response["serial_gate_rerun"] = prior["id"]
                 rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.action_limit)[0]
                 self.dispatch_rerun(rerun, known)
                 if self.run.environment_release:
@@ -1922,7 +1959,8 @@ class Controller(worker_turns.WorkerTurns):
             except BaseException as error:
                 errors.append(error)
         try:
-            self.resume_queued(launch=False)
+            if self.exchanged or not self.run.action_only:
+                self.resume_queued(launch=False)
             if self.exchanged:
                 for w in exchange.workers(self.lease).values():
                     if w["phase"] not in exchange.CLOSED and not w["data"].get("reason"):
