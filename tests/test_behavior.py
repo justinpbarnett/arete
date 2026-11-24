@@ -3057,6 +3057,34 @@ with db.tx() as c:
 """)
 
 
+class WorkspaceProcessInventoryTests(_WorkspaceChildCase):
+    def test_serve_records_the_current_child_identity_before_workspace_activation(self):
+        self.run_child(workspace_schema(27) + r"""
+import subprocess
+import sys
+from arete import control, serve
+
+with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
+    try:
+        identity = db.process_identity(child.pid)
+        assert identity is not None
+        observed = serve.restart_children()
+        assert (child.pid, identity) in observed
+        beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+        util.write_json(beat, {"pid": os.getpid(), "schema": 27, **db.workspace_child_fields(observed)})
+        assert (child.pid, identity) in serve.startup_beat()
+        with db.reader() as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+            assert f"inherited child {child.pid}" in db.contract_blockers(conn, 28)
+    finally:
+        child.communicate(timeout=3)
+assert not serve.startup_beat()
+with db.reader() as conn:
+    assert not db.contract_blockers(conn, 28)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+""")
+
+
 class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
     def test_authorized_file_rule_records_filing_before_workspace_access(self):
         self.run_child(workspace_schema() + r"""
