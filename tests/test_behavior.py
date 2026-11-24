@@ -1420,6 +1420,48 @@ assert schema_version() == {version}
 """
 
 
+class SecretRegistryExpansionTests(_WorkspaceChildCase):
+    def test_expand_preserves_existing_rows_and_is_idempotent(self):
+        self.run_child(workspace_schema(26) + """
+tables = ("workspaces", "orchestration_workers", "orchestration_messages")
+
+def snapshot(c):
+    return {name: [tuple(row) for row in c.execute(f"SELECT * FROM {name}")] for name in tables}
+
+with db.tx() as c:
+    c.execute("INSERT INTO workspaces (name, state, made_at) VALUES ('sample-7', 'kept', '2026-01-01T00:00:00Z')")
+    c.execute("INSERT INTO orchestration_workers VALUES ('sample-run', 'w', 'w.1', 1, 'integrated', '{}')")
+    c.execute("INSERT INTO orchestration_messages (root, id, worker, kind, body, reply_to, action, state, attempt, history) VALUES "
+              "('sample-run', 'm', 'w', 'steer', 'fixture', '', 'step', 'acknowledged', 'w.1', '[]')")
+    before = snapshot(c)
+    oldest = db.metadata(c)['oldest_writer']
+
+with patch.object(db.migrations, 'load', return_value=chain[:db.SECRET_REGISTRY_SCHEMA]):
+    for _ in range(2):
+        db.migrate()
+        with db.reader() as c:
+            assert schema_version() == db.SECRET_REGISTRY_SCHEMA
+            assert snapshot(c) == before and db.metadata(c)['oldest_writer'] == oldest
+            strict = {r['name']: r['strict'] for r in c.execute('PRAGMA table_list')}
+            for name in ('secrets', 'secret_events', 'accounts'):
+                assert strict[name] and c.execute(f'SELECT count(*) FROM {name}').fetchone()[0] == 0
+            assert not c.execute('PRAGMA foreign_key_check').fetchall()
+""")
+
+    def test_subscription_accounts_require_a_personal_holder_and_unique_identity(self):
+        self.run_child(workspace_schema(27) + """
+with db.tx() as c:
+    insert = ("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES (?, 'sample', 'fixture', 'subscription', ?, ?, 'fixture', '2026-01-01T00:00:00Z')")
+    for holder, usage in (('u:fixture', 'workspace'), ('hand', 'personal')):
+        with case.assertRaises(sqlite3.IntegrityError):
+            c.execute(insert, ('sample:subscription', holder, usage))
+    c.execute(insert, ('sample:subscription', 'u:fixture', 'personal'))
+    with case.assertRaises(sqlite3.IntegrityError):
+        c.execute(insert, ('sample:subscription:2', 'u:fixture', 'personal'))
+""")
+
+
 class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
     def test_authorized_file_rule_records_filing_before_workspace_access(self):
         self.run_child(workspace_schema() + r"""
