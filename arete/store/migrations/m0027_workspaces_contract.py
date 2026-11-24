@@ -307,6 +307,22 @@ def snapshot_directory(folder):
                 os.close(fd)
 
 
+@contextmanager
+def recovery_snapshot(folder, ws):
+    from arete.store import workspaces
+
+    filename = f"{ws.name}.json"
+    with snapshot_directory(folder) as fd:
+        if fd is None:
+            raise ValueError(f"{ws.name} snapshot is missing")
+        before = os.stat(filename, dir_fd=fd, follow_symlinks=False)
+        made = read_snapshot(folder, fd, filename, before)
+        owner = recorded_owner(folder / filename, ws, made.get("\0owner", {}))
+        yield owner, workspaces.snapshot_fields(made), before.st_mtime_ns
+        if signature(os.stat(filename, dir_fd=fd, follow_symlinks=False)) != signature(before):
+            raise ValueError(f"{ws.name} snapshot changed during retry")
+
+
 def snapshot_names(fd):
     return {name for name in os.listdir(fd) if name.endswith(".json")} if fd is not None else set()
 

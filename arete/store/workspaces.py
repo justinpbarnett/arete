@@ -308,13 +308,7 @@ def retry_quarantine(name: str, folder: Path) -> None:
     ws = paths.WORKTREES_DIR / name
     repo, ticket = row["repo"], row["ticket"]
     if not repo or not ticket:
-        with handoff.snapshot_directory(folder) as fd:
-            if fd is None:
-                raise ValueError(f"{name} snapshot is missing")
-            filename = f"{name}.json"
-            before = os.stat(filename, dir_fd=fd, follow_symlinks=False)
-            made = handoff.read_snapshot(folder, fd, filename, before)
-            owner = handoff.recorded_owner(folder / filename, ws, made.get("\0owner", {}))
+        with handoff.recovery_snapshot(folder, ws) as (owner, _, _):
             repo, ticket = owner.repo, owner.ticket
             if not repo or not ticket:
                 raise ValueError(f"{name} snapshot has no recorded ticket")
@@ -324,15 +318,11 @@ def retry_quarantine(name: str, folder: Path) -> None:
         with folder_lock(ws, wait=False) as locked:
             if not locked:
                 raise ValueError(f"{name} is in use")
-            with writes.atomic() as conn, handoff.snapshot_directory(folder) as fd:
+            with writes.atomic() as conn, handoff.recovery_snapshot(folder, ws) as (owner, fields, modified):
                 if open_for(name) != row or runs.issue_running(repo, ticket):
                     raise ValueError(f"{name} changed or is in use")
-                if fd is None or ws.is_symlink() or not ws.is_dir():
+                if ws.is_symlink() or not ws.is_dir():
                     raise ValueError(f"{name} or its snapshot is missing")
-                filename = f"{name}.json"
-                before = os.stat(filename, dir_fd=fd, follow_symlinks=False)
-                made = handoff.read_snapshot(folder, fd, filename, before)
-                owner = handoff.recorded_owner(folder / filename, ws, made.get("\0owner", {}))
                 run = runs.run_get(owner.run) if owner.run else None
                 if (not run or (owner.repo, owner.ticket) != (repo, ticket)
                         or (run["repo"], str(run["issue"])) != (owner.repo, owner.ticket)
@@ -341,12 +331,9 @@ def retry_quarantine(name: str, folder: Path) -> None:
                     raise ValueError(f"{name} snapshot owner does not match its workspace")
                 removed = conn.execute("SELECT * FROM workspaces WHERE name = ? AND state = 'removed' "
                                        "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
-                if removed and (before.st_mtime_ns // 1_000_000_000 < util.parse_iso(removed["removed_at"]).timestamp()
+                if removed and (modified // 1_000_000_000 < util.parse_iso(removed["removed_at"]).timestamp()
                                 or not handoff.newer_owner(removed, owner, run, lambda: nullcontext(conn))):
                     raise ValueError(f"{name} has a removed predecessor; preserve and retire it instead")
-                if handoff.signature(os.stat(filename, dir_fd=fd, follow_symlinks=False)) != handoff.signature(before):
-                    raise ValueError(f"{name} snapshot changed during retry")
-                fields = snapshot_fields(made)
                 fields.update(handoff.keep_fields())
                 fields.update(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run)
                 if not row["checkouts"]:
