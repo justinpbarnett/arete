@@ -1270,12 +1270,14 @@ assert workspace.head_recorded(workspace.made_before(ws), c) == head
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 import subprocess
 import sys
-from arete import control
+from arete import control, serve
 
 legacy.mkdir()
 with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
     beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
     util.write_json(beat, {"schema": db.LATEST, "pid": os.getpid(), "workspace_contract_children": [child.pid]})
+    assert serve.startup_beat() == {(child.pid, None)}
+    assert control.database_beat()["workspace_contract_child_identities"] == {}
     with db.reader() as conn:
         assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         with patch.dict(os.environ, {db.INHERITED_SERVE_CHILDREN: str(child.pid)}):
@@ -1305,6 +1307,103 @@ with child:
     finally:
         child.communicate(timeout=3)
 assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
+""")
+
+
+class WorkspaceProcessOwnershipTests(_WorkspaceChildCase):
+    def test_running_ticket_with_recycled_pid_requires_a_held_ticket_lock(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete.store import runs
+
+legacy.mkdir()
+lock = runs.run_lock("pipeline", "sample", "7")
+with workspaces.ticket_lock("sample", "7") as held:
+    assert held
+    rid = record.start("pipeline", repo="sample", issue="7", lock=lock, schema_version=24)
+    with db.reader() as conn:
+        assert rid in db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA)
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+
+assert runs.run_get(rid)["pid"] == os.getpid() and util.pid_alive(os.getpid())
+assert not util.lock_is_held(lock)
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+""")
+
+    def test_child_identity_survives_restart_but_does_not_protect_a_recycled_pid(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+import subprocess
+import sys
+from arete import control, serve
+
+legacy.mkdir()
+with (subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child,
+      util.hold_lock("serve") as held):
+    try:
+        identity = db.process_identity(child.pid)
+        assert identity is not None
+        expected = {(child.pid, identity)}
+        server = serve.Server()
+        server.lock = held
+        assert not serve.startup_beat()
+        handoff = {}
+
+        def capture_exec(*args):
+            handoff.update({name: os.environ[name] for name in
+                            (serve.RESTARTED_FOR_NEW_CODE, db.INHERITED_SERVE_IDENTITIES)})
+            raise OSError("exec boundary")
+
+        with patch.object(serve.os, "execv", side_effect=capture_exec), case.assertRaisesRegex(OSError, "exec boundary"):
+            server.restart_for_new_code()
+        assert handoff[serve.RESTARTED_FOR_NEW_CODE] == str(child.pid)
+        assert db.heartbeat_serve_children(control.database_beat()) == expected
+        with patch.dict(os.environ, handoff):
+            assert db.inherited_serve_children() == expected
+            assert serve.startup_beat() == expected
+            restarted = serve.Server()
+            assert restarted.reloaded and restarted.inherited == {child.pid}
+            assert restarted.workspace_contract_children == expected
+            restarted.beat()
+        assert db.heartbeat_serve_children(control.database_beat()) == expected
+        assert serve.startup_beat() == expected
+        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+
+        replacement = (identity[0], identity[1] + 1)
+        with patch.object(db, "process_identity", return_value=replacement):
+            assert util.pid_alive(child.pid)
+            assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+            assert not serve.startup_beat()
+            restarted.beat()
+            assert control.database_beat()["workspace_contract_children"] == []
+            with patch.dict(os.environ, handoff):
+                assert db.inherited_serve_children() == {(child.pid, None)}
+    finally:
+        child.communicate(timeout=3)
+""")
+
+    def test_stale_serve_heartbeat_does_not_override_a_free_lock(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import control
+
+legacy.mkdir()
+beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+pid = os.getpid()
+with util.hold_lock("serve"):
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    util.write_json(beat, {"schema": db.LATEST, "pid": pid})
+    os.utime(beat, (1, 1))
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid} has not reported its schema"]
+    util.write_json(beat, {"schema": db.LATEST, "pid": pid + 1})
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    util.write_json(beat, {"pid": pid})
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid} has not reported its schema"]
+    util.write_json(beat, {"schema": 27, "pid": pid})
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid}"]
+
+assert util.pid_alive(pid) and not util.lock_is_held("serve")
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
 """)
 
 

@@ -274,6 +274,20 @@ def child_pids() -> set[int]:
     return {int(p) for p in found.stdout.split()} if found.returncode == 0 else set()
 
 
+def restart_children() -> foundation.ServeChildren:
+    reap_children()
+    children = set()
+    for pid in child_pids():
+        identity = foundation.process_identity(pid)
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                confirmed = foundation.process_identity(pid)
+                children.add((pid, identity if identity == confirmed else None))
+        except ChildProcessError:
+            continue
+    return children
+
+
 def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     last = util.parse_iso(last_fire)
     if loop.trigger.every:
@@ -333,14 +347,16 @@ class Server:
         self.db_lock = threading.Lock()
         self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
                           "finished_at": None, "error": None}
-        restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
-        self.loaded = restarted_with is not None
-        self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.workspace_contract_children = set(self.inherited)
+        restarted = RESTARTED_FOR_NEW_CODE in os.environ
+        self.loaded = restarted
+        self.workspace_contract_children = foundation.live_serve_children(foundation.inherited_serve_children())
+        self.inherited = {pid for pid, _ in self.workspace_contract_children}
+        os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
+        os.environ.pop(foundation.INHERITED_SERVE_IDENTITIES, None)
         self.pruned = self.swept = self.workspaces_swept = self.rotated = 0.0
         self.checked_closed = 0.0
         self.ticks = 0
-        self.reloaded = restarted_with is not None
+        self.reloaded = restarted
         self.failing: dict[str, dict] = {}
         self.logged: dict[str, str] = {}
         self.every_loop: list[Loop] = []
@@ -1115,19 +1131,27 @@ class Server:
             if busy := self.busy_with():
                 self.note_once(f"new code waits to load: {busy}")
                 return
-            reap_children()
-            still_running = child_pids()
+            still_running = restart_children()
+            children = foundation.live_serve_children(self.workspace_contract_children | still_running)
+            self.workspace_contract_children = children
+            beat = util.read_json(control.BEAT_FILE, {})
+            if not isinstance(beat, dict):
+                beat = {}
+            util.write_json(control.BEAT_FILE, {**beat, **foundation.workspace_child_fields(children)})
             self.say(f"new code: serve {os.getpid()} restarts itself" + (
                 f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
-            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
+            fields = foundation.workspace_child_fields(still_running)
             fd = self.lock.fileno()
             os.set_inheritable(fd, True)
             os.environ[SERVE_LOCK_FD] = str(fd)
+            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, fields[foundation.WORKSPACE_CHILD_PIDS]))
+            os.environ[foundation.INHERITED_SERVE_IDENTITIES] = json.dumps(fields[foundation.WORKSPACE_CHILD_IDENTITIES])
             try:
                 os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
             except BaseException:
                 os.set_inheritable(fd, False)
-                os.environ.pop(SERVE_LOCK_FD, None)
+                for name in (SERVE_LOCK_FD, RESTARTED_FOR_NEW_CODE, foundation.INHERITED_SERVE_IDENTITIES):
+                    os.environ.pop(name, None)
                 raise
         finally:
             dashboard.POSTS_IN_FLIGHT.reopen()
@@ -1157,6 +1181,7 @@ class Server:
             tickets = len(slots.holding(rows, "pipeline"))
         except Exception:
             tickets = None
+        self.workspace_contract_children = foundation.live_serve_children(self.workspace_contract_children)
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1169,7 +1194,7 @@ class Server:
             "tick_ok": not failing and not self.contracts_waiting, "last_ok": self.last_ok,
             "failing": failing, "reloaded": self.reloaded,
             "workspace_contract_waiting": self.contracts_waiting,
-            "workspace_contract_children": sorted(pid for pid in self.workspace_contract_children if util.pid_alive(pid)),
+            **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
@@ -1200,22 +1225,29 @@ def cleanup_legacy() -> None:
             pass
 
 
+def startup_beat() -> foundation.ServeChildren:
+    beat = util.read_json(control.BEAT_FILE, {})
+    if not isinstance(beat, dict):
+        beat = {}
+    inherited = foundation.heartbeat_serve_children(beat) | foundation.inherited_serve_children()
+    children = foundation.live_serve_children(inherited)
+    if beat.get("pid") != os.getpid():
+        beat = {}
+    util.write_json(control.BEAT_FILE, {**beat, "pid": os.getpid(), "schema": foundation.LATEST,
+                                       **foundation.workspace_child_fields(children),
+                                       "db": beat.get("db") or {
+                                           **dbstats.empty_collection(), "status": "initial",
+                                           "requested_at": None, "finished_at": None, "error": None}})
+    return children
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     codebase.load()
     rotation_notes = install.rotate_own_log()
     with principals.acting("hand"):
         held = take_serve_lock()
         try:
-            beat = util.read_json(control.BEAT_FILE, {})
-            inherited = foundation.inherited_serve_children()
-            inherited |= set(beat.get("workspace_contract_children", []))
-            if beat.get("pid") != os.getpid():
-                beat = {}
-            util.write_json(control.BEAT_FILE, {**beat, "pid": os.getpid(), "schema": foundation.LATEST,
-                                              "workspace_contract_children": sorted(inherited),
-                                              "db": beat.get("db") or {
-                                                  **dbstats.empty_collection(), "status": "initial",
-                                                  "requested_at": None, "finished_at": None, "error": None}})
+            inherited = startup_beat()
             try:
                 with util.lock("migrate", wait=True):
                     backup.recover_restore()
