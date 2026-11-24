@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.request
@@ -10,7 +11,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import paths
+from . import config, paths, secretstore
+from .store import credentials, db, devices, principals
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 LOOKUP_TIMEOUT = 3
@@ -19,6 +21,7 @@ MAX_LOGIN_METADATA = 4 * 1024 * 1024
 CACHE_SECONDS = 300
 CACHE_SIZE = 128
 PI_SUBSCRIPTIONS = frozenset({"openai", "openai-codex", "github-copilot", "xai", "kimi-coding", "meta"})
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -191,3 +194,65 @@ def scope(auth: Auth, limit: str, unknown: str = "") -> str:
         return "credit-v1:" + fingerprint(auth.provider, auth.credential or unknown) if auth.credential or unknown else ""
     account = auth.identity or auth.credential or unknown
     return "subscription-v1:" + json.dumps([auth.family, account, limit], separators=(",", ":")) if account else ""
+
+
+def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False,
+           defer_unconfigured: bool = False) -> dict | None:
+    who = auth.identity or auth.credential
+    if not (auth.provider and auth.mode and who) or not paths.DB_FILE.exists():
+        return None
+    provider = re.sub(r"[^a-z0-9_-]+", "-", auth.provider.lower()).strip("-_") or "provider"
+    label = f"{provider[:48]}:{auth.mode}"
+    secretstore.validate_account_id(label)
+    if paths.DB_FILE.parent != paths.STATE_DIR or paths.FINGERPRINT_KEY_FILE.parent != paths.STATE_DIR:
+        raise secretstore.StoreError("account registry files must belong to the current state directory")
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
+    with db.tx() as c:
+        settings = config.secret_settings() if defer_unconfigured else None
+        if settings is not None and not settings.store and not secretstore.local_key_path().exists():
+            if db.metadata(c).keys().isdisjoint((secretstore.KEY_LOCAL, secretstore.KEY_REF)):
+                return None
+        holder = principals.ensure_local_owner(c)
+        if holder is None:
+            return None
+        key = secretstore.fingerprint_key(settings)
+        digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
+        if not auth.identity and secret_id is None and auth.mode == "subscription":
+            login = scope(auth, "")
+            refreshes = devices.refresh_links(c)
+            aliases = devices.linked_scopes(login, refreshes)
+            identities = {s: secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, s)
+                          for s in aliases}
+            existing = credentials.reconcile_logins(c, auth.provider, auth.mode, identities.values(), holder)
+            if refresh_only and existing is None:
+                return None
+            identity = existing["identity"] if existing else identities[login]
+            if existing and any(before == auth.generation and after != before for before, after, _, _ in refreshes):
+                digest = existing["fingerprint"]
+        else:
+            identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
+                                          auth.identity or (secret_id if secret_id is not None else who))
+        return credentials.save_account(c, label, auth.provider, auth.mode, holder, "personal", identity, digest,
+                                        secret_id)
+
+
+def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigured: bool = False,
+                    wait_for_activation: bool = False) -> bool:
+    """Return true when the provider attempt should retry enrollment after its child exits."""
+    try:
+        while True:
+            try:
+                row = record(auth, refresh_only=refresh_only, defer_unconfigured=defer_unconfigured)
+                return defer_unconfigured and row is None
+            except secretstore.CredentialActivationBusy:
+                if not wait_for_activation:
+                    return True
+                if db.in_write():
+                    raise
+                with secretstore.credential_activation(publishing=True, wait=True):
+                    pass
+    except (OSError, secretstore.StoreMissing) as error:
+        if wait_for_activation:
+            raise
+        LOG.warning("Could not record a resolved account (%s)", type(error).__name__)
+        return False
