@@ -528,6 +528,7 @@ class Run(AgentRun):
     environment_release: str = ""
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
+    code_review: bool = False
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -3100,6 +3101,9 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         check_files = catch_up_paths(c.wt)
+        if getattr(run, "code_review", False) is True:
+            raise CatchUpGateHold("review", "the base changed; run the configured checks and review this candidate",
+                                  head, "")
         if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
@@ -3200,13 +3204,17 @@ def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verifi
 
 def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Verified,
                            review: Review, head: str) -> tuple[str, str] | None:
-    if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
+    from . import code_review
+
+    review_only = (getattr(b.run, "code_review", False) is True and code_review.completed(review)
+                   and not code_review.requires_behavior(b) and verified == code_review.unverified())
+    if not review_only and (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks):
         return "verify", "native behavioral verification did not pass"
     if not head:
         return "verify", "this run has no published head to verify"
     tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
     trees = {c.prefix: tree}
-    if not tree or verified.native_trees != trees:
+    if not tree or (not review_only and verified.native_trees != trees):
         return "verify", "there is no native behavioral pass for the published tree"
     if not review.approved() or review.trees != trees:
         return "review", "the published tree lacks a current approving review"
@@ -4448,7 +4456,13 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
-            reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
+            reply: str = "", *, catch_up: workspace.Checkout | None = None,
+            skill: bool = False, spec: str = "") -> Review:
+    if skill:
+        from . import code_review
+
+        return code_review.run_axes(b, util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+                                    index_trees(b.checkouts), spec)
     before = before or Review.stored({})
     if catch_up is None:
         earlier = before.blocking()
