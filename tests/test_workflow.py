@@ -8344,7 +8344,9 @@ class SelfDeployRollbackTests(unittest.TestCase):
                                              RUNS_DIR=self.state / "runs", LOG_DIR=root / "logs",
                                              WORKTREES_DIR=root / "worktrees", SERVER_FILE=self.state / "server.json",
                                              ISOLATED=False))
+        self.enterContext(mock.patch.object(serve.control, "BEAT_FILE", self.state / paths.SERVE_BEAT_FILE.name))
         self.server = object.__new__(serve.Server)
+        self.server.workspace_contract_children = set()
         self.server.deploy_refusals = set()
         self.server.say = mock.Mock()
         self.server.workspace_sweep = None
