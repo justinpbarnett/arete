@@ -438,12 +438,14 @@ def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -
                                            "AND started >= ? ORDER BY started", (repo, issue, since))]
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False) -> dict | None:
+def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False,
+              candidate: str = "") -> dict | None:
     with connect() as c:
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
                       + (f"AND {LIVE_RUN} " if live else "")
+                      + ("AND id = ? " if candidate else "")
                       + "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
-                      (repo, issue, run_id)).fetchone()
+                      (repo, issue, *([candidate] if candidate else []), run_id)).fetchone()
         return dict(r) if r else None
 
 

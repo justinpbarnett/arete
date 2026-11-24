@@ -115,7 +115,9 @@ TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
+WORKSPACE_SNAPSHOT_SCHEMA = 25
+# Workspace operations migrate before accessing the snapshot columns.
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n != WORKSPACE_SNAPSHOT_SCHEMA)
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -233,15 +235,21 @@ def migrate(contracts=True):
                 conn.close()
 
 
-def checked_connection(*, timeout: float | None = None):
+def _schema_key(identity, needed):
+    return (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
+            getattr(identity, "st_birthtime", None), LATEST, needed)
+
+
+def checked_connection(*, timeout: float | None = None, on_demand: bool = False, needed: int | None = None):
     from .. import backup
 
+    needed = NEEDED if needed is None else needed
     if backup.pending_restore():
         raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
-        if not paths.ISOLATED or timeout is not None:
+        if not on_demand and (not paths.ISOLATED or timeout is not None):
             raise missing_database() from None
         migrate()
         identity = paths.DB_FILE.stat()
@@ -254,20 +262,23 @@ def checked_connection(*, timeout: float | None = None):
             raise missing_database() from None
         raise
     try:
-        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
-               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
+        key = _schema_key(identity, needed)
         if key not in _CHECKED:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if on_demand and version < needed:
+                conn.close()
+                migrate()
+                return checked_connection(timeout=timeout, needed=needed)
             if paths.ISOLATED and version == 0 and timeout is None:
                 conn.close()
                 migrate()
-                return checked_connection()
+                return checked_connection(needed=needed)
             deadline = time.monotonic() + (MIGRATE_WAIT_SECONDS if timeout is None else 0)
-            if version < NEEDED:
-                print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
-            while version < NEEDED:
+            if version < needed:
+                print(f"schema {version} waits for schema {needed}; run arete serve or arete migrate", flush=True)
+            while version < needed:
                 if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
+                    raise IncompatibleSchema(f"schema {version} needs {needed}; run arete serve or arete migrate")
                 time.sleep(0.5)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
             oldest = conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0]
@@ -441,6 +452,19 @@ def in_write():
 def ensure_schema() -> None:
     with db():
         pass
+
+
+def migrate_on_demand() -> None:
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        return
+    needed = max(NEEDED, WORKSPACE_SNAPSHOT_SCHEMA)
+    try:
+        if _schema_key(paths.DB_FILE.stat(), needed) in _CHECKED:
+            return
+    except FileNotFoundError:
+        pass
+    checked_connection(on_demand=True, needed=needed).close()
 
 
 def quoted(name: str) -> str:
