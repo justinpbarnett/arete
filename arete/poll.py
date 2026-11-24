@@ -21,6 +21,7 @@ from . import (
     paths,
     pilot,
     pipeline,
+    pr_recovery,
     queueing,
     requeue,
     routing,
@@ -47,6 +48,7 @@ from .slots import slots_free_to_start
 from .store import asks as ask_store
 from .store import db
 from .store import insights as insights_store
+from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 
@@ -355,6 +357,12 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     with tasks.PENDING_LOCK, (nullcontext() if dry_run else util.lock(tasks.START_LOCK, wait=True)):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
             return "skipped"
+    newest = run_store.newest_live_whole_run(repo.name, str(tid)) or {}
+    held = pr_recovery.blocked(newest)
+    if held and (not pick.from_feedback or repo.name in cfg.unblock_repos or newest.get("stop_asked")
+                 or orchestration_store.publication_pending(newest["id"])
+                 or not pr_recovery.fresh_feedback_after_hold(newest, held, pending_feedback(repo.name, str(tid)))):
+        return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
@@ -368,6 +376,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
+    if held and not ticket.open:
+        return "skipped"
     fresh_feedback = False
     if pick.from_feedback and not dry_run and insights_store.has_fresh_feedback(pending_feedback(repo.name, tid)):
         mode = pipeline.recorded_path(answered["id"]) if answered else pipeline.dispatch_path(repo, str(tid))

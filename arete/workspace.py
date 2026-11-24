@@ -42,6 +42,8 @@ class Checkout:
     onto: str = ""
     kept: str = ""
     pushed_head: str = ""
+    recovery_head: str = ""
+    recovery_base: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> Checkout:
@@ -92,12 +94,12 @@ class Checkout:
 
     @property
     def diff_from_base(self) -> str:
-        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.origin_base}...HEAD"
+        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.recovery_base or self.origin_base}...HEAD"
 
     @property
     def diff_from_fork(self) -> str:
         try:
-            fork = git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
+            fork = self.recovery_base or git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
         except (RuntimeError, OSError):
             fork = ""
         return f"git {f'-C {self.dir} ' if self.dir else ''}diff {fork or self.origin_base}"

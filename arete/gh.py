@@ -591,8 +591,10 @@ class BaseTipChanged(str):
 
 
 def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True,
-                     watch_checks: bool = False) -> dict:
+                     watch_checks: bool = False, identity: bool = False) -> dict:
     fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title,reviewDecision"
+    if identity:
+        fields += ",url,headRefName,isCrossRepository"
     if watch_checks:
         fields += ",statusCheckRollup"
     args = ["pr", "view", pr, "--json", fields]

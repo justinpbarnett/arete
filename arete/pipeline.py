@@ -46,6 +46,7 @@ from . import (
     outbound,
     owner_asks,
     paths,
+    pr_recovery,
     principals,
     prompt_loader,
     record,
@@ -804,7 +805,7 @@ def restore_paths(wt: Path, source: str, paths: list[str]) -> None:
         wt, env={"GIT_LITERAL_PATHSPECS": "1"})
 
 
-def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> None:
+def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> tuple[str, str] | None:
     head = git(["rev-parse", "HEAD"], c.wt).strip()
     workspace.drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
@@ -822,22 +823,27 @@ def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | No
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
         util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         c.onto = c.onto or head
+        return head, git(["rev-parse", "HEAD"], c.wt).strip()
+    return None
 
 
-def keep_edits(run: Run) -> None:
+def keep_edits(run: Run) -> dict[str, tuple[str, str]]:
+    kept = {}
     if run.dry_run or not run.workspace:
-        return
+        return kept
     for c in run.workspace[1]:
         if not (c.wt / ".git").exists():
             continue
         try:
-            commit_kept(run.id, c, run.layer)
+            if heads := commit_kept(run.id, c, run.layer):
+                kept[c.github] = heads
         except (RuntimeError, OSError) as e:
             run.log(f"could not commit the edits in {c.github}, so they stay uncommitted in {c.wt}: {e}")
             try:
                 c.onto = c.onto or git(["rev-parse", "HEAD"], c.wt).strip()
             except (RuntimeError, OSError):
                 pass
+    return kept
 
 
 def kept_heads(run: Run) -> dict:
@@ -894,7 +900,7 @@ class Staged(diffguard.Diff):
 
 
 def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = True) -> str:
-    return git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
+    return c.recovery_base or git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
 
 
 def has_unpublished_base(c: workspace.Checkout) -> bool:
@@ -1431,10 +1437,10 @@ class Build(TicketWork):
                             f"### Lines changed by file\n\n{lines_by_file(counts)}{pushed}")
 
     def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None,
-             check_targets: Callable[[], None] | None = None) -> None:
+             check_targets: Callable[[], None] | None = None, recovery: pr_recovery.Publication | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
         commit_and_push(self.checkouts, self.staged.changed, branch, message, before_push=before_push,
-                        check_targets=check_targets)
+                        check_targets=check_targets, recovery=recovery)
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None, *,
@@ -1743,7 +1749,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         if (status == "noop" and run.closed_feedback_prs) or (
                 status == "failed" and failure.get("reason") == "policy-changed"):
             insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
-        elif run.step_started or (flow and flow.work_started):
+        elif failure.get("reason") == pr_recovery.REASON or run.step_started or (flow and flow.work_started):
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         else:
             insights_store.release_feedback(run.id)
@@ -2120,6 +2126,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 raise
             return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
         status, pr_url, passed, drive_entered, retaining_catch_up = "failed", "", None, False, False
+        open_pr_hold, kept = None, {}
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -2275,6 +2282,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if status == "interrupted":
                 summary += " The next poll can reconcile the recorded push."
             run.log(summary)
+        except pr_recovery.Hold as error:
+            if _termination is not None:
+                raise
+            open_pr_hold = error
+            status, summary = "failed", error.why
         except workspace.RunFailed as e:
             if _termination is not None:
                 raise
@@ -2326,7 +2338,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             try:
                 if run.workspace and not zte_grant:
                     if not keep_edits_blocker():
-                        keep_edits(run)
+                        kept = keep_edits(run)
                     workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
                                         preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
                     workspaces.keep(run.workspace[0], status)
@@ -2342,6 +2354,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"could not record retained heads for the catch-up park: {e}")
         try:
             with handoff_io():
+                if open_pr_hold:
+                    status, summary, pr_url = hold_open_pr(run, open_pr_hold, kept)
                 settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
             if not zte_grant:
@@ -2361,6 +2375,30 @@ def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str
     run.log(f"verification retry held: {why}")
     run.enter("pr")
     return "pr", why, pr_url
+
+
+def hold_open_pr(run: Run, error: pr_recovery.Hold, kept: dict[str, tuple[str, str]]) -> tuple[str, str, str]:
+    failure = dict(error.recovery)
+    why = error.why
+    before, after = kept.get(failure["github"], ("", ""))
+    if before == failure["local"] and after:
+        failure["local"] = after
+        why += f" Arete kept the remaining edits at {after}."
+    failure["held_at"] = util.iso()
+    try:
+        replies = pr_recovery.pr_replies(failure["pr"], run.repo.name, str(run.tid))
+        decision = pr_recovery.decision_for(run.id, run.tracker, str(run.tid), failure["pr"], replies=replies)
+        failure["seen_replies"] = pr_recovery.reply_keys_since(replies, failure["held_at"])
+    except (*tracker.ERRORS, OSError, ValueError) as read_error:
+        prior = run.recovery.get("binding", {}).get("pr_recovery", {})
+        decision = prior.get("decision", "") if prior.get("refs", {}).get("url") == failure["pr"] else ""
+        run.log(f"could not record the current owner discussion: {util.first_line(vault.hidden(str(read_error)), 300)}")
+    run.failure = {"class": "environment", **failure, "decision": decision}
+    run.log(f"held: {why}")
+    run.enter(run.failed_state)
+    if not run.dry_run and pr_recovery.notice(run.repo.name, str(run.tid), run.failure):
+        run.say(why, on_ticket=True)
+    return "failed", why, ""
 
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
@@ -3404,7 +3442,10 @@ def note_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> None:
 
 def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str,
                     *, before_push: Callable[[workspace.Checkout], str] | None = None,
-                    check_targets: Callable[[], None] | None = None) -> None:
+                    check_targets: Callable[[], None] | None = None,
+                    recovery: pr_recovery.Publication | None = None) -> None:
+    if not recovery and any(c.recovery_head for c in changed):
+        raise workspace.RunFailed("a reconciled PR requires fresh controller gates and an exact-head publication lease")
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
@@ -3412,8 +3453,17 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
         try:
             util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
+            if recovery:
+                raise recovery.failure(f"the commit in {c.github} failed", vault.hidden(str(e))) from e
             raise workspace.RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
         c.onto = c.onto or before
+    if recovery:
+        recovery.recheck(during="before pushing the candidate")
+        for c in changed:
+            if check_targets:
+                check_targets()
+            recovery.push(c)
+        return
     moved = [c.github for c in checkouts if workspace.remote_head(c.src, branch) != c.lease]
     if moved:
         raise workspace.RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",

@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from . import (alerts, config, delegation, environment, factory, flows, gh, launch_lease, outbound,
-               owner_asks, paths, pilot, pipeline, principals, prompt_loader, queueing, record, run_lines, runlimits,
-               steps, tracker, util, vault, webpush, zte)
+               owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, queueing, record, run_lines,
+               runlimits, steps, tracker, util, vault, webpush, workspace, zte)
 from .agent import json_from_text
 from .store import asks as asks_store
 from .store import db
@@ -138,18 +138,38 @@ def policy(cfg, repo) -> str:
     return merge_review.policy(cfg, config.load_layer(repo.layer_dir))
 
 
-def snapshot(cfg, repo, source, t, row, *, prs=None) -> dict:
+def pr_recovery_observation(repo, t, row, held: dict) -> dict:
+    prepared = flows.prepared_data(row["id"])
+    published = flows.publication(row["id"]).get("prs", {})
+    listed = next((c for c in prepared.get("checkouts", ()) if c["github"] == held["github"]
+                   and (c.get("pr") or published.get(c["github"])) == held["pr"]), None)
+    if not listed or prepared.get("branch") != held["branch"]:
+        raise ValueError("the held PR does not match the saved continuation")
+    c = workspace.Checkout.from_row({**listed, "pr": held["pr"]})
+    if (not any((c.dir, c.github, c.src) == (p.dir, p.github, repo.path / p.dir) for p in repo.parts)
+            or not c.wt.resolve().is_relative_to(paths.WORKTREES_DIR.resolve())):
+        raise ValueError("the held PR does not match a configured checkout")
+    refs = pr_recovery.observe(c, held["branch"])
+    return {"refs": asdict(refs), "target": refs.target_matches(c, held["branch"]),
+            "local": pr_recovery.current_head(c) if (c.wt / ".git").exists() else "missing",
+            "decision": pr_recovery.decision(row["id"], t.comments)}
+
+
+def snapshot(cfg, repo, source, t, row, *, prs=None, recovery=None) -> dict:
     approved, version = approval(source, t)
     if not approved:
         raise ValueError("the ticket is no longer approved")
     branch = row.get("branch") or ""
     if not branch and row:
         branch = flows.prepared_data(row["id"]).get("branch", "")
-    return {"run": row.get("id", ""), "version": row.get("version", 0), "status": row.get("status", ""),
-            "spec": runlimits.specification(t), "comments": digest(t.comments), "task_version": version,
-            "policy": policy(cfg, repo),
-            "branch": branch, "heads": runlimits.heads(repo, branch), "trees": worktree_of(row),
-            "prs": prs_of(row) if prs is None else prs, "asks": ask_binding(asks_of(row))}
+    binding = {"run": row.get("id", ""), "version": row.get("version", 0), "status": row.get("status", ""),
+               "spec": runlimits.specification(t), "comments": digest(t.comments), "task_version": version,
+               "policy": policy(cfg, repo),
+               "branch": branch, "heads": runlimits.heads(repo, branch), "trees": worktree_of(row),
+               "prs": prs_of(row) if prs is None else prs, "asks": ask_binding(asks_of(row))}
+    if held := pr_recovery.blocked(row):
+        binding["pr_recovery"] = recovery if recovery is not None else pr_recovery_observation(repo, t, row, held)
+    return binding
 
 
 def evidence_for(t, row, saved, asks, prs, cycle) -> dict:

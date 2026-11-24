@@ -5,9 +5,10 @@ import re
 import time
 
 from . import config, gh, issue_goal, merge_review, owner_asks, pilot, pipeline, principals, repairs, runlimits, slots
-from . import tasks, tracker, unblock, util
+from . import pr_recovery, tasks, tracker, unblock, util
 from .store import asks as asks_store
 from .store import db
+from .store import orchestration
 from .store import runs as runs_store
 from .store import tasks as tasks_store
 from .store import unblock as ledger
@@ -199,6 +200,44 @@ def land(repo, tid, case, attempt, candidate):
             ledger.mark(case, "resolved", "The issue orchestrator merged the verified PR")
 
 
+def inspect_pr_recovery(cfg, repo, source, t, row, held, existing) -> None:
+    if orchestration.publication_pending(row["id"]) or t.blocker or row.get("stop_asked"):
+        return
+    observed = unblock.pr_recovery_observation(repo, t, row, held)
+    cause = pr_recovery.REASON
+    key = unblock.digest(observed)
+    baseline = held.get("decision") or ""
+    if not baseline.startswith(pr_recovery.DECISION_VERSION):
+        saved = json.loads(existing.get("snapshot") or "{}")
+        since = held.get("held_at") or row.get("finished")
+        if saved.get("run") == row["id"] and "held_decision" in saved:
+            baseline = saved["held_decision"]
+        elif not (since and pr_recovery.new_owner_input(row["id"], source, t.id, held["pr"], since)):
+            baseline = observed["decision"]
+    same_heads = all(observed[k] == held[k] for k in ("refs", "local"))
+    if (same_heads and observed["decision"] == baseline) or not observed["target"] or observed["local"] == "missing":
+        case = ledger.observe(repo.name, t.id, cause, key,
+                              {"run": row["id"], "pr_recovery": observed, "held_decision": baseline})
+        detail = row.get("summary") or "The PR and retained work need reconciliation."
+        ledger.mark(case, "needs_owner", detail, unblock.RECHECK)
+        return
+    binding = unblock.snapshot(cfg, repo, source, t, row, recovery=observed)
+    case = ledger.observe(repo.name, t.id, cause, key, {**binding, "held_decision": baseline})
+    if time.time() < case["due"]:
+        return
+    attempt = ledger.latest_attempt(case)
+    if not attempt:
+        attempt_id = ledger.begin(case)
+        ledger.decide(case, attempt_id, {"action": "retry", "reason": "The held PR, retained head or owner answer changed"},
+                      {"binding": binding})
+        attempt = ledger.latest_attempt(case)
+    if attempt.get("child") or attempt.get("grant", {}).get("binding") != binding:
+        return
+    result = tasks.launch_recovery(cfg, repo, row, attempt)
+    if result.get("state") in ("queued", "refused"):
+        ledger.mark(case, "queued", result["why"], unblock.RECHECK)
+
+
 def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if not unblock.active(cfg, repo.name, tid) or unblock.exclude(repo.name, tid):
         if existing:
@@ -221,6 +260,9 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
         if existing:
             issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "The ticket is no longer approved")
+        return
+    if held := pr_recovery.blocked(row):
+        inspect_pr_recovery(cfg, repo, source, t, row, held, existing or ledger.get(repo.name, tid))
         return
     prior = existing or ledger.get(repo.name, tid)
     prs = unblock.prs_of(row)
