@@ -787,8 +787,9 @@ def validate_store_location(directory: Path, folder: Path, repo_paths=()) -> Non
         try:
             (parent / ".git").lstat()
         except (FileNotFoundError, NotADirectoryError):
-            continue
-        raise ValueError("[secrets] store_dir must be outside git work trees")
+            if not ((parent / "HEAD").is_file() and (parent / "objects").is_dir() and (parent / "refs").is_dir()):
+                continue
+        raise ValueError("[secrets] store_dir must be outside git repositories and work trees")
 
 
 def keychain_program() -> str | None:
@@ -802,6 +803,8 @@ def keychain_program() -> str | None:
         if paths.HOME.resolve() != home or sandbox.sandboxed():
             return None
         if (config_dir, state_dir) != (home / ".config/arete", home / ".local/share/arete"):
+            return None
+        if paths.CONFIG_FILE.is_symlink() or paths.CONFIG_FILE.resolve() != config_dir / "config.toml":
             return None
     except (AttributeError, KeyError, OSError, RuntimeError):
         return None

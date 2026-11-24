@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 import stat
 import subprocess
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,17 +138,27 @@ def registry(*, write=False):
     return writes.atomic() if write else db.reader()
 
 
+def require_private_directory(fd: int) -> None:
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise StoreError("secret store directory must have mode 0700 and belong to this user")
+
+
 @contextmanager
 def file_parent(path: Path, root: Path, *, create=False, private=False):
     if paths.ISOLATED and (paths.confined(root) is None or
                            paths.scratch_root(root) != paths.scratch_root(paths.STATE_DIR)):
         raise StoreError("secret item must stay inside the instance's scratch folder")
-    with paths.directory_fd(root, create=create) as fd:
-        info = os.fstat(fd)
-        if private and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
-            raise StoreError("secret store directory must have mode 0700 and belong to this user")
-        with paths.directory_fd(path.parent.relative_to(root), fd, create=create) as parent:
-            yield parent
+    with paths.directory_fd(root, create=create) as fd, ExitStack() as stack:
+        parent = path.parent.relative_to(root)
+        if private:
+            require_private_directory(fd)
+            for part in parent.parts:
+                fd = stack.enter_context(paths.directory_fd(Path(part), fd, create=create))
+                require_private_directory(fd)
+        else:
+            fd = stack.enter_context(paths.directory_fd(parent, fd, create=create))
+        yield fd
 
 
 def private_file(info: os.stat_result) -> bool:
