@@ -1005,16 +1005,18 @@ def sweep():
 
 def check_failures(error):
     summary = dashboard.get_health(None, [], {})["workspaces"]["rows"]
-    assert summary["blocked"] == len(rows), summary
+    assert summary["blocked"] == 0, summary
     entries = {entry["name"]: entry for entry in summary["rows"]}
     for ws, wid, state in rows:
         row = workspaces.get(wid)
         assert row["state"] == state and row["sweep_attempts"] == 1 and row["last_sweep_at"], row
-        entry = entries[ws.name]
-        assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        if state == "kept":
+            entry = entries[ws.name]
+            assert not entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        else:
+            assert ws.name not in entries
         assert ws.is_dir() and registered(ws)
-    check = heartbeat.check_workspaces()[0]
-    assert not check.ok and f"{len(rows)} blocked" in check.detail and error in check.detail, check
+    assert heartbeat.check_workspaces()[0].ok
 
 def check_retry():
     sweep()
@@ -1169,7 +1171,7 @@ workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "released" and row["sweep_attempts"] == 1
 assert "locked" in row["last_sweep_error"] and registered(ws), row
-assert not heartbeat.check_workspaces()[0].ok
+assert heartbeat.check_workspaces()[0].detail == "none held"
 
 util.git(["worktree", "unlock", str(ws)], src)
 workspaces.sweep(cfg)
