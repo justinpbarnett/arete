@@ -1010,6 +1010,38 @@ with db.one_read() as reader:
     assert secretstore.read('global', 'OWNED') == value.encode()
 """)
 
+    def test_committed_binding_serves_a_pinned_reader_when_cleanup_is_deferred(self):
+        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+file, value, row = seed_owner_file('hand')
+paths.CONFIG_FILE.write_text(configured)
+with mock.patch.object(secretstore, 'retire_local_key'):
+    secretstore.fingerprint_key()
+assert paths.FINGERPRINT_KEY_FILE.exists()
+with db.one_read() as reader, mock.patch.object(secretstore, 'pending_journals') as journals:
+    assert db.metadata(reader)[secretstore.KEY_REF]
+    assert secretstore.fingerprint(value) == row['fingerprint']
+    assert secretstore.read('global', 'OWNED') == value.encode()
+    journals.assert_not_called()
+assert secretstore.fingerprint(value) == row['fingerprint'] and not paths.FINGERPRINT_KEY_FILE.exists()
+""")
+
+    def test_concurrently_retired_file_descriptor_counts_as_a_missing_name(self):
+        self.run_secret_child(r"""
+marker = Path.cwd() / 'ordinary-marker'
+marker.write_bytes(b'read fixture')
+marker.chmod(0o600)
+validate = secretstore.require_private_file
+
+def retire_after_open(fd):
+    marker.unlink()
+    validate(fd)
+
+with mock.patch.object(secretstore, 'require_private_file', side_effect=retire_after_open):
+    assert secretstore.read_file(marker, marker.parent) is None
+""")
+
 
 class RegistryKeyContinuityTests(_SecretChildCase):
     def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
