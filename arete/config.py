@@ -80,6 +80,12 @@ class Orchestration:
     max_actions: int = 128
     max_workers: int = 3
     progress_seconds: int = 30
+    max_builders: int | None = None
+    private_worker_model: str = ""
+
+    @property
+    def builder_limit(self) -> int:
+        return min(self.max_builders or 1, self.max_workers)
 
 
 def orchestration_table(data) -> Orchestration:
@@ -89,9 +95,14 @@ def orchestration_table(data) -> Orchestration:
         raise ValueError(message)
     only(data, layer_schema("orchestration"), "[orchestration]", message=message)
     values = {name: data.get(name, getattr(defaults, name)) for name in defaults.__dataclass_fields__}
-    if any(type(value) is not int or not 0 < value <= 10000 for value in values.values()):
+    model = values.pop("private_worker_model")
+    if "private_worker_model" in data and (not isinstance(model, str) or len(model) > 200
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9][A-Za-z0-9._:/-]*", model)):
+        raise ValueError("[orchestration] private_worker_model requires a provider/model name")
+    if any(type(value) is not int or not 0 < value <= 10000 for name, value in values.items()
+           if name != "max_builders" or name in data):
         raise ValueError("[orchestration] limits must be integers between 1 and 10000")
-    return Orchestration(**values)
+    return Orchestration(**values, private_worker_model=model)
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 
 
@@ -365,6 +376,8 @@ class Config:
     document: dict = field(default_factory=dict)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     oncall: OncallConfig = field(default_factory=OncallConfig)
+    unblock_repos: tuple[str, ...] = ()
+    unblock_step: dict = field(default_factory=dict)
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
@@ -410,6 +423,10 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
+    if "orchestration" in data and data["orchestration"].get("max_builders") is None:
+        data["orchestration"].pop("max_builders", None)
+    if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
+        data["orchestration"].pop("private_worker_model", None)
     routing = data.pop("routing", {})
     if sparse and isinstance(value, Config):
         if value.routing.payment_modes == PAYMENT_MODES:
@@ -1222,6 +1239,18 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.jobs = [job_table(job) for job in data.get("job", [])]
     cfg.probes = [probe_table(probe) for probe in data.get("probe", [])]
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
+    unblock = only(table_of(data.get("unblock", {}), "unblock"), root_schema("unblock"), "[unblock]")
+    enabled = flag(unblock, "enabled", False, "[unblock]")
+    repos = unblock.get("repos", [])
+    if not isinstance(repos, list) or any(not isinstance(r, str) for r in repos):
+        raise TypeError("[unblock] repos must be a list of repo names")
+    if set(repos) - {repo.name for repo in cfg.repos if repo.pipeline}:
+        raise ValueError("[unblock] repos must name configured pipeline repositories")
+    cfg.unblock_step = step_table(unblock.get("step", {}), "[unblock.step]")
+    if enabled:
+        cfg.unblock_repos = tuple(dict.fromkeys(repos))
+        if not cfg.unblock_repos:
+            raise ValueError("[unblock] needs an explicit repo allowlist")
     cfg.replay = replay_table(data.get("replay") or {}, ignored)
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research = research_table(data.get("research") or {}, ignored)

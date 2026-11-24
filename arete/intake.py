@@ -24,7 +24,7 @@ ACTIONABLE = ("Does this ticket request concrete work in a software repository t
               "Size and unfinished dependencies do not make repository work a human-only task.")
 LABEL_STYLES = {
     tracker.LABEL: tracker.APPROVAL_LABEL_STYLE,
-    AUTO_LABEL: ("c5def5", "Approved by automatic triage; a person merges the PR"),
+    AUTO_LABEL: ("c5def5", "Approved by automatic triage"),
     FIX: ("d73a4a", "Repair existing behavior; eligible for Arete's guarded patch flow"),
     FEATURE: ("a2eeef", "New or changed capability; use Arete's full feature flow"),
 }

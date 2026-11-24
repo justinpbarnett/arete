@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Collection
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -575,11 +576,12 @@ def root_names(view: View | None = None) -> set[str] | None:
         return None
 
 
-def admitted(fd: int, key: bytes, name: str, now: float) -> bool:
+def admitted(fd: int, key: bytes, name: str, now: float, pending_refresh: Collection[str]) -> bool:
     if now - os.stat(name, dir_fd=fd, follow_symlinks=False).st_mtime <= SETTLE_AFTER_SECONDS:
         return False
     data = load(fd, key, name[:-5])
-    return data["state"] == "done" and not os.path.lexists(data["attempt"]["root"])
+    root = data["attempt"]["root"]
+    return data["state"] == "done" and root not in pending_refresh and not os.path.lexists(root)
 
 
 def move_settled(fd: int, name: str) -> None:
@@ -587,18 +589,18 @@ def move_settled(fd: int, name: str) -> None:
         os.rename(name, name, src_dir_fd=fd, dst_dir_fd=settled)
 
 
-def settle_hot(fd: int, key: bytes, failures: list[str]) -> None:
+def settle_hot(fd: int, key: bytes, failures: list[str], pending_refresh: Collection[str]) -> None:
     now = time.time()
     for name in sorted(n for n in os.listdir(fd) if n.endswith(".json")):
         try:
-            if not admitted(fd, key, name, now):
+            if not admitted(fd, key, name, now, pending_refresh):
                 continue
             lease = os.open(name[:-5] + ".lease", os.O_RDWR | os.O_NOFOLLOW, dir_fd=fd)
         except (OSError, ValueError, KeyError, TypeError):
             continue
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if admitted(fd, key, name, now):
+            if admitted(fd, key, name, now, pending_refresh):
                 move_settled(fd, name)
         except BlockingIOError:
             pass
@@ -674,11 +676,11 @@ def prune_old(fd: int, key: bytes, days: float, failures: list[str]) -> None:
         pass
 
 
-def settle(days: float) -> list[str]:
+def settle(days: float, *, pending_refresh: Collection[str] = ()) -> list[str]:
     failures: list[str] = []
     with registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
-        settle_hot(fd, key, failures)
+        settle_hot(fd, key, failures, pending_refresh)
         if NEXT_SECRET not in os.listdir(fd):
             prune_old(fd, key, days, failures)
     return failures

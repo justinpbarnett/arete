@@ -1,10 +1,22 @@
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 from arete import config, dbstats, paths, sandbox
 from arete.store import db as foundation
+
+
+@contextmanager
+def workspace_state(root):
+    state = root / "state"
+    config = root / "config"
+    with mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
+                             CONFIG_DIR=config, CONFIG_FILE=config / "config.toml",
+                             LOCKS_DIR=state / "locks", RUNS_DIR=state / "runs", LOG_DIR=root / "logs",
+                             WORKTREES_DIR=root / "fixtures", SERVER_FILE=state / "server.json"):
+        yield
 
 
 def isolate_live_state():

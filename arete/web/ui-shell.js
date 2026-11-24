@@ -98,8 +98,8 @@ function panels({ route, snapshot, resources, now, retry, runs }) {
     case "outbox": return [html`<${InboxQueue} snapshot=${snapshot} route=${route} retry=${retry} />`,
       html`<${InboxFocus} snapshot=${snapshot} route=${route} retry=${retry} />`];
     case "task":
-    case "board": return [html`<${TaskQueue} resource=${resources.tasks} route=${route} retry=${retry} />`,
-      html`<${TaskFocus} resource=${resources.task} route=${route} retry=${retry} />`];
+    case "board": return [html`<${TaskQueue} resource=${resources.tasks} route=${route} retry=${retry} recovering=${snapshot.live?.recovering_tasks} />`,
+      html`<${TaskFocus} resource=${resources.task} route=${route} retry=${retry} recovering=${snapshot.live?.recovering_tasks} />`];
     case "run": return [runQueueBody({ view: runs, route, retry }), html`
       ${runs.detail?.run?.status === "needs-info" ? html`<${RunQuestions} resource=${snapshot.questions} run=${runs.id} retry=${retry} />` : null}
       <${RunFocus} key=${runs.id} view=${runs} now=${now} retry=${retry} />`];

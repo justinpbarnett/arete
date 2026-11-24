@@ -356,6 +356,17 @@ def answers_for(ask: dict, body) -> list[dict]:
     return found
 
 
+def unstaged(ask: dict) -> dict:
+    staged = ask.get("staged_answers", {})
+    return {**ask, "questions": [q for i, q in enumerate(ask["questions"]) if str(i) not in staged]}
+
+
+def combine_staged(ask: dict, answers: list[dict]) -> list[dict]:
+    staged = ask.get("staged_answers", {})
+    supplied = iter(answers)
+    return [staged[str(i)] if str(i) in staged else next(supplied) for i in range(len(ask["questions"]))]
+
+
 def secret_values(ask: dict, body: dict) -> dict[str, str]:
     given = body.get("answers")
     if not isinstance(given, list):
@@ -383,18 +394,27 @@ def answered_lines(rows: list[dict], why: bool = False) -> str:
     for row in rows:
         for q, a in zip(row["questions"], row["answers"], strict=True):
             n += 1
-            out.append(f"{n}. {q['header']}: {q['question']}\n   Answer: {answer_words(q, a)}")
+            actor = " (issue orchestrator)" if a.get("by") == "rule:unblock" else ""
+            out.append(f"{n}. {q['header']}: {q['question']}\n   Answer{actor}: {answer_words(q, a)}")
+            if actor and a.get("basis"):
+                out.append(f"   Basis: {a['basis']}")
         if why and row.get("why"):
             out.append(f"   Why you asked: {row['why']}")
     return "\n".join(out)
 
 
+def supervisor_answered(rows: list[dict]) -> bool:
+    return any(a.get("by") == "rule:unblock" for row in rows for a in row["answers"])
+
+
 def answers_message(rows: list[dict]) -> str:
-    return ("Your owner answered what you asked:\n\n" + answered_lines(rows) +
-            "\n\nCarry on with these and finish the step.")
+    opening = "Answers to your questions:" if supervisor_answered(rows) else "Your owner answered what you asked:"
+    return opening + "\n\n" + answered_lines(rows) + "\n\nCarry on with these and finish the step."
 
 
 def fresh_note(rows: list[dict]) -> str:
+    if supervisor_answered(rows):
+        return "## Answers to questions from earlier in this step\n\n" + answered_lines(rows, why=True)
     return ("## Earlier in this step you asked your owner\n\n" + answered_lines(rows, why=True) +
             "\n\nThe owner has answered. Use the answers and finish the step without asking again.")
 

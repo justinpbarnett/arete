@@ -62,6 +62,7 @@ from .store import incidents as incident_store
 from .store import loops as loop_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import workspaces
 
 TICK_SECONDS = 20
 DEPLOY_SECONDS = 120
@@ -71,6 +72,7 @@ PRUNE_SECONDS = 3600
 ROTATE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
+WORKSPACE_SWEEP_SECONDS = 600
 CLOSED_SECONDS = 300
 POLL_THREADS = 8
 
@@ -311,6 +313,7 @@ class Server:
         self.started = util.now()
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
+        self.workspace_sweep: Future | None = None
         self.oncall: Future | None = None
         self.deployment: Future | None = None
         self.deploy_at = time.monotonic() - DEPLOY_SECONDS
@@ -318,6 +321,8 @@ class Server:
         self.deploy_refusals: set[tuple[str, str]] = set()
         self.checkout_update = threading.Lock()
         self.zte_work: Future | None = None
+        self.unblock_work: Future | None = None
+        self.unblock_at = 0.0
         self.zte_at = 0.0
         self.oncall_error = ""
         self.tried: dict[str, float] = {}
@@ -331,7 +336,7 @@ class Server:
         restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
         self.loaded = restarted_with is not None
         self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
-        self.pruned = self.swept = self.rotated = 0.0
+        self.pruned = self.swept = self.workspaces_swept = self.rotated = 0.0
         self.checked_closed = 0.0
         self.ticks = 0
         self.reloaded = restarted_with is not None
@@ -442,9 +447,11 @@ class Server:
         stages = (
             ("forget", self.forget_unpolled_errors, (self.live,)),
             ("oncall", self.watch_oncall, ()), ("zte", self.zte_when_due, ()),
+            ("unblock", self.unblock_when_due, ()),
             ("dispatch", self.dispatch, ({x.name: x for x in reversed(self.every_loop)},)),
             ("approvals", self.approvals, ()), ("rotate", self.rotate_when_due, ()),
             ("prune", self.prune_when_due, ()), ("sweep", self.sweep_when_due, ()),
+            ("workspaces", self.sweep_workspaces_when_due, ()),
             ("asks", self.expire_asks, ()), ("closed", self.release_closed_when_due, ()),
             ("remind", self.remind, ()),
         )
@@ -475,6 +482,18 @@ class Server:
             self.zte_at = time.monotonic()
             self.zte_work = self.pool.submit(zte_delivery.tick, self.cfg)
 
+    def unblock_when_due(self) -> None:
+        from . import unblock, unblock_watch
+
+        if self.unblock_work is not None:
+            if not self.unblock_work.done():
+                return
+            finished, self.unblock_work = self.unblock_work, None
+            finished.result()
+        if time.monotonic() - self.unblock_at >= unblock.INTERVAL:
+            self.unblock_at = time.monotonic()
+            self.unblock_work = self.pool.submit(unblock_watch.watch, self.cfg)
+
     def approvals(self) -> None:
         for released in delivery.release_lapsed():
             self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
@@ -494,6 +513,12 @@ class Server:
         if time.monotonic() - self.swept > SWEEP_SECONDS and not self.sweeping():
             self.sweep = self.pool.submit(self.sweep_vms)
             self.swept = time.monotonic()
+
+    def sweep_workspaces_when_due(self) -> None:
+        now = time.monotonic()
+        if now - self.workspaces_swept > WORKSPACE_SWEEP_SECONDS and not self.sweeping_workspaces():
+            self.workspace_sweep = self.pool.submit(self.sweep_workspaces)
+            self.workspaces_swept = now
 
     def expire_asks(self) -> None:
         for note in tasks.expire_asks(self.cfg):
@@ -567,9 +592,7 @@ class Server:
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
         if not root or Path(root).resolve() != src:
             return
-        required = config.load_layer(repo.layer_dir).required_check
-        if required is None and repo.name == cfg.arete_repo:
-            required = pilot.CHECK
+        required = pilot.required_check(cfg, repo, config.load_layer(repo.layer_dir))
         if required is not None:
             self.deploy_checkout(repo, src, required)
 
@@ -862,6 +885,15 @@ class Server:
         except Exception as e:
             self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
+    def sweeping_workspaces(self) -> bool:
+        return bool(self.workspace_sweep) and not self.workspace_sweep.done()
+
+    def sweep_workspaces(self) -> None:
+        try:
+            workspaces.sweep(self.cfg)
+        except Exception as e:
+            self.say(f"sweeping workspaces failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
     def sweep_log(self, run_id: str | None) -> Callable[[str], None]:
         if not run_id:
             return self.say
@@ -997,6 +1029,8 @@ class Server:
             return "an on-call scan is still running"
         if self.sweeping():
             return "a sweep of left-over VMs is still running"
+        if self.sweeping_workspaces():
+            return "a sweep of workspaces is still running"
         if dashboard.POSTS_IN_FLIGHT.active():
             return "the dashboard is still answering a request"
         if chat.any_busy():

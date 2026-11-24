@@ -311,6 +311,7 @@ def ensure_key(c, settings):
 def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
     settings = config.secret_settings() if settings is None else settings
     local = local_key_path()
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     try:
         with db.reader() as c:
             meta = db.metadata(c)
@@ -345,17 +346,20 @@ def item_digest(key: bytes, value: bytes) -> str:
 
 def get(scope, name):
     validate(scope, name)
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.reader() as c:
         return credentials.secret(c, scope, name)
 
 
 def items():
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.reader() as c:
         return credentials.secrets(c)
 
 
 def history(scope, name):
     validate(scope, name)
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.reader() as c:
         row = credentials.secret(c, scope, name)
         return credentials.history(c, row["id"]) if row else []
@@ -368,6 +372,7 @@ def read(scope, name) -> bytes | None:
         raise InternalSecret("This secret is managed by Arete.")
     settings = config.secret_settings()
     configured(settings)
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.reader() as c:
         row = credentials.secret(c, scope, name)
         if row and row["status"] == "set":
@@ -378,6 +383,7 @@ def read(scope, name) -> bytes | None:
 
 @contextmanager
 def registry_write():
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.tx() as c:
         c.execute("SAVEPOINT secret_registry")
         try:

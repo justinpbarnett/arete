@@ -301,7 +301,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                 routing.request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
                 remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
                 tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
-                hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom)
+                hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom,
+                private_worker=bool(kw.get("private_worker")))
     limited: list[Result] = []
     previous: Stopped | None = None
     launches, measured = 0, size
@@ -423,6 +424,7 @@ class Trip:
     hard_cap: bool = False
     needs_server: bool = False
     headroom: dict | None = None
+    private_worker: bool = False
 
 
 @dataclass
@@ -569,6 +571,9 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
     skipped: list[dict] = []
     for candidate in found:
         key = routing.route_key(candidate)
+        if trip.private_worker and (trip.target.remote or candidate.runner not in ("pi", REPLAY)):
+            skipped.append(passed_over(candidate, "ineligible", "private workers require an isolated local route"))
+            continue
         if key in trip.barred:
             skipped.append(passed_over(candidate, "ineligible", trip.barred[key]))
             continue
@@ -730,6 +735,8 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or ()), *claude_tools]
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
+    if kw.get("private_worker") and which == "pi":
+        kw["private_hidden"] = closed_context
     if closed_context:
         if target.remote:
             raise ValueError("closed grading context requires a local runner")
@@ -745,11 +752,12 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     if target.remote:
         kw["remote"] = target
     else:
-        kw["passing"] = environment.passed(cfg, repo)
+        supervisor = getattr(getattr(trip, "settings", None), "step", "") == "unblock" or trace[1] == "orchestrate-monitor"
+        kw["passing"] = [] if supervisor else environment.passed(cfg, repo)
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
             kw["read_roots"] = tuple(Path(root) for root in roots)
-        kept = {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
+        kept = {} if supervisor else {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
         if picked.selected:
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
         if kept:

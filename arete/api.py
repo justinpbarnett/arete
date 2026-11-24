@@ -179,6 +179,8 @@ def prepare(name, values):
                 secretstore.validate(values["scope"], values["name"])
             except ValueError as error:
                 raise contract.Problem("invalid_input", str(error)) from None
+    if credential_http.registry_operation(name):
+        foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
     if name == "hook.ingest":
         for i, event in enumerate(values["events"]):
             event_timestamp(event["ts"], f"input.events[{i}].ts")

@@ -3,23 +3,24 @@ import { runHash, taskHash } from "./ui-data.js";
 import { Decisions, DetailLink, Panel, Read, Rows, Text, html } from "./ui-operations.js";
 import { Empty, Fault, Gate } from "./ui-states.js";
 
-const states = { "needs-info": "Needs you", failed: "Failed", running: "Running", pr: "In review", todo: "To do", done: "Done", closed: "Closed" };
+const states = { "needs-info": "Needs you", recovering: "Recovering", failed: "Failed", running: "Running", pr: "In review", todo: "To do", done: "Done", closed: "Closed" };
 const stateWord = (state) => states[state] ?? state;
+const displayState = (task, recovering) => task.state === "needs-info" && recovering?.includes(task.id) ? "recovering" : task.state;
 const listRow = (task) => ({ id: task.id, href: taskHash(task.id), title: task.title || task.id, context: [task.repo, task.id].filter(Boolean).join(" · ") });
 
 export class TaskQueue extends Component {
   state = { query: "" };
-  render({ resource, route, retry }, { query }) {
+  render({ resource, route, retry, recovering }, { query }) {
     const open = route.active === "my-work";
     return html`<${Read} what="Tasks" resource=${resource} retry=${retry}>${({ tasks }) => {
       const search = query.toLowerCase().trim();
       const enough = tasks.filter((task) => !(open && ["done", "closed"].includes(task.state))
         && `${task.title} ${task.repo} ${task.id}`.toLowerCase().includes(search));
-      const statesInUse = [...new Set([...Object.keys(states), ...enough.map((task) => task.state)])];
+      const statesInUse = [...new Set([...Object.keys(states), ...enough.map((task) => displayState(task, recovering))])];
       return html`<div class="ops-detail task-list" data-list="local-tasks">
         <label class="ops-field">Filter tasks<input type="search" data-search="" value=${query} placeholder="Title, repo or task ID" onInput=${(e) => this.setState({ query: e.target.value })} /></label>
         ${enough.length ? statesInUse.map((state) => {
-        const rows = enough.filter((task) => task.state === state).map(listRow);
+        const rows = enough.filter((task) => displayState(task, recovering) === state).map(listRow);
         return rows.length ? html`<section key=${state} class="task-group"><h3>${stateWord(state)} <span>${rows.length}</span></h3>
           <${Rows} rows=${rows} open=${route.screen === "task" ? route.path[0] : ""} />
         </section>` : null;
@@ -29,11 +30,11 @@ export class TaskQueue extends Component {
   }
 }
 
-export function TaskFocus({ route, resource, retry }) {
+export function TaskFocus({ route, resource, retry, recovering }) {
   if (route.screen !== "task" || !route.path[0]) return html`<div class="ops-detail"><h3>Local tasks</h3>
     <p>Choose a task to see its activity and runs. GitHub and Jira tickets are linked from their runs, not listed here.</p></div>`;
   return html`<${Read} what="Task" resource=${resource} retry=${retry}>${(task) => html`<article class="ops-detail">
-    <header><p class="ops-kicker">${[task.ref || task.id, task.repo, stateWord(task.state)].filter(Boolean).join(" · ")}</p>
+    <header><p class="ops-kicker">${[task.ref || task.id, task.repo, stateWord(displayState(task, recovering))].filter(Boolean).join(" · ")}</p>
       <h3>${task.title || task.id}</h3><${DetailLink} href=${task.url}>Open source ticket<//></header>
     <${Text} text=${task.body} />
     ${task.children?.length ? html`<section class="ops-section"><h3>Child tasks</h3><${Rows} id="child-tasks" rows=${task.children.map(listRow)} /></section>` : null}
@@ -69,6 +70,11 @@ export function FloorFocus({ snapshot, retry }) {
       <p>${snapshot.needsYou == null || !snapshot.questions?.data || snapshot.questions.error ? "See the inbox for current work." :
     `${snapshot.needsYou + snapshot.questions.data.asks.length} items in the inbox`}</p>
       <a href="#triage">Open Triage</a></section>
+    ${snapshot.live?.recovery?.rows?.length ? html`<section class="ops-section"><h3>Automatic recovery</h3>
+      <${Rows} id="recovery-queue" rows=${snapshot.live.recovery.rows.map((item) => ({
+        id: `${item.repo}/${item.ticket}`, href: item.source ? runHash(item.source) : taskHash(item.ticket, item.repo),
+        title: `${item.repo} ${item.ticket}`, context: item.detail || item.cause, state: item.phase.replaceAll("_", " ")
+      }))} /></section>` : null}
     <section class="ops-section"><h3>Health</h3><p>${snapshot.health ?? "Not yet read"}</p><a href="#settings/health">Open Health</a></section>
     ${feedback ? html`<${Panel} panel=${feedback} title="Waiting for review feedback" retry=${retry}>${({ tickets, quiet_minutes }) => tickets.length
     ? html`<div><p>Runs start ${quiet_minutes} minutes after the last comment, or when a review is submitted.</p>

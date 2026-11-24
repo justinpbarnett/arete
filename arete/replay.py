@@ -77,12 +77,12 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     if not isinstance(answer, dict):
         return failed(f"replay: {answer_file} is not one JSON object")
     controller = trace[1].startswith("orchestrate-")
-    if controller and (patched or answer.get("tool_calls")):
+    if (controller or trace[1] == "unblock") and (patched or answer.get("tool_calls")):
         return failed("replay: controller answers cannot apply patches or execute tool calls")
     if controller and "decision" in answer:
         try:
             observed = json.loads(prompt.rsplit("## Current observation\n\n", 1)[1])
-            answer = {**answer, "structured": {"version": 1, "decision_id": observed["decision_id"],
+            answer = {**answer, "structured": {"version": observed["version"], "decision_id": observed["decision_id"],
                       "state_version": observed["state_version"], "rationale": "Replay the selected next action.",
                       "calls": answer["decision"]}}
         except (ValueError, KeyError, IndexError) as error:

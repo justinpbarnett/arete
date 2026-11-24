@@ -26,16 +26,16 @@ def take_messages(run_id: str) -> list[str]:
 
 def ask_row(r) -> dict:
     return {**dict(r), "questions": json.loads(r["questions"]), "session": json.loads(r["session"] or "{}"),
-            "answers": json.loads(r["answers"] or "[]")}
+            "answers": json.loads(r["answers"] or "[]"), "staged_answers": json.loads(r["staged_answers"])}
 
 
 def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
-            questions: list[dict], session: dict) -> None:
+            questions: list[dict], session: dict, *, recovery_route: str = "owner") -> None:
     with db() as c:
         c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
-                  "session) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
-                   json.dumps(session)))
+                   json.dumps(session), recovery_route))
 
 
 def ask_get(ask_id: str, connect=reader) -> dict | None:
@@ -51,12 +51,37 @@ def asks_of(run: str, status: str = "", connect=reader) -> list[dict]:
             (run, status) if status else (run,))]
 
 
-def open_asks(connect=reader) -> list[dict]:
+def routes_of(runs: list[str], *, connect=reader) -> dict[str, str]:
+    if not runs:
+        return {}
+    places = ",".join("?" for _ in runs)
+    with connect() as c:
+        rows = c.execute(f"SELECT run, MAX(CASE WHEN status<>'open' THEN 0 "
+                         f"WHEN recovery_route='unblock' THEN 1 ELSE 2 END) AS route "
+                         f"FROM asks WHERE run IN ({places}) GROUP BY run", runs)
+        return {r["run"]: ("closed", "unblock", "owner")[r["route"]] for r in rows}
+
+
+def open_asks(connect=reader, *, owner_only=False) -> list[dict]:
     with connect() as c:
         return [ask_row(r) for r in c.execute(
-            "SELECT * FROM asks WHERE status = 'open' AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
+            "SELECT * FROM asks WHERE status = 'open' "
+            + ("AND recovery_route='owner' " if owner_only else "")
+            + "AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
             "a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue AND "
-            "COALESCE(later.only_step, '') = '' AND later.rowid > a.rowid) ORDER BY asked, rowid")]
+            "COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.rowid > a.rowid) ORDER BY asked, rowid")]
+
+
+def stage(ask_id: str, answers: dict) -> bool:
+    with db() as c:
+        return bool(c.execute("UPDATE asks SET staged_answers=? WHERE id=? AND status='open'",
+                              (json.dumps(answers), ask_id)).rowcount)
+
+
+def route_to_owner(ask_id: str) -> bool:
+    with db() as c:
+        return bool(c.execute("UPDATE asks SET recovery_route='owner' WHERE id=? AND status='open' "
+                              "AND recovery_route='unblock'", (ask_id,)).rowcount)
 
 
 def asks_due(run_ids) -> list[dict]:

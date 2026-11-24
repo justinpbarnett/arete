@@ -645,15 +645,15 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 
 ## When a worktree is kept and when it is removed
 
-A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The run that makes it owns it: `workspaces/<name>.json` under the state folder holds the owner (run id, repo, ticket, created time and the checkouts) and a fingerprint of every file arete made there, including the setup outputs such as `.venv/`, written when the workspace is made and again before any removal.
+A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The workspace row in `arete.db` records the owner, checkouts and cleanup state. Arete records fingerprints of files it made, including setup outputs such as `.venv/`, and writes compatible `workspaces/<name>.json` records for rollback.
 
 - Kept after a failed, parked or stopped run, a waiting ask, a dry run, leftover verification scratch, or any file the record does not cover.
 - Removed by the run itself at a `pr`, `done`, no-change or plain needs-info ending. When the removal is blocked, `run.log` says `workspace kept at ...: removal blocked by` and lists the names.
 - Removed by the next run of the same ticket, when the worktree still matches the record.
-- Removed by each poll's sweep when the owning run is `merged`, `rejected` or `done` (or the ticket is a closed local task), no run holds the ticket, and every file still matches the record. The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock. A workspace waiting for its ticket, or blocked by a file arete did not make, stays.
-- Every poll also runs `git worktree prune` on each configured repo. The local `arete/<n>-...` branch stays.
+- Retried by `arete serve` every ten minutes after release. The sweep also removes kept or held workspaces when the latest whole run is `merged`, `rejected` or `done` (or the ticket is a closed local task). It skips tickets in use and keeps workspaces with saved edits or files that block removal.
+- The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock and prunes registrations in each configured repo. The local `arete/<n>-...` branch stays.
 
-The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. A blocked workspace is listed with the names of the files that block it (ignored, untracked or edited tracked files that the record does not cover). The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
+The sweep records cleanup results on the workspace rows. Dashboard Health lists held workspaces with their blocking files or last sweep error. The heartbeat check `workspaces:held` reports their count, size and age and warns about blocked workspaces. The sweep removes unowned folders after seven days when they contain no files or scratch roots, and records old unowned folders with files as held.
 
 ## Records
 
@@ -1005,7 +1005,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, workspace cleanup state, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` rollback records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1064,7 +1064,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
-| `[orchestration]` | Finite adaptive limits: `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, `progress_seconds = 30`; each is an integer from 1 to 10000. See [Orchestration](docs/orchestration.md). |
+| `[orchestration]` | `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, and `progress_seconds = 30`. Set `max_builders = 1` to pilot addressed worker turns, or `2` to allow two private builders on independent work. Each configured limit takes an integer from 1 to 10000. [Orchestration](docs/orchestration.md) |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
@@ -1277,13 +1277,49 @@ A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
+### Durable issue orchestration
+
+Enable issue goals for the repositories that Arete should follow through tracker closure or PR merge.
+
+```toml
+[unblock]
+enabled = true
+repos = ["example"]
+```
+
+Configure the repository's `orchestrate` step with an eligible Pi route.
+Existing `[unblock.step]` settings are accepted for config compatibility.
+Delivery decisions and monitor observations go to the issue's Pi Durable conversation using the orchestrator route.
+The host needs Node 22.19 or later and npm; the first native issue turn installs the locked SDK in the Arete state directory.
+Each issue has its own SQLite database under `issue-goals/`.
+
+Arete submits worker results, failed checks, held PRs and owner responses as observations.
+The durable monitor waits through open PR review without consuming inference and settles on tracker closure or merge of the issue's PRs.
+Serve rechecks tracker state after restart and reuses the same issue conversation.
+A stopped run cancels monitoring.
+A policy mismatch waits for reconciliation.
+Use `arete status` or the dashboard's recovery case to see what the issue is waiting for.
+
+Enrolled whole runs keep accounting for run time, verification and repairs, and can continue past all three cumulative limits.
+Their adaptive controllers can also continue past the configured decision and action counts.
+There is no daily or per-blocker continuation quota.
+Concurrency, individual worker timeouts, routing, payment and publication checks still apply.
+
+For a local dependency cycle, the owner can confirm removal of a standalone obsolete prerequisite with the ticket comment `Arete dependency correction: remove t-1234`.
+Owner-only inputs use the existing question and secure credential flow.
+Disable new supervised admissions by removing the repository from `repos` or setting `enabled = false`.
+
 ### Pipeline auto-merge
 
 Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
 GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
-JEV must complete its risk screen on the diff and not hold it.
+JEV must complete its risk screen on the diff.
+For approved issues enrolled in durable orchestration on an `automerge` repo, the issue orchestrator decides whether to merge, request revisions or wait.
+It receives the risk assessment, verified behavior, review and diff for the exact head and base. Its decision and reason are recorded with the issue.
+The host rechecks authorization, GitHub readiness and CI before performing an approved squash merge.
+On other delivery paths a JEV risk hold leaves the merge with a person.
 Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
-It never arms a later merge and leaves changes spanning repositories for a person.
+The durable monitor can pick up a verified PR when its checks turn green. Changes spanning repositories require separate merge coordination.
 Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
 #### One-shot delivery pilot with owner merge
@@ -2293,7 +2329,7 @@ auto_per_refresh = 50
 
 `auto` defaults to false and allows ready owner-authored GitHub issues and assigned Jira tickets into their configured pipeline repos.
 It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receives its repository route label.
-`agent:auto` preserves the requirement for a person to merge even if label publication succeeds before the local approval record is saved.
+`agent:auto` records automatic admission even if label publication succeeds before the local approval record is saved.
 JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
 `no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
 Issues labelled `loop` stay with their dedicated loop-intake workflow.
@@ -2304,7 +2340,7 @@ Research and person work stay on their existing routes rather than acquiring `ag
 The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
 Existing `[jira] auto = true` remains supported and retains its own `auto_per_refresh` limit and sprint scope, including when the new general switch is on.
 Automatic admission never increases concurrency, bypasses dependencies or changes run budgets.
-A PR from automatic triage never automerges, whatever the repo's trust level.
+For enrolled issues in an `automerge` repo, the durable issue orchestrator reviews the assumptions and checks from triage before deciding whether to merge. On other paths, a person merges PRs from automatic triage.
 Sent tickets remain on the board for seven days with their pipeline status and PR.
 
 `route_fixes` defaults to false and independently enables classification of already-approved issues before scheduling or direct execution.

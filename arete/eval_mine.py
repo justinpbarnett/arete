@@ -274,7 +274,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
     pushed = set(git(["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/arete"], c.repo.path).split())
     name = free_name(wanted, lambda n: f"{EVALS}/{n}.toml" in merged or f"arete/evals-{n}" in pushed)
     branch = f"arete/evals-{name}"
-    wt = workspace.make_worktree(c.repo, base, branch, f"evals-{name}")
+    wt = workspace.make_worktree(c.repo, base, branch, f"evals-{name}", owner=run.id)
     try:
         rel = f"{EVALS}/{name}.toml"
         (wt / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +290,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         run.log(f"opened {url}")
         return f"{rel} in {url}"
     finally:
-        workspace.remove_worktree(c.repo, wt)
+        workspace.remove_worktree(c.repo, wt, owner=run.id)
 
 
 def run(repo_name: str, limit: int, dry_run: bool = False) -> int:

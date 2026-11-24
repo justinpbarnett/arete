@@ -29,6 +29,10 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 PILOT_TASK = re.compile(r"t-[0-9a-f]{32}\Z")
 
 
+def required_check(cfg, repo, layer):
+    return layer.required_check or (CHECK if repo.name == cfg.arete_repo else None)
+
+
 class Held(RuntimeError):
     pass
 

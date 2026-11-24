@@ -1077,7 +1077,7 @@ def get_runs(handler, rest, query):
 
 
 def get_run(handler, rest, query):
-    return board.run_board(unquote(rest))
+    return board.run_board(unquote(rest), messages_after=whole_number(query.get("messages_after", "0")))
 
 
 def get_tasks(handler, rest, query):
@@ -1089,7 +1089,7 @@ def get_task(handler, rest, query):
 
 
 def get_asks(handler, rest, query):
-    return tasks.asks_view()
+    return tasks.asks_view(owner_only=query.get("include_recovery") != "1")
 
 
 def get_health(handler, rest, query):
@@ -1418,6 +1418,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
     while True:
         try:
             foundation.ensure_schema()
+            foundation.migrate_on_demand()
             break
         except foundation.IncompatibleSchema:
             if not inside_serve:

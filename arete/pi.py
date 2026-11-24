@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
@@ -24,6 +24,7 @@ from . import (
     config,
     devices,
     environment,
+    issue_goal,
     owner_asks,
     paths,
     pi_shell,
@@ -584,10 +585,11 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
                                               "write_files": [str(GUARD_FILE), str(ASK_FILE), str(SHELL_FILE)]})}
 
 
-def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None) -> list[str]:
+def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None,
+                goal_paths: tuple[Path, ...] = ()) -> list[str]:
     return sandbox.write_confinement(
         cwd, add_dirs, selected.owner if selected and selected.using_login else None,
-        state=(paths.STATE_DIR, (*floor.open, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
+        state=(paths.STATE_DIR, (*floor.open, *goal_paths, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
                                  sandbox.KEY_DIR, paths.PACKAGE_DIR)),
         hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
 
@@ -822,8 +824,11 @@ def _run(
     ask_owner: bool = False,
     floor: guard.Floor | None = None,
     delegation_only: bool = False,
+    issue_session: tuple[str, str] | None = None,
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
+    private_worker: bool = False,
+    private_hidden: tuple[Path, ...] = (),
     native_observation: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
@@ -856,24 +861,52 @@ def _run(
         cmd += ["--provider", selected.provider]
     if json_schema is not None:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
+    goal_paths = ()
+    session_lock = nullcontext(True)
+    if issue_session:
+        if not delegation_only:
+            raise ValueError("a durable issue session requires a tool-free controller")
+        key, event = issue_session
+        cwd = issue_goal.directory(key)
+        private_dir(cwd)
+        bundle = issue_goal.runtime()
+        goal_paths = (cwd, bundle)
+        session_lock = util.lock("issue-goal-" + key, wait=True)
+        cmd = [issue_goal.executable("node"), str(bundle / "issue.mjs"), str(cwd), "turn", event,
+               selected.provider, launch_model, effort]
     confined = False
     writing = sorted(WRITING & set(names))
-    if writing or observing:
+    if private_worker:
+        if add_dirs or resume.id or persist or ask_owner or not sandbox.can_confine(False):
+            raise ValueError("private Pi workers require a fresh local confined invocation")
+        floor = replace(floor, open=(cwd,))
+        call = selected.view
+        cmd = sandbox.write_confinement(
+            cwd, [call], selected.owner if selected.using_login else None,
+            agent_roots=False, private_temporary=True, peers=paths.WORKTREES_DIR,
+            hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR, *private_hidden),
+            state=(paths.STATE_DIR, (cwd, call, selected.owner, paths.PACKAGE_DIR))) + cmd
+        confined = True
+    elif writing or observing:
         if not sandbox.can_confine(False):
             return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot run confined commands here",
                           session=resume, runner="pi", model=model)
         cmd = confinement(cwd, add_dirs, floor, selected) + cmd
         confined = True
     if selected and selected.using_login and not confined and sandbox.can_confine(False):
-        cmd = confinement(cwd, add_dirs, floor, selected) + cmd
+        cmd = confinement(cwd, add_dirs, floor, selected, goal_paths) + cmd
 
-    cmd = [*cmd, "--", prompt]
+    cmd += [prompt] if issue_session else ["--", prompt]
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
            **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
                        delegation_only=delegation_only, shell=pi_shell.TOOL in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
+    if private_worker:
+        protection["workspace"] = str(cwd)
+        env["ARETE_PI_GUARD_PATHS"] = json.dumps(protection)
+        env["TMPDIR"] = str(folder)
     env.pop("ARETE_PI_OBSERVE", None)
     if observing:
         env["ARETE_PI_OBSERVE"] = native_observation
@@ -884,7 +917,7 @@ def _run(
                             judge, time.monotonic() + timeout, tuple(read_roots))
              if observing or pi_shell.TOOL in names else None)
     try:
-        with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
+        with session_lock, refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
             descriptors = (*refresh, *terminal)
             if error := plan_token_error(env.items()):
                 return Result(ok=False, session=resume, error=error, runner="pi", model=model)
@@ -1079,7 +1112,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         text=text,
         session=session_after(stream, resume, totals["cost_usd"]),
         structured=json_from_text(text) if json_schema is not None and not failed else None,
-        turns=len(replies),
+        turns=0 if end.get("durableReplay") is True else len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
         usage_limit=limit,

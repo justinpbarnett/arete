@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
+import sqlite3
 import stat
 from collections.abc import Callable, Collection
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from . import config, gh, paths, record, sandbox, scratch, tracker, util
-from .store import runs as run_store
+from .store import workspaces
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -20,7 +20,6 @@ OWNER_KEY = "\0owner"
 RETAINED_KEY = "\0retained"
 ENDED = ("merged", "rejected", "done")
 WAITING = ("running", "pr", "needs-info")
-HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
 termination_pending = False
 
 
@@ -225,28 +224,24 @@ def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
     return held
 
 
-def finalize_scratch() -> list[str]:
+def finalize_scratch(*, pending_refresh: set[str] | None = None) -> list[str]:
     done = scratch.recover_pending()
-    for root in done:
-        refresh_released(Path(root).parent, Path(root).name)
+    roots = dict.fromkeys(done)
+    if pending_refresh is not None:
+        roots.update(dict.fromkeys(data["attempt"]["root"] for data in scratch.records() if data["state"] == "done"))
+    for root in roots:
+        refreshed = refresh_released(Path(root).parent, Path(root).name)
+        if not refreshed and pending_refresh is not None:
+            pending_refresh.add(root)
     return done
 
 
-def refresh_released(ws: Path, root: str) -> None:
-    made = made_before(ws)
-    held, salt = retained_in(made), salt_of(made)
-    if held is None or not isinstance(held.get("roots"), list) or root not in held["roots"]:
-        return
-    del made[RETAINED_KEY]
-    names = [n for n in held.get("names") or [] if isinstance(n, str) and n in made]
+def refresh_released(ws: Path, root: str) -> bool:
     try:
-        made |= {n: fingerprint(ws / n, salt) for n in names}
-    except OSError:
-        pass
-    try:
-        made_record(ws).write_text(json.dumps(made))
-    except OSError:
-        pass
+        return workspaces.refresh_released(ws, root)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
+        print(f"{util.iso()} refreshing workspace {ws} after scratch: {util.first_line(str(e), 300)}")
+        return False
 
 
 def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[Path]) -> dict:
@@ -257,26 +252,81 @@ def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[P
             "names": [n for n in names if n in loose]}
 
 
-def remove_workspace(ws: Path, checkouts: list[Checkout], *, excluded: Collection[Path] = ()) -> Release:
+def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
+                     excluded: Collection[Path] = (), edits: bool = False) -> Release:
     if termination_pending:
         return Release("held", ["SIGTERM unwinding"])
-    made = made_before(ws)
-    if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made):
+    with workspaces.folder_lock(ws):
+        options = {"edits": True} if edits else {}
+        try:
+            snapshot_error = None
+            try:
+                row = workspaces.release(ws, checkouts, excluded=excluded)
+            except workspaces.SnapshotUnavailable as e:
+                row = workspaces.release(ws, checkouts, excluded=excluded, reconcile=False)
+                snapshot_error = e
+            if row:
+                excluded = {Path(wt) for wt in row["release_excluded"]}
+            if snapshot_error is not None:
+                if (not isinstance(snapshot_error, workspaces.UnstatableSnapshot) or by != "sweep"
+                        or not row or not row["remove_asked_by"]):
+                    raise snapshot_error
+                options["check_legacy"] = lambda: workspaces.require_unstatable_record(ws)
+            if row and by and by != "sweep" and by == row["owner_run"]:
+                note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
+            made = workspaces.made_before(ws) if row and snapshot_error is None else {}
+        except workspaces.SnapshotUnavailable as e:
+            if by == "sweep" and not isinstance(e, workspaces.UnreadableSnapshot):
+                raise
+            row = workspaces.open_for(ws.name)
+            force = by == "sweep" and bool(row and row["remove_asked_by"])
+            names = workspace_blockers(ws, checkouts, edits, excluded=excluded, made={}, force=force, strict=by == "sweep")
+            if by == "sweep" and not names:
+                raise
+            release = Release("held", names or [str(ws)])
+        else:
+            force = by == "sweep" and bool(row and row["remove_asked_by"])
+            try:
+                release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force, **options)
+            except OSError as e:
+                if row:
+                    workspaces.record_release_error(ws, row, e)
+                raise
+        workspaces.record_release(ws, checkouts, row, release, excluded=excluded)
+        return release
+
+
+def remove_checkouts(ws: Path, checkouts: list[Checkout], made: dict, *, excluded: Collection[Path],
+                     force: bool, check_legacy: Callable[[], None] | None = None, edits: bool = False) -> Release:
+    if names := workspace_blockers(ws, checkouts, edits, excluded=excluded, made=made, force=force, strict=True):
         return Release("held", names)
     for index, c in enumerate(checkouts):
         target_last = checkouts[:index] + checkouts[index + 1:] + [c]
         with util.repo_lock(c.src):
-            if names := workspace_blockers(ws, target_last, excluded=excluded, made=made, target=c):
+            if names := workspace_blockers(ws, target_last, edits, excluded=excluded, made=made, target=c, force=force,
+                                           strict=True):
                 return Release("held", names)
-            git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
-    if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made, after_removal=True):
+            attached, unsafe = checkout_attachment(ws, c.wt)
+            if unsafe is not None:
+                return Release("held", [str(unsafe)])
+            if attached:
+                if check_legacy is not None:
+                    check_legacy()
+                try:
+                    git(["worktree", "remove", "--force", str(c.wt)], c.src)
+                except RuntimeError as e:
+                    raise OSError(f"{c.wt}: {e}") from e
+    if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made, after_removal=True, force=force):
         return Release("held", names)
     if excluded:
         return Release("removed")
-    shutil.rmtree(ws, ignore_errors=True)
+    if check_legacy is not None:
+        check_legacy()
     if os.path.lexists(ws):
-        return Release("held", workspace_blockers(ws, checkouts, made=made, after_removal=True))
-    made_record(ws).unlink(missing_ok=True)
+        shutil.rmtree(ws)
+    if os.path.lexists(ws):
+        return Release("held", workspace_blockers(ws, checkouts, made=made, after_removal=True, force=force))
+    workspaces.unlink_record(ws)
     for c in checkouts:
         with util.repo_lock(c.src):
             git(["worktree", "prune"], c.src, check=False)
@@ -324,18 +374,51 @@ def checkout_attachment(ws: Path, wt: Path) -> tuple[bool, Path | None]:
     return True, None
 
 
-def checkout_blockers(c: Checkout, made: dict, edits: bool) -> list[str]:
+def registered_root_checkout(ws: Path) -> list[Checkout]:
+    attached, _ = checkout_attachment(ws, ws)
+    marker = ws / ".git"
+    if not attached or not stat.S_ISREG(marker.lstat().st_mode):
+        return []
+    resolved = git(["rev-parse", "--resolve-git-dir", str(marker)], ws, check=False).removesuffix("\n")
+    if not resolved:
+        return []
+    gitdir = Path(resolved)
+    try:
+        backlink = os.fsdecode((gitdir / "gitdir").read_bytes().removesuffix(b"\n"))
+    except FileNotFoundError:
+        return []
+    if not backlink or (gitdir / backlink).resolve() != marker.resolve():
+        return []
+    try:
+        listing = git(["worktree", "list", "--porcelain", "-z"], ws)
+    except RuntimeError as e:
+        raise OSError(f"{ws}: {e}") from e
+    entries = [entry.split("\0") for entry in listing.split("\0\0") if entry.startswith("worktree ")]
+    if not entries:
+        return []
+    main, *linked = entries
+    root = ws.resolve()
+    for path, *attrs in linked:
+        if Path(path.removeprefix("worktree ")).resolve() == root and not any(a.startswith("prunable ") for a in attrs):
+            return [Checkout("", "", Path(main[0].removeprefix("worktree ")), ws, "")]
+    return []
+
+
+def checkout_blockers(c: Checkout, made: dict, edits: bool, *, strict: bool) -> list[str]:
     try:
         found = (uncommitted(c.wt) + ignored_files(c.wt) if edits
                  else ignored_files(c.wt) + sorted(untracked_files(c.wt)))
         return [c.prefix + n for n in dict.fromkeys(found) if unverified(made, c.wt, n, c.prefix)]
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as e:
+        if strict:
+            raise OSError(f"{c.wt}: {e}") from e
         return [c.dir or "."]
 
 
 def workspace_blockers(ws: Path, checkouts: list[Checkout], edits: bool = False, *,
                        excluded: Collection[Path] = (), made: dict | None = None,
-                       after_removal: bool = False, target: Checkout | None = None) -> list[str]:
+                       after_removal: bool = False, target: Checkout | None = None, force: bool = False,
+                       strict: bool = False) -> list[str]:
     held = scratch_left(ws, checkouts)
     names = [str(p) for p in held]
     try:
@@ -363,15 +446,16 @@ def workspace_blockers(ws: Path, checkouts: list[Checkout], edits: bool = False,
             if attached:
                 examined.add(c.wt)
     containers = {ws, *(c.wt for c in checkouts)}
-    names += outside_blockers(ws, made, examined.union(excluded, set(held) - containers))
+    if not force:
+        names += outside_blockers(ws, made, examined.union(excluded, set(held) - containers))
     if not after_removal:
         for c in checkouts:
             attached, unsafe = checkout_attachment(ws, c.wt)
             if unsafe is not None:
                 names.append(str(unsafe))
                 continue
-            if attached:
-                names += checkout_blockers(c, made, edits)
+            if attached and not force:
+                names += checkout_blockers(c, made, edits, strict=strict)
             if c is target:
                 still_attached, unsafe = checkout_attachment(ws, c.wt)
                 if unsafe is not None or still_attached != attached:
@@ -411,10 +495,11 @@ def fingerprint(p: Path, salt: str) -> str:
 
 def made_before(ws: Path) -> dict:
     try:
-        made = json.loads(made_record(ws).read_text())
-    except (OSError, ValueError):
+        return workspaces.made_before(ws)
+    except workspaces.UnreadableSnapshot:
         return {}
-    return made if isinstance(made, dict) else {}
+    except workspaces.SnapshotUnavailable as e:
+        raise worktree_failure(f"arete could not reconcile the existing workspace {ws}: {e}", ws, "") from e
 
 
 def salt_of(made: dict) -> str:
@@ -487,9 +572,21 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None 
               during_termination: bool = False) -> None:
     if termination_pending and not during_termination:
         return
+    with workspaces.folder_lock(ws):
+        if row := workspaces.open_for(ws.name):
+            _note_made(ws, checkouts, row, owner, preserve, excluded)
+
+
+def _note_made(ws: Path, checkouts: list[Checkout], row: dict, owner: WorkspaceOwner | None,
+               preserve: Collection[str], excluded: Collection[Path]) -> None:
+    excluded = set(excluded) | {Path(wt) for wt in row["release_excluded"] or ()}
+    if excluded:
+        checkouts = [c for c in checkouts if c.wt not in excluded]
+    owner = owner or workspaces.owner_of(row)
+    if not owner.checkouts:
+        owner.checkouts = checkouts
     try:
-        before = made_before(ws) if excluded or not owner else {}
-        owner_row = owner.to_row() if owner else before.get(OWNER_KEY)
+        before = workspaces.made_before(ws, strict=True) if excluded else {}
         salt = salt_of(before) if excluded else ""
         excluded_records = {n: digest for n, digest in before.items() if salt and not n.startswith("\0")
                             and any((ws / n).is_relative_to(wt) for wt in excluded)}
@@ -506,19 +603,30 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None 
         if names or heads or excluded_records:
             salt = salt if excluded_records else os.urandom(16).hex()
             made = excluded_records | {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
-            if isinstance(owner_row, dict) and owner_row:
-                made[OWNER_KEY] = owner_row
+            made[OWNER_KEY] = owner.to_row()
             if held:
                 made[RETAINED_KEY] = retained(ws, checkouts, names, held)
-            made_record(ws).parent.mkdir(parents=True, exist_ok=True)
-            made_record(ws).write_text(json.dumps(made))
+            workspaces.save_snapshot(ws, row, made, owner)
             if held and not scratch_left(ws, checkouts):
                 for root in made[RETAINED_KEY]["roots"]:
                     refresh_released(ws, root)
             return
-    except (OSError, RuntimeError):
-        pass
-    made_record(ws).unlink(missing_ok=True)
+    except workspaces.SnapshotUnavailable as e:
+        log_snapshot_error(ws, owner.run, e)
+        workspaces.clear_snapshot(ws, row, unlink_legacy=isinstance(e, workspaces.UnreadableSnapshot))
+        return
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
+        log_snapshot_error(ws, owner.run, e)
+    workspaces.clear_snapshot(ws, row)
+
+
+def log_snapshot_error(ws: Path, run_id: str, error: Exception) -> None:
+    line = f"{util.iso()} could not record files in {ws}: {util.first_line(str(error), 300)}"
+    print(line, flush=True)
+    if run_id and Path(run_id).name == run_id and run_id not in (".", ".."):
+        with suppress(OSError):
+            with (paths.RUNS_DIR / run_id / "run.log").open("a") as log:
+                log.write(line + "\n")
 
 
 def unrecorded_files(ws: Path, names: list[str], source: Path, copies: list[str], made: dict,
@@ -530,25 +638,29 @@ def unrecorded_files(ws: Path, names: list[str], source: Path, copies: list[str]
 
 def kept_checkout(ws: Path, c: Checkout, source: Path, copies: list[str], *,
                   made: dict | None = None, commits: bool = True, held: list[Path] | None = None,
-                  closed: bool = False) -> str:
+                  closed: bool = False, force: bool = False, strict: bool = False) -> str:
     try:
         if closed and not (c.wt / ".git").exists():
             if c.wt.is_symlink() or (c.wt.exists() and any(c.wt.iterdir())):
                 return f"The closed PR checkout `{c.github}` at `{c.wt}` is incomplete. Arete left its files in place."
             return ""
         made = made_before(ws) if made is None else made
-        edits = uncommitted(c.wt)
+        edits = [] if force else uncommitted(c.wt)
         if edits and closed:
             return f"The closed PR checkout `{c.github}` at `{c.wt}` has uncommitted edits. Arete left them in place."
         edits = unrecorded_files(ws, [c.prefix + n for n in edits], source, copies, made, held)
-        ignored = unrecorded_files(ws, [c.prefix + n for n in ignored_files(c.wt)], source, copies, made, held)
+        ignored = [] if force else unrecorded_files(
+            ws, [c.prefix + n for n in ignored_files(c.wt)], source, copies, made, held)
         ahead = "0"
         if not closed:
             ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
             if head_recorded(made, c) == git(["rev-parse", "HEAD"], c.wt).strip():
                 ahead = "0"
     except (RuntimeError, OSError) as e:
-        return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
+        why = f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
+        if strict:
+            raise OSError(why) from e
+        return why
     if edits or ignored or ahead != "0":
         what = (f"uncommitted edits that arete has no record of leaving there ({', '.join(edits[:5])})" if edits
                 else (f"git-ignored files that arete has no record of leaving there ({', '.join(ignored[:5])})"
@@ -559,15 +671,21 @@ def kept_checkout(ws: Path, c: Checkout, source: Path, copies: list[str], *,
 
 
 def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True,
-              held: list[Path] | None = None, *, excluded: Collection[Path] = ()) -> str:
+              held: list[Path] | None = None, *, excluded: Collection[Path] = (), force: bool = False,
+              strict: bool = False) -> str:
     made = made_before(ws)
     examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
     for c in checkouts:
-        if c.wt in examined and (why := kept_checkout(ws, c, source, copies, made=made, commits=commits, held=held)):
+        if c.wt in examined and (why := kept_checkout(ws, c, source, copies, made=made, commits=commits, held=held,
+                                                     force=force, strict=strict)):
             return why
+    if force:
+        return ""
     try:
         others = unrecorded_files(ws, unexamined(ws, examined.union(excluded)), source, copies, made, held)
     except OSError as e:
+        if strict:
+            raise
         return f"arete could not read the existing workspace {ws}, so it left it as it is: {e}"
     if others:
         return (f"the existing workspace {ws} holds files outside this repo's worktrees ({', '.join(others[:5])}), "
@@ -588,14 +706,18 @@ def worktree_failure(why: str, ws: Path, branch: str) -> RunFailed:
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
-                    branch: str = "", *, excluded: Collection[Path] = ()) -> None:
+                    branch: str = "", *, excluded: Collection[Path] = (), by: str = "") -> None:
     if left := scratch_held(ws, checkouts):
         raise scratch_failure(
             f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})",
             ws, left)
-    if why := kept_work(ws, checkouts, source, copies, excluded=excluded):
+    row = workspaces.open_for(ws.name) if by == "sweep" else None
+    options = {"force": True} if row and row["remove_asked_by"] else {}
+    if why := kept_work(ws, checkouts, source, copies, excluded=excluded, strict=by == "sweep", **options):
         raise worktree_failure(why, ws, branch)
     removal = {"excluded": excluded} if excluded else {}
+    if by:
+        removal["by"] = by
     release = remove_workspace(ws, checkouts, **removal)
     if release.state == "held":
         raise removal_failure(ws, checkouts, release)
@@ -675,24 +797,30 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
     return ws, checkouts
 
 
-def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
+def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False, owner: str = "") -> Path:
     c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
-    release = remove_workspace(c.wt, [c])
-    if release.state == "held":
-        names = ", ".join(release.held_by[:5])
-        raise RunFailed("worktree removal withheld to preserve existing resources"
-                        + (f" ({names})" if names else ""))
-    fetch(c.src, base)
-    if resume:
-        fetch(c.src, branch)
-    c.resumes = resume
-    add_worktree(c, branch, start_of(c, branch))
+    with workspaces.folder_lock(c.wt):
+        release = remove_workspace(c.wt, [c])
+        if release.state == "held":
+            names = ", ".join(release.held_by[:5])
+            raise RunFailed("worktree removal withheld to preserve existing resources"
+                            + (f" ({names})" if names else ""))
+        fetch(c.src, base)
+        if resume:
+            fetch(c.src, branch)
+        c.resumes = resume
+        add_worktree(c, branch, start_of(c, branch))
+        workspaces.claim(c.wt, repo.name, "", owner or os.environ.get("ARETE_RUN_ID", ""), checkouts=[c])
     return c.wt
 
 
-def remove_worktree(repo: config.Repo, wt: Path) -> None:
+def remove_worktree(repo: config.Repo, wt: Path, owner: str = "") -> None:
     checkouts = [Checkout("", repo.github, repo.path, wt, "")]
-    release = remove_workspace(wt, checkouts)
+    try:
+        release = remove_workspace(wt, checkouts, by=owner or os.environ.get("ARETE_RUN_ID", ""))
+    except (OSError, sqlite3.Error) as e:
+        print(f"{util.iso()} worktree kept at {wt}: removal failed: {util.first_line(str(e), 300)}")
+        return
     if release.state == "held":
         print(f"{util.iso()} worktree kept at {wt}: removal blocked by {', '.join(release.held_by[:10])}")
 
@@ -701,19 +829,9 @@ def parts_of(repo: config.Repo) -> list[config.Part]:
     return repo.parts or [config.Part("", repo.name)]
 
 
-def owner_of(d: Path, cfg: config.Config) -> WorkspaceOwner | None:
-    owner = owner_in(made_before(d), strict=True)
-    if owner and owner.repo and owner.checkouts:
-        return owner
-    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True) if made_record(d).is_file() else []:
-        tid = d.name.removeprefix(f"{repo.name}-")
-        if tid != d.name and run_store.ticket_runs(repo.name, tid, limit=1):
-            checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, d / p.dir, "") for p in parts_of(repo)]
-            return WorkspaceOwner("", repo.name, tid, "", checkouts)
-    return None
-
-
 def tree_bytes(d: Path) -> int:
+    if d.is_symlink():
+        return 0
     total = 0
     for root, dirs, files in os.walk(d):
         for n in dirs + files:
@@ -724,67 +842,8 @@ def tree_bytes(d: Path) -> int:
     return total
 
 
-def held_entry(d: Path, owner: WorkspaceOwner, row: dict, blocked: bool, why: str,
-               names: list[str] | None = None) -> dict:
-    try:
-        modified = util.iso(datetime.fromtimestamp(d.stat().st_mtime, UTC))
-    except OSError:
-        modified = ""
-    return {"name": d.name, "path": str(d), "repo": owner.repo, "ticket": owner.ticket,
-            "run": row.get("id") or owner.run, "status": row.get("status") or "",
-            "since": row.get("finished") or row.get("started") or owner.created or modified,
-            "bytes": tree_bytes(d), "blocked": blocked, "why": why, "names": (names or [])[:10]}
-
-
 def ticket_closed(tid: str) -> bool:
     return tracker.is_task_id(tid) and tracker.task_state(tid) == "closed"
-
-
-def sweep_verdict(d: Path, owner: WorkspaceOwner, run_id: str, status: str) -> str | None:
-    if status not in ENDED and (status in WAITING or not ticket_closed(owner.ticket)):
-        return f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket"
-    made = made_before(d)
-    if any(onto_recorded(made, c) and (c.wt / ".git").exists() for c in owner.checkouts):
-        return f"run {run_id} kept edits in the workspace, so it waits for a resume"
-    return None
-
-
-def sweep_owned(d: Path, owner: WorkspaceOwner) -> dict | None:
-    repo, tid = owner.repo, owner.ticket
-    lock_name = run_store.run_lock("pipeline", repo, tid)
-    if util.lock_is_held(lock_name) or run_store.issue_running(repo, tid):
-        return None
-    row = (run_store.run_get(owner.run) if owner.run else None) or run_store.newest_whole_run(repo, tid) or {}
-    status = row.get("status") or ""
-    run_id = row.get("id") or owner.run
-    if why := sweep_verdict(d, owner, run_id, status):
-        return held_entry(d, owner, row, False, why)
-    with util.lock(lock_name) as got:
-        if not got:
-            return None
-        if blocked := sweep_remove(d, owner, row):
-            return blocked
-    print(f"{util.iso()} removed the workspace {d}: "
-          + (f"run {run_id} is {status}" if status in ENDED else f"task {tid} is closed"))
-    return None
-
-
-def sweep_remove(d: Path, owner: WorkspaceOwner, row: dict) -> dict | None:
-    checkouts = owner.checkouts
-    try:
-        clear_workspace(d, checkouts, checkouts[0].src, [])
-    except RunFailed as e:
-        names = workspace_blockers(d, checkouts, edits=True) if e.held_by is None else e.held_by
-        return held_entry(d, owner, row, True, e.why, names)
-    except (OSError, RuntimeError) as e:
-        return held_entry(d, owner, row, True, util.first_line(str(e), 300),
-                          workspace_blockers(d, checkouts, edits=True))
-    return None
-
-
-def sweep_unowned(d: Path, cutoff: float) -> None:
-    if d.stat().st_mtime < cutoff and not scratch_left(d, []) and not unexamined(d, set()):
-        shutil.rmtree(d, ignore_errors=True)
 
 
 def prune_repos(cfg: config.Config) -> None:
@@ -798,28 +857,11 @@ def prune_repos(cfg: config.Config) -> None:
                 pass
 
 
-def cleanup_worktrees(days: float = 7, cfg: config.Config | None = None) -> None:
-    cfg = cfg or config.load()
-    cutoff = util.now().timestamp() - days * 86400
-    held = []
-    for d in paths.WORKTREES_DIR.glob("*"):
-        try:
-            if not d.is_dir() or d.is_symlink():
-                continue
-            owner = owner_of(d, cfg)
-            if owner is None:
-                sweep_unowned(d, cutoff)
-            elif entry := sweep_owned(d, owner):
-                held.append(entry)
-        except Exception as e:
-            print(f"{util.iso()} sweeping {d}: {type(e).__name__}: {e}")
-    prune_repos(cfg)
-    util.write_json(HELD_FILE, sorted(held, key=lambda h: h["since"]))
-
-
 def held_summary() -> dict:
-    rows = util.read_json(HELD_FILE, [])
-    rows = rows if isinstance(rows, list) else []
+    candidates = workspaces.by_state("held", "kept", "released")
+    rows = [workspaces.held_entry(row) for row in candidates
+            if row["state"] != "released" or row["last_sweep_error"]]
+    rows.sort(key=lambda row: row["since"])
     oldest = rows[0] if rows else {}
     return {"count": len(rows), "bytes": sum(r.get("bytes") or 0 for r in rows), "oldest": oldest.get("since", ""),
             "oldest_name": oldest.get("name", ""), "blocked": sum(1 for r in rows if r.get("blocked")), "rows": rows}

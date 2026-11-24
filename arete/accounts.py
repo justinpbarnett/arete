@@ -205,6 +205,7 @@ def record(auth: Auth, *, secret_id: int | None = None) -> dict | None:
     secretstore.validate_account_id(label)
     if paths.DB_FILE.parent != paths.STATE_DIR or paths.FINGERPRINT_KEY_FILE.parent != paths.STATE_DIR:
         raise secretstore.StoreError("account registry files must belong to the current state directory")
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.tx() as c:
         holder = principals.ensure_local_owner(c)
         if holder is None:

@@ -220,8 +220,12 @@ def check_slot(run, *, parallel: bool):
         yield tuple(lock.fileno() for lock in (lease, seeker.request, serial) if lock is not None)
 
 
+def merge_lock(github: str) -> str:
+    return f"automerge-{quote(github.casefold(), safe='')}"
+
+
 def take_merge_lease(run, github: str, *, slot: RunSlot | None = None) -> TextIO:
-    lease = util.lock_file(f"automerge-{quote(github.casefold(), safe='')}")
+    lease = util.lock_file(merge_lock(github))
     try:
         with ExitStack() as stack:
             with admitting():

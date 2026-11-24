@@ -71,6 +71,7 @@ from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import triage as triage_store
+from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
 
@@ -526,6 +527,7 @@ class Run(AgentRun):
     owner_questions_blocked: bool = False
     environment_release: str = ""
     preview_of: str = ""
+    recovery: dict = field(default_factory=dict)
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -558,8 +560,18 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if kw.get("read_only"):
             return super().agent(step, text, cwd, role, **kw)
+        if self.recovery.get("direction") and role in ("plan", "build", "check_repair", "review_repair", "ci_repair"):
+            from . import unblock
+
+            text = unblock.brief(self, text)
         if not self.asks_owner:
+            due = self.answers_due if step == "plan" and not self.path else []
+            if due:
+                text = self.fresh_text(text, due)
             res = super().agent(step, text, cwd, role, **kw)
+            if due and res.ok:
+                asks_store.asks_taken([a["id"] for a in due], self.id)
+                self.answers_due = []
             if self.owner_questions_blocked and res.record and any(
                     event.get("kind") == "tool_call" and owner_asks.is_ask(event.get("name"))
                     for event in record.events(paths.record_dir(self.id) / res.record)):
@@ -743,24 +755,35 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner | None:
-    earlier = workspace.owner_in(workspace.made_before(ws))
-    if run.alone:
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
+    row = workspaces.open_for(ws.name)
+    earlier = workspaces.owner_of(row) if row and (row["owner_run"] or row["legacy_owner"]) else None
+    if run.alone and earlier:
         return earlier
     created = earlier.created if earlier else ""
     return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
 
 
+def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
+    workspace.made_before(ws)
+    owner = workspace_owner(run, ws, checkouts)
+    workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
+    run.workspace = ws, checkouts
+
+
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
-    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
-                        excluded=run.closed_checkout_paths)
-    if run.closed_checkouts:
-        run.log(f"workspace kept at {ws}: it contains closed PR worktrees")
+    try:
+        if run.closed_checkouts or run.catch_up_preserved:
+            workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
+                                excluded=run.closed_checkout_paths)
+            why = ("it contains closed PR worktrees" if run.closed_checkouts
+                   else "it contains files that existed before catch-up")
+            run.log(f"workspace kept at {ws}: {why}")
+            return False
+        release = workspace.remove_workspace(ws, checkouts, by=run.id)
+    except (OSError, sqlite3.Error) as e:
+        run.log(f"workspace kept at {ws}: removal failed: {util.first_line(str(e), 300)}")
         return False
-    if run.catch_up_preserved:
-        run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
-        return False
-    release = workspace.remove_workspace(ws, checkouts)
     if release.state == "removed":
         return True
     names = release.held_by
@@ -1800,7 +1823,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, launch_lease, pilot, zte
+    from . import flows, launch_lease, pilot, unblock, zte
     from .store import db
     from .store import zte as zte_store
 
@@ -1815,7 +1838,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     if not script:
-        adw = dispatch_path(repo, str(tid)) != "classic"
+        recovery_child = launch_lease.recovery(repo.name, str(tid))
+        adw = not recovery_child and dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1823,7 +1847,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = run_store.run_lock("pipeline", repo.name, tid)
-    with util.lock(lock) as got:
+    with workspaces.ticket_lock(repo.name, tid) as got:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -1889,8 +1913,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             feedback = pending_feedback(repo.name, tid) if may_revise else []
             feedback_readmits = (not dry_run and script and script.path == "orchestrate"
                                  and insights_store.has_fresh_feedback(feedback))
+            recovery, recovery_case = unblock.child_grant(cfg, repo, tk, str(tid), force=force, script=script,
+                                                           dry_run=dry_run)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-            if feedback_readmits and not (force or readmission):
+            if recovery or (feedback_readmits and not (force or readmission)):
                 budget_admission = runlimits.Admission()
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
@@ -1925,6 +1951,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
+            if recovery and slots.slots_free_to_start(cfg.max_parallel) == 0:
+                print(f"{name}: recovery is waiting for a run slot")
+                return SLOT_QUEUE_FAILED_EXIT
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
@@ -2014,6 +2043,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=committed)
+            elif recovery:
+                try:
+                    run_id = unblock.register(repo, recovery, recovery_case, start)
+                except ValueError as error:
+                    slot.free()
+                    print(f"{name}: {error}")
+                    return 2
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -2025,12 +2061,19 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
+                      recovery=recovery.get("grant", {}),
                 **(script.run_fields if script else {}))
+            if run.recovery:
+                run_lines.write(run.id, "recovery", grant=recovery["id"], source=recovery_case["source"],
+                                allowance=run.recovery.get("allowance", {}), action=recovery["decision"]["action"],
+                                direction=run.recovery.get("direction", ""))
+            if not script and run.answering and not dry_run:
+                run.answers_due = asks_store.asks_due([run.answering["id"]])
             try:
                 with handoff_io():
                     run.dir.mkdir(parents=True, exist_ok=True)
                     run_lines.write(run.id, "execution", path=run.path or "classic",
-                                    protocol=1 if run.path == "orchestrate" else 0,
+                                    **({} if run.path == "orchestrate" else {"protocol": 0}),
                                     **({"environment_release": run.environment_release} if run.environment_release else {}))
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                 if not zte_grant:
@@ -2076,7 +2119,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not zte_grant:
                 raise
             return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
-        pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
+        status, pr_url, passed, drive_entered, retaining_catch_up = "failed", "", None, False, False
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -2130,8 +2173,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
-            parent = parent_run(script, earlier, budget_history)
-            allow_reset = not (dry_run or retry_of)
+            parent = recovery_case["source"] if recovery else parent_run(script, earlier, budget_history)
+            if restarting and not (dry_run or only or run.recovery or zte_grant):
+                run.recovery = unblock.inherited(earlier, lambda: runlimits.specification(tk.get(tid)))
+            allow_reset = not (dry_run or retry_of or run.recovery)
             previous = "" if allow_reset and budget_admission.reset_time else parent
             repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
             can_reset_specs = bool(previous) and allow_reset and not restarting and not run.repairs and not run.alone
@@ -2140,11 +2185,19 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             current = tk.get(tid) if reset_changed_specs else None
             answered_runs = ()
             if not dry_run and not only and not (flow and flow.refusal):
-                answered_runs = tuple(a["run"] for a in run.answers_due)
-                if run.answering and answer_text(run.answering["id"]).strip():
+                answered_runs = tuple(a["run"] for a in run.answers_due if not owner_asks.supervisor_answered([a]))
+                if run.answering and not run.recovery and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
+            issue_goal = (not dry_run and not run.alone and not run.closed_context
+                          and unblock.active(cfg, repo.name, str(tid)) and not unblock.exclude(repo.name, str(tid)))
+            if issue_goal:
+                from . import issue_goal as goal_store
+
+                enrolled = unblock.ledger.follow(repo.name, str(tid), run.id)
+                if enrolled and not cfg.replay.all:
+                    goal_store.lifecycle(repo.name, tid, "start")
             new_budget = partial(runlimits.Budget, run, runlimits.Policy.of(layer), previous,
-                                 repair_previous=repair_parent, answered_runs=answered_runs,
+                                 repair_previous=repair_parent, answered_runs=answered_runs, issue_goal=issue_goal,
                                  wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                  checkpoint_gate=checkpoint_allowed if zte_grant else None, fixed_gaps=fixed_gaps)
             budget_started = None
@@ -2270,12 +2323,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     run.log(f"SIGTERM: could not keep work: {error}")
                 finally:
                     os.kill(os.getpid(), signal.SIGTERM)
-            if run.workspace and not zte_grant:
-                if not keep_edits_blocker():
-                    keep_edits(run)
-                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                    excluded=run.closed_checkout_paths)
-            slot.free()
+            try:
+                if run.workspace and not zte_grant:
+                    if not keep_edits_blocker():
+                        keep_edits(run)
+                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                                        preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
+                    workspaces.keep(run.workspace[0], status)
+            except (OSError, sqlite3.Error) as e:
+                run.log(f"could not finalize workspace {run.workspace[0]}: {util.first_line(str(e), 300)}")
+            finally:
+                slot.free()
         if run.catch_up_cleanup_park and (held := kept_heads(run)):
             try:
                 if parked := runlimits.metadata(run.id, "parked.json"):
@@ -2369,9 +2427,20 @@ def question_time(run: dict) -> str:
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
+        questions = run_lines.read(answering["id"])
         asked = question_time(answering)
         if asked:
-            run_lines.waited(run_id, "person", asked, passed_over or now)
+            until = passed_over or now
+            if any(line.get("event") == "question" and line.get("recovery") for line in questions):
+                from .store import unblock as unblock_store
+
+                owner_at = unblock_store.notified_at(answering["id"])
+                handled = min(owner_at, until) if owner_at else until
+                run_lines.waited(run_id, "unblock", asked, handled)
+                if owner_at and owner_at < until:
+                    run_lines.waited(run_id, "person", owner_at, until)
+            else:
+                run_lines.waited(run_id, "person", asked, until)
     if passed_over:
         run_lines.waited(run_id, "slot", passed_over, now)
 
@@ -2384,18 +2453,29 @@ def run_minutes(row: dict) -> float:
 
 def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, summary: str,
          asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
+    from . import unblock
+
+    recover = (not run.dry_run and not run.alone and unblock.active(run.config, run.repo.name, str(run.tid))
+               and not unblock.exclude(run.repo.name, str(run.tid)))
+    if recover and not asked:
+        question = owner_asks.text_ask(summary)
+        asked = [{**question, "step": "plan", "call": "plan", "ask_id": f"{run.id}-a1"}]
+        session = {}
     for ask in asked or [{}]:
-        run_lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
+        run_lines.write(run.id, "question", question=comment, summary=summary[:300], recovery=recover, **ask)
     if asked and session is not None and not run.dry_run:
         for ask in asked:
             asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
-                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session)
-        run.say(outbound.screen(comment))
+                          ask.get("why", ""), ask.get("tried", ""), ask["questions"], session,
+                          recovery_route="unblock" if recover else "owner")
+        if not recover:
+            run.say(outbound.screen(comment))
         run.enter("needs-info")
         devices.release(run.id, run.log)
-        alerts.ask_notice(run.where, summary)
-        for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
-            run.log(note)
+        if not recover:
+            alerts.ask_notice(run.where, summary)
+            for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
+                run.log(note)
         run.log("needs-info: kept the work folder and the step's session for the answer")
         return "needs-info", summary[:300], ""
     run.say(comment)
@@ -2521,7 +2601,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     try:
         ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
                                                  main_layer.copy, preview_of=run.preview_of)
-        run.workspace = ws, checkouts
+        claim_workspace(run, ws, checkouts)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -2883,10 +2963,13 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
 
 
 def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
+    from . import merge_review
+
     run = b.run
     if draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
         return False
-    if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
+    triaged = (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels
+    if triaged and not merge_review.enrolled(run):
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         run.log(f"automerge left off: {run.facts['merge_held']}")
         return False
@@ -2908,10 +2991,15 @@ def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, re
 
 
 def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
+    from . import merge_review
+
     if not hold:
         run.log(f"automerged {c.pr} at {c.lease}")
         return
     run.facts["merge_held"] = hold
+    if hold == merge_review.PENDING or (merge_review.enrolled(run) and hold != merge_review.MULTIPLE):
+        run.log(f"{c.pr}: {hold}")
+        return
     run.log(f"automerge left {c.pr} for a person: {hold}")
     try:
         gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
@@ -3126,8 +3214,10 @@ def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Ver
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                track_moved_base: bool = False) -> str:
+    from . import merge_review
+
     if len(b.checkouts) != 1:
-        return "a change spanning repositories cannot be merged atomically"
+        return merge_review.MULTIPLE
     head = c.lease
     if hold := merge_evidence_hold(b, c, verified, review, head):
         return hold
@@ -3137,6 +3227,10 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     if not has_merge_base(c, head, base_sha):
         hold = "the checked head does not contain the target base"
         return gh.MovedBaseHold(hold) if track_moved_base else hold
+    if merge_review.enrolled(b.run):
+        if b.cfg.replay.all or paths.ISOLATED:
+            return "Live issue merge decisions require a live delivery"
+        return merge_review.nominate(b, c, verified, review, base_sha, about)
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base)
@@ -4969,7 +5063,8 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
 
 
 def retry_scratch(days: float = 30) -> None:
-    for root in workspace.finalize_scratch():
+    pending_refresh: set[str] = set()
+    for root in workspace.finalize_scratch(pending_refresh=pending_refresh):
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained") and data["diagnostic"]:
@@ -4981,7 +5076,7 @@ def retry_scratch(days: float = 30) -> None:
     except OSError as e:
         print(f"verification scratch store unreadable: {e}")
     try:
-        for failure in scratch.settle(days):
+        for failure in scratch.settle(days, pending_refresh=pending_refresh):
             print(f"verification scratch settle failed: {failure}")
     except sandbox.ConfinementUnavailable:
         pass
