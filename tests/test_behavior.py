@@ -5473,6 +5473,43 @@ class VersionedApiTests(unittest.TestCase):
         self.assertEqual(self.request({"repo": "fixture", "prompt": "Must roll back"}), answer)
 
 
+class AuthorityHeadlessOwnerTests(_WorkspaceChildCase):
+    def test_tailnet_seed_links_the_headless_owner_once(self):
+        self.run_child("""
+from arete import principals, tailnet
+from arete.store import principals as people
+
+db.migrate()
+with db.tx() as c:
+    owner = people.ensure_local_owner(c)
+    assert people.ensure_local_owner(c) == owner
+assert owner.startswith('u:') and principals.needs_owner_login()
+login = 'owner@example.test'
+host = Mock()
+host.seed_identity.return_value = (login, 'Fixture owner')
+for _ in range(2):
+    tailnet.seed_owner(host, config.Config())
+host.seed_identity.assert_called_once()
+assert principals.owner() == principals.for_login(login) == owner
+assert not principals.needs_owner_login()
+""")
+
+    def test_existing_nonowner_keeps_the_original_id_and_is_not_enrolled(self):
+        self.run_child("""
+from arete import principals
+from arete.store import principals as people
+
+db.migrate()
+with db.tx() as c:
+    c.execute("INSERT INTO principals (id, kind, role, name, status, created) "
+              "VALUES ('u:existing', 'human', 'member', 'Member', 'active', ?)", (util.iso(),))
+    assert people.ensure_local_owner(c) is None
+assert not principals.needs_owner_login()
+assert principals.seed_owner('unrelated@example.test') == 'u:existing'
+assert principals.for_login('unrelated@example.test') is None and principals.owner() == 'hand'
+""")
+
+
 class PrincipalTests(unittest.TestCase):
     def test_principal_gate(self):
         owner = principals.seed_owner("fixture@example.test")

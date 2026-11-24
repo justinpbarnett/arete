@@ -148,7 +148,7 @@ def this_node(host: Tailscale | None = None) -> Node | None:
 
 
 def seed_owner(host, cfg):
-    if not principals.active_human():
+    if principals.needs_owner_login():
         principals.seed_owner(*host.seed_identity(cfg.dashboard_owner))
 
 
