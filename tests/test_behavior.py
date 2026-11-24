@@ -1164,6 +1164,33 @@ with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', file):
     assert not file.exists()
 """)
 
+    def test_missing_fallback_after_configuration_does_not_adopt_an_unbound_key(self):
+        self.run_secret_child(r"""
+from arete import accounts
+from arete.store import principals
+
+principals.seed_owner('fixture@example.invalid')
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    auth = accounts.pi('fixture', {'key': 'synthetic-provider-key'})
+    assert accounts.record(auth)
+    paths.FINGERPRINT_KEY_FILE.unlink()
+    paths.CONFIG_FILE.write_text(settings)
+    configured = config.secret_settings()
+    ref = secretstore.Reference(configured.store, db.schema_metadata()['instance_tag'], secretstore.KEY_ITEM)
+    secretstore.write_item(ref, configured, b'x' * 32)
+    with mock.patch.object(secretstore, 'write_item') as write:
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            accounts.record(auth)
+        with db.tx() as c:
+            c.execute('DELETE FROM schema_meta WHERE key = ?', (secretstore.KEY_LOCAL,))
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            accounts.record(auth)
+        write.assert_not_called()
+    assert 'fingerprint_key_ref' not in db.schema_metadata()
+""")
+
 
 class AuthoritySchemaTests(_SecretChildCase):
     def test_secret_tables_are_strict_and_subscription_requires_personal_holder(self):
@@ -1212,6 +1239,620 @@ with db.reader() as c:
     assert snapshot(c) == before
 assert secretstore.get('global', 'DEMO_KEY') == row
 """, schema=26)
+
+
+SECRET_ROUTED_ACCOUNT_FIXTURE = r"""
+from types import SimpleNamespace
+
+from arete import accounts, pi, runner
+from arete.agent import Result
+from arete.store import principals
+
+login = 'fixture@example.invalid'
+
+def launch_picked(auth, credential, *, agent='pi', model='demo', billing='free', route=None, result=None):
+    candidate = SimpleNamespace(runner=agent, provider=auth.provider, model=model, credential=credential, billing=billing,
+                                effort='', tier='', position=0, requested=True)
+    pick = runner.Picked(candidate, auth, route, 'demo', '', {auth}, None)
+    with (mock.patch.object(runner, 'pick', return_value=(pick, [])),
+          mock.patch.object(runner, 'launch_kwargs', return_value={}),
+          mock.patch.object(runner, 'launch_env', return_value=[]),
+          mock.patch.object(runner, 'attempt', return_value=result or Result(ok=True)) as attempt):
+        launched = runner.run('fixture prompt', Path.cwd(), runner=agent, model=model, cfg=config.Config())
+    attempt.assert_called_once()
+    return launched
+
+def assert_no_accounts():
+    with db.reader() as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 0
+"""
+
+
+class AuthorityAccountTests(_SecretChildCase):
+    def test_fresh_headless_run_enrolls_the_login_under_an_owner_principal(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+from dataclasses import replace
+from arete import tailnet
+from arete.agent import Session
+
+assert principals.owner() == 'hand'
+auth = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-account'}, 'fixture')
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    result = launch_picked(auth, 'cli_login', agent='codex',
+                           result=Result(ok=True, session=Session(id='fixture', runner='codex')))
+    assert result.ok and result.session.account == runner.account_of(auth)
+    with db.reader() as c:
+        first, = map(dict, c.execute('SELECT * FROM accounts'))
+        assert c.execute('SELECT count(*) FROM principal_logins').fetchone()[0] == 0
+        assert c.execute('SELECT count(*) FROM tokens').fetchone()[0] == 0
+    paths.CONFIG_FILE.write_text(settings)
+    assert accounts.record(auth) == first
+holder = principals.owner()
+assert first['id'] == 'openai-codex:subscription' and first['holder'] == holder and holder.startswith('u:')
+assert first['usage'] == 'personal'
+assert first['identity'] != auth.identity and first['fingerprint'] != auth.credential
+assert principals.for_login(login) is None
+host = SimpleNamespace(seed_identity=mock.Mock(return_value=(login, 'Fixture Owner')))
+tailnet.seed_owner(host, config.Config())
+tailnet.seed_owner(host, config.Config())
+host.seed_identity.assert_called_once()
+assert principals.owner() == principals.for_login(login) == holder
+rotated = accounts.record(replace(auth, credential='synthetic-rotation'))
+assert rotated['id'] == first['id'] and rotated['identity'] == first['identity']
+assert rotated['fingerprint'] != first['fingerprint'] and rotated['version'] == first['version'] + 1
+other = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'another-fixture'}, 'fixture')
+assert accounts.record(other)['id'] == first['id'] + ':2'
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM events_log WHERE subject = 'account:openai-codex:subscription' "
+                     "AND kind = 'credential.changed'").fetchone()[0] == 2
+""")
+
+    def test_keyless_local_route_records_no_account(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+principals.seed_owner(login)
+auth = accounts.pi('ollama')
+route = pi.Route('ollama', 'demo', auth, local=True)
+assert launch_picked(auth, 'local', model='ollama/demo', route=route).ok
+assert_no_accounts()
+assert not Path('store').exists()
+""")
+
+    def test_registry_keychain_failure_keeps_the_resolved_provider_launch(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import subprocess
+
+principals.seed_owner(login)
+key = 'synthetic-provider-key'
+auth = accounts.pi('openai', {'key': key})
+route = pi.Route('openai', 'demo', auth, key=key)
+locked = subprocess.CompletedProcess([], 1, b'', b'fixture locked')
+with (mock.patch.object(paths, 'ISOLATED', False),
+      mock.patch.object(secretstore, 'security', return_value=locked) as backend,
+      case.assertLogs('arete.accounts', 'WARNING') as warnings):
+    assert launch_picked(auth, 'api_key', billing='paid', route=route).ok
+backend.assert_called_once()
+assert len(warnings.output) == 1 and 'StoreError' in warnings.output[0]
+assert_no_accounts()
+assert 'fingerprint_key_ref' not in db.schema_metadata()
+""", keychain=True)
+
+
+class AuthorityAccountRefreshTests(_SecretChildCase):
+    def test_two_workers_and_a_pinned_retry_keep_one_confirmed_login(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+route = pi.Route(provider, 'fixture', first, owner=owner)
+pi.observed_refresh(route, {'provider': provider, 'before': before, 'after': after})
+refreshed = accounts.record(latest)
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
+    def test_confirmed_refresh_reconciles_after_the_worker_lease(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import json
+import os
+import subprocess
+from arete import sandbox
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+owner.write_text(json.dumps({provider: before}))
+route = pi.Route(provider, provider + '/fixture', first, owner=owner, using_login=True, view=Path.cwd())
+
+def stream(cmd, cwd, env, *_args, pass_fds):
+    paths.CONFIG_FILE.write_text(configured)
+    event = {'provider': provider, 'before': before, 'after': after}
+    writer, ack = pass_fds
+    os.write(writer, json.dumps(event).encode() + b'\n')
+    assert os.read(ack, 1) == b'1'
+    with db.tx(timeout=1) as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert secretstore.KEY_REF not in db.schema_metadata()
+    reply = {'type': 'agent_end', 'messages': [{'role': 'assistant', 'content': []}]}
+    return subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ''), ''
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(pi, 'stream', side_effect=stream),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi')):
+    result = pi.run('fixture', Path.cwd(), selected=route, persist=False)
+assert result.ok, result.error
+assert secretstore.KEY_REF in db.schema_metadata()
+with db.reader() as c:
+    refreshed, = map(dict, c.execute('SELECT * FROM accounts'))
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(latest) == refreshed
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
+SECRET_HTTP_FIXTURE = r"""
+import json
+from types import SimpleNamespace
+
+from arete import contract, dashboard, idempotency, tailnet
+from arete.store import principals, tokens
+from tests.test_behavior import VersionedApiTests, fixture_bearer
+
+login = 'fixture@example.invalid'
+actor = principals.seed_owner(login)
+bearer = fixture_bearer(actor).removeprefix('Bearer ')
+logins = tailnet.Logins(mock.Mock())
+logins.of = lambda _: login
+server = SimpleNamespace(node=SimpleNamespace(names={'127.0.0.1'}), logins=logins, tls=object())
+root = '/api/v1/secrets'
+item = root + '/global/DEMO_KEY'
+pairings = '/api/v1/auth/pairings'
+
+def request(method, at, payload=b'', *, token=None, cookie=None, key='request-demo', media='application/json',
+            handler=dashboard.Handler, csrf=True, status=200, code=None, reason=None, allow=None):
+    headers = {'Connection': 'close'}
+    if method != 'GET':
+        headers.update({'Content-Type': media, 'Content-Length': str(len(payload)), 'Idempotency-Key': key})
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    if cookie:
+        headers.update({'Cookie': cookie, 'Origin': 'https://127.0.0.1'})
+        if csrf:
+            headers['X-Arete'] = '1'
+    actual_status, response, raw = VersionedApiTests.wire_exchange(method, at, headers, payload, server=server, handler=handler)
+    answer = json.loads(raw)
+    expected = (status, code, reason, allow)
+    actual = (actual_status, answer.get('code'), answer.get('reason'), response.get('Allow'))
+    assert all(want is None or got == want for got, want in zip(actual, expected)), (method, at, expected, actual, answer)
+    return response, answer
+
+def assert_shape(operation, result):
+    contract.validate(result, contract.BY_NAME[operation]['result'])
+
+def browser_session():
+    _, pairing = request('POST', pairings, token=bearer, status=201)
+    claim = json.dumps({'code': pairing['code']}).encode()
+    headers, _ = request('POST', pairings + '/claim', claim, key='request-claim', status=201)
+    return headers['Set-Cookie'].split(';')[0]
+"""
+
+
+class SecretApiTests(_SecretChildCase):
+    def test_every_secret_route_requires_a_store_and_principal_is_reserved(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+for method, at in [('GET', root), ('GET', item), ('GET', item + '/history'), ('PUT', item + '/value'),
+                   ('DELETE', item), ('POST', item + '/check')]:
+    request(method, at, token=bearer, status=501, code='secret_store_missing')
+paths.CONFIG_FILE.write_text(settings)
+request('GET', root + '/principal%3Au%3A1234abcd/DEMO_KEY', token=bearer, status=404, code='not_found')
+""")
+
+    def test_only_a_paired_browser_sets_values_and_responses_are_metadata(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+value = b'fixture-api-token'
+write = dict(payload=value, media='text/plain', key='request-set')
+for tls, status, code, reason in [(None, 426, 'tls_required', None), (object(), 403, 'forbidden', 'presence_required')]:
+    server.tls = tls
+    request('PUT', item + '/value', token=bearer, status=status, code=code, reason=reason, **write)
+assert secretstore.get('global', 'DEMO_KEY') is None and not Path('store').exists()
+cookie = browser_session()
+_, result = request('PUT', item + '/value', cookie=cookie, **write)
+row = secretstore.get('global', 'DEMO_KEY')
+assert result['secret']['fingerprint'] == row['fingerprint']
+request('PUT', item + '/value', cookie=cookie, **write)
+with db.reader() as conn:
+    event, = conn.execute("SELECT actor, data FROM events_log WHERE kind = 'credential.changed'").fetchall()
+    assert event['actor'] == actor
+    assert json.loads(event['data']) == {'name': 'DEMO_KEY', 'scope': 'global', 'fingerprint': row['fingerprint']}
+    receipt = conn.execute("SELECT * FROM idempotency WHERE key = 'request-set'").fetchone()
+    expected = idempotency.fingerprint('PUT', '/api/v1/secrets/{scope}/{name}/value',
+                                       {'scope': 'global', 'name': 'DEMO_KEY'}, {'fingerprint': row['fingerprint']})
+    assert receipt['request_sha'] == expected
+    assert value not in receipt['response']
+
+def assert_redacted(operation, result):
+    assert_shape(operation, result)
+    body = json.dumps(result)
+    assert value.decode() not in body and row['reference'] not in body
+
+_, result = request('GET', item, token=bearer)
+assert_redacted('secret.get', result)
+_, reader = tokens.issue(actor, 'Read fixture', ['read'])
+request('POST', item + '/check', token=reader, key='request-check', status=403, code='scope_missing')
+_, checker = tokens.issue(actor, 'Check fixture', ['config:activate'])
+_, result = request('POST', item + '/check', token=checker, key='request-check')
+assert result['secret']['check_ok'] is True, result
+_, result = request('DELETE', item, cookie=cookie, key='request-delete')
+assert result['secret']['present'] is False and secretstore.read('global', 'DEMO_KEY') is None, result
+_, result = request('GET', item + '/history', token=bearer)
+assert_redacted('secret.history', result)
+assert [event['event'] for event in result['history']] == ['set', 'checked', 'removed']
+
+from arete import accounts
+
+accounts.record(accounts.Auth('api_key', credential='synthetic-account-login', provider='demo'), secret_id=row['id'])
+_, result = request('GET', '/api/v1/accounts', token=bearer)
+assert_shape('account.list', result)
+assert result['accounts'] == [{'id': 'demo:api_key', 'service': 'demo', 'mode': 'api_key',
+                               'usage': 'personal', 'holder': actor, 'secret_name': 'DEMO_KEY'}]
+""")
+
+    def test_removal_refuses_fingerprint_key_and_owner_file(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + SECRET_OWNER_FILE_FIXTURE + r"""
+cookie = browser_session()
+file, value, row = seed_owner_file(actor)
+key = secretstore.fingerprint_key()
+meta = db.schema_metadata()
+ref = secretstore.parse_reference(meta['fingerprint_key_ref'], meta['instance_tag'])
+for name in ('FINGERPRINT_KEY', 'OWNED'):
+    request('DELETE', f'{root}/global/{name}', cookie=cookie, key=f'remove-{name}', status=409, code='secret_internal')
+assert secretstore.get('global', 'OWNED') == row and not secretstore.history('global', 'OWNED')
+assert secretstore.read_item(ref, config.secret_settings()) == key
+assert file.read_bytes() == value.encode()
+""")
+
+
+class AuthorityRegistryAdmissionTests(_SecretChildCase):
+    def test_scratch_read_admission_excludes_the_registry_directly_and_in_batches(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+from arete import verify_faults
+
+(paths.STATE_DIR.parent / '.arete-owned').write_bytes(verify_faults.MARKER + b'\n')
+scratch = dashboard.handlers().open
+assert scratch is not dashboard.Handler
+server.tls = None
+request('GET', '/api/v1/runs', handler=scratch)
+batch = '/api/v1/batch'
+reads = [{'operation': 'meta.get'}]
+request('POST', batch, json.dumps({'requests': reads}).encode(), handler=scratch)
+for operation, route in [('secret.list', root), ('account.list', '/api/v1/accounts')]:
+    request('GET', route, handler=scratch, status=401, code='unauthenticated')
+    body = json.dumps({'requests': [*reads, {'operation': operation}]}).encode()
+    request('POST', batch, body, handler=scratch, status=401, code='unauthenticated')
+    request('POST', batch, body, token=bearer, handler=scratch)
+""")
+
+    def test_unsupported_put_reports_allow_and_registry_put_still_requires_admission(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+_, reader = tokens.issue(actor, 'Read fixture', ['read'])
+unsupported = dict(status=405, code='method_not_allowed')
+for route, allow in [('/api/v1/meta', 'GET'), ('/api/v1/batch', 'POST'), (item, 'GET, DELETE')]:
+    request('PUT', route, token=reader, allow=allow, **unsupported)
+
+cookie = browser_session()
+request('PUT', item, cookie=cookie, csrf=False, allow='GET, DELETE', **unsupported)
+write = dict(payload=b'fixture-registry-value', media='text/plain')
+for token, status, code, reason in [(None, 401, 'unauthenticated', None), (reader, 403, 'forbidden', 'presence_required')]:
+    request('PUT', item + '/value', token=token, status=status, code=code, reason=reason, **write)
+request('PUT', item + '/value', cookie=cookie, csrf=False, status=403, code='csrf', **write)
+assert secretstore.get('global', 'DEMO_KEY') is None
+""")
+
+
+class AuthorityAccountIsolationTests(_SecretChildCase):
+    def test_resolved_account_refuses_state_from_another_instance(self):
+        self.run_secret_child(r"""
+from arete import accounts
+
+auth = accounts.Auth('api_key', credential='fixture-account', provider='openrouter')
+with (mock.patch.object(paths, 'STATE_DIR', Path.cwd() / 'other-state'),
+      mock.patch.object(db, 'tx') as transaction, mock.patch.object(config, 'secret_settings') as settings):
+    accounts.record_resolved(auth)
+    transaction.assert_not_called()
+    settings.assert_not_called()
+""")
+
+
+SECRET_GUARD_FIXTURE = r"""
+import json
+import time
+from contextlib import redirect_stdout
+from io import StringIO
+from threading import Event
+from types import SimpleNamespace
+
+from arete import codex, guard, pi_shell, sandbox, scratch
+from arete.commands.hooks import cmd_guard
+
+store = config.secret_settings().store_dir
+assert store in sandbox.authority_roots() and store in scratch.hidden_folders()
+row = secretstore.put('global', 'DEMO_KEY', 'synthetic-guard-value', 'api_key', 'hand')
+ref = secretstore.parse_reference(row['reference'], db.schema_metadata()['instance_tag'])
+path, _ = secretstore.file_location(ref, config.secret_settings())
+work = Path.cwd() / 'workspace'
+work.mkdir()
+args = SimpleNamespace(scratch='', scratch_id='', scratch_saves='', judge=False, open=[work], closed=[])
+
+def check(tool, **values):
+    payload = {'tool_name': tool, 'tool_input': values, 'cwd': str(work)}
+    with mock.patch('sys.stdin', StringIO(json.dumps(payload))), redirect_stdout(StringIO()) as out:
+        assert cmd_guard(args) == 0
+    return json.loads(out.getvalue())['hookSpecificOutput']['permissionDecision'] if out.getvalue() else ''
+
+def codex_check(command):
+    return codex.guard_reason({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(work)}, False, [])
+
+shell = pi_shell.Shell(work, (), guard.floor('', work, ()), ('Bash',), (), {}, (), False, time.monotonic() + 30)
+"""
+
+
+class AuthoritySecretGuardTests(_SecretChildCase):
+    def test_agent_hooks_deny_interactive_keychain_and_external_store(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+for command in ('security -i', 'security', 'security find-generic-password -s ' + ref.service,
+                'env -u ARETE_FIXTURE security -i', 'nice -n 5 /usr/bin/security', 'timeout 2 security -i',
+                "bash -lc 'env -u ARETE_FIXTURE security'", '>fixture-output security -i'):
+    assert check('Bash', command=command) == 'deny'
+    assert codex_check(command)
+    with case.assertRaisesRegex(ValueError, 'security keychain items'):
+        shell.execute({'command': command}, Event())
+assert check('Read', file_path=str(path)) == 'deny'
+assert check('Bash', command=f'cat {path}') == 'deny'
+assert check('Read', file_path=str(work / 'ordinary.txt')) == ''
+alternate = store.with_name(store.name.upper()) / path.relative_to(store)
+assert check('Read', file_path=str(alternate)) == 'deny'
+assert check('Bash', command=f'cat {alternate}') == 'deny'
+assert check('Grep', path=str(store.parent), pattern='fixture') == 'deny'
+assert check('Grep', path=str(work), pattern='fixture') == ''
+args.open.append(path.parent)
+assert check('Read', file_path=str(path)) == 'deny'
+""")
+
+    def test_claude_lab_checkout_is_open_inside_closed_grading_context(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+assert check('Grep', path='..', pattern='fixture') == 'deny'
+assert check('Glob', pattern='../**/*') == 'deny'
+closed = Path.cwd() / 'outer-state'
+checkout = closed / 'trial' / 'checkout'
+checkout.mkdir(parents=True)
+args.closed = [closed]
+args.open.append(checkout)
+assert check('Read', file_path=str(checkout / 'README.md')) == ''
+assert check('Bash', command=f'cat {checkout}/README.md') == ''
+assert check('Grep', path=str(checkout), pattern='fixture') == ''
+assert check('Read', file_path=str(closed / 'other-context.txt')) == 'deny'
+assert check('Bash', command=f'cat {closed}/other-context.txt') == 'deny'
+""")
+
+    def test_all_three_agents_allow_public_certificate_verification_and_security_searches(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+for command in ('rg -n security .', "grep -R 'security' .",
+                'env -u ARETE_FIXTURE rg security .', "bash -lc 'rg -n security .'",
+                'security verify-cert -c public.crt', '/usr/bin/security -q verify-cert -c public.crt'):
+    assert check('Bash', command=command) == '', command
+    assert codex_check(command) == '', command
+    with mock.patch.object(pi_shell.Shell, 'profile', side_effect=RuntimeError('admitted')):
+        with case.assertRaisesRegex(RuntimeError, 'admitted'):
+            shell.execute({'command': command}, Event())
+""")
+
+
+SECRET_LINUX_CLAUDE_FIXTURE = r"""
+import os
+import subprocess
+
+from arete import accounts, claude, sandbox
+
+store = config.secret_settings().store_dir
+state = paths.STATE_DIR.resolve()
+key = secretstore.local_key_path()
+bwrap = '/usr/bin/bwrap'
+store_mask = ['--tmpfs', str(store), '--remount-ro', str(store)]
+key_mask = ['--ro-bind', os.devnull, str(key)]
+
+def linux_checkout(parent=paths.WORKTREES_DIR):
+    checkout = parent / 'checkout'
+    checkout.mkdir(parents=True)
+    return checkout
+
+def run_claude(checkout, **options):
+    return claude.run('fixture', checkout, auth=accounts.Auth(), passing=[], persist=False, **options)
+
+@contextmanager
+def linux_claude(*, error=''):
+    stdout = '' if error else '{"type":"result","result":"fixture"}'
+    fixture = subprocess.CompletedProcess([], int(bool(error)), stdout, error)
+    with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
+          mock.patch.object(sandbox.shutil, 'which', return_value=bwrap) as which,
+          mock.patch.object(claude, 'binary', return_value='/fixture/claude'),
+          mock.patch.object(sandbox.WorkerLease, 'command', lambda _, cmd: cmd),
+          mock.patch.object(claude.child, 'stream', return_value=fixture) as stream):
+        yield which, stream
+
+def assert_missing_bwrap(which, stream, checkout, **options):
+    which.return_value = None
+    refused = run_claude(checkout, **options)
+    assert not refused.ok and 'requires bubblewrap' in refused.error
+    stream.assert_not_called()
+    which.return_value = bwrap
+
+def assert_linux_policy(argv, env, checkout, masks, extra=()):
+    from arete import guard
+
+    end = argv.index('--')
+    policy = argv[:end]
+    assert argv[end - 2:end + 2] == ['--chdir', str(checkout), '--', '/fixture/claude']
+    assert ['--ro-bind', '/', '/'] == policy[policy.index('--new-session') + 1:policy.index('--proc')]
+    assert policy[policy.index('--proc'):policy.index('--dev') + 2] == ['--proc', '/proc', '--dev', '/dev']
+    readonly = {tuple(policy[i + 1:i + 3]) for i, flag in enumerate(policy) if flag == '--ro-bind'}
+    assert (str(state), str(state)) in readonly
+    assert ('/dev/null', str(key)) in readonly if '--ro-bind' in masks else ('/dev/null', str(key)) not in readonly
+    profile = Path(env.get('CLAUDE_CONFIG_DIR') or Path(env['HOME']) / '.claude').resolve()
+    added = {Path(argv[i + 1]).resolve() for i, flag in enumerate(argv[:-1]) if flag == '--add-dir'}
+    allowed = {checkout.resolve(), profile, Path(env['TMPDIR']), *extra, *added,
+               *(p.resolve() for p in guard.run_folders(env.get('ARETE_RUN_ID', '')))}
+    writes = {Path(policy[i + 2]) for i, flag in enumerate(policy) if flag == '--bind'}
+    assert writes == {p for p in allowed if allowed.isdisjoint(p.parents)}, (writes, allowed)
+    assert all(state != p and not state.is_relative_to(p) for p in writes)
+    if masks:
+        assert policy[-len(masks) - 2:-2] == list(masks)
+
+def assert_mounts(stream, checkout, *masks):
+    argv, _, _, env, *_ = stream.call_args.args
+    assert argv[0] == bwrap
+    assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc',
+            '--die-with-parent', '--new-session'} <= set(argv)
+    assert argv[argv.index('--cap-drop') + 1] == 'ALL'
+    assert_linux_policy(argv, env, checkout, masks)
+    if '--tmpfs' in masks:
+        assert store.stat().st_mode & 0o777 == 0o700
+"""
+
+
+class AuthorityLinuxStoreTests(_SecretChildCase):
+    def test_linux_claude_runs_inside_store_confinement_or_fails_closed(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+checkout = linux_checkout()
+with linux_claude(error='fixture: namespace unavailable') as (which, stream):
+    assert_missing_bwrap(which, stream, checkout, tools=['Bash'])
+    blocked = run_claude(checkout, tools=['Bash'])
+    stream.assert_called_once()
+    assert_mounts(stream, checkout, *store_mask)
+    assert not blocked.ok and 'namespace unavailable' in blocked.error
+""")
+
+
+    def test_codex_publication_waits_for_the_old_profile(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+from arete import codex
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+
+def launch(cmd, *_args, **_kwargs):
+    assert str(store) not in ' '.join(cmd)
+    paths.CONFIG_FILE.write_text(configured)
+    with case.assertRaises(secretstore.CredentialActivationBusy):
+        secretstore.fingerprint_key()
+    assert not store.exists()
+    return subprocess.CompletedProcess(cmd, 0, '{"type":"thread.started","thread_id":"fixture"}\n', '')
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(codex, 'launch', side_effect=launch),
+      mock.patch.object(codex, 'binary', return_value='/fixture/codex')):
+    assert codex.run('fixture', linux_checkout(), auth=accounts.Auth(), persist=False).ok
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux descendant supervision")
+    def test_keyless_claude_relay_drains_background_work_before_publication(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+work = linux_checkout()
+launcher = Path.cwd() / 'fixture-launcher'
+launcher.write_text(r'''#!/bin/sh
+sleep 60 &
+echo $! > child.pid
+printf '%s\n' '{"type":"result","session_id":"fixture"}'
+''')
+launcher.chmod(0o700)
+with (mock.patch.object(sandbox.shutil, 'which', return_value=str(launcher)),
+      mock.patch.object(claude, 'binary', return_value='/fixture/claude')):
+    result = run_claude(work)
+assert result.ok and result.session.id == 'fixture'
+with case.assertRaises(ProcessLookupError):
+    os.kill(int((work / 'child.pid').read_text()), 0)
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+
+class AuthorityPrivatePiWorkerTests(_SecretChildCase):
+    def test_private_worker_launch_denies_the_configured_file_store(self):
+        self.run_secret_child(r"""
+import json
+import subprocess
+
+from arete import accounts, guard, pi, sandbox
+
+secretstore.put('global', 'DEMO_KEY', 'synthetic-worker-value', 'api_key', 'hand')
+store = config.secret_settings().store_dir
+checkout = paths.WORKTREES_DIR / 'worker'
+view = paths.STATE_DIR / 'pi-view'
+checkout.mkdir()
+view.mkdir()
+route = pi.Route('ollama', 'ollama/demo', accounts.pi('ollama'), local=True,
+                 view=view, owner=view / 'auth.json')
+reply = {'type': 'agent_end', 'messages': [
+    {'role': 'assistant', 'content': [{'type': 'text', 'text': 'fixture reply'}]},
+]}
+proc = subprocess.CompletedProcess([], 0, json.dumps(reply) + '\n', '')
+with (mock.patch.object(sandbox, 'AUTHORITY', paths.CONFIG_DIR / 'fixture-authority'),
+      mock.patch.object(sandbox, 'can_confine', return_value=True),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi'),
+      mock.patch.object(pi, 'stream', return_value=(proc, '')) as stream):
+    result = pi.run('fixture prompt', checkout, selected=route, private_worker=True, persist=False, tools=['Read'])
+assert result.ok and result.text == 'fixture reply', result.error
+stream.assert_called_once()
+argv, cwd, env = stream.call_args.args[:3]
+assert argv[0] == '/usr/bin/sandbox-exec' and cwd == str(checkout)
+params = dict(arg.split('=', 1) for flag, arg in zip(argv, argv[1:]) if flag == '-D')
+hidden, = [name for name, path in params.items() if name.startswith('H') and path == str(store)]
+profile = argv[argv.index('-p') + 1]
+assert f'(deny file-read* file-write* file-link (subpath (param "{hidden}")))' in profile
+protection = json.loads(env['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['roots']
+assert protection['open'] == [str(checkout)] and protection['workspace'] == str(checkout)
+nested = store / db.schema_metadata()['instance_tag'] / 'global'
+floor = guard.floor('', checkout, [nested])
+protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['files'] and str(nested) not in protection['open']
+""")
 
 
 WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
@@ -5773,7 +6414,7 @@ class VersionedApiTests(unittest.TestCase):
               mock.patch.object(dashboard, "start_poll_without_failing_the_send", return_value="Poll queued."),
               mock.patch.object(dashboard.api_http, "log_request"),
               mock.patch.object(accounts, "read", side_effect=forbidden),
-              mock.patch.object(jira.Client, "from_env", side_effect=forbidden),
+              mock.patch.object(jira, "credentials", side_effect=forbidden),
               mock.patch("urllib.request.urlopen", side_effect=forbidden),
               mock.patch.object(gh, "gh", side_effect=forbidden),
               mock.patch.object(gh, "gh_json", side_effect=lookup),
@@ -6050,11 +6691,15 @@ class VersionedApiTests(unittest.TestCase):
         return self.wire_request("POST", path, headers, payload)
 
     def wire_request(self, method, path, headers, payload=b""):
-        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
         if method != "GET":
             if self.authorization is None:
                 self.authorization = fixture_bearer(self.actor)
-            request.append(f"Authorization: {self.authorization}\r\n")
+            headers = {"Authorization": self.authorization, **headers}
+        return self.wire_exchange(method, path, headers, payload)
+
+    @staticmethod
+    def wire_exchange(method, path, headers, payload, *, server=None, handler=None):
+        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
         request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
         incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
@@ -6065,10 +6710,11 @@ class VersionedApiTests(unittest.TestCase):
 
         connection = mock.Mock(makefile=lambda *args: incoming, sendall=outgoing.extend, send=send,
                                gettimeout=lambda: None)
-        logins = tailnet.Logins(mock.Mock())
-        logins.of = lambda _: "fixture@example.test"
-        server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
-        dashboard.Handler(connection, ("127.0.0.1", 0), server)
+        if server is None:
+            logins = tailnet.Logins(mock.Mock())
+            logins.of = lambda _: "fixture@example.test"
+            server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
+        (handler or dashboard.Handler)(connection, ("127.0.0.1", 0), server)
         response = HTTPResponse(SimpleNamespace(makefile=lambda *args: BytesIO(outgoing)))
         response.begin()
         return response.status, dict(response.getheaders()), response.read()
@@ -6095,8 +6741,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 59)
-        self.assertEqual(len({op["name"] for op in operations}), 59)
+        self.assertEqual(len(operations), 66)
+        self.assertEqual(len({op["name"] for op in operations}), 66)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -7481,8 +8127,9 @@ class CredentialClaimTests(_CredentialCase):
 
 class ApiCredentialCutoverTests(unittest.TestCase):
     def test_admitted_requests_need_credentials(self):
-        with tempfile.TemporaryDirectory(prefix="arete-read-auth-") as directory:
-            root = Path(directory).resolve()
+        with tempfile.TemporaryDirectory(prefix="arete-read-auth-", dir=Path("/tmp").resolve(),
+                                         ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
             entry = "from tests.test_behavior import ApiCredentialCutoverTests; ApiCredentialCutoverTests().check_routes()"
             done = subprocess.run(api_check.child_command(api_check.SOURCE, entry), cwd=root,
                                   env=api_check.isolated_env(root), capture_output=True, text=True,
@@ -7495,9 +8142,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
         with api_check.offline():
             db.migrate()
             login = "owner@example.invalid"
-            principals.seed_owner(login)
-            token_store.init_owner()
-            bearer = credential_files.read_client(db.schema_metadata()["instance_tag"])
+            bearer = fixture_bearer(principals.seed_owner(login))
             address = "127.0.0.1"
             logins = tailnet.Logins(SimpleNamespace(whois=lambda _: (login, "fixture-node")))
             server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=logins, tls=None,
@@ -7524,7 +8169,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
 
             runs = "/api/v1/runs"
             request("GET", runs, 401, code="unauthenticated")
-            allowed = request("GET", runs, 200, headers={"Authorization": f"Bearer {bearer}"})
+            allowed = request("GET", runs, 200, headers={"Authorization": bearer})
             self.assertEqual(allowed["runs"], [])
             meta = {"/api/meta", "/api/v1/meta"}
             pairing_start = "/api/v1/auth/pairings"
@@ -7546,7 +8191,9 @@ class ApiCredentialCutoverTests(unittest.TestCase):
                 if method == "GET" or not actions:
                     routes.append((method, path))
                 routes.extend((method, path + "/" + re.sub(r"\{\w+\}", "fixture", action)) for action in actions)
-            routes += [("GET", path) for path in ("/api/v1/events", "/api/v1/principals", "/api/v1/principals/me")]
+            routes.extend(("GET", path) for path in (
+                "/api/v1/events", "/api/runs/fixture/events", "/api/v1/principals", "/api/v1/principals/me",
+            ))
             for method, path in routes:
                 if path == mcp_protocol.PATH:
                     continue
@@ -7564,7 +8211,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
             self.assertNotIn("text", pending)
             self.assertEqual(len(logins.credentials.issues["fixture-node"]), 1)
             start_key = {"Idempotency-Key": "fixture-pairing-start"}
-            bearer_headers = {"Authorization": f"Bearer {bearer}", **start_key}
+            bearer_headers = {"Authorization": bearer, **start_key}
             pairing_code = request("POST", pairing_start, 201, body={}, headers=bearer_headers)
             request("POST", pairing_claim, 201, body={"code": pairing_code["code"]},
                     headers={"Idempotency-Key": "fixture-pairing-claim"})

@@ -13,17 +13,17 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, idempotency, principals, util
+from . import api_http, config, contract, idempotency, principals, util
 from .store import db, events, tokens
 from .store import idempotency as claims
 
 COOKIE = "__Host-arete_session"
 PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
-TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim"}
-PRESENCE = {"token.issue", "token.rotate"}
-WRITES = ("POST", "PATCH", "DELETE")
-SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)")
+TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set"}
+PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove"}
+WRITES = ("POST", "PATCH", "PUT", "DELETE")
+SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|config:activate")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
 LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "stage": "capture"}
 
@@ -161,6 +161,10 @@ def require_tls(op):
     return op is not None and op["name"] in TLS_OPERATIONS
 
 
+def registry_operation(name):
+    return isinstance(name, str) and (name.startswith("secret.") or name == "account.list")
+
+
 def origin_of(scheme, host):
     try:
         parsed = urlsplit(f"{scheme}://{host}")
@@ -191,7 +195,8 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
     claim = name == "pairing.claim"
     meta = method == "GET" and path in ("/api/meta", "/api/v1/meta")
     api_route = path == "/api" or path.startswith("/api/")
-    requires_credential = api_route and not (mcp or scratch or meta or claim or name == "token.issue")
+    scratch_exempt = scratch and not registry_operation(name)
+    requires_credential = api_route and not (mcp or scratch_exempt or meta or claim or name == "token.issue")
     if (mcp or require_tls(op) and (auth or cookies or not requires_credential)) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
@@ -234,7 +239,7 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
     handler.actor = credential.actor if credential else handler.person
     principals.admit(handler.actor)
 
-    write = method in WRITES and name != "batch.run"
+    write = method in WRITES and name != "batch.run" and (method != "PUT" or op is not None)
     if mcp or write and (credential or claim):
         check_origin(handler)
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
@@ -263,6 +268,8 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
     if requires_credential and credential is None:
         raise unauthenticated(handler, write, secure)
+    if name.startswith("secret."):
+        secret_access(unquote(handler.operation[1].get("scope", "")))
     if name == "pairing.start" and (credential is None or credential.kind != "session"):
         with db.reader() as c:
             if tokens.live_session(c):
@@ -285,6 +292,13 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
         resource = provider.removeprefix("post_").split("_", 1)[0]
         scope = f"{LEGACY_SCOPES.get(resource, resource)}:write" if resource else "*"
     require_scope(credential, scope)
+
+
+def secret_access(scope):
+    if scope.startswith("principal:"):
+        raise problem("not_found")
+    if not config.secret_settings().store:
+        raise problem("secret_store_missing")
 
 
 def issue_grants(values):

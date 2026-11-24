@@ -437,18 +437,18 @@ def referenced_key(meta, settings):
 
 
 @contextmanager
-def credential_activation(*, publishing: bool = False, wait: bool = False):
+def credential_activation(*, publishing: bool = False, wait: bool = False, state: Path | None = None):
     if sys.platform != "linux":
         yield
         return
-    state = paths.STATE_DIR if paths.ISOLATED else paths.STATE_DIR.resolve()
-    with confined_directory(state, create=True) as parent:
+    root = state or (paths.STATE_DIR if paths.ISOLATED else paths.STATE_DIR.resolve())
+    with confined_directory(root, create=True) as parent:
         launch_lease.private_directory(parent)
         with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
             if not publishing or wait:
                 fcntl.flock(fd, fcntl.LOCK_EX if publishing else fcntl.LOCK_SH)
             elif not launch_lease.take(fd):
-                raise CredentialActivationBusy("Retry credential publication after the local Claude run exits.")
+                raise CredentialActivationBusy("Retry credential publication after the active Linux workers exit.")
             yield
 
 
@@ -971,11 +971,11 @@ def reconcile(scope, name, actor, *, deleting=False):
     settings = config.secret_settings()
     local = local_key_path()
     with registry(write=True) as c:
+        row = credentials.secret(c, scope, name)
+        if deleting and row and settings.store is not None:
+            require_removable(item, row["store"])
         meta, key, journals = key_context(c, settings, local)
         require_store(settings)
-        row = credentials.secret(c, scope, name)
-        if deleting and row:
-            require_removable(item, row["store"])
         raw, receipt = journals.get(item, (None, {}))
         pending = receipt.get("sets", [])
         target = row or receipt.get("removal") or (pending[0] if pending else None)

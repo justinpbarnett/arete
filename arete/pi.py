@@ -554,13 +554,15 @@ def launch_env_names(route: Route) -> list[str]:
 
 def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
               secret_paths: tuple[Path, ...] = (), *, delegation_only: bool = False,
-              shell: bool = False) -> dict[str, str]:
+              shell: bool = False, protected: tuple[Path, ...] | None = None) -> dict[str, str]:
+    protected = sandbox.authority_roots() if protected is None else protected
     sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
-    roots = [*floor.closed, PI_HOME, *sorted(sources), sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
+    roots = [*floor.closed, *protected, PI_HOME, *sorted(sources),
+             sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
              Path("/proc"), Path("/dev")]
     auth = [PI_HOME / "agent" / "auth.json", owner_dir() / "auth.json", sandbox.AGENT_DIR / "auth.json",
             *(auth_paths or [])]
-    files = [*floor.files, KEYS_FILE, paths.CONFIG_FILE,
+    files = [*floor.files, *protected, KEYS_FILE, paths.CONFIG_FILE,
              *(source / name for source in sorted(sources) for name in ("models.json", "settings.json"))]
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
@@ -579,7 +581,8 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
                                               "secret_names": sandbox.SECRET_NAMES, "safe_names": sandbox.SAFE_NAMES,
                                               "secret_dirs": sorted(sandbox.SECRET_DIRS),
                                               "roots": list(map(str, roots)), "files": list(map(str, files)),
-                                              "open": list(map(str, floor.open)),
+                                              "open": [str(p) for p in floor.open if not any(
+                                                  p.resolve().is_relative_to(root.resolve()) for root in protected)],
                                               "write_roots": [str(paths.PACKAGE_DIR)],
                                               "write_files": [str(GUARD_FILE), str(ASK_FILE), str(SHELL_FILE)]})}
 
@@ -681,7 +684,7 @@ def login_unchanged(route: Route) -> bool:
                 bool(route.auth.identity) and latest.identity == route.auth.identity))
 
 
-def observed_refresh(route: Route, event: dict) -> None:
+def observed_refresh(route: Route, event: dict) -> accounts.Auth | None:
     if event.get("provider") != route.provider:
         return
     before, after = accounts.mapping(event.get("before")), accounts.mapping(event.get("after"))
@@ -705,10 +708,14 @@ def observed_refresh(route: Route, event: dict) -> None:
     devices_store.record_refresh(previous, latest.generation, *prefixes)
     route.refreshed.add(latest.generation)
     route.refreshed_auths.add(latest)
+    if previous != latest.generation and not (earlier.identity or latest.identity):
+        if accounts.record_resolved(latest, refresh_only=True):
+            return latest
+    return None
 
 
 @contextmanager
-def refresh_channel(route: Route | None, env: dict):
+def refresh_channel(route: Route | None, env: dict, deferred: list[accounts.Auth]):
     if route is None or not route.using_login:
         yield ()
         return
@@ -720,7 +727,8 @@ def refresh_channel(route: Route | None, env: dict):
             with os.fdopen(reader, "rb") as source:
                 for raw in source:
                     try:
-                        observed_refresh(route, accounts.mapping(json.loads(raw)))
+                        if pending := observed_refresh(route, accounts.mapping(json.loads(raw))):
+                            deferred.append(pending)
                     except (ValueError, TypeError):
                         pass
                     try:
@@ -769,18 +777,25 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
                         runner="pi", model=selected.model, session=kw.get("resume", NO_SESSION))
     else:
         folder = None
+        deferred = []
         try:
             if selected and selected.view is None:
                 folder = prepare(selected, delegation_only=kw.get("delegation_only", False),
                                  structured=kw.get("json_schema") is not None)
                 selected = replace(selected, view=folder)
-            result = _run(*args, auth=auth, selected=selected, **kw)
+            with sandbox.WorkerLease() as activation:
+                activation.acquire()
+                result = _run(*args, auth=auth, selected=selected, activation=activation, deferred=deferred, **kw)
         except (OSError, ValueError) as e:
             result = Result(ok=False, error=f"pi setup failed: {e}", runner="pi", model=kw.get("model", ""),
                             session=kw.get("resume", NO_SESSION))
         finally:
-            if folder is not None:
-                cleanup(folder)
+            try:
+                for refreshed in deferred:
+                    accounts.record_resolved(refreshed, refresh_only=True, wait_for_activation=True)
+            finally:
+                if folder is not None:
+                    cleanup(folder)
     result.call_seconds = time.monotonic() - started
     if result.calls:
         result.calls[0].call_seconds = result.call_seconds - sum(call.call_seconds for call in result.calls[1:])
@@ -829,6 +844,8 @@ def _run(
     private_worker: bool = False,
     private_hidden: tuple[Path, ...] = (),
     native_observation: str = "",
+    activation: sandbox.WorkerLease,
+    deferred: list[accounts.Auth],
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -899,7 +916,8 @@ def _run(
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
            **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
-                       delegation_only=delegation_only, shell=pi_shell.TOOL in names),
+                       delegation_only=delegation_only, shell=pi_shell.TOOL in names,
+                       protected=sandbox.worker_authority(activation)),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
     if private_worker:
@@ -916,11 +934,11 @@ def _run(
                             judge, time.monotonic() + timeout, tuple(read_roots))
              if observing or pi_shell.TOOL in names else None)
     try:
-        with session_lock, refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
+        with session_lock, refresh_channel(selected, env, deferred) as refresh, pi_shell.channel(shell, env) as terminal:
             descriptors = (*refresh, *terminal)
             if error := plan_token_error(env.items()):
                 return Result(ok=False, session=resume, error=error, runner="pi", model=model)
-            proc, cut_short_by = stream(cmd, str(cwd), env, timeout, max_budget_usd,
+            proc, cut_short_by = stream(activation.command(cmd, descriptors), str(cwd), env, timeout, max_budget_usd,
                                        lambda line: reply_cost(line, model, price, auth.mode), on_line,
                                        **({"pass_fds": descriptors} if descriptors else {}))
     except FileNotFoundError as e:
