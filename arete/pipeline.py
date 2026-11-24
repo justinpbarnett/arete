@@ -215,15 +215,27 @@ def facts(name: str, data: dict) -> dict:
     if name == "verify" and isinstance(data.get("verified"), dict):
         return {"requirements": verify.Verified.stored(data["verified"]).requirements()}
     if name == "review" and isinstance(data.get("review"), dict):
-        return {"review": Review.stored(data["review"]).report()}
+        return {"review": stored_review(data["review"]).report()}
     return {}
+
+
+def stored_review(data: dict) -> Review:
+    review = Review.stored(data)
+    if any(not problem.get("finding") for problem in review.blocking()):
+        digest = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+        review.identify(f"saved-review:{digest}")
+    return review
 
 
 def seam_facts(run_id: str) -> dict:
     found: dict = {}
-    for line in factory.history(factory.chain(run_id)):
+    chained = factory.chain(run_id)
+    for line in factory.history(chained):
         if line.get("result") == "pass" or line.get("step") == "review":
             found.update(facts(str(line.get("step") or ""), factory.outcome_of(line).data))
+    for line in (line for read in chained for line in reversed(read)):
+        if (evidence := publication_review_of(line)) is not None:
+            return found | publication_review_facts(evidence)
     return found
 
 
@@ -488,11 +500,10 @@ class CatchUpNeedsInput(workspace.RunFailed):
 
 class CatchUpGateHold(workspace.RunFailed):
     def __init__(self, gate: str, why: str, head: str, report: str,
-                 verified: verify.Verified | None = None, review: Review | None = None, *, repair_tree: str = ""):
+                 verified: verify.Verified | None = None, review: Review | None = None):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
-        self.repair_tree = repair_tree
         self.candidate_restored = True
 
 
@@ -500,20 +511,18 @@ class CatchUpFocusedHold(CatchUpGateHold):
     pass
 
 
-class CatchUpRepairParked(runlimits.Parked):
-    def __init__(self, reason: str, repair_tree: str):
-        super().__init__(reason)
-        self.repair_tree = repair_tree
-
-
 class FocusedRepairHold(workspace.RunFailed):
     pass
 
 
-class CiFixFocusedHold(FocusedRepairHold):
-    def __init__(self, failure: FocusedRepairHold, targets: set[tuple[str, str, str]]):
-        super().__init__(failure.why, failure.detail)
+class CiFixGateHold(workspace.RunFailed):
+    def __init__(self, failure: workspace.RunFailed, targets: set[tuple[str, str, str]]):
+        super().__init__(failure.why, failure.detail, recovery=failure.recovery, held_by=failure.held_by)
         self.targets = targets
+
+
+class CiFixFocusedHold(CiFixGateHold, FocusedRepairHold):
+    pass
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
@@ -1330,6 +1339,13 @@ class Build(TicketWork):
     repair_findings: dict[str, dict] = field(default_factory=dict)
     repair_receipts: dict[str, dict] = field(default_factory=dict)
     in_use_waivers: dict[str, dict] = field(default_factory=dict)
+    ci_review_evidence: dict = field(default_factory=dict)
+
+    def ci_review(self) -> Review | None:
+        return stored_review(self.ci_review_evidence["review"]) if self.ci_review_evidence else None
+
+    def ci_review_pending(self) -> bool:
+        return bool((review := self.ci_review()) and review.blocking())
 
     def repair_state(self) -> dict:
         if not self.repair_findings:
@@ -1343,12 +1359,33 @@ class Build(TicketWork):
         if state:
             self.in_use_waivers = dict(state.get("in_use_waivers", {}))
 
-    def carry_review(self, review: Review, receipt: str) -> None:
-        found = review.identify(receipt).repair_requirements()
-        fresh = {key: {**requirement, "reviewed_trees": review.trees} for key, requirement in found.items()
-                 if key not in self.repair_findings}
-        if fresh:
-            self.repair_findings.update(fresh)
+    def carry_review(self, review: Review, receipt: str = "", *, restored: bool = False) -> None:
+        if receipt:
+            review.identify(receipt)
+        requirements = review.repair_requirements()
+        updates = {}
+        for problem in review.blocking():
+            key = problem["finding"]
+            requirement, current = requirements[key], self.repair_findings.get(key)
+            implicit = restored and not problem.get("verification")
+            unclassified = implicit and not any(problem.get(name) for name in ("check", "test_class", "acceptance"))
+            if current is None:
+                requirement["reviewed_trees"] = {} if restored and (review.failed or problem.get("status") == "open") else review.trees
+            elif implicit and not current.get("inspection_eligible"):
+                if current["verification"] == "review":
+                    if not current["check"]:
+                        current = {**current, "check": requirement["check"], "test_class": requirement["test_class"]}
+                elif (current["verification"] != "check" or not unclassified or current["check"] or current["test_class"]
+                      or current.get("selection") or self.repair_receipts.get(key, {}).get("command_sha")):
+                    continue
+                requirement = {**current, "verification": "check", "reason": requirement["reason"]}
+            else:
+                continue
+            if unclassified and not (requirement["check"] or requirement["test_class"]):
+                requirement["inspection_eligible"] = True
+            updates[key] = requirement
+        if updates:
+            self.repair_findings.update(updates)
             self.run.save("repair-checks.json", self.repair_state())
 
     def repair_commands(self) -> dict:
@@ -1369,32 +1406,31 @@ class Build(TicketWork):
                 and not self.repair_receipts.get(key, {}).get("command_sha")}
 
     def resolve_repair_selectors(self, staged: Staged, pending: list[str], *, baseline: bool) -> None:
-        unresolved = self.unresolved_repair_selectors()
-        if not unresolved or not (trees := verification_trees(self)):
+        if not (unresolved := self.unresolved_repair_selectors()) or not (trees := verification_trees(self)):
             return
-        missing = {key: unresolved[key] for key in pending if key in unresolved
-                   and (not baseline or unresolved[key]["reviewed_trees"] == trees)}
+        missing = {key: f for key, f in unresolved.items() if key in pending and (not baseline or f["reviewed_trees"] == trees)}
         if not missing:
             return
         names = prompt_loader.code_list(sorted(self.repair_commands())) or "None configured."
+        selectors = REPAIR_SELECTOR_SCHEMA["properties"]["selectors"]
+        item = selectors["items"]
+        item = {**item, "properties": {**item["properties"], "inspection_condition": {"type": "string"}}}
+        schema = {**REPAIR_SELECTOR_SCHEMA, "properties": {"selectors": {**selectors, "items": item}}}
         text = prompt_loader.task_prompt(
-            "Independently resolve missing focused regression selectors only. Do not review the whole change, "
-            "edit files, or close any finding. Read the candidate for an existing focused test or one added "
-            "for this repair. For each finding use the exact ID and select a check from the owner-approved names. "
-            "For `classes`, give one dotted test class or method. Do not supply a command. If none can exercise "
-            "the acceptance condition, explain why and select `review` for independent inspection or `in_use` "
-            "for a behavioral observation via configured verification. If undecidable, leave it unresolved.\n\n"
-            f"Approved names: {names}\nIn-use verification configured: {bool(self.layer.verify)}\n\n"
+            "Independently resolve missing selectors; do not edit files, review the whole change, or close findings. "
+            "For repeatable findings, give the exact ID and an approved check name, never a command. For `classes`, "
+            "give one dotted test class or method. If no suitable test exists, leave the selector unresolved. "
+            "Only for a legacy finding flagged `inspection_eligible` that needs inspection rather than reproduction, "
+            "use `review`: explain why in `reason` and state the concrete fact to confirm in `inspection_condition`. "
+            "An absent test is not grounds for inspection-only verification. Do not change other verification methods.\n\n"
+            f"Approved names: {names}\n\n"
             f"Findings: {vault.hidden(json.dumps(missing))}\n\n"
             f"Candidate diff:\n{util.tail(diffguard.fold_moved(staged.patch), MAX_DIFF_IN_PROMPT)}")
         step = self.next_step("review_selectors")
-        result = self.run.agent(step, text, self.ws, role="review", read_only=True, persist=False,
-                                json_schema=REPAIR_SELECTOR_SCHEMA)
+        result = self.run.agent(step, text, self.ws, role="review", read_only=True, persist=False, json_schema=schema)
         if verification_trees(self) != trees:
             raise workspace.RunFailed("the candidate changed while selecting focused evidence")
-        if not result.ok or not isinstance(result.structured, dict):
-            return
-        choices = result.structured.get("selectors")
+        choices = result.structured.get("selectors") if result.ok and isinstance(result.structured, dict) else None
         if not isinstance(choices, list):
             return
         named = [choice for choice in choices if isinstance(choice, dict) and isinstance(choice.get("id"), str)]
@@ -1407,12 +1443,14 @@ class Build(TicketWork):
             if not all(isinstance(value, str) for value in fields.values()):
                 continue
             requirement = {**missing[key], **{name: value.strip() for name, value in fields.items()}}
-            method = requirement["verification"]
-            if method == "check":
-                if not self.repair_command_sha(requirement):
+            if requirement["verification"] == "review":
+                condition = choice.get("inspection_condition")
+                if (not missing[key].get("inspection_eligible") or not requirement["reason"]
+                        or requirement["check"] or requirement["test_class"]
+                        or not isinstance(condition, str) or not condition.strip()):
                     continue
-            elif (method not in ("review", "in_use") or not requirement["reason"] or requirement["check"]
-                  or requirement["test_class"] or (method == "in_use" and not self.layer.verify)):
+                requirement["acceptance"] = condition.strip()
+            elif requirement["verification"] != "check" or not self.repair_command_sha(requirement):
                 continue
             self.repair_findings[key] = {**requirement, "selection": {"tree": trees, "producer": step}}
             changed = True
@@ -1421,9 +1459,7 @@ class Build(TicketWork):
 
     def focused_status(self) -> dict[str, str]:
         repeatable = {key: f for key, f in self.repair_findings.items() if f["verification"] not in ("review", "in_use")}
-        if not repeatable:
-            return {}
-        trees = verification_trees(self)
+        trees = verification_trees(self) if repeatable else {}
         status = {}
         for key, f in repeatable.items():
             found = self.repair_receipts.get(key)
@@ -1447,9 +1483,9 @@ class Build(TicketWork):
                 check = " ".join(filter(None, (f["check"], f["test_class"]))) or "(not specified)"
                 detail = f"Focused check `{check}`: {status[key]}. {f['reason']}".strip()
                 if key in unresolved:
-                    detail += (" Use or add a focused case under an approved check where policy permits; "
-                               "an independent selector step will choose the check or record why it needs "
-                               "another kind of evidence.")
+                    detail += " Use or add a focused case if policy permits; an independent selector will choose the approved check."
+                    if f.get("inspection_eligible"):
+                        detail += " For inspection-only findings, the selector can specify what independent review must confirm."
             elif key in waived:
                 detail = f"Independent review waived in-use evidence: {self.in_use_waivers[key]['why']}"
             else:
@@ -1486,6 +1522,8 @@ class Build(TicketWork):
             name, test_class = finding["check"], finding["test_class"]
             command_sha = self.repair_command_sha(finding)
             before, exits = verification_trees(self), {}
+            if baseline and (not before or before != finding["reviewed_trees"]):
+                continue
             if staged.denied or staged.earlier_denied or self.denied_feedback:
                 report = "The existing check policy requires resolving denied edits first."
             elif not command_sha:
@@ -1528,18 +1566,14 @@ class Build(TicketWork):
                               after_worker: Callable[[], None] | None = None) -> tuple[bool, str]:
         if not self.check_repair_findings(producer=producer):
             return True, reply
-        tries = self.run.settings("check_repair").tries
-        for _ in range(1, tries):
+        for _ in range(1, self.run.settings("check_repair").tries):
             if hold_at_limit and (reason := self.focused_repair_limit()):
                 return False, reason
             try:
                 step, result = self.repair_focused()
+            finally:
                 if after_worker:
                     after_worker()
-            except runlimits.Parked:
-                if after_worker:
-                    after_worker()
-                raise
             reply = result.text
             if not result.ok:
                 break
@@ -1550,6 +1584,14 @@ class Build(TicketWork):
     def current_in_use_waivers(self) -> set[str]:
         trees = verification_trees(self) if self.in_use_waivers else {}
         return {key for key, waiver in self.in_use_waivers.items() if trees and waiver["tree"] == trees}
+
+    def renewable_in_use_waivers(self, before: Review | None) -> dict[str, dict]:
+        if not before or not self.in_use_waivers:
+            return {}
+        stale = self.in_use_waivers.keys() - self.current_in_use_waivers()
+        return {p["finding"]: p for p in before.waived or []
+                if p.get("finding") in stale and p.get("category") in ("issue", "regression")
+                and self.repair_findings.get(p["finding"], {}).get("verification") == "in_use"}
 
     def record_in_use_waivers(self, review: Review, answers, trees: dict[str, str]) -> None:
         if not trees or review.trees != trees or verification_trees(self) != trees:
@@ -1578,14 +1620,15 @@ class Build(TicketWork):
         return {key: f["acceptance"] for key, f in self.repair_findings.items()
                 if f["verification"] == "in_use" and key not in waived}
 
-    def in_use_repair_hold(self, verified: verify.Verified) -> str:
+    def in_use_repair_hold(self, verified: verify.Verified, *, reconsider: dict[str, dict] | None = None) -> str:
         needed = self.in_use_repair_checks()
         if not needed:
             return ""
         observed = (verified.repair_observations if verified.verdict == "pass" and verified.finished
                     and not verified.failed_checks and verified.observed_trees
                     and verified.observed_trees == verification_trees(self) else {})
-        return ", ".join(key for key, acceptance in needed.items() if observed.get(key) != acceptance)
+        return ", ".join(key for key, acceptance in needed.items()
+                         if key not in (reconsider or {}) and observed.get(key) != acceptance)
 
     def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
@@ -1758,14 +1801,15 @@ class Build(TicketWork):
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None, *,
-                           after: str = "the build and its fixes", focused: str = "") -> tuple[bool, int]:
+                           after: str = "the build and its fixes", focused: str = "",
+                           return_focused_hold: bool = False) -> tuple[bool, int]:
         step_name = step_name or (lambda n: self.next_step("check_repair"))
         attempts, tries = 1, self.run.settings("check_repair").tries
         while True:
             staged = self.restage() if focused and self.repair_findings else None
             if staged is not None and not (staged.denied or self.denied_feedback):
                 if pending := self.check_repair_findings(producer=focused, fresh=True):
-                    if attempts < tries and not self.focused_repair_limit():
+                    if not return_focused_hold and attempts < tries and not self.focused_repair_limit():
                         focused, result = self.repair_focused()
                         attempts += 1
                         if result.ok:
@@ -1782,8 +1826,9 @@ class Build(TicketWork):
                         prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
                                checks=self.check_commands, denied=prompt_loader.code_list(self.deny)), role="check_repair")
 
-    def recheck(self, after: str, *, focused: str = "") -> None:
-        if not self.check_with_repairs(after=after, focused=focused)[0]:
+    def recheck(self, after: str, *, focused: str = "", return_focused_hold: bool = False) -> None:
+        ok, _ = self.check_with_repairs(after=after, focused=focused, return_focused_hold=return_focused_hold)
+        if not ok:
             raise workspace.RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
@@ -2747,6 +2792,31 @@ def note_review(run: Run, review: Review, verified: verify.Verified) -> None:
     run.facts.update(requirements=verified.requirements(), review=review.report())
 
 
+def publication_review_of(line: dict) -> dict | None:
+    if line.get("event") == "publication_review":
+        return line.get("evidence")
+    if line.get("event") == "step_end":
+        name, data = line.get("step"), line.get("data") or {}
+        if name == "ci" and "ci_review" in data:
+            return data["ci_review"] or {}
+        if name == "review" and (review := data.get("review")) and not review.get("failed"):
+            return {}
+    return None
+
+
+def publication_review_facts(evidence: dict) -> dict:
+    if not evidence:
+        return {}
+    return {"review": stored_review(evidence["review"]).report(), "requirements": evidence["requirements"]}
+
+
+def note_publication_review(run: Run, gate: str, review: Review, verified: verify.Verified) -> dict:
+    note_review(run, review, verified)
+    evidence = {"review": review.asdict(), "requirements": verified.requirements()}
+    run.write_line("publication_review", event_id=uuid4().hex, gate=gate, evidence=evidence)
+    return evidence
+
+
 def assumptions_of(plan: dict) -> list[str]:
     listed = plan.get("assumptions")
     return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
@@ -3311,7 +3381,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                         break
                     b.catch_ups += 1
                     verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review, repair_focused=True)
-                    note_review(run, review, verified)
+                    note_publication_review(run, "catch_up", review, verified)
                     publish_gate_evidence(run, b.ticket, c, verified, review)
                     max_rounds = run.settings("ci_repair").tries
                     rounds = watch_publication_ci(b, slot, [c], max_rounds)
@@ -3321,6 +3391,8 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                 except CatchUpPushUnconfirmed:
                     raise
                 except (workspace.RunFailed, RuntimeError, OSError) as e:
+                    if isinstance(e, CatchUpGateHold) and e.review and not e.review.failed and e.verified:
+                        note_publication_review(run, "catch_up", e.review, e.verified)
                     if isinstance(e, CatchUpFocusedHold) and own_draft_state(run, c) is False:
                         set_draft(run, c, True, "automerge")
                     reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
@@ -3461,6 +3533,13 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     worktree_files = catch_up_paths(c.wt)
     check_files = None
     head = ""
+    repair_tree: str | None = ""
+
+    def checkpoint():
+        nonlocal repair_tree
+        repair_tree = None
+        repair_tree = catch_up_repair_tree(b, c, base_tree)
+
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -3472,13 +3551,26 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         check_files = catch_up_paths(c.wt)
+        trees, repaired = None, False
+        producer = f"catch-up:{head}"
         if repair_focused and b.repair_findings:
-            head = repair_caught_up_head(b, c, head)
-        else:
-            if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
-                raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback())
-            if not b.check(staged=b.staged, defer_failed_cleanup=True):
-                raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
+            base_tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+            passed, reply = b.retry_focused_repairs(producer, "", hold_at_limit=True, after_worker=checkpoint)
+            if not passed:
+                raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
+                                         "\n\n".join(filter(None, (b.repair_feedback(), reply))))
+            trees = verification_trees(b)
+            repaired = trees != {c.prefix: base_tree}
+            if repaired:
+                b.require_valid_diff("repairing the moved base", from_base=True)
+        elif pending := b.check_repair_findings(producer=producer):
+            raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback())
+        if not b.check(staged=b.staged, defer_failed_cleanup=True) or (trees is not None and not b.full_checks_current(trees)):
+            why = "the layer's local checks failed" + (" after the focused repair" if repaired else "")
+            raise CatchUpGateHold("checks", why, head, b.report)
+        if repaired:
+            head = commit_catch_up_repair(b, c, head, trees)
+        repair_tree = ""
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
@@ -3486,20 +3578,22 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback(), verified)
         if b.repair_findings and not b.full_checks_current(verification_trees(b)):
             raise CatchUpGateHold("checks", "the candidate lacks current full checks after verification", head, b.report, verified)
-        if pending := b.in_use_repair_hold(verified):
-            raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head,
-                                  b.report, verified)
-        if head != c.merge:
+        if b.repair_findings and (pending := b.in_use_repair_hold(
+                verified, reconsider=b.renewable_in_use_waivers(prior_review))):
+            raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head, b.report,
+                                  verified)
+        catch_up = c if head == c.merge else None
+        if catch_up is None:
             b.restage(from_base=True)
-            review_plan = (f"{plan}\n\nThe previously approved head `{c.lease}` caught up to base `{base_sha}` in "
-                           f"`{c.merge}`. Review the resulting tree, including the focused repair in `{c.merge}..{head}` "
-                           "and its interaction with the moved base.")
-            review = _review(b, review_plan, verified, step=b.next_step("review"), before=prior_review)
-        else:
-            review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
+            plan += (f"\n\nApproved head `{c.lease}` caught up to base `{base_sha}` in `{c.merge}`. Review the resulting tree, "
+                     f"including the focused repair `{c.merge}..{head}` and its interaction with the moved base.")
+        review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=catch_up)
         if problem := merge_evidence_problem(b, c, verified, review, head):
             gate, why = problem
             raise CatchUpGateHold(gate, why, head, b.report, verified, review)
+        if b.repair_findings and (pending := b.in_use_repair_hold(verified)):
+            raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head, b.report,
+                                  verified, review)
         if git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree changed while checking the merge")
         if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
@@ -3507,13 +3601,19 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if before_push is not None:
             before_push(head, verified, review)
     except BaseException as error:
+        if repair_tree is None:
+            run.catch_up_repair_held = True
+            c.onto = c.onto or head
+            log_catch_up_failure(run, "left the worktree in place because it could not checkpoint the repair", error)
+            raise
         log_catch_up_failure(run, "failed", error)
         gate_hold = error if isinstance(error, CatchUpGateHold) else None
-        repair_tree = error.repair_tree if isinstance(error, (CatchUpGateHold, CatchUpRepairParked)) else ""
         held_head = gate_hold.head if gate_hold else ""
-        if isinstance(error, runlimits.Parked) and head and (repair_tree or head != c.merge):
+        if repair_tree or (head and head != c.merge):
             held_head = head
-        if held_head and (repair_tree or held_head != c.merge):
+        reviewed = gate_hold.review if gate_hold else None
+        rejected = repair_focused and reviewed and not reviewed.failed and reviewed.blocking()
+        if held_head and (repair_tree or held_head != c.merge or rejected):
             run.catch_up_repair_held = True
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
@@ -3545,6 +3645,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if not held_head:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
+        elif tracked_restored and held_head != c.merge:
+            c.onto = c.onto or c.merge
         if tracked_restored and paths_restored and _termination is None:
             run.catch_up_owns_checkout = False
         if isinstance(error, owner_asks.Asked):
@@ -3559,7 +3661,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
 
 
 def catch_up_repair_tree(b: Build, c: workspace.Checkout, base_tree: str) -> str:
-    staged = b.restage(from_base=True)
+    staged = stage(b.checkouts, b.deny, from_base=True, worker_trees=b.worker_trees,
+                   ignored_denied_paths=b.ignored_denied_paths)
     tree = git(["write-tree"], c.wt).strip()
     denied = {name.removeprefix(c.prefix) for name in staged.denied + staged.earlier_denied}
     denied.update(staged.fatal_restores.get(c.github, []))
@@ -3570,37 +3673,14 @@ def catch_up_repair_tree(b: Build, c: workspace.Checkout, base_tree: str) -> str
     return tree if tree != base_tree else ""
 
 
-def repair_caught_up_head(b: Build, c: workspace.Checkout, head: str) -> str:
-    base_tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
-    repair_tree = ""
-
-    def checkpoint():
-        nonlocal repair_tree
-        repair_tree = catch_up_repair_tree(b, c, base_tree)
-
-    try:
-        passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True, after_worker=checkpoint)
-        if not passed:
-            raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
-                                     "\n\n".join(filter(None, (b.repair_feedback(), reply))), repair_tree=repair_tree)
-        trees = verification_trees(b)
-        repaired = trees != {c.prefix: base_tree}
-        if repaired:
-            b.require_valid_diff("repairing the moved base", from_base=True)
-        if not b.check(staged=b.staged, defer_failed_cleanup=True) or not b.full_checks_current(trees):
-            why = "the layer's local checks failed" + (" after the focused repair" if repaired else "")
-            raise CatchUpGateHold("checks", why, head, b.report, repair_tree=repair_tree)
-        if not repaired:
-            return head
-        if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
-            raise workspace.RunFailed("the catch-up repair changed after the checks")
-        util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
-        repaired_head = git(["rev-parse", "HEAD"], c.wt).strip()
-        if git(["rev-parse", f"{repaired_head}^{{tree}}"], c.wt).strip() != trees[c.prefix] or workspace.uncommitted(c.wt):
-            raise workspace.RunFailed("the catch-up repair committed a different candidate than the checks covered")
-        return repaired_head
-    except runlimits.Parked as error:
-        raise CatchUpRepairParked(str(error), repair_tree) from error
+def commit_catch_up_repair(b: Build, c: workspace.Checkout, head: str, trees: dict[str, str]) -> str:
+    if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
+        raise workspace.RunFailed("the catch-up repair changed after the checks")
+    util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
+    repaired_head = git(["rev-parse", "HEAD"], c.wt).strip()
+    if git(["rev-parse", f"{repaired_head}^{{tree}}"], c.wt).strip() != trees[c.prefix] or workspace.uncommitted(c.wt):
+        raise workspace.RunFailed("the catch-up repair committed a different candidate than the checks covered")
+    return repaired_head
 
 
 def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str, *,
@@ -3908,7 +3988,7 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
         raise
     except Exception as e:
         failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
-        if isinstance(failed, CiFixFocusedHold):
+        if isinstance(failed, CiFixGateHold):
             targets = [c for c in with_prs if (c.github, c.pr, c.lease) in failed.targets]
             drafted = [c for c in targets if (state := own_draft_state(run, c)) is True
                        or (state is False and set_draft(run, c, True))]
@@ -3922,6 +4002,8 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
             raise
         raise failed from e
     last = rounds[-1]
+    if b.ci_review_pending():
+        draft_why = draft_why or "the latest CI repair review still requests changes"
     if stopped_before and not draft_why and all(w.read or w.previous_failure for w in last.seen):
         for c in stopped_before:
             set_draft(run, c, False)
@@ -4023,6 +4105,7 @@ def published_note(draft_why: str, verified: verify.Verified, opened: list[works
 def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.Checkout], max_rounds: int,
               fix: CiFix | None = None, *, review: Review | None = None, goal: str = "") -> Iterator[ci.Round]:
     run = b.run
+    review = b.ci_review() or review
     watched = list(pushed)
     not_caused: dict[tuple[str, str, gh.CheckKey], tuple[str, int, str]] = {}
     reruns = classic_ci_reruns(b)
@@ -4177,9 +4260,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     try:
         ok, _ = b.check_with_repairs(after="the CI fix", focused=f"ci-fix:{n}")
     except FocusedRepairHold as error:
-        targets = {(r.target.github, r.target.pr, r.target.sha) for r in caused}
-        targets.update((c.github, c.pr, c.lease) for c in b.restage().changed if c.pr)
-        raise CiFixFocusedHold(error, targets) from error
+        raise CiFixFocusedHold(error, ci_fix_targets(caused, b.restage().changed)) from error
     if not ok:
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
@@ -4190,21 +4271,34 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     trees = verification_trees(b)
     if not b.full_checks_current(trees):
         raise workspace.RunFailed("the CI fix lacks current full check evidence")
+    targets = ci_fix_targets(caused, b.staged.changed)
     b.restage(from_base=True)
-    verified = verify_ci_fix(b, goal, trees)
-    if trees != verification_trees(b) or b.focused_hold():
-        raise workspace.RunFailed("the CI fix changed during in-use verification", b.repair_feedback())
-    plan = b.plan_text + (f"\n\n{NOT_CHECKED_LEFT_FOR_A_PERSON}{b.left_for_a_person}" if b.left_for_a_person else "")
-    reviewed = _review(b, plan, verified, step=b.next_step("review_ci_fix"), before=review)
-    b.run.save(f"ci-repair-round{n}.json", {"trees": trees, "checked": checked, "verified": asdict(verified),
-                                          "review": reviewed.asdict(), "focused": b.repair_state()})
-    if not reviewed.approved() or reviewed.trees != trees or b.focused_hold():
-        raise workspace.RunFailed("the CI fix lacks a current approving independent review", reviewed.markdown())
-    b.require_valid_diff("the reviewed CI fix")
-    if (no_pr := [c.github for c in b.staged.changed if not c.pr]):
-        raise workspace.RunFailed(f"the CI fix changed {', '.join(no_pr)}, where this run has no PR")
-    if trees != verification_trees(b) or trees != index_trees(b.checkouts):
-        raise workspace.RunFailed("the CI fix changed after the evidence was collected")
+    try:
+        verified = verify_ci_fix(b, goal, trees, before=review)
+        if trees != verification_trees(b) or b.focused_hold():
+            raise workspace.RunFailed("the CI fix changed during in-use verification", b.repair_feedback())
+        plan = b.plan_text + (f"\n\n{NOT_CHECKED_LEFT_FOR_A_PERSON}{b.left_for_a_person}" if b.left_for_a_person else "")
+        reviewed = _review(b, plan, verified, step=b.next_step("review_ci_fix"), before=review)
+        current = reviewed.trees == trees == verification_trees(b)
+        if not reviewed.failed and current:
+            b.ci_review_evidence = note_publication_review(b.run, "ci", reviewed, verified)
+            if not reviewed.approved():
+                b.check_repair_findings(producer=f"ci-fix:{n}:before", baseline=True)
+        b.run.save(f"ci-repair-round{n}.json", {"trees": trees, "checked": checked, "verified": asdict(verified),
+                                              "review": reviewed.asdict()})
+        if not reviewed.approved() or not current or b.focused_hold():
+            raise workspace.RunFailed("the CI fix lacks a current approving independent review", reviewed.markdown())
+        if b.in_use_repair_hold(verified):
+            raise workspace.RunFailed("the CI fix lacks a current in-use pass", b.repair_feedback())
+        b.require_valid_diff("the reviewed CI fix")
+        if (no_pr := [c.github for c in b.staged.changed if not c.pr]):
+            raise workspace.RunFailed(f"the CI fix changed {', '.join(no_pr)}, where this run has no PR")
+        if trees != verification_trees(b) or trees != index_trees(b.checkouts):
+            raise workspace.RunFailed("the CI fix changed after the evidence was collected")
+    except (workspace.RunFailed, RuntimeError, OSError) as error:
+        failure = (error if isinstance(error, workspace.RunFailed) else
+                   workspace.RunFailed(f"the CI watch crashed: {type(error).__name__}: {error}"))
+        raise CiFixGateHold(failure, targets) from error
 
     def check_commits():
         heads = {c.prefix: git(["rev-parse", "HEAD^{tree}"], c.wt).strip() for c in b.checkouts}
@@ -4215,18 +4309,25 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     return reviewed
 
 
-def verify_ci_fix(b: Build, goal: str, trees: dict[str, str]) -> verify.Verified:
+def ci_fix_targets(caused: list[ci.Red], changed: list[workspace.Checkout]) -> set[tuple[str, str, str]]:
+    return ({(r.target.github, r.target.pr, r.target.sha) for r in caused}
+            | {(c.github, c.pr, c.lease) for c in changed if c.pr})
+
+
+def verify_ci_fix(b: Build, goal: str, trees: dict[str, str], *, before: Review | None = None) -> verify.Verified:
     needed = b.in_use_repair_checks()
+    reconsider = b.renewable_in_use_waivers(before)
+    required_before_review = needed.keys() - reconsider.keys()
     if not b.layer.verify or ("refactor" in b.ticket.labels and not needed):
-        if needed:
+        if required_before_review:
             raise workspace.RunFailed("the CI fix still needs independent in-use evidence", b.repair_feedback())
         return (verify.not_configured(b.layer.dir, b.ws) if not b.layer.verify else
                 verify.Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`."))
     verified = check_in_use(b, goal, b.build_summary)
-    if not needed and verified.verdict == "blocked" and not verification_refused(verified):
+    if not required_before_review and verified.verdict == "blocked" and not verification_refused(verified):
         return verified
     if (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks
-            or verified.observed_trees != trees or b.in_use_repair_hold(verified)):
+            or verified.observed_trees != trees or b.in_use_repair_hold(verified, reconsider=reconsider)):
         raise workspace.RunFailed("the CI fix lacks a current in-use pass", verified.markdown())
     return verified
 
@@ -4680,7 +4781,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     text = prompt_loader.prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
                   merged_base=merged_base, left_for_a_person=left, denied=prompt_loader.code_list(b.deny))
     if carried := b.repair_feedback():
-        text += f"\n\nKeep these earlier repairs working:\n\n{carried}"
+        text += f"\n\nAddress these review findings and keep earlier repairs working:\n\n{carried}"
     res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair", json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
@@ -4964,16 +5065,12 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
             reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
     before = before or Review.stored({})
+    reconsider = b.renewable_in_use_waivers(before) if isinstance(b, Build) else {}
+    waived = [p for p in before.waived or [] if p.get("finding") not in reconsider]
     if catch_up is None:
         earlier = list(before.blocking())
-        if isinstance(b, Build) and b.in_use_waivers:
-            current = b.current_in_use_waivers()
-            listed = {p.get("finding") for p in earlier}
-            for p in reversed(before.waived or []):
-                key = p.get("finding")
-                if key in b.in_use_waivers and key not in current and key not in listed:
-                    earlier.append(p)
-                    listed.add(key)
+        listed = {p.get("finding") for p in earlier}
+        earlier.extend(p for key, p in reconsider.items() if key not in listed)
         schema = REVIEW_SCHEMA
         text = b.brief.prompt(
             "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
@@ -4981,14 +5078,23 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
             earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
         context = nullcontext((text, {}))
     else:
-        earlier = []
+        earlier = list(reconsider.values())
         schema = CATCH_UP_REVIEW_SCHEMA
+        if earlier:
+            schema = {**schema, "properties": {**schema["properties"], "earlier": REVIEW_SCHEMA["properties"]["earlier"]},
+                      "required": [*schema["required"], "earlier"]}
         context = catch_up_review_prompt(b, catch_up, plan, verified, before)
     allowed_tools = prompt_loader.bash_rules(b.read_bash)
     names = prompt_loader.code_list(sorted(b.repair_commands())) or "None configured."
     repair = f"\n\nApproved check names for focused regressions: {names}\n"
+    if reconsider:
+        repair += "\nPrior in-use waivers are not evidence on this candidate. Reassess them; `fixed` is not an observation.\n"
+        if catch_up is not None:
+            repair += ("\nIn `earlier`, give each finding's numbered ID, `status` (`fixed`, `open`, or `waived`), and `why`. "
+                       "Waive only outside the issue or builder's tools. Do not repeat them in `problems`.\n\n"
+                       + numbered(earlier) + "\n")
     if feedback := b.repair_feedback():
-        repair += "\n\nRepair requirements and focused results (confirm the named check actually covers the path):\n" + feedback
+        repair += "\n\nRepair requirements and focused results (confirm each named check covers the path):\n" + feedback
     waiver_trees = (verification_trees(b) if isinstance(b, Build) and any(
         b.repair_findings.get(p.get("finding"), {}).get("verification") == "in_use" for p in earlier) else {})
     with context as (text, patches):
@@ -4999,12 +5105,12 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                 said = res.structured
                 if catch_up is not None:
                     said = {**said, "problems": catch_up_problems(said["problems"], patches)}
-                found = Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
+                found = Review.judged(said, earlier, waived, index_trees(b.checkouts))
                 b.carry_review(found, f"{b.run.id}:{step}:{uuid4().hex[:12]}")
                 if waiver_trees:
                     b.record_in_use_waivers(found, said.get("earlier"), waiver_trees)
                 return found
-    return Review.failed_step(earlier, before.waived or [], before.trees or {})
+    return Review.failed_step(earlier, waived, before.trees or {})
 
 
 @contextmanager
@@ -5070,7 +5176,7 @@ def fixed_since(b: Build, trees: dict[str, str]) -> str:
     return util.tail(vault.hidden("".join(parts)), MAX_FIX_DIFF_IN_PROMPT)
 
 
-def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
+def verify_in_use(b: Build, goal: str, summary: str, *, return_focused_hold: bool = False) -> verify.Verified:
     if not b.layer.verify:
         b.run.log("verify: the layer has no [verify] section, so nothing checks the change in use")
         return verify.not_configured(b.layer.dir, b.ws)
@@ -5083,7 +5189,8 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         if attempt == tries:
             break
         repair_in_use(b, attempt + 1, tries, verified)
-        b.recheck("fixing what the check in use found", focused=f"verify-fix:{attempt + 1}")
+        b.recheck("fixing what the check in use found", focused=f"verify-fix:{attempt + 1}",
+                  return_focused_hold=return_focused_hold)
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
     raise workspace.RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",

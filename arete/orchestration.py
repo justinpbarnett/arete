@@ -358,7 +358,7 @@ class Controller(worker_turns.WorkerTurns):
                                                  self.job.left_for_a_person])
         self.recover()
         if self.job.review.blocking():
-            self.job.b.carry_review(self.job.review, f"{self.lease.root}:restored-review")
+            self.job.b.carry_review(self.job.review, f"{self.lease.root}:restored-review", restored=True)
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
@@ -1399,6 +1399,8 @@ class Controller(worker_turns.WorkerTurns):
             evidence.append(hold.verified.markdown())
         if hold.review is not None:
             self.job.b.carry_review(hold.review, f"{self.run.id}:{self.executing}:catch-up")
+            if not hold.review.failed and hold.review.blocking() and hold.verified is not None:
+                pipeline.note_publication_review(self.run, "catch_up", hold.review, hold.verified)
             evidence.append(hold.review.markdown())
         feedback = "\n\n".join(evidence)
         self.data["catch_up_hold"] = {"action": self.executing, "gate": hold.gate, "reason": reason,
@@ -1489,7 +1491,7 @@ class Controller(worker_turns.WorkerTurns):
     def note_caught_up(self, checkout):
         job, b = self.job, self.job.b
         self.data["publication"]["heads"][checkout.github] = checkout.lease
-        pipeline.note_review(self.run, job.review, job.verified)
+        pipeline.note_publication_review(self.run, "catch_up", job.review, job.verified)
         self.run.log(f"automerge: pushed catch-up {b.catch_ups} to {checkout.pr} at {checkout.lease}")
         self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
         self.stamp("verify", asdict(job.verified))

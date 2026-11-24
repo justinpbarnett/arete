@@ -77,6 +77,9 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    related = lineage_runs(continues) if continues else {}
+    if continues and only in ("", "review", "ci") and not (run.environment_release or run.path == "orchestrate"):
+        job.continued_ci = continued_review(related)
     if run.path == "orchestrate" and not (continues or only or run.dry_run or run.repairs) and requeue.policy_retry(earlier):
         job.policy_retry = requeue.recorded_failure(earlier)
     catch_up = not only and run.path == "orchestrate" and pending_catch_up(continues)
@@ -98,7 +101,7 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
                     "build when the worktree still holds that run's edits, and runs every later step again")
             renew = "prepare"
     return factory.Flow(run.id, job, continues=continues, only=only, again=again, refusal=refusal, renew=renew,
-                        step_runs=list(step_runs(continues).values()) if continues else [])
+                        step_runs=[read for read in related.values() if standalone_step(read)])
 
 
 def pending_refusal(job: Job) -> str:
@@ -175,6 +178,50 @@ def pending_catch_up(run_id: str) -> dict:
     from .store import orchestration
 
     return orchestration.catch_up_push(adaptive_state(run_id))
+
+
+def saved_repair_state(run_id: str) -> dict:
+    state = util.read_json(paths.RUNS_DIR / run_id / "repair-checks.json", {})
+    return {name: rows for name, rows in state.items() if isinstance(rows, dict)} if isinstance(state, dict) else {}
+
+
+def standalone_step(read: list[dict]) -> str:
+    return str(factory.first(read, "route").get("only") or "")
+
+
+def continued_review(related: dict[str, list[dict]], *, report: dict | None = None) -> dict:
+    states = []
+    report = report or {}
+    reported = repairs.report_review(report)
+
+    def restore(review: Review, line: dict, gate: dict | None = None, only: str = "") -> dict:
+        keys = {p["finding"] for p in review.blocking()}
+        state = next((state for state in states if keys <= state.get("findings", {}).keys()), {})
+        return {"review": review, "ci_review": gate or {}, "repair_state": state, "line": line, "standalone": only}
+
+    for source, read in reversed(related.items()):
+        only = standalone_step(read)
+        if only and only not in ("review", "ci"):
+            continue
+        if state := saved_repair_state(source):
+            states.append(state)
+        for line in reversed(read):
+            data = line.get("data") if line.get("event") == "step_end" else None
+            data = data if isinstance(data, dict) else {}
+            if (state := data.get("repair_state")) and isinstance(state, dict):
+                states.append(state)
+            gate = pipeline.publication_review_of(line) or {}
+            review = gate.get("review") or (data.get("review") if line.get("step") == "review" and only != "ci" else None)
+            if not isinstance(review, dict) or review.get("failed") or not review.get("verdict"):
+                continue
+            if only and not gate:
+                gate = {"review": review, "requirements": []}
+            if not gate and reported.verdict and source != report.get("run"):
+                return restore(reported, report)
+            return restore(pipeline.stored_review(review), line, gate, only)
+    if reported.verdict:
+        return restore(reported, report)
+    return {"repair_state": states[0]} if states else {}
 
 
 def prepared_data(continues: str) -> dict:
@@ -366,18 +413,27 @@ def base_moved(continues: str, *, repos: set[str] | None = None) -> str:
 STEP_RUNS_READ = 500
 
 
-def step_runs(run_id: str) -> dict[str, list[dict]]:
-    row, known, found = run_store.run_get(run_id) or {}, factory.chain_runs(run_id), {}
-    if not row:
-        return found
+def lineage_runs(run_id: str) -> dict[str, list[dict]]:
+    whole = {read[0]["run"]: read for read in reversed(factory.chain(run_id)) if read}
+    row = run_store.run_get(run_id)
+    if not row or not row.get("repo") or not row.get("issue"):
+        return whole
+    known, found = set(whole), {}
     for other in reversed(run_store.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
-        if not other.get("only_step") or other["id"] in known:
-            continue
-        read = run_lines.read(other["id"])
-        if str(factory.first(read, "route").get("continues") or "") in known:
-            known.add(other["id"])
-            found[other["id"]] = read
-    return found
+        source = other["id"]
+        if source in whole:
+            found[source] = whole[source]
+        elif (only := other.get("only_step")) and source not in known:
+            read = run_lines.read(source)
+            route = factory.first(read, "route")
+            if route.get("only") == only and route.get("continues") in known:
+                known.add(source)
+                found[source] = read
+    return {**{source: read for source, read in whole.items() if source not in found}, **found}
+
+
+def step_runs(run_id: str) -> dict[str, list[dict]]:
+    return {source: read for source, read in lineage_runs(run_id).items() if standalone_step(read)}
 
 
 def authors(run_id: str) -> set[str]:
@@ -529,6 +585,7 @@ class Job:
     closed_prs: set[str] = field(default_factory=set)
     policy_retry: dict = field(default_factory=dict)
     check_publication_targets: Callable[[], None] | None = None
+    continued_ci: dict = field(default_factory=dict)
 
     @property
     def held_reason(self) -> str:
@@ -637,8 +694,15 @@ class Job:
         if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
             self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
             return False
-        if name == "review" and outcome.passed and outcome.data.get("repair_state"):
-            if not (trees := outcome.data.get("review_trees")) or trees != pipeline.verification_trees(self.b):
+        if name == "ci" and not outcome.passed:
+            return False
+        if name == "review" and outcome.passed:
+            if self.built is not None and self.b.ci_review_evidence and (
+                    self.b.ci_review_pending() or self.continued_ci.get("standalone")):
+                self.run.log("review: later repair review evidence prevents reuse of the earlier approval")
+                return False
+            trees = (outcome.data.get("review") or {}).get("trees")
+            if outcome.data.get("repair_state") and (not trees or trees != pipeline.verification_trees(self.b)):
                 self.run.log("review: the saved repair review was on a different tree; rerunning is required")
                 return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
@@ -688,10 +752,12 @@ class Job:
             run.facts.update(pipeline.facts(name, data))
         if "story" in data:
             run.story = list(data["story"])
-        if "repair_state" in data:
+        if "repair_state" in data and (not stored or not self.continued_ci.get("repair_state")):
             self.b.restore_repair_state(data["repair_state"])
         if name == "prepare" and outcome.passed:
             self.prepared(data, stored)
+            if not self.only:
+                self.restore_continued_ci()
         elif name in ("plan", "patch") and outcome.passed:
             self.patch_mode = name == "patch" and not data.get("escalate")
             self.plan_text, self.goal, self.estimate = data["plan"], data["goal"], data["estimate"]
@@ -731,21 +797,50 @@ class Job:
                 self.attempts = data["attempts"]
                 if stored:
                     record.note(run.id, attempts=self.attempts)
-        elif name == "verify" and outcome.passed:
-            self.verified = Verified.stored(data["verified"])
+        elif name == "verify" and (outcome.passed or data.get("focused_hold")):
+            if outcome.passed:
+                self.verified = Verified.stored(data["verified"])
             if "checked" in data:
                 self.b.checked = data["checked"]
             self.b.steps = Counter(data["names"])
         elif name == "review":
             self.review_exhausted = data.get("review_exhausted") is True
             if "review" in data:
-                self.review, self.reviews = Review.stored(data["review"]), data.get("attempt", 0)
+                self.review, self.reviews = pipeline.stored_review(data["review"]), data.get("attempt", 0)
+                if stored and self.review.blocking() and not self.continued_ci.get("ci_review"):
+                    self.b.carry_review(self.review, restored=True)
+                if not stored and not self.review.failed and self.built is not None:
+                    self.b.ci_review_evidence = {}
         elif name == "document" and outcome.passed:
             self.document = data.get("text", "")
         elif name == "pr" and outcome.passed:
             self.published(data, stored)
-        elif name == "ci" and outcome.passed:
-            self.ci_result = data["summary"]
+        elif name == "ci":
+            if stored and not self.continued_ci and "ci_review" in data:
+                self.b.ci_review_evidence = data["ci_review"]
+            if outcome.passed:
+                self.ci_result = data["summary"]
+        if self.built is not None:
+            facts = pipeline.publication_review_facts(self.b.ci_review_evidence)
+            if self.continued_ci.get("standalone") == "review" and self.b.ci_review_evidence == self.continued_ci.get("ci_review"):
+                facts.pop("requirements", None)
+            run.facts.update(facts)
+
+    def restore_continued_ci(self) -> None:
+        if not self.continued_ci:
+            return
+        b = self.b
+        b.restore_repair_state(self.continued_ci.get("repair_state", {}))
+        b.ci_review_evidence = self.continued_ci.get("ci_review", {})
+        if review := b.ci_review():
+            b.carry_review(review, restored=True)
+        if state := b.repair_state():
+            self.run.save("repair-checks.json", state)
+        if b.ci_review_pending():
+            prs = publication(self.continues).get("prs", {})
+            known = [url for c in self.checkouts if (url := prs.get(c.github)) and url not in self.closed_prs]
+            if known:
+                record.note(self.run.id, branch=self.branch, pr_url=" ".join(known))
 
     def published(self, data: dict, stored: bool) -> None:
         for c in self.checkouts:
@@ -1102,14 +1197,15 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("fail", "failed", why=str(e))
     moved = [c.github for c in targets if heads[c.github] != c.lease]
     findings = found.review.findings()
-    count = len(found.review.problems)
+    count = len(found.review.blocking())
     run.log(f"repair: run {found.run_id}, {found.evidence}, {util.count(count, 'finding')}")
     for github in moved:
         run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
                 "again on it")
     run.story.append(f"Review findings of run {found.run_id} to repair:\n{findings}")
     b = job.b
-    b.carry_review(found.review, f"{found.run_id}:saved")
+    b.restore_repair_state(found.repair_state)
+    b.carry_review(found.review, restored=True)
     b.check_repair_findings(producer="repair:before", baseline=True)
     res = run.agent("repair", job.brief.prompt(
         "repair", plan=found.plan, source=found.run_id, findings=b.repair_feedback() or findings, checks=job.checks),
@@ -1218,17 +1314,26 @@ def retry_passed(verified: Verified) -> bool:
 
 
 @factory.step("verify")
-def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
+def verify(flow: factory.Flow, tree: str, single: bool = False, *, return_focused_hold: bool = False) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
     check_only = single or bool(job.run.environment_release)
+    goal = job.with_left(job.goal)
     if single and "refactor" in job.ticket.labels:
         verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
     elif check_only and not job.layer.verify:
         verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
+    elif check_only:
+        verified = pipeline.check_in_use(b, goal, job.build_summary)
     else:
-        check = pipeline.check_in_use if check_only else pipeline.verify_in_use
-        verified = check(b, job.with_left(job.goal), job.build_summary)
+        try:
+            verified = pipeline.verify_in_use(b, goal, job.build_summary, return_focused_hold=return_focused_hold)
+        except pipeline.FocusedRepairHold as hold:
+            if not return_focused_hold:
+                raise
+            return Outcome("fail", next="implement", feedback=hold.detail, data={
+                "focused_hold": hold.why, "repair_state": b.repair_state(), "names": dict(b.steps),
+                "story": job.run.story, "policy": job.policy("verify", {}), "checked": b.checked})
     if job.run.environment_release and not retry_passed(verified):
         return end_as("stop", "environment-held", verified=asdict(verified),
                       summary="Verification did not pass on the live release. The PR stays a draft.")
@@ -1242,15 +1347,17 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
     run = job.run
     attempt = 2 if second else attempt
     stage = pipeline.round_name("review", attempt)
+    if job.only == "review":
+        job.restore_continued_ci()
     b = job.b
     if pending := b.check_repair_findings(producer=f"{stage}:before"):
         return Outcome("fail", next="implement", feedback=b.repair_feedback(),
                        data={"focused_hold": pending, "repair_state": b.repair_state()})
-    said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified, stage,
-                            job.review if attempt > 1 else None, job.fix_reply)
+    before = b.ci_review() or (job.review if attempt > 1 else None)
+    said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified, stage, before, job.fix_reply)
     data = {"review": said.asdict(), "attempt": attempt, "story": run.story}
     if state := b.repair_state():
-        data.update(repair_state=state, review_trees=said.trees)
+        data["repair_state"] = state
     if said.verdict != "request_changes":
         return Outcome("pass", data=data)
     problems = said.findings()
@@ -1363,23 +1470,25 @@ def settle_unpushed_checkouts(job: Job):
     return fresh, staged, size, outcome, unpushed
 
 
-def held_pr_check(job: Job, targets: list[workspace.Checkout]) -> Callable[[], None]:
+def held_pr_check(job: Job, targets: list[workspace.Checkout], *, ordinary_hold: str = "") -> Callable[[], None]:
     check_targets = job.check_publication_targets
 
     def check_held_targets(*, convert=False):
         if check_targets:
             check_targets()
-        try:
-            for c in targets:
+        for c in targets:
+            try:
                 pipeline.require_held_pr(job.run, c, convert=convert)
-        except workspace.RunFailed as e:
-            raise workspace.RunFailed(e.why, job.b.repair_feedback()) from e
+            except workspace.RunFailed as e:
+                if ordinary_hold:
+                    raise workspace.RunFailed(f"{c.pr} is not a confirmed draft at this run's head", ordinary_hold) from e
+                raise workspace.RunFailed(e.why, job.b.repair_feedback()) from e
 
     check_held_targets(convert=not (job.run.feedback or job.prepared_feedback_prs))
     return check_held_targets
 
 
-def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, focused_draft="", check_targets=None):
+def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, check_targets=None):
     b, run, t = job.b, job.run, job.ticket
     if unpushed:
         publishing(run, job.branch, lambda: pipeline.commit_and_push(
@@ -1388,7 +1497,6 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, focus
         b.committed_lines = max(b.committed_lines, staged.lines)
     committed = not fresh.empty or bool(unpushed)
     subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
-    draft_why = "\n\n".join(filter(None, (job.held_reason, focused_draft)))
     revised = ("Revised for the review feedback on the PR.\n\n" if run.feedback else
                f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")
     if not fresh.empty:
@@ -1397,7 +1505,7 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, focus
             job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}",
             before_push=before_push, check_targets=check_targets))
         b.staged = staged
-    return subject, draft_why, committed
+    return subject, committed
 
 
 def publication_outcome(job: Job, staged, summary, committed, draft_why="", report_body="", opened=(), pushed=(),
@@ -1422,7 +1530,7 @@ def report(job: Job, size: str, images: dict, held: str, *, measurement_section:
 
 def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
                         before_push=None, *, updated: list[workspace.Checkout],
-                        held_adoptions: list[workspace.Checkout], measurement_section: str = "") -> Outcome:
+                        held_at_head: list[workspace.Checkout], measurement_section: str = "") -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
     report_body = report(job, size, images, draft_why, measurement_section=measurement_section)
@@ -1455,7 +1563,7 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
                                          job.left_for_a_person, link, stops, committed,
                                          measurement_section=measurement_section)
-    drafted = held_adoptions + pipeline.hold_pushed(
+    drafted = held_at_head + pipeline.hold_pushed(
         run, pushed + [c for c in found if c in updated], ci_stopped, draft_why)
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
@@ -1507,13 +1615,20 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
 
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
     updated = unpushed + fresh.changed
+    draft_why = "\n\n".join(filter(None, (job.held_reason, focused_draft)))
+    repair_hold = focused_draft or job.b.in_use_repair_hold(job.verified)
+    held_at_head = []
+    feedback_prs = run.feedback_prs + job.prepared_feedback_prs
+    if run.repo.parts and draft_why and (repair_hold or not feedback_prs):
+        ordinary_recheck = job.continues and len(staged.changed) == 1 and not (updated or run.repairs or repair_hold)
+        held_at_head = [c for c in staged.changed if c.pr and c not in updated
+                        and (ordinary_recheck or c in found or (c.revision and c.lease != c.revision)
+                             or (repair_hold and c.pr in feedback_prs))]
     check_targets = job.check_publication_targets
-    held_adoptions = []
-    if focused_draft or job.b.in_use_repair_hold(job.verified):
-        held_adoptions = [c for c in found if c in staged.changed and c not in updated]
-        check_targets = held_pr_check(job, [c for c in updated if c.pr] + held_adoptions)
-    subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push,
-                                                  focused_draft=focused_draft, check_targets=check_targets)
+    if repair_hold or held_at_head:
+        held_updates = [c for c in updated if c.pr] if repair_hold else []
+        check_targets = held_pr_check(job, held_updates + held_at_head, ordinary_hold="" if repair_hold else draft_why)
+    subject, committed = publish_branch(job, fresh, staged, unpushed, before_push, check_targets=check_targets)
     if not job.run.repo.parts:
         record.note(job.run.id, branch=job.branch)
         if draft_why:
@@ -1521,7 +1636,7 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push,
-                               updated=updated, held_adoptions=held_adoptions, measurement_section=measurement_section)
+                               updated=updated, held_at_head=held_at_head, measurement_section=measurement_section)
 
 
 def with_stop(text: str, stop: str) -> str:
@@ -1532,22 +1647,27 @@ def with_stop(text: str, stop: str) -> str:
 def watch(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     run = job.run
-    job.b.from_base = False
+    if job.only == "ci":
+        job.restore_continued_ci()
+    b = job.b
+    b.from_base = False
 
     def fix(name: str, text: str, failures: str) -> Result:
         done = step(flow, "implement", tree=tree, round=name, feedback=failures, asks=text)
         return Result(done.passed, done.data.get("said", ""), structured=done.data.get("verdicts"))
 
+    draft = job.draft_why
+    if job.continued_ci.get("standalone") == "review" and (reviewed := b.ci_review()) and reviewed.approved():
+        draft = draft or "a standalone review does not clear the publication hold"
     try:
-        result = pipeline.watch_ci(job.b, job.slot, job.branch, job.picked(job.changed), job.with_prs, job.draft_why,
+        result = pipeline.watch_ci(b, job.slot, job.branch, job.picked(job.changed), job.with_prs, draft,
                                    fix=fix, review=job.review, goal=job.with_left(job.goal))
     except workspace.RunFailed as e:
-        if run.feedback:
-            raise
-        prs = pipeline.pr_link_list(job.with_prs)
-        return end_as("fail", "failed", why=e.why, prs=True,
-                      detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR start a revision, as on any "
-                             "arete PR.")
+        detail = e.detail
+        if not run.feedback:
+            prs = pipeline.pr_link_list(job.with_prs)
+            detail += f"\n\n### PRs\n\n{prs}\n\nReview comments on a PR start a revision, as on any arete PR."
+        return end_as("fail", "failed", why=e.why, prs=not run.feedback, detail=detail, recovery=e.recovery)
     return Outcome("pass", data={"summary": result})
 
 
@@ -1591,6 +1711,8 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
 
 
 def publication_candidates(job: Job, fresh: list[workspace.Checkout]) -> list[workspace.Checkout]:
+    if job.run.feedback or job.prepared_feedback_prs or (job.built is not None and job.b.ci_review_pending()):
+        return []
     standing = [c for c in job.picked(job.changed) if c not in fresh]
     ready = pipeline.ready_pushed(job.run, standing, job.picked(job.ci_stopped), job.draft_why)
     return fresh + ready
@@ -1657,7 +1779,7 @@ def finish(flow: factory.Flow, ending: str, **fields) -> tuple[str, str, str]:
 
 
 def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
-    return finish(flow, **{key: value for key, value in outcome.data.items() if key != "repair_state"})
+    return finish(flow, **{key: value for key, value in outcome.data.items() if key not in ("repair_state", "ci_review")})
 
 
 def end_dry_run(flow: factory.Flow, *, measurement_section: str = "") -> tuple[str, str, str]:
@@ -1669,8 +1791,33 @@ def end_dry_run(flow: factory.Flow, *, measurement_section: str = "") -> tuple[s
     return finish(flow, "dry-run", summary=outcome_text)
 
 
+def rerun_rejected_ci(flow: factory.Flow) -> tuple[str, str, str] | None:
+    job: Job = flow.ctx
+    if (job.run.dry_run or job.run.path not in ("feature", "patch", "revise", "repair")
+            or (job.cfg.adws and job.cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+        return None
+    ci_at = max((i for i, line in enumerate(flow.earlier) if line.get("step") == "ci"), default=-1)
+    if (ci_at < 0 or not job.continued_ci.get("ci_review")
+            or (flow.earlier[ci_at].get("result") != "fail" and not job.continued_ci.get("standalone"))
+            or not (published := publication(flow.continues))):
+        return None
+    tree = str(job.ws)
+    if not (prepared := step(flow, "prepare", tree=tree)).passed:
+        return ended(flow, prepared)
+    for line in flow.earlier[flow.at:ci_at]:
+        name = line.get("step")
+        if name in ("plan", "patch", "revise", "repair", "implement") and line.get("result") == "pass":
+            job.take(name, factory.outcome_of(line), stored=True)
+    job.take("pr", Outcome("pass", data=published), stored=True)
+    step(flow, "ci", tree=tree)
+    status, summary, _ = alone(flow)
+    return status, summary, ""
+
+
 def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, str]]) -> tuple[str, str, str]:
     try:
+        if flow.only == "ci" and (outcome := rerun_rejected_ci(flow)) is not None:
+            return outcome
         return drive(flow)
     except pipeline.CatchUpPushUnconfirmed:
         raise

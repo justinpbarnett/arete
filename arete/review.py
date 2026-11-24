@@ -39,7 +39,12 @@ REVIEW_SCHEMA = {
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
                     "acceptance": {"type": "string"},
-                    "verification": {"type": "string", "enum": list(REPAIR_METHODS)},
+                    "verification": {
+                        "type": "string",
+                        "enum": list(REPAIR_METHODS),
+                        "description": "Defaults to check for blockers. Use review for inspection or in_use for a "
+                                       "live observation.",
+                    },
                     "check": {"type": "string"},
                     "test_class": {"type": "string"},
                     "verification_reason": {"type": "string"},
@@ -219,12 +224,11 @@ class Review:
     def repair_requirements(self) -> dict[str, dict]:
         requirements = {}
         for p in self._blocking:
-            method = p.get("verification") or ("check" if p.get("check") else "review")
+            method = p.get("verification") or "check"
             acceptance = p.get("acceptance") or f"Exercise the reported path and observe it no longer fails: {p['problem']}"
             reason = p.get("verification_reason", "")
             if not reason and method in ("review", "in_use"):
-                reason = ("No alternate verification reason was recorded." if p.get("verification") else
-                          "The saved review did not specify a regression; independently close this evidence gap.")
+                reason = "No alternate verification reason was recorded."
             requirements[p["finding"]] = {"file": p.get("file", ""), "problem": p["problem"], "acceptance": acceptance,
                                            "verification": method, "check": p.get("check", ""),
                                            "test_class": p.get("test_class", ""), "reason": reason}

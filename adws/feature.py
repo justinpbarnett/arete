@@ -1,13 +1,14 @@
 from dataclasses import replace
 
-from arete import factory, patching
+from arete import factory, patching, pipeline
 from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, deliver, ended, finish, retry_environment, step
-from arete.pipeline import round_name, verification_trees
+from arete.pipeline import round_name
 from arete.verify import Verified
 
 SKIPPED_LABEL = "refactor"
 SKIPPED_TEXT = f"Check in use skipped because the ticket is labeled `{SKIPPED_LABEL}`."
 PREDATES = "This check in use predates the review fixes."
+FOCUSED_FAILURE = "focused review regressions did not pass"
 
 
 def feature(flow):
@@ -53,22 +54,25 @@ def built(flow, first, prepared=False, patch=False):
         outcome = check_candidate(flow, ws, f"build:{attempt}", attempt=attempt, tries=tries, **extra)
     if not outcome.passed:
         step(flow, "learn", tree=ws, apply=False)
-        return finish(flow, "failed", why=f"checks still failing after {attempt} attempts", detail=outcome.feedback)
-    before_verify = verification_trees(job.b) if job.b.repair_findings else {}
+        why = FOCUSED_FAILURE if outcome.data.get("focused_hold") else f"checks still failing after {attempt} attempts"
+        return finish(flow, "failed", why=why, detail=outcome.feedback)
+    before_verify = pipeline.verification_trees(job.b) if job.b.repair_findings else {}
     skipped = SKIPPED_LABEL in job.ticket.labels
     if skipped:
         job.verified = Verified("unverified", SKIPPED_TEXT)
     elif patch:
         job.verified = Verified("unverified", "Focused verification follows review convergence on the final tree.")
     else:
-        if not (verified := step(flow, "verify", tree=ws)).passed:
-            return ended(flow, verified)
+        outcome = step(flow, "verify", tree=ws, return_focused_hold=True)
+        if not outcome.passed and not outcome.data.get("focused_hold"):
+            return ended(flow, outcome)
     reviews = max(1, job.run.settings("review").tries)
     if patch:
         reviews = min(reviews, job.layer.patch.review_tries)
     n = 1
-    fixed = bool(before_verify and verification_trees(job.b) != before_verify)
-    outcome = checked_after(flow, ws, "in-use verification", n) if fixed else factory.Outcome("pass")
+    fixed = bool(before_verify and pipeline.verification_trees(job.b) != before_verify)
+    if outcome.passed and fixed:
+        outcome = checked_after(flow, ws, "in-use verification", n)
     if outcome.passed:
         outcome = step(flow, "review", attempt=n, tries=reviews)
     elif not outcome.data.get("focused_hold"):
@@ -93,13 +97,15 @@ def built(flow, first, prepared=False, patch=False):
     if patch and (why or not outcome.passed):
         job.run.log(f"patch: escalating to the feature flow: {why or 'review needs more than the patch repair budget'}")
         return built(flow, [("plan", {}), ("implement", {"tree": ws, "round": BUILD})], prepared=True)
+    if not outcome.passed and outcome.data.get("focused_hold"):
+        return finish(flow, "failed", why=FOCUSED_FAILURE, detail=outcome.feedback)
     review_needed = False
     while blocked := final_blocker(flow, ws, patch=patch, fixed=fixed, skipped=skipped, review_needed=review_needed):
         why, outcome = blocked
-        if not why:
-            return ended(flow, outcome)
-        if not (outcome and outcome.next == "implement" and outcome.data.get("focused_hold") and n < reviews):
-            return finish(flow, "failed", why=why, detail=outcome.feedback if outcome else "")
+        if not (outcome and outcome.next == "implement" and outcome.data.get("focused_hold")):
+            return finish(flow, "failed", why=why, detail=outcome.feedback if outcome else "") if why else ended(flow, outcome)
+        if n >= reviews:
+            return finish(flow, "failed", why=FOCUSED_FAILURE, detail=outcome.feedback)
         repaired = step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
         if not repaired.passed:
             return ended(flow, repaired)
@@ -115,33 +121,47 @@ def built(flow, first, prepared=False, patch=False):
 
 def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
     job = flow.ctx
-    before = verification_trees(job.b)
+    before = pipeline.verification_trees(job.b)
     if not (checked := final_checks(flow, ws, review_needed=review_needed)).passed:
         return "the final full checks did not converge with review", checked
-    checked_trees = verification_trees(job.b)
+    checked_trees = pipeline.verification_trees(job.b)
     if skipped or not job.review.approved() or not (patch or fixed or checked_trees != before):
         return None
-    if not (verified := step(flow, "verify", tree=ws)).passed:
+    if not (verified := step(flow, "verify", tree=ws, return_focused_hold=True)).passed:
         return "", verified
-    if patch and patching.allowed_gap(job.layer, job.ticket, job.verified):
+    allowed_gap = patch and patching.allowed_gap(job.layer, job.ticket, job.verified)
+    trees = pipeline.verification_trees(job.b)
+    missing_evidence = "the candidate changed during or after verification and requires new behavioral evidence"
+    if not trees:
+        return missing_evidence, None
+    if trees != checked_trees:
+        if not (checked := final_checks(flow, ws)).passed:
+            return "the verification repairs did not converge with review", checked
+        if pipeline.verification_trees(job.b) != trees:
+            return missing_evidence, None
+        if allowed_gap:
+            if not (verified := step(flow, "verify", tree=ws, single=True)).passed:
+                return "", verified
+            if pipeline.verification_trees(job.b) != trees:
+                return missing_evidence, None
+            allowed_gap = patching.allowed_gap(job.layer, job.ticket, job.verified)
+        if not allowed_gap and (job.verified.verdict != "pass" or job.verified.observed_trees != trees):
+            return missing_evidence, None
+        if not job.b.full_checks_current(trees):
+            return "the verification repairs lack current full checks", None
+        if not (reviewed := review_after_fixes(flow)).passed:
+            return "the verification repairs need further review", reviewed
+        if not job.review.approved() or job.review.trees != trees or pipeline.verification_trees(job.b) != trees:
+            return "the verification repairs lack current independent review", None
+    if allowed_gap:
         job.verified = replace(job.verified, verdict="unverified", summary=(
-            job.verified.summary + "\nThe owner's patch policy permits this environmental gap; it is not a pass."))
-    verified_trees = verification_trees(job.b)
-    if verified_trees and verified_trees == checked_trees:
-        return None
-    if not (checked := final_checks(flow, ws)).passed:
-        return "the verification repairs did not converge with review", checked
-    trees = verification_trees(job.b)
-    if not trees or trees != verified_trees or job.verified.verdict != "pass" or job.verified.observed_trees != trees:
-        return "the candidate changed during or after verification and requires new behavioral evidence", None
-    if not (reviewed := review_after_fixes(flow)).passed:
-        return "the verification repairs need further review", reviewed
+            job.verified.markdown() + "\n\nThe owner's patch policy permits this environmental gap; it is not a pass."))
     return None
 
 
 def final_checks(flow, ws, *, review_needed=False):
     job = flow.ctx
-    before = verification_trees(job.b)
+    before = pipeline.verification_trees(job.b)
     if job.b.full_checks_current(before):
         if pending := focused_blocker(job.b, "final-checks"):
             return pending
@@ -151,7 +171,7 @@ def final_checks(flow, ws, *, review_needed=False):
         outcome = checked_after(flow, ws, "the final full checks", job.reviews + 1)
         if not outcome.passed:
             return outcome
-        trees = verification_trees(job.b)
+        trees = pipeline.verification_trees(job.b)
         if not job.b.full_checks_current(trees):
             return factory.Outcome("fail", feedback="The repaired candidate lacks current full checks.")
         if trees != before:
@@ -185,16 +205,14 @@ def check_candidate(flow, ws, producer, **kw):
 def checked_after(flow, ws, after, n, quick=False):
     tries = flow.ctx.run.settings(CHECK_REPAIR).tries
     extra = {"quick": True} if quick else {}
-    attempt = 1
-    outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
-    while not outcome.passed and not outcome.data.get("focused_hold") and attempt < tries:
-        attempt += 1
-        repaired = step(flow, "implement", tree=ws, round=f"{CHECK_REPAIR}{n}_{attempt}", feedback=outcome.feedback,
-                        attempt=attempt, tries=tries)
+    for attempt in range(1, max(1, tries) + 1):
+        outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
+        if outcome.passed or outcome.data.get("focused_hold") or attempt >= tries:
+            return outcome
+        repaired = step(flow, "implement", tree=ws, round=f"{CHECK_REPAIR}{n}_{attempt + 1}", feedback=outcome.feedback,
+                        attempt=attempt + 1, tries=tries)
         if not repaired.passed:
             return repaired
-        outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
-    return outcome
 
 
 if __name__ == "__main__":
