@@ -69,6 +69,9 @@ SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "wh
 SHELL_WORD_BREAKS = " \t\n;|&()<>"
 SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
 SED_SEARCH = re.compile(r"/(?:\\[^\n]|[^/\\\n])*/p")
+SED_LITERAL_SEARCH = re.compile(r"\s*/security/\s*(?:p|=|!d|\{\s*p\s*;?\s*\})\s*")
+AWK_SEARCH = re.compile(r'(?:/security/|\$0[ \t]*~[ \t]*/security/|index\(\$0,[ \t]*"security"\))'
+                        r'(?:\s*\{\s*print(?:[ \t]+(?:\$0|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$0)?))?\s*;?\s*\})?\s*')
 BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
 ANSI_C_QUOTE = re.compile(r"\$'((?:\\[\s\S]|[^'\\])*)'")
 ANSI_C_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c(?:\\\\|[\x00-\x7f])|.)",
@@ -894,15 +897,19 @@ def command_words(words: list[str]) -> list[str]:
     return []
 
 
-def sed_search(args: list[str]) -> bool:
+def sed_search(args: list[str], literal: bool = False) -> bool:
     while args and args[0] in ("-n", "-E", "-r", "--quiet", "--silent", "--regexp-extended"):
         args = args[1:]
-    if args[:1] in (["-e"], ["--expression"], ["--"]):
+    while (literal and len(args) > 2 and args[0] in ("-e", "--expression", "-ne") and args[2] in ("-e", "--expression")
+           and (SED_SEARCH.fullmatch(args[1]) or SED_LITERAL_SEARCH.fullmatch(args[1]))):
+        args = args[2:]
+    if args[:1] in (["-e"], ["--expression"], ["--"]) or literal and args[:1] == ["-ne"]:
         args = args[1:]
-    return bool(args and SED_SEARCH.fullmatch(args[0]) and all(not arg.startswith("-") for arg in args[1:]))
+    return bool(args and all(not arg.startswith("-") for arg in args[1:])
+                and (SED_SEARCH.fullmatch(args[0]) or literal and SED_LITERAL_SEARCH.fullmatch(args[0])))
 
 
-def denied_keychain(words: list[str], depth: int, shell: str) -> str:
+def denied_keychain(words: list[str], depth: int, shell: str, *, literal: bool = False) -> str:
     if not words:
         return ""
     if depth > 12:
@@ -924,7 +931,12 @@ def denied_keychain(words: list[str], depth: int, shell: str) -> str:
             if arg in ("-exec", "-execdir", "-ok", "-okdir"):
                 if reason := denied_keychain(command_words(args[index + 1:]), depth + 1, shell):
                     return reason
-    if program in SCRIPT_TOOLS and not (program == "sed" and sed_search(args)):
+    if program in SCRIPT_TOOLS and not (program == "sed" and sed_search(args, literal)):
+        if literal and program in ("awk", "gawk") and args[:1] == ["-e"]:
+            args = args[1:]
+        if literal and program in ("awk", "gawk") and args and AWK_SEARCH.fullmatch(args[0]) and all(
+                not arg.startswith("-") for arg in args[1:]):
+            return ""
         if any(KEYCHAIN_COMMAND.search(word) for word in words):
             return guard.reach("security keychain items")
     return ""
@@ -959,7 +971,7 @@ def preserves_shell_lookup(words: list[str]) -> bool:
         return len(words) > 1 and DISPLAY_FORMAT.fullmatch(words[1]) is not None
     if words[0] == "set":
         return all(re.fullmatch(r"[-+][eufx]+", flag) for flag in words[1:]) or words[1:] == ["-o", "pipefail"]
-    return words[0] in (":", "echo", "true", "false", "pwd") or words == ["cd", "."]
+    return words[0] in (":", "cd", "echo", "true", "false", "pwd")
 
 
 class KeychainShell:
@@ -1179,6 +1191,7 @@ class KeychainShell:
         pipeline: list[list[str]] = []
         docs: list[tuple[str, bool, bool, list[list[str]]]] = []
         needs_consumer = False
+        literal = True
         arithmetic = self.shell in ("bash", "zsh", "/bin/sh")
 
         def finish() -> None:
@@ -1191,7 +1204,8 @@ class KeychainShell:
                     pipeline.append(command)
                 if not preserves_shell_lookup(words):
                     initial_path = ""
-                self.refusal = self.refusal or denied_keychain(command, depth, self.shell)
+                self.refusal = self.refusal or denied_keychain(command, depth, self.shell,
+                                                               literal=literal and command == words)
                 needs_consumer = False
 
         while ch := self.char():
@@ -1217,7 +1231,7 @@ class KeychainShell:
                 needs_consumer = False
             elif ch in ";|&\n()":
                 finish()
-                words = []
+                words, literal = [], True
                 boolean = self.starts("||") or self.starts("&&")
                 self.pos += 2 if boolean or self.starts("|&") else 1
                 if ch == "|" and not boolean:
@@ -1253,7 +1267,8 @@ class KeychainShell:
                     pipeline.append([])
                     needs_consumer = False
                 elif words or (raw not in SHELL_PREFIX and not ASSIGNMENT.match(raw)):
-                    if initial_path and not LITERAL_SHELL_WORD.fullmatch(raw):
+                    literal = literal and LITERAL_SHELL_WORD.fullmatch(raw) is not None
+                    if not literal:
                         initial_path = ""
                     words.append(word)
                 else:

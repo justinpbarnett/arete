@@ -362,7 +362,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         launch_kw = admitted(launch_kw, on_launch(route))
         account = account_of(picked.auth)
         if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
-            accounts.record_resolved(picked.auth)
+            accounts.record_resolved(picked.auth, defer_unconfigured=(
+                sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote))
         started = util.iso()
         with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
             res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,

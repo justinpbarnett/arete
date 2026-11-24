@@ -8,7 +8,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, closing, suppress
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -143,40 +143,41 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
 
 
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
-                       mount_lease: ExitStack | None = None) -> list[str]:
+                       mount_lease: ExitStack | None = None, activation_lease: ExitStack | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
         return command
-    from . import config, secretstore
+    from . import secretstore
 
     try:
-        settings = config.secret_settings()
-        store = settings.store_dir
         key = secretstore.local_key_path()
-        protect_fallback = settings.store is None
-        with suppress(FileNotFoundError):
-            key.lstat()
-            protect_fallback = True
+        info = linux_key_info(key)
+        had_local = info is not None
+        if activation_lease is not None:
+            activation_lease.enter_context(secretstore.credential_activation())
+            info = linux_key_info(key)
+        if info is not None and mount_lease is not None:
+            had_local = True
+            info = mount_lease.enter_context(secretstore.local_key_mount_lease(key))
+        store, activated = linux_store_policy(has_local=info is not None, had_local=had_local)
+        if activated and activation_lease is not None:
+            activation_lease.close()
+        if info is None and store is None:
+            return command
         work = Path(cwd).resolve()
-        roots = tuple(dict.fromkeys((work, *(Path(p).resolve() for p in opened))))
-    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+        masks = linux_fingerprint_mounts(key, info, (work, *opened)) if info is not None else []
+    except ConfinementUnavailable:
+        raise
+    except secretstore.FingerprintKeyMissing as error:
+        raise ConfinementUnavailable(str(error)) from error
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
         raise ConfinementUnavailable("Claude could not determine Linux secret confinement paths") from error
-    if not protect_fallback and store is None:
-        return command
     launcher = shutil.which("bwrap", path=os.defpath)
     if not launcher:
         raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
     if store is not None and work.is_relative_to(store):
         raise ConfinementUnavailable("Claude cannot start inside the secret store")
-    if mount_lease is not None and (protect_fallback or settings.store == "pve_store"):
-        try:
-            mount_lease.enter_context(secretstore.local_key_mount_lease(key))
-        except OSError as error:
-            raise ConfinementUnavailable("Claude could not lease the Linux fingerprint key mask") from error
-    masks = linux_fingerprint_mounts(key, roots, settings, required=protect_fallback)
-    if not masks and mount_lease is not None:
-        mount_lease.close()
     if store is not None:
         try:
             with secretstore.file_parent(store / "mount", store, create=True, private=True):
@@ -189,46 +190,40 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
             *masks, "--chdir", str(work), "--", *command]
 
 
-def linux_fingerprint_mounts(key: Path, opened: tuple[Path, ...], settings, *, required: bool) -> list[str]:
+def linux_key_info(key: Path) -> os.stat_result | None:
+    with suppress(FileNotFoundError):
+        return key.lstat()
+    return None
+
+
+def linux_fingerprint_mounts(key: Path, info: os.stat_result, opened: tuple[Path, ...]) -> list[str]:
     from . import secretstore
 
-    if not required and settings.store != "pve_store":
-        return []
-    if any(root.is_relative_to(key) for root in opened):
+    if any(Path(root).resolve().is_relative_to(key) for root in opened):
         raise ConfinementUnavailable("Claude cannot open the instance fingerprint key as a workspace")
-    try:
-        try:
-            info = key.lstat()
-        except FileNotFoundError:
-            if settings.store == "pve_store":
-                check_linux_stored_key(settings, required)
-                return []
-            if settings.store is not None:
-                raise
-            secretstore.fingerprint_key(settings)
-            info = key.lstat()
-    except secretstore.FingerprintKeyMissing as error:
-        raise ConfinementUnavailable(str(error)) from error
-    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
-        raise ConfinementUnavailable("Claude could not prepare the Linux fingerprint key mask") from error
     if not secretstore.private_file(info) or info.st_size != 32:
         raise ConfinementUnavailable("Claude requires a private regular fingerprint key file for confinement")
     return ["--ro-bind", os.devnull, str(key)]
 
 
-def check_linux_stored_key(settings, required: bool) -> None:
-    from . import secretstore
+def linux_store_policy(*, has_local: bool, had_local: bool) -> tuple[Path | None, bool]:
+    from . import config, secretstore
     from .store import db
 
-    with suppress(db.NoDatabase), db.reader() as c:
+    meta = {}
+    required = had_local
+    with suppress(db.NoDatabase), closing(db.read_connection()) as c, db.read_snapshot(c):
         meta = db.metadata(c)
-        if secretstore.KEY_REF in meta:
-            secretstore.referenced_key(meta, settings, expected_store="pve_store")
-            return
         required = required or secretstore.KEY_LOCAL in meta or (
-            db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c) and secretstore.has_fingerprints(c))
-    if required:
+            not has_local and bool(meta) and db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c)
+            and secretstore.has_fingerprints(c))
+    settings = config.secret_settings()
+    activated = secretstore.KEY_REF in meta
+    if activated and settings.store == "pve_store":
+        secretstore.referenced_key(meta, settings, expected_store="pve_store")
+    elif activated or (required and not has_local):
         raise secretstore.FingerprintKeyMissing("fingerprint_key_missing")
+    return settings.store_dir, activated
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,

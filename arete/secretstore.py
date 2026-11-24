@@ -317,7 +317,8 @@ def write_item(ref: Reference, settings: config.SecretsConfig, value: bytes) -> 
         if result.returncode or keychain_read(ref) != value:
             raise StoreError("could not write Keychain item")
     elif ref.store == "pve_store":
-        write_file(*file_location(ref, settings), value, private=True)
+        with credential_activation(publishing=True):
+            write_file(*file_location(ref, settings), value, private=True)
     else:
         raise InternalSecret("This secret is managed by its owning service.")
 
@@ -364,14 +365,33 @@ def referenced_key(meta, settings, *, expected_store=None):
 
 
 @contextmanager
-def local_key_mount_lease(local: Path):
-    with file_parent(local, local.parent, create=True) as parent:
-        fcntl.flock(parent, fcntl.LOCK_SH)
-        try:
+def credential_activation(*, publishing: bool = False):
+    if sys.platform != "linux":
+        yield
+        return
+    with paths.directory_fd(paths.STATE_DIR.resolve(), create=True) as parent:
+        launch_lease.private_directory(parent)
+        with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
+            if not publishing:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            elif not launch_lease.take(fd):
+                raise StoreError("Retry credential publication after the local Claude run exits.")
             yield
+
+
+@contextmanager
+def local_key_mount_lease(local: Path):
+    with file_parent(local, local.parent) as parent:
+        fcntl.flock(parent, fcntl.LOCK_SH)
+        info = None
+        try:
+            with suppress(FileNotFoundError):
+                info = os.stat(local.name, dir_fd=parent, follow_symlinks=False)
+            yield info
         finally:
             fcntl.flock(parent, fcntl.LOCK_UN)
-            retire_committed_local_key(local)
+            if info is not None:
+                retire_committed_local_key(local)
 
 
 def committed_key_metadata():
@@ -437,7 +457,8 @@ def ensure_key(c, settings, *, probe_local=None):
             db.after_commit(lambda: retire_local_key(local, key, str(ref)))
     else:
         if fallback is None:
-            write_file(local, local.parent, key)
+            with credential_activation(publishing=True):
+                write_file(local, local.parent, key)
         c.execute("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, '1')", (KEY_LOCAL,))
     return key
 

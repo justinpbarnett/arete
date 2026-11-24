@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import paths, secretstore
+from . import config, paths, secretstore
 from .store import credentials, db, devices, principals
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -196,7 +196,8 @@ def scope(auth: Auth, limit: str, unknown: str = "") -> str:
     return "subscription-v1:" + json.dumps([auth.family, account, limit], separators=(",", ":")) if account else ""
 
 
-def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False) -> dict | None:
+def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False,
+           defer_unconfigured: bool = False) -> dict | None:
     who = auth.identity or auth.credential
     if not (auth.provider and auth.mode and who) or not paths.DB_FILE.exists():
         return None
@@ -207,10 +208,14 @@ def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = Fal
         raise secretstore.StoreError("account registry files must belong to the current state directory")
     db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
     with db.tx() as c:
+        settings = config.secret_settings() if defer_unconfigured else None
+        if settings is not None and not settings.store and not secretstore.local_key_path().exists():
+            if db.metadata(c).keys().isdisjoint((secretstore.KEY_LOCAL, secretstore.KEY_REF)):
+                return None
         holder = principals.ensure_local_owner(c)
         if holder is None:
             return None
-        key = secretstore.fingerprint_key()
+        key = secretstore.fingerprint_key(settings)
         digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
         if not auth.identity and secret_id is None and auth.mode == "subscription":
             login = scope(auth, "")
@@ -231,8 +236,8 @@ def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = Fal
                                         secret_id)
 
 
-def record_resolved(auth: Auth, *, refresh_only: bool = False) -> None:
+def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigured: bool = False) -> None:
     try:
-        record(auth, refresh_only=refresh_only)
+        record(auth, refresh_only=refresh_only, defer_unconfigured=defer_unconfigured)
     except (OSError, secretstore.StoreMissing) as error:
         LOG.warning("Could not record a resolved account (%s)", type(error).__name__)

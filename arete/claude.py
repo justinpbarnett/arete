@@ -246,11 +246,12 @@ def _run(
                 release_mount_lease()
                 on_line(line)
 
-            try:
-                cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts)
-                proc = child.stream(cmd, str(cwd), prompt, env, timeout, after_mounts)
-            finally:
-                release_mount_lease()
+            with ExitStack() as activation:
+                try:
+                    cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts, activation_lease=activation)
+                    proc = child.stream(cmd, str(cwd), prompt, env, timeout, after_mounts)
+                finally:
+                    release_mount_lease()
     except sandbox.ConfinementUnavailable as e:
         return Result(ok=False, session=resume, error=str(e))
     except device_turns.Lost as e:

@@ -2,7 +2,7 @@ from tests.test_behavior import SECRET_LINUX_CLAUDE_FIXTURE, _SecretChildCase
 
 
 class AuthorityClaudeConfinementTests(_SecretChildCase):
-    def test_linux_masks_only_the_fingerprint_file_without_requiring_a_store(self):
+    def test_linux_unconfigured_startup_needs_confinement_only_with_a_fallback_key(self):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 checkout = linux_checkout()
@@ -13,31 +13,21 @@ ordinary.write_text('ordinary fixture')
 state_control.write_text('unrelated state fixture')
 options = dict(add_dirs=[extra], tools=['Bash'])
 with linux_claude() as (which, stream):
-    assert_missing_bwrap(which, stream, checkout, **options)
-    for present in (False, True):
-        with case.subTest(key_present=present):
-            assert key.exists() == present
-            assert run_claude(checkout, **options).ok
-            assert_mounts(stream, checkout, *key_mask)
-            assert ordinary.read_text() == 'ordinary fixture'
-            assert state_control.read_text() == 'unrelated state fixture'
-            if not present:
-                original = key.read_bytes()
-                assert len(original) == 32 and key.stat().st_mode & 0o777 == 0o600
-            assert key.read_bytes() == original
-    assert stream.call_count == 2
-""")
+    baseline = ['/fixture/claude']
+    assert sandbox.claude_confinement(baseline, checkout, (extra,)) == baseline
+    which.assert_not_called()
+    assert not key.exists() and not store.exists()
+    assert {secretstore.KEY_LOCAL, secretstore.KEY_REF}.isdisjoint(db.schema_metadata())
 
-    def test_linux_keeps_store_mask_during_fallback_transition(self):
-        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
-checkout = linux_checkout()
-key.write_bytes(b'F' * 32)
-key.chmod(0o600)
-with linux_claude() as (_, stream):
-    assert run_claude(checkout, tools=['Bash']).ok
+    original = b'F' * 32
+    secretstore.write_file(key, key.parent, original)
+    assert_missing_bwrap(which, stream, checkout, **options)
+    assert run_claude(checkout, **options).ok
     stream.assert_called_once()
-    assert_mounts(stream, checkout, *key_mask, *store_mask)
-assert key.read_bytes() == b'F' * 32
+    assert_mounts(stream, checkout, *key_mask)
+    assert ordinary.read_text() == 'ordinary fixture'
+    assert state_control.read_text() == 'unrelated state fixture'
+    assert key.read_bytes() == original and key.stat().st_mode & 0o777 == 0o600
 """)
 
     def test_macos_profile_denies_fingerprint_even_before_it_exists(self):
