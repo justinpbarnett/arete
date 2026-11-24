@@ -446,7 +446,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_evidence(int(item[1]))
             if method == "GET" and (run_events := EVENTS_PATH.fullmatch(path)):
                 return self.send_events(unquote(run_events[1]), query)
-            if method == "GET" or path == "/api/v1/batch":
+            if self.operation and (method == "GET" or self.operation[0]["name"] == "batch.run"):
+                result = self.api(method, path, query)
+                self.read_seq = result["seq"]
+            elif method == "GET":
                 with foundation.one_read() as conn:
                     self.read_seq = events.metadata(conn)["head"]
                     result = self.api(method, path, query)

@@ -98,7 +98,8 @@ def secret_store_roots() -> tuple[Path, ...]:
 
 def authority_roots() -> tuple[Path, ...]:
     return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
-            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR, *secret_store_roots(),
+            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
+            paths.FINGERPRINT_KEY_FILE, *secret_store_roots(),
             *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
 
 
@@ -120,9 +121,10 @@ def already_protects_authority() -> bool:
         return False
 
     for path in authority_roots():
-        if denied(path, b"file-read-data", b"file-write-data", b"file-write-create"):
+        fingerprint = path == paths.FINGERPRINT_KEY_FILE
+        if denied(real_path(path) if fingerprint else path, b"file-read-data", b"file-write-data", b"file-write-create"):
             continue
-        if absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
+        if not fingerprint and absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
                 paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority"))):
             continue
         return False
@@ -138,32 +140,57 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
-def linux_store_confinement(command: list[str], cwd: Path | str) -> list[str]:
+def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = ()) -> list[str]:
+    if sys.platform == "darwin" and not can_confine(False):
+        raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
         return command
     from . import config, secretstore
 
     try:
         settings = config.secret_settings()
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        raise ConfinementUnavailable("Claude could not determine Linux secret store confinement") from error
-    store = settings.store_dir
-    if store is None:
+        store = settings.store_dir
+        key = secretstore.local_key_path()
+        protect_fallback = settings.store is None or key.exists()
+        work = Path(cwd).resolve()
+        roots = tuple(dict.fromkeys((work, *(Path(p).resolve() for p in opened))))
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+        raise ConfinementUnavailable("Claude could not determine Linux secret confinement paths") from error
+    if not protect_fallback and store is None:
         return command
     launcher = shutil.which("bwrap", path=os.defpath)
     if not launcher:
-        raise ConfinementUnavailable("Claude with a configured store_dir on Linux requires bubblewrap for confinement")
-    work = Path(cwd).resolve()
-    if work.is_relative_to(store):
+        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
+    if store is not None and work.is_relative_to(store):
         raise ConfinementUnavailable("Claude cannot start inside the secret store")
-    try:
-        with secretstore.file_parent(store / "mount", store, create=True, private=True):
-            pass
-    except OSError as error:
-        raise ConfinementUnavailable("Claude could not prepare the Linux secret store mount") from error
+    masks = linux_fingerprint_mounts(key, roots) if protect_fallback else []
+    if store is not None:
+        try:
+            with secretstore.file_parent(store / "mount", store, create=True, private=True):
+                pass
+        except OSError as error:
+            raise ConfinementUnavailable("Claude could not prepare the Linux secret store mount") from error
+        masks += ["--tmpfs", str(store), "--remount-ro", str(store)]
     return [launcher, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL",
             "--die-with-parent", "--new-session", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-            "--tmpfs", str(store), "--remount-ro", str(store), "--chdir", str(work), "--", *command]
+            *masks, "--chdir", str(work), "--", *command]
+
+
+def linux_fingerprint_mounts(key: Path, opened: tuple[Path, ...]) -> list[str]:
+    state = key.parent
+    if state == Path("/") or any(p == state or p.is_relative_to(key) for p in opened):
+        raise ConfinementUnavailable("Claude cannot open the instance state directory as a workspace")
+    try:
+        with paths.directory_fd(state, create=True):
+            pass
+    except OSError as error:
+        raise ConfinementUnavailable("Claude could not prepare the Linux fingerprint key mask") from error
+    mounts = ["--tmpfs", str(state)]
+    inside = tuple(p for p in opened if p.is_relative_to(state))
+    for root in inside:
+        if not any(parent != root and root.is_relative_to(parent) for parent in inside):
+            mounts += ["--bind", str(root), str(root)]
+    return [*mounts, "--remount-ro", str(state)]
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,

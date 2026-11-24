@@ -230,7 +230,10 @@ def _run(
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
-            cmd = sandbox.linux_store_confinement(cmd, cwd)
+            opened = tuple(add_dirs or ())
+            if openrouter_config is not None:
+                opened += (openrouter_config,)
+            cmd = sandbox.claude_confinement(cmd, cwd, opened)
             proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
     except sandbox.ConfinementUnavailable as e:
         return Result(ok=False, session=resume, error=str(e))

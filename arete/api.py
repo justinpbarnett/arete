@@ -179,8 +179,6 @@ def prepare(name, values):
                 secretstore.validate(values["scope"], values["name"])
             except ValueError as error:
                 raise contract.Problem("invalid_input", str(error)) from None
-    if credential_http.registry_operation(name):
-        foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
     if name == "hook.ingest":
         for i, event in enumerate(values["events"]):
             event_timestamp(event["ts"], f"input.events[{i}].ts")
@@ -209,10 +207,15 @@ def execute(name, values, handler=None):
         from . import dashboard
 
         return dashboard.record_usage(handler, values)
+    reads = values["requests"] if name == "batch.run" else ()
+    if credential_http.registry_operation(name) or any(credential_http.registry_operation(r["operation"]) for r in reads):
+        foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
-        result = read(name, values, handler)
-        return {"seq": seq, **result}
+        if name == "batch.run":
+            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler)} for r in reads]
+            return {"seq": seq, "results": results}
+        return {"seq": seq, **read(name, values, handler)}
 
 
 def read(name, values, handler):
@@ -231,8 +234,6 @@ def read(name, values, handler):
         return {**contract.publish(), "contract_sha": contract.digest()}
     if name == "error.list":
         return {"errors": contract.ERRORS}
-    if name == "batch.run":
-        return {"results": [execute(r["operation"], r.get("input", {}), handler) for r in values["requests"]]}
     if name == "screen.get":
         view = values.get("view", "live")
         if view not in VIEWS and view not in ("run", "task", "chat", "loop", "incident"):
@@ -323,6 +324,8 @@ def dispatch(handler, op, path_values, query):
     try:
         if write:
             prepare(name, values)
+            if credential_http.registry_operation(name):
+                foundation.migrate_on_demand(foundation.SECRET_REGISTRY_SCHEMA)
             raw, hash_body = None, None
             if plain:
                 raw = handler.text_body()
