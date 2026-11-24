@@ -756,12 +756,24 @@ class Run(AgentRun):
 
 
 def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
+    from .store import db
+
+    if db.WORKSPACE_ROWS_ACTIVE:
+        return contracted_workspace_owner(run, ws, checkouts)
     row = workspaces.open_for(ws.name)
     earlier = workspaces.owner_of(row) if row and (row["owner_run"] or row["legacy_owner"]) else None
     if run.alone and earlier:
         return earlier
     created = earlier.created if earlier else ""
     return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
+
+
+def contracted_workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
+    row = workspaces.open_for(ws.name)
+    earlier = workspaces.owner_of(row) if row and row["owner_run"] else None
+    if run.alone and earlier:
+        return earlier
+    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), checkouts)
 
 
 def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:

@@ -4,6 +4,10 @@ Agent loops that keep running and keep making the harness they run in better.
 
 Arete is one global engine for every repo on the machine. Each repo gets a thin layer that says how to set up, what checks must pass, and how much the agents are trusted there. The layer is `.agents/` in the repo, or a folder outside it when the rest of the team does not use arete. Agents edit files. Arete's own code commits, pushes and opens PRs, so no agent ever holds git write access.
 
+## Dark software factory
+
+A dark software factory repeatedly turns authorized goals for a defined class of work into working software at its agreed point of delivery, without requiring a person to implement, review, approve, or advance ordinary changes. It verifies the delivered behavior using acceptance checks the builder cannot waive or weaken. It recovers from routine failures on its own and, when it cannot safely proceed, stops the affected work and makes the reason visible.
+
 ## Database transactions and the timing rollout
 
 Retain at least one full day of rollback-mode measurements before deploying this WAL release.
