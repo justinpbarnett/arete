@@ -1606,7 +1606,9 @@ def linux_mounts(checkout, *masks):
 def assert_mounts(stream, checkout, *masks):
     argv = stream.call_args.args[0]
     assert argv[0] == bwrap
-    assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc'} <= set(argv)
+    assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc',
+            '--die-with-parent', '--new-session'} <= set(argv)
+    assert argv[argv.index('--cap-drop') + 1] == 'ALL'
     assert argv[argv.index('--bind'):argv.index('--') + 2] == linux_mounts(checkout, *masks)
     if '--tmpfs' in masks:
         assert store.stat().st_mode & 0o777 == 0o700
@@ -1648,12 +1650,19 @@ assert len(secretstore.fingerprint_key()) == 32
 """)
 
     @unittest.skipUnless(sys.platform == "linux", "requires native Linux descendant supervision")
-    def test_keyless_claude_drains_background_work_before_publication(self):
+    def test_keyless_claude_relay_drains_background_work_before_publication(self):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 work = linux_checkout()
-argv = ['/bin/sh', '-c', 'sleep 60 & echo $! > child.pid; echo \'{"type":"result","session_id":"fixture"}\'']
-with mock.patch.object(claude, 'command', return_value=argv):
+launcher = Path.cwd() / 'fixture-launcher'
+launcher.write_text(r'''#!/bin/sh
+sleep 60 &
+echo $! > child.pid
+printf '%s\n' '{"type":"result","session_id":"fixture"}'
+''')
+launcher.chmod(0o700)
+with (mock.patch.object(sandbox.shutil, 'which', return_value=str(launcher)),
+      mock.patch.object(claude, 'binary', return_value='/fixture/claude')):
     result = run_claude(work)
 assert result.ok and result.session.id == 'fixture'
 with case.assertRaises(ProcessLookupError):

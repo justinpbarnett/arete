@@ -23,6 +23,7 @@ SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
 LOGIN_DIR = paths.STATE_DIR / "pi-login"
 KEY_DIR = paths.STATE_DIR / "pi-key"
+LINUX_SHM = Path("/dev/shm")
 TEMPORARY_ROOTS = ("/private/tmp", "/private/var/folders")
 WRITABLE_ALWAYS = (*TEMPORARY_ROOTS, "/dev")
 WRITABLE_DEVICES = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/dtracehelper", "/dev/tty")
@@ -254,14 +255,139 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
+def linux_git_probe(cwd: Path, *args: str) -> list[str]:
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", *args], cwd=cwd,
+            env={"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return [] if probe.returncode else os.fsdecode(probe.stdout).removesuffix("\n").split("\n")
+
+
+def linux_checkout_root(cwd: Path, worktrees: Path) -> Path:
+    if LINUX_SHM not in cwd.parents and worktrees not in cwd.parents:
+        return cwd
+    for root in (cwd, *cwd.parents):
+        if root in (LINUX_SHM, LINUX_SHM.parent, worktrees):
+            break
+        marker = root / ".git"
+        if marker.is_symlink():
+            break
+        if marker.is_dir() or marker.is_file():
+            if root == cwd or linux_git_probe(cwd, "--show-toplevel") == [str(root)]:
+                return root
+            break
+    return cwd
+
+
+def linux_linked_common(checkout: Path) -> Path | None:
+    marker = checkout / ".git"
+    if marker.is_symlink() or not marker.is_file() or checkout.resolve() != checkout:
+        return None
+    fields = linux_git_probe(checkout, "--git-dir", "--git-common-dir")
+    if len(fields) != 2:
+        return None
+    git_dir, common = (Path(p) for p in fields)
+    if (LINUX_SHM in common.parents and common.resolve() == common
+            and git_dir.parent == common / "worktrees" and git_dir.resolve() == git_dir):
+        return common
+    return None
+
+
+def linux_direct_git_metadata(source: Path) -> Path | None:
+    marker = source / ".git"
+    if LINUX_SHM not in source.parents or source.resolve() != source or marker.is_symlink():
+        return None
+    if marker.is_dir():
+        return marker
+    if marker.exists():
+        return None
+    fields = linux_git_probe(source, "--git-dir", "--git-common-dir", "--is-bare-repository")
+    return source if fields == [str(source), str(source), "true"] else None
+
+
+def linux_checkout_metadata(checkouts: tuple[Path, ...], git_roots: tuple[Path, ...], base: Path,
+                            session_checkout: tuple[Path, Path] | None) -> set[Path]:
+    from . import config
+    from .store import db, workspaces
+
+    requested: dict[str, list[tuple[Path, Path]]] = {}
+    for cwd, root in zip(checkouts, git_roots, strict=True):
+        if base in cwd.parents:
+            requested.setdefault(cwd.relative_to(base).parts[0], []).append((cwd, root))
+    sources: set[Path] = set()
+    selected: set[tuple[Path, Path]] = set()
+    if session_checkout is not None:
+        worktree, source = session_checkout
+        expected = base / worktree.name
+        if worktree.parent.resolve() == base and git_roots[:1] == (expected,):
+            source = Path(os.path.abspath(source))
+            sources.add(source)
+            selected.add((expected, source))
+    if requested:
+        with suppress(db.NoDatabase), db.reader() as conn:
+            if db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
+                for name, roots in requested.items():
+                    if not (row := workspaces.open_for(name)):
+                        continue
+                    for checkout in workspaces.owner_of(row).checkouts:
+                        worktree = checkout.wt.resolve()
+                        if not worktree.is_relative_to(base / name):
+                            continue
+                        source = Path(os.path.abspath(checkout.src))
+                        sources.add(source)
+                        if any(worktree.is_relative_to(cwd) or worktree == root for cwd, root in roots):
+                            selected.add((worktree, source))
+    required: set[Path] = set()
+    for worktree, source in selected:
+        if (common := linux_linked_common(worktree)) is not None and (
+                common == linux_direct_git_metadata(source) or common == linux_linked_common(source)):
+            required.add(common)
+    linked = {root for root in git_roots if (root / ".git").is_file()}
+    if not required and not linked:
+        return set()
+    configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
+                  for part in ([p.dir for p in repo.parts] or [""])}
+    required.update(common for root in linked & configured if (common := linux_linked_common(root)) is not None)
+    anchors = sources | configured
+    return {common for common in required if (
+        (common in anchors and linux_direct_git_metadata(common) == common)
+        or (common.name == ".git" and common.parent in anchors and linux_direct_git_metadata(common.parent) == common)
+    )}
+
+
+def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None,
+                        session_checkout: tuple[Path, Path] | None = None) -> list[str]:
+    roots = checkouts + (paths.STATE_DIR.resolve(),) + ((profile,) if profile is not None else ())
+    if any(root in (LINUX_SHM, LINUX_SHM.parent) for root in roots):
+        raise ConfinementUnavailable("Claude cannot restore a shared device directory")
+    if profile is not None and LINUX_SHM in profile.parents and not profile.is_dir():
+        with paths.directory_fd(profile, create=True):
+            pass
+    base = paths.WORKTREES_DIR.resolve()
+    checkout_roots = tuple(linux_checkout_root(cwd, base) for cwd in checkouts)
+    metadata = linux_checkout_metadata(checkouts, checkout_roots, base, session_checkout)
+    restored = {root for root in (*roots, *checkout_roots, *metadata) if LINUX_SHM in root.parents}
+    return [arg for root in sorted(restored) if restored.isdisjoint(root.parents)
+            for arg in ("--bind", str(root), str(root))]
+
+
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
-                       mount_lease: ExitStack | None = None, activation_lease: WorkerLease | None = None) -> list[str]:
+                       profile: Path | None = None, mount_lease: ExitStack | None = None,
+                       activation_lease: WorkerLease | None = None,
+                       session_checkout: tuple[Path, Path] | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
         return command
     from . import secretstore
 
+    launcher = shutil.which("bwrap", path=os.defpath)
+    if not launcher:
+        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
     try:
         key = secretstore.local_key_path()
         info = linux_key_info(key)
@@ -275,21 +401,20 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         store, activated = linux_store_policy(has_local=info is not None, had_local=had_local)
         if activated and activation_lease is not None:
             activation_lease.close()
-        if info is None and store is None:
-            return command
         work = Path(cwd).resolve()
-        masks = linux_fingerprint_mounts(key, info, (work, *opened)) if info is not None else []
+        checkouts = (work, *(Path(root).resolve() for root in opened))
+        profile = (work / profile).resolve() if profile is not None else None
+        targets = checkouts + ((profile,) if profile is not None else ())
+        if store is not None and any(root.is_relative_to(store) for root in targets):
+            raise ConfinementUnavailable("Claude cannot start inside the secret store")
+        masks = linux_fingerprint_mounts(key, info, targets) if info is not None else []
+        restored = linux_claude_mounts(checkouts, profile, session_checkout)
     except ConfinementUnavailable:
         raise
     except secretstore.FingerprintKeyMissing as error:
         raise ConfinementUnavailable(str(error)) from error
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
         raise ConfinementUnavailable("Claude could not determine Linux secret confinement paths") from error
-    launcher = shutil.which("bwrap", path=os.defpath)
-    if not launcher:
-        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
-    if store is not None and work.is_relative_to(store):
-        raise ConfinementUnavailable("Claude cannot start inside the secret store")
     if store is not None:
         try:
             with secretstore.file_parent(store / "mount", store, create=True, private=True):
@@ -299,7 +424,7 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         masks += ["--tmpfs", str(store), "--remount-ro", str(store)]
     return [launcher, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL",
             "--die-with-parent", "--new-session", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-            *masks, "--chdir", str(work), "--", *command]
+            *restored, *masks, "--chdir", str(work), "--", *command]
 
 
 def linux_key_info(key: Path) -> os.stat_result | None:

@@ -176,7 +176,7 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
         return
     spec.source = str(repo.path)
     spec.branch = f"session/{spec.id}"
-    wt = paths.WORKTREES_DIR / f"session-{spec.id}"
+    wt = paths.WORKTREES_DIR / session_lock(spec.id)
     if spec.task:
         spec.deny = diffguard.denied_paths(config.load_layer(repo.layer_dir))
         spec.cloned = published_baseline(repo)
@@ -279,14 +279,28 @@ def session_lock(session_id: str) -> str:
     return f"session-{session_id}"
 
 
-def turn_arguments(spec: Spec, cfg: config.Config, device: devices.Device) -> dict:
+def turn_arguments(spec: Spec) -> dict:
     def remaining_budget():
         return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
 
-    return {"model": spec.model, "runner": spec.runner, "cfg": cfg, "device": device, "tools": spec.tools,
-            "allowed_tools": spec.tools, "disallowed_tools": routing.NO_GIT_WRITES, "remaining_budget": remaining_budget,
-            "hard_cap": bool(spec.chat), "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
-            "repo": session_repo(spec, cfg)}
+    return {"model": spec.model, "runner": spec.runner, "tools": spec.tools, "allowed_tools": spec.tools,
+            "disallowed_tools": routing.NO_GIT_WRITES, "remaining_budget": remaining_budget, "hard_cap": bool(spec.chat),
+            "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text)}
+
+
+def run_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, **kwargs) -> runner.Result:
+    repo = session_repo(spec, cfg)
+    checkout = paths.WORKTREES_DIR / session_lock(spec.id)
+    origin = None
+    if (not device.remote and repo and spec.source and Path(spec.source) == repo.path
+            and spec.branch == f"session/{spec.id}" and checkout.parent == paths.WORKTREES_DIR
+            and Path(spec.cwd).is_relative_to(checkout)):
+        origin = (checkout, repo.path)
+    token = claude.SESSION_CHECKOUT.set(origin)
+    try:
+        return runner.run(prompt, spec.cwd, cfg=cfg, device=device, repo=repo, **kwargs)
+    finally:
+        claude.SESSION_CHECKOUT.reset(token)
 
 
 def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, turn: int,
@@ -296,8 +310,8 @@ def take_turn(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
     log_line(spec, "you", prompt)
     resume = compacted(spec, cfg, device, prompt, recent, turn, resume)
     whole = handover(spec, prompt, recent) if turn > 1 else prompt
-    res = runner.run(prompt if resume.id else whole, spec.cwd, trace=(spec.id, f"turn {turn}"), resume=resume,
-                     fresh_prompt=lambda which: whole, **turn_arguments(spec, cfg, device))
+    res = run_turn(spec, cfg, device, prompt if resume.id else whole, trace=(spec.id, f"turn {turn}"), resume=resume,
+                   fresh_prompt=lambda which: whole, **turn_arguments(spec))
     spec.turn_error = "" if res.ok else util.one_line(res.error, 400)
     record.note(spec.id, model=res.model, runner=res.runner)
     note = runner.cost_note(res)
@@ -328,10 +342,9 @@ def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: st
                      ).answers.get("switch")
     if not switch or switch.value is not True or not switch.sure(cfg.jev.confidence):
         return resume
-    res = runner.run("/compact", spec.cwd, model=row.get("model") or spec.model, runner="claude",
-                     trace=(spec.id, f"turn {turn} compact"), resume=resume, cfg=cfg, device=device,
-                     timeout=TURN_TIMEOUT_SECONDS, repo=session_repo(spec, cfg), fallback=False,
-                     wait_out_limits=False, resume_only=True)
+    res = run_turn(spec, cfg, device, "/compact", model=row.get("model") or spec.model, runner="claude",
+                   trace=(spec.id, f"turn {turn} compact"), resume=resume, timeout=TURN_TIMEOUT_SECONDS,
+                   fallback=False, wait_out_limits=False, resume_only=True)
     log_line(spec, "compact" if res.ok else "error",
              f"compacted {tokens:,} tokens of context before a new task (JEV {switch.note()}) {runner.cost_note(res)}"
              if res.ok else f"compaction failed: {util.first_line(res.error)}")
@@ -520,8 +533,8 @@ def ask_report(spec: Spec, cfg: config.Config, device: devices.Device, turn: int
                resume: Session) -> tuple[dict | None, str]:
     prompt = report_prompt(spec)
     log_line(spec, "you", prompt)
-    res = runner.run(prompt, spec.cwd, trace=(spec.id, "report"), resume=resume, json_schema=REPORT_SCHEMA,
-                     resume_only=True, **turn_arguments(spec, cfg, device))
+    res = run_turn(spec, cfg, device, prompt, trace=(spec.id, "report"), resume=resume, json_schema=REPORT_SCHEMA,
+                   resume_only=True, **turn_arguments(spec))
     note = runner.cost_note(res)
     if res.ok and isinstance(res.structured, dict):
         log_line(spec, "reply", f"{(res.text.strip() or 'a report')}\n{note}")

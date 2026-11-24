@@ -2,7 +2,7 @@ from tests.test_behavior import SECRET_LINUX_CLAUDE_FIXTURE, _SecretChildCase
 
 
 class AuthorityClaudeConfinementTests(_SecretChildCase):
-    def test_linux_unconfigured_startup_needs_confinement_only_with_a_fallback_key(self):
+    def test_linux_unconfigured_startup_requires_confinement_before_and_after_the_first_key(self):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 checkout = linux_checkout()
@@ -13,11 +13,21 @@ ordinary.write_text('ordinary fixture')
 state_control.write_text('unrelated state fixture')
 options = dict(add_dirs=[extra], tools=['Bash'])
 with linux_claude() as (which, stream):
-    baseline = ['/fixture/claude']
-    assert sandbox.claude_confinement(baseline, checkout, (extra,)) == baseline
-    which.assert_not_called()
+    assert_missing_bwrap(which, stream, checkout, **options)
+    which.assert_called_once_with('bwrap', path=os.defpath)
+    stream.side_effect = PermissionError('fixture: unusable launcher')
+    blocked = run_claude(checkout, **options)
+    assert not blocked.ok and 'could not start Linux secret confinement' in blocked.error
+    stream.assert_called_once()
+    assert_mounts(stream, checkout)
+
+    stream.reset_mock(side_effect=True)
+    assert run_claude(checkout, **options).ok
+    stream.assert_called_once()
+    assert_mounts(stream, checkout)
     assert not key.exists() and not store.exists()
     assert {secretstore.KEY_LOCAL, secretstore.KEY_REF}.isdisjoint(db.schema_metadata())
+    stream.reset_mock()
 
     original = b'F' * 32
     secretstore.write_file(key, key.parent, original)

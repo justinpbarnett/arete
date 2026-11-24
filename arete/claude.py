@@ -5,9 +5,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
 from threading import Lock
@@ -52,6 +54,7 @@ OPENROUTER_WITHHELD = frozenset({
     "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
 })
 UNRECOGNIZED_MODEL = "[claude-code:unrecognized_model]"
+SESSION_CHECKOUT: ContextVar[tuple[Path, Path] | None] = ContextVar("claude_session_checkout", default=None)
 
 
 def binary() -> str:
@@ -204,6 +207,11 @@ def _run(
 ) -> Result:
     openrouter = openrouter_config is not None
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
+    if not remote and sys.platform == "linux" and add_dirs:
+        try:
+            add_dirs = [Path(root).resolve() for root in add_dirs]
+        except (OSError, RuntimeError, ValueError):
+            return Result(ok=False, session=resume, error="Claude could not resolve Linux additional workspace paths")
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
                   resume=resume, fresh_session=fresh_session, system=system,
@@ -232,9 +240,7 @@ def _run(
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
-            opened = tuple(add_dirs or ())
-            if openrouter_config is not None:
-                opened += (openrouter_config,)
+            profile = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME") or paths.HOME) / ".claude")
             mounts = ExitStack()
             release_lock = Lock()
 
@@ -248,8 +254,16 @@ def _run(
 
             with sandbox.WorkerLease() as activation:
                 try:
-                    cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts, activation_lease=activation)
-                    proc = child.stream(activation.command(cmd), str(cwd), prompt, env, timeout, after_mounts)
+                    confined = sandbox.claude_confinement(
+                        cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,
+                        activation_lease=activation, session_checkout=SESSION_CHECKOUT.get())
+                    try:
+                        proc = child.stream(activation.command(confined), str(cwd), prompt, env, timeout, after_mounts)
+                    except OSError as e:
+                        if confined is cmd:
+                            raise
+                        raise sandbox.ConfinementUnavailable(
+                            f"Claude could not start Linux secret confinement: {e.strerror or e}") from e
                 finally:
                     release_mount_lease()
     except sandbox.ConfinementUnavailable as e:
