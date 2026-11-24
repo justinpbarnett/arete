@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 
 from . import (
     alerts,
@@ -69,12 +70,16 @@ from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
 from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
+from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import triage as triage_store
 from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
+
+if TYPE_CHECKING:
+    from . import unblock
 
 ADW = "adw"
 ORCHESTRATED = "orchestrated"
@@ -510,6 +515,7 @@ class Run(AgentRun):
     tracker: tracker.Tracker
     tid: str
     force: bool = False
+    from_poll: bool = False
     feedback: list[dict] = field(default_factory=list)
     claim_feedback_on_revise: bool = False
     closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
@@ -537,17 +543,31 @@ class Run(AgentRun):
     recovery: dict = field(default_factory=dict)
     pr_recovery_cutoff: str = field(default="", init=False)
     pr_recovery_discussion: dict[str, RecoveryDiscussion] = field(default_factory=dict, init=False)
+    pr_recovery_ticket_replies: list[unblock.TicketReply] | None = field(default=None, init=False)
+    pr_recovery_answers: list[dict] = field(default_factory=list, init=False)
 
     def capture_pr_recovery_discussion(self, prs: list[str]) -> None:
-        self.pr_recovery_cutoff = self.pr_recovery_cutoff or util.iso()
+        from . import unblock
+
+        if not self.pr_recovery_cutoff:
+            self.pr_recovery_cutoff = util.iso()
+            self.pr_recovery_answers = pr_recovery.answered_asks(self.id)
+            try:
+                self.pr_recovery_ticket_replies = unblock.ticket_reply_rows(self.tracker, str(self.tid))
+            except (*tracker.ERRORS, OSError, KeyError, TypeError, ValueError) as error:
+                detail = util.first_line(vault.hidden(str(error)), 300)
+                self.log(f"could not record the initial ticket replies: {detail}")
         prior = self.recovery.get("binding", {}).get("pr_recovery", {})
-        for pr in prs:
+        for pr in dict.fromkeys(prs):
+            if pr in self.pr_recovery_discussion:
+                continue
             decision = prior.get("decision", "") if prior.get("refs", {}).get("url") == pr else ""
             replies = None
             try:
                 replies = pr_recovery.pr_replies(pr, self.repo.name, str(self.tid))
-                if not decision:
-                    decision = pr_recovery.decision_for(self.id, self.tracker, str(self.tid), pr, replies=replies)
+                if self.pr_recovery_ticket_replies is not None:
+                    decision = unblock.recovery_decision_for(replies, self.pr_recovery_ticket_replies,
+                                                             self.pr_recovery_answers)
             except (*tracker.ERRORS, OSError, ValueError) as error:
                 detail = util.first_line(vault.hidden(str(error)), 300)
                 self.log(f"could not record the initial owner discussion on {pr}: {detail}")
@@ -846,9 +866,9 @@ def drop_new_bytecode(wt: Path, retained: pr_recovery.Retained) -> None:
     if not retained.names:
         workspace.drop_untracked_bytecode(wt)
         return
-    for name in workspace.untracked_files(wt) - retained.names:
-        if Path(name).parent.name == "__pycache__":
-            workspace.remove_untracked(wt, name)
+    names = {n for n in workspace.untracked_files(wt) if Path(n).parent.name == "__pycache__"}
+    for name in names.difference(pr_recovery.overlapping_paths(names, retained.names)):
+        workspace.remove_untracked(wt, name)
 
 
 def protect_retained_from_restore(c: workspace.Checkout, paths: list[str]) -> None:
@@ -1000,11 +1020,8 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
             if names := stageable_untracked(c.wt, ignored=True).intersection(forced) - saved.names:
                 git(["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], c.wt,
                     input="\0".join(sorted(names)) + "\0", env={"GIT_LITERAL_PATHSPECS": "1"})
-        if saved.names:
-            pr_recovery.add_retained_safe(c, saved)
-            diff = diffguard.between(c.wt, "--cached", against, deny=deny, prefix=c.prefix, moves=True)
-        else:
-            diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
+        pr_recovery.add_retained_safe(c, saved)
+        diff = diffguard.between(c.wt, "--cached", against, deny=deny, prefix=c.prefix, moves=True)
         merged = pending_merge(c)
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
@@ -1184,8 +1201,12 @@ def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
 
 
 def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]]:
-    return [(d, name) for d, names in before.items()
-            for name in sorted(workspace.untracked_files(d) - names - pr_recovery.read_retained(d).names)]
+    added = []
+    for d, names in before.items():
+        current = workspace.untracked_files(d) - names
+        protected = pr_recovery.overlapping_paths(current, pr_recovery.read_retained(d).names)
+        added.extend((d, name) for name in sorted(current.difference(protected)))
+    return added
 
 
 def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
@@ -1272,6 +1293,23 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
+
+
+def checkout_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
+    trees = {c.github: factory.fingerprint(c.wt) for c in checkouts}
+    return trees if len(trees) == len(checkouts) and all(trees.values()) else {}
+
+
+def check_tree(trees: dict[str, str]) -> str:
+    if not trees:
+        return ""
+    return next(iter(trees.values())) if len(trees) == 1 else orchestration_store.digest(trees)
+
+
+def check_git_state(checkouts: list[workspace.Checkout]) -> dict[str, tuple[str, str, str]]:
+    return {c.github: (pr_recovery.current_head(c), pr_recovery.current_ref(c),
+                       hashlib.sha256(util.git_bytes(["ls-files", "--stage", "-v", "-z"], c.wt)).hexdigest())
+            for c in checkouts}
 
 
 class RetryNextPoll(Exception):
@@ -1412,18 +1450,28 @@ class Build(TicketWork):
                                defer_failed_cleanup: bool = False) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
-        before = factory.fingerprint(self.ws)
+        before = checkout_trees(self.checkouts)
+        if not before:
+            self.report = "Checks did not run: could not fingerprint every participating checkout."
+            return False
+        git_before = check_git_state(self.checkouts)
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
                                      defer_failed_cleanup=defer_failed_cleanup)
         pr_recovery.check_staging(self.checkouts)
+        after = checkout_trees(self.checkouts)
+        if not after:
+            self.report += "\n\nCould not fingerprint every participating checkout after checks."
+            return False
+        git_after = check_git_state(self.checkouts)
+        if changed := [repo for repo in before if before[repo] != after[repo] or git_before[repo] != git_after[repo]]:
+            self.report += (f"\n\nChecks modified the source tree, index or HEAD in {', '.join(changed)}; "
+                            "rerun the full suite on the intended candidate.")
+            return False
         if ok:
-            after = factory.fingerprint(self.ws)
-            if before and after and before != after:
-                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
-                return False
+            tree = check_tree(before)
             if full:
-                self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
-            elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
+                self.checked = {"tree": tree, "trees": before, "commands": dict(self.layer.checks), "report": self.report}
+            elif tree == previous.get("tree") and previous.get("commands") == self.layer.checks:
                 self.checked = previous
         return ok
 
@@ -2001,9 +2049,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
-            poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
-                            and latest["status"] == "failed" and not latest["dry_run"]
-                            and launch_lease.from_poll(repo.name, str(tid)) else "")
+            from_poll = launch_lease.from_poll(repo.name, str(tid))
+            poll_failure = (latest["id"] if from_poll and not (dry_run or force or retry_of or readmission) and latest
+                            and latest["status"] == "failed" and not latest["dry_run"] else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -2135,7 +2183,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=from_poll,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
@@ -2393,6 +2441,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, summary)
+            elif run.path == "orchestrate" and pr_recovery.pending_receipt(flows.adaptive_state(run.id)):
+                status, summary, pr_url = _fail(run, "publication was interrupted; reconcile before resuming",
+                                               recovery=run.failure)
             else:
                 run.give_up("crashed before finishing")
         finally:
@@ -2456,21 +2507,29 @@ def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str
 
 
 def hold_open_pr(run: Run, error: pr_recovery.Hold, kept: dict[str, tuple[str, str]]) -> tuple[str, str, str]:
-    from . import flows
+    from . import flows, unblock
 
     failure = dict(error.recovery)
     why = error.why
-    if pr_recovery.pending_receipt(flows.adaptive_state(run.id)):
-        why += f" After inspecting the recorded effects, use `arete resume {run.id}` to verify the retained publication."
+    if pr_recovery.pending_receipt(saved := flows.adaptive_state(run.id)):
+        why += ". " + (pr_recovery.manual_publication_hold(saved["publication_intent"])
+                       or f"Inspect the recorded effects, then resume `{run.id}` to verify the retained publication")
     before, after = kept.get(failure["github"], ("", ""))
     if before == failure["local"] and after:
         failure["local"] = after
         why += f" Arete kept the remaining edits at {after}."
+    if "attempted_refs" in failure:
+        retry = run.recovery.get("binding", {}).get("pr_recovery", {})
+        refs = retry.get("refs", {})
+        if refs.get("url") == failure["pr"] and retry.get("local") == failure["local"]:
+            failure["retried_refs"] = refs
     discussion = run.pr_recovery_discussion.get(failure["pr"], RecoveryDiscussion())
     failure["held_at"] = run.pr_recovery_cutoff or util.iso()
     failure["seen_replies_by_pr"] = {pr: pr_recovery.reply_keys(snapshot.replies)
                                      for pr, snapshot in run.pr_recovery_discussion.items()}
     failure["seen_replies"] = failure["seen_replies_by_pr"].get(failure["pr"])
+    ticket_replies = run.pr_recovery_ticket_replies
+    failure["seen_ticket_replies"] = None if ticket_replies is None else unblock.ticket_reply_keys(ticket_replies)
     run.failure = {"class": "environment", **failure, "decision": discussion.decision}
     run.log(f"held: {why}")
     run.enter(run.failed_state)
@@ -2481,6 +2540,12 @@ def hold_open_pr(run: Run, error: pr_recovery.Hold, kept: dict[str, tuple[str, s
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
           *, recovery: dict | None = None) -> tuple[str, str, str]:
+    from . import flows
+
+    saved = flows.adaptive_state(run.id) if run.path == "orchestrate" else {}
+    reconciling = pr_recovery.pending_receipt(saved)
+    if reconciling:
+        why = pr_recovery.manual_publication_hold(saved["publication_intent"]) or why
     run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
     run.log(f"failed: {why}")
     run.enter(run.failed_state)
@@ -2489,10 +2554,7 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
     task = ("apply your feedback" if run.feedback else "repair the review findings" if run.repairs
             else "finish this one")
-    from . import flows
-
-    reconciling = run.path == "orchestrate" and pr_recovery.pending_receipt(flows.adaptive_state(run.id))
-    retry = (f"Inspect the publication effects before using `arete resume {run.id}`" if reconciling else run.retry_hint)
+    retry = "Reconcile the recorded publication effects before resuming" if reconciling else run.retry_hint
     run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
             f"Mac. {retry}.", **({"on_ticket": True} if reconciling else {}))
     return "failed", why, ""
@@ -3498,6 +3560,19 @@ def report_recovered_measurement(run: Run, recovery: pr_recovery.Publication, c:
                          during="before refreshing measurement evidence")
 
 
+def link_recovered_prs(run: Run, t: tracker.Ticket, recovery: pr_recovery.Publication,
+                       with_prs: list[workspace.Checkout]) -> None:
+    ticket_links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    for c in with_prs:
+        body = gh.pr_body(c.pr)
+        link, text = gh.split_link(body, ticket_links)
+        updated = with_siblings(text, sibling_section(t.ref, c, with_prs))
+        if updated == text or (payload := gh.outgoing(updated, link)) == body:
+            continue
+        with recovery.pr_write(c, "PR sibling links", "before linking sibling PRs", "after linking sibling PRs"):
+            gh.gh(["pr", "edit", c.pr, "--body-file", "-"], input=payload, write=True, retry=False)
+
+
 def refresh_recovered_prs(run: Run, t: tracker.Ticket, recovery: pr_recovery.Publication,
                           with_prs: list[workspace.Checkout], changed: list[workspace.Checkout],
                           report: str, link: str) -> list[workspace.Checkout]:
@@ -3506,10 +3581,9 @@ def refresh_recovered_prs(run: Run, t: tracker.Ticket, recovery: pr_recovery.Pub
     for c in (c for c in with_prs if c in changed):
         if stopped_by_ci(run, c):
             ci_stopped.append(c)
-        base = recovery.targets[c.github].refs
-        compared = f"Compared with `{base.base_branch}` at `{base.base}`."
+        compared = f"Compared with `{c.base}` at `{recovery.checked_base(c)}`."
         related = sibling_section(t.ref, c, with_prs)
-        recovery.comment(c, f"{compared}\n\n{ticket}{report}{related}", kind="Recovered gate evidence",
+        recovery.comment(c, f"{compared}\n\n{ticket}{report}{related}", kind=pr_recovery.GATE_EVIDENCE,
                          during="before refreshing PR evidence")
     return ci_stopped
 
@@ -3581,10 +3655,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             raise workspace.RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
         c.onto = c.onto or before
     if recovery:
-        recovery.recheck(during="before pushing the candidate")
         for c in changed:
-            if check_targets:
-                check_targets()
             recovery.push(c)
         return
     moved = [c.github for c in checkouts if workspace.remote_head(c.src, branch) != c.lease]
@@ -3664,14 +3735,12 @@ def drafted_note(drafted: list[workspace.Checkout], with_prs: list[workspace.Che
 def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci", *,
               recovery: pr_recovery.Publication | None = None) -> bool:
     now = "a draft" if draft else "ready for review"
-    if recovery and not recovery.before_pr_write(c, "draft state", during="before changing the PR draft state"):
-        return False
+    write = (recovery.pr_write(c, "draft state", "before changing the PR draft state",
+                               f"after attempting to mark the PR {now}", draft=draft) if recovery else nullcontext())
     try:
-        gh.pr_set_draft(c.pr, draft, **({"single_attempt": True} if recovery else {}))
+        with write:
+            gh.pr_set_draft(c.pr, draft, **({"single_attempt": True} if recovery else {}))
     except gh.GhError as e:
-        if recovery and isinstance(e, gh.GhUnsure):
-            raise recovery.unconfirmed_pr_write(c, during=f"after attempting to mark the PR {now}",
-                                                why=f"GitHub did not confirm whether the PR was marked {now}") from e
         run.log(f"{by}: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
         return False
     run.log(f"{by}: marked {c.pr} {now}")
@@ -3712,7 +3781,8 @@ def hold_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: lis
 
 
 def ready_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
-                 draft_why: str, *, recovery: pr_recovery.Publication | None = None) -> list[workspace.Checkout]:
+                 draft_why: str, *, recovery: pr_recovery.Publication | None = None,
+                 ready_drafts: bool = True) -> list[workspace.Checkout]:
     if draft_why or run.repairs or run.feedback:
         return []
     ready = []
@@ -3723,7 +3793,7 @@ def ready_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: li
         draft = own_draft_state(run, c)
         if draft is None:
             continue
-        if not draft or set_draft(run, c, False, "pr", **options):
+        if not draft or (ready_drafts and set_draft(run, c, False, "pr", **options)):
             ready.append(c)
     return ready
 
@@ -3797,9 +3867,11 @@ def classic_ci_reruns(b: Build) -> AutomaticCIReruns:
 
 
 class AutomaticCIReruns:
-    def __init__(self, requested_heads: set[tuple[str, str]], remember: Callable[[str, str], bool | None] | None = None):
+    def __init__(self, requested_heads: set[tuple[str, str]], remember: Callable[[str, str], bool | None] | None = None,
+                 request: Callable[[str, int], bool] | None = None):
         self.requested_heads = requested_heads
         self.remember = remember
+        self.request = request
         self.reruns: dict[tuple[str, str, str], list[gh.WorkflowRerun]] = {}
         self.before: dict[tuple[str, str, str], ci.Watched] = {}
 
@@ -3854,7 +3926,11 @@ class AutomaticCIReruns:
         unsure = None
         failed = False
         try:
-            gh.rerun_failed_jobs(repo, workflow)
+            if self.request:
+                if not self.request(repo, workflow):
+                    return False
+            else:
+                gh.rerun_failed_jobs(repo, workflow)
             current.story = f"Arete reran failed jobs for {names}. GitHub accepted the rerun request."
         except gh.GhUnsure as e:
             unsure = util.first_line(str(e), 300)
@@ -4611,13 +4687,15 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str, *,
             key = (f["pr_url"], f["thread"])
             threads[key] = by_comment.get(f["gh_id"]) or by_comment.get(f["thread"]) or threads.get(key) or fallback
     for (url, thread), text in threads.items():
+        write = nullcontext()
         if recovery:
-            checkout = next((c for c in recovery.checkouts if c.pr == url), None)
-            if not checkout or not recovery.before_pr_write(checkout, "feedback reply",
-                                                            during="before replying to PR feedback"):
+            if not (checkout := next((c for c in recovery.checkouts if c.pr == url), None)):
                 continue
+            write = recovery.pr_write(checkout, "feedback reply", "before replying to PR feedback",
+                                      "after replying to PR feedback", thread=thread)
         try:
-            gh.pr_reply(url, thread, public_text(run, text))
+            with write:
+                gh.pr_reply(url, thread, public_text(run, text))
         except gh.GhError as e:
             run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
 
@@ -5013,12 +5091,14 @@ def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified, 
     shots = verified.screenshots(run.dir / "evidence")
     if not shots:
         return {}
-    if recovery and not recovery.before_pr_write(c, "screenshot upload", during="before uploading screenshot evidence"):
-        return {}
+    write = (recovery.pr_write(c, "screenshot upload", "before uploading screenshot evidence",
+                               "after uploading screenshot evidence") if recovery else nullcontext())
     try:
-        with util.repo_lock(c.src):
+        with write, util.repo_lock(c.src):
             images = verify.push_evidence(c.src, c.github, run.id, shots)
     except RuntimeError as e:
+        if recovery:
+            raise
         run.log(f"evidence: the push failed, so the PR shows no screenshots: {util.first_line(str(e), 300)}")
         return {}
     run.log(f"evidence: pushed {util.count(len(shots), 'screenshot')} to {verify.EVIDENCE_BRANCH} on {c.github}")

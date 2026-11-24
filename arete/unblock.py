@@ -256,9 +256,14 @@ def pr_recovery_observation(repo, source, t, row, held: dict) -> dict:
 
 
 def recovery_changed(held: dict, observed: dict) -> bool:
-    return (observed["target"] and observed["local"] != "missing"
-            and (observed["decision"] != (held.get("decision") or "") or bool(observed["sibling_replies"])
-                 or any(observed[k] != held[k] for k in ("refs", "local"))))
+    if not observed["target"] or observed["local"] == "missing":
+        return False
+    refs = observed["refs"]
+    changed_refs = refs != pr_recovery.held_refs(held)
+    if "attempted_refs" in held:
+        changed_refs = changed_refs and refs != held.get("retried_refs") and pr_recovery.Refs(**refs).aligned()
+    return (changed_refs or observed["local"] != held["local"]
+            or observed["decision"] != (held.get("decision") or "") or bool(observed["sibling_replies"]))
 
 
 def snapshot(cfg, repo, source, t, row, *, prs=None, recovery=None) -> dict:
