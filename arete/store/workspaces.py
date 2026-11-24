@@ -456,7 +456,7 @@ def _reconcile(ws: Path, cfg: config.Config | None = None, *,
         row = _decode(c.execute("SELECT * FROM workspaces WHERE name = ? "
                                 "ORDER BY state = 'removed', id DESC LIMIT 1", (ws.name,)).fetchone())
     if untracked_only and (row is not None or not ws.is_dir() or ws.is_symlink()):
-        return None, None, False
+        return row, None, False
     source = workspace.made_record(ws)
     recorded = _read_record(source, strict=strict)
     version = recorded[2] if recorded else None
@@ -466,11 +466,11 @@ def _reconcile(ws: Path, cfg: config.Config | None = None, *,
     return current, version, current is not None and current != row
 
 
-def import_legacy(ws: Path) -> dict | None:
-    """Import a legacy snapshot for a folder with no workspace row history."""
+def import_legacy(ws: Path) -> tuple[dict | None, bool]:
     migrate_on_demand()
     with folder_lock(ws):
-        return _reconcile(ws, untracked_only=True)[0]
+        row, _, imported = _reconcile(ws, untracked_only=True)
+        return row, imported
 
 
 def _legacy_takeover(row: dict, owner: workspace.WorkspaceOwner | None) -> dict | None:
@@ -638,15 +638,14 @@ def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | No
                 change(row, **fields)
             else:
                 create(ws.name, **_release_selection(checkouts, excluded), **fields)
+        elif row and excluded:
+            change(row, state="kept", kept_reason="operator", held_by=[], bytes=size, last_sweep_error="")
         elif row:
-            if excluded:
-                change(row, state="kept", kept_reason="operator", held_by=[], bytes=size, last_sweep_error="")
-            else:
-                change(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
+            change(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
 
 
-def record_release_error(row: dict, error: OSError) -> None:
-    _change_current(row, last_sweep_error=util.first_line(str(error), 300))
+def record_release_error(ws: Path, row: dict, error: OSError) -> None:
+    _change_current(row, bytes=workspace.tree_bytes(ws), last_sweep_error=util.first_line(str(error), 300))
 
 
 def _ticket_ended(row: dict) -> bool:
@@ -702,9 +701,14 @@ def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
             not _has_attached_onto(ws, checkouts, row["onto"], allow_root=not excluded) and _ticket_ended(row)
         )
     )
-    if (remove or row["last_sweep_error"]) and _sweep_attempt(row) is None:
-        return
     if not remove:
+        size = workspace.tree_bytes(ws)
+        if row["last_sweep_error"]:
+            _sweep_attempt(row, bytes=size)
+        elif size != row["bytes"]:
+            change(row, bytes=size)
+        return
+    if _sweep_attempt(row) is None:
         return
     try:
         if not checkouts and not excluded:

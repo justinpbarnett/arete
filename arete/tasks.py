@@ -564,12 +564,17 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.R
         checkouts = [workspace.Checkout.from_row(c)
                      for c in flows.prepared_data(run_id).get("checkouts") or []]
     except (TypeError, KeyError):
-        return None
+        checkouts = None
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
-        if (imported := workspaces.import_legacy(ws)) and not checkouts:
-            checkouts = workspaces.owner_of(imported).checkouts
-        return workspace.remove_workspace(ws, checkouts)
+        row, imported = workspaces.import_legacy(ws)
+        if row and row["state"] == "removed":
+            return None if os.path.lexists(ws) else workspace.Release("removed")
+        if imported:
+            checkouts = checkouts or workspaces.owner_of(row).checkouts or workspace.registered_root_checkout(ws)
+        if checkouts is None:
+            return None
+        return workspace.remove_workspace(ws, checkouts, edits=True)
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:

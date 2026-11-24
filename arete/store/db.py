@@ -115,7 +115,7 @@ TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
-WORKSPACE_SNAPSHOT_SCHEMA = 24
+WORKSPACE_SNAPSHOT_SCHEMA = 25
 # Workspace operations migrate before accessing the snapshot columns.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n != WORKSPACE_SNAPSHOT_SCHEMA)
 MIGRATE_WAIT_SECONDS = 60

@@ -253,11 +253,11 @@ def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[P
 
 
 def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
-                     excluded: Collection[Path] = ()) -> Release:
+                     excluded: Collection[Path] = (), edits: bool = False) -> Release:
     if termination_pending:
         return Release("held", ["SIGTERM unwinding"])
     with workspaces.folder_lock(ws):
-        options = {}
+        options = {"edits": True} if edits else {}
         try:
             snapshot_error = None
             try:
@@ -274,13 +274,13 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
                 options["check_legacy"] = lambda: workspaces.require_unstatable_record(ws)
             if row and by and by != "sweep" and by == row["owner_run"]:
                 note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
-            made = workspaces.made_before(ws) if row and not options else {}
+            made = workspaces.made_before(ws) if row and snapshot_error is None else {}
         except workspaces.SnapshotUnavailable as e:
             if by == "sweep" and not isinstance(e, workspaces.UnreadableSnapshot):
                 raise
             row = workspaces.open_for(ws.name)
             force = by == "sweep" and bool(row and row["remove_asked_by"])
-            names = workspace_blockers(ws, checkouts, excluded=excluded, made={}, force=force, strict=by == "sweep")
+            names = workspace_blockers(ws, checkouts, edits, excluded=excluded, made={}, force=force, strict=by == "sweep")
             if by == "sweep" and not names:
                 raise
             release = Release("held", names or [str(ws)])
@@ -290,20 +290,20 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
                 release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force, **options)
             except OSError as e:
                 if row:
-                    workspaces.record_release_error(row, e)
+                    workspaces.record_release_error(ws, row, e)
                 raise
         workspaces.record_release(ws, checkouts, row, release, excluded=excluded)
         return release
 
 
 def remove_checkouts(ws: Path, checkouts: list[Checkout], made: dict, *, excluded: Collection[Path],
-                     force: bool, check_legacy: Callable[[], None] | None = None) -> Release:
-    if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made, force=force, strict=True):
+                     force: bool, check_legacy: Callable[[], None] | None = None, edits: bool = False) -> Release:
+    if names := workspace_blockers(ws, checkouts, edits, excluded=excluded, made=made, force=force, strict=True):
         return Release("held", names)
     for index, c in enumerate(checkouts):
         target_last = checkouts[:index] + checkouts[index + 1:] + [c]
         with util.repo_lock(c.src):
-            if names := workspace_blockers(ws, target_last, excluded=excluded, made=made, target=c, force=force,
+            if names := workspace_blockers(ws, target_last, edits, excluded=excluded, made=made, target=c, force=force,
                                            strict=True):
                 return Release("held", names)
             attached, unsafe = checkout_attachment(ws, c.wt)

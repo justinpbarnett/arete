@@ -287,7 +287,7 @@ assert util.git(["worktree", "list", "--porcelain"], src) == registrations
 
 class WorkspaceMigrationTests(_WorkspaceChildCase):
     def test_first_workspace_read_migrates_an_older_database(self):
-        self.run_child(WORKSPACE_SCHEMA_23 + """
+        self.run_child(workspace_schema(23) + """
 ws = paths.WORKTREES_DIR / "sample"
 assert workspace.made_before(ws) == {}
 assert schema_version() == db.LATEST
@@ -481,7 +481,6 @@ class WorkspaceSweepTests(_WorkspaceChildCase):
         self.run_child(WORKSPACE_REPO + r"""
 from arete import heartbeat, tracker
 from arete.store import runs, tasks
-
 merged, _, _, mid = checkout("1", "merged")
 locked, _, _, lid = checkout("2", "done")
 blocked, _, _, bid = checkout("3", "merged")
@@ -495,16 +494,14 @@ local = tasks.task_add(repo.name, "closed task", reserved_id="t-a123")
 tasks.task_set_state(local, "closed")
 closed, _, _, cid = checkout(local, "failed")
 record.start("pipeline", repo=repo.name, issue="1", status="failed", only_step="build")
-with util.lock(runs.run_lock("pipeline", repo.name, "2")) as got:
+with (util.lock(runs.run_lock("pipeline", repo.name, "2")) as got,
+      patch.object(tracker, "for_repo", side_effect=AssertionError("external tracker lookup"))):
     assert got
-    with patch.object(tracker, "for_repo", side_effect=AssertionError("external tracker lookup")):
-        workspaces.sweep(cfg)
-assert not merged.exists() and not registered(merged) and workspaces.get(mid)["state"] == "removed"
-assert not gone.exists() and not registered(gone) and workspaces.get(gid)["state"] == "removed"
-assert not closed.exists() and workspaces.get(cid)["state"] == "removed"
-assert locked.exists() and workspaces.get(lid)["state"] == "live"
-assert running.exists() and workspaces.get(rid)["state"] == "live"
-assert failed.exists() and workspaces.get(fid)["state"] == "kept"
+    workspaces.sweep(cfg)
+for ws, wid in ((merged, mid), (gone, gid), (closed, cid)):
+    assert not ws.exists() and not registered(ws) and workspaces.get(wid)["state"] == "removed"
+for ws, wid, state in ((locked, lid, "live"), (running, rid, "live"), (failed, fid, "kept")):
+    assert ws.exists() and workspaces.get(wid)["state"] == state
 assert workspaces.get(fid)["kept_reason"] == "failed"
 row = workspaces.get(bid)
 assert row["state"] == "held" and row["held_by"] == ["hand.txt"]
@@ -544,10 +541,8 @@ assert not released.exists() and workspaces.get(released_id)["state"] == "remove
 
     def test_sweep_ignores_onto_after_its_checkout_is_removed(self):
         self.run_child(WORKSPACE_REPO + r"""
-ws = paths.WORKTREES_DIR / "sample-7"
-clean = workspace.Checkout("api", repo.github, src, ws / "api", "main")
-saved = workspace.Checkout("web", repo.github, src, ws / "web", "main")
-workspace.add_worktree(clean, "clean", clean.origin_base)
+ws, clean = add_checkout("7", part="api")
+saved = replace(clean, dir="web", wt=ws / "web")
 workspace.add_worktree(saved, "saved", saved.origin_base)
 saved.onto = util.git(["rev-parse", "HEAD"], saved.wt).strip()
 (saved.wt / "notes.txt").write_text("kept edits\n")
@@ -555,7 +550,6 @@ util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qam", "keep edits"], saved.wt)
 rid = record.start("pipeline", repo=repo.name, issue="7", status="done")
 wid = workspaces.claim(ws, repo.name, "7", rid, checkouts=[clean, saved])
 workspace.note_made(ws, [clean, saved])
-
 workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "kept" and row["onto"] == {"web/": saved.onto} and row["sweep_attempts"] == 0, row
@@ -580,7 +574,6 @@ index.write_bytes(b"invalid Git index")
 released, c, _, released_id = checkout("8", "pr")
 workspaces.release(released, [c])
 util.git(["worktree", "lock", str(released)], src)
-
 workspaces.sweep(cfg)
 summary = workspace.held_summary()
 assert summary["blocked"] == 2, summary
@@ -605,7 +598,6 @@ assert workspace.held_summary()["blocked"] == 0
 WORKSPACE_SWEEP_RETRY = WORKSPACE_REPO + r"""
 from types import SimpleNamespace
 from arete import dashboard, heartbeat, serve
-
 kept, _, _, kept_id = checkout("7", "pr")
 workspaces.keep(kept, "pr")
 released, c, _, released_id = checkout("8", "pr")
@@ -648,22 +640,18 @@ records = []
 for ws, wid, _ in rows:
     made = workspace.made_before(ws)
     older = workspaces.get(wid)["legacy_mtime_ns"] - 1_000_000_000
-    source = write_workspace_record(ws, {**made, "\0head ": "stale-head"})
-    os.utime(source, ns=(older, older))
+    write_workspace_record(ws, {**made, "\0head ": "stale-head"}, after=older)
     records.append((ws, made, older))
 sweep()
 check_failures("legacy workspace record is older")
-
 for ws, made, older in records:
-    source = write_workspace_record(ws, made)
-    os.utime(source, ns=(older, older))
+    write_workspace_record(ws, made, after=older)
 check_retry()
 """)
 
     def test_inspection_permission_error_leaves_rows_and_retries(self):
         self.run_child(WORKSPACE_SWEEP_RETRY + r"""
 from arete.store import runs
-
 ended, _, _, ended_id = checkout("9", "done")
 rows += ((ended, ended_id, "kept"),)
 protected = {}
@@ -773,7 +761,6 @@ class WorkspaceLockedReleaseTests(_WorkspaceChildCase):
     def test_git_lock_keeps_release_retryable_until_unlock_with_pr_open(self):
         self.run_child(WORKSPACE_REPO + r"""
 from arete import heartbeat, tracker
-
 ws, c, rid, wid = checkout("7", "pr")
 run = pipeline.Run(rid, repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(cfg, repo, "7"), tid="7")
 run.dir.mkdir(parents=True, exist_ok=True)
@@ -784,7 +771,6 @@ assert row["state"] == "released" and "locked" in row["last_sweep_error"], row
 workspace.remove_worktree(repo, ws, owner=rid)
 assert workspaces.get(wid)["state"] == "released"
 assert ws.is_dir() and registered(ws)
-
 workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "released" and row["sweep_attempts"] == 1
@@ -882,7 +868,6 @@ assert ws.is_dir() and registered(ws)
         self.run_child(WORKSPACE_REPO + r"""
 from arete import flows, run_lines, tasks
 from arete.store import runs, tasks as task_store
-
 ticket = task_store.task_add(repo.name, "Stop while waiting for an answer")
 ws, c, rid, wid = checkout(ticket, "needs-info")
 with (patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}),
@@ -1028,22 +1013,23 @@ assert approvals.proposal(proposal["id"])["status"] == "approve"
 """)
 
 
-WORKSPACE_SCHEMA_23 = r"""
+def workspace_schema(version=24):
+    return f"""
 chain = db.migrations.load()
-with patch.object(db.migrations, "load", return_value=chain[:23]):
+with patch.object(db.migrations, "load", return_value=chain[:{version}]):
     db.migrate()
 
 def schema_version():
     with db.reader() as c:
         return c.execute("PRAGMA user_version").fetchone()[0]
 
-assert schema_version() == 23
+assert schema_version() == {version}
 """
 
 
 class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
-    def test_authorized_file_rule_records_filing_on_schema_23_before_workspace_access(self):
-        self.run_child(WORKSPACE_SCHEMA_23 + r"""
+    def test_authorized_file_rule_records_filing_before_workspace_access(self):
+        self.run_child(workspace_schema() + r"""
 from argparse import Namespace
 from arete import control, miner
 from arete.commands.tasks import cmd_file_rule
@@ -1055,10 +1041,10 @@ rid = record.start("miner", status="done")
 approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
                                 change="Add a rule", why="fixture"), "approve")
 proposal, = approvals.proposals(status=["approve"])
-assert schema_version() == 23
+assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == 23
+    assert schema_version() == 24
     assert approvals.proposal(p["id"])["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.LATEST
@@ -1075,8 +1061,8 @@ assert approvals.proposal(proposal["id"])["status"] == "merged"
 
 
 class WorkspacePipelineSchemaTests(_WorkspaceChildCase):
-    def test_local_poll_records_heartbeat_on_schema_23(self):
-        self.run_child(WORKSPACE_SCHEMA_23 + r"""
+    def test_local_poll_records_heartbeat_before_workspace_migration(self):
+        self.run_child(workspace_schema() + r"""
 from arete import poll
 from arete.store import loops
 
@@ -1085,11 +1071,11 @@ with patch.object(config, "load", return_value=cfg):
     assert poll.poll() == 0
 heartbeat = loops.loop_state("poll")
 assert heartbeat["mark_ok"] == 1 and heartbeat["mark_at"], heartbeat
-assert schema_version() == 23
+assert schema_version() == 24
 """)
 
     def test_standalone_dashboard_migrates_before_serving_health(self):
-        self.run_child(WORKSPACE_SCHEMA_23 + r"""
+        self.run_child(workspace_schema() + r"""
 from http.client import HTTPResponse
 from io import BytesIO
 from types import SimpleNamespace
@@ -1099,7 +1085,7 @@ from tests.test_behavior import fixture_bearer
 with db.tx() as c:
     c.execute("INSERT INTO workspaces (name, state, made_at) VALUES ('saved', 'kept', '2026-01-01')")
 auth = fixture_bearer(principals.seed_owner(api_check.LOGIN))
-assert schema_version() == 23
+assert schema_version() == 24
 
 def read_health(handlers, cfg, port, inside_serve, host):
     address = api_check.ADDRESS
@@ -1451,8 +1437,7 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         ws = paths.WORKTREES_DIR / f"{self.repo.name}-{tid}"
         c = workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
         workspace.add_worktree(c, f"arete/{tid}", "main")
-        (c.wt / ".venv").mkdir()
-        (c.wt / ".venv/pyvenv.cfg").write_text("home\n")
+        write_workspace_output(c.wt, "home\n")
         rid = record.start("pipeline", repo=self.repo.name, issue=tid, status=status, **fields)
         run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(self.cfg, self.repo, tid),
                            tid=tid)
