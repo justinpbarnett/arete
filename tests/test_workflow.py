@@ -1570,8 +1570,11 @@ class RestoredPRRevisionTests(unittest.TestCase):
         git = util.git
 
         def publication_git(args, cwd, **kw):
+            self.assertEqual(cwd, c.wt)
             if args[0] == "push":
                 return git(args, cwd, **kw)
+            if args == ["merge-base", c.origin_base, "HEAD"]:
+                return c.base_commit
             self.assertEqual(args, ["diff", "--cached", "--name-only"])
             return ""
 
@@ -1579,7 +1582,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.enterContext(mock.patch.object(pipeline, "git", side_effect=publication_git))
 
         review = {"method": "code-review", "verdict": "approve", "trees": {c.prefix: "tree"},
-                  "bases": {c.prefix: "new-head"}}
+                  "bases": {c.prefix: c.base_commit}}
         self.enterContext(mock.patch.object(orchestration.code_review, "candidate_trees", return_value=review["trees"]))
         self.job.review = Review.stored(review)
         ctl.data["evidence"] = {"checks": {"result": {"full": True}}, "review": {"result": review}}

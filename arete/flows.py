@@ -930,7 +930,7 @@ class Job:
                 plan.install()
                 made[workspace.head_key(c)] = plan.candidate
                 made.pop(workspace.onto_key(c), None)
-                workspaces.save_snapshot(self.ws, row, made)
+                workspaces.save_snapshot(row, made)
                 if self.on_pr_plan_installed:
                     self.on_pr_plan_installed(c)
                 plan.check_files(installed=True)
