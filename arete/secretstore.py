@@ -602,23 +602,34 @@ class KeyInitialization:
 
 def lookup_key(c, settings, local, meta):
     if meta.get(KEY_REF):
-        return referenced_key(meta, settings)
+        return meta, referenced_key(meta, settings)
     if KEY_REF in meta or KEY_PROOF in meta or KEY_STORE_DIR in meta:
         raise FingerprintKeyMissing("fingerprint_key_missing")
     if KEY_LOCAL in meta:
         if c.execute("SELECT 1 FROM secrets WHERE store != 'owner_file' "
                      "AND fingerprint IS NOT NULL LIMIT 1").fetchone():
             raise FingerprintKeyMissing("fingerprint_key_missing")
-        return KeyInitialization(meta["instance_id"]).verify(read_file(local, local.parent), meta[KEY_LOCAL])
+        initialization = KeyInitialization(meta["instance_id"])
+        value = read_file(local, local.parent)
+        if value is None and not db.in_write():
+            # The WAL reader can outlive publication of the same key in the configured store.
+            with closing(db.read_connection()) as latest, db.read_snapshot(latest):
+                published = db.metadata(latest)
+            if (published.get(KEY_REF) and published.get("instance_id") == meta["instance_id"]
+                    and published.get(KEY_LOCAL) == meta[KEY_LOCAL]):
+                active = settings if settings.store else config.secret_settings()
+                value = referenced_key(published, active)
+                return published, initialization.verify(value, meta[KEY_LOCAL])
+        return meta, initialization.verify(value, meta[KEY_LOCAL])
     if credentials.has_fingerprints(c):
         raise FingerprintKeyMissing("fingerprint_key_missing")
-    return None
+    return meta, None
 
 
 def key_context(c, settings, local):
     meta = db.metadata(c)
     pending = pending_journals(meta["instance_tag"], settings)
-    key = lookup_key(c, settings, local, meta)
+    meta, key = lookup_key(c, settings, local, meta)
     if pending:
         ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM)
         if not meta.get(KEY_REF):
@@ -756,7 +767,9 @@ def read(scope, name) -> bytes | None:
     with registry() as c:
         row = credentials.secret(c, scope, name)
         meta = db.metadata(c)
-        key = lookup_key(c, settings, local_key_path(), meta) if row and row["fingerprint"] is not None else None
+        key = None
+        if row and row["fingerprint"] is not None:
+            _, key = lookup_key(c, settings, local_key_path(), meta)
         require_store(settings)
         if key is None or row["status"] != "set":
             return None

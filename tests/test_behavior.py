@@ -990,6 +990,27 @@ assert secretstore.read('global', 'FIRST') == b'sample-original'
 """)
 
 
+class RegistryHandoffReadTests(_SecretChildCase):
+    def test_pinned_reader_keeps_its_fingerprint_and_owner_file_through_key_relocation(self):
+        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
+from concurrent.futures import ThreadPoolExecutor
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+db.enable_wal()
+file, value, row = seed_owner_file('hand')
+paths.CONFIG_FILE.write_text(configured)
+with db.one_read() as reader:
+    before = db.metadata(reader)
+    assert secretstore.KEY_LOCAL in before and secretstore.KEY_REF not in before
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(secretstore.fingerprint_key).result(timeout=5)
+    assert not paths.FINGERPRINT_KEY_FILE.exists() and db.metadata(reader) == before
+    assert secretstore.fingerprint(value) == row['fingerprint']
+    assert secretstore.read('global', 'OWNED') == value.encode()
+""")
+
+
 class RegistryKeyContinuityTests(_SecretChildCase):
     def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
         self.run_secret_child(r"""
