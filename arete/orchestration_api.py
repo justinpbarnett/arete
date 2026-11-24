@@ -100,8 +100,29 @@ OPERATIONS = {
 }
 
 
+WORKER_PROTOCOL = 2
+WORKER_OPERATIONS = {
+    **OPERATIONS,
+    "worker.start": replace(OPERATIONS["worker.start"], fields={
+        **OPERATIONS["worker.start"].fields, "write_paths": (list, []), "acceptance_check": (str, "none")}),
+    "worker.reply": Operation("Answer an open question and schedule its logical worker.",
+                              {"worker_id": required(str), "question_id": required(str), "message": required(str),
+                               "write_paths": (list, [])}),
+    "worker.messages": Operation("Read a page of message receipts after a sequence cursor.",
+                                 {"after": (int, 0), "limit": (int, 20)},
+                                 {"after": {"minimum": 0}, "limit": {"minimum": 1, "maximum": 20}}),
+}
+
+
+def operations(protocol):
+    return WORKER_OPERATIONS if protocol == WORKER_PROTOCOL else OPERATIONS
+
+
 class Catalog:
-    def __init__(self, job):
+    protocol = PROTOCOL
+
+    def __init__(self, job, protocol=PROTOCOL):
+        self.protocol = protocol
         self.job, self.entries, self.settings = job, {}, {}
         for role in ("plan", "build", "check_repair", "review_repair", "ci_repair", "verify", "review"):
             setting = job.run.settings(role)
@@ -159,8 +180,8 @@ class Catalog:
             raise ValueError("describe takes between 1 and 10 IDs")
         found = []
         for key in ids:
-            if key in OPERATIONS:
-                found.append({"id": key, **OPERATIONS[key].describe()})
+            if key in operations(self.protocol):
+                found.append({"id": key, **operations(self.protocol)[key].describe()})
             elif key in self.entries:
                 entry = dict(self.entries[key])
                 if entry["kind"] == "models":
@@ -218,7 +239,7 @@ class Catalog:
 
     def validate(self, response, turn: str, version: int, known: dict[str, dict], *, enforce_size_limit=True) -> dict:
         if (not isinstance(response, dict) or set(response) != {"version", "decision_id", "state_version", "rationale", "calls"}
-                or type(response["version"]) is not int or response["version"] != PROTOCOL
+                or type(response["version"]) is not int or response["version"] != (WORKER_PROTOCOL if self.protocol == WORKER_PROTOCOL else PROTOCOL)
                 or response["decision_id"] != turn or type(response["state_version"]) is not int
                 or response["state_version"] != version or type(response["rationale"]) is not str
                 or len(response["rationale"]) > 2000 or type(response["calls"]) is not list
@@ -228,10 +249,10 @@ class Catalog:
         calls = []
         for call in response["calls"]:
             if (not isinstance(call, dict) or set(call) != {"op", "args"} or type(call["op"]) is not str
-                    or call["op"] not in OPERATIONS):
+                    or call["op"] not in operations(self.protocol)):
                 raise ValueError("unknown operation or malformed call")
             op = call["op"]
-            args = OPERATIONS[op].arguments(call["args"])
+            args = operations(self.protocol)[op].arguments(call["args"])
             if op == "worker.start":
                 args["tool_bundle"] = args["tool_bundle"].removeprefix("tools:")
                 self.worker(args)
@@ -241,7 +262,7 @@ class Catalog:
             if op in ("verification.run", "review.run"):
                 self.route(args["route_id"], args["effort"], ("verify" if op.startswith("verification") else "review",))
                 self.refs(args.get("context_refs", args.get("goal_refs", [])))
-            if op.startswith("worker.") and op != "worker.start":
+            if op.startswith("worker.") and op not in ("worker.start", "worker.messages"):
                 prior = known.get(args["worker_id"], {})
                 if prior.get("op") not in ("worker.start", "worker.continue"):
                     raise ValueError("unknown worker")
@@ -249,7 +270,7 @@ class Catalog:
                     if (set(args["settings"]) - {"route_id", "effort"}
                             or any(type(value) is not str for value in args["settings"].values())):
                         raise ValueError("continuation settings may select only an approved route and effort")
-                    if prior["state"] not in ("succeeded", "failed", "cancelled", "interrupted"):
+                    if self.protocol == PROTOCOL and prior["state"] not in ("succeeded", "failed", "cancelled", "interrupted"):
                         raise ValueError("continue requires a quiescent worker")
                     effective = prior["result"].get("effective")
                     if not effective:
@@ -258,7 +279,7 @@ class Catalog:
             if op == "catalog.describe":
                 ids = args["ids"]
                 if (not 1 <= len(ids) <= 10 or any(type(key) is not str or key not in self.entries
-                                                and key not in OPERATIONS for key in ids)):
+                                                and key not in operations(self.protocol) for key in ids)):
                     raise ValueError("describe needs between 1 and 10 known catalog or operation IDs")
             if op == "context.read":
                 self.read(**args)
@@ -278,9 +299,9 @@ class Catalog:
         return {**response, "calls": calls}
 
 
-def describe_operations() -> dict:
-    return {name: operation.describe() for name, operation in OPERATIONS.items()}
+def describe_operations(protocol=PROTOCOL) -> dict:
+    return {name: operation.describe() for name, operation in operations(protocol).items()}
 
 
-def help_text() -> str:
-    return json.dumps(describe_operations(), separators=(",", ":"))
+def help_text(protocol=PROTOCOL) -> str:
+    return json.dumps(describe_operations(protocol), separators=(",", ":"))

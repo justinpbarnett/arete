@@ -5,6 +5,7 @@ import { syncList, selectItem, pane, activatePane } from "./ui-keys.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 import { dispatch, actions, runContext, runPageContext, repairThisRun, step as retryStep } from "./ui-actions.js";
 import { register } from "./ui-palette.js";
+import { webFetch } from "./ui-request.js";
 import { notice } from "./ui-notice.js";
 import { parse } from "./ui-router.js";
 import { runHash as hashOf, taskHash } from "./ui-data.js";
@@ -197,6 +198,29 @@ function Head({ view, now }) {
   </header>`;
 }
 
+class Workers extends Component {
+  state = { page: null, error: "" };
+  async next(cursor) {
+    if (!cursor) return this.setState({ page: null });
+    try {
+      const res = await webFetch(`/api/runs/${encodeURIComponent(this.props.id)}?messages_after=${cursor}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      this.setState({ page: (await res.json()).orchestration, error: "" });
+    } catch (error) { this.setState({ error: error.message }); }
+  }
+  render({ data }, { page, error }) {
+    const { messages, more_messages, message_cursor } = page || data;
+    return html`<section><h4>Workers</h4>
+      <p>${data.capacity.active_builders} active builders · limit ${data.capacity.effective_builders} (${data.capacity.configured_builders} configured)</p>
+      <ul>${data.workers.map(w => html`<li key=${w.id}><strong>${w.id}</strong> · ${w.phase} · attempt ${w.attempt}
+        ${w.reason || w.question || ""}</li>`)}</ul>
+      ${messages.map(m => html`<details key=${m.id}><summary>${m.kind} · ${m.worker} · ${m.state}</summary>
+        <p>${m.body}</p><pre>${[m.id, m.reply_to, ...m.history.map(e => `${e.at}  ${e.state}  ${e.action}`)].filter(Boolean).join("\n")}</pre></details>`)}
+      ${more_messages || page ? html`<button onClick=${() => this.next(more_messages ? message_cursor : 0)}>${more_messages ? "Next messages" : "First messages"}</button>` : null}
+      ${error ? html`<p role="alert">${error}</p>` : null}</section>`;
+  }
+}
+
 function Orchestration({ view, retry }) {
   const data = view.detail.orchestration;
   if (!data) return null;
@@ -204,10 +228,13 @@ function Orchestration({ view, retry }) {
   const rerun = (id) => dispatch(retryStep(), { ...runContext(run, "steps", {}, id), stale: retry,
     commit: (_, result) => { retry(); if (result.run) location.hash = hashOf(result.run); return { label: `Started ${id} alone; dependent evidence must be refreshed` }; } });
   const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
+    && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
+    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return html`<section class="run-orchestration" aria-label="Orchestration"><h3>Orchestration</h3>
     <p class="mono">${data.mode} · ${data.decisions} decisions · ${data.launches} controller launches · generation ${data.generation}</p>
+    ${data.capacity ? html`<${Workers} key=${run.id} id=${run.id} data=${data} />` : null}
     <div class="run-steps-scroll" tabindex="0" role="region" aria-label="Adaptive actions"><table class="run-steps">
       <thead><tr><th>Action</th><th>Operation</th><th>State</th><th>Result</th><th></th></tr></thead>
       <tbody>${data.actions.map((a) => html`<tr key=${a.id}><td data-label="Action">${a.id}</td><td data-label="Operation">${a.op}</td><td data-label="State">${a.state}</td>

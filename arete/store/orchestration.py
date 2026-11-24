@@ -6,10 +6,11 @@ import os
 from dataclasses import dataclass
 
 from .. import util
-from .db import reader, tx
+from .db import WORKER_EXCHANGE_SCHEMA, migrate_on_demand, migration_applied, reader, tx
 
 TABLES = {"orchestrations": "run lineage", "orchestration_turns": "run lineage",
-          "orchestration_actions": "run lineage"}
+          "orchestration_actions": "run lineage", "orchestration_workers": "run lineage",
+          "orchestration_messages": "run lineage"}
 TERMINAL = ("succeeded", "failed", "cancelled", "interrupted", "reconciliation-required")
 UNCHANGED_WAIT = "accepted-unchanged-wait"
 
@@ -64,6 +65,8 @@ def lookup(c, run_id):
 
 
 def acquire(run_id: str, previous: str, data: dict) -> Lease:
+    if data.get("protocol") == 2:
+        migrate_on_demand(WORKER_EXCHANGE_SCHEMA)
     with tx() as c:
         old = lookup(c, previous) if previous else None
         if previous and old is None:
@@ -193,27 +196,32 @@ def actions(lease: Lease, connect=reader) -> list[dict]:
 
 def transition(lease: Lease, action: str, state: str, result: dict, expected=("accepted", "running")) -> dict:
     with tx() as c:
-        current = fenced(c, lease)
-        result = {**result, "revision": current["version"] + 1}
-        row = c.execute("SELECT * FROM orchestration_actions WHERE root = ? AND id = ?",
-                        (lease.root, action)).fetchone()
-        if row is None or row["state"] not in expected:
-            raise Conflict(f"action {action} is not in an expected state")
-        kept = decoded(row)["result"]
-        result = {**{key: kept[key] for key in ("pid", "identity", "writing", "role", "input_stamp") if key in kept},
-                  **result}
-        c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",
-                  (state, encoded(result), util.iso(), lease.root, action))
-        if (row["op"] == "run.wait" and row["state"] == "running" and state == "succeeded"
-                and result.get("reason") == "timeout" and result.get("active")):
-            c.execute("UPDATE orchestration_turns SET state = ? WHERE root = ? AND id = ? AND state = 'accepted' "
-                      "AND (SELECT count(*) FROM orchestration_actions WHERE root = ? AND turn = ?) = 1",
-                      (UNCHANGED_WAIT, lease.root, row["turn"], lease.root, row["turn"]))
-        c.execute("UPDATE orchestrations SET version = version + 1, at = ? WHERE root = ?", (util.iso(), lease.root))
-        return {**decoded(row), "state": state, "result": result}
+        return transition_in(c, lease, action, state, result, expected)
 
 
-def view(run_id: str, connect=reader) -> dict | None:
+def transition_in(c, lease, action, state, result, expected=("accepted", "running")):
+    current = fenced(c, lease)
+    result = {**result, "revision": current["version"] + 1}
+    row = c.execute("SELECT * FROM orchestration_actions WHERE root = ? AND id = ?",
+                    (lease.root, action)).fetchone()
+    if row is None or row["state"] not in expected:
+        raise Conflict(f"action {action} is not in an expected state")
+    kept = decoded(row)["result"]
+    retained = ("pid", "identity", "writing", "role", "worker_id", "active_builders", "input_stamp")
+    result = {**{key: kept[key] for key in retained if key in kept},
+              **result}
+    c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",
+              (state, encoded(result), util.iso(), lease.root, action))
+    if (row["op"] == "run.wait" and row["state"] == "running" and state == "succeeded"
+            and result.get("reason") == "timeout" and result.get("active")):
+        c.execute("UPDATE orchestration_turns SET state = ? WHERE root = ? AND id = ? AND state = 'accepted' "
+                  "AND (SELECT count(*) FROM orchestration_actions WHERE root = ? AND turn = ?) = 1",
+                  (UNCHANGED_WAIT, lease.root, row["turn"], lease.root, row["turn"]))
+    c.execute("UPDATE orchestrations SET version = version + 1, at = ? WHERE root = ?", (util.iso(), lease.root))
+    return {**decoded(row), "state": state, "result": result}
+
+
+def view(run_id: str, connect=reader, *, messages_after=0) -> dict | None:
     with connect() as c:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='orchestrations'").fetchone():
             return None
@@ -222,7 +230,16 @@ def view(run_id: str, connect=reader) -> dict | None:
             return None
         actions = [decoded(row) for row in c.execute(
             "SELECT * FROM orchestration_actions WHERE root = ? ORDER BY rowid", (found["root"],))]
-        return {"root": found["root"], "current_run": found["current_run"], "generation": found["generation"],
+        details = {}
+        if found["data"].get("protocol") == 2:
+            from . import worker_exchange
+
+            lease = Lease(found["root"], found["current_run"], found["generation"])
+            for action in actions:
+                action["request"] = worker_exchange.public_text(action["request"])
+                action["result"] = worker_exchange.public_text(action["result"])
+            details = worker_exchange.projection(c, lease, found["data"].get("limits", {}), after=messages_after)
+        return {**details, "root": found["root"], "current_run": found["current_run"], "generation": found["generation"],
                 "mode": found["data"].get("mode", "orchestrate"),
                 "version": found["version"], "decisions": found["turns"] - unchanged_waits(c, found["root"]),
                 "launches": found["launches"],
@@ -255,5 +272,15 @@ def purge(c, run_id: str) -> None:
                     (run_id, run_id)).fetchone()
     if row and not c.execute("SELECT 1 FROM runs WHERE id = ? AND files_purged IS NULL",
                               (row["current_run"],)).fetchone():
-        for table in ("orchestration_actions", "orchestration_turns", "orchestrations"):
+        tables = ["orchestration_actions", "orchestration_turns", "orchestrations"]
+        if migration_applied(WORKER_EXCHANGE_SCHEMA, c):
+            from .. import builder_workspaces
+
+            for worker in c.execute("SELECT data FROM orchestration_workers WHERE root=?", (row["root"],)):
+                saved = json.loads(worker["data"])
+                for candidate in [*saved.get("retained", []), saved.get("candidate")]:
+                    if candidate:
+                        builder_workspaces.release(candidate)
+            tables[:0] = ["orchestration_messages", "orchestration_workers"]
+        for table in tables:
             c.execute(f"DELETE FROM {table} WHERE root = ?", (row["root"],))

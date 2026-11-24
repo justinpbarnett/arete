@@ -667,6 +667,7 @@ def settle_interrupted(exp: Experiment, path: Path) -> None:
 
 @dataclass
 class TrialRun(evals.EvalRun):
+    max_builders: int | None = None
     limits: dict = field(default_factory=dict)
     before: Totals = field(default_factory=Totals)
     began: float = field(default_factory=time.monotonic)

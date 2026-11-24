@@ -116,8 +116,9 @@ TIME_GLOB = time_shape.TIME_GLOB
 _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
 WORKSPACE_SNAPSHOT_SCHEMA = 25
-# Workspace operations migrate before accessing the snapshot columns.
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n != WORKSPACE_SNAPSHOT_SCHEMA)
+WORKER_EXCHANGE_SCHEMA = 26
+# Each capability migrates at its own entry point. Unrelated writers can use older databases.
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -454,11 +455,11 @@ def ensure_schema() -> None:
         pass
 
 
-def migrate_on_demand() -> None:
+def migrate_on_demand(needed: int = WORKSPACE_SNAPSHOT_SCHEMA) -> None:
     active = getattr(_OWNER, "active", None)
     if active and active[0] == os.getpid():
         return
-    needed = max(NEEDED, WORKSPACE_SNAPSHOT_SCHEMA)
+    needed = max(NEEDED, needed)
     try:
         if _schema_key(paths.DB_FILE.stat(), needed) in _CHECKED:
             return

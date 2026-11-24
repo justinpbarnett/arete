@@ -80,6 +80,11 @@ class Orchestration:
     max_actions: int = 128
     max_workers: int = 3
     progress_seconds: int = 30
+    max_builders: int | None = None
+
+    @property
+    def builder_limit(self) -> int:
+        return min(self.max_builders or 1, self.max_workers)
 
 
 def orchestration_table(data) -> Orchestration:
@@ -89,7 +94,8 @@ def orchestration_table(data) -> Orchestration:
         raise ValueError(message)
     only(data, layer_schema("orchestration"), "[orchestration]", message=message)
     values = {name: data.get(name, getattr(defaults, name)) for name in defaults.__dataclass_fields__}
-    if any(type(value) is not int or not 0 < value <= 10000 for value in values.values()):
+    if any(type(value) is not int or not 0 < value <= 10000 for name, value in values.items()
+           if name != "max_builders" or name in data):
         raise ValueError("[orchestration] limits must be integers between 1 and 10000")
     return Orchestration(**values)
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
@@ -406,6 +412,8 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
+    if "orchestration" in data and data["orchestration"].get("max_builders") is None:
+        data["orchestration"].pop("max_builders", None)
     routing = data.pop("routing", {})
     if sparse and isinstance(value, Config):
         if value.routing.payment_modes == PAYMENT_MODES:

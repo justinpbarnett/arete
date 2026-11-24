@@ -326,6 +326,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                 return with_spent(res, limited)
             return with_spent(done, limited)
         chosen_route = picked.candidate
+        if kw.get("private_worker") and (target.remote or chosen_route.runner not in ("pi", REPLAY)):
+            return with_spent(Result(ok=False, runner=chosen_route.runner, model=picked.name,
+                                     error="private workers require an isolated local route"), limited)
         if kw.get("native_observation") and (target.remote or chosen_route.runner != "pi"
                                              or picked.auth.mode != "subscription"):
             return Result(ok=False, runner=chosen_route.runner, model=name,
@@ -727,6 +730,8 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or ()), *claude_tools]
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
+    if kw.get("private_worker") and which == "pi":
+        kw["private_hidden"] = closed_context
     if closed_context:
         if target.remote:
             raise ValueError("closed grading context requires a local runner")

@@ -1055,7 +1055,7 @@ def get_runs(handler, rest, query):
 
 
 def get_run(handler, rest, query):
-    return board.run_board(unquote(rest))
+    return board.run_board(unquote(rest), messages_after=whole_number(query.get("messages_after", "0")))
 
 
 def get_tasks(handler, rest, query):
