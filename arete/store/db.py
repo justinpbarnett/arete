@@ -229,7 +229,10 @@ def workspace_handoff_blockers(conn, source, *, explicit=False):
             blockers.append(f"serve {lock_pid} has not reported its schema")
     receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
     if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
-        blockers.append("deploy health acknowledgement")
+        contract = next(m for m in _CHAIN if m.n == WORKSPACE_CONTRACT_SCHEMA)
+        if reason := serve_guard.unsupported_contract(paths.PACKAGE_DIR.parent, receipt.previous,
+                                                      [(contract.name, contract.sha256)]):
+            blockers.append(f"deploy a compatible workspace rollback release first: {reason}")
     if problem := workspace_source_blocker(conn, source, explicit=explicit):
         blockers.append(problem)
     return blockers

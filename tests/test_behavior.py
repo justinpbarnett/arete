@@ -1207,6 +1207,7 @@ class WorkspaceCutoverGateTests(_WorkspaceChildCase):
         self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from arete import control, loop_run, serve, serve_guard, tasks
 
@@ -1222,7 +1223,7 @@ server.cfg = config.load()
 tip = "2" * 40
 server.started_head = tip[:12]
 receipt = serve_guard.Receipt(str(paths.PACKAGE_DIR.parent), "main", "1" * 40, tip,
-                              "fixture/arete", 0, starts=1)
+                              "fixture/arete", time.time(), starts=1)
 serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, vars(receipt))
 with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
     loop = record.start("loop", pid=child.pid, schema_version=24, started="2026-01-01T00:00:00Z")
@@ -1234,9 +1235,9 @@ with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read(
         server.acknowledge_deploy(server.tick())
         assert server.contracts_waiting
         assert [call.args[0] for call in stage.call_args_list] == ["tick:load"]
-        dashboard.assert_called_once()
+        dashboard.assert_not_called()
         restart.assert_not_called()
-    assert serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT)["healthy"]
+    assert not serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT)["healthy"]
     assert schema_version() == 27
     with case.assertRaises(db.IncompatibleSchema):
         workspaces.sweep(cfg)
@@ -1394,10 +1395,10 @@ def handle(label, *_):
     return {}
 
 with (patch.object(server, "guard", side_effect=handle) as stage,
-      patch.object(serve_guard, "at_tip", return_value=True)):
+      patch.object(serve_guard, "at_tip", return_value=True),
+      patch.object(serve_guard, "git_bytes", return_value=Path(db.workspace_contract.__file__).read_bytes())):
     server.acknowledge_deploy(server.tick())
-    assert serve_guard.read(receipt_path)["healthy"] and server.contracts_waiting
-    assert server.tick() and not server.contracts_waiting
+    assert serve_guard.read(receipt_path)["healthy"] and not server.contracts_waiting
     assert {"loop:fixture", "stage:dispatch", "stage:workspaces"} <= {call.args[0] for call in stage.call_args_list}
 assert schema_version() == db.LATEST and not legacy.exists()
 """)
@@ -2183,7 +2184,9 @@ from arete.commands.tasks import cmd_file_rule
 from arete.store import approvals
 
 repo = config.Repo("sample", paths.WORKTREES_DIR)
-cfg = config.Config(repos=[repo])
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir(exist_ok=True)
+cfg = config.Config(repos=[repo], workspace_snapshots=legacy)
 rid = record.start("miner", status="done")
 approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
                                 change="Add a rule", why="fixture"), "approve")
@@ -2191,11 +2194,8 @@ proposal, = approvals.proposals(status=["approve"])
 assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == 24
+    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     assert approvals.proposal(p["id"])["status"] == "filing"
-    legacy = paths.STATE_DIR / "workspaces"
-    legacy.mkdir()
-    assert not db.migrate(workspace_snapshots=legacy)
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.LATEST
     return "main"

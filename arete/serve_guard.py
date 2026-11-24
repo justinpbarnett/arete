@@ -147,6 +147,10 @@ def rollback_schema_refusal(state: Path, checkout: Path, previous: str) -> str:
         return f"could not verify the database schema ({e})"
     if not contracts:
         return "the database contract ledger is missing"
+    return unsupported_contract(checkout, previous, contracts)
+
+
+def unsupported_contract(checkout: Path, previous: str, contracts) -> str:
     for name, digest in contracts:
         try:
             body = git_bytes(checkout, "show", f"{previous}:arete/store/migrations/{name}")

@@ -438,7 +438,7 @@ class Server:
         if not self.guard("tick:load", self.load) or self.code_problem:
             return False
         if self.contracts_waiting:
-            return foundation.workspace_handoff_ready(self.cfg.workspace_snapshots)
+            return False
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
