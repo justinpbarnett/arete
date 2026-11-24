@@ -33,10 +33,52 @@ with (linux_claude() as (which, stream), mock.patch.object(runner, 'pick', retur
     which.assert_not_called()
     stream.assert_called_once()
     with db.reader() as c:
-        assert not secretstore.has_fingerprints(c)
-    assert {secretstore.KEY_LOCAL, secretstore.KEY_REF}.isdisjoint(db.schema_metadata())
+        account, = c.execute("SELECT id, holder FROM accounts")
+        assert account['id'] == 'anthropic:subscription' and account['holder'].startswith('u:')
+    assert secretstore.KEY_REF in db.schema_metadata() and not key.exists()
 
     assert secretstore.put('global', 'DEMO', 'synthetic-value', 'api_key', 'hand')['status'] == 'set'
+""")
+
+    def test_busy_account_enrollment_retries_after_the_last_worker_exits(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+auth = accounts.Auth('subscription', 'claude', identity='fixture-wait', provider='anthropic')
+activation = secretstore.credential_activation
+waiting = Event()
+
+@contextmanager
+def observed(**options):
+    if options.get('deadline'):
+        waiting.set()
+    with activation(**options):
+        yield
+
+with linux_claude(), mock.patch.object(secretstore, 'credential_activation', observed), ThreadPoolExecutor(1) as pool:
+    with activation():
+        assert accounts.record_resolved(auth)
+        retry = pool.submit(accounts.record_resolved, auth, wait_for_activation=True)
+        assert waiting.wait(3)
+        with db.tx(timeout=1) as c:
+            assert c.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+    assert not retry.result(timeout=3)
+    with db.reader() as c:
+        assert [r[0] for r in c.execute("SELECT id FROM accounts")] == ['anthropic:subscription']
+""")
+
+    def test_kernel_refusal_does_not_retry_an_existing_key_without_a_namespace(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+checkout = linux_checkout(paths.WORKTREES_DIR)
+secretstore.fingerprint_key()
+with linux_claude(error='fixture: namespace unavailable') as (_, stream):
+    result = run_claude(checkout)
+    assert not result.ok and 'namespace unavailable' in result.error
+    stream.assert_called_once()
+    assert_mounts(stream, checkout, *key_mask)
 """)
 
 

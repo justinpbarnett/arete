@@ -7,7 +7,7 @@ import shlex
 import sys
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -361,14 +361,16 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         launch_kw = admitted(launch_kw, on_launch(route))
         account = account_of(picked.auth)
-        if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
-            accounts.record_resolved(picked.auth, defer_unconfigured=(
-                sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote))
-        started = util.iso()
-        with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
-            res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                          tier, kind, picked.auth, route, try_no, atom,
-                          openrouter_quote=chosen_route.price if openrouter else None)
+        with ExitStack() as after_attempt:
+            if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
+                local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
+                if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
+                    after_attempt.callback(accounts.record_resolved, picked.auth, wait_for_activation=True)
+            started = util.iso()
+            with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
+                res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target,
+                              launch_kw, tier, kind, picked.auth, route, try_no, atom,
+                              openrouter_quote=chosen_route.price if openrouter else None)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:

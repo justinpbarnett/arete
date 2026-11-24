@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,10 @@ class StoreMissing(RuntimeError):
 
 
 class StoreError(OSError):
+    pass
+
+
+class CredentialActivationBusy(StoreError):
     pass
 
 
@@ -365,7 +370,7 @@ def referenced_key(meta, settings, *, expected_store=None):
 
 
 @contextmanager
-def credential_activation(*, publishing: bool = False):
+def credential_activation(*, publishing: bool = False, deadline: float = 0):
     if sys.platform != "linux":
         yield
         return
@@ -374,8 +379,12 @@ def credential_activation(*, publishing: bool = False):
         with launch_lease.opened_file(parent, "credential-activation.lock", create=True) as fd:
             if not publishing:
                 fcntl.flock(fd, fcntl.LOCK_SH)
-            elif not launch_lease.take(fd):
-                raise StoreError("Retry credential publication after the local Claude run exits.")
+            else:
+                while not launch_lease.take(fd):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CredentialActivationBusy("Retry credential publication after the local Claude run exits.")
+                    time.sleep(min(0.1, remaining))
             yield
 
 
