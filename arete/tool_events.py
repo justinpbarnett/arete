@@ -5,12 +5,15 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 from datetime import UTC, datetime
 
 from . import paths, refusals, util
 
 INGEST_MARK = "_arete_ingest"
+WORKER_HOOK_SOCKET = "ARETE_WORKER_HOOK_SOCKET"
+MAX_HOOK_EVENT = 64 * 1024
 
 BASH_CLASSES = [
     ("missing_tool", r"command not found"),
@@ -112,16 +115,77 @@ def build_event(p: dict) -> dict | None:
     return None
 
 
+def append_hook_event(event):
+    with event_lock("hook-events"):
+        finish_ingest()
+        with paths.EVENTS_FILE.open("a+b") as out:
+            out.write(line_break(out) + (json.dumps(event, ensure_ascii=False) + "\n").encode())
+
+
+@contextlib.contextmanager
+def worker_hook_sink(env):
+    if sys.platform != "linux":
+        yield None
+        return
+
+    import socketserver
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    class HookRequest(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.connection.settimeout(2)
+            try:
+                line = self.rfile.readline(MAX_HOOK_EVENT + 1)
+                if not line.endswith(b"\n") or len(line) > MAX_HOOK_EVENT:
+                    return
+                event = json.loads(line)
+                if not isinstance(event, dict) or event.get("hook") not in ("PostToolUse", "PostToolUseFailure", "StopFailure"):
+                    return
+                append_hook_event(event)
+                self.wfile.write(b"1")
+            except (OSError, ValueError, RecursionError):
+                return
+
+    with tempfile.TemporaryDirectory(prefix="arete-w-") as folder:
+        root = Path(folder).resolve()
+        temporary = root / "tmp"
+        temporary.mkdir(mode=0o700)
+        address = str(root / "hook")
+        with socketserver.UnixStreamServer(address, HookRequest) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                env.update({WORKER_HOOK_SOCKET: address, "TMPDIR": str(temporary)})
+                yield temporary
+            finally:
+                server.shutdown()
+                thread.join()
+
+
+def send_hook_event(event, address):
+    line = (json.dumps(event) + "\n").encode()
+    if len(line) > MAX_HOOK_EVENT:
+        raise ValueError("worker hook event is too large")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(3)
+        client.connect(address)
+        client.sendall(line)
+        if client.recv(1) != b"1":
+            raise OSError("worker hook event could not be recorded")
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
         ev = build_event(payload)
         if ev:
-            with event_lock("hook-events"):
-                finish_ingest()
-                with paths.EVENTS_FILE.open("a+b") as out:
-                    out.write(line_break(out) + (json.dumps(ev, ensure_ascii=False) + "\n").encode())
+            if address := os.environ.get(WORKER_HOOK_SOCKET):
+                send_hook_event(ev, address)
+            else:
+                append_hook_event(ev)
     except Exception as e:
         with contextlib.suppress(OSError):
             paths.LOG_DIR.mkdir(parents=True, exist_ok=True)

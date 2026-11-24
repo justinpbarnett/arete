@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 
-from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, util
+from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, tool_events, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -244,11 +244,11 @@ def _run(
                 release_mount_lease()
                 on_line(line)
 
-            with sandbox.WorkerLease() as activation:
+            with sandbox.WorkerLease() as activation, tool_events.worker_hook_sink(env) as temporary:
                 try:
                     confined = sandbox.claude_confinement(
                         cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,
-                        activation_lease=activation)
+                        activation_lease=activation, run_id=env.get("ARETE_RUN_ID", ""), temporary=temporary)
                     try:
                         proc = child.stream(activation.command(confined), str(cwd), prompt, env, timeout, after_mounts)
                     except OSError as e:
