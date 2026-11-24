@@ -191,8 +191,6 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     saved = runlimits.metadata(row["id"], "parked.json") if row else {}
     prs = unblock.prs_of(row)
     cause, limit = blocker(row, saved, asks, prs, cycle)
-    if not cause and row.get("status") == "failed" and not row.get("environment_retry_of"):
-        cause = "delivery"
     if not cause and attempt.get("grant") and not attempt.get("child") and row.get("status") == "needs-info":
         cause = "ask" if not any(a["status"] == "open" for a in asks) else ""
     if not cause:

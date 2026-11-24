@@ -83,7 +83,22 @@ try {
         const result = await harness.waitForTask(task, context);
         if (result.state.outcome.status !== "completed") throw new Error("Issue monitor failed to settle");
     } else if (operation === "start") {
-        harness.resume();
+        const graph = await harness.watchTaskGraph(context);
+        try {
+            if (graph.value.tasks[task]?.state.status !== "sleeping") {
+                await new Promise((resolve, reject) => {
+                    graph.start(call => {
+                        if (call.kind !== "value") return;
+                        const node = call.value.tasks[task];
+                        if (node?.state.status === "sleeping") resolve();
+                        else if (!node || node.blocked) reject(new Error("Issue monitor could not start"));
+                    });
+                    harness.resume();
+                });
+            }
+        } finally {
+            await graph.stop();
+        }
     } else if (operation === "turn") {
         await root.configure({ model: { provider, modelId }, thinkingLevel, tools: [], modelTools: [],
             instructions: objective + " Use the current Arete observation and its action schema." }, context);

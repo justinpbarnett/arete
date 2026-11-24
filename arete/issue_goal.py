@@ -31,12 +31,11 @@ def exists(repo, ticket):
 def executable(name):
     from . import pi
 
-    found = shutil.which(name)
-    if found:
-        return found
     local = Path(pi.binary()).with_name(name)
-    if local.is_file():
+    if local.is_absolute() and os.access(local, os.X_OK):
         return str(local)
+    if found := shutil.which(name):
+        return found
     raise ValueError(f"Pi Durable requires {name} on the serve host")
 
 
@@ -56,7 +55,9 @@ def runtime():
                     shutil.copyfile(SOURCE / name, stage / name)
                 try:
                     subprocess.run([executable("npm"), "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=stage,
-                                   check=True, timeout=240, stdout=subprocess.DEVNULL)
+                                   check=True, timeout=240, stdout=subprocess.DEVNULL,
+                                   env={**os.environ, "PATH": str(Path(executable("node")).parent) + os.pathsep
+                                        + os.environ.get("PATH", "")})
                 except subprocess.SubprocessError as error:
                     raise ValueError("Could not install the locked Pi Durable runtime") from error
                 stage.rename(installed)
