@@ -120,7 +120,7 @@ def seed_owner(login, name=""):
     with foundation.tx() as c:
         principal = owner()
         if principal == "hand" and (person := active_human()):
-            return person
+            return person[0]
         if principal != "hand" and has_login(c, principal):
             return principal
         if not login:
