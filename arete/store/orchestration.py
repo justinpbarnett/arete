@@ -5,7 +5,8 @@ import json
 import os
 from dataclasses import dataclass
 
-from .. import util
+from .. import outbound, paths, record, util
+from . import runs, ticket_progress
 from .db import WORKER_EXCHANGE_SCHEMA, migrate_on_demand, migration_applied, reader, tx
 
 TABLES = {"orchestrations": "run lineage", "orchestration_turns": "run lineage",
@@ -31,13 +32,17 @@ def digest(value) -> str:
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
-def decoded(row) -> dict:
+def decoded(row, *, internal: bool = False) -> dict:
     if row is None:
         return {}
     found = dict(row)
     for key in ("data", "request", "result", "response"):
         if key in found:
             found[key] = json.loads(found[key])
+    if "result" in found:
+        found["timing"] = found["result"].pop("timing", None)
+        if not internal:
+            found["result"].pop("check_timeline_cursor", None)
     return found
 
 
@@ -199,6 +204,53 @@ def transition(lease: Lease, action: str, state: str, result: dict, expected=("a
         return transition_in(c, lease, action, state, result, expected)
 
 
+def execution_timing(lease: Lease, previous: str, state: str, timing: dict | None, at: str) -> dict | None:
+    if timing is None:
+        if previous == "accepted" and state == "running":
+            return {"run_id": lease.run, "started_at": at, "finished_at": None}
+        return None
+    if state in TERMINAL and timing["run_id"] == lease.run and timing["finished_at"] is None:
+        return {**timing, "finished_at": at}
+    return timing
+
+
+def check_timeline(run_id: str):
+    return paths.record_dir(run_id) / record.TIMELINE
+
+
+def timeline_cursor(run_id: str) -> int | None:
+    try:
+        return check_timeline(run_id).stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def report_failed_checks(lease: Lease, action: str, cursor: int) -> None:
+    run = runs.run_get(lease.run)
+    if (not run or run["kind"] != "pipeline" or not run["repo"] or not run["issue"] or run.get("only_step")
+            or run["dry_run"] or run["status"] == "dry-run"):
+        return
+    trail = record.AppendedLines(check_timeline(lease.run))
+    trail.offset = cursor
+    attempt = f"{lease.root}/{action}"
+    evidence = []
+    try:
+        for row in record.entries(trail.read()):
+            name, command, code = row.get("name"), row.get("command"), row.get("exit")
+            if (row.get("kind") != "check" or not isinstance(name, str) or not isinstance(command, str)
+                    or type(code) is not int or code == 0):
+                continue
+            cause = "check:" + digest([name, command, code])
+            label = outbound.sanitize(outbound.screen(name), 100) or "Configured check"
+            evidence.append((cause, attempt, f"Check {label} failed again (exit {code})."))
+    except OSError:
+        return
+    if evidence:
+        ticket_progress.record(run["repo"], run["issue"], evidence=evidence)
+
+
 def transition_in(c, lease, action, state, result, expected=("accepted", "running")):
     current = fenced(c, lease)
     result = {**result, "revision": current["version"] + 1}
@@ -206,19 +258,42 @@ def transition_in(c, lease, action, state, result, expected=("accepted", "runnin
                     (lease.root, action)).fetchone()
     if row is None or row["state"] not in expected:
         raise Conflict(f"action {action} is not in an expected state")
-    kept = decoded(row)["result"]
+    previous = decoded(row, internal=True)
+    kept = previous["result"]
     retained = ("pid", "identity", "writing", "role", "worker_id", "active_builders", "input_stamp")
-    result = {**{key: kept[key] for key in retained if key in kept},
-              **result}
+    result = {**{key: kept[key] for key in retained if key in kept}, **result}
+    at = util.iso()
+    result.pop("timing", None)
+    timing = execution_timing(lease, row["state"], state, previous["timing"], at)
+    stored = {**result, "timing": timing} if timing else dict(result)
+    if row["op"] == "checks.run":
+        cursor = kept.get("check_timeline_cursor")
+        if state == "running":
+            if row["state"] == "accepted":
+                cursor = timeline_cursor(lease.run)
+            if cursor is not None:
+                stored["check_timeline_cursor"] = cursor
+        if (row["state"] == "running" and row["run"] == lease.run and state in ("succeeded", "failed")
+                and result.get("passed") is False and cursor is not None):
+            report_failed_checks(lease, action, cursor)
     c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",
-              (state, encoded(result), util.iso(), lease.root, action))
+              (state, encoded(stored), at, lease.root, action))
     if (row["op"] == "run.wait" and row["state"] == "running" and state == "succeeded"
             and result.get("reason") == "timeout" and result.get("active")):
         c.execute("UPDATE orchestration_turns SET state = ? WHERE root = ? AND id = ? AND state = 'accepted' "
                   "AND (SELECT count(*) FROM orchestration_actions WHERE root = ? AND turn = ?) = 1",
                   (UNCHANGED_WAIT, lease.root, row["turn"], lease.root, row["turn"]))
     c.execute("UPDATE orchestrations SET version = version + 1, at = ? WHERE root = ?", (util.iso(), lease.root))
-    return {**decoded(row), "state": state, "result": result}
+    return {**previous, "state": state, "result": result, "at": at, "timing": timing}
+
+
+def timed_actions(root: str, connect=reader) -> list[dict]:
+    with connect() as c:
+        rows = c.execute("SELECT id, op, state, json_extract(result, '$.timing') AS timing, "
+                         "json_extract(result, '$.writing') AS writing, json_extract(result, '$.role') AS role "
+                         "FROM orchestration_actions WHERE root = ? AND json_type(result, '$.timing') = 'object' "
+                         "ORDER BY rowid", (root,))
+        return [{**dict(row), "timing": json.loads(row["timing"])} for row in rows]
 
 
 def view(run_id: str, connect=reader, *, messages_after=0) -> dict | None:
@@ -243,7 +318,7 @@ def view(run_id: str, connect=reader, *, messages_after=0) -> dict | None:
                 "mode": found["data"].get("mode", "orchestrate"),
                 "version": found["version"], "decisions": found["turns"] - unchanged_waits(c, found["root"]),
                 "launches": found["launches"],
-                "actions": [{key: action[key] for key in ("id", "run", "op", "state", "at", "request", "result")}
+                "actions": [{key: action[key] for key in ("id", "run", "op", "state", "at", "timing", "request", "result")}
                             for action in actions]}
 
 

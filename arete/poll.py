@@ -407,16 +407,20 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
             if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
                 continue
             try:
-                if not dry_run and repo.name in cfg.unblock_repos:
-                    from . import unblock
-
+                observe = None
+                publish_unblock = repo.name in cfg.unblock_repos
+                if not dry_run and (publish_unblock or isinstance(queue.tracker, tracker.GitHubTracker)):
                     def observe(source, tickets):
-                        unblock.publish_queue(repo, source, tickets)
+                        if publish_unblock:
+                            from . import unblock
 
-                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected,
-                                     queue.recovered, observe=observe)
-                else:
-                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected, queue.recovered)
+                            unblock.publish_queue(repo, source, tickets)
+                        if isinstance(source, tracker.GitHubTracker):
+                            guard(errors, f"{repo.name} dependency discovery",
+                                  lambda: environment_gaps.observe_dependencies(cfg, source))
+
+                pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected,
+                                 queue.recovered, observe=observe)
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:

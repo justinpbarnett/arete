@@ -63,13 +63,40 @@ export function FloorQueue({ snapshot, retry }) {
       <${Rows} id="floor-runs" rows=${rows ?? []} empty="No running work" /><//>`;
 }
 
+export function TicketProgress({ progress }) {
+  if (!progress) return null;
+  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing } = progress;
+  const unread = Object.entries(prerequisite_issues ?? {}).filter(([, read]) => !read).map(([ref]) => ref);
+  return html`<div data-ticket-progress="">
+    <p>${activity}${progress.since ? html` <small>· since ${stamp(progress.since)}</small>` : null}</p>
+    ${blocker ? html`<p><strong>Blocker:</strong> ${blocker}</p>` : null}
+    ${next_event ? html`<p><strong>Next:</strong> ${next_event}</p>` : null}
+    ${timing ? html`<section aria-label="Run lineage timing">${timing.lines.map((line) => html`<p key=${line}>${line}</p>`)}</section>` : null}
+    ${prerequisites?.length ? html`<ul>${prerequisites.map((pr) => html`<li key=${pr.key}>
+      ${pr.deployed_release ? "Deployed prerequisite" : pr.state === "merged"
+    ? "Merged prerequisite (deployment not confirmed)" : `Prerequisite (${pr.state})`}:
+      <${DetailLink} href=${pr.url}>${pr.key}<//></li>`)}</ul>` : null}
+    ${unread.length ? html`<p>Prerequisite lookup not confirmed: ${unread.join(", ")}</p>` : null}
+    ${follow_up?.prs?.length ? html`<p><strong>${follow_up.draft ? "Draft follow-up" : "Follow-up PR"}:</strong>
+      ${follow_up.prs.map((url) => html` <${DetailLink} key=${url} href=${url}>${url}<//>`)}</p>` : null}
+    ${updates?.length ? html`<ul aria-label="Recent ticket updates">${updates.map((update, index) => html`
+      <li key=${`${update.seq}:${index}`}><small>${stamp(update.at)}</small> ${update.message}</li>`)}</ul>` : null}
+  </div>`;
+}
+
 export function FloorFocus({ snapshot, retry }) {
   const feedback = snapshot.live?.waiting;
+  const progress = snapshot.live?.ticket_progress;
   return html`<div class="ops-detail">
     <section class="ops-section"><h3>Needs you</h3>
       <p>${snapshot.needsYou == null || !snapshot.questions?.data || snapshot.questions.error ? "See the inbox for current work." :
     `${snapshot.needsYou + snapshot.questions.data.asks.length} items in the inbox`}</p>
       <a href="#triage">Open Triage</a></section>
+    ${progress && (progress.error || progress.rows?.length) ? html`<${Panel} panel=${progress} title="Ticket progress" retry=${retry}>
+      ${(rows) => rows.map((row) => html`<article key=${`${row.repo}:${row.issue}`}>
+        <h4><a href=${row.run ? runHash(row.run) : taskHash(row.issue, row.repo)}>${row.ticket}</a></h4>
+        <${TicketProgress} progress=${row} />
+      </article>`)}<//>` : null}
     ${snapshot.live?.recovery?.rows?.length ? html`<section class="ops-section"><h3>Automatic recovery</h3>
       <${Rows} id="recovery-queue" rows=${snapshot.live.recovery.rows.map((item) => ({
         id: `${item.repo}/${item.ticket}`, href: item.source ? runHash(item.source) : taskHash(item.ticket, item.repo),

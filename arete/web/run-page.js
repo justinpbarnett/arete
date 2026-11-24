@@ -87,6 +87,23 @@ function orchestrationDetail(board, place) {
       cell(eligible(a) ? button("Rerun alone", "rerun-action", (b) => retry(a, b), { of: a.id }) : null))), { stack: true })];
 }
 
+function ticketProgressParts(progress) {
+  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing } = progress;
+  const unread = Object.entries(prerequisite_issues ?? {}).filter(([, read]) => !read).map(([ref]) => ref);
+  return [el("p", {}, activity, progress.since ? [" · since ", zonedClock(progress.since)] : null),
+    blocker ? el("p", {}, el("strong", { text: "Blocker: " }), blocker) : null,
+    next_event ? el("p", {}, el("strong", { text: "Next: " }), next_event) : null,
+    timing ? el("section", { "aria-label": "Run lineage timing" }, timing.lines.map((text) => el("p", { text }))) : null,
+    prerequisites?.length ? el("ul", {}, prerequisites.map((pr) => el("li", {},
+      pr.deployed_release ? "Deployed prerequisite: " : pr.state === "merged"
+        ? "Merged prerequisite (deployment not confirmed): " : `Prerequisite (${pr.state}): `, link(pr.url, pr.key)))) : null,
+    unread.length ? el("p", { text: `Prerequisite lookup not confirmed: ${unread.join(", ")}` }) : null,
+    follow_up?.prs?.length ? el("p", {}, el("strong", { text: follow_up.draft ? "Draft follow-up: " : "Follow-up PR: " }),
+      follow_up.prs.map((url) => [" ", link(url, url)])) : null,
+    updates?.length ? el("ul", { "aria-label": "Recent ticket updates" }, updates.map((update) => el("li", {},
+      el("small", { text: zonedClock(update.at) }), " ", update.message))) : null];
+}
+
 function drawRunDetail(pane, result, kind) {
   const id = route.detail.id;
   const place = `detail:${kind}:${id}`;
@@ -115,6 +132,7 @@ function drawRunDetail(pane, result, kind) {
       fact("Paid", paidWords(r, board.models)),
       fact("Pull request", r.pr_url ? pullLinks(r.pr_url) : ""),
       fact("Summary", r.summary ? withLinks(r.summary) : "")),
+    board.ticket_progress ? [el("h3", { text: "Ticket progress" }), ticketProgressParts(board.ticket_progress)] : null,
     board.approvals.length ? [el("h3", { text: "Waiting for you" }),
       table("", NEEDS_HEADS, board.approvals.map((a) => approvalRow(a, place)), { stack: true })] : null,
     s ? [el("h3", { text: "Session" }), el("dl", { class: "w" },

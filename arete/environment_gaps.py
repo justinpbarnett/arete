@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from . import ci, codebase, config, control, factory, gh, outbound, paths, pipeline, run_lines, tracker, util, vault
 from .store import runs as run_store
+from .store import ticket_progress
 
 STEP_PATHS = ("feature", "patch")
 RESUME_PATHS = (*STEP_PATHS, "classic", "orchestrate")
@@ -265,11 +267,21 @@ def issue_for(release: config.Repo, own: tuple[str, int] | None, run_id: str, ga
         raise
 
 
-def notice(url: str, talk: gh.Discussion, event: str, body: str) -> None:
+def is_retry_notice(body: str, retry_id: str) -> bool:
+    if not gh.has_arete_mark(body) or not re.search(rf"(?<![\w-]){re.escape(retry_id)}(?![\w-])", body):
+        return False
+    text = normalized(body)
+    return all(phrase in text for phrase in ("verification", "retry", "draft", "owner review"))
+
+
+def notice(url: str, talk: gh.Discussion, event: str, body: str, *, retry_id: str = "") -> None:
     key = "environment-gap-" + digest(f"{url}\n{event}")
     marker = gh.key_mark(key)
-    if not any(marker in (row.get("body") or "").splitlines() for row in talk.comments):
-        gh.pr_comment(url, body, key=key, single_attempt=True)
+    for row in talk.comments:
+        previous = row.get("body") or ""
+        if marker in previous.splitlines() or (retry_id and is_retry_notice(previous, retry_id)):
+            return
+    gh.pr_comment(url, body, key=key, single_attempt=True)
 
 
 def open_ticket(source: tracker.GitHubTracker, number: int) -> dict:
@@ -281,13 +293,14 @@ def open_ticket(source: tracker.GitHubTracker, number: int) -> dict:
     return {}
 
 
-def ticket_blocker(source: tracker.Tracker, tid: str) -> str | None:
+def ticket_gate(source: tracker.Tracker, tid: str) -> tuple[str | None, list[tuple[str, int]]]:
     if isinstance(source, tracker.GitHubTracker):
         if not re.fullmatch(r"[1-9][0-9]*", tid) or not (ticket := open_ticket(source, int(tid))):
-            return None
-        return source.wait_blocker(tracker.github_waits(ticket.get("body") or "", source.repo.github))
+            return None, []
+        refs = tracker.github_waits(ticket.get("body") or "", source.repo.github)
+        return source.wait_blocker(refs), refs
     ticket = source.get(tid, include_environment=False)
-    return ticket.blocker if ticket.open else None
+    return (ticket.blocker if ticket.open else None), []
 
 
 def linked_numbers(hold: Hold, waits: dict, repo: str) -> list[int]:
@@ -308,7 +321,7 @@ def confirmed_retry_gaps(cfg: config.Config, repo: config.Repo, row: dict, sha: 
             or run_store.environment_retry(run_id)):
         return ()
     source = tracker.for_ticket(cfg, repo, tid)
-    if ticket_blocker(source, tid) != "" or not discussions(row, hold, source):
+    if ticket_gate(source, tid)[0] != "" or not discussions(row, hold, source):
         return ()
     numbers = linked_numbers(hold, saved["waits"], release.github)
     if not release_contains_fixes(release, numbers, sha):
@@ -321,19 +334,126 @@ def displayed_refs(repo: str, gaps_repo: str, numbers: list[int]) -> str:
     return tracker.joined([f"{prefix}#{n}" for n in numbers])
 
 
-def finish_retry(row: dict, hold: Hold, talks: dict[str, gh.Discussion], dry_run: bool) -> None:
-    if dry_run or row["retry_status"] == "running":
+def prerequisite_reads(release: config.Repo | None, refs: set[tuple[str, int]], follow_up_urls: Iterable[str],
+                       sha: str) -> dict:
+    follow_up = {(gh.pr_repo(url).casefold(), gh.pr_number(url)) for url in follow_up_urls if PR_URL.fullmatch(url)}
+    reads = {}
+    for repo, number in sorted(refs):
+        ref = f"{repo}#{number}"
+        try:
+            reads[ref] = [p for p in gh.prerequisite_pulls(repo, number) if (p.repo, p.number) not in follow_up]
+        except gh.GhError:
+            reads[ref] = None
+    base = ""
+    scope = release.github.casefold() if release else ""
+    if release and sha and any(p.repo == scope and p.merge_commit for pulls in reads.values() for p in pulls or ()):
+        try:
+            target = release_base(release)
+            if gh.branch_contains(release.github, target, sha):
+                base = target
+        except gh.GhError:
+            pass
+    deployed = {}
+    for pulls in reads.values():
+        for p in pulls or ():
+            if (release and base and p.repo == scope and p.base == base and p.merge_commit
+                    and p.merge_commit not in deployed):
+                try:
+                    deployed[p.merge_commit] = sha if gh.branch_contains(release.github, sha, p.merge_commit) else ""
+                except gh.GhError:
+                    deployed[p.merge_commit] = ""
+    return {ref: None if pulls is None else [
+        {"key": p.key, "url": p.url, "state": p.state, "merge_commit": p.merge_commit,
+         "deployed_release": deployed.get(p.merge_commit, "") if p.repo == scope and p.base == base else ""}
+        for p in pulls] for ref, pulls in reads.items()}
+
+
+def observe_dependencies(cfg: config.Config, source: tracker.GitHubTracker) -> None:
+    repo = source.repo
+    held = {str(row["issue"]) for row in run_store.environment_holds(repo.name)}
+    release = release_repo(cfg)
+    sha = None
+    for ticket in source.dependency_tickets:
+        if ticket.id in held:
+            continue
+        refs = set(tracker.github_waits(ticket.body, repo.github)) - {(repo.github.casefold(), int(ticket.id))}
+        if not refs and not ticket_progress.get(repo.name, ticket.id).get("declared_prerequisites"):
+            continue
+        if sha is None:
+            sha = live_release() if release else ""
+        newest = run_store.newest_live_whole_run(repo.name, ticket.id) or {}
+        reads = prerequisite_reads(release, refs, (newest.get("pr_url") or "").split(), sha)
+        ticket_progress.record(repo.name, ticket.id, prerequisite_reads=reads, declared=True)
+
+
+def repeated_gap(sig: Signature, run_id: str) -> tuple[str, str, str]:
+    return sig.key, run_id, f"Verification hit the same blocker again: {sig.title}."
+
+
+def progress(row: dict, hold: Hold, state: str, next_event: str, *, reads: dict | None = None,
+             retry_blockers: set[Signature] | None = None, workspace_blocker: str = "") -> None:
+    run_id, retry_id = row["id"], row.get("retry_id") or ""
+    signatures = {g.signature for g in hold.gaps}
+    current = signatures if state == "waiting" else retry_blockers or set()
+    evidence = [repeated_gap(sig, run_id) for sig in sorted(signatures, key=lambda sig: sig.key)]
+    evidence += [repeated_gap(sig, retry_id) for sig in sorted(current, key=lambda sig: sig.key) if state == "owner-review"]
+    blocker = {"kind": "verification-environment", "causes": {s.key: s.title for s in current}} if current else None
+    if workspace_blocker:
+        blocker = {"kind": "retry-workspace", "causes": {"workspace": workspace_blocker}}
+    ticket_progress.record(row["repo"], row["issue"], {
+        "run": run_id, "attempt": retry_id or run_id,
+        "blocker": blocker,
+        "next_event": next_event,
+        "follow_up": {"state": state, "prs": sorted(hold.heads), "draft": True if state != "inactive" else None},
+    }, evidence=evidence, prerequisite_reads=reads, only_current=state == "inactive")
+
+
+def finish_retry(row: dict, hold: Hold, reads: dict, talks: dict[str, gh.Discussion]) -> None:
+    if row["retry_status"] == "running":
+        progress(row, hold, "verifying", "Automatic verification finishes", reads=reads)
         return
-    retry_id = row["retry_id"]
-    outcome = last_data(factory.ends(run_lines.read(retry_id)), "verify")
-    prior = {gap.signature for gap in hold.gaps}
-    checks = (outcome.get("verified") or {}).get("checks", [])
-    if outcome.get("ending") == "environment-held" and any(
-            check_signature(check) in prior for check in checks):
+    completed = [line for line in factory.ends(run_lines.read(row["retry_id"])) if not line.get("carried")]
+    outcome = last_data(completed, "verify")
+    if outcome.get("ending") == "environment-held":
+        checks = (outcome.get("verified") or {}).get("checks", [])
+        blockers = {sig for check in checks if (sig := check_signature(check))}
+        progress(row, hold, "owner-review", "Owner reviews the draft and decides how to unblock verification",
+                 retry_blockers=blockers, reads=reads)
+        retry_id = row["retry_id"]
         for url, talk in talks.items():
-            notice(url, talk, f"{retry_id}-retry", f"Verification in run `{retry_id}` hit the same environment gap "
-                   "after the automatic retry. The PR stays a draft for a person to check.")
+            notice(url, talk, f"{retry_id}-still-held", f"Automatic verification retry `{retry_id}` did not pass on "
+                   "the live release. This PR stays a draft and needs owner review.", retry_id=retry_id)
+    else:
+        progress(row, hold, "retry-finished", "", reads=reads)
     run_store.release_environment_hold(row["id"])
+
+
+def next_hold_event(blocker: str, release: config.Repo, numbers: list[int], reads: dict) -> str:
+    if blocker:
+        return f"Tracker prerequisite is resolved ({safe_text(blocker)})"
+    if not numbers:
+        return "A prerequisite issue is linked to each verification gap"
+    required = [reads[f"{release.github.casefold()}#{n}"] for n in numbers]
+    if any(group is None for group in required):
+        return "The prerequisite PR state can be confirmed"
+    if not all(any(pr["state"] == "merged" for pr in group) for group in required):
+        return "A fix for each verification gap is confirmed merged"
+    if not all(any(pr["deployed_release"] for pr in group) for group in required):
+        return "The live release is confirmed to contain the fixes"
+    return "Automatic verification retry starts when eligible"
+
+
+def observe_wait(row: dict, hold: Hold, release: config.Repo, declared: list[tuple[str, int]], waits: dict,
+                 numbers: list[int], blocker: str, sha: str, *, eligible: bool = True,
+                 workspace_blocker: str = "") -> None:
+    reads = prerequisite_reads(release, set(declared) | set(waits.values()), hold.heads, sha)
+    if workspace_blocker:
+        event = "The saved workspace becomes restorable or the owner takes over the draft"
+    elif eligible:
+        event = next_hold_event(blocker, release, numbers, reads)
+    else:
+        event = "The hold becomes eligible for recovery"
+    progress(row, hold, "waiting", event, reads=reads, workspace_blocker=workspace_blocker)
 
 
 def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, can_start: bool) -> bool:
@@ -342,6 +462,8 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
     run_id, tid = row["id"], str(row["issue"])
     if row.get("files_purged"):
         if not dry_run:
+            saved = run_store.environment_hold(run_id)
+            progress(row, Hold([], saved.get("heads", {})), "inactive", "")
             run_store.release_environment_hold(run_id)
         return False
     release, hold = release_repo(cfg), hold_of(run_id)
@@ -349,26 +471,32 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
     if not release or not hold or saved.get("heads") != hold.heads:
         return False
     source = tracker.for_ticket(cfg, repo, tid)
-    blocker = ticket_blocker(source, tid)
+    blocker, declared = ticket_gate(source, tid)
     talks = discussions(row, hold, source) if blocker is not None else {}
     if not talks:
         if not dry_run:
+            progress(row, hold, "inactive", "")
             run_store.release_environment_hold(run_id)
         return False
     if row["retry_id"]:
-        finish_retry(row, hold, talks, dry_run)
-        return False
-    path = pipeline.recorded_path(run_id)
-    if (path not in RESUME_PATHS or tid in oncall.parked(repo.name) or pilot.is_pilot_task(tid) or zte.reserved(tid)
-            or tasks.pending_start(repo.name, tid)
-            or (path in STEP_PATHS and cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+        if not dry_run:
+            refs = set(declared) | {tuple(ref) for ref in saved["waits"].values()}
+            finish_retry(row, hold, prerequisite_reads(release, refs, hold.heads, live_release()), talks)
         return False
     if run_store.later_run(repo.name, tid, run_id, live=True):
         return False
     scope = release.github.casefold()
+    waits = {key: tuple(ref) for key, ref in saved["waits"].items()}
+    path = pipeline.recorded_path(run_id)
+    if (path not in RESUME_PATHS or tid in oncall.parked(repo.name) or pilot.is_pilot_task(tid) or zte.reserved(tid)
+            or tasks.pending_start(repo.name, tid)
+            or (path in STEP_PATHS and cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+        if not dry_run:
+            observe_wait(row, hold, release, declared, waits, linked_numbers(hold, waits, scope), blocker,
+                         live_release(), eligible=False)
+        return False
     own = (repo.github.casefold(), int(tid)) if isinstance(source, tracker.GitHubTracker) else None
     include_check = bool(own and own[0] == scope and all(gh.pr_repo(url).casefold() == scope for url in hold.heads))
-    waits = {key: tuple(ref) for key, ref in saved["waits"].items()}
     for gap in hold.gaps:
         key = gap.signature.key
         previous = waits.get(key)
@@ -382,24 +510,25 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
             if not dry_run:
                 run_store.set_environment_waits(run_id, waits)
     numbers = linked_numbers(hold, waits, scope)
-    if not numbers:
-        return False
+    sha = live_release() if not dry_run or can_start else ""
+    ready = (numbers and not blocker and sha and (path != "orchestrate" or verification_action(run_id))
+             and release_contains_fixes(release, numbers, sha))
+    workspace_blocker = ""
+    if ready:
+        try:
+            flows.check_environment_workspace(repo, row, hold.heads)
+        except workspace.RunFailed as error:
+            workspace_blocker = util.first_line(safe_text(error.why), 300) or "The saved workspace cannot be restored"
+            print(f"{util.iso()} {run_id}: verify retry still waiting for its workspace: {workspace_blocker}")
     if not dry_run:
-        event = f"{run_id}-wait-{scope}-{','.join(map(str, numbers))}"
-        for url, talk in talks.items():
-            refs = displayed_refs(gh.pr_repo(url), release.github, numbers)
-            notice(url, talk, event, f"Verification is waiting on {refs} for the environment gap in run `{run_id}`. "
-                   "This PR stays a draft until verification can run again.")
-    if not can_start or blocker:
-        return False
-    if not (sha := live_release()) or (path == "orchestrate" and not verification_action(run_id)):
-        return False
-    if not release_contains_fixes(release, numbers, sha):
-        return False
-    try:
-        flows.check_environment_workspace(repo, row, hold.heads)
-    except workspace.RunFailed as error:
-        print(f"{util.iso()} {row['id']}: verify retry still waiting for its workspace: {error.why}")
+        observe_wait(row, hold, release, declared, waits, numbers, blocker, sha, workspace_blocker=workspace_blocker)
+        if numbers:
+            event = f"{run_id}-wait-{scope}-{','.join(map(str, numbers))}"
+            for url, talk in talks.items():
+                refs = displayed_refs(gh.pr_repo(url), release.github, numbers)
+                notice(url, talk, event, f"Verification is waiting on {refs} for the environment gap in run `{run_id}`. "
+                       "This PR stays a draft until verification can run again.")
+    if not can_start or not ready or workspace_blocker:
         return False
     layer = config.load_layer(repo.layer_dir)
     if runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False).reason:

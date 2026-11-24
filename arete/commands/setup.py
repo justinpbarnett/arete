@@ -17,6 +17,7 @@ from .common import (
     print_recent,
     print_records,
     print_skipped,
+    print_ticket_progress,
     print_triage,
     print_waiting,
     serve_line,
@@ -148,6 +149,8 @@ def print_status(cfg, problem, views, snap, records, server_url):
         show(recovery, "automatic recovery", print_recovery)
     show(snap["triage"], "triage", print_triage)
     show(snap["live"], "the live runs", print_live)
+    if progress := snap.get("ticket_progress"):
+        show(progress, "ticket progress", print_ticket_progress)
 
 
 def print_recovery(rows):
