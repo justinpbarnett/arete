@@ -1,171 +1,233 @@
-from collections import Counter
-from unittest.mock import patch
+from datetime import timedelta
+from functools import partialmethod
+from unittest import TestCase
+from unittest.mock import Mock, patch
 
-from arete import config, outcomes, pipeline, poll, pr_recovery, util, workspace
+from arete import config, gh, jev, outcomes, pipeline, poll, pr_recovery, tasks, unblock, util, workspace
 from arete.store import insights
-from arete.store import unblock as ledger
-from tests import support
-from tests.test_pr_recovery import RecoveryFixture, ResumeFixture
-
-
-def setUpModule():
-    support.isolate_live_state()
+from arete.store import tasks as task_store
+from tests.support import isolate_live_state as setUpModule
+from tests.test_pr_recovery import MultiCheckoutFixture, RecoveryFixture
 
 
 class IgnoreSafetyTests(RecoveryFixture):
-    def excludes(self, source_rules, retained_rules):
+    def keep_with_excludes(self, initial, source_rules, retained_rules, replacement):
+        self.accepted = self.advance(".gitignore", initial)
+        self.git(self.wt, "pull", "--ff-only", "origin", "topic")
+        self.checkout.note_pushed_head(self.accepted)
         source = self.root / "source-excludes"
-        retained = self.wt.parent / "retained-excludes"
         source.write_text(source_rules)
-        retained.write_text(retained_rules)
+        (self.wt.parent / "retained-excludes").write_text(retained_rules)
         self.git(self.src, "config", "extensions.worktreeConfig", "true")
         self.git(self.src, "config", "core.excludesFile", str(source))
         self.git(self.wt, "config", "--worktree", "core.excludesFile", "../retained-excludes")
+        notes = self.wt / "retained notes.txt"
+        notes.write_bytes(b"retained bytes\x00")
+        return notes, self.keep(), self.advance(".gitignore", replacement)
 
-    def accept_rule(self, rule):
-        self.accepted = self.advance(".gitignore", rule)
-        self.git(self.wt, "pull", "--ff-only", "origin", "topic")
-        self.checkout.note_pushed_head(self.accepted)
-
-    def test_retained_excludes_override_does_not_expose_private_bytes(self):
-        self.accept_rule("/notes.txt\n")
-        self.excludes("/notes.txt\n", "# no ignores\n")
-        private = self.wt / "notes.txt"
-        secret = b"dummy private bytes"
-        private.write_bytes(secret)
-        local = self.keep()
-        remote = self.advance(".gitignore", "# no ignores\n")
-
-        with self.assertRaisesRegex(pr_recovery.Hold, "expose retained ignored files: 'notes.txt'") as caught:
+    def check_excludes(self, *, private):
+        rule = "/retained notes.txt\n"
+        rules = (rule, rule, "") if private else ("!" + rule, "", rule)
+        notes, local, remote = self.keep_with_excludes(*rules, "")
+        self.job.layer.deny = [notes.name]
+        why = "expose retained ignored files" if private else "hide retained untracked files"
+        with self.assertRaisesRegex(pr_recovery.Hold, f"{why}: {notes.name!r}") as caught:
             self.reclaim()
-        self.assertNotIn(secret.decode(), str(caught.exception))
-        self.assertEqual(private.read_bytes(), secret)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), remote)
-        staged = self.job.b.restage(from_base=True)
-        self.assertNotIn(private.name, staged.files)
-        self.assertNotIn(secret.decode(), staged.patch)
+        self.assertIn("Save the named files separately", str(caught.exception))
+        self.assert_heads(local, remote)
+        self.assert_loose(notes, b"retained bytes\x00", private=private)
+        self.assertEqual(self.git(self.wt, "diff", "--cached"), "")
+        if private:
+            self.assertNotIn("retained bytes", str(caught.exception))
+            staged = self.job.b.restage(from_base=True)
+            self.assertNotIn(notes.name, staged.files)
+            self.assertNotIn("retained bytes", staged.patch)
 
-    def test_relative_retained_excludes_do_not_hide_untracked_file(self):
-        self.accept_rule("!/notes.txt\n")
-        self.excludes("# no ignores\n", "/notes.txt\n")
-        notes = self.wt / "notes.txt"
-        notes.write_bytes(b"retained untracked bytes")
-        local = self.keep()
-        self.advance(".gitignore", "# removed the negation\n")
+    test_retained_excludes_override_does_not_expose_private_bytes = partialmethod(check_excludes, private=True)
+    test_relative_retained_excludes_do_not_hide_untracked_file = partialmethod(check_excludes, private=False)
 
-        with self.assertRaisesRegex(pr_recovery.Hold, "hide retained untracked files: 'notes.txt'"):
-            self.reclaim()
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertIn(notes.name, workspace.untracked_files(self.wt))
-        self.assertEqual(notes.read_bytes(), b"retained untracked bytes")
-
-    def test_recovery_can_install_when_retained_excludes_keep_the_file_ignored(self):
-        self.accept_rule("/notes.txt\n")
-        self.excludes("# no ignores\n", "/notes.txt\n")
-        notes = self.wt / "notes.txt"
-        notes.write_bytes(b"dummy private bytes")
-        local = self.keep()
-        remote = self.advance(".gitignore", "# no tracked ignores\n")
-
+    def test_recovery_holds_if_the_retained_fallback_disappears_during_installation(self):
+        rule = "/retained notes.txt\n"
+        notes, local, remote = self.keep_with_excludes(rule, "# no ignores\n", rule, "")
         self.reclaim()
-        self.job.install_pr_plans()
-        candidate = self.git(self.wt, "rev-parse", "HEAD")
-        self.assertTrue(pr_recovery.ancestor(self.wt, local, candidate))
-        self.assertTrue(pr_recovery.ancestor(self.wt, remote, candidate))
-        self.assertIn(notes.name, workspace.ignored_file_paths(self.wt))
-        self.assertEqual(notes.read_bytes(), b"dummy private bytes")
-        self.assertNotIn(notes.name, self.job.b.restage(from_base=True).files)
+        self.assert_heads(local, remote)
+        self.assert_loose(notes, b"retained bytes\x00", private=True)
+        why = f"expose retained ignored files: {notes.name!r}"
+        exclude = self.wt.parent / "retained-excludes"
+        with self.on_git("merge --no-autostash", lambda _: exclude.write_text("")), self.assertRaisesRegex(pr_recovery.Hold, why):
+            self.job.install_pr_plans()
+        candidate = self.job.pr_plans[0].candidate
+        self.assert_heads(candidate, remote)
+        self.assert_contains(self.wt, candidate, local, remote)
+        self.assertEqual(workspace.head_recorded(workspace.made_before(self.ws), self.checkout), candidate)
+        self.assert_staging_refused(why)
+        self.assert_loose(notes, b"retained bytes\x00")
+        self.assertEqual(self.git(self.wt, "diff", "HEAD", "--name-only"), "")
 
 
-class SettlementReplyTests(ResumeFixture):
-    def conflict(self):
-        self.keep("shared.txt")
-        self.advance("shared.txt")
-        self.seed()
+class TicketReplyCutoffTests(TestCase):
+    def test_same_second_guidance_requires_a_snapshot_without_the_reply(self):
+        since = "2026-11-24T12:00:00Z"
+        for snapshot in ({}, {"seen_ticket_replies": None}, {"seen_ticket_replies": ["1"]}, {"seen_ticket_replies": []}):
+            with self.subTest(snapshot=snapshot):
+                held = {"held_at": since, **snapshot}
+                replies = [(str(i), f"2026-11-24T{stamp}Z", "Guidance")
+                           for i, stamp in enumerate(("11:59:59", "12:00:00", "12:00:01"))]
+                self.assertEqual([unblock.ticket_answer_after_hold({}, held, [reply], []) for reply in replies],
+                                 [False, snapshot.get("seen_ticket_replies") == [], True])
 
-    def reply(self, comment_id, body, *, login="keeper"):
-        self.pr_comments.append({"id": comment_id, "user": {"login": login}, "body": body, "created_at": util.iso()})
 
-    def resume_with_settlement_reply(self, previous, *, attempt=""):
+class HeldReplyTests(MultiCheckoutFixture):
+    def setUp(self):
+        super().setUp()
+        self.clock = self.enterContext(patch.object(util, "now", return_value=util.now()))
+        self.comments, self.reviews = {}, []
+        self.enterContext(patch.object(gh, "pr_discussion", side_effect=lambda url: gh.Discussion(
+            [], self.reviews if url == self.url else [], self.comments.get(url, []))))
+        self.addCleanup(self.decide.assert_not_called)
+
+    def reply(self, number, body, *, url=None, login="keeper", age=0):
+        self.comments.setdefault(url or self.url, []).append({"id": number, "body": body, "user": {"login": login},
+                                                             "created_at": util.iso(util.now() - timedelta(seconds=age))})
+
+    def ordinary(self):
+        self.cfg.unblock_repos, self.repo.pipeline = (), True
+        self.cfg.jev = config.JevConfig(enabled=True, feedback_skip=0.5)
+        self.enterContext(patch.multiple(pipeline, FEEDBACK_QUIET_MINUTES=0, SKIPPED_FILE=self.root / "skipped.json"))
+        self.enterContext(patch.object(outcomes, "PR_SEEN_FILE", self.root / "pr_seen.json"))
+        self.enterContext(patch.multiple(poll, network_up_or_skip=Mock(return_value=True), retry_scratch=Mock(),
+                                         mark_loop=Mock()))
+        self.enterContext(patch.object(tasks, "spawn_pending", side_effect=self.spawn_boundary))
+        self.enterContext(patch.object(jev, "key", return_value="fixture-key"))
+        self.judge = self.enterContext(patch.object(jev, "ask_many", side_effect=self.classify))
+        self.spawn.side_effect = self.continue_held
+
+    def continue_held(self, command, log):
+        self.assertEqual(command[-4:], [self.repo.name, self.tid, "--continue", self.held["id"]])
+        self.held = self.resume(self.held["id"])
+        self.assert_held(self.held)
+
+    def classify(self, items, cfg, *, trace):
+        scores = (0.1 if prompt.endswith("\n\nComment:\nThanks for the example.") else 0.9 for prompt, _ in items)
+        return [jev.Reply({"asks": jev.Answer(p > 0.5, 0.9, {"yes": p})}) for p in scores]
+
+    def assert_stable(self, enrolled, launches=0, *, requeue=False):
+        notices = self.notices()
+        for _ in range(2):
+            if enrolled:
+                self.assertEqual(self.watch()["phase"], "needs_owner")
+            else:
+                if requeue:
+                    task_store.task_set_state(self.tid, "todo")
+                self.assertEqual(poll.poll(), 0)
+        self.assertEqual((self.spawn.call_count, self.notices()), (launches, notices))
+
+    def retry_held(self, enrolled):
+        if enrolled:
+            prior = len(self.launched)
+            self.watch()
+            attempt, = self.launched[prior:]
+            self.held = self.resume_attempt(self.held, attempt)
+        else:
+            self.assertEqual(poll.poll(), 0)
+
+    def hold_conflict(self, *, enrolled=True, snapshot=True):
+        if not enrolled:
+            self.ordinary()
+        self.seed_conflict()
+        self.held = self.resume(self.previous) if snapshot else self.resume_without_discussion()
+        self.assertEqual(len(self.notices()), 1)
+        return self.assert_held(self.held) if snapshot else pr_recovery.blocked(self.held)
+
+    def test_enrolled_attempt_does_not_consume_new_guidance_during_settlement(self):
+        self.assertEqual(self.hold_conflict()["seen_replies"], [])
+        self.assert_stable(True)
+        self.reply(1, "First guidance")
         hold_open_pr = pipeline.hold_open_pr
 
         def settle(run, error, kept):
-            self.assertTrue(run.pr_recovery_cutoff)
             self.assertTrue(run.pr_recovery_discussion[error.recovery["pr"]].decision)
             self.reply(2, "New settlement guidance")
-            self.reply(3, "Ignore the conflict", login="stranger")
             return hold_open_pr(run, error, kept)
 
-        # Keep the replies and baseline in the same timestamp second; their order comes from the snapshot.
-        with (patch.object(util, "now", return_value=util.now()),
-              patch.object(pipeline, "hold_open_pr", side_effect=settle)):
-            return self.resume(previous, recovery=attempt)
+        with patch.object(pipeline, "hold_open_pr", side_effect=settle):
+            self.retry_held(True)
+        self.retry_held(True)
+        self.assert_stable(True, 2)
 
-    def test_enrolled_attempt_does_not_consume_new_guidance_during_settlement(self):
-        self.conflict()
-        held = self.resume(self.previous)
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.spawn.assert_not_called()
-        self.reply(1, "First guidance")
-        self.watch()
-        first, = self.launched
-        child = self.resume_with_settlement_reply(held["id"], attempt=first)
-        self.assert_held(child)
-        self.assertEqual(ledger.attempt_of(first)["child"], child["id"])
+    def check_pr_answer(self, *, enrolled, snapshot=True, primary=False):
+        pr = self.url if primary else self.sibling()[0].pr
+        for url in ((pr,) if snapshot else (self.url, pr)):
+            self.reply(1, "Earlier reply", url=url, age=1)
+            self.reply(2, "Same-second baseline reply", url=url)
+        failure = self.hold_conflict(enrolled=enrolled, snapshot=snapshot)
+        seen = {self.url: [], pr: [["comment", 1], ["comment", 2]]} if snapshot else dict.fromkeys((self.url, pr))
+        self.assertEqual((failure["seen_replies_by_pr"], failure["seen_replies"], failure["held_at"]),
+                         (seen, seen[self.url], util.iso()))
+        keys = {("comment", n) for n in (1, 2, 4)}
+        if not snapshot:
+            self.assertEqual(failure["decision"], "")
+            self.reply(5, "Ambiguous same-second guidance", url=pr)
+            keys.add(("comment", 5))
+            self.assert_stable(enrolled)
+            self.clock.return_value += timedelta(seconds=1)
+        self.reply(3, "Untrusted guidance", url=pr, login="stranger")
+        self.assert_stable(enrolled)
+        if not enrolled:
+            self.judge.assert_not_called()
+        if primary:
+            keys.add(("review", 2))
+            self.reviews.append({"id": 2, "user": {"login": "keeper"}, "body": "Thanks for the example.",
+                                 "state": "COMMENTED", "submitted_at": util.iso()})
+            self.assertEqual(poll.poll(), 0)
+            self.spawn.assert_not_called()
+        self.reply(4, "Keep both versions", url=pr)
+        self.retry_held(enrolled)
+        self.assert_stable(enrolled, 1)
+        if not enrolled:
+            judged = [p.split("\n\nComment:\n", 1)[1] for call in self.judge.call_args_list for p, _ in call.args[0]]
+            self.assertEqual(judged, (["Thanks for the example."] if primary else []) + ["Keep both versions"])
+            self.assertEqual(self.judge.call_count, 2 if primary else 1)
+            self.assertEqual(insights.feedback_keys(pr), keys)
+        if primary or not snapshot:
+            self.assertEqual(len(self.notices()), 2)
 
-        self.watch()
-        _, second = self.launched
-        retried = self.resume(child["id"], recovery=second)
-        self.assert_held(retried)
-        notices = self.notices()
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.reply(4, "Untrusted follow-up", login="stranger")
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(self.notices(), notices)
-        self.assertEqual(self.launched, [first, second])
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
+    test_enrolled_watch_retries_for_later_sibling_reply = partialmethod(check_pr_answer, enrolled=True, snapshot=False)
+    test_ordinary_poll_retries_for_later_sibling_reply = partialmethod(check_pr_answer, enrolled=False, snapshot=False)
+    test_enrolled_watch_retries_for_same_second_sibling_reply = partialmethod(check_pr_answer, enrolled=True)
+    test_ordinary_poll_retries_for_same_second_sibling_reply = partialmethod(check_pr_answer, enrolled=False)
+    test_ordinary_poll_distinguishes_primary_comment_and_review = partialmethod(check_pr_answer, enrolled=False, primary=True)
 
-    def test_unenrolled_feedback_poll_picks_up_only_new_settlement_reply_once(self):
-        self.cfg.unblock_repos = ()
-        self.conflict()
-        with patch.object(util, "now", return_value=util.now()):
-            self.reply(1, "Baseline guidance")
-            baseline = outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid)
-            held = self.resume_with_settlement_reply(self.previous)
-        failure = self.assert_held(held)
-        self.assertEqual(failure["seen_replies"], [["comment", 1]])
-        self.assertEqual({reply["created_at"] for reply in self.pr_comments}, {failure["held_at"]})
-        layer = config.load_layer(self.repo.layer_dir)
-        queue = poll.RepoQueue(self.repo, self.source, set(), layer,
-                               poll.routing.Discovery(self.cfg, self.repo, priced=False, layer=layer))
-        skips = pipeline.SkipLog({})
+    def assert_ticket_snapshot(self, failure, expected_count):
+        replies = unblock.ticket_reply_rows(self.source, self.tid)
+        self.assertEqual(len(replies), expected_count)
+        self.assertEqual(failure["held_at"], util.iso())
+        self.assertEqual(failure["seen_ticket_replies"], unblock.ticket_reply_keys(replies))
+        self.assertEqual(failure["decision"], unblock.recovery_decision_for([], replies, []))
 
-        def collect_and_pick():
-            insights.add_feedback(outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid))
-            return poll.next_pick(self.repo, self.source, skips, set())
+    def check_same_second_ticket_answer(self, *, enrolled):
+        if enrolled:
+            self.assertTrue(task_store.task_comment(self.tid, "owner", "Captured tracker guidance"))
+        self.assert_ticket_snapshot(self.hold_conflict(enrolled=enrolled), int(enrolled))
+        self.assertTrue(task_store.task_comment(self.tid, "service:untrusted", "Untrusted tracker guidance"))
+        self.assert_stable(enrolled, requeue=not enrolled)
 
-        def resume_feedback(repo, tid, readmission):
-            self.assertIsNone(readmission)
-            self.assert_held(self.resume(held["id"]))
-            return True
+        self.assertTrue(task_store.task_comment(self.tid, "owner", "Keep both versions for review."))
+        if not enrolled:
+            task_store.task_set_state(self.tid, "failed")
+            self.assert_stable(False)
+            task_store.task_set_state(self.tid, "todo")
+        self.retry_held(enrolled)
+        self.assert_ticket_snapshot(self.assert_held(self.held), int(enrolled) + 1)
+        self.assert_stable(enrolled, 1, requeue=not enrolled)
+        self.assertEqual(len(self.notices()), 2)
+        if not enrolled:
+            remote = self.advance()
+            self.retry_held(False)
+            self.assertEqual(self.assert_held(self.held)["refs"]["head"], remote)
+            self.assert_stable(False, 2, requeue=True)
+            self.assertEqual(len(self.notices()), 3)
+            self.judge.assert_not_called()
 
-        with (patch.object(pipeline, "FEEDBACK_QUIET_MINUTES", 0),
-              patch.object(poll, "spawn_unparked", side_effect=resume_feedback) as start):
-            self.assertEqual(insights.add_feedback(baseline), 1)
-            pick = poll.next_pick(self.repo, self.source, skips, set())
-            self.assertTrue(pick.from_feedback)
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "skipped")
-            start.assert_not_called()
-
-            pick = collect_and_pick()
-            self.assertTrue(pick.from_feedback)
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
-            self.reply(4, "Untrusted follow-up", login="stranger")
-            self.assertIsNone(collect_and_pick())
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "skipped")
-            start.assert_called_once()
-        self.spawn.assert_not_called()
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
+    test_enrolled_watch_readmits_same_second_ticket_answer = partialmethod(check_same_second_ticket_answer, enrolled=True)
+    test_ordinary_requeue_readmits_same_second_ticket_answer = partialmethod(check_same_second_ticket_answer, enrolled=False)

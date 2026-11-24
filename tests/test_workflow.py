@@ -5492,7 +5492,7 @@ class CatchUpCleanupTests(unittest.TestCase):
         controller.job = SimpleNamespace(b=b, checkouts=[checkout], approval=None, draft_why="", ticket=b.ticket,
                                          build_summary="", branch="fixture", slot=None, goal="", plan_text="",
                                          with_left=str, verified=verify.Verified("pass"), review=self.prior,
-                                         check_publication_targets=None)
+                                         check_publication_targets=None, recovery_publication=None)
         with (mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
               mock.patch.object(gh, "pr_comment") as comment):
@@ -6442,7 +6442,7 @@ class MovedBasePublicationFixture:
                         waiting=mock.Mock(return_value=nullcontext()), feedback=[], repairs="", facts={},
                         action="", environment_release="", owner_questions_blocked=False)
         job = mock.Mock(run=run, only="", checkouts=[checkout], workspace_checkouts=[checkout], with_prs=[checkout],
-                        check_publication_targets=None,
+                        check_publication_targets=None, recovery_publication=None,
                         picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
                         verified=verify.Verified("pass"), review=Review("approve", trees={"": "head-tree"}),
                         approval=None, draft_why="", found=[], drafted=[],

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import config, diffguard, factory, gh, repairs, tracker, util, vault, workspace
-from .store import asks, orchestration, runs, unblock
+from . import diffguard, factory, gh, repairs, tracker, util, vault, workspace
+from .store import asks, orchestration, unblock
 
 REASON = "open-pr-recovery"
 DECISION_VERSION = "v2:"
@@ -38,6 +39,10 @@ class Refs:
                 and gh.pr_repo(self.url).casefold() == c.github.casefold()
                 and self.branch == branch and self.base_branch == c.base)
 
+    def aligned(self) -> bool:
+        return (self.head == self.origin and self.base == self.origin_base
+                and all(OID.fullmatch(oid) for oid in (self.head, self.base)))
+
 
 def observe(c: workspace.Checkout, branch: str) -> Refs:
     pr = gh.pr_merge_details(c.pr, timeout=30, retry=False, identity=True)
@@ -51,6 +56,10 @@ def observe(c: workspace.Checkout, branch: str) -> Refs:
 
 def current_head(c: workspace.Checkout) -> str:
     return util.git(["rev-parse", "--verify", "HEAD"], c.wt).strip()
+
+
+def current_ref(c: workspace.Checkout) -> str:
+    return util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip()
 
 
 @dataclass(frozen=True)
@@ -84,23 +93,26 @@ class Inputs:
                    "publication_unconfirmed": True}
         return Hold(vault.hidden(summary), recovery=failure)
 
-    def moved(self, refs: Refs, *, during: str, local: str = "", pushed: dict[str, str] | None = None) -> Hold:
+    def moved(self, refs: Refs, *, during: str, pushed: dict[str, str] | None = None, updated: bool = False) -> Hold:
         was = self.refs
+        change = (f"the PR or origin moved {during} (expected head {was.head}, origin head {was.origin}, "
+                  f"base {was.base_branch}@{was.base}, origin base {was.origin_base}; now {refs.state or 'unknown'} "
+                  f"on {refs.branch or 'unknown'} targeting {refs.base_branch}@{refs.base or 'missing'}, "
+                  f"origin base {refs.origin_base or 'missing'})")
+        if updated and not pushed:
+            return self.publication_unconfirmed(f"{change} after a PR update was attempted", refs, {})
         action = (f"{pushed_note(self.branch, pushed)} Reconcile the partial publication before resuming" if pushed
                   else "Inspect the new head and retry against it; no push was made by this attempt")
-        error = self.hold(f"the PR or origin moved {during} (expected head {was.head}, origin head {was.origin}, "
-                          f"base {was.base_branch}@{was.base}, origin base {was.origin_base}; "
-                          f"now {refs.state or 'unknown'} on {refs.branch or 'unknown'}, "
-                          f"origin base {refs.origin_base or 'missing'})", action, observed=refs, local=local)
-        error.recovery["expected_refs"] = asdict(was)
-        if pushed:
-            error.recovery["pushed"] = dict(pushed)
+        error = self.hold(change, action, observed=refs)
+        error.recovery.update(expected_refs=asdict(was), **({"pushed": dict(pushed)} if pushed else {}))
         return error
 
-    def recheck(self, *, during: str, local: str = "", pushed: dict[str, str] | None = None) -> None:
-        refs = observe(self.checkout, self.branch)
-        if refs != self.refs or not refs.target_matches(self.checkout, self.branch):
-            raise self.moved(refs, during=during, local=local, pushed=pushed)
+    def matches(self, refs: Refs) -> bool:
+        return refs == self.refs and refs.target_matches(self.checkout, self.branch)
+
+    def recheck(self, *, during: str, pushed: dict[str, str] | None = None) -> None:
+        if not self.matches(refs := observe(self.checkout, self.branch)):
+            raise self.moved(refs, during=during, pushed=pushed)
 
 
 class Hold(workspace.RunFailed):
@@ -164,34 +176,22 @@ def decision_for(run_id: str, source: tracker.Tracker, tid: str, pr: str, *, rep
     return DECISION_VERSION + orchestration.digest([ticket_replies(source, tid), review, answers])
 
 
-def reply_keys_since(rows: list[dict], since: str) -> list[list]:
-    return sorted([r["kind"], r["gh_id"]] for r in rows if (r.get("created") or "") >= since)
+def reply_key(row: dict) -> tuple[str, int]:
+    return row["kind"], row["gh_id"]
 
 
-def new_owner_input(run_id: str, source: tracker.Tracker, tid: str, pr: str, since: str) -> bool:
-    return bool(reply_keys_since(pr_replies(pr, source.repo.name, tid), since)
-                or ticket_replies(source, tid, since)
-                or any((a.get("answered") or "") >= since for a in answered_asks(run_id)))
+def reply_keys(rows: list[dict] | None) -> list[list] | None:
+    return None if rows is None else sorted(list(reply_key(row)) for row in rows)
 
 
-def fresh_feedback_after_hold(row: dict, held: dict, feedback: list[dict]) -> bool:
-    since = held.get("held_at") or row.get("finished")
-    if not since:
-        return False
-    seen = {tuple(key) for key in held.get("seen_replies") or ()}
-    fresh = [r for r in feedback if r["pr_url"] == held["pr"] and r["pr_state"] == "OPEN"
-             and r["status"] == "new" and r["run_id"] is None and is_reply(r["body"] or "")]
-    return any(tuple(key) not in seen for key in reply_keys_since(fresh, since))
+def reply_snapshot(held: dict, pr: str) -> set[tuple[str, int]] | None:
+    legacy = held.get("seen_replies") if pr == held["pr"] else None
+    seen = held.get("seen_replies_by_pr", {}).get(pr, legacy)
+    return None if seen is None else {tuple(key) for key in seen}
 
 
-def decision(run_id: str, _display_comments: str) -> str:
-    row = runs.run_get(run_id) or {}
-    if not (held := blocked(row)):
-        raise ValueError("the saved PR hold changed before reading its owner discussion")
-    cfg = config.load()
-    tid = str(row["issue"])
-    source = tracker.for_ticket(cfg, cfg.repo(row["repo"]), tid)
-    return decision_for(run_id, source, tid, held["pr"])
+def captured_reply_keys(held: dict) -> set[tuple[str, int]]:
+    return reply_snapshot(held, held["pr"]) or set()
 
 
 def notice(repo: str, ticket: str, failure: dict) -> bool:
@@ -226,43 +226,59 @@ def merge(inputs: Inputs, wt: Path, head: str, label: str, run_id: str) -> None:
                           "PR branch, then retry without resetting the retained worktree") from error
 
 
-def unowned(c: workspace.Checkout, head: str, remote: str, base: str, runs: set[str]) -> list[str]:
-    log = util.git(["log", f"--format={repairs.TRAILER}", head, f"^{remote}", f"^{base}"], c.wt)
-    commits = [row.partition("\t") for row in log.splitlines()]
-    return [sha for sha, _, tags in commits if not runs.intersection(t.strip() for t in tags.split(","))]
+def unowned(wt: Path, head: str, bases: Collection[str], runs: set[str]) -> list[str]:
+    log = util.git(["log", f"--format={repairs.TRAILER}", head, *(f"^{base}" for base in bases if base)], wt)
+    return [sha for sha, _, tags in (row.partition("\t") for row in log.splitlines())
+            if not runs.intersection(t.strip() for t in tags.split(","))]
 
 
-def colliding_paths(c: workspace.Checkout, before: str, candidate: str) -> list[str]:
-    dirty = set(workspace.uncommitted(c.wt)) | workspace.ignored_file_paths(c.wt)
-    ignore_case = util.git(["config", "--bool", "core.ignoreCase"], c.wt, check=False).strip() == "true"
-
+def overlapping_paths(names: Collection[str], changed: Collection[str], *, ignore_case: bool = True) -> list[str]:
     def path_of(name: str) -> Path:
         return Path(name.casefold() if ignore_case else name)
 
-    changed = {path_of(name) for name in util.git_records(["diff", "--no-renames", "--name-only", before, candidate], c.wt)}
-    dirs = {parent for path in changed for parent in path.parents}
-    return sorted(name for name in dirty if (path := path_of(name)) in changed
-                  or path in dirs or not changed.isdisjoint(path.parents))
+    targets = {path_of(name) for name in changed}
+    parents = {parent for target in targets for parent in target.parents}
+    return sorted(name for name in names if (path := path_of(name)) in targets
+                  or path in parents or not targets.isdisjoint(path.parents))
 
 
-def rule_dirs(names: set[str] | list[str]) -> set[Path]:
-    return {Path(n.casefold()).parent for n in names if Path(n).name.casefold() == ".gitignore"}
-
-
-def incoming_ignore_dirs(wt: Path, *revs: str) -> set[Path]:
-    return rule_dirs(util.git_records(["diff", "--no-renames", "--name-only", *revs], wt))
+def rule_dirs(names: Collection[str]) -> set[Path]:
+    return {p.parent for n in names if (p := Path(n.casefold())).name == ".gitignore"}
 
 
 def under_rules(name: str, dirs: set[Path]) -> bool:
     return not dirs.isdisjoint(Path(name.casefold()).parents)
 
 
-def affected_retained(wt: Path, dirs: set[Path]) -> dict[str, bool]:
-    if not dirs:
-        return {}
-    return {name: ignored for ignored, names in ((False, workspace.untracked_files(wt)),
-                                                  (True, workspace.ignored_file_paths(wt)))
-            for name in names if under_rules(name, dirs)}
+@dataclass(frozen=True)
+class Retained:
+    visible: set[str]
+    ignored: set[str]
+
+    @property
+    def names(self) -> set[str]:
+        return self.visible | self.ignored
+
+
+def loose_files(wt: Path) -> Retained:
+    return Retained(workspace.untracked_files(wt), workspace.ignored_file_paths(wt))
+
+
+def path_hold(c: workspace.Checkout, why: str, paths: Collection[str], action: str = "Inspect the named paths and retry",
+              inputs: Inputs | None = None) -> workspace.RunFailed:
+    why = f"{why}: {', '.join(map(repr, sorted(paths)))}"
+    return inputs.hold(why, action) if inputs else workspace.RunFailed(vault.hidden(f"{c.github}: {why}. {action}"))
+
+
+def retained_snapshot(inputs: Inputs, files: Retained) -> dict[str, str]:
+    c = inputs.checkout
+    try:
+        snapshot = {name: workspace.fingerprint(c.wt / name, "") for name in files.names}
+    except OSError as error:
+        raise path_hold(c, "could not verify the retained files", files.names, inputs=inputs) from error
+    if missing := {name for name, digest in snapshot.items() if digest == "missing"}:
+        raise path_hold(c, "could not verify the retained files", missing, inputs=inputs)
+    return snapshot
 
 
 def retained_excludes(wt: Path) -> Path | None:
@@ -273,49 +289,147 @@ def retained_excludes(wt: Path) -> Path | None:
     return wt.absolute() / value if value else None
 
 
-def changes_excludes(wt: Path, excludes: Path, changed: list[str]) -> bool:
-    roots = {wt.absolute(), wt.resolve()}
-    files = {Path(str(p).casefold()) for p in (excludes, excludes.resolve())}
-    possible_changes = files | {parent for path in files for parent in path.parents}
-    return any(Path(str(root / name).casefold()) in possible_changes for root in roots for name in changed)
+def retained_record(wt: Path) -> Path | None:
+    dotgit = wt / ".git"
+    if not dotgit.is_dir():
+        try:
+            raw = dotgit.read_bytes()
+        except FileNotFoundError:
+            return None
+        if not raw.startswith(b"gitdir: "):
+            return None
+        dotgit = wt / os.fsdecode(raw.removeprefix(b"gitdir: ").rstrip(b"\r\n"))
+    return dotgit / "arete-retained-ignored.json"
 
 
-def check_ignore_changes(i: Inputs, wt: Path, affected: dict[str, bool], excludes: Path | None,
-                         *, excludes_changed: bool) -> None:
-    if not affected:
+def read_retained(wt: Path) -> Retained:
+    try:
+        data = json.loads(path.read_bytes()) if (path := retained_record(wt)) else {}
+    except FileNotFoundError:
+        data = {}
+    if isinstance(data, list):
+        data = {"ignored": data}
+    if not isinstance(data, dict) or data.keys() - {"visible", "ignored"}:
+        raise ValueError("the retained file record is invalid")
+    visible, ignored = data.get("visible", []), data.get("ignored", [])
+    for names in (visible, ignored):
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ValueError("the retained file record is invalid")
+    return Retained(set(visible), set(ignored))
+
+
+def existing_paths(c: workspace.Checkout, names: set[str], inputs: Inputs | None = None) -> set[str]:
+    present = set()
+    for name in sorted(names):
+        try:
+            (c.wt / name).lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            raise path_hold(c, "could not inspect retained files", [name], inputs=inputs) from error
+        present.add(name)
+    return present
+
+
+def check_retained(c: workspace.Checkout, inputs: Inputs | None = None, *, files: Retained | None = None,
+                   remember: bool = False, forced: Collection[str] = (), found: Retained | None = None) -> Retained:
+    saved = read_retained(c.wt)
+    if files is not None:
+        saved = Retained(saved.visible | files.visible, saved.ignored | files.ignored)
+    if not saved.names:
+        return saved
+    try:
+        found = found if found is not None else loose_files(c.wt)
+        indexed = indexed_paths(c.wt)
+    except (RuntimeError, OSError) as error:
+        raise path_hold(c, "could not check retained file classifications", saved.names, inputs=inputs) from error
+    exposed = (saved.ignored & indexed) | saved.ignored.intersection(forced)
+    exposed |= existing_paths(c, saved.ignored - found.ignored, inputs)
+    if exposed:
+        raise path_hold(c, "staging would expose retained ignored files", exposed,
+                        "Save the named files separately or restore their ignore rules, then retry", inputs)
+    if hidden := saved.visible & found.ignored:
+        raise path_hold(c, "ignore rules now hide retained untracked files", hidden,
+                        "Save the named files separately or restore their visibility, then retry", inputs)
+    if unclear := existing_paths(c, saved.visible - found.visible - indexed, inputs):
+        raise path_hold(c, "could not account for retained untracked files", unclear, inputs=inputs)
+    if remember:
+        try:
+            if not (path := retained_record(c.wt)):
+                raise OSError("missing worktree gitdir")
+            util.write_json(path, {"visible": sorted(saved.visible), "ignored": sorted(saved.ignored)})
+        except OSError as error:
+            raise path_hold(c, "could not record retained files", saved.names,
+                            "Inspect the checkout and retry", inputs) from error
+    return saved
+
+
+def check_staging(checkouts: list[workspace.Checkout], forced: dict[str, list[str]] | None = None) -> dict[str, Retained]:
+    return {c.github: check_retained(c, forced=(forced or {}).get(c.github, ())) for c in checkouts}
+
+
+def indexed_paths(wt: Path) -> set[str]:
+    return set(util.git_records(["ls-files", "--cached"], wt))
+
+
+def apply_pathspec(wt: Path, args: list[str], excluded: Collection[str], *paths: str) -> None:
+    spec = [".", *paths, *(f":(top,exclude,literal){name}" for name in sorted(excluded))]
+    util.git([*args, "--pathspec-from-file=-", "--pathspec-file-nul"], wt, input="\0".join(spec) + "\0")
+
+
+def add_retained_safe(c: workspace.Checkout, retained: Retained) -> None:
+    if not retained.names:
+        diffguard.add(c.wt)
         return
+    args = ["ls-files", "--others", "--exclude-standard", "--", ".", *diffguard.NEVER_STAGED]
+    before = set(util.git_records(args, c.wt)) if retained.visible else set()
+    apply_pathspec(c.wt, ["add", "-A"], retained.ignored, *diffguard.NEVER_STAGED)
+    check_retained(c)
+    if retained.visible and (missing := ((before | set(util.git_records(args, c.wt))) & retained.visible)
+                             - indexed_paths(c.wt)):
+        raise path_hold(c, "staging could not preserve retained untracked files", missing)
+
+
+def cleanup_paths(c: workspace.Checkout) -> set[str]:
+    saved = read_retained(c.wt)
+    if not saved.names:
+        return set()
+    clean = set(util.git_records(["ls-tree", "-r", "--name-only", "HEAD"], c.wt)) - set(workspace.uncommitted(c.wt))
+    return existing_paths(c, saved.names - (clean - saved.ignored))
+
+
+def ignored_by_candidate(wt: Path, git_dir: Path, paths: list[str], override: list[str]) -> set[str]:
+    result = util.sh(["git", f"--git-dir={git_dir}", f"--work-tree={wt}", *override,
+                     "check-ignore", "--no-index", "-z", "--stdin"], cwd=wt, input="\0".join(paths) + "\0")
+    if result.returncode not in (0, 1):
+        raise RuntimeError("could not prove which retained files the candidate ignores")
+    return set(result.stdout.split("\0")) - {""}
+
+
+def check_ignore_changes(i: Inputs, wt: Path, files: Retained, changed: list[str]) -> None:
     retained = i.checkout.wt
-    retained_rules = rule_dirs(set(workspace.uncommitted(retained)) | workspace.ignored_file_paths(retained))
+    excludes = retained_excludes(retained)
+    paths = [str(root / name) for root in {retained.absolute(), retained.resolve()} for name in changed]
+    excludes_changed = excludes is not None and bool(overlapping_paths([str(excludes), str(excludes.resolve())], paths))
+    dirs = rule_dirs(changed)
+    names = sorted(n for n in files.names if excludes_changed or under_rules(n, dirs))
+    if not names:
+        return
+    rules = rule_dirs(set(workspace.uncommitted(retained)) | files.ignored)
     git_dir = util.git(["rev-parse", "--absolute-git-dir"], retained).rstrip("\n")
     override = ["-c", f"core.excludesFile={excludes}"] if excludes is not None else []
-    result = util.sh(["git", f"--git-dir={git_dir}", f"--work-tree={wt}", *override,
-                     "check-ignore", "--no-index", "-z", "--stdin"], cwd=wt,
-                     input="\0".join(sorted(affected)) + "\0")
-    ignored = set(result.stdout.split("\0")) - {""}
-    hidden, exposed = [], []
-    for name, was_ignored in sorted(affected.items()):
-        if (excludes_changed or result.returncode not in (0, 1) or under_rules(name, retained_rules)
-                or (name in ignored) != was_ignored):
-            (exposed if was_ignored else hidden).append(name)
-    if hidden or exposed:
+    try:
+        ignored = ignored_by_candidate(wt, Path(git_dir), names, override)
+    except (OSError, RuntimeError) as error:
+        raise path_hold(i.checkout, "could not verify the candidate's ignore rules for retained files", names,
+                        "Save the named files separately or inspect the ignore rules, then retry", i) from error
+    flipped = {n for n in names if excludes_changed or under_rules(n, rules) or (n in ignored) != (n in files.ignored)}
+    if flipped:
         i.recheck(during="during isolated reconciliation")
-        changes = []
-        if hidden:
-            changes.append(f"incoming ignore rules can hide retained untracked files: {', '.join(map(repr, hidden))}")
-        if exposed:
-            changes.append(f"incoming ignore rules can expose retained ignored files: {', '.join(map(repr, exposed))}")
-        raise i.hold("; ".join(changes),
-                     "Save the named files separately or have the owner adjust the PR's ignore rules, then retry")
-
-
-def check_base_ignore_changes(c: workspace.Checkout, branch: str, head: str) -> None:
-    dirs = incoming_ignore_dirs(c.wt, f"{head}...{c.base_commit}")
-    if affected := affected_retained(c.wt, dirs):
-        inputs = expected_inputs(c, branch, head)
-        inputs.recheck(during="before merging the PR base")
-        raise inputs.hold(f"incoming base ignore rules can change the visibility of retained files: "
-                          f"{', '.join(map(repr, sorted(affected)))}",
-                          "Save the named files separately or have the owner adjust the PR's ignore rules, then retry")
+        why = "; ".join(f"incoming ignore rules can {reason}: {', '.join(map(repr, sorted(paths)))}" for reason, paths in
+                        (("hide retained untracked files", flipped & files.visible),
+                         ("expose retained ignored files", flipped & files.ignored)) if paths)
+        raise i.hold(why, "Save the named files separately or have the owner adjust the PR's ignore rules, then retry")
 
 
 @dataclass(frozen=True)
@@ -323,20 +437,32 @@ class Plan:
     inputs: Inputs
     candidate: str
     fingerprint: str
-    ignore_dirs: set[Path]
-    affected: dict[str, bool]
+    retained: Retained
+    files: dict[str, str]
+
+    def check_files(self, *, installed: bool = False) -> None:
+        i = replace(self.inputs, local=self.candidate) if installed else self.inputs
+        found = loose_files(i.checkout.wt)
+        check_retained(i.checkout, i, files=self.retained, found=found)
+        current = retained_snapshot(i, found)
+        if changed := {name for name in current.keys() | self.files.keys() if current.get(name) != self.files.get(name)}:
+            raise path_hold(i.checkout, "the retained files changed during recovery", changed,
+                            "Inspect the named paths before resuming", i)
 
     def check_local(self, ws: Path, src: Path, copies: list[str]) -> None:
         i, c = self.inputs, self.inputs.checkout
-        if (util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip() != f"refs/heads/{i.branch}"
-                or current_head(c) != i.local or affected_retained(c.wt, self.ignore_dirs) != self.affected
-                or factory.fingerprint(c.wt) != self.fingerprint
+        self.check_files()
+        if (current_ref(c) != f"refs/heads/{i.branch}"
+                or current_head(c) != i.local or factory.fingerprint(c.wt) != self.fingerprint
                 or workspace.kept_checkout(ws, c, src, copies, commits=False)):
             raise i.hold("the retained worktree changed during recovery", "Save or restore the retained edits and retry",
                          local=current_head(c))
-        if paths := colliding_paths(c, i.local, self.candidate):
-            raise i.hold(f"incoming changes overlap retained uncommitted or ignored files: {', '.join(map(repr, paths))}",
-                         "Save those files separately, restore the recorded worktree, and retry")
+        dirty = set(workspace.uncommitted(c.wt)) | workspace.ignored_file_paths(c.wt)
+        changed = util.git_records(["diff", "--no-renames", "--name-only", i.local, self.candidate], c.wt)
+        ignore_case = util.git(["config", "--bool", "core.ignoreCase"], c.wt, check=False).strip() == "true"
+        if paths := overlapping_paths(dirty, changed, ignore_case=ignore_case):
+            raise path_hold(c, "incoming changes overlap retained uncommitted or ignored files", paths,
+                            "Save those files separately, restore the recorded worktree, and retry", i)
 
     def install(self) -> None:
         i, c = self.inputs, self.inputs.checkout
@@ -348,8 +474,7 @@ class Plan:
                 raise i.hold(f"the retained worktree refused candidate {self.candidate} ({why})",
                              "Inspect the local branch and index, then retry without resetting either version",
                              local=current_head(c)) from error
-        head = current_head(c)
-        on = util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip()
+        head, on = current_head(c), current_ref(c)
         if head != self.candidate or on != f"refs/heads/{i.branch}":
             raise i.hold(f"the local checkout moved to {on or 'a detached HEAD'} while installing {self.candidate}",
                          "Inspect the retained branch before retrying", local=head)
@@ -368,8 +493,7 @@ def plan(c: workspace.Checkout, branch: str, accepted: str, local: str, remote: 
                      "Restore the saved PR target or reconcile the PR manually before resuming")
     if not refs.origin:
         raise i.hold(f"origin/{branch} is missing", "Restore the published branch before resuming")
-    if (refs.origin != remote or refs.head != refs.origin or refs.base != refs.origin_base
-            or not all(OID.fullmatch(oid) for oid in (refs.head, refs.base))):
+    if refs.origin != remote or not refs.aligned():
         raise i.hold(f"GitHub and origin did not agree with the observed refs (initial origin head {remote or 'missing'}, "
                      f"origin base {refs.origin_base or 'missing'})", "Wait for the refs to agree, then retry")
     if not OID.fullmatch(accepted):
@@ -387,9 +511,12 @@ def plan(c: workspace.Checkout, branch: str, accepted: str, local: str, remote: 
                      "Save any local work and restore the recorded retained head before resuming")
     if not (ancestor(c.wt, accepted, local) or ancestor(c.wt, local, accepted)):
         raise i.hold("the retained history does not contain the accepted history", "Reconcile the local history manually")
-    if foreign := unowned(c, local, refs.head, refs.base, runs):
+    if foreign := unowned(c.wt, local, (refs.head, refs.base), runs):
         raise i.hold(f"the retained history includes unowned commits: {', '.join(foreign)}",
                      "Set those commits aside or have their owner reconcile them explicitly on the PR")
+    retained = loose_files(c.wt)
+    check_retained(c, i, found=retained)
+    files = retained_snapshot(i, retained)
     if not (fingerprint := factory.fingerprint(c.wt)):
         raise i.hold("the retained index and files could not be read", "Inspect the retained worktree and retry")
     with TemporaryDirectory(prefix="arete-pr-recovery-") as folder:
@@ -407,30 +534,126 @@ def plan(c: workspace.Checkout, branch: str, accepted: str, local: str, remote: 
                 raise i.hold(f"the candidate differs from the PR base in protected files: {', '.join(map(repr, diff.denied))}",
                              "Have the owner reconcile the protected paths on the PR before resuming")
             changed = util.git_records(["diff", "--no-renames", "--name-only", local, candidate], wt)
-            excludes = retained_excludes(c.wt)
-            excludes_changed = excludes is not None and changes_excludes(c.wt, excludes, changed)
-            dirs = {Path(".")} if excludes_changed else rule_dirs(changed)
-            affected = affected_retained(c.wt, dirs)
-            check_ignore_changes(i, wt, affected, excludes, excludes_changed=excludes_changed)
+            check_ignore_changes(i, wt, retained, changed)
         finally:
             with util.repo_lock(c.src):
                 util.git([*NO_HOOKS, "worktree", "remove", "--force", str(wt)], c.src)
-    return Plan(i, candidate, fingerprint, dirs, affected)
+    return Plan(i, candidate, fingerprint, retained, files)
+
+
+def pending_receipt(data: dict) -> dict:
+    return (data.get("publication_intent") or {}).get("recovery_receipt") or {}
+
+
+def check_no_pr_refs(c: workspace.Checkout, branch: str) -> None:
+    observed = workspace.remote_head(c.src, branch)
+    if observed != c.lease:
+        raise factory.Refused(vault.hidden(f"{c.github}: origin/{branch} moved while settling publication "
+                                           f"(expected {c.lease or 'absent'}, observed {observed or 'absent'}); "
+                                           "reconcile the sibling branch before resuming"))
+    if url := gh.open_pr_url(c.github, branch):
+        raise factory.Refused(vault.hidden(f"{c.github}: found {url} on the sibling branch without a PR in the receipt; "
+                                           "reconcile that PR before resuming"))
+
+
+def settle(checkouts: list[workspace.Checkout], branch: str, made: dict, intent: dict, owners: set[str]) -> None:
+    saved = intent["recovery_receipt"]
+    repos, targets = {c.github for c in checkouts}, {c.github for c in checkouts if c.pr}
+    attempts, pushed = intent.get("attempts", {}), intent.get("pushed", {})
+    if (not branch or not targets or len(repos) != len(checkouts) or branch != saved["branch"]
+            or targets != saved["targets"].keys() or repos != saved["trees"].keys()
+            or orchestration.digest(saved["trees"]) != intent["tree"] or not (pushed.keys() | attempts.keys()) <= targets
+            or any(e["kind"] == "PR creation" or e["github"] not in targets for e in intent.get("pr_effects", ()))):
+        raise factory.Refused("the interrupted publication lacks a matching receipt for its checkouts and PR effects; "
+                             "inspect its effects manually")
+    verified, without_pr = [], []
+    for c in checkouts:
+        head, tree = current_head(c), saved["trees"][c.github]
+        target = saved["targets"].get(c.github)
+        i = Inputs(c, branch, target["accepted"], head, Refs(**target["refs"])) if target else None
+        check_retained(c, i)
+        if (not OID.fullmatch(head) or workspace.head_recorded(made, c) != head
+                or current_ref(c) != f"refs/heads/{branch}" or factory.fingerprint(c.wt) != tree):
+            raise factory.Refused(vault.hidden(f"{c.pr or c.github}: retained head {head} does not match the gated "
+                                               "publication receipt; save any new edits and restore the recorded candidate "
+                                               "before resuming"))
+        if i is None:
+            base = c.base_commit or c.revision
+            if (not OID.fullmatch(base) or not ancestor(c.wt, base, head)
+                    or (c.lease and (not OID.fullmatch(c.lease) or not ancestor(c.wt, c.lease, head)))
+                    or any(util.git(["rev-parse", f"{oid}^{{tree}}"], c.wt).strip() != tree for oid in (head, base))
+                    or workspace.uncommitted(c.wt) or unowned(c.wt, head, (c.lease, base), owners)):
+                raise factory.Refused(vault.hidden(f"{c.github}: retained head {head} is not an unchanged sibling without "
+                                                   "PR effects; reconcile it against the recorded base before resuming"))
+            check_no_pr_refs(c, branch)
+            without_pr.append(c)
+            continue
+        expected = i.refs
+        confirmed = pushed.get(c.github, expected.head)
+        attempted = attempts.get(c.github, confirmed)
+        if (not expected.target_matches(c, branch) or not expected.aligned()
+                or not all(OID.fullmatch(oid) for oid in (confirmed, attempted, i.accepted))
+                or (c.github in attempts and attempted != head)
+                or not all(ancestor(c.wt, oid, head) for oid in (expected.head, expected.base, confirmed, i.accepted))
+                or unowned(c.wt, head, (expected.head, expected.base), owners)):
+            raise factory.Refused(vault.hidden(f"{c.pr}: retained head {head} does not match the gated publication "
+                                               f"receipt (expected {expected.head}, attempted {attempted}); save any "
+                                               "new edits and restore the recorded candidate before resuming"))
+        seen = observe(c, branch)
+        if not seen.target_matches(c, branch) or not seen.aligned():
+            raise i.moved(seen, during="while settling the publication", pushed=pushed)
+        fetch_inputs(replace(i, refs=seen))
+        if not ancestor(c.wt, confirmed, seen.head):
+            raise i.moved(seen, during="while settling the publication", pushed=pushed)
+        if not ancestor(c.wt, attempted, seen.head):
+            raise i.hold(f"the attempted publication {attempted} is not in the observed PR history",
+                         "Inspect the attempted push and reconcile that commit onto the PR before resuming; "
+                         "Arete will not resend it", observed=seen)
+        verified.append((replace(i, refs=seen), attempted, expected.base))
+    for c in without_pr:
+        check_no_pr_refs(c, branch)
+    for i, _, _ in verified:
+        i.recheck(during="while settling the publication", pushed=pushed)
+    for i, accepted, base in verified:
+        c = i.checkout
+        c.note_pushed_head(accepted)
+        c.recovery_head, c.recovery_base = accepted, base
 
 
 class Publication:
     def __init__(self, checkouts: list[workspace.Checkout], branch: str, runs: set[str], *,
-                 record_pushes: Callable[[dict[str, str]], None]):
+                 record: Callable[..., None], record_attempt: Callable[[str, str], None],
+                 settled: dict | None = None, settled_effects: Collection[dict] = ()):
         self.checkouts, self.branch, self.runs = checkouts, branch, runs
         self.trees = {c.github: util.git(["write-tree"], c.wt).strip() for c in checkouts}
         self.targets = {c.github: expected_inputs(c, branch, "") for c in checkouts if c.pr}
         self.leases = {c.github: c.lease for c in checkouts}
+        self.record, self.record_attempt = record, record_attempt
+        self.settled_effects = settled_effects
         self.pushed: dict[str, str] = {}
-        self.record_pushes = record_pushes
+        self.pr_effects: list[dict[str, str]] = []
+        if settled:
+            if branch != settled["branch"] or self.leases.keys() != settled["heads"].keys():
+                raise factory.Refused("the retained workspace no longer matches the recovered publication; reconcile it first")
+            self.leases = dict(settled["heads"])
+            self.pushed = dict(settled["pushed"])
+            self.pr_effects = list(settled["pr_effects"])
+            self.targets = {c.github: Inputs(c, branch, target["accepted"], "", Refs(**target["refs"]))
+                            for c in checkouts if (target := settled["targets"].get(c.github))}
 
     @property
     def effected(self) -> bool:
-        return bool(self.pushed)
+        return bool(self.pushed or self.pr_effects)
+
+    def snapshot(self) -> dict:
+        return {"branch": self.branch, "heads": {c.github: self.expected_head(c) for c in self.checkouts},
+                "targets": {repo: {"accepted": i.accepted, "refs": asdict(self.inputs(i.checkout, "").refs)}
+                            for repo, i in self.targets.items()},
+                "pushed": dict(self.pushed), "pr_effects": list(self.pr_effects)}
+
+    def bind(self, c: workspace.Checkout) -> None:
+        if not self.bound(c):
+            self.targets[c.github] = expected_inputs(c, self.branch, "")
 
     def bound(self, c: workspace.Checkout) -> bool:
         return c.github in self.targets
@@ -444,35 +667,76 @@ class Publication:
         return replace(target, local=head, refs=replace(target.refs, head=expected, origin=expected))
 
     def failure(self, why: str, detail: str = "") -> workspace.RunFailed:
-        if self.pushed:
-            why = f"{why}. {pushed_note(self.branch, self.pushed)} Reconcile the partial publication before resuming"
+        if self.effected:
+            done = pushed_note(self.branch, self.pushed) if self.pushed else "A PR update was attempted;"
+            why = f"{why}. {done} Reconcile the partial publication before resuming"
         return workspace.RunFailed(vault.hidden(why), detail)
 
     def recheck(self, during: str = "before publication") -> None:
+        check_staging(self.checkouts)
         for c in self.checkouts:
             if self.bound(c):
-                inputs = self.inputs(c, current_head(c))
-                try:
-                    inputs.recheck(during=during, pushed=self.pushed)
-                except (RuntimeError, OSError, ValueError) as error:
-                    if not self.pushed:
-                        raise
-                    raise inputs.publication_unconfirmed(f"could not confirm the refs {during}", None, self.pushed) from error
+                self.recheck_pr(c, during)
             else:
                 expected, observed = self.expected_head(c), workspace.remote_head(c.src, self.branch)
                 if observed != expected:
                     raise self.failure(f"{c.github}: origin/{self.branch} moved {during} "
                                        f"(expected head {expected or 'missing'}, observed head {observed or 'missing'})")
 
+    def recheck_pr(self, c: workspace.Checkout, during: str) -> None:
+        try:
+            seen = observe(c, self.branch)
+        except (RuntimeError, OSError, ValueError) as error:
+            if not self.effected:
+                raise
+            raise self.ref_hold(c, during, None, why=f"could not confirm the refs {during}") from error
+        if not self.inputs(c, "").matches(seen):
+            raise self.ref_hold(c, during, seen)
+
+    def ref_hold(self, c: workspace.Checkout, during: str, seen: Refs | None, *, why: str = "") -> Hold:
+        inputs = self.inputs(c, current_head(c))
+        error = (inputs.publication_unconfirmed(why, seen, self.pushed) if why or seen is None
+                 else inputs.moved(seen, during=during, pushed=self.pushed, updated=bool(self.pr_effects)))
+        if self.pr_effects:
+            error.recovery["pr_effects"] = list(self.pr_effects)
+        return error
+
+    def before_pr_write(self, c: workspace.Checkout, kind: str, *, during: str) -> bool:
+        if self.bound(c):
+            self.recheck_pr(c, during)
+        else:
+            self.recheck(during=during)
+        effect = {"kind": kind, "github": c.github, "pr": c.pr, "head": self.expected_head(c)}
+        if effect in self.settled_effects:
+            return False
+        self.pr_effects.append(effect)
+        self.record(pr_effects=list(self.pr_effects))
+        return True
+
+    def unconfirmed_pr_write(self, c: workspace.Checkout, *, during: str, why: str) -> Hold:
+        self.recheck_pr(c, during)
+        return self.ref_hold(c, during, self.inputs(c, "").refs, why=why)
+
+    def comment(self, c: workspace.Checkout, body: str, *, kind: str, during: str) -> None:
+        if not self.before_pr_write(c, kind, during=during):
+            return
+        head = self.expected_head(c)
+        try:
+            gh.pr_comment(c.pr, f"{kind} for head `{head}`\n\n{body}", single_attempt=True)
+        except gh.GhUnsure as error:
+            raise self.unconfirmed_pr_write(c, during=f"after posting {kind.lower()}",
+                                            why=f"GitHub did not confirm the {kind.lower()} comment") from error
+
     def push(self, c: workspace.Checkout) -> None:
         head, expected = current_head(c), self.expected_head(c)
         if (util.git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip() != self.trees[c.github]
                 or (expected and not ancestor(c.wt, expected, head))):
             raise self.failure(f"{c.github}: {head} is not the gated candidate tree on top of {expected}")
-        if c.recovery_head:
-            if not ancestor(c.wt, c.recovery_base, head):
-                raise self.failure(f"{c.github}: {head} no longer contains the observed PR base {c.recovery_base}")
-            if foreign := unowned(c, head, expected, c.recovery_base, self.runs):
+        if self.bound(c):
+            base = self.targets[c.github].refs.base
+            if not ancestor(c.wt, base, head):
+                raise self.failure(f"{c.github}: {head} no longer contains the observed PR base {base}")
+            if foreign := unowned(c.wt, head, (expected, base), self.runs):
                 why = f"the candidate includes unowned commits: {', '.join(foreign)}"
                 if self.pushed:
                     raise self.failure(f"{c.github}: {why}")
@@ -481,6 +745,7 @@ class Publication:
         args = ["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", f"--force-with-lease={ref}:{expected}",
                 "origin", f"{head}:{ref}"]
         self.recheck(during="immediately before the leased push")
+        self.record_attempt(c.github, head)
         res = util.sh(["git", *args], cwd=c.wt, timeout=600, keeps=("ssh-agent",))
         if res.returncode:
             rejected = res.returncode == 1 and any(
@@ -492,8 +757,11 @@ class Publication:
                     refs = observe(c, self.branch)
                 except (RuntimeError, OSError, ValueError):
                     refs = None
-                if rejected and refs is not None and refs != inputs.refs:
-                    raise inputs.moved(refs, during="during the leased push", pushed=self.pushed)
+                if rejected and refs is not None:
+                    self.record_attempt(c.github, "")
+                    if refs != inputs.refs:
+                        raise inputs.moved(refs, during="during the leased push", pushed=self.pushed)
+                    raise inputs.hold("Git rejected the leased push", "Inspect the remote branch protection and retry")
                 raise inputs.publication_unconfirmed("the leased push did not confirm publication", refs, self.pushed)
             try:
                 observed = workspace.remote_head(c.src, self.branch) or "missing"
@@ -505,4 +773,4 @@ class Publication:
         self.pushed[c.github] = head
         c.note_pushed_head(head)
         c.onto = ""
-        self.record_pushes(dict(self.pushed))
+        self.record(pushed=dict(self.pushed))

@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import Counter
+from collections.abc import Collection
 from dataclasses import asdict, replace
+from datetime import UTC, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import (alerts, config, delegation, environment, factory, flows, gh, launch_lease, outbound,
-               owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, queueing, record, run_lines,
-               runlimits, steps, tracker, util, vault, webpush, workspace, zte)
+from . import (alerts, config, delegation, environment, factory, flows, gh, jira, launch_lease, outbound,
+               owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, queueing, record,
+               run_lines, runlimits, steps, tracker, util, vault, webpush, workspace, zte)
 from .agent import json_from_text
 from .store import asks as asks_store
 from .store import db
@@ -25,8 +28,12 @@ ACTOR = "rule:unblock"
 OWNER_DIRECTIVE = "Arete owner action: "
 DEPENDENCY_DIRECTIVE = "Arete dependency correction: remove "
 EXCLUDED_LABELS = {"no-agent", "agent:hold", tracker.ZTE_LABEL}
+HELD_REPLY_RETRY = ("If a reply could not be confirmed as new, post the guidance as a new ticket comment "
+                    "or use Resume on the held run.")
 ACTIONS = {"retry": {"direction", "limit"}, "clarify": {"direction", "limit"}, "answer": {"answers"}, "merge": {"head", "base"},
            "wait_for": set(), "needs_owner": {"asks"}}
+
+type TicketReply = tuple[str, str, str]
 
 
 def active(cfg, repo: str, ticket: str) -> bool:
@@ -138,21 +145,120 @@ def policy(cfg, repo) -> str:
     return merge_review.policy(cfg, config.load_layer(repo.layer_dir))
 
 
-def pr_recovery_observation(repo, t, row, held: dict) -> dict:
+def recovery_checkouts(repo: config.Repo, row: dict) -> tuple[str, dict[str, dict]]:
     prepared = flows.prepared_data(row["id"])
     published = flows.publication(row["id"]).get("prs", {})
-    listed = next((c for c in prepared.get("checkouts", ()) if c["github"] == held["github"]
-                   and (c.get("pr") or published.get(c["github"])) == held["pr"]), None)
-    if not listed or prepared.get("branch") != held["branch"]:
+    configured = {(p.dir, p.github, repo.path / p.dir) for p in repo.parts}
+    checkouts = {}
+    for c in prepared.get("checkouts", ()):
+        pr = c.get("pr") or published.get(c["github"])
+        if (pr and gh.pr_repo(pr).casefold() == c["github"].casefold()
+                and (c["dir"], c["github"], Path(c["src"])) in configured):
+            checkouts[pr] = {**c, "pr": pr}
+    return prepared.get("branch", ""), checkouts
+
+
+def replies_after_hold(row: dict, held: dict, replies: list[dict], attached: Collection[str]) -> list[dict]:
+    if not replies or not (since := held.get("held_at") or row.get("finished")):
+        return []
+    held = {**held, "seen_replies_by_pr": held.get("seen_replies_by_pr") or {}}
+    captured = {pr: pr_recovery.reply_snapshot(held, pr) for pr in attached}
+    fresh = []
+    for reply in replies:
+        pr = reply["pr_url"]
+        if pr not in captured or reply["pr_state"] != "OPEN" or not pr_recovery.is_reply(reply["body"] or ""):
+            continue
+        created, seen = reply.get("created") or "", captured[pr]
+        if (seen is None and created > since) or (seen is not None and (not created or created >= since)
+                                                  and pr_recovery.reply_key(reply) not in seen):
+            fresh.append(reply)
+    return fresh
+
+
+def ticket_reply_rows(source: tracker.Tracker, tid: str) -> list[TicketReply]:
+    if isinstance(source, tracker.GitHubTracker):
+        comments = gh.api_list(f"repos/{source.repo.github}/issues/{int(tid)}/comments")
+        return [(str(c["id"]), c.get("created_at") or "", body) for c in comments
+                if source.by_owner({"author": c.get("user")})
+                and pr_recovery.is_reply(body := (c.get("body") or "").strip())]
+    if isinstance(source, tracker.JiraTracker):
+        if not (me := source.client.me().get("accountId")):
+            raise jira.JiraError("Jira could not identify the account that handles ticket replies")
+        return [(str(c["id"]), util.iso(jira.parse_time(c["created"]).astimezone(UTC)), body)
+                for c in source.client.comments(tid) if (c.get("author") or {}).get("accountId") == me
+                and pr_recovery.is_reply(body := (c.get("body") or "").strip()) and c.get("created")]
+    counts: Counter[str] = Counter()
+    replies = []
+    for c in tasks_store.task_comments(tid):
+        body = (c["body"] or "").strip()
+        if principals.is_person(c["author"]) and pr_recovery.is_reply(body):
+            key = digest([c["author"], c["ts"], body])
+            counts[key] += 1
+            replies.append((f"{key}:{counts[key]}", c["ts"] or "", body))
+    return replies
+
+
+def ticket_reply_keys(replies: list[TicketReply]) -> list[str]:
+    return sorted(key for key, _, _ in replies)
+
+
+def ticket_answer_after_hold(row: dict, held: dict, replies: list[TicketReply], answers: list[dict]) -> bool:
+    if not (since := held.get("held_at") or row.get("finished")):
+        return False
+    after = util.iso(util.parse_iso(since) + timedelta(seconds=1))
+    captured = held.get("seen_ticket_replies")
+    cutoff, seen = (after, set()) if captured is None else (since, set(captured))
+    return (any(created >= cutoff and key not in seen for key, created, _ in replies)
+            or any((a.get("answered") or "") >= after for a in answers))
+
+
+def recovery_decision_for(replies: list[dict], ticket_replies: list[TicketReply], answers: list[dict]) -> str:
+    ticket = sorted((key, body) for key, _, body in ticket_replies)
+    review = sorted((r["kind"], r["gh_id"], r["body"]) for r in replies)
+    return pr_recovery.DECISION_VERSION + digest([ticket, review, [[a["id"], a["answers"]] for a in answers]])
+
+
+def recovery_decision(source: tracker.Tracker, tid: str, row: dict, held: dict) -> str:
+    pr = held["pr"]
+    replies = pr_recovery.pr_replies(pr, source.repo.name, tid)
+    ticket_replies = ticket_reply_rows(source, tid)
+    answers = pr_recovery.answered_asks(row["id"])
+    if replies_after_hold(row, held, replies, (pr,)) or ticket_answer_after_hold(row, held, ticket_replies, answers):
+        return recovery_decision_for(replies, ticket_replies, answers)
+    return held.get("decision") or ""
+
+
+def sibling_reply_digest(repo: str, tid: str, row: dict, held: dict, checkouts: dict) -> str:
+    replies = []
+    for pr in sorted(checkouts.keys() - {held["pr"]}):
+        try:
+            current = gh.pr_view(pr)
+            if current.get("state") == "OPEN" and current.get("url") == pr:
+                replies.extend(pr_recovery.pr_replies(pr, repo, tid))
+        except gh.GhError:
+            continue
+    fresh = replies_after_hold(row, held, replies, checkouts)
+    return digest(sorted((r["pr_url"], *pr_recovery.reply_key(r), r["body"]) for r in fresh)) if fresh else ""
+
+
+def pr_recovery_observation(repo, source, t, row, held: dict) -> dict:
+    branch, checkouts = recovery_checkouts(repo, row)
+    if branch != held["branch"] or not (listed := checkouts.get(held["pr"])) or listed["github"] != held["github"]:
         raise ValueError("the held PR does not match the saved continuation")
-    c = workspace.Checkout.from_row({**listed, "pr": held["pr"]})
-    if (not any((c.dir, c.github, c.src) == (p.dir, p.github, repo.path / p.dir) for p in repo.parts)
-            or not c.wt.resolve().is_relative_to(paths.WORKTREES_DIR.resolve())):
+    c = workspace.Checkout.from_row(listed)
+    if not c.wt.resolve().is_relative_to(paths.WORKTREES_DIR.resolve()):
         raise ValueError("the held PR does not match a configured checkout")
-    refs = pr_recovery.observe(c, held["branch"])
-    return {"refs": asdict(refs), "target": refs.target_matches(c, held["branch"]),
+    refs = pr_recovery.observe(c, branch)
+    return {"refs": asdict(refs), "target": refs.target_matches(c, branch),
             "local": pr_recovery.current_head(c) if (c.wt / ".git").exists() else "missing",
-            "decision": pr_recovery.decision(row["id"], t.comments)}
+            "decision": recovery_decision(source, t.id, row, held),
+            "sibling_replies": sibling_reply_digest(repo.name, t.id, row, held, checkouts)}
+
+
+def recovery_changed(held: dict, observed: dict) -> bool:
+    return (observed["target"] and observed["local"] != "missing"
+            and (observed["decision"] != (held.get("decision") or "") or bool(observed["sibling_replies"])
+                 or any(observed[k] != held[k] for k in ("refs", "local"))))
 
 
 def snapshot(cfg, repo, source, t, row, *, prs=None, recovery=None) -> dict:
@@ -168,7 +274,8 @@ def snapshot(cfg, repo, source, t, row, *, prs=None, recovery=None) -> dict:
                "branch": branch, "heads": runlimits.heads(repo, branch), "trees": worktree_of(row),
                "prs": prs_of(row) if prs is None else prs, "asks": ask_binding(asks_of(row))}
     if held := pr_recovery.blocked(row):
-        binding["pr_recovery"] = recovery if recovery is not None else pr_recovery_observation(repo, t, row, held)
+        binding["pr_recovery"] = (recovery if recovery is not None
+                                  else pr_recovery_observation(repo, source, t, row, held))
     return binding
 
 

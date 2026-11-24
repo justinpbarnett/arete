@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import (
@@ -34,6 +34,7 @@ from . import (
 )
 from .agent import NO_SESSION, Result
 from .factory import Outcome
+from .pr_recovery import ancestor, current_head, current_ref
 from .review import Review
 from .store import asks as asks_store
 from .store import insights as insights_store
@@ -126,12 +127,16 @@ def kept_pending(job: Job, continues: str) -> bool:
 
 
 def guard(job: Job, continues: str, *, controller_restore: bool = False) -> str:
+    from . import launch_lease
     from .store import orchestration
 
     if orchestration.publication_pending(continues):
-        if (job.run.path == "orchestrate" and not any((job.only, job.run.dry_run, job.run.action,
-                                                      job.run.environment_release)) and pending_catch_up(continues)):
-            return ""
+        if job.run.path == "orchestrate" and not any((job.only, job.run.dry_run, job.run.action,
+                                                      job.run.environment_release)):
+            saved = adaptive_state(continues)
+            if (orchestration.catch_up_push(saved) or (pr_recovery.pending_receipt(saved) and not job.run.recovery
+                    and not launch_lease.from_poll(job.run.repo.name, str(job.run.tid)))):
+                return ""
         return "publication was interrupted; reconcile its branch/PR effects before resuming"
     if (getattr(job.run, "action", "") and not job.run.environment_release
             and (why := action_workspace_refusal(continues))):
@@ -406,10 +411,6 @@ def foreign(wt: Path, tip: str, bases: list[str], runs: set[str]) -> list[str]:
             if sha and not runs & ids]
 
 
-def ancestor(wt: Path, a: str, b: str) -> bool:
-    return util.sh(["git", "merge-base", "--is-ancestor", a, b], cwd=wt).returncode == 0
-
-
 def remade(line: dict) -> tuple[str, list[workspace.Checkout], str]:
     data = line.get("data") if isinstance(line.get("data"), dict) else {}
     branch, listed = str(data.get("branch") or ""), data.get("checkouts")
@@ -530,6 +531,8 @@ class Job:
     before_pr_recovery: Callable[[], None] | None = None
     on_pr_plan_installed: Callable[[workspace.Checkout], None] | None = None
     pr_plans: list[pr_recovery.Plan] = field(default_factory=list)
+    sibling_pr_inputs: list[pr_recovery.Inputs] = field(default_factory=list)
+    pr_recovery_ci: bool = False
     recovery_publication: pr_recovery.Publication | None = None
 
     @property
@@ -768,20 +771,26 @@ class Job:
         here = c.wt if attached else c.src
         try:
             if attached:
-                on = util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip()
+                on = current_ref(c)
                 if on != f"refs/heads/{branch}":
                     where = f"branch {on.removeprefix('refs/heads/')}" if on else "a detached HEAD"
                     return (f"the worktree of {c.github} is on {where}, not {branch}, so arete ran no model and "
                             f"published nothing; check out {branch} there or remove the worktree, then continue again")
             remote = workspace.remote_head(c.src, branch)
             if attached:
-                head = pr_recovery.current_head(c)
+                head = current_head(c)
             else:
                 head = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], c.src, check=False).strip() or remote
             if (attached and self.before_pr_recovery and not self.run.workspace and c.pr
                     and (c.recovery_head or expected and remote != expected)):
-                self.plan_pr_recovery(c, expected, head, remote, runs)
-                return ""
+                pinned = pr_recovery.expected_inputs(c, branch, head)
+                if (self.pr_recovery_ci and c.recovery_head and expected == remote == c.lease
+                        and pinned.refs.aligned() and pr_recovery.observe(c, branch) == pinned.refs):
+                    pr_recovery.check_retained(c, pinned)
+                    self.sibling_pr_inputs.append(pinned)
+                else:
+                    self.plan_pr_recovery(c, expected, head, remote, runs)
+                    return ""
             if remote:
                 workspace.fetch(c.src, branch)
                 if util.sh(["git", "cat-file", "-e", f"{remote}^{{commit}}"], cwd=here).returncode:
@@ -842,6 +851,7 @@ class Job:
             for c in self.checkouts:
                 c.onto = ""
         if stored and not reconciling_catch_up:
+            self.pr_recovery_ci = bool(adaptive_state(self.continues).get("recovered_publication"))
             runs = authors(self.continues)
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
@@ -864,23 +874,38 @@ class Job:
                                               recorded, diffguard.denied_paths(self.layer)))
 
     def plan_sibling_prs(self, runs: set[str]) -> None:
-        planned = {p.inputs.checkout.github for p in self.pr_plans}
+        planned = {i.checkout.github for i in self.sibling_pr_inputs} | {p.inputs.checkout.github for p in self.pr_plans}
         for c in self.with_prs:
             if c.github in planned:
                 continue
-            expected = pr_recovery.expected_inputs(c, self.branch, "")
+            head = current_head(c)
+            expected = pr_recovery.expected_inputs(c, self.branch, head)
             refs = pr_recovery.observe(c, self.branch)
-            if (refs == expected.refs and refs.base and refs.target_matches(c, self.branch)
-                    and pipeline.base_of_head(c, check=False) == refs.base):
-                c.resumes = True
+            if (refs == expected.refs and refs.aligned() and refs.target_matches(c, self.branch)
+                    and ancestor(c.wt, refs.base, head)):
+                pr_recovery.check_retained(c, expected)
+                self.sibling_pr_inputs.append(expected)
+                c.recovery_base, c.resumes = refs.base, True
                 continue
-            head = pr_recovery.current_head(c)
             self.plan_pr_recovery(c, c.lease, head, refs.origin, runs)
+
+    def recheck_pr_plans(self, during: str, *, installed: bool = False) -> None:
+        planned = [replace(p.inputs, local=p.candidate) if installed else p.inputs for p in self.pr_plans]
+        for inputs in planned + self.sibling_pr_inputs:
+            pr_recovery.check_retained(inputs.checkout, inputs)
+            inputs.recheck(during=during)
+        if installed and self.pr_plans:
+            pr_recovery.check_staging([c for c in self.checkouts if not c.pr])
 
     def install_pr_plans(self) -> None:
         for plan in self.pr_plans:
             plan.check_local(self.ws, self.run.repo.path, self.layer.copy)
-            plan.inputs.recheck(during="during isolated reconciliation")
+        self.recheck_pr_plans("during isolated reconciliation")
+        if self.pr_plans:
+            planned = {p.inputs.checkout.github: p.retained for p in self.pr_plans}
+            for c in self.checkouts:
+                files = planned.get(c.github) or pr_recovery.loose_files(c.wt)
+                pr_recovery.check_retained(c, files=files, remember=True)
         for plan in self.pr_plans:
             c = plan.inputs.checkout
             with workspaces.folder_lock(self.ws):
@@ -896,6 +921,7 @@ class Job:
                 workspaces.save_snapshot(self.ws, row, made)
                 if self.on_pr_plan_installed:
                     self.on_pr_plan_installed(c)
+                plan.check_files(installed=True)
             self.carried = True
             if plan.candidate != c.lease and c.github not in self.pending:
                 self.pending.append(c.github)
@@ -1390,8 +1416,7 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
                                      f"{job.branch} does not match origin")
     if unpushed:
         publishing(job, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, "", before_push=before_push,
-                                                          check_targets=job.check_publication_targets,
-                                                          recovery=job.recovery_publication))
+                                                          check_targets=job.check_publication_targets, recovery=recovery))
     return fresh, staged, size, outcome, unpushed
 
 
@@ -1436,28 +1461,36 @@ def report(job: Job, size: str, images: dict, held: str, *, measurement_section:
 def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
                         before_push=None, *, measurement_section: str = "") -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
-    images = pipeline.evidence_images(run, staged.changed[0], job.verified)
+    recovery = job.recovery_publication
+    if recovery:
+        recovery.recheck(during="before refreshing PR evidence")
+    images = pipeline.evidence_images(run, staged.changed[0], job.verified, recovery=recovery)
     report_body = report(job, size, images, draft_why, measurement_section=measurement_section)
     link = tk.pr_link(t, whole=not job.left_for_a_person)
     opened = [c for c in found if c in staged.changed]
     found = list(opened)
-    recovery = job.recovery_publication
-    prior_bodies = {c.pr: gh.pr_body(c.pr) for c in (job.with_prs if recovery else found)}
-    stops = {c.github: pipeline.ci.stopped_section(prior_bodies[c.pr]) for c in found}
-    if recovery:
-        recovery.recheck(during="before refreshing PR evidence")
+    stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found} if not recovery else {}
     for c in staged.changed:
         if c in opened:
-            gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
+            if not recovery:
+                gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
         elif not c.pr:
             if before_push:
                 remote_head = workspace.remote_head(c.src, job.branch)
                 if not remote_head or remote_head != c.lease or c.lease != before_push(c):
                     raise workspace.RunFailed("the authorized pilot branch changed before PR creation")
-            c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), report_body,
-                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
+            title = tk.pr_title(subject, t)
+            if recovery and not recovery.before_pr_write(c, "PR creation", during="before opening the PR"):
+                raise recovery.failure(f"inspect the prior PR creation for {c.github} before resuming")
+            options = {"single_attempt": True} if recovery else {}
+            body = "Gate evidence is posted separately." if recovery else report_body
+            c.pr = gh.pr_create(c.github, job.branch, c.base, title, body, labels=tk.pr_labels,
+                                draft=bool(draft_why), cwd=c.wt, link=link, **options)
+            if recovery:
+                recovery.bind(c)
+            else:
+                pipeline.note_prs(run, job.branch, job.with_prs)
             opened.append(c)
-            pipeline.note_prs(run, job.branch, job.with_prs)
             if before_push and gh.pr_draft_and_head(c.pr)[1] != c.lease:
                 raise workspace.RunFailed("GitHub created a PR with a different head; inspect it before any merge")
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
@@ -1466,16 +1499,17 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     standing = [c for c in staged.changed if c not in opened]
     pushed = standing if committed else []
     with_prs = job.with_prs
-    if not recovery:
-        pipeline.note_prs(run, job.branch, with_prs)
-    ci_stopped = [c for c in found if stops[c.github]]
-    ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
-                                         job.left_for_a_person, link, stops, committed,
-                                         measurement_section=measurement_section, prior_bodies=prior_bodies)
-    drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
     if recovery:
-        recovery.recheck(during="before recording publication")
+        ci_stopped = pipeline.refresh_recovered_prs(run, t, recovery, with_prs, staged.changed, report_body, link)
+    else:
         pipeline.note_prs(run, job.branch, with_prs)
+        ci_stopped = [c for c in found if stops[c.github]]
+        ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
+                                             job.left_for_a_person, link, stops, committed,
+                                             measurement_section=measurement_section)
+    drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why, recovery=recovery)
+    if recovery:
+        recovery.recheck(during="after refreshing PR evidence")
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
 
@@ -1500,8 +1534,10 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outco
     require_environment_owner_clear(job)
     run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
-    if job.recovery_publication:
-        job.recovery_publication.recheck()
+    if recovery := job.recovery_publication:
+        for c in found:
+            recovery.bind(c)
+        recovery.recheck()
     refuse_changed_prs(job)
     before_push = None
     if pilot.is_pilot_task(str(run.tid)):
@@ -1519,8 +1555,6 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outco
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job, before_push)
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push)
     if not job.run.repo.parts:
-        if job.recovery_publication:
-            job.recovery_publication.recheck(during="before recording publication")
         record.note(job.run.id, branch=job.branch)
         if draft_why:
             return end_as("fail", "failed",
@@ -1574,18 +1608,29 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
         return end_as("pass", "done", summary=f"{what}: {job.summary}")
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
-    enter_publication(run)
-    if merge and (failure := merge(publication_candidates(job, fresh))):
+    recovery = job.recovery_publication
+    if recovery:
+        run.enter("pr")
+    else:
+        enter_publication(run)
+    candidates = publication_candidates(job, fresh)
+    if recovery:
+        recovery.recheck(during="before finishing publication")
+    if merge and (failure := merge(candidates)):
         return Outcome("fail", feedback=failure["error"], data=failure)
     if not merge:
-        candidates = publication_candidates(job, fresh)
         job.ci_result = pipeline.automerge(
             job.b, job.approval, job.draft_why, job.verified, job.review, candidates,
             pipeline.automerge_about(job.ticket, job.build_summary), slot=job.slot, branch=job.branch,
             goal=job.with_left(job.goal), plan=job.with_left(job.plan_text)) or job.ci_result
     if run.feedback:
-        pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
-        run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
+        if recovery:
+            pipeline.answer_feedback(run, job.replies, "See the recovered publication evidence on this PR.",
+                                     recovery=recovery)
+            recovery.recheck(during="after replying to PR feedback")
+        else:
+            pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
+            run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
     elif run.repairs:
         run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
                 + (pipeline.draft_note(job.draft_why, job.verified, kept=True)
@@ -1598,7 +1643,8 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
 
 def publication_candidates(job: Job, fresh: list[workspace.Checkout]) -> list[workspace.Checkout]:
     standing = [c for c in job.picked(job.changed) if c not in fresh]
-    ready = pipeline.ready_pushed(job.run, standing, job.picked(job.ci_stopped), job.draft_why)
+    ready = pipeline.ready_pushed(job.run, standing, job.picked(job.ci_stopped), job.draft_why,
+                                  recovery=job.recovery_publication)
     return fresh + ready
 
 

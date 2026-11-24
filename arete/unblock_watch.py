@@ -200,34 +200,18 @@ def land(repo, tid, case, attempt, candidate):
             ledger.mark(case, "resolved", "The issue orchestrator merged the verified PR")
 
 
-def inspect_pr_recovery(cfg, repo, source, t, row, held, existing) -> None:
+def inspect_pr_recovery(cfg, repo, source, t, row, held) -> None:
     if orchestration.publication_pending(row["id"]) or t.blocker or row.get("stop_asked"):
         return
-    observed = unblock.pr_recovery_observation(repo, t, row, held)
-    cause = pr_recovery.REASON
-    key = unblock.digest(observed)
-    baseline = held.get("decision") or ""
-    origin = ledger.for_run(row["id"])
-    admitted = origin.get("grant", {}).get("binding", {}).get("pr_recovery", {})
-    if (origin.get("repo"), origin.get("ticket"), admitted.get("refs", {}).get("url")) == (repo.name, t.id, held["pr"]):
-        if (decision := admitted.get("decision", "")).startswith(pr_recovery.DECISION_VERSION):
-            baseline = decision
-    if not baseline.startswith(pr_recovery.DECISION_VERSION):
-        saved = json.loads(existing.get("snapshot") or "{}")
-        since = held.get("held_at") or row.get("finished")
-        if saved.get("run") == row["id"] and "held_decision" in saved:
-            baseline = saved["held_decision"]
-        elif not (since and pr_recovery.new_owner_input(row["id"], source, t.id, held["pr"], since)):
-            baseline = observed["decision"]
-    same_heads = all(observed[k] == held[k] for k in ("refs", "local"))
-    if (same_heads and observed["decision"] == baseline) or not observed["target"] or observed["local"] == "missing":
-        case = ledger.observe(repo.name, t.id, cause, key,
-                              {"run": row["id"], "pr_recovery": observed, "held_decision": baseline})
+    observed = unblock.pr_recovery_observation(repo, source, t, row, held)
+    changed = unblock.recovery_changed(held, observed)
+    binding = (unblock.snapshot(cfg, repo, source, t, row, recovery=observed) if changed
+               else {"run": row["id"], "pr_recovery": observed})
+    case = ledger.observe(repo.name, t.id, pr_recovery.REASON, unblock.digest(observed), binding)
+    if not changed:
         detail = row.get("summary") or "The PR and retained work need reconciliation."
-        ledger.mark(case, "needs_owner", detail, unblock.RECHECK)
+        ledger.mark(case, "needs_owner", f"{detail} {unblock.HELD_REPLY_RETRY}", unblock.RECHECK)
         return
-    binding = unblock.snapshot(cfg, repo, source, t, row, recovery=observed)
-    case = ledger.observe(repo.name, t.id, cause, key, {**binding, "held_decision": baseline})
     if time.time() < case["due"]:
         return
     attempt = ledger.latest_attempt(case)
@@ -267,7 +251,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             ledger.mark(existing, "cancelled", "The ticket is no longer approved")
         return
     if held := pr_recovery.blocked(row):
-        inspect_pr_recovery(cfg, repo, source, t, row, held, existing or ledger.get(repo.name, tid))
+        inspect_pr_recovery(cfg, repo, source, t, row, held)
         return
     prior = existing or ledger.get(repo.name, tid)
     prs = unblock.prs_of(row)

@@ -2,66 +2,65 @@ import os
 import signal
 import tempfile
 import unittest
-from collections import Counter
 from dataclasses import asdict
 from datetime import timedelta
+from functools import cache, partialmethod
 from itertools import count
 from pathlib import Path
 from subprocess import CompletedProcess
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
-from arete import (config, flows, gh, launch_lease, outcomes, paths, pipeline, poll, pr_recovery, tasks, tracker,
-                   unblock, unblock_watch, util, workspace)
+from arete import (config, flows, gh, launch_lease, paths, pipeline, pr_recovery, tasks, tracker, unblock,
+                   unblock_watch, util, workspace)
 from arete.orchestration import PROTOCOL, Controller, orchestrate
-from arete.store import db
-from arete.store import insights as insights_store
 from arete.store import orchestration
 from arete.store import tasks as task_store
 from arete.store import unblock as ledger
 from arete.verify import Verified
-from tests import support
+from tests.support import isolate_live_state as setUpModule
+from tests.support import workspace_state
 
 PR_NUMBERS = count(961)
 
 
-def setUpModule():
-    support.isolate_live_state()
+@cache
+def empty_state():
+    return paths.DB_FILE.read_bytes()
 
 
 class RecoveryFixture(unittest.TestCase):
     part = ""
 
     def setUp(self):
+        snapshot = empty_state()
         self.root = root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.enterContext(support.workspace_state(root))
+        self.enterContext(workspace_state(root))
         git_env = self.enterContext(patch.dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                                                GIT_CONFIG_COUNT="0", GIT_ALLOW_PROTOCOL="file", GIT_TERMINAL_PROMPT="0"))
         git_env.pop("GIT_CONFIG_PARAMETERS", None)
         self.enterContext(patch.object(util, "wait_for_network", side_effect=AssertionError("unexpected network wait")))
-        db.migrate()
+        paths.DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        paths.DB_FILE.write_bytes(snapshot)
         src, layer = root / "sources", root / "policy"
-        src.mkdir()
-        layer.mkdir()
+        for directory in (src, layer):
+            directory.mkdir()
         self.repo = config.Repo(root.name, src, "example/sample", tracker="local", layer=layer,
                                 parts=[config.Part(self.part, "example/sample")])
         self.cfg = config.Config(repos=[self.repo], unblock_repos=(self.repo.name,), replay=config.ReplayConfig(all=True))
         self.tid = task_store.task_add(self.repo.name, "Resume the PR", "Keep both edits")
         self.source = tracker.LocalTracker(self.repo)
-        self.ticket = self.source.get(self.tid)
         self.previous = f"earlier-{self.tid}"
         self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.tid}"
-        self.ws.parent.mkdir(parents=True, exist_ok=True)
         self.remotes = {}
         self.checkout, self.other = self.make_checkout(self.part, self.repo.github)
         self.src, self.wt, self.url = self.checkout.src, self.checkout.wt, self.checkout.pr
         self.remote = self.remotes[self.url]
-        self.accepted, self.base = self.checkout.lease, self.checkout.base_commit
-        run_dir = root / "resumed"
-        run_dir.mkdir()
-        self.run = pipeline.Run("resumed", self.repo, run_dir, tracker=self.source, tid=self.tid, path="orchestrate")
-        self.job = flows.Job(self.cfg, self.run, self.ws, ticket=self.ticket, branch="topic", checkouts=[self.checkout],
-                             layer=config.RepoLayer(dir=self.repo.layer_dir), before_pr_recovery=Mock())
+        self.accepted = self.checkout.lease
+        self.run = pipeline.Run("resumed", self.repo, root / "resumed", tracker=self.source, tid=self.tid, path="orchestrate")
+        self.run.dir.mkdir()
+        self.job = flows.Job(self.cfg, self.run, self.ws, ticket=self.source.get(self.tid), branch="topic",
+                             checkouts=[self.checkout], layer=config.RepoLayer(dir=layer), before_pr_recovery=Mock())
+        self.gh_command = gh.gh
         self.enterContext(patch.multiple(gh, pr_merge_details=Mock(side_effect=self.pr),
                                          pr_view=Mock(side_effect=self.pr), pr_body=Mock(return_value=""),
                                          pr_comment=Mock(), gh=Mock(side_effect=AssertionError("unexpected GitHub call"))))
@@ -76,13 +75,11 @@ class RecoveryFixture(unittest.TestCase):
         if ignore:
             base = self.commit(src, ".gitignore", ignore)
         self.git(src, "remote", "add", "origin", str(remote))
-        self.git(src, "switch", "-c", "topic")
-        accepted = self.commit(src, "accepted.txt", "pushed by Arete\n", owner=self.previous)
-        self.git(src, "push", "origin", "main", "topic")
-        self.git(src, "switch", "main")
-        self.git(self.root, "clone", "--branch", "topic", str(remote), str(other))
         wt.parent.mkdir(parents=True, exist_ok=True)
-        self.git(src, "worktree", "add", str(wt), "topic")
+        self.git(src, "worktree", "add", "-b", "topic", str(wt))
+        accepted = self.commit(wt, "accepted.txt", "pushed by Arete\n", owner=self.previous)
+        self.git(src, "push", "origin", "main", "topic")
+        self.git(self.root, "clone", "--branch", "topic", str(remote), str(other))
         url = f"https://github.com/{github}/pull/{next(PR_NUMBERS)}"
         self.remotes[url] = remote
         return workspace.Checkout(part, github, src, wt, "main", url, accepted, True, base_commit=base), other
@@ -96,24 +93,37 @@ class RecoveryFixture(unittest.TestCase):
         message = file + (f"\n\nArete-Run: {owner}" if owner else "")
         self.git(path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c",
                  "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", message)
-        return self.git(path, "rev-parse", "HEAD")
+        return self.head(path)
+
+    def head(self, wt=None):
+        return self.git(wt or self.wt, "rev-parse", "HEAD")
+
+    def assert_contains(self, wt, head, *ancestors):
+        for ancestor in ancestors:
+            self.assertTrue(pr_recovery.ancestor(wt, ancestor, head), f"{head} dropped {ancestor}")
+
+    def remote_refs(self, remote, *branches):
+        refs = [f"refs/heads/{name}" for name in branches]
+        try:
+            return [(remote / ref).read_text().strip() for ref in refs]
+        except FileNotFoundError:
+            return self.git(remote, "rev-parse", *refs).splitlines()
 
     def remote_head(self, branch="topic"):
-        return self.git(self.remote, "rev-parse", f"refs/heads/{branch}")
+        return self.remote_refs(self.remote, branch)[0]
 
     def pr(self, url, **kw):
-        remote = self.remotes[url]
-        try:
-            head, base = ((remote / "refs" / "heads" / name).read_text().strip() for name in ("topic", "main"))
-        except FileNotFoundError:
-            head, base = self.git(remote, "rev-parse", "refs/heads/topic", "refs/heads/main").splitlines()
+        head, base = self.remote_refs(self.remotes[url], "topic", "main")
         return {"url": url, "state": "OPEN", "headRefName": "topic", "isCrossRepository": False,
                 "headRefOid": head, "baseRefName": "main", "baseRefOid": base}
 
-    def advance(self, file="other.txt", value="second session\n"):
-        head = self.commit(self.other, file, value)
-        self.git(self.other, "push", "origin", "topic")
+    def push_edit(self, other, file, value="second session\n"):
+        head = self.commit(other, file, value)
+        self.git(other, "push", "origin", "topic")
         return head
+
+    def advance(self, file="other.txt", value="second session\n"):
+        return self.push_edit(self.other, file, value)
 
     def record_retained(self):
         pipeline.claim_workspace(self.run, self.ws, self.job.checkouts)
@@ -128,6 +138,30 @@ class RecoveryFixture(unittest.TestCase):
     def reclaim(self):
         self.assertEqual(self.job.reclaim(self.checkout, self.accepted, True, {self.previous}), "")
 
+    def assert_heads(self, local, remote):
+        self.assertEqual((self.head(), self.remote_head()), (local, remote))
+
+    def assert_loose(self, file, contents, *, private=False):
+        files = workspace.ignored_file_paths if private else workspace.untracked_files
+        self.assertIn(file.name, files(self.wt))
+        self.assertEqual(file.read_bytes(), contents)
+
+    def assert_staging_refused(self, why):
+        with self.assertRaisesRegex(workspace.RunFailed, why):
+            self.job.b.restage(from_base=True)
+
+    def on_git(self, command, hook, *, wt=None, after=False):
+        sh = util.sh
+
+        def run(argv, **kw):
+            if argv[0] == "git" and util.git_command(argv[1:]) == command and kw["cwd"] == (wt or self.wt):
+                if after:
+                    return hook(argv, sh(argv, **kw))
+                hook(argv)
+            return sh(argv, **kw)
+
+        return patch.object(util, "sh", side_effect=run)
+
     def other_state(self):
         return (self.git(self.other, "show-ref"), self.git(self.other, "symbolic-ref", "HEAD"),
                 self.git(self.other, "status", "--porcelain"), (self.other / "other.txt").read_bytes())
@@ -137,130 +171,36 @@ class OpenPRRecoveryTests(RecoveryFixture):
     def setUp(self):
         super().setUp()
         self.enterContext(patch.object(pipeline.record, "mark"))
-        self.enterContext(patch.object(flows, "authors", return_value={self.previous}))
 
-    def controller(self):
-        controller = object.__new__(Controller)
-        controller.job, controller.run, controller.workers = self.job, self.run, {}
-        controller.lease = "lease"
-        controller.data = {"acceptance": "owner answer", "evidence": {}, "prepared": {"ticket": {}}}
-        controller.policy_sha = lambda: "policy"
-        controller.catalog = SimpleNamespace(add_context=Mock())
-        controller.executing = "action"
-        controller.persist = Mock()
-        controller.check_pilot_publication = Mock()
-        controller.finish_publication = Mock(return_value={"status": "pr"})
-        controller.publication_ci = Mock(return_value=None)
-
-        def publish_pr(name, **kw):
-            self.assertEqual(name, "pr")
-            fresh, staged, _, _, unpushed = flows.settle_unpushed_checkouts(self.job)
-            self.assertTrue(fresh.empty)
-            self.assertEqual(unpushed, [self.checkout])
-            return flows.publication_outcome(self.job, staged, "", True)
-
-        controller.atomic = Mock(side_effect=publish_pr)
-        return controller
-
-    def stamp(self, controller):
-        controller.stamp("checks", {"full": True})
-        controller.stamp("verify", {"verdict": "pass"})
-        controller.stamp("review", {"verdict": "approve"})
-
-    def test_compatible_advance_compares_with_exact_pr_base_and_requires_fresh_gates(self):
-        local = self.keep()
-        external = self.advance()
-        base = self.commit(self.src, "base-only.txt", "advanced base\n")
-        self.git(self.src, "push", "origin", "main")
-        before = self.other_state()
-
+    def check_cleanup(self, *, private):
+        exclude, notes = self.src / ".git/info/exclude", self.wt / "notes.txt"
+        rule, contents = "/notes.txt\n", b"retained contents\n"
+        exclude.write_text(rule if private else "")
+        notes.write_bytes(contents)
+        self.keep()
+        remote = self.advance()
         self.reclaim()
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
         self.job.install_pr_plans()
-        candidate = self.git(self.wt, "rev-parse", "HEAD")
-        for original in (local, external, base):
-            self.assertTrue(pr_recovery.ancestor(self.wt, original, candidate))
-        for file, value in (("local.txt", "retained work\n"), ("other.txt", "second session\n")):
-            self.assertEqual((self.wt / file).read_text(), value)
-        staged = self.job.b.restage()
-        self.assertEqual(staged.bases, {self.repo.github: base})
-        self.assertEqual(set(staged.files), {"accepted.txt", "local.txt", "other.txt"})
+        head = self.head()
+        pipeline.claim_workspace(self.run, self.ws, self.job.checkouts)
+        before = pipeline.untracked_by_dir([self.wt])
+        exclude.write_text("" if private else rule)
+        with patch.object(workspace, "scratch_view", return_value=None):
+            self.assertEqual(pipeline.restore_worktrees(before, self.root), 0)
+        reason = "expose retained ignored files" if private else "hide retained untracked files"
+        self.assert_staging_refused(f"{reason}: 'notes.txt'")
+        self.assertFalse(pipeline.keep_edits(self.run))
+        if not private:
+            self.assertFalse(pipeline.release_workspace(self.run, self.ws, self.job.checkouts))
+        self.assert_heads(head, remote)
+        self.assert_loose(notes, contents, private=not private)
+        if not private:
+            exclude.write_text("")
+            self.assertIn(notes.name, self.job.b.restage().files)
+            self.assertEqual(self.git(self.wt, "show", ":notes.txt"), contents.decode().strip())
 
-        controller = self.controller()
-        self.stamp(controller)
-        with patch.object(orchestration, "actions", return_value=[{"id": "old-review", "state": "succeeded"}]):
-            controller.discard_pr_recovery_state()
-        self.assertEqual(controller.data["stale_actions"], ["old-review"])
-        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review, verify"):
-            controller.publish()
-        controller.atomic.assert_not_called()
-        self.assertEqual(self.remote_head(), external)
-
-        self.stamp(controller)
-        self.assertEqual(controller.publish(), {"status": "pr"})
-        self.assertEqual(self.remote_head(), candidate)
-        self.assertEqual(self.other_state(), before)
-
-    def test_conflict_retains_original_heads_and_names_resolution(self):
-        local = self.keep("shared.txt")
-        external = self.advance("shared.txt")
-        registered = self.git(self.src, "worktree", "list", "--porcelain")
-        with self.assertRaises(pr_recovery.Hold) as caught:
-            self.reclaim()
-        error = caught.exception
-        for text in ("shared.txt", local, external, "Resolve the named files in a separate checkout"):
-            self.assertIn(text, str(error))
-        self.assertEqual(error.recovery["refs"]["head"], external)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), external)
-        self.assertEqual(self.git(self.src, "worktree", "list", "--porcelain"), registered)
-        self.assertEqual((self.wt / "shared.txt").read_text(), "retained work\n")
-        self.assertEqual((self.other / "shared.txt").read_text(), "second session\n")
-
-    def test_incoming_ignore_rule_holds_without_hiding_or_committing_retained_file(self):
-        local = self.commit(self.wt, "local.txt", "retained commit\n", owner=self.previous)
-        name = "private notes.tmp"
-        secret = b"retained but not for publication\x00\n"
-        (self.wt / name).write_bytes(secret)
-        self.job.layer.deny = [name]
-        self.record_retained()
-        external = self.advance(".gitignore", f"/{name}\n")
-
-        with self.assertRaises(pr_recovery.Hold) as caught:
-            self.reclaim()
-        why = str(caught.exception)
-        for text in ("incoming ignore rules", repr(name), "Save the named files separately", local, external):
-            self.assertIn(text, why)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), external)
-        self.assertIn(name, workspace.untracked_files(self.wt))
-        self.assertEqual((self.wt / name).read_bytes(), secret)
-        self.assertEqual(self.git(self.wt, "diff", "--cached"), "")
-
-    def test_removed_ignore_rule_keeps_retained_file_out_of_staging_and_patches(self):
-        name = "local notes.txt"
-        secret = "dummy private contents that should not appear"
-        self.accepted = self.advance(".gitignore", f"/{name}\n")
-        self.git(self.wt, "pull", "--ff-only", "origin", "topic")
-        self.checkout.note_pushed_head(self.accepted)
-        (self.wt / name).write_bytes(secret.encode())
-        local = self.keep()
-        external = self.advance(".gitignore", "# no ignores\n")
-
-        with self.assertRaises(pr_recovery.Hold) as caught:
-            self.reclaim()
-        why = str(caught.exception)
-        for text in ("expose retained ignored files", repr(name), local, external):
-            self.assertIn(text, why)
-        self.assertNotIn(secret, why)
-        self.assertIn(name, workspace.ignored_file_paths(self.wt))
-        staged = self.job.b.restage(from_base=True)
-        self.assertNotIn(name, staged.files)
-        self.assertNotIn(secret, staged.patch)
-        self.assertEqual(self.git(self.wt, "ls-files", "--", name), "")
-        self.assertEqual((self.wt / name).read_bytes(), secret.encode())
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), external)
+    test_cleanup_does_not_commit_retained_private_file_after_excludes_change = partialmethod(check_cleanup, private=True)
+    test_cleanup_does_not_omit_retained_visible_file_after_excludes_change = partialmethod(check_cleanup, private=False)
 
     def test_owned_merge_does_not_authorize_a_foreign_local_parent(self):
         self.git(self.wt, "switch", "-c", "foreign")
@@ -270,26 +210,10 @@ class OpenPRRecoveryTests(RecoveryFixture):
                  "commit.gpgsign=false", "merge", "--no-ff", "-m", f"local merge\n\nArete-Run: {self.previous}",
                  "foreign")
         self.record_retained()
-        local = self.git(self.wt, "rev-parse", "HEAD")
-        external = self.advance()
+        local, external = self.head(), self.advance()
         with self.assertRaisesRegex(pr_recovery.Hold, f"unowned commits: {foreign}"):
             self.reclaim()
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), external)
-
-    def test_head_race_during_isolated_plan_does_not_install_candidate(self):
-        local = self.keep()
-        observed = self.advance()
-        self.reclaim()
-        moved = self.advance("late.txt")
-        before = self.other_state()
-        with self.assertRaises(pr_recovery.Hold) as caught:
-            self.job.install_pr_plans()
-        for text in ("during isolated reconciliation", observed, moved, "no push was made"):
-            self.assertIn(text, str(caught.exception))
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), moved)
-        self.assertEqual(self.other_state(), before)
+        self.assert_heads(local, external)
 
 
 class ResumeFixture(RecoveryFixture):
@@ -301,11 +225,12 @@ class ResumeFixture(RecoveryFixture):
         self.enterContext(patch.multiple(pipeline.scratch, process_ids=set, service_labels=set,
                                          RUN_BASELINES={}, RUN_LABELS={}))
         self.pr_comments, self.launched = [], []
-        self.enterContext(patch.object(gh, "me", return_value="keeper"))
-        self.enterContext(patch.object(gh, "pr_discussion", side_effect=lambda _: gh.Discussion([], [], self.pr_comments)))
+        self.enterContext(patch.multiple(gh, me=Mock(return_value="keeper"),
+                                         pr_discussion=Mock(side_effect=lambda _: gh.Discussion([], [], self.pr_comments))))
         self.spawn = self.enterContext(patch.object(tasks.control, "launch"))
         self.enterContext(patch.object(tasks, "spawned", side_effect=self.spawn_boundary))
-        self.model = self.enterContext(patch.object(unblock, "diagnose", side_effect=AssertionError("unexpected diagnosis")))
+        model = self.enterContext(patch.object(unblock, "diagnose", side_effect=AssertionError("unexpected diagnosis")))
+        self.addCleanup(model.assert_not_called)
         self.decide = self.enterContext(patch.object(Controller, "decide", autospec=True,
                                                      side_effect=AssertionError("unexpected controller inference")))
 
@@ -315,7 +240,11 @@ class ResumeFixture(RecoveryFixture):
             self.launched.append(lease.recovery)
         return "", "starting"
 
-    def seed(self):
+    def seed_advance(self, name="other.txt", *, retained="local.txt", **state):
+        local = self.keep(retained) if retained else self.head()
+        if not retained:
+            self.record_retained()
+        observed = self.advance(name)
         pipeline.record.start("pipeline", run_id=self.previous, repo=self.repo.name, issue=self.tid)
         pipeline.run_lines.write(self.previous, "execution", path="orchestrate")
         prepared = {"branch": "topic", "ticket": asdict(self.source.get(self.tid)), "triage": "", "attachments": "",
@@ -323,34 +252,90 @@ class ResumeFixture(RecoveryFixture):
                     "checkouts": [c.to_row() for c in self.job.checkouts]}
         orchestration.acquire(self.previous, "", {"protocol": PROTOCOL, "mode": "orchestrate", "evidence": {},
                                                    "run_settings": "fixture", "overrides": {}, "step_overrides": {},
-                                                   "prepared": prepared})
-        pipeline.record.settle(self.previous, "pr", branch="topic", pr_url=" ".join(c.pr for c in self.job.checkouts))
+                                                   "prepared": prepared, **state})
+        pipeline.record.settle(self.previous, "pr", branch="topic", pr_url=" ".join(c.pr for c in self.job.checkouts if c.pr))
+        return local, observed
 
-    def gate_publication(self, check):
-        (self.repo.layer_dir / "config.toml").write_text(f'[checks]\nboth = "{check}"\n[verify]\nstart = "echo fixture"\n')
-        controllers = []
+    seed_conflict = partialmethod(seed_advance, "shared.txt", retained="shared.txt")
+
+    def resume_without_discussion(self, previous=None):
+        with patch.object(gh, "pr_discussion", side_effect=gh.GhError("discussion temporarily unavailable")):
+            return self.resume(previous or self.previous)
+
+    def gate_advance(self, check="test -f local.txt && test -f other.txt", *, retained="local.txt", state=None, **options):
+        heads = self.seed_advance(retained=retained, **(state or {}))
+        self.gate_publication(check, **options)
+        return heads
+
+    def gate_publication(self, check, *, finish_failed=False, requests=1, trust="pr"):
+        (self.repo.layer_dir / "config.toml").write_text(
+            f'[trust]\nlevel = "{trust}"\n[checks]\nboth = "{check}"\n[verify]\nstart = "echo fixture"\n')
 
         def gate_actions(ctl):
-            self.assertFalse(controllers, "publication should leave the controller on a hold")
-            controllers.append(ctl)
-            self.assertEqual(ctl.job.b.restage().bases, {c.github: c.base_commit for c in self.job.checkouts})
+            self.decide.assert_called_once()
+            self.assertEqual(ctl.job.b.restage().bases,
+                             {c.github: self.pr(c.pr)["baseRefOid"] if c.pr else c.base_commit for c in self.job.checkouts})
             self.assertFalse(any(ctl.current(gate) for gate in ("checks", "verify", "review")))
             calls = [{"op": "checks.run", "args": {}}]
             for role, op in (("verify", "verification.run"), ("review", "review.run")):
                 route = f"model:{role}:0"
                 calls.append({"op": op, "args": {"route_id": route, "effort": ctl.catalog.entries[route]["efforts"][0]}})
-            calls.append({"op": "publication.request", "args": {}})
+            calls += [{"op": "publication.request", "args": {}}] * requests
+            if finish_failed:
+                calls.append({"op": "run.finish", "args": {"reason": "failed"}})
             turn = orchestration.begin(ctl.lease, {}, ctl.decision_limit)
             version = orchestration.snapshot(ctl.lease)["version"]
             response = ctl.catalog.validate({"version": ctl.protocol, "decision_id": turn, "state_version": version,
-                                            "rationale": "Run each gate on the reconciled tree", "calls": calls},
-                                            turn, version, {})
+                                             "rationale": "Run fresh gates", "calls": calls}, turn, version, {})
             return orchestration.accept(ctl.lease, turn, version, response, ctl.action_limit)
 
         self.decide.side_effect = gate_actions
-        self.enterContext(patch.object(pipeline, "check_in_use", return_value=Verified("pass", "Both edits checked")))
-        self.enterContext(patch.object(pipeline, "_review", return_value=pipeline.Review("approve", "Reconciled tree approved")))
-        return controllers
+        checked = Verified("pass", checks=[{"what": "Required edits are present", "passed": True,
+                                           "how": "Inspect the candidate", "saw": "Both edits"}])
+        self.enterContext(patch.multiple(pipeline, check_in_use=Mock(return_value=checked),
+                                         _review=Mock(return_value=pipeline.Review("approve")),
+                                         watch_checkout_ci=Mock(side_effect=self.passing_ci)))
+        drafts = {}
+        self.enterContext(patch.multiple(
+            gh, pr_set_draft=Mock(side_effect=lambda url, flag, **_: drafts.update({url: flag})),
+            pr_draft_and_head=Mock(side_effect=lambda url: (drafts.get(url, False), self.pr(url)["headRefOid"])),
+            pr_edit_body=Mock(side_effect=AssertionError("recovery rewrote a PR description"))))
+
+    def passing_ci(self, run, checkout, *_):
+        target = pipeline.ci_target(checkout)
+        self.assertEqual(target.sha, self.pr(target.pr)["headRefOid"])
+        return pipeline.ci.Watched(target, {})
+
+    def unread_ci(self, run, checkout, *_):
+        return pipeline.ci.Watched(pipeline.ci_target(checkout), {}, read=False)
+
+    def controller(self):
+        return self.decide.call_args.args[0]
+
+    def action_states(self):
+        return [a["state"] for a in orchestration.view(self.previous)["actions"]]
+
+    def saved(self, run=None):
+        return orchestration.find(run or self.previous)["data"]
+
+    def publication_intent(self, run=None):
+        return self.saved(run)["publication_intent"]
+
+    def reports(self):
+        return [(call.args[0], call.args[1].splitlines()[0]) for call in gh.pr_comment.call_args_list]
+
+    def assert_published(self, row, heads, *, states=None):
+        self.assertEqual(row["status"], "pr", row["summary"])
+        self.assertEqual(set(row["pr_url"].split()), {c.pr for c in self.job.checkouts if c.pr})
+        saved = self.saved(row["id"])
+        self.assertFalse(orchestration.publication_pending(row["id"]))
+        self.assertEqual(saved["publication"]["heads"], heads)
+        self.assertEqual(self.action_states(), states or ["succeeded"] * 4)
+        self.assertEqual({saved["evidence"][gate]["tree"] for gate in ("checks", "verify", "review")}, {saved["published_tree"]})
+        self.assertIn("### both passed", (paths.RUNS_DIR / row["id"] / "checks.md").read_text())
+        pipeline.check_in_use.assert_called_once()
+        pipeline._review.assert_called_once()
+        return saved
 
     def resume(self, previous, *, recovery="", expected=1):
         script = pipeline.Script("orchestrate", orchestrate, continues=previous)
@@ -367,8 +352,22 @@ class ResumeFixture(RecoveryFixture):
         unblock_watch.watch(self.cfg)
         return ledger.get(self.repo.name, self.tid)
 
+    def resume_attempt(self, parent, attempt):
+        child = self.resume(parent["id"], recovery=attempt)
+        self.assert_held(child)
+        self.assertEqual(ledger.attempt_of(attempt)["child"], child["id"])
+        return child
+
     def notices(self):
         return [c["body"] for c in task_store.task_comments(self.tid) if c["author"] == "arete"]
+
+    def assert_quiet_hold(self):
+        baseline = self.watch()
+        self.assertEqual(baseline["phase"], "needs_owner")
+        self.assertEqual(self.watch()["generation"], baseline["generation"])
+        self.assertEqual(len(self.notices()), 1)
+        self.spawn.assert_not_called()
+        return baseline
 
     def assert_held(self, row, *, pending=False):
         held = pr_recovery.blocked(row)
@@ -377,340 +376,201 @@ class ResumeFixture(RecoveryFixture):
         self.assertEqual(orchestration.publication_pending(row["id"]), pending)
         return held
 
+    def assert_move(self, row, c, moved, phase, *, pending=False, expected=None):
+        held = self.assert_held(row, pending=pending)
+        if pending:
+            self.assertEqual(self.action_states()[-1], "reconciliation-required")
+        expected = c.lease if expected is None else expected
+        self.assertNotEqual(expected, moved)
+        self.assertEqual((held["pr"], held["expected_refs"]["head"], held["refs"]["head"]), (c.pr, expected, moved))
+        for text in (phase, expected, moved):
+            self.assertIn(text, row["summary"])
+        return held
+
 
 class OpenPRRecoveryResumeTests(ResumeFixture):
     def test_conflict_stays_held_across_notice_eviction_and_allows_only_a_trusted_pr_reply(self):
         for number in range(tracker.MAX_COMMENTS):
             task_store.task_comment(self.tid, "owner", f"Owner note {number}.")
-        local = self.keep("shared.txt")
-        remote = self.advance("shared.txt")
-        self.seed()
-
-        held = self.resume(self.previous)
-        self.assert_held(held)
-        for text in ("shared.txt", local, remote, "Resolve the named files"):
+        local, remote = self.seed_conflict()
+        registered = self.git(self.src, "worktree", "list", "--porcelain")
+        held = self.resume_without_discussion()
+        for text in ("shared.txt", local, remote, "Resolve the named files in a separate checkout"):
             self.assertIn(text, held["summary"])
+        self.assertEqual(self.git(self.src, "worktree", "list", "--porcelain"), registered)
+        self.assertEqual((self.wt / "shared.txt").read_text(), "retained work\n")
+        self.assertEqual((self.other / "shared.txt").read_text(), "second session\n")
         self.assertNotIn("Owner note 0.", self.source.get(self.tid).comments)
-        repeated = self.resume(held["id"])
-        first, again = self.assert_held(held), self.assert_held(repeated)
-        self.assertEqual({**first, "held_at": again["held_at"]}, again)
+        repeated = self.resume_without_discussion(held["id"])
+        first, again = pr_recovery.blocked(held), pr_recovery.blocked(repeated)
+        self.assertEqual(first, {**again, "held_at": first["held_at"]})
+        self.assertEqual((again["decision"], again["seen_replies"]), ("", None))
         baseline = self.watch()
-        self.assertEqual(baseline["phase"], "needs_owner", baseline["detail"])
-        self.pr_comments.extend([{"id": 1, "user": {"login": "example"}, "author_association": "OWNER",
-                                  "body": "Try again"},
-                                 {"id": 2, "user": {"login": "keeper"}, "body": gh.marked("Arete PR notice")}])
-        self.assertEqual(self.watch()["generation"], baseline["generation"])
-        self.assertEqual(len(self.notices()), 1)
-        self.spawn.assert_not_called()
-
-        self.pr_comments.append({"id": 3, "user": {"login": "keeper"}, "body": "Keep the second session's wording."})
+        after = util.iso(util.parse_iso(again["held_at"]) + timedelta(seconds=1))
+        self.pr_comments.extend({**reply, "created_at": after} for reply in (
+            {"id": 1, "user": {"login": "example"}, "author_association": "OWNER", "body": "Try again"},
+            {"id": 2, "user": {"login": "keeper"}, "body": gh.marked("Arete PR notice")},
+            {"id": 4, "user": {"login": "keeper"}, "body": f"{tracker.ARETE_TAG}\nArete notice"}))
+        self.assertEqual(self.assert_quiet_hold()["generation"], baseline["generation"])
+        self.pr_comments.append({"id": 3, "user": {"login": "keeper"}, "body": "Keep both edits.", "created_at": after})
         eligible = self.watch()
         attempt, = self.launched
         self.assertGreater(eligible["generation"], baseline["generation"])
-        held_again = self.resume(repeated["id"], recovery=attempt)
-        self.assert_held(held_again)
-        self.assertEqual(ledger.attempt_of(attempt)["child"], held_again["id"])
+        self.resume_attempt(repeated, attempt)
+        self.assertEqual(self.watch()["phase"], "needs_owner")
         self.assertEqual(len(self.notices()), 2)
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(self.watch()["phase"], "needs_owner")
         self.spawn.assert_called_once()
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), remote)
-
-    def test_first_successful_watch_keeps_trusted_reply_after_failed_baseline_read(self):
-        self.keep("shared.txt")
-        self.advance("shared.txt")
-        self.seed()
-        with patch.object(gh, "pr_discussion", side_effect=gh.GhError("discussion temporarily unavailable")):
-            held = self.resume(self.previous)
-        failure = pr_recovery.blocked(held)
-        self.assertEqual(failure["decision"], "")
-        self.spawn.assert_not_called()
-
-        self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "Keep the upstream wording.",
-                                 "created_at": failure["held_at"]})
-        self.watch()
-        attempt, = self.launched
-        child = self.resume(held["id"], recovery=attempt)
-        self.assert_held(child)
-        self.assertEqual(ledger.attempt_of(attempt)["child"], child["id"])
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.spawn.assert_called_once()
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
-
-    def test_feedback_poll_can_revise_held_pr_without_unblock_enrollment(self):
-        self.cfg.unblock_repos = ()
-        self.keep("shared.txt")
-        self.advance("shared.txt")
-        self.seed()
-        self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "An earlier reply",
-                                 "created_at": util.iso(util.now() - timedelta(minutes=10))})
-        held = self.resume(self.previous)
-        cutoff = self.assert_held(held)["held_at"]
-        self.pr_comments.extend([
-            {"id": 2, "user": {"login": "stranger"}, "body": "Try again", "created_at": cutoff},
-            {"id": 3, "user": {"login": "keeper"}, "body": gh.marked("Arete PR notice"), "created_at": cutoff},
-            {"id": 4, "user": {"login": "keeper"}, "body": f"{tracker.ARETE_TAG}\nArete notice", "created_at": cutoff},
-        ])
-        layer = config.load_layer(self.repo.layer_dir)
-        discovery = poll.routing.Discovery(self.cfg, self.repo, priced=False, layer=layer)
-        queue = poll.RepoQueue(self.repo, self.source, set(), layer, discovery)
-        skips = pipeline.SkipLog({})
-
-        def collect_and_pick():
-            insights_store.add_feedback(outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid))
-            return poll.next_pick(self.repo, self.source, skips, set())
-
-        def spawn_feedback(repo, tid, readmission):
-            self.assertEqual(pipeline.run_command(repo, tid)[-2:], ["--continue", held["id"]])
-            self.assertIsNone(readmission)
-            self.assert_held(self.resume(held["id"]))
-            return True
-
-        with (patch.object(pipeline, "FEEDBACK_QUIET_MINUTES", 0),
-              patch.object(poll, "spawn_unparked", side_effect=spawn_feedback) as start):
-            pick = collect_and_pick()
-            self.assertTrue(pick.from_feedback)
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "skipped")
-            start.assert_not_called()
-
-            self.pr_comments.append({"id": 5, "user": {"login": "keeper"}, "body": "Please preserve both versions.",
-                                     "created_at": cutoff})
-            pick = collect_and_pick()
-            self.assertTrue(pick.from_feedback)
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
-            self.assertIsNone(collect_and_pick())
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "skipped")
-            start.assert_called_once()
-        self.watch()
-        self.spawn.assert_not_called()
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
+        self.assert_heads(local, remote)
 
     def test_leased_push_race_is_held_after_real_publication_action_and_new_head_requeues(self):
-        local = self.keep()
-        observed = self.advance()
-        self.seed()
-        controllers = self.gate_publication("test -f local.txt && test -f other.txt")
-        sh = util.sh
-        pushed, moved = [], []
+        local, observed = self.gate_advance()
 
-        def racing_push(argv, **kwargs):
-            if argv[:3] == ["git", "push", "--porcelain"]:
-                self.assertIn(f"--force-with-lease=refs/heads/topic:{observed}", argv)
-                pushed.append(self.git(self.wt, "rev-parse", "HEAD"))
-                self.assertIn(f"{pushed[-1]}:refs/heads/topic", argv)
-                moved.append(self.advance("late.txt"))
-            return sh(argv, **kwargs)
+        def racing_push(argv):
+            pipeline.check_in_use.assert_called_once()
+            pipeline._review.assert_called_once()
+            self.assertIn(f"--force-with-lease=refs/heads/topic:{observed}", argv)
+            self.assertIn(f"{self.head()}:refs/heads/topic", argv)
+            self.advance("late.txt")
 
-        with patch.object(util, "sh", side_effect=racing_push):
+        with self.on_git("push --porcelain", racing_push):
             row = self.resume(self.previous)
-        held = self.assert_held(row)
-        candidate, = pushed
-        raced, = moved
-        for text in ("during the leased push", observed, raced, candidate):
-            self.assertIn(text, row["summary"])
-        pipeline.check_in_use.assert_called_once()
-        pipeline._review.assert_called_once()
-        ctl, = controllers
-        actions = orchestration.actions(ctl.lease)
-        self.assertEqual([a["state"] for a in actions], ["succeeded", "succeeded", "succeeded", "failed"])
-        self.assertIn("### both passed", (paths.RUNS_DIR / row["id"] / "checks.md").read_text())
-        self.assertEqual(held["refs"]["head"], raced)
-        self.assertEqual(self.remote_head(), raced)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), candidate)
-        for original in (local, observed):
-            self.assertTrue(pr_recovery.ancestor(self.wt, original, candidate))
-
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.spawn.assert_not_called()
-        self.assertEqual(len(self.notices()), 1)
+        candidate, raced = self.head(), self.head(self.other)
+        self.assert_move(row, self.checkout, raced, "during the leased push", expected=observed)
+        self.assertIn(candidate, row["summary"])
+        self.assertEqual(self.action_states(), ["succeeded"] * 3 + ["failed"])
+        self.assert_heads(candidate, raced)
+        self.assert_contains(self.wt, candidate, local, observed)
+        self.assert_quiet_hold()
         changed = self.advance("again.txt")
         self.watch()
         attempt, = self.launched
         self.assertEqual(ledger.attempt_of(attempt)["grant"]["binding"]["pr_recovery"]["refs"]["head"], changed)
-        self.model.assert_not_called()
         self.decide.assert_called_once()
 
     def test_first_push_with_lost_confirmation_is_not_automatically_retried(self):
-        local = self.keep()
-        observed = self.advance()
-        self.seed()
-        controllers = self.gate_publication("test -f local.txt && test -f other.txt")
-        sh = util.sh
+        local, observed = self.gate_advance()
 
-        def lose_confirmation(argv, **kwargs):
-            res = sh(argv, **kwargs)
-            if argv[:3] == ["git", "push", "--porcelain"]:
-                self.assertEqual(res.returncode, 0, res.stderr)
-                return CompletedProcess(argv, util.TIMED_OUT, "", "fixture lost the result")
-            return res
+        def lose_confirmation(argv, res):
+            self.assertEqual(res.returncode, 0, res.stderr)
+            return CompletedProcess(argv, util.TIMED_OUT, "", "fixture lost the result")
 
-        with patch.object(util, "sh", side_effect=lose_confirmation):
+        with self.on_git("push --porcelain", lose_confirmation, after=True):
             row = self.resume(self.previous)
-        held = self.assert_held(row, pending=True)
-        candidate = self.git(self.wt, "rev-parse", "HEAD")
+        candidate = self.head()
+        held = self.assert_move(row, self.checkout, candidate, "did not confirm publication", pending=True, expected=observed)
         self.assertTrue(held["publication_unconfirmed"])
         self.assertEqual(held["pushed"], {})
-        self.assertEqual(held["expected_refs"]["head"], observed)
-        self.assertEqual(held["refs"]["head"], candidate)
         self.assertEqual(self.remote_head(), candidate)
-        self.assertTrue(all(pr_recovery.ancestor(self.wt, oid, candidate) for oid in (local, observed)))
+        self.assert_contains(self.wt, candidate, local, observed)
         self.assertNotIn("no push was made", row["summary"])
-        ctl, = controllers
-        self.assertEqual(orchestration.actions(ctl.lease)[-1]["state"], "reconciliation-required")
         self.git(self.other, "pull", "--ff-only", "origin", "topic")
         self.advance("again.txt")
         self.watch()
         self.spawn.assert_not_called()
+        (self.wt / "local.txt").write_text("edits outside the publication receipt")
+        refused = self.resume(row["id"])
+        self.assertIn("does not match the gated publication receipt", refused["summary"])
+        self.assertTrue(orchestration.publication_pending(refused["id"]))
+        self.decide.assert_called_once()
 
-
-class RecoveredPublicationBoundaryTests(ResumeFixture):
-    def test_advance_after_confirmed_push_holds_before_refreshing_evidence(self):
-        self.keep()
-        observed = self.advance()
-        self.seed()
-        controllers = self.gate_publication("test -f local.txt && test -f other.txt")
-        heads = []
-
-        def read_body(_):
-            pushed = self.remote_head()
-            if not heads and pushed != observed:
-                self.git(self.other, "pull", "--ff-only", "origin", "topic")
-                heads.append((pushed, self.advance("after-push.txt")))
-            return ""
-
-        with (patch.object(gh, "pr_body", side_effect=read_body),
-              patch.object(gh, "pr_edit_body") as edit):
-            row = self.resume(self.previous)
-        held = self.assert_held(row, pending=True)
-        (pushed, advanced), = heads
-        for text in ("before refreshing PR evidence", pushed, advanced, "Reconcile the partial publication"):
-            self.assertIn(text, row["summary"])
-        self.assertEqual(held["expected_refs"]["head"], pushed)
-        self.assertEqual(held["expected_refs"]["origin"], pushed)
-        self.assertEqual(held["refs"]["head"], advanced)
-        self.assertEqual(held["refs"]["origin"], advanced)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), pushed)
-        self.assertEqual(self.remote_head(), advanced)
-        edit.assert_not_called()
-        gh.pr_comment.assert_not_called()
-        ctl, = controllers
-        actions = orchestration.actions(ctl.lease)
-        self.assertEqual([a["state"] for a in actions], ["succeeded"] * 3 + ["reconciliation-required"])
-        data = orchestration.find(row["id"])["data"]
-        self.assertNotIn("publication", data)
-        self.assertEqual(data["publication_intent"]["pushed"], {self.repo.github: pushed})
-        self.watch()
-        self.spawn.assert_not_called()
-
-
-class SettlementReplyRecoveryTests(ResumeFixture):
-    def resume_with_settlement_reply(self, previous, reply_id, *, recovery=""):
-        drive = flows.driven
-
-        def reply_after_hold(*args):
-            try:
-                return drive(*args)
-            except pr_recovery.Hold:
-                self.pr_comments.append({"id": reply_id, "user": {"login": "keeper"},
-                                         "body": "Keep both versions for my review.", "created_at": util.iso()})
-                raise
-
-        with patch.object(flows, "driven", side_effect=reply_after_hold):
-            return self.resume(previous, recovery=recovery)
-
-    def test_enrolled_hold_does_not_consume_a_reply_received_during_settlement(self):
-        local = self.keep("shared.txt")
-        remote = self.advance("shared.txt")
-        self.seed()
-        held = self.resume(self.previous)
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "Keep the upstream wording."})
-        self.watch()
-        attempt, = self.launched
-
-        child = self.resume_with_settlement_reply(held["id"], 2, recovery=attempt)
-        self.assert_held(child)
-        self.assertEqual(ledger.attempt_of(attempt)["child"], child["id"])
-        self.watch()
-        first, next_attempt = self.launched
-        self.assertEqual(first, attempt)
-        self.assertNotEqual(next_attempt, first)
-
-        retried = self.resume(child["id"], recovery=next_attempt)
-        self.assert_held(retried)
-        self.assertEqual(ledger.attempt_of(next_attempt)["child"], retried["id"])
-        baseline = self.watch()
-        self.assertEqual(baseline["phase"], "needs_owner")
-        self.assertEqual(self.watch()["generation"], baseline["generation"])
-        self.assertEqual(self.spawn.call_count, 2)
-        self.assertEqual(len(self.notices()), 3)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), remote)
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
-
-    def test_feedback_poll_sees_a_trusted_reply_received_during_settlement(self):
-        self.cfg.unblock_repos = ()
-        self.keep("shared.txt")
-        self.advance("shared.txt")
-        self.seed()
-        with patch.object(util, "now", return_value=util.now()):
-            held = self.resume_with_settlement_reply(self.previous, 1)
-        self.assert_held(held)
-        insights_store.add_feedback(outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid))
-        layer = config.load_layer(self.repo.layer_dir)
-        discovery = poll.routing.Discovery(self.cfg, self.repo, priced=False, layer=layer)
-        queue = poll.RepoQueue(self.repo, self.source, set(), layer, discovery)
-        skips = pipeline.SkipLog({})
-
-        def spawn_feedback(repo, tid, readmission):
-            self.assertEqual(pipeline.run_command(repo, tid)[-2:], ["--continue", held["id"]])
-            self.assert_held(self.resume(held["id"]))
-            return True
-
-        with (patch.object(pipeline, "FEEDBACK_QUIET_MINUTES", 0),
-              patch.object(poll, "spawn_unparked", side_effect=spawn_feedback) as start):
-            pick = poll.next_pick(self.repo, self.source, skips, set())
-            self.assertTrue(pick.from_feedback)
-            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
-            self.assertIsNone(poll.next_pick(self.repo, self.source, skips, set()))
-            start.assert_called_once()
-        self.decide.assert_not_called()
-        self.model.assert_not_called()
+    def test_fresh_gates_retire_catch_up_hold_without_automerge_on_an_unpinned_base(self):
+        prior = {"catch_up_hold": {"reason": "earlier review held"}, "catch_ups": 2}
+        local, observed = self.gate_advance(trust="automerge", state=prior)
+        base = self.commit(self.src, "base-only.txt", "advanced base\n")
+        self.git(self.src, "push", "origin", "main")
+        other_before = self.other_state()
+        with (patch.object(gh, "merge_readiness", side_effect=AssertionError("unpinned base was mergeable")),
+              patch.object(gh, "pr_merge_auto", side_effect=AssertionError("unpinned base was merged"))):
+            row = self.resume(self.previous, expected=0)
+        head = self.remote_head()
+        saved = self.assert_published(row, {self.repo.github: head})
+        self.assertNotIn("catch_up_hold", saved)
+        self.assertEqual(saved["catch_ups"], 0)
+        self.assert_contains(self.remote, head, local, observed, base)
+        self.assertEqual(self.git(self.remote, "diff", "--name-only", base, head).splitlines(),
+                         ["accepted.txt", "local.txt", "other.txt"])
+        self.assertEqual(self.other_state(), other_before)
+        self.assertEqual(saved["recovered_merge_heads"], {self.url: head})
+        self.assertEqual(self.reports(), [(self.url, f"Recovered {kind} for head `{head}`")
+                                          for kind in ("gate evidence", "CI evidence", "automerge decision")])
+        self.assertIn(f"Compared with `main` at `{base}`.", gh.pr_comment.call_args_list[0].args[1])
+        reason = (f"GitHub cannot require the checked base `main` at `{base}` when merging this recovered PR; "
+                  "the merge API only pins the head")
+        report, = [line for line in pipeline.run_lines.read(row["id"]) if line.get("event") == "report"]
+        self.assertEqual(report["merge_held"], reason)
+        self.assertIn(f"Automerge stays off for this PR: {reason}", gh.pr_comment.call_args.args[1])
 
 
 class MultiCheckoutFixture(ResumeFixture):
     part = "first"
 
-    def sibling(self, *, ignore=""):
+    def sibling(self, *, ignore="", without_pr=False):
         side, other = self.make_checkout("second", "example/second", ignore=ignore)
         self.repo.parts.append(config.Part(side.dir, side.github))
         self.job.checkouts.append(side)
+        if without_pr:
+            side.pr, side.resumes, side.revision = "", False, side.base_commit
+            side.note_pushed_head("")
+            self.git(side.wt, "reset", "--hard", side.base_commit)
+            self.git(side.src, "push", "origin", ":topic")
         return side, other
 
-    def advance_sibling(self, other, name="side-race.txt"):
-        head = self.commit(other, name, "new sibling remote head\n")
-        self.git(other, "push", "origin", "topic")
-        return head
+    advance_sibling = partialmethod(RecoveryFixture.push_edit, file="side-race.txt")
+
+    def move_sibling_base(self, side, name, text):
+        base = self.commit(side.src, name, text)
+        self.git(side.src, "push", "origin", "main")
+        return base
+
+    def gate_siblings(self, *, retained=False, **options):
+        side, other = self.sibling()
+        _, observed = self.gate_advance("test -f first/other.txt && test -f second/accepted.txt",
+                                        retained="local.txt" if retained else "", **options)
+        return side, other, observed
+
+    def assert_drafts(self, side, *, ready=False):
+        expected = [(url, draft) for draft in ((True, False) if ready else (True,)) for url in (self.url, side.pr)]
+        self.assertEqual(gh.pr_set_draft.call_args_list, [call(*change, single_attempt=True) for change in expected])
 
 
 class MultiCheckoutRecoveryTests(MultiCheckoutFixture):
-    def test_unchanged_sibling_head_with_a_conflicting_base_holds_before_installing(self):
+    def check_sibling_move(self, *, installed):
         side, other = self.sibling()
+        local, external = self.seed_advance()
+        kind, method = (Controller, "merge_restored_bases") if installed else (flows.Job, "install_pr_plans")
+        original = getattr(kind, method)
+
+        def race(obj):
+            if installed:
+                original(obj)
+            self.advance_sibling(other)
+            if not installed:
+                original(obj)
+
+        with patch.object(kind, method, race):
+            row = self.resume(self.previous)
+        self.assert_move(row, side, self.head(other), "before resuming work" if installed else "during isolated reconciliation")
+        self.assertIn("no push was made", row["summary"])
+        if installed:
+            self.assert_contains(self.wt, self.head(), local, external)
+        else:
+            self.assertEqual(self.head(), local)
+        self.assertEqual(self.remote_head(), external)
+        self.assertEqual(self.head(side.wt), side.lease)
+        self.decide.assert_not_called()
+        gh.pr_comment.assert_not_called()
+
+    test_unchanged_sibling_move_after_observation_holds_before_installation = partialmethod(check_sibling_move, installed=False)
+    test_unchanged_sibling_move_after_installation_holds_before_dispatch = partialmethod(check_sibling_move, installed=True)
+
+
+class SiblingBaseRecoveryTests(MultiCheckoutFixture):
+    def test_unchanged_sibling_head_with_a_conflicting_base_holds_before_installing(self):
+        side, _ = self.sibling()
         name = "shared.txt"
         retained = self.commit(side.wt, name, "retained sibling edit\n", owner=self.previous)
-        local = self.keep()
-        external = self.advance()
-        self.seed()
-        base = self.commit(side.src, name, "new base edit\n")
-        self.git(side.src, "push", "origin", "main")
+        local, external = self.seed_advance()
+        base = self.move_sibling_base(side, name, "new base edit\n")
 
         row = self.resume(self.previous)
         held = self.assert_held(row)
@@ -718,297 +578,234 @@ class MultiCheckoutRecoveryTests(MultiCheckoutFixture):
         self.assertEqual((held["refs"]["head"], held["refs"]["base"]), (side.lease, base))
         for text in (repr(name), retained, base, "Resolve the named files in a separate checkout"):
             self.assertIn(text, row["summary"])
-        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), retained)
-        self.assertEqual(self.git(side.wt, "status", "--porcelain"), "")
+        self.assertEqual(self.head(side.wt), retained)
         self.assertEqual((side.wt / name).read_text(), "retained sibling edit\n")
-        self.assertEqual(self.git(side.src, "show", f"{base}:{name}"), "new base edit")
-        remote = self.pr(side.pr)
-        self.assertEqual((remote["headRefOid"], remote["baseRefOid"]), (side.lease, base))
-        self.assertEqual(self.git(other, "rev-parse", "HEAD"), side.lease)
-        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), local)
-        self.assertEqual(self.remote_head(), external)
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(self.watch()["phase"], "needs_owner")
-        self.assertEqual(len(self.notices()), 1)
-        self.spawn.assert_not_called()
+        self.assertEqual(self.remote_refs(self.remotes[side.pr], "topic", "main"), [side.lease, base])
+        self.assert_heads(local, external)
+        self.assert_quiet_hold()
         self.decide.assert_not_called()
-        self.model.assert_not_called()
 
-    def test_sibling_base_ignore_change_does_not_expose_retained_file(self):
-        name = "side-private.txt"
-        side, _ = self.sibling(ignore=f"/{name}\n")
-        secret = b"dummy sibling contents that should not appear\n"
-        (side.wt / name).write_bytes(secret)
-        self.keep()
-        self.advance()
-        self.seed()
-        base = self.commit(side.src, ".gitignore", "# no ignores\n")
-        self.git(side.src, "push", "origin", "main")
 
+class InterruptedPublicationTests(MultiCheckoutFixture):
+    def interrupted_gate_report(self, effect):
+        gh.pr_comment.side_effect = effect
         row = self.resume(self.previous)
-        held = self.assert_held(row)
-        self.assertEqual(held["github"], side.github)
-        self.assertEqual(held["refs"]["base"], base)
-        self.assertIn(repr(name), row["summary"])
-        self.assertNotIn(secret.decode().strip(), row["summary"])
-        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), side.lease)
-        self.assertIn(name, workspace.ignored_file_paths(side.wt))
-        self.assertEqual(self.git(side.wt, "diff", "--cached"), "")
-        self.assertEqual((side.wt / name).read_bytes(), secret)
+        intent, head = self.publication_intent(row["id"]), self.remote_head()
+        self.assertEqual(intent["pushed"], {self.repo.github: head})
+        self.assertEqual(self.reports(), [(self.url, f"Recovered gate evidence for head `{head}`")])
+        gh.pr_comment.reset_mock(side_effect=True)
+        self.decide.reset_mock()
+        return row, intent, head
+
+    def resume_without_replay(self, prior, heads, check):
+        self.gate_publication(check)
+        with patch.object(util, "sh", wraps=util.sh) as shell:
+            resumed = self.resume(prior["id"], expected=0)
+        self.assertFalse(any(c.args[0][:2] == ["git", "push"] for c in shell.call_args_list if c.args))
+        self.assert_published(resumed, heads, states=["succeeded"] * 3 + ["failed"] + ["succeeded"] * 4)
+
+    def test_resume_settles_only_the_open_pr_with_an_unchanged_no_pr_sibling(self):
+        side, other = self.sibling(without_pr=True)
+        check = "test -f first/local.txt && test -f second/shared.txt && test ! -e second/accepted.txt"
+        self.gate_advance(check=check)
+        self.enterContext(patch.multiple(gh, open_pr_url=Mock(return_value=""),
+                                         pr_create=Mock(side_effect=AssertionError("unexpected PR creation"))))
+        row, intent, published = self.interrupted_gate_report(gh.GhUnsure("fixture lost confirmation of a gate report"))
+        receipt, heads = intent["recovery_receipt"], intent["pushed"]
+        self.assertEqual(receipt["targets"].keys(), heads.keys())
+        self.assertEqual(receipt["trees"].keys(), {self.repo.github, side.github})
+        self.git(other, "push", "origin", "HEAD:topic")
+        refused = self.resume(row["id"])
+        self.assertIn(f"{side.github}: origin/topic moved while settling publication", refused["summary"])
+        self.assertTrue(orchestration.publication_pending(refused["id"]))
         self.decide.assert_not_called()
+        gh.pr_comment.assert_not_called()
+        self.git(other, "push", "origin", ":topic")
+        self.resume_without_replay(refused, heads, check)
+        self.assertEqual((self.remote_head(), workspace.remote_head(side.src, "topic")), (published, ""))
+        self.assertEqual(self.reports(), [(self.url, f"Recovered CI evidence for head `{published}`")])
+        gh.pr_create.assert_not_called()
 
-    def test_unchanged_sibling_race_while_settling_is_a_no_effect_hold(self):
-        side, other = self.sibling()
-        retained = self.commit(side.wt, "side-local.txt", "retained sibling\n", owner=self.previous)
-        local = self.keep()
-        external = self.advance()
-        self.seed()
-        controllers = self.gate_publication("test -f first/local.txt && test -f first/other.txt && test -f second/side-local.txt")
-        settle = flows.settle_unpushed_checkouts
-        moved = []
-
-        def race(job, *args):
-            self.assertFalse(job.checkouts[1].recovery_head)
-            moved.append(self.advance_sibling(other))
-            return settle(job, *args)
-
-        with patch.object(flows, "settle_unpushed_checkouts", side_effect=race):
+    def test_second_leased_push_race_reports_confirmed_first_push(self):
+        side, other, _ = self.gate_siblings(retained=True)
+        (side.wt / "side-local.txt").write_text("retained sibling edit\n")
+        self.record_retained()
+        with self.on_git("push --porcelain", lambda _: self.advance_sibling(other), wt=side.wt):
             row = self.resume(self.previous)
-        held = self.assert_held(row)
-        raced, = moved
-        for text in ("while settling the retained commits", side.lease, raced, retained, "no push was made"):
-            self.assertIn(text, row["summary"])
-        self.assertEqual(held["expected_refs"]["origin"], side.lease)
-        self.assertEqual(held["refs"]["origin"], raced)
-        self.assertNotIn("pushed", held)
-        ctl, = controllers
-        self.assertEqual(orchestration.actions(ctl.lease)[-1]["state"], "failed")
-        self.assertEqual(self.remote_head(), external)
-        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), retained)
-        self.assertEqual(self.pr(side.pr)["headRefOid"], raced)
-        self.assertTrue(pr_recovery.ancestor(self.wt, local, self.git(self.wt, "rev-parse", "HEAD")))
-        baseline = self.watch()
-        self.assertEqual(baseline["phase"], "needs_owner")
-        self.assertEqual(self.watch()["generation"], baseline["generation"])
-        self.assertEqual(len(self.notices()), 1)
-        self.spawn.assert_not_called()
-        changed = self.advance_sibling(other, "changed-again.txt")
+        raced = self.head(other)
+        held = self.assert_move(row, side, raced, "during the leased push", pending=True)
+        self.assertEqual(held["pushed"], {self.repo.github: self.remote_head()})
+        self.assertIn("Already pushed", row["summary"])
+        self.assertEqual((side.wt / "side-local.txt").read_text(), "retained sibling edit\n")
+
+    def test_resume_after_a_push_and_pr_update_runs_fresh_gates_without_replay(self):
+        side, other, _ = self.gate_siblings(retained=True)
+        row, intent, published = self.interrupted_gate_report(lambda *_, **kw: self.advance_sibling(other))
+        raced = self.head(other)
+        held = self.assert_move(row, side, raced, "before refreshing PR evidence", pending=True)
+        self.assertEqual(intent["pr_effects"], held["pr_effects"])
         self.watch()
-        attempt, = self.launched
-        self.assertEqual(ledger.attempt_of(attempt)["grant"]["binding"]["pr_recovery"]["refs"]["origin"], changed)
-        self.model.assert_not_called()
-        self.decide.assert_called_once()
+        self.spawn.assert_not_called()
+        self.resume_without_replay(row, {self.repo.github: published, side.github: raced},
+                                   "test -f first/local.txt && test -f second/side-race.txt")
+        self.assertEqual(self.reports(), [(side.pr, f"Recovered gate evidence for head `{raced}`"),
+                                          (self.url, f"Recovered CI evidence for head `{published}`"),
+                                          (side.pr, f"Recovered CI evidence for head `{raced}`")])
 
 
-class MultiCheckoutPublicationRaceTests(MultiCheckoutFixture):
-    def test_second_pass_pre_push_race_reports_first_pass(self):
-        self.check_second_pass_race("pre-push")
+class RecoveredCIRetryTests(MultiCheckoutFixture):
+    def test_stable_ci_retry_and_repair_use_the_pinned_base(self):
+        side, _, observed = self.gate_siblings(requests=2)
+        bases = {c.github: c.base_commit for c in self.job.checkouts}
+        disclosure = pipeline.unverified_measurement_section({"requirement": "Required edits are present",
+                                                             "measurement": "Earlier observation"})
+        gh.pr_body.side_effect = lambda url: disclosure if url == side.pr and gh.pr_comment.called else ""
+        red = gh.Check("fixture", "fail", job=123, workflow_run_id=456)
+        rerun = gh.WorkflowRerun(456, 2, {red.name: red.job})
 
-    def test_second_pass_rejected_lease_reports_first_pass(self):
-        self.check_second_pass_race("lease")
+        def watch(run, checkout, reruns):
+            target = pipeline.ci_target(checkout)
+            self.assertEqual(target.base, bases[checkout.github])
+            if reruns:
+                b = self.controller().job.b
+                with patch.object(workspace, "fetch", side_effect=AssertionError("CI repair fetched a mutable base")):
+                    self.assertEqual(pipeline.merge_moved_bases_for_ci_fix(b, [checkout]), "")
+                return pipeline.ci.Watched(target, {})
+            return pipeline.ci.Watched(target, {red.key: red}, read=False,
+                                       reds=[pipeline.ci.Red(target, red, None, target.base)])
 
-    def test_second_pass_uncertain_push_requires_reconciliation(self):
-        self.check_second_pass_race("uncertain")
+        pipeline.watch_checkout_ci.side_effect = watch
+        with (patch.object(gh, "failed_job_reruns", return_value=[rerun]), patch.object(gh, "rerun_failed_jobs") as launch,
+              patch.object(gh, "job_log", return_value="fixture failure")):
+            row = self.resume(self.previous, expected=0)
+        self.assertEqual(launch.call_count, 2)
+        gh.pr_edit_body.assert_not_called()
+        self.assertIn((side.pr, f"Recovered measurement evidence for head `{side.lease}`"), self.reports())
+        self.assert_drafts(side, ready=True)
+        saved = self.assert_published(row, {self.repo.github: observed, side.github: side.lease},
+                                      states=["succeeded"] * 3 + ["failed", "succeeded"])
+        self.assertFalse({"ci_failed", "ci_retry", "recovered_publication"} & saved.keys())
 
-    def check_second_pass_race(self, race):
-        side, other = self.sibling()
-        name = "side-local.txt"
-        (side.wt / name).write_text("fresh sibling edits\n")
-        local = self.keep()
-        external = self.advance()
-        self.seed()
-        controllers = self.gate_publication(f"test -f first/local.txt && test -f first/other.txt && test -f second/{name}")
-        publish_branch, sh = flows.publish_branch, util.sh
-        heads, moved = {}, []
 
-        def race_second_pass(job, *args, **kw):
-            self.assertFalse(job.checkouts[1].recovery_head)
-            self.assertEqual(heads.keys(), {self.wt})
-            self.assertEqual(self.remote_head(), heads[self.wt])
-            self.assertEqual(orchestration.find(self.previous)["data"]["publication_intent"]["pushed"],
-                             {self.repo.github: heads[self.wt]})
-            if race == "pre-push":
-                moved.append(self.advance_sibling(other))
-            return publish_branch(job, *args, **kw)
+class RecoveredFailedCIFinishTests(MultiCheckoutFixture):
+    def test_failed_gate_before_first_publication_does_not_draft_advanced_sibling(self):
+        side, other, _ = self.gate_siblings(requests=0, finish_failed=True)
 
-        def racing_push(argv, **kwargs):
-            if argv[:3] != ["git", "push", "--porcelain"]:
-                return sh(argv, **kwargs)
-            wt = kwargs["cwd"]
-            heads[wt] = self.git(wt, "rev-parse", "HEAD")
-            if wt == side.wt:
-                self.assertIn(f"--force-with-lease=refs/heads/topic:{side.lease}", argv)
-                if race == "lease":
-                    moved.append(self.advance_sibling(other))
-                elif race == "uncertain":
-                    res = sh(argv, **kwargs)
-                    self.assertEqual(res.returncode, 0, res.stderr)
-                    moved.append(heads[wt])
-                    return CompletedProcess(argv, util.TIMED_OUT, "", "fixture lost the result")
-            return sh(argv, **kwargs)
+        def reject(*_):
+            self.advance_sibling(other)
+            return pipeline.Review("request_changes", "The reconciled tree needs work")
 
-        with (patch.object(flows, "publish_branch", side_effect=race_second_pass),
-              patch.object(util, "sh", side_effect=racing_push)):
-            row = self.resume(self.previous)
-        held = self.assert_held(row, pending=True)
-        raced, = moved
-        first = heads[self.wt]
-        expected = {self.repo.github: first}
-        retained = self.git(side.wt, "rev-parse", "HEAD")
-        phase = {"pre-push": "before pushing the candidate", "lease": "during the leased push",
-                 "uncertain": "did not confirm publication"}[race]
-        for text in (phase, side.lease, raced, retained, f"Already pushed {self.repo.github}:topic@{first}"):
-            self.assertIn(text, row["summary"])
-        self.assertNotIn("no push was made", row["summary"])
-        self.assertEqual(held["expected_refs"]["head"], side.lease)
-        self.assertEqual(held["refs"]["origin"], raced)
-        self.assertEqual(held["pushed"], expected)
-        self.assertEqual(bool(held.get("publication_unconfirmed")), race == "uncertain")
-        self.assertEqual(side.wt in heads, race != "pre-push")
-        ctl, = controllers
-        action = orchestration.actions(ctl.lease)[-1]
-        self.assertEqual(action["state"], "reconciliation-required")
-        self.assertEqual(action["result"]["pushed"], expected)
-        intent = orchestration.find(row["id"])["data"]["publication_intent"]
-        self.assertEqual(intent["pushed"], expected)
-        self.assertEqual(self.remote_head(), first)
-        self.assertTrue(all(pr_recovery.ancestor(self.wt, oid, first) for oid in (local, external)))
-        self.assertEqual(self.pr(side.pr)["headRefOid"], raced)
-        self.assertTrue(pr_recovery.ancestor(side.wt, side.lease, retained))
-        self.assertEqual(self.git(side.wt, "show", f"{retained}:{name}"), "fresh sibling edits")
-        if race != "uncertain":
-            self.assertEqual(self.git(other, "show", "HEAD:side-race.txt"), "new sibling remote head")
+        pipeline._review.side_effect = reject
+        row = self.resume(self.previous)
+        self.assert_move(row, side, self.head(other), "before reporting the failure")
+        self.assertEqual(self.action_states()[-1], "failed")
+        gh.pr_set_draft.assert_not_called()
+        gh.pr_comment.assert_not_called()
+
+    def test_failed_finish_does_not_draft_sibling_advanced_after_lookup(self):
+        side, other, _ = self.gate_siblings(finish_failed=True)
+        pipeline.watch_checkout_ci.side_effect = self.unread_ci
+
+        def details(url, **options):
+            row = self.pr(url) | {"isDraft": url == self.url}
+            if (url == side.pr and not options.get("identity")
+                    and self.saved().get("publication_intent", {}).get("phase") == "failed-ci"):
+                self.advance_sibling(other)
+            return row
+
+        gh.pr_merge_details.side_effect = details
+        row = self.resume(self.previous)
+        self.assert_move(row, side, self.head(other), "before changing the PR draft state", pending=True)
+        self.assert_drafts(side)
+
+
+class RecoveredDraftMutationTests(MultiCheckoutFixture):
+    def check_lost_mutation(self, *, draft):
+        set_draft, sh = gh.pr_set_draft, util.sh
+        side, other, _ = self.gate_siblings()
+        if draft:
+            pipeline.watch_checkout_ci.side_effect = self.unread_ci
         else:
-            self.git(other, "pull", "--ff-only", "origin", "topic")
-        self.advance_sibling(other, "head-after-hold.txt")
-        self.watch()
-        self.spawn.assert_not_called()
-        self.model.assert_not_called()
-        self.decide.assert_called_once()
+            gh.pr_draft_and_head.side_effect = lambda url: (url == side.pr, self.pr(url)["headRefOid"])
+        attempts = []
 
-    def test_second_leased_push_race_reports_first_push_and_requires_reconciliation(self):
-        side, other = self.sibling()
-        side_local = self.commit(side.wt, "side-local.txt", "retained sibling\n", owner=self.previous)
-        local = self.keep()
-        external = self.advance()
-        side_external = self.commit(other, "side-other.txt", "second session\n")
-        self.git(other, "push", "origin", "topic")
-        self.seed()
-        controllers = self.gate_publication("test -f first/local.txt && test -f first/other.txt && "
-                                            "test -f second/side-local.txt && test -f second/side-other.txt")
-        sh = util.sh
-        pushes, moved = [], []
+        def change(argv, **kw):
+            if argv[0] != "gh":
+                return sh(argv, **kw)
+            self.assertEqual((argv[:3], argv[4:]), (["gh", "pr", "ready"], ["--undo"] if draft else []))
+            attempts.append(argv[3])
+            if argv[3] == self.url:
+                return CompletedProcess(argv, 0, "", "")
+            self.assertEqual(self.publication_intent()["pr_effects"][-1],
+                             {"kind": "draft state", "github": side.github, "pr": side.pr, "head": side.lease})
+            self.advance_sibling(other)
+            return CompletedProcess(argv, 1, "", "error connecting to api.github.com: connection reset")
 
-        def racing_push(argv, **kwargs):
-            if argv[:3] == ["git", "push", "--porcelain"]:
-                wt = kwargs["cwd"]
-                pushes.append((wt, self.git(wt, "rev-parse", "HEAD")))
-                if wt == side.wt:
-                    self.assertIn(f"--force-with-lease=refs/heads/topic:{side_external}", argv)
-                    self.assertEqual(self.remote_head(), pushes[0][1])
-                    moved.append(self.commit(other, "late.txt", "new remote head\n"))
-                    self.git(other, "push", "origin", "topic")
-            return sh(argv, **kwargs)
-
-        with patch.object(util, "sh", side_effect=racing_push):
+        with (patch.object(util, "sh", side_effect=change), patch.object(gh, "gh", self.gh_command),
+              patch.object(gh, "pr_set_draft", set_draft)):
             row = self.resume(self.previous)
-        held = self.assert_held(row, pending=True)
-        (first_wt, first_head), (second_wt, second_head) = pushes
-        self.assertEqual((first_wt, second_wt), (self.wt, side.wt))
-        raced, = moved
-        for text in ("during the leased push", side_external, raced, second_head,
-                     f"Already pushed {self.repo.github}:topic@{first_head}", "Reconcile the partial publication"):
-            self.assertIn(text, row["summary"])
-        self.assertEqual(held["expected_refs"]["head"], side_external)
-        self.assertEqual(held["refs"]["origin"], raced)
-        self.assertEqual(held["pushed"], {self.repo.github: first_head})
-        ctl, = controllers
-        action = orchestration.actions(ctl.lease)[-1]
-        self.assertEqual(action["state"], "reconciliation-required")
-        self.assertEqual(action["result"]["pushed"], held["pushed"])
-        self.assertEqual(self.remote_head(), first_head)
-        self.assertEqual(self.pr(side.pr)["headRefOid"], raced)
-        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), second_head)
-        self.assertTrue(all(pr_recovery.ancestor(self.wt, oid, first_head) for oid in (local, external)))
-        self.assertTrue(all(pr_recovery.ancestor(side.wt, oid, second_head) for oid in (side_local, side_external)))
-        self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "Try again without reconciliation."})
-        self.watch()
-        self.spawn.assert_not_called()
+        self.assertEqual(attempts, [self.url, side.pr] if draft else [side.pr])
+        state = "a draft" if draft else "ready for review"
+        self.assert_move(row, side, self.head(other), f"after attempting to mark the PR {state}", pending=True)
+
+    test_initial_ci_failure_does_not_retry_drafting_after_head_move = partialmethod(check_lost_mutation, draft=True)
+    test_passing_ci_does_not_retry_readying_after_head_move = partialmethod(check_lost_mutation, draft=False)
 
 
-class SiblingIgnoreRecoveryTests(MultiCheckoutFixture):
-    def test_sibling_comment_only_ignore_change_resumes_with_private_file_still_ignored(self):
-        name = "side-private.txt"
-        rule = f"/{name}\n"
-        side, other = self.sibling(ignore=rule)
-        private = side.wt / name
-        private.write_text("retained private notes\n")
-        self.keep()
-        self.advance()
-        self.seed()
-        rules_with_comment = f"# Added a comment\n{rule}"
-        base = self.commit(side.src, ".gitignore", rules_with_comment)
-        self.git(side.src, "push", "origin", "main")
+class RecoveredAutomergeReportTests(ResumeFixture):
+    def test_move_during_last_automerge_comment_leaves_intent_pending(self):
+        _, observed = self.gate_advance(retained="", check="test -f other.txt", trust="automerge")
 
-        def recovered(ctl):
-            candidate = ctl.job.checkouts[1]
-            self.assertEqual(candidate.recovery_base, base)
-            self.assertTrue(pr_recovery.ancestor(side.wt, base, "HEAD"))
-            self.assertEqual((side.wt / ".gitignore").read_text(), rules_with_comment)
-            self.assertIn(name, workspace.ignored_file_paths(side.wt))
-            self.assertNotIn(candidate.prefix + name, ctl.job.b.restage().files)
-            ctl.ending = ("noop", "Resumed with the sibling's new base", "")
-            return []
+        def comment(url, body, *, single_attempt):
+            if "Automerge stays off" in body:
+                self.assertTrue(single_attempt)
+                self.assertIn(f"for head `{observed}`", body)
+                self.assertIn("the merge API only pins the head", body)
+                self.advance("during-report.txt")
 
-        self.decide.side_effect = recovered
-        self.resume(self.previous, expected=0)
-        self.decide.assert_called_once()
-        self.assertEqual(private.read_text(), "retained private notes\n")
-        self.assertEqual(self.git(side.wt, "ls-files", "--", name), "")
-        self.assertEqual(self.git(other, "rev-parse", "HEAD"), side.lease)
+        gh.pr_comment.side_effect = comment
+        row, raced = self.resume(self.previous), self.head(self.other)
+        held = self.assert_move(row, self.checkout, raced, "before clearing publication intent", pending=True, expected=observed)
+        self.assertEqual(held["pr_effects"][-1]["kind"], "Recovered automerge decision")
+        self.assertTrue(held["publication_unconfirmed"])
 
 
 class MultiCheckoutInstallTests(MultiCheckoutFixture):
     def test_later_install_failure_keeps_successful_checkout_provenance_for_next_resume(self):
-        side, other = self.sibling()
+        name, notes = "side-private.txt", "private notes\n"
+        side, _ = self.sibling(ignore=f"/{name}\n")
+        (side.wt / name).write_text(notes)
         self.checkout.onto = self.accepted
         side_local = self.commit(side.wt, "side-local.txt", "retained sibling\n", owner=self.previous)
-        local = self.keep()
-        external = self.advance()
-        side_external = self.commit(other, "side-other.txt", "second session\n")
-        self.git(other, "push", "origin", "topic")
-        self.seed()
-        git = util.git
+        base = self.move_sibling_base(side, ".gitignore", f"# Comment\n/{name}\n")
+        local, external = self.seed_advance()
 
-        def fail_second_install(args, cwd, **kw):
-            if cwd == side.wt and "--ff-only" in args:
-                raise RuntimeError("fixture refused the fast-forward")
-            return git(args, cwd, **kw)
-
-        with patch.object(util, "git", side_effect=fail_second_install):
+        refuse_install = Mock(side_effect=RuntimeError("fixture refused the fast-forward"))
+        with self.on_git("merge --no-autostash", refuse_install, wt=side.wt):
             row = self.resume(self.previous)
-        held = self.assert_held(row)
-        self.assertEqual(held["github"], side.github)
+        self.assertEqual(self.assert_held(row)["github"], side.github)
         self.assertIn("refused candidate", row["summary"])
         self.decide.assert_not_called()
-        actual = self.git(self.wt, "rev-parse", "HEAD")
-        self.assertNotEqual(actual, local)
-        self.assertTrue(pr_recovery.ancestor(self.wt, external, actual))
-        self.assertEqual(self.git(side.wt, "rev-parse", "HEAD"), side_local)
-        self.assertEqual(self.pr(side.pr)["headRefOid"], side_external)
+        actual = self.head()
+        self.assert_contains(self.wt, actual, local, external)
+        self.assertEqual((self.head(side.wt), self.pr(side.pr)["headRefOid"]), (side_local, side.lease))
         made = workspace.made_before(self.ws)
         self.assertEqual([workspace.head_recorded(made, c) for c in self.job.checkouts], [actual, side_local])
         self.assertEqual(workspace.onto_recorded(made, self.checkout), "")
         saved = flows.prepared_data(row["id"])["checkouts"]
         self.assertEqual([c["recovery_head"] for c in saved], [external, ""])
-        self.assertEqual(self.watch()["phase"], "needs_owner")
+        self.assert_quiet_hold()
 
         def recovered(ctl):
-            self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), actual)
-            self.assertTrue(pr_recovery.ancestor(side.wt, side_external, self.git(side.wt, "rev-parse", "HEAD")))
+            self.assertEqual(self.head(), actual)
+            self.assert_contains(side.wt, self.head(side.wt), side_local, base)
+            self.assertEqual(ctl.job.checkouts[1].recovery_base, base)
+            self.assertNotIn(side.prefix + name, ctl.job.b.restage().files)
             ctl.ending = ("noop", "Reached the next decision after recovering both checkouts", "")
             return []
 
         self.decide.side_effect = recovered
         self.resume(row["id"], expected=0)
         self.decide.assert_called_once()
+        self.assertIn(name, workspace.ignored_file_paths(side.wt))
+        self.assertEqual((side.wt / name).read_text(), notes)

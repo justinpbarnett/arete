@@ -105,6 +105,7 @@ class Controller(worker_turns.WorkerTurns):
     issue_goal = False
     merge_lease: TextIO | None = None
     starts_new_lineage = False
+    route_noted = False
 
     def __init__(self, flow, *, max_builders=None):
         self.flow, self.job = flow, flow.ctx
@@ -175,7 +176,7 @@ class Controller(worker_turns.WorkerTurns):
         self.job.take(name, outcome, stored=False)
         return outcome
 
-    def continuation_blocker(self, *, decision_boundary=False):
+    def continuation_blocker(self, *, decision_boundary=False, settling=""):
         for turn in ledger.pending(self.lease):
             launch = turn["response"] or {}
             if delegation.live(launch.get("pid"), launch.get("identity")):
@@ -187,7 +188,9 @@ class Controller(worker_turns.WorkerTurns):
                 return f"worker {action['id']} is still live; no replacement was launched"
         if decision_boundary:
             for action in actions:
-                if action["state"] not in ledger.TERMINAL:
+                if action["state"] not in ledger.TERMINAL and not (
+                    settling and (action["id"] == settling or action["state"] == "accepted")
+                ):
                     return f"accepted action {action['id']} is unfinished ({action['state']})"
         return ""
 
@@ -241,9 +244,15 @@ class Controller(worker_turns.WorkerTurns):
                         break
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
-            self.lineage()
-            if self.starts_new_lineage:
-                self.discard_gate_state()
+            receipt = pr_recovery.pending_receipt(self.data)
+            if receipt:
+                self.note_route()
+                self.lineage(settling=receipt.get("action", ""))
+                self.settle_recovered_publication(prepared)
+            else:
+                self.lineage()
+                if self.starts_new_lineage:
+                    self.discard_gate_state()
             if restore_prs:
                 if ending := self.restore_pr_targets(prepared):
                     return ending
@@ -381,11 +390,10 @@ class Controller(worker_turns.WorkerTurns):
         self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
-        self.data["recovery_code"] = codebase.STAMP
         self.data["limits"] = self.configured_limits()
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
-        self.recheck_recovered_prs()
+        self.job.recheck_pr_plans("before restoring controller actions", installed=True)
         self.recover()
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
@@ -408,6 +416,7 @@ class Controller(worker_turns.WorkerTurns):
                                           **({"new_lineage": True} if old_lineage.keys() - REFRESHABLE_LINEAGE else {})}
         self.persist()
         self.write_lineage_event()
+        self.job.recheck_pr_plans("before resuming work", installed=True)
         return None
 
     def restore_pr_targets(self, prepared):
@@ -449,21 +458,24 @@ class Controller(worker_turns.WorkerTurns):
     def before_pr_recovery(self):
         if why := self.continuation_blocker():
             raise factory.Refused(f"cannot reconcile the PR while {why}; settle the pending work first")
+        if self.job.pr_plans:
+            return
         if self.exchanged:
             try:
                 self.worker_barrier()
             except ValueError as error:
                 raise factory.Refused(f"cannot reconcile the PR: {error}; settle the private assignments first") from error
-        if not self.job.pr_plans:
-            ticket = self.run.tracker.get(self.run.tid)
-            if not ticket.open:
-                raise factory.Refused("the ticket closed before the PR could be reconciled")
-            self.job.ticket.comments = ticket.comments
-            self.note_route()
-            self.run.capture_pr_recovery_discussion([checkout.pr for checkout in self.job.with_prs])
+        ticket = self.run.tracker.get(self.run.tid)
+        if not ticket.open:
+            raise factory.Refused("the ticket closed before the PR could be reconciled")
+        self.job.ticket.comments = ticket.comments
+        self.note_route()
+        self.run.capture_pr_recovery_discussion([c.pr for c in self.job.with_prs])
 
     def note_route(self):
-        run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
+        if not self.route_noted:
+            run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
+            self.route_noted = True
 
     def record_pr_recovery_checkout(self, checkout):
         rows = self.data["prepared"]["checkouts"]
@@ -471,21 +483,20 @@ class Controller(worker_turns.WorkerTurns):
         ledger.save(self.lease, self.data)
 
     def discard_pr_recovery_state(self):
+        self.invalidate_reconciled_inputs()
+        for plan in self.job.pr_plans:
+            self.data.get("worker_trees", {}).pop(plan.inputs.checkout.github, None)
+        self.data["prepared"]["ticket"]["comments"] = self.job.ticket.comments
+
+    def invalidate_reconciled_inputs(self):
         self.discard_gate_state()
         self.data["pr_recovery_stale_actions"] = self.data["stale_actions"]
         for action in ledger.actions(self.lease):
             if action["state"] == "accepted":
                 ledger.transition(self.lease, action["id"], "cancelled", {"reason": "PR reconciliation invalidated the input"})
-        for name in ("published", "published_tree", "ci_failed", "ci_retry", "ci_failures", "steering"):
+        for name in ("publication", "published", "published_tree", "recovered_publication",
+                     "ci_failed", "ci_retry", "ci_failures", "steering", "catch_up_hold", "catch_ups"):
             self.data.pop(name, None)
-        worker_trees = self.data.get("worker_trees", {})
-        for plan in self.job.pr_plans:
-            worker_trees.pop(plan.inputs.checkout.github, None)
-        self.data["prepared"]["ticket"]["comments"] = self.job.ticket.comments
-
-    def recheck_recovered_prs(self):
-        for plan in self.job.pr_plans:
-            plan.inputs.recheck(during="before resuming work", local=plan.candidate)
 
     def check_push_targets(self):
         recovery = self.job.recovery_publication
@@ -615,7 +626,7 @@ class Controller(worker_turns.WorkerTurns):
         if "job" in self.data:
             self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
 
-    def lineage(self):
+    def lineage(self, *, settling=""):
         tid = str(getattr(self.run, "tid", ""))
         pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
         restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
@@ -636,7 +647,7 @@ class Controller(worker_turns.WorkerTurns):
                 raise factory.Refused(f"{changes}; outstanding private assignments need reconciliation before resuming")
         if old.keys() - REFRESHABLE_LINEAGE and not restarts:
             raise factory.Refused(f"{changes}; reconcile before resuming")
-        if why := self.continuation_blocker(decision_boundary=bool(old)):
+        if why := self.continuation_blocker(decision_boundary=bool(old), settling=settling):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
         self.starts_new_lineage = bool(old.keys() - REFRESHABLE_LINEAGE)
         return found, old
@@ -658,7 +669,9 @@ class Controller(worker_turns.WorkerTurns):
             self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
+        pr_recovery.check_staging(self.job.checkouts)
         prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
+        pr_recovery.check_staging(self.job.checkouts)
         return ledger.digest(prints) if prints and all(prints.values()) else ""
 
     def stamp(self, gate, result):
@@ -1127,9 +1140,9 @@ class Controller(worker_turns.WorkerTurns):
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         gates = ("checks", "review", "verify")
-        recovering = any(c.recovery_head for c in self.job.checkouts)
+        recovering = bool(self.data.get("recovered_publication") or any(c.recovery_head for c in self.job.checkouts))
         tree = self.fingerprint() if recovering else None
-        needed = [gate for gate in gates if not self.current(gate, tree=tree)]
+        needed = [gate for gate in gates if not self.current(gate, **({"tree": tree} if recovering else {}))]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
         if not self.data["evidence"]["checks"]["result"].get("full"):
@@ -1142,7 +1155,7 @@ class Controller(worker_turns.WorkerTurns):
         measurement_section = (pipeline.unverified_measurement_section(unverified_measurement)
                                if unverified_measurement else "")
         if (not self.run.dry_run and not zte.reserved(str(self.run.tid)) and self.data.get("ci_failed")
-                and (retry := self.data.get("ci_retry")) and (tree := self.fingerprint())
+                and (retry := self.data.get("ci_retry")) and (tree := tree or self.fingerprint())
                 and tree == self.data.get("published_tree")):
             return self.retry_publication_ci(retry, tree, measurement_section=measurement_section)
         self.validate_publication_diff()
@@ -1154,51 +1167,162 @@ class Controller(worker_turns.WorkerTurns):
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
         self.check_pilot_publication()
+        publication = None
         if recovering:
-            authors = flows.authors(self.job.continues) | {self.run.id}
-            publication = pr_recovery.Publication(self.job.checkouts, self.job.branch, authors,
-                                                  record_pushes=self.record_recovery_pushes)
-            tree = self.fingerprint()
-            if tree != ledger.digest(publication.trees) or not all(self.current(gate, tree=tree) for gate in gates):
+            publication = self.recovered_publication()
+            if tree != self.fingerprint() or tree != ledger.digest(publication.trees):
                 raise ValueError("the staged candidate does not match the reconciled tree's gates; refresh the gates")
             self.job.recovery_publication = publication
         if catch_up:
             checkout, = self.job.checkouts
             self.take_merge_lease(checkout)
-        self.data["publication_intent"] = {"tree": tree if recovering else self.fingerprint()}
-        self.persist()
+        self.begin_publication(tree if recovering else self.fingerprint())
         outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section)
         if not outcome.passed:
             self.ending = flows.ended(self.flow, outcome)
             return outcome.data
-        self.data.pop("publication_intent", None)
-        self.job.recovery_publication = None
-        for checkout in self.job.checkouts:
-            checkout.recovery_head = checkout.recovery_base = ""
         self.data.pop("worker_trees", None)
         self.job.b.worker_trees = {}
         self.data.pop("ignored_denied_paths", None)
         self.job.b.ignored_denied_paths = {}
-        self.data["publication"] = outcome.data
-        self.persist()
-        if catch_up:
-            for checkout in self.job.picked(self.job.changed):
-                pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, self.job.verified, self.job.review)
-        if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
+        changed = self.job.picked(self.job.changed)
+        if not recovering:
+            self.data.pop("publication_intent", None)
+            self.data["publication"] = outcome.data
+            self.persist()
+            if catch_up:
+                for c in changed:
+                    pipeline.publish_gate_evidence(self.run, self.job.ticket, c, self.job.verified, self.job.review)
+        failure = self.publication_ci(changed) if self.run.repo.parts else None
+        if publication:
+            publication.recheck(during="before recording publication")
+            self.data["publication"] = outcome.data
+            if self.job.with_prs:
+                pipeline.note_prs(self.run, self.job.branch, self.job.with_prs)
+        if failure:
+            self.keep_failed_publication()
             return self.settle_publication_failure(failure)
         return self.finish_publication()
 
-    def record_recovery_pushes(self, pushed: dict[str, str]) -> None:
-        self.data["publication_intent"]["pushed"] = pushed
+    def recovered_publication(self):
+        authors = flows.authors(self.job.continues) | {self.run.id}
+        publication = pr_recovery.Publication(self.job.checkouts, self.job.branch, authors,
+                                              record=self.record_recovery_effects,
+                                              record_attempt=self.record_recovery_attempt,
+                                              settled=self.data.get("recovered_publication"),
+                                              settled_effects=self.data.get("settled_pr_effects", ()))
+        missing = [target.refs.url for target in publication.targets.values()
+                   if target.refs.url not in self.run.pr_recovery_discussion]
+        if missing:
+            self.run.capture_pr_recovery_discussion(missing)
+        return publication
+
+    def begin_publication(self, tree, *, phase=""):
+        intent = {"tree": tree}
+        if phase:
+            intent["phase"] = phase
+        if recovery := self.job.recovery_publication:
+            snapshot = recovery.snapshot()
+            intent["recovery_receipt"] = {"branch": recovery.branch, "targets": snapshot["targets"],
+                                          "trees": recovery.trees, "action": self.executing}
+            intent.update({key: snapshot[key] for key in ("pushed", "pr_effects") if snapshot[key]})
+        self.data["publication_intent"] = intent
         self.persist()
+
+    def resume_recovered_publication(self, phase):
+        if not (settled := self.data.get("recovered_publication")):
+            return None
+        recovery = self.job.recovery_publication = self.recovered_publication()
+        self.begin_publication(settled["tree"], phase=phase)
+        return recovery
+
+    def end_publication_intent(self, *, keep_recovery=False, keep_candidate=False):
+        if recovery := self.job.recovery_publication:
+            recovery.recheck(during="before clearing publication intent")
+            if keep_recovery:
+                self.data["recovered_publication"] = {**recovery.snapshot(), "tree": self.data["publication_intent"]["tree"]}
+                for target in recovery.targets.values():
+                    c = target.checkout
+                    c.recovery_head, c.recovery_base = recovery.expected_head(c), target.refs.base
+            else:
+                self.data.pop("recovered_publication", None)
+                if not keep_candidate:
+                    for checkout in self.job.checkouts:
+                        checkout.recovery_head = checkout.recovery_base = ""
+            self.job.recovery_publication = None
+        self.data.pop("publication_intent", None)
+
+    def keep_failed_publication(self):
+        if self.job.recovery_publication:
+            self.end_publication_intent(keep_recovery=True)
+            self.persist()
+
+    def record_recovery_effects(self, **effects):
+        self.data["publication_intent"].update(effects)
+        self.persist()
+
+    def record_recovery_attempt(self, repo: str, head: str) -> None:
+        attempts = self.data["publication_intent"].setdefault("attempts", {})
+        if head:
+            attempts[repo] = head
+            workspace.note_made(self.job.ws, self.job.checkouts, excluded=self.run.closed_checkout_paths)
+        else:
+            attempts.pop(repo, None)
+        self.persist()
+
+    def settle_recovered_publication(self, prepared):
+        if (self.run.dry_run or self.run.action or self.run.environment_release or self.run.recovery
+                or self.run.repairs or self.run.alone):
+            raise factory.Refused("use a whole-run resume to settle the interrupted recovered publication")
+        self.quiescent()
+        intent = self.data["publication_intent"]
+        action_id = intent["recovery_receipt"].get("action")
+        actions = ledger.actions(self.lease)
+        prior = next((a for a in actions if a["id"] == action_id), None)
+        if (not prior or prior["op"] not in ("publication.request", "run.finish")
+                or prior["result"].get("input_stamp", {}).get("tree") != intent["tree"]
+                or not (prior["state"] in ("running", "reconciliation-required")
+                        or prior["state"] == "failed" and prior["result"].get("publication_settled"))):
+            raise factory.Refused("the interrupted publication has no matching durable action; inspect its effects manually")
+        if any(a["id"] != action_id and (a["state"] == "reconciliation-required"
+               or a["state"] == "running" and a["op"] == "publication.request") for a in actions):
+            raise factory.Refused("another action still has unconfirmed effects; inspect it before resuming")
+        checkouts = [workspace.Checkout.from_row(row) for row in prepared["checkouts"]
+                     if row.get("pr") not in prepared.get("closed_prs", ())]
+        if any(not (c.wt / ".git").exists() for c in checkouts):
+            raise factory.Refused("settling publication requires the original retained worktrees")
+        try:
+            pr_recovery.settle(checkouts, prepared["branch"], workspace.made_before(self.job.ws), intent,
+                               flows.authors(self.flow.continues))
+        except factory.Refused:
+            raise
+        except (RuntimeError, OSError, ValueError, KeyError) as error:
+            raise factory.Refused(f"could not verify the interrupted publication: "
+                                  f"{util.first_line(vault.hidden(str(error)), 300)}") from error
+        settled = {c.github: c.to_row() for c in checkouts}
+        prepared["checkouts"] = [settled.get(row["github"], row) for row in prepared["checkouts"]]
+        effects = self.data.setdefault("settled_pr_effects", [])
+        effects.extend(e for e in intent.get("pr_effects", ()) if e not in effects)
+        if not prior["result"].get("publication_settled"):
+            ledger.transition(self.lease, prior["id"], "failed", {**prior["result"], "publication_settled": True},
+                              expected=(prior["state"],))
+        self.invalidate_reconciled_inputs()
+        self.data.pop("publication_intent")
+        ledger.save(self.lease, self.data)
+        self.run.log("Settled the interrupted branch publication without replay. Previously attempted PR updates "
+                     "are not repeated on those heads; inspect the PRs and CI. Fresh gates are required.")
 
     def retry_publication_ci(self, retry, tree, *, measurement_section=""):
         job = self.job
         self.check_pilot_publication()
         flows.require_environment_owner_clear(job)
+        recovery = self.resume_recovered_publication("ci-rerun")
+        if recovery:
+            recovery.recheck(during="before retrying publication CI")
         flows.refuse_changed_prs(job)
         checkouts = {c.github: c for c in job.with_prs}
-        heads = self.data["publication"]["heads"]
+        publication = self.data["publication"]
+        heads = publication["heads"]
         retried = self.data.get("ci_retried_heads", {})
         pushed = []
         targets = retry["targets"]
@@ -1210,21 +1334,28 @@ class Controller(worker_turns.WorkerTurns):
             pushed.append(checkout)
         automatic_requested = self.rerun_requested(pushed)
         if not automatic_requested and (failure := self.second_ci_failure(targets, retried)):
+            self.keep_failed_publication()
             return failure
         if retry["caught_up"]:
             checkout, = pushed
             self.take_merge_lease(checkout)
-        for checkout in pushed:
-            row = gh.pr_merge_details(checkout.pr)
-            if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
-                    or row.get("baseRefName") != checkout.base):
-                raise ValueError("the PR no longer matches this run's published head and base")
+        if not recovery:
+            for checkout in pushed:
+                row = gh.pr_merge_details(checkout.pr)
+                if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
+                        or row.get("baseRefName") != checkout.base):
+                    raise ValueError("the PR no longer matches this run's published head and base")
         observed = [] if measurement_section else pipeline.observed_measurements(self.run, job.verified)
         if measurement_section or observed:
             for checkout in pushed:
                 try:
-                    pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
-                                                            observed_requirements=observed)
+                    if recovery:
+                        report = publication.get("report_body", "")
+                        pipeline.report_recovered_measurement(self.run, recovery, checkout, report,
+                                                              measurement_section, observed, job.verified)
+                    else:
+                        pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
+                                                                observed_requirements=observed)
                 except gh.GhError as error:
                     raise ValueError(f"could not update the unverified requirement in {checkout.pr}") from error
         saved = retry.get("reruns")
@@ -1232,6 +1363,7 @@ class Controller(worker_turns.WorkerTurns):
             if self.refresh_publication_ci(pushed, retry, automatic_requested):
                 return self.finish_ci_retry()
             if saved is None:
+                self.keep_failed_publication()
                 return self.settle_publication_failure(self.publication_ci_failure())
         launches = {}
         if saved is not None:
@@ -1241,31 +1373,32 @@ class Controller(worker_turns.WorkerTurns):
             reruns = {c.github: gh.failed_job_reruns(c.github, c.pr, c.lease, targets[c.github]["jobs"])
                       for c in pushed if c.lease not in retried.get(c.github, [])}
             if not any(reruns.values()):
+                self.keep_failed_publication()
                 raise ValueError("the failed CI has no GitHub Actions jobs to rerun")
             for checkout in pushed:
                 if reruns.get(checkout.github):
                     retried.setdefault(checkout.github, []).append(checkout.lease)
             launches = reruns
-        self.data["publication_intent"] = {"tree": tree, "phase": "ci-rerun"}
-        self.persist()
+        if not recovery:
+            self.begin_publication(tree, phase="ci-rerun")
         for repo, requested in launches.items():
             for rerun in requested:
-                gh.rerun_failed_jobs(repo, rerun.run)
+                if not recovery or recovery.before_pr_write(checkouts[repo], "CI rerun", during="before rerunning CI"):
+                    gh.rerun_failed_jobs(repo, rerun.run)
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
-            self.data.pop("publication_intent", None)
-            if saved is not None and not automatic_requested:
-                targets = self.data["ci_retry"]["targets"]
-                if second_failure := self.second_ci_failure(targets, retried):
-                    return second_failure
-            return self.settle_publication_failure(failure)
+            second_failure = (self.second_ci_failure(self.data["ci_retry"]["targets"], retried)
+                              if saved is not None and not automatic_requested else None)
+            self.end_publication_intent(keep_recovery=True)
+            return second_failure or self.settle_publication_failure(failure)
         return self.finish_ci_retry()
 
     def finish_ci_retry(self):
         job = self.job
         flows.require_environment_owner_clear(job)
         fresh = [c for c in job.picked(job.opened) if c.github not in job.found]
-        pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
+        options = {"recovery": recovery} if (recovery := job.recovery_publication) else {}
+        pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why, **options)
         return self.finish_publication()
 
     def refresh_publication_ci(self, pushed, retry, automatic_requested):
@@ -1303,6 +1436,10 @@ class Controller(worker_turns.WorkerTurns):
         return any(c.lease in requested.get(c.github, []) for c in pushed)
 
     def remember_ci_rerun(self, repo, head):
+        if recovery := self.job.recovery_publication:
+            checkout = next(c for c in self.job.with_prs if (c.github, c.lease) == (repo, head))
+            if not recovery.before_pr_write(checkout, "CI rerun", during="before rerunning CI"):
+                return False
         self.data.setdefault("ci_rerun_requested_heads", {}).setdefault(repo, []).append(head)
         self.persist()
 
@@ -1317,20 +1454,28 @@ class Controller(worker_turns.WorkerTurns):
 
     def report_publication_ci(self, pushed, caught_up, section):
         self.check_pilot_publication()
-        if caught_up:
+        if recovery := self.job.recovery_publication:
+            body = pipeline.public_text(self.run, section)
+            for checkout in pushed:
+                recovery.comment(checkout, body, kind="Recovered CI evidence",
+                                 during="before refreshing PR CI evidence")
+        elif caught_up:
             for checkout in pushed:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
 
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
-        tree = self.fingerprint()
+        recovery = self.job.recovery_publication
+        tree = self.data["publication_intent"]["tree"] if recovery else self.fingerprint()
         saved = self.data.get("ci_retry", {}) if reruns is not None else {}
         max_rounds = saved.get("max_rounds", 2) if reruns is not None else self.run.settings("ci_repair").tries
         earlier = [pipeline.ci.Round(n, [], story) for n, story in enumerate(saved.get("round_stories", []), 1)]
         requested_heads = {(repo, head) for name in ("ci_rerun_requested_heads", "ci_retried_heads")
                            for repo, heads in self.data.get(name, {}).items() for head in heads}
         automatic = pipeline.AutomaticCIReruns(requested_heads, self.remember_ci_rerun)
+        if recovery:
+            recovery.recheck(during="before watching publication CI")
         rounds = pipeline.watch_publication_ci(self.job.b, self.job.slot, pushed, max_rounds,
                                                automatic=automatic, reruns=reruns)
         current = rounds[-1]
@@ -1374,12 +1519,13 @@ class Controller(worker_turns.WorkerTurns):
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         check_head = caught_up or self.data.get("catch_up_hold")
         watched_heads = {w.target.pr: w.target.sha for w in current.seen}
+        draft_options = {"recovery": recovery} if recovery else {}
         for checkout in self.job.with_prs:
             self.check_pilot_publication()
             if check_head and (watched_heads.get(checkout.pr) != checkout.lease
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
-            pipeline.set_draft(self.run, checkout, True)
+            pipeline.set_draft(self.run, checkout, True, **draft_options)
         return self.publication_ci_failure()
 
     def take_merge_lease(self, checkout):
@@ -1399,12 +1545,21 @@ class Controller(worker_turns.WorkerTurns):
             return None
         about = pipeline.automerge_about(job.ticket, job.build_summary)
         track_base = not pilot.is_pilot_task(str(self.run.tid))
+        recovery = job.recovery_publication
         for checkout in candidates:
+            if recovery:
+                recovery.recheck(during="before considering automerge")
+                hold = (merge_review.MULTIPLE if len(job.checkouts) != 1 else
+                        pipeline.unpinned_merge_hold(checkout, recovery.targets[checkout.github].refs.base))
+                pipeline.report_automerge(self.run, checkout, hold, recovery=recovery)
+                continue
             if len(job.checkouts) == 1:
                 self.take_merge_lease(checkout)
+            options = ({"require_pinned_base": True}
+                       if self.data.get("recovered_merge_heads", {}).get(checkout.pr) == checkout.lease else {})
             while True:
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
-                                              track_moved_base=track_base)
+                                              track_moved_base=track_base, **options)
                 if hold is None:
                     self.clear_catch_up_hold()
                     return None
@@ -1498,10 +1653,13 @@ class Controller(worker_turns.WorkerTurns):
 
     def park_catch_up(self, reason, *, on_ticket=False, close_failed=False):
         held = self.data["catch_up_hold"]["reason"]
-        for checkout in self.job.with_prs:
-            if pipeline.own_draft_state(self.run, checkout) is False:
-                pipeline.set_draft(self.run, checkout, True, "automerge")
-        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
+        recovering = (self.job.recovery_publication or self.data.get("recovered_publication")
+                      or any(c.recovery_head for c in self.job.checkouts))
+        if not recovering:
+            for checkout in self.job.with_prs:
+                if pipeline.own_draft_state(self.run, checkout) is False:
+                    pipeline.set_draft(self.run, checkout, True, "automerge")
+        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket or bool(recovering))
         reason = f"{held}. {reason}"
         if close_failed:
             return pipeline.record_park(self.run, reason, {}, comment=False)
@@ -1580,12 +1738,20 @@ class Controller(worker_turns.WorkerTurns):
 
     def finish_publication(self):
         self.check_pilot_publication()
-        self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
-        self.persist()
+        recovery = self.job.recovery_publication
+        if recovery:
+            self.data["publication_intent"]["phase"] = "publish"
+            self.persist()
+        else:
+            self.begin_publication(self.fingerprint(), phase="publish")
         outcome = self.atomic("publish", merge=self.automerge)
-        self.data.pop("publication_intent", None)
+        tree = self.fingerprint() if outcome.passed else ""
+        self.end_publication_intent()
         if outcome.passed:
-            self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
+            if recovery:
+                self.data.setdefault("recovered_merge_heads", {}).update(
+                    (c.pr, c.lease) for c in self.job.picked(self.job.changed) if c.pr)
+            self.data["published"], self.data["published_tree"] = outcome.data, tree
         else:
             self.data.pop("published", None)
             if not self.data.get("ci_retry"):
@@ -1634,6 +1800,8 @@ class Controller(worker_turns.WorkerTurns):
                 "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
                 (self.lease.root, turn)).fetchone()
         rationale = ledger.decoded(row).get("response", {}).get("rationale")
+        recovery = self.job.recovery_publication
+        draft_options = {"recovery": recovery} if recovery else {}
         for checkout in self.job.with_prs:
             try:
                 pr = gh.pr_merge_details(checkout.pr)
@@ -1643,16 +1811,19 @@ class Controller(worker_turns.WorkerTurns):
                 self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
                 continue
             if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
-                pipeline.set_draft(self.run, checkout, True, "failed")
-        if rationale is None:
+                pipeline.set_draft(self.run, checkout, True, "failed", **draft_options)
+        if recovery:
+            recovery.recheck(during="before reporting the failure")
+        if rationale is None and not recovery:
             yield
             return
-        comment_rationale = outbound.screen(rationale.strip()).encode("utf-8", "backslashreplace").decode("utf-8")
-        with principals.acting(f"run:{self.run.id}/respond"):
-            self.run.say(f"Run `{self.run.id}` failed without delivery.\n\n{comment_rationale}"
-                         f"\n\n{self.run.retry_hint}.")
         say = self.run.say
-        self.run.say = lambda _body: ""
+        if rationale is not None:
+            comment_rationale = outbound.screen(rationale.strip()).encode("utf-8", "backslashreplace").decode("utf-8")
+            with principals.acting(f"run:{self.run.id}/respond"):
+                options = {"on_ticket": True} if recovery else {}
+                say(f"Run `{self.run.id}` failed without delivery.\n\n{comment_rationale}\n\n{self.run.retry_hint}.", **options)
+        self.run.say = (lambda _body: "") if rationale is not None else (lambda body: say(body, on_ticket=True))
         try:
             yield
         finally:
@@ -1790,15 +1961,32 @@ class Controller(worker_turns.WorkerTurns):
                     reason = f"{reason}. {feedback}"
                 self.ending = pipeline.park_run(self.run, reason)
             else:
+                recovery = self.resume_recovered_publication("failed-ci")
+                before_first = not recovery and any(c.recovery_head for c in self.job.checkouts)
+                if before_first:
+                    recovery = self.job.recovery_publication = self.recovered_publication()
+                if recovery:
+                    recovery.recheck(during="before reporting the failure")
+                if before_first:
+                    self.begin_publication(self.fingerprint(), phase="failed-gates")
                 with self.report_failed_finish(action.get("turn")):
                     self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                                recovery=self.failure_recovery())
+                if recovery:
+                    self.end_publication_intent(keep_recovery=not before_first, keep_candidate=before_first)
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
     def hold_for_denied_edit(self, feedback):
         self.data["denied_feedback"] = feedback
         self.persist()
+
+    def dispatch_publication(self, action):
+        publication = getattr(getattr(self, "job", None), "recovery_publication", None)
+        intent = getattr(self, "data", {}).get("publication_intent") or {}
+        reconciles = bool(intent and (action["op"] == "publication.request"
+                                      or (intent.get("recovery_receipt") or {}).get("action") == action["id"]))
+        return publication, reconciles
 
     def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":
@@ -1818,43 +2006,31 @@ class Controller(worker_turns.WorkerTurns):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
         except pr_recovery.Hold as error:
-            publication = self.job.recovery_publication
-            if publication is None or publication.effected or error.recovery.get("publication_unconfirmed"):
-                ledger.transition(self.lease, action["id"], "reconciliation-required",
-                                  {"error": error.why, **error.recovery})
-                self.persist()
-                run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="reconciliation-required")
-                if publication is None:
-                    raise workspace.RunFailed(f"Unconfirmed publication must be reconciled. {error.why}") from error
-                raise
-            self.data.pop("publication_intent", None)
-            ledger.transition(self.lease, action["id"], "failed", {"error": error.why, **error.recovery})
+            publication, _ = self.dispatch_publication(action)
+            reconcile = publication is None or publication.effected or error.recovery.get("publication_unconfirmed")
+            state = "reconciliation-required" if reconcile else "failed"
+            if not reconcile:
+                self.data.pop("publication_intent", None)
+            ledger.transition(self.lease, action["id"], state, {"error": error.why, **error.recovery})
             self.persist()
-            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="failed")
+            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
+            if publication is None:
+                raise workspace.RunFailed(f"Unconfirmed publication must be reconciled. {error.why}") from error
             raise
-        except RetargetedPR as error:
-            publication = self.job.recovery_publication
-            if publication and publication.effected:
-                failure = publication.failure(f"{error.pr}: {error}")
-                ledger.transition(self.lease, action["id"], "reconciliation-required",
-                                  {"error": failure.why, "pushed": dict(publication.pushed)})
-                self.persist()
-                raise failure from error
-            refusal = error
-            self.ending = self.hold_revision(error.pr, str(error))
-            self.data.pop("publication_intent", None)
-            result = {"error": str(error)}
-            ledger.transition(self.lease, action["id"], "failed", result)
         except ValueError as error:
-            if (action["op"] == "publication.request" and (publication := self.job.recovery_publication)
-                    and self.data.get("publication_intent")):
-                failure = publication.failure(util.first_line(vault.hidden(str(error)), 300))
+            publication, reconcile = self.dispatch_publication(action)
+            if publication and (reconcile or publication.effected):
+                why = f"{error.pr}: {error}" if isinstance(error, RetargetedPR) else str(error)
+                failure = publication.failure(util.first_line(vault.hidden(why), 300))
                 ledger.transition(self.lease, action["id"], "reconciliation-required",
                                   {"error": failure.why, "pushed": dict(publication.pushed)})
                 self.persist()
                 raise failure from error
             refusal = error
             result = {"error": str(error)[:2000]}
+            if isinstance(error, RetargetedPR):
+                self.ending = self.hold_revision(error.pr, str(error))
+                self.data.pop("publication_intent", None)
             if self.exchanged and action["op"] in ("worker.start", "worker.continue"):
                 wid = action["request"].get("worker_id", action["id"])
                 found = exchange.workers(self.lease).get(wid)
@@ -1863,12 +2039,13 @@ class Controller(worker_turns.WorkerTurns):
                     result.update(worker_id=wid, effective=found["data"]["effective"])
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
-            if action["id"] in self.workers:
+            if action["id"] in getattr(self, "workers", {}):
                 raise
-            state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
+            publication, reconcile = self.dispatch_publication(action)
+            state = "reconciliation-required" if reconcile else "interrupted"
             result = {"error": f"stopped by {type(error).__name__}",
                       "usage_unknown": action["op"] in ("worker.start", "worker.continue", "verification.run", "review.run")}
-            if action["op"] == "publication.request" and (publication := self.job.recovery_publication):
+            if reconcile and publication:
                 result["pushed"] = dict(publication.pushed)
                 if isinstance(error, workspace.RunFailed):
                     result["error"] = error.why
