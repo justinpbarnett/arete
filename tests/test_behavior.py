@@ -2072,26 +2072,6 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LAT
 """)
 
 
-class WorkspaceLegacyChildIdentityTests(_WorkspaceChildCase):
-    def test_a_legacy_pid_newer_than_its_heartbeat_file_can_be_released(self):
-        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
-import subprocess
-from arete import control
-
-legacy.mkdir()
-beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
-pid = os.getpid()
-util.write_json(beat, {"workspace_contract_children": [pid]})
-os.utime(beat, (946684800, 946684800))
-with patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout="")):
-    with db.reader() as c:
-        assert f"inherited child {pid}" in db.contract_blockers(c, 28)
-process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
-with patch.object(util, "sh", return_value=process):
-    assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
-""")
-
-
 class WorkspaceProcessOwnershipTests(_WorkspaceChildCase):
     def test_running_ticket_with_recycled_pid_requires_a_held_ticket_lock(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
@@ -3054,6 +3034,26 @@ with db.tx() as c:
     c.execute(insert, ('sample:subscription', 'u:fixture', 'personal'))
     with case.assertRaises(sqlite3.IntegrityError):
         c.execute(insert, ('sample:subscription:2', 'u:fixture', 'personal'))
+""")
+
+
+class WorkspaceLegacyChildIdentityTests(_WorkspaceChildCase):
+    def test_a_legacy_pid_newer_than_its_heartbeat_file_can_be_released(self):
+        self.run_child(workspace_schema(27) + r"""
+import subprocess
+from arete import control
+
+beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+pid = os.getpid()
+util.write_json(beat, {"workspace_contract_children": [pid]})
+os.utime(beat, (946684800, 946684800))
+with patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout="")):
+    with db.reader() as c:
+        assert f"inherited child {pid}" in db.contract_blockers(c, 28)
+process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
+with patch.object(util, "sh", return_value=process):
+    with db.reader() as c:
+        assert f"inherited child {pid}" not in db.contract_blockers(c, 28)
 """)
 
 
