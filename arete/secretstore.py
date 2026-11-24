@@ -739,11 +739,11 @@ def reconcile(scope, name, actor, *, deleting=False):
     settings = config.secret_settings()
     local = local_key_path()
     with registry(write=True) as c:
+        row = credentials.secret(c, scope, name)
+        if deleting and row and settings.store is not None:
+            require_removable(item, row["store"])
         meta, key = lookup_key(c, settings, local)
         require_store(settings)
-        row = credentials.secret(c, scope, name)
-        if deleting and row:
-            require_removable(item, row["store"])
         raw, receipt = load_pending(item)
         pending = receipt.get("sets", [])
         target = row or receipt.get("removal") or (pending[0] if pending else None)
