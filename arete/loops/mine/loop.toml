@@ -1,11 +1,30 @@
-kind = "command"
-description = "Mine the last day of transcripts into harness fixes and open PRs for them"
+kind = "watch"
+description = "Review a closed parent spec and publish follow-up tickets for its repository or Arete"
 
 [trigger]
-cron = "50 23 * * *"
+event = ["spec.closed"]
+group = "key"
+trust = "internal"
+
+[[source]]
+name = "github-specs"
+type = "closed-specs"
+tracker = "github"
+every = "5m"
+
+[[source]]
+name = "jira-specs"
+type = "closed-specs"
+tracker = "jira"
+every = "5m"
 
 [run]
-command = "arete mine"
-try_command = "arete mine --dry-run"
-timeout_minutes = 120
-stale_hours = 30
+tools = []
+timeout_minutes = 15
+
+[[emit]]
+type = "ticket"
+repo = "$finding.repo"
+tracker = "configured"
+labels = []
+approve = false
