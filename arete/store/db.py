@@ -7,7 +7,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -113,8 +113,21 @@ TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["ru
                 "orchestration_actions": ("at",)}
 TIME_GLOB = time_shape.TIME_GLOB
 
+WORKSPACE_CONTRACT_SCHEMA = 28
+
+
+def workspace_rows_installed():
+    if not paths.DB_FILE.is_file():
+        return False
+    with closing(connect_db(paths.DB_FILE, readonly=True)) as c:
+        return c.execute("PRAGMA user_version").fetchone()[0] >= WORKSPACE_CONTRACT_SCHEMA
+
+
+# A process keeps one workspace protocol throughout its lifetime. The activation
+# release waits for users of the legacy protocol before committing the contract.
+WORKSPACE_ROWS_ACTIVE = workspace_rows_installed()
 _CHAIN = migrations.load()
-LATEST = _CHAIN[-1].n
+LATEST = _CHAIN[-1].n if WORKSPACE_ROWS_ACTIVE else WORKSPACE_CONTRACT_SCHEMA - 1
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
 SECRET_REGISTRY_SCHEMA = 27
@@ -193,6 +206,8 @@ def migrate(contracts=True):
             snapshot = None
             started_chain = False
             for migration in chain:
+                if migration.n == WORKSPACE_CONTRACT_SCHEMA and not WORKSPACE_ROWS_ACTIVE:
+                    break
                 if migration.n <= version:
                     continue
                 if migration.phase == "contract":
@@ -590,3 +605,7 @@ def enable_wal():
             raise RuntimeError("arete.db refused WAL mode")
     finally:
         conn.close()
+
+
+def require_workspace_contract():
+    migrate_on_demand(WORKSPACE_CONTRACT_SCHEMA)
