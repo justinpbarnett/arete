@@ -233,6 +233,10 @@ def reap_pending() -> None:
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
     global PENDING_REAPER
 
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
     with PENDING_LOCK, launch_lease.acquiring(repo_name, tid) as lease:
         before = set(run_ids(repo_name, tid))
         proc = spawn()
@@ -560,26 +564,6 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
-    if foundation.WORKSPACE_ROWS_ACTIVE:
-        return contracted_folder_removed(repo, tid, run_id)
-    try:
-        checkouts = [workspace.Checkout.from_row(c)
-                     for c in flows.prepared_data(run_id).get("checkouts") or []]
-    except (TypeError, KeyError):
-        checkouts = None
-    ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
-    with workspaces.folder_lock(ws):
-        row, imported = workspaces.import_legacy(ws)
-        if row and row["state"] == "removed":
-            return None if os.path.lexists(ws) else workspace.Release("removed")
-        if imported:
-            checkouts = checkouts or workspaces.owner_of(row).checkouts or workspace.registered_root_checkout(ws)
-        if checkouts is None:
-            return None
-        return workspace.remove_workspace(ws, checkouts, edits=True)
-
-
-def contracted_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
         row = workspaces.open_for(ws.name)
@@ -631,7 +615,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         folder = "its work folder was left in place"
         try:
             release = kept_folder_removed(repo, tid, run_id) if latest else None
-        except (OSError, sqlite3.Error, migrations.Refused, foundation.IncompatibleSchema, workspaces.SnapshotUnavailable) as e:
+        except (OSError, sqlite3.Error, foundation.IncompatibleSchema, migrations.Refused) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
             if release and release.state == "removed":

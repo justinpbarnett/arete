@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import config, gh, paths, record, sandbox, scratch, tracker, util
-from .store import db, runs
-from .store import workspaces
+from .store import db, runs, workspaces
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -916,17 +915,3 @@ def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str]
                         git(["worktree", "remove", "--force", str(c.wt)], c.src)
                 add_worktree(c, branch, start_of(c, starting_branch))
             clone["resumed"] = c.resumes
-
-
-# Processes started before the cutover retain their original snapshot protocol.
-if not db.WORKSPACE_ROWS_ACTIVE:
-    from . import workspace_legacy as legacy
-
-    OWNER_KEY = legacy.OWNER_KEY
-    WorkspaceOwner = legacy.WorkspaceOwner
-    remove_workspace = legacy.remove_workspace
-    remove_checkouts = legacy.remove_checkouts
-    made_record = legacy.made_record
-    made_before = legacy.made_before
-    owner_in = legacy.owner_in
-    _note_made = legacy._note_made

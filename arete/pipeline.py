@@ -756,19 +756,6 @@ class Run(AgentRun):
 
 
 def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
-    from .store import db
-
-    if db.WORKSPACE_ROWS_ACTIVE:
-        return contracted_workspace_owner(run, ws, checkouts)
-    row = workspaces.open_for(ws.name)
-    earlier = workspaces.owner_of(row) if row and (row["owner_run"] or row["legacy_owner"]) else None
-    if run.alone and earlier:
-        return earlier
-    created = earlier.created if earlier else ""
-    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
-
-
-def contracted_workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
     row = workspaces.open_for(ws.name)
     earlier = workspaces.owner_of(row) if row and row["owner_run"] else None
     if run.alone and earlier:
@@ -777,7 +764,6 @@ def contracted_workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Che
 
 
 def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
-    workspace.made_before(ws)
     owner = workspace_owner(run, ws, checkouts)
     workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
     run.workspace = ws, checkouts
@@ -1848,6 +1834,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         tid = tk.normalize(tid)
     except ValueError as e:
         print(f"{repo_name}: {e}")
+        return 1
+    try:
+        db.require_workspace_contract()
+    except db.IncompatibleSchema as e:
+        print(str(e))
         return 1
     if not script:
         recovery_child = launch_lease.recovery(repo.name, str(tid))

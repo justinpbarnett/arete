@@ -453,6 +453,8 @@ class Server:
         foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return False
+        if self.contracts_waiting:
+            return False
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
@@ -579,7 +581,7 @@ class Server:
             finished, self.deployment = self.deployment, None
             finished.result()
         now = time.monotonic()
-        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
+        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem and not self.contracts_waiting:
             self.deploy_at = now
             self.deployment = self.pool.submit(self.deploy_if_ready, self.cfg)
 
@@ -594,7 +596,10 @@ class Server:
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
             self.say(f"deploy: {receipt.tip} is healthy")
         elif receipt.expired():
-            self.restart_for_new_code()
+            if reason := serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous):
+                self.note_once(f"deploy: code-only rollback refused because {reason}")
+            else:
+                self.restart_for_new_code()
 
     def deploy_if_ready(self, cfg: config.Config) -> None:
         try:
