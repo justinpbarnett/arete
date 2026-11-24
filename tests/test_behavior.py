@@ -1130,7 +1130,7 @@ with db.tx() as c:
     before = snapshot(c)
 
 row = secretstore.put('global', 'DEMO_KEY', 'synthetic-upgrade-value', 'api_key', 'hand')
-assert_schema(27)
+assert_schema(db.LATEST)
 with db.reader() as c:
     assert snapshot(c) == before
 assert secretstore.get('global', 'DEMO_KEY') == row
