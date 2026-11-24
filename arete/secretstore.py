@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
+import errno
 import hmac
 import json
 import os
@@ -24,6 +26,7 @@ KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
+ACL_TYPE_EXTENDED = 0x100
 KEY_REF = "fingerprint_key_ref"
 KEY_LOCAL = "fingerprint_key_local"
 
@@ -138,10 +141,32 @@ def registry(*, write=False):
     return writes.atomic() if write else db.reader()
 
 
+def require_no_macos_acl(fd: int) -> None:
+    if not paths.ON_MAC:
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl, free_acl = libc.acl_get_fd_np, libc.acl_free
+        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+        get_acl.restype = ctypes.c_void_p
+        free_acl.argtypes = (ctypes.c_void_p,)
+        free_acl.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        raise StoreError("could not verify macOS ACL privacy for the secret store") from None
+    ctypes.set_errno(0)
+    acl = get_acl(fd, ACL_TYPE_EXTENDED)
+    if acl is not None:
+        free_acl(acl)
+        raise StoreError("secret store files and directories must not have macOS ACLs")
+    if ctypes.get_errno() != errno.ENOENT:
+        raise StoreError("could not verify macOS ACL privacy for the secret store")
+
+
 def require_private_directory(fd: int) -> None:
     info = os.fstat(fd)
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
         raise StoreError("secret store directory must have mode 0700 and belong to this user")
+    require_no_macos_acl(fd)
 
 
 @contextmanager
@@ -165,13 +190,18 @@ def private_file(info: os.stat_result) -> bool:
     return stat.S_IMODE(info.st_mode) == 0o600 and launch_lease.plain(info)
 
 
+def require_private_file(fd: int) -> None:
+    if not private_file(os.fstat(fd)):
+        raise StoreError("secret item must be a private regular file with mode 0600")
+    require_no_macos_acl(fd)
+
+
 def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
     try:
         with file_parent(path, root, private=private) as parent:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
-                if not private_file(os.fstat(fd)):
-                    raise StoreError("secret item must be a private regular file with mode 0600")
+                require_private_file(fd)
                 with os.fdopen(fd, "rb", closefd=False) as file:
                     return file.read()
             finally:
@@ -187,6 +217,7 @@ def write_file(path: Path, root: Path, value: bytes, *, private=False) -> None:
         try:
             with os.fdopen(fd, "wb") as file:
                 os.fchmod(file.fileno(), 0o600)
+                require_private_file(file.fileno())
                 file.write(value)
                 file.flush()
                 util.flush_fd(file.fileno())

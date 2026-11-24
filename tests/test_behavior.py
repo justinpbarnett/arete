@@ -461,6 +461,83 @@ assert all(argv in (find, delete) and stdin == '' for argv, stdin in calls[1:])
 """, keychain=True)
 
 
+class SecretBackendAclTests(_SecretChildCase):
+    adapter_only = True
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS filesystem ACLs")
+    def test_file_store_rejects_macos_acls(self):
+        self.run_secret_child(r"""
+import subprocess
+
+
+def chmod(*args):
+    subprocess.run(['/bin/chmod', *args], check=True, capture_output=True)
+
+
+settings = config.secret_settings()
+ref = secretstore.Reference('pve_store', '1234abcd', 'global/DEMO_KEY')
+value = b'synthetic ACL fixture\x00\xff'
+secretstore.write_item(ref, settings, value)
+file, root = secretstore.file_location(ref, settings)
+for target in (root, file.parent.parent, file.parent, file):
+    with case.subTest(target=target):
+        right, mode = ('read', 0o600) if target == file else ('search', 0o700)
+        chmod('+a', f'everyone allow {right}', target)
+        try:
+            assert target.stat().st_mode & 0o777 == mode
+            with case.assertRaisesRegex(secretstore.StoreError, 'must not have macOS ACLs'):
+                secretstore.read_item(ref, settings)
+        finally:
+            chmod('-N', target)
+assert secretstore.read_item(ref, settings) == value
+
+shared = root.parent / 'fixture-shared'
+shared.mkdir(mode=0o700)
+chmod('+a', 'everyone allow list,search,file_inherit,directory_inherit', shared)
+settings = config.SecretsConfig('pve_store', shared / 'store')
+with case.assertRaisesRegex(secretstore.StoreError, 'must not have macOS ACLs'):
+    secretstore.write_item(ref, settings, value)
+assert not any(path.is_file() for path in shared.rglob('*'))
+""")
+
+    def test_file_store_checks_temp_acl_before_writing_any_bytes(self):
+        self.run_secret_child(r"""
+import ctypes
+import errno
+import os
+import stat
+from contextlib import ExitStack
+
+settings = config.secret_settings()
+ref = secretstore.Reference('pve_store', '1234abcd', 'global/DEMO_KEY')
+file, _ = secretstore.file_location(ref, settings)
+for acl, error, message in ((123, 0, 'must not have macOS ACLs'),
+                            (None, errno.EIO, 'could not verify macOS ACL privacy'),
+                            (None, 0, 'could not verify macOS ACL privacy')):
+    with case.subTest(acl=acl, error=error), ExitStack() as cleanup:
+        retained = []
+
+        def get_acl(fd, acl_type):
+            assert acl_type == 0x100
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                ctypes.set_errno(errno.ENOENT)
+                return None
+            retained.append(os.dup(fd))
+            cleanup.callback(os.close, retained[-1])
+            ctypes.set_errno(error)
+            return acl
+
+        libc = mock.Mock()
+        libc.acl_get_fd_np.side_effect = get_acl
+        with (mock.patch.object(paths, 'ON_MAC', True), mock.patch.object(ctypes, 'CDLL', return_value=libc),
+              case.assertRaisesRegex(secretstore.StoreError, message)):
+            secretstore.write_item(ref, settings, b'synthetic value that must not be written')
+        case.assertEqual(len(retained), 1)
+        case.assertEqual(os.fstat(retained[0]).st_size, 0)
+        case.assertEqual(list(file.parent.iterdir()), [])
+""")
+
+
 class SecretBackendTests(_SecretChildCase):
     def test_keychain_uses_instance_service_and_sends_base64_on_stdin(self):
         self.run_secret_child(r"""
