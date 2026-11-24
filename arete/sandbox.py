@@ -280,7 +280,8 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...]) -> list[Path]:
     return metadata
 
 
-def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, run_id="", temporary=None, store=None):
+def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, run_id="", temporary=None,
+                       store=None, managed_profile=False):
     from . import guard
 
     state = paths.STATE_DIR.resolve()
@@ -294,13 +295,16 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
         writable.add(profile)
     if temporary is not None:
         writable.add(temporary)
+    resumed_profile = (managed_profile and profile and profile.name == "claude-openrouter"
+                       and profile.parent.parent == paths.RUNS_DIR.resolve())
     for root in writable:
         if root in (LINUX_SHM, LINUX_SHM.parent) or any(p.is_relative_to(root) for p in protected):
             raise ConfinementUnavailable("Claude writable directories must be separate from its protected state")
         if root.is_relative_to(config_root) or (store and root.is_relative_to(store)):
             raise ConfinementUnavailable("Claude cannot write to its configuration or secret store")
         if root.is_relative_to(state) and not (
-                worktrees in root.parents or any(root.is_relative_to(p.absolute()) for p in run_dirs)):
+                (worktrees != state and worktrees in root.parents) or (root == profile and resumed_profile)
+                or any(root.is_relative_to(p.absolute()) for p in run_dirs)):
             raise ConfinementUnavailable("Claude cannot write to instance coordination state")
     for path in (*run_dirs, *((profile,) if profile is not None else ())):
         with paths.directory_fd(path.absolute(), create=True):
@@ -318,7 +322,7 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
 def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
                        profile: Path | None = None, mount_lease: ExitStack | None = None,
                        activation_lease: WorkerLease | None = None, run_id: str = "",
-                       temporary: Path | None = None) -> list[str]:
+                       temporary: Path | None = None, managed_profile: bool = False) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
@@ -348,7 +352,8 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         if store is not None and any(root.is_relative_to(store) for root in targets):
             raise ConfinementUnavailable("Claude cannot start inside the secret store")
         masks = linux_fingerprint_mounts(key, info, targets) if info is not None else []
-        restored = linux_claude_mounts(checkouts, profile, run_id=run_id, temporary=temporary, store=store)
+        restored = linux_claude_mounts(checkouts, profile, run_id=run_id, temporary=temporary,
+                                      store=store, managed_profile=managed_profile)
     except ConfinementUnavailable:
         raise
     except secretstore.FingerprintKeyMissing as error:

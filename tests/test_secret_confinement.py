@@ -6,7 +6,7 @@ class AuthorityClaudeConfinementTests(_SecretChildCase):
         self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 checkout = linux_checkout()
-extra = state / 'additional'
+extra = checkout.parent / 'additional'
 extra.mkdir()
 ordinary, state_control = checkout / 'control.txt', state / 'control.txt'
 ordinary.write_text('ordinary fixture')

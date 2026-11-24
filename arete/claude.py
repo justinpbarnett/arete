@@ -248,7 +248,8 @@ def _run(
                 try:
                     confined = sandbox.claude_confinement(
                         cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,
-                        activation_lease=activation, run_id=env.get("ARETE_RUN_ID", ""), temporary=temporary)
+                        activation_lease=activation, run_id=env.get("ARETE_RUN_ID", ""), temporary=temporary,
+                        managed_profile=openrouter_config is not None)
                     try:
                         proc = child.stream(activation.command(confined), str(cwd), prompt, env, timeout, after_mounts)
                     except OSError as e:

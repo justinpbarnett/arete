@@ -1573,7 +1573,7 @@ bwrap = '/usr/bin/bwrap'
 store_mask = ['--tmpfs', str(store), '--remount-ro', str(store)]
 key_mask = ['--ro-bind', os.devnull, str(key)]
 
-def linux_checkout(parent=state / 'worktrees'):
+def linux_checkout(parent=paths.WORKTREES_DIR):
     checkout = parent / 'checkout'
     checkout.mkdir(parents=True)
     return checkout
@@ -1599,17 +1599,34 @@ def assert_missing_bwrap(which, stream, checkout, **options):
     stream.assert_not_called()
     which.return_value = bwrap
 
-def linux_mounts(checkout, *masks):
-    return ['--bind', '/', '/', '--proc', '/proc', '--dev', '/dev', *masks,
-            '--chdir', str(checkout), '--', '/fixture/claude']
+def assert_linux_policy(argv, env, checkout, masks, extra=()):
+    from arete import guard
+
+    end = argv.index('--')
+    policy = argv[:end]
+    assert argv[end - 2:end + 2] == ['--chdir', str(checkout), '--', '/fixture/claude']
+    assert ['--ro-bind', '/', '/'] == policy[policy.index('--new-session') + 1:policy.index('--proc')]
+    assert policy[policy.index('--proc'):policy.index('--dev') + 2] == ['--proc', '/proc', '--dev', '/dev']
+    readonly = {tuple(policy[i + 1:i + 3]) for i, flag in enumerate(policy) if flag == '--ro-bind'}
+    assert (str(state), str(state)) in readonly
+    assert ('/dev/null', str(key)) in readonly if '--ro-bind' in masks else ('/dev/null', str(key)) not in readonly
+    profile = Path(env.get('CLAUDE_CONFIG_DIR') or Path(env['HOME']) / '.claude').resolve()
+    added = {Path(argv[i + 1]).resolve() for i, flag in enumerate(argv[:-1]) if flag == '--add-dir'}
+    allowed = {checkout.resolve(), profile, Path(env['TMPDIR']), *extra, *added,
+               *(p.resolve() for p in guard.run_folders(env.get('ARETE_RUN_ID', '')))}
+    writes = {Path(policy[i + 2]) for i, flag in enumerate(policy) if flag == '--bind'}
+    assert writes == {p for p in allowed if allowed.isdisjoint(p.parents)}, (writes, allowed)
+    assert all(state != p and not state.is_relative_to(p) for p in writes)
+    if masks:
+        assert policy[-len(masks) - 2:-2] == list(masks)
 
 def assert_mounts(stream, checkout, *masks):
-    argv = stream.call_args.args[0]
+    argv, _, _, env, *_ = stream.call_args.args
     assert argv[0] == bwrap
     assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc',
             '--die-with-parent', '--new-session'} <= set(argv)
     assert argv[argv.index('--cap-drop') + 1] == 'ALL'
-    assert argv[argv.index('--bind'):argv.index('--') + 2] == linux_mounts(checkout, *masks)
+    assert_linux_policy(argv, env, checkout, masks)
     if '--tmpfs' in masks:
         assert store.stat().st_mode & 0o777 == 0o700
 """

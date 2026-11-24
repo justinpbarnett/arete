@@ -113,8 +113,7 @@ secretstore.write_file(key, key.parent, b'F' * 32)
 with linux_claude() as (_, stream):
     assert run_claude(checkout).ok
     stream.assert_called_once()
-    checkout_mount = ['--bind', str(checkout), str(checkout)]
-    assert_mounts(stream, checkout, *checkout_mount, *key_mask, *store_mask)
+    assert_mounts(stream, checkout, *key_mask, *store_mask)
 """)
 
     def test_linked_and_secondary_checkouts_with_redirected_session_and_hook_state(self):
@@ -147,8 +146,7 @@ def binds(*roots):
     return [arg for p in sorted(roots) for arg in ('--bind', str(p), str(p))]
 
 def worker(cmd, cwd, prompt, env, timeout, on_line):
-    masks = [*binds(checkout, secondary, source / '.git', profile, state), *key_mask, *store_mask]
-    assert cmd[cmd.index('--bind'):cmd.index('--') + 2] == linux_mounts(checkout, *masks)
+    assert_linux_policy(cmd, env, checkout, [*key_mask, *store_mask], extra=(secondary, source / '.git'))
     assert cmd[cmd.index('--add-dir') + 1] == str(secondary)
     assert git(cwd, 'status', '--short') == ' M notes.txt\n'
     assert '+linked edit' in git(cwd, 'diff', '--', 'notes.txt')
@@ -167,7 +165,8 @@ def worker(cmd, cwd, prompt, env, timeout, on_line):
     payload = {'hook_event_name': 'PostToolUse', 'tool_name': 'Skill', 'tool_input': {'skill': 'fixture'},
                'session_id': session, 'cwd': cwd}
     assert Path(env['ARETE_STATE_DIR']) == paths.EVENTS_FILE.parent
-    with mock.patch.object(tool_events.sys, 'stdin', StringIO(json.dumps(payload))):
+    with (mock.patch.object(tool_events.sys, 'stdin', StringIO(json.dumps(payload))),
+          mock.patch.dict(os.environ, {tool_events.WORKER_HOOK_SOCKET: env[tool_events.WORKER_HOOK_SOCKET]})):
         assert tool_events.main() == 0
     result = json.dumps({'type': 'result', 'result': 'fixture', 'session_id': session})
     on_line(result + '\n')
@@ -177,8 +176,8 @@ options = {'auth': accounts.Auth(), 'passing': [], 'add_dirs': [secondary],
            'extra_env': {'CLAUDE_CONFIG_DIR': str(profile)}}
 with mock.patch.object(sandbox, 'LINUX_SHM', shm), linux_claude() as (_, stream):
     # A Git link alone does not authorize an external mount.
-    assert sandbox.linux_claude_mounts((checkout,), None) == binds(checkout, state)
-    with case.assertRaisesRegex(sandbox.ConfinementUnavailable, 'shared device directory'):
+    assert sandbox.linux_claude_mounts((checkout,), None) == ['--ro-bind', str(state), str(state), *binds(checkout)]
+    with case.assertRaisesRegex(sandbox.ConfinementUnavailable, 'protected state'):
         sandbox.linux_claude_mounts((shm,), None)
     workspaces.claim(checkout, 'fixture', '', '', checkouts=[linked])
     stream.side_effect = worker
