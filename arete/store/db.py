@@ -613,9 +613,15 @@ def after_commit(callback: Callable[[], None]) -> None:
     _OWNER.after_commit.append(callback)
 
 
-def in_write():
+def transaction_mode():
     active = getattr(_OWNER, "active", None)
-    return bool(active and active[:2] == (os.getpid(), "write") and active[2].in_transaction)
+    if active and active[0] == os.getpid() and active[2].in_transaction:
+        return active[1]
+    return None
+
+
+def in_write():
+    return transaction_mode() == "write"
 
 
 def ensure_schema() -> None:
