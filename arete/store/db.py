@@ -15,6 +15,7 @@ from pathlib import Path
 from .. import dbstats, paths, util
 from . import migrations
 from .migrations import m0002_foundation_time_shape as time_shape
+from .migrations import m0028_workspaces_contract as workspace_contract
 
 TABLES = {"schema_meta": "kept", "schema_migrations": "kept"}
 DB_LOCK = threading.Lock()
@@ -222,17 +223,16 @@ def workspace_handoff_blockers(conn, snapshots):
 
 
 def new_workspace_store(conn):
-    return (conn.execute("SELECT 1 FROM schema_meta WHERE key = 'new_workspace_store'").fetchone() is not None
+    return (conn.execute("SELECT 1 FROM schema_meta WHERE key = 'new_workspace_store' AND value = '1'").fetchone() is not None
             and workspace_store_is_new())
 
 
 def workspace_handoff_ready(snapshots: Path | None) -> bool:
-    from .migrations.m0028_workspaces_contract import snapshot_directory
-
-    if snapshots is None:
-        with reader() as conn:
+    with reader() as conn:
+        snapshots = workspace_contract.snapshot_source(conn, snapshots)
+        if snapshots is None:
             return new_workspace_store(conn)
-    with snapshot_directory(snapshots):
+    with workspace_contract.snapshot_directory(snapshots):
         return True
 
 
@@ -288,7 +288,7 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
                     try:
-                        blockers = (workspace_handoff_blockers(conn, workspace_snapshots)
+                        blockers = (workspace_handoff_blockers(conn, workspace_contract.snapshot_source(conn, workspace_snapshots))
                                     if migration.n == WORKSPACE_CONTRACT_SCHEMA else contract_blockers(conn, migration.n))
                     finally:
                         conn.close()
@@ -305,20 +305,22 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
                     timing = dbstats.Timing(paths.DB_FILE, "write")
                     with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
                         if migration.n == WORKSPACE_CONTRACT_SCHEMA:
-                            if blockers := workspace_handoff_blockers(writer, workspace_snapshots):
+                            source = workspace_contract.snapshot_source(writer, workspace_snapshots)
+                            if blockers := workspace_handoff_blockers(writer, source):
                                 print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
                                 return True
                             from .. import install
 
                             if paths.DB_FILE.parent == paths.STATE_DIR and install.serve_guard_file().exists():
                                 install.write_serve_guard()
-                            migration.apply(writer, workspace_snapshots)
+                            migration.apply(writer, source)
                         elif migration.sql is not None:
                             execute_statements(writer, migration.sql)
                         else:
                             migration.apply(writer)
-                        if migration.n == 1 and fresh_workspaces:
-                            writer.execute("INSERT INTO schema_meta (key, value) VALUES ('new_workspace_store', '1')")
+                        if migration.n == 1 and chain[-1].n >= WORKSPACE_CONTRACT_SCHEMA:
+                            writer.execute("INSERT INTO schema_meta (key, value) VALUES ('new_workspace_store', ?)",
+                                           ("1" if fresh_workspaces else "0",))
                         writer.execute("INSERT INTO schema_migrations "
                                        "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
                                        (migration.n, migration.name, migration.area, migration.phase, migration.sha256,

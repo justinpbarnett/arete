@@ -16,6 +16,32 @@ class MalformedSnapshot(InvalidSnapshot):
     pass
 
 
+def snapshot_source(conn, explicit):
+    from arete import paths
+
+    if explicit is not None:
+        return explicit
+    if paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve():
+        return None
+    meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('instance_id', 'new_workspace_store')"))
+    try:
+        with paths.directory_fd(paths.DB_FILE.parent.resolve() / paths.backups_dir().name) as fd:
+            with os.fdopen(os.open("instance.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), "rb") as src:
+                info = os.fstat(src.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                    return None
+                marker = json.loads(src.read(4097))
+    except (OSError, ValueError):
+        return None
+    if (meta.get("new_workspace_store") == "0" or not isinstance(marker, dict)
+            or not meta.get("instance_id") or marker.get("instance_id") != meta["instance_id"]):
+        return None
+    folder = paths.STATE_DIR / "workspaces"
+    if not folder.exists() and conn.execute("SELECT 1 FROM workspaces WHERE state != 'removed' AND legacy_mtime_ns > 0 LIMIT 1").fetchone():
+        return None
+    return folder
+
+
 def signature(st):
     return st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_ctime_ns, st.st_mtime_ns
 

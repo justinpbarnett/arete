@@ -530,9 +530,10 @@ assert workspaces.files(row["id"]) == {"sample.txt": workspace.fingerprint(outpu
 
 
 class WorkspaceMigrationTests(_WorkspaceChildCase):
-    def test_first_workspace_read_waits_for_explicit_handoff_on_an_older_database(self):
+    def test_moved_database_needs_an_explicit_snapshot_directory(self):
         self.run_child(workspace_schema(23) + """
 ws = paths.WORKTREES_DIR / "sample"
+(paths.backups_dir() / "instance.json").unlink()
 with case.assertRaisesRegex(db.IncompatibleSchema, "--workspace-snapshots"):
     workspace.made_before(ws)
 assert schema_version() == 27
@@ -710,7 +711,8 @@ for source in root.rglob("*.py"):
                         and isinstance(node.args[0], ast.Constant) and node.args[0].value == "workspaces"), source
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             if isinstance(node.right, ast.Constant) and node.right.value == "workspaces":
-                assert ast.unparse(node.left).split(".")[-1] != "STATE_DIR", source
+                if ast.unparse(node.left).split(".")[-1] == "STATE_DIR":
+                    assert source.name == "m0028_workspaces_contract.py", source
 """)
 
 
@@ -1329,7 +1331,7 @@ assert schema_version() == db.LATEST
 
 
 class WorkspaceCutoverInputTests(_WorkspaceChildCase):
-    def test_existing_install_schedules_after_checking_its_declared_absent_snapshot_directory(self):
+    def test_in_place_upgrade_schedules_after_automatically_checking_its_snapshot_directory(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from types import SimpleNamespace
 from arete import serve, serve_guard
@@ -1352,12 +1354,6 @@ def handle(label, *_):
 
 with (patch.object(server, "guard", side_effect=handle) as stage,
       patch.object(serve_guard, "at_tip", return_value=True)):
-    server.acknowledge_deploy(server.tick())
-    assert not serve_guard.read(receipt_path)["healthy"]
-    assert server.contracts_waiting and schema_version() == 27
-    assert [call.args[0] for call in stage.call_args_list] == ["tick:load"]
-
-    paths.CONFIG_FILE.write_text(f"[serve]\nworkspace_snapshots = {json.dumps(str(legacy))}\n")
     server.acknowledge_deploy(server.tick())
     assert serve_guard.read(receipt_path)["healthy"] and server.contracts_waiting
     assert server.tick() and not server.contracts_waiting
@@ -1422,7 +1418,7 @@ rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schem
 saved = {workspace.head_key(c): head, workspace.onto_key(c): onto}
 legacy_record(ws, c, rid, saved)
 
-assert not db.migrate(workspace_snapshots=legacy)
+assert not db.migrate()
 row = workspaces.open_for(ws.name)
 assert row["state"] == "kept" and row["owner_run"] == rid
 assert workspace.made_before(ws) == saved
