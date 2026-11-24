@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 import stat
 import time
@@ -785,23 +784,23 @@ def _sweep_unowned(cfg: config.Config, ws: Path, cutoff: float) -> None:
         try:
             recorded = _read_record(source)
         except UnreadableSnapshot:
-            if names := workspace.unexamined(ws, set()):
-                _record_orphan(ws, owner.repo, modified, names)
+            if not (names := workspace.unexamined(ws, set())):
+                return
+        else:
+            if recorded and (recorded[0] is not None or legacy_owner(cfg, ws, {}, require_history=True).ticket):
+                return
+            names = workspace.unexamined(ws, set())
+            if not names and workspace.scratch_left(ws, []):
+                return
+            _require_record_version(source, recorded[2] if recorded else None)
+        if names:
+            create(ws.name, repo=owner.repo, state="held", held_by=names, bytes=workspace.tree_bytes(ws),
+                   made_at=util.iso(datetime.fromtimestamp(modified, UTC)))
             return
-        if recorded and (recorded[0] is not None or legacy_owner(cfg, ws, {}, require_history=True).ticket):
-            return
-        version = recorded[2] if recorded else None
-        if names := workspace.unexamined(ws, set()):
-            _require_record_version(source, version)
-            _record_orphan(ws, owner.repo, modified, names)
-        elif not workspace.scratch_left(ws, []) and not workspace.unexamined(ws, set()):
-            _require_record_version(source, version)
-            shutil.rmtree(ws, ignore_errors=True)
-
-
-def _record_orphan(ws: Path, repo: str, modified: float, names: list[str]) -> None:
-    create(ws.name, repo=repo, state="held", held_by=names, bytes=workspace.tree_bytes(ws),
-           made_at=util.iso(datetime.fromtimestamp(modified, UTC)))
+        for _, children, _, parent in os.fwalk(ws, topdown=False):
+            for child in children:
+                os.rmdir(child, dir_fd=parent)
+        ws.rmdir()
 
 
 def sweep(cfg: config.Config) -> None:
