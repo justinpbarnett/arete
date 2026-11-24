@@ -186,6 +186,7 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
+        merge_verification = self.run.recovery.get("merge_verification") is True
         prepared = self.data.get("prepared")
         restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
         if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
@@ -196,7 +197,7 @@ class Controller:
         if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
-            if self.run.recovery.get("merge_verification"):
+            if merge_verification and not pending_push:
                 ticket = self.run.tracker.get(self.run.tid)
                 prepared["ticket"] = asdict(ticket)
                 prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
@@ -325,7 +326,7 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.run.environment_release or self.run.recovery.get("merge_verification"):
+        if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         if restore_prs:
@@ -928,7 +929,7 @@ class Controller:
                 util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
                 for c in checkouts
             ):
-                merge_verification = self.run.recovery.get("merge_verification")
+                merge_verification = self.run.recovery.get("merge_verification") is True
                 if ((self.run.environment_release or merge_verification) and not self.data.get("ci_failed")
                         and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
                     whole = staged if b.from_base else b.restage(from_base=True)
