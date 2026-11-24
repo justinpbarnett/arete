@@ -105,9 +105,11 @@ def open_for(name: str) -> dict | None:
         return _decode(c.execute("SELECT * FROM workspaces WHERE name = ? AND state != 'removed'", (name,)).fetchone())
 
 
-def by_state(*states: str) -> list[dict]:
-    migrate_on_demand()
-    with reader() as c:
+def by_state(*states: str, connect=None) -> list[dict]:
+    if connect is None:
+        migrate_on_demand()
+        connect = reader
+    with connect() as c:
         marks = ", ".join("?" for _ in states)
         return [_decode(row) for row in c.execute(
             f"SELECT * FROM workspaces WHERE state IN ({marks}) ORDER BY released_at, id", states)]
