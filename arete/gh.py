@@ -301,8 +301,23 @@ def issue_edit_body(repo: str, number: int, body: str) -> None:
     gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
-def issue_merge_commit(repo: str, number: int, base: str) -> str:
+def issue_graph(repo: str, number: int, query: str, *, paginate: bool = False) -> list[dict]:
     owner, name = repo.split("/", 1)
+    args = ["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+            "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]
+    try:
+        result = gh_json([*args, "--paginate", "--slurp"] if paginate else args)
+        pages = result if paginate else [result]
+        if isinstance(pages, list) and pages and not any(page.get("errors") for page in pages):
+            issues = [page["data"]["repository"]["issue"] for page in pages]
+            if all(isinstance(issue, dict) for issue in issues):
+                return issues
+    except (json.JSONDecodeError, AttributeError, TypeError, KeyError):
+        pass
+    raise GhError(f"Could not read GitHub issue {repo}#{number}")
+
+
+def issue_merge_commit(repo: str, number: int, base: str) -> str:
     query = """
     query($owner:String!, $name:String!, $number:Int!) {
       repository(owner:$owner, name:$name) {
@@ -323,14 +338,7 @@ def issue_merge_commit(repo: str, number: int, base: str) -> str:
     }
     """
     unreadable = f"Could not confirm closure of {repo}#{number}"
-    try:
-        result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
-                          "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")])
-    except json.JSONDecodeError as error:
-        raise GhError(unreadable) from error
-    if not isinstance(result, dict) or result.get("errors"):
-        raise GhError(unreadable)
-    issue = ((result.get("data") or {}).get("repository") or {}).get("issue") or {}
+    issue, = issue_graph(repo, number, query)
     if issue.get("state") not in ("OPEN", "CLOSED"):
         raise GhError(unreadable)
     if (issue["state"], issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
@@ -350,25 +358,7 @@ def issue_merge_commit(repo: str, number: int, base: str) -> str:
     return ""
 
 
-@dataclass(frozen=True)
-class PrerequisitePull:
-    repo: str
-    number: int
-    state: str
-    base: str
-    merge_commit: str
-
-    @property
-    def key(self) -> str:
-        return f"{self.repo}#{self.number}"
-
-    @property
-    def url(self) -> str:
-        return f"https://github.com/{self.repo}/pull/{self.number}"
-
-
-def prerequisite_pulls(repo: str, number: int) -> list[PrerequisitePull]:
-    owner, name = repo.split("/", 1)
+def prerequisite_pulls(repo: str, number: int) -> dict[tuple[str, int], tuple[str, str, str]]:
     query = """
     query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
       repository(owner:$owner, name:$name) {
@@ -381,32 +371,26 @@ def prerequisite_pulls(repo: str, number: int) -> list[PrerequisitePull]:
       }
     }
     """
-    args = ["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
-            "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}"), "--paginate", "--slurp"]
     unreadable = f"Could not read linked PRs for {repo}#{number}"
-    try:
-        pages = gh_json(args)
-    except json.JSONDecodeError as error:
-        raise GhError(unreadable) from error
-    if not isinstance(pages, list) or not pages or not all(isinstance(p, dict) for p in pages):
-        raise GhError(unreadable)
     pulls = {}
-    for page in pages:
-        issue = ((page.get("data") or {}).get("repository") or {}).get("issue") or {}
-        nodes = (issue.get("closedByPullRequestsReferences") or {}).get("nodes")
-        if page.get("errors") or not isinstance(nodes, list):
-            raise GhError(unreadable)
-        for pr in filter(None, nodes):
-            name = ((pr.get("repository") or {}).get("nameWithOwner") or "").casefold()
-            n, state = pr.get("number"), pr.get("state")
-            if (not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", name) or type(n) is not int or n < 1
-                    or state not in ("OPEN", "MERGED", "CLOSED")):
-                continue
-            sha = (pr.get("mergeCommit") or {}).get("oid") or ""
-            sha = sha if state == "MERGED" and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
-            pull = PrerequisitePull(name, n, state.lower(), pr.get("baseRefName") or "", sha)
-            pulls[pull.key] = pull
-    return sorted(pulls.values(), key=lambda p: (p.repo, p.number))
+    try:
+        for issue in issue_graph(repo, number, query, paginate=True):
+            nodes = (issue.get("closedByPullRequestsReferences") or {}).get("nodes")
+            if not isinstance(nodes, list):
+                raise GhError(unreadable)
+            for pr in filter(None, nodes):
+                name = ((pr.get("repository") or {}).get("nameWithOwner") or "").casefold()
+                n, state = pr.get("number"), pr.get("state")
+                if (not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", name) or type(n) is not int or n < 1
+                        or state not in ("OPEN", "MERGED", "CLOSED")):
+                    continue
+                sha = (pr.get("mergeCommit") or {}).get("oid") or ""
+                sha = sha if state == "MERGED" and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+                base = pr.get("baseRefName")
+                pulls[name, n] = state.lower(), base if isinstance(base, str) else "", sha
+    except (AttributeError, TypeError) as error:
+        raise GhError(unreadable) from error
+    return pulls
 
 
 def issue_reopen(repo: str, number: int) -> None:

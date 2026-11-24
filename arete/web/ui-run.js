@@ -1,5 +1,6 @@
 import { h, Component } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
+import { effect } from "./vendor-signals.js";
 import { createList, ListHeader } from "./ui-list.js";
 import { syncList, selectItem, pane, activatePane } from "./ui-keys.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
@@ -9,7 +10,7 @@ import { webFetch } from "./ui-request.js";
 import { notice } from "./ui-notice.js";
 import { parse } from "./ui-router.js";
 import { runHash as hashOf, taskHash } from "./ui-data.js";
-import { snapshot } from "./ui-live.js";
+import { runView, snapshot } from "./ui-live.js";
 import { TicketProgress } from "./ui-work.js";
 
 const html = htm.bind(h);
@@ -177,6 +178,7 @@ function Steps({ view }) {
 
 export const stepsOf = (view) => reduceSteps(view.events).filter((row) => row.kind === "step").length;
 const recordedTurns = (view) => view.events.reduce((sum, event) => sum + (event.event === "step_end" && Number.isFinite(event.turns) ? event.turns : 0), 0);
+const liveProgress = (rows, run) => rows?.find((row) => row.repo === run.repo && String(run.issue) === row.issue);
 
 function Head({ view, now }) {
   const run = view.detail.run;
@@ -186,14 +188,11 @@ function Head({ view, now }) {
   const tokensIn = models.reduce((sum, model) => sum + (model.tokens_in || 0), 0);
   const tokensOut = models.reduce((sum, model) => sum + (model.tokens_out || 0), 0);
   const prs = pullUrls(run.pr_url);
-  const detailProgress = view.detail.ticket_progress;
-  const current = detailProgress && snapshot.value.live?.ticket_progress?.rows?.find(
-    (row) => row.repo === run.repo && String(run.issue) === row.issue);
-  const detailTiming = detailProgress?.timing;
-  const latestTiming = current?.timing;
-  const timing = latestTiming?.run_ids?.includes(run.id)
-    && (!detailTiming || Date.parse(latestTiming.as_of) >= Date.parse(detailTiming.as_of)) ? latestTiming : detailTiming;
-  const progress = current ? { ...current, timing } : detailProgress;
+  let progress = view.detail.ticket_progress;
+  const current = progress && liveProgress(snapshot.value.live?.ticket_progress?.rows, run);
+  if (current && !(Date.parse(progress.timing?.as_of) > Date.parse(current.timing?.as_of))) {
+    progress = { ...current, timing: current.timing?.run_ids?.includes(run.id) ? current.timing : progress.timing };
+  }
   return html`<header class="run-head">
     <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${runWord(run)}</span>
       <span class="run-id mono">${run.id}</span>
@@ -283,21 +282,32 @@ export class RunFocus extends Component {
     if (!open.delete(key)) open.add(key);
     this.setState({ open });
   };
-  componentDidMount() { focus = this; this.sync(); }
-  componentDidUpdate(previous) {
+  componentDidMount() {
     focus = this;
     this.sync();
-    const before = previous.view.detail;
-    const after = this.props.view.detail;
-    if (before?.run.status === "running" && after?.run.id === before.run.id && after.run.status !== "running"
-        && before.ticket_progress && after.ticket_progress === before.ticket_progress) this.props.retry();
+    let before, wasDraft, wasMissing;
+    this.unwatchProgress = effect(() => {
+      const { id, detail } = runView.value;
+      const rows = snapshot.value.live?.ticket_progress?.rows;
+      if (id !== this.props.view.id || !detail?.ticket_progress) return;
+      const current = liveProgress(rows, detail.run);
+      const missing = rows && !current && (wasDraft || detail.ticket_progress.follow_up?.draft);
+      const ended = before?.run.status === "running" && detail.run.status !== "running"
+        && detail.ticket_progress === before.ticket_progress;
+      const refresh = ended || missing && !wasMissing;
+      if (rows) [wasDraft, wasMissing] = [current?.follow_up?.draft, missing];
+      before = detail;
+      if (refresh) this.props.retry();
+    });
   }
+  componentDidUpdate() { focus = this; this.sync(); }
   componentWillUnmount() {
     if (focus === this) focus = null;
+    this.unwatchProgress();
     this.unregister?.();
   }
   sync() {
-    const id = this.props.view.detail?.run?.id ?? "";
+    const id = this.props.view.detail?.run.id ?? "";
     if (this.registered !== id) {
       this.unregister?.();
       this.registered = id;

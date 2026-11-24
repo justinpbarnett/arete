@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+from contextlib import suppress
 from dataclasses import dataclass
 
 from .. import outbound, paths, record, util
-from . import runs, ticket_progress
+from . import ticket_progress
 from .db import WORKER_EXCHANGE_SCHEMA, migrate_on_demand, migration_applied, reader, tx
 
 TABLES = {"orchestrations": "run lineage", "orchestration_turns": "run lineage",
@@ -204,51 +206,27 @@ def transition(lease: Lease, action: str, state: str, result: dict, expected=("a
         return transition_in(c, lease, action, state, result, expected)
 
 
-def execution_timing(lease: Lease, previous: str, state: str, timing: dict | None, at: str) -> dict | None:
-    if timing is None:
-        if previous == "accepted" and state == "running":
-            return {"run_id": lease.run, "started_at": at, "finished_at": None}
-        return None
-    if state in TERMINAL and timing["run_id"] == lease.run and timing["finished_at"] is None:
-        return {**timing, "finished_at": at}
-    return timing
-
-
-def check_timeline(run_id: str):
-    return paths.record_dir(run_id) / record.TIMELINE
-
-
 def timeline_cursor(run_id: str) -> int | None:
     try:
-        return check_timeline(run_id).stat().st_size
-    except FileNotFoundError:
-        return 0
-    except OSError:
-        return None
+        return (paths.record_dir(run_id) / record.TIMELINE).stat().st_size
+    except OSError as error:
+        return 0 if isinstance(error, FileNotFoundError) else None
 
 
-def report_failed_checks(lease: Lease, action: str, cursor: int) -> None:
-    run = runs.run_get(lease.run)
-    if (not run or run["kind"] != "pipeline" or not run["repo"] or not run["issue"] or run.get("only_step")
-            or run["dry_run"] or run["status"] == "dry-run"):
-        return
-    trail = record.AppendedLines(check_timeline(lease.run))
+def failed_checks(run_id: str, attempt: str, cursor: int, suite: str = ""):
+    trail = record.AppendedLines(paths.record_dir(run_id) / record.TIMELINE)
     trail.offset = cursor
-    attempt = f"{lease.root}/{action}"
-    evidence = []
-    try:
+    with suppress(OSError):
         for row in record.entries(trail.read()):
             name, command, code = row.get("name"), row.get("command"), row.get("exit")
-            if (row.get("kind") != "check" or not isinstance(name, str) or not isinstance(command, str)
-                    or type(code) is not int or code == 0):
+            diagnostic = row.get("diagnostic_sha")
+            if (row.get("kind") != "check" or (suite and row.get("suite") != suite)
+                    or not isinstance(name, str) or not isinstance(command, str) or type(code) is not int or code == 0
+                    or not isinstance(diagnostic, str) or not re.fullmatch(r"[0-9a-f]{64}", diagnostic)):
                 continue
-            cause = "check:" + digest([name, command, code])
+            cause = "check:" + digest([name, command, code, diagnostic])
             label = outbound.sanitize(outbound.screen(name), 100) or "Configured check"
-            evidence.append((cause, attempt, f"Check {label} failed again (exit {code})."))
-    except OSError:
-        return
-    if evidence:
-        ticket_progress.record(run["repo"], run["issue"], evidence=evidence)
+            yield cause, attempt or suite, f"Check {label} failed again (exit {code})."
 
 
 def transition_in(c, lease, action, state, result, expected=("accepted", "running")):
@@ -264,18 +242,24 @@ def transition_in(c, lease, action, state, result, expected=("accepted", "runnin
     result = {**{key: kept[key] for key in retained if key in kept}, **result}
     at = util.iso()
     result.pop("timing", None)
-    timing = execution_timing(lease, row["state"], state, previous["timing"], at)
+    started = row["state"] == "accepted" and state == "running"
+    timing = previous["timing"]
+    if timing is None and started:
+        timing = {"run_id": lease.run, "started_at": at, "finished_at": None}
+    elif timing and state in TERMINAL and timing["run_id"] == lease.run and timing["finished_at"] is None:
+        timing = {**timing, "finished_at": at}
     stored = {**result, "timing": timing} if timing else dict(result)
     if row["op"] == "checks.run":
-        cursor = kept.get("check_timeline_cursor")
-        if state == "running":
-            if row["state"] == "accepted":
-                cursor = timeline_cursor(lease.run)
-            if cursor is not None:
-                stored["check_timeline_cursor"] = cursor
-        if (row["state"] == "running" and row["run"] == lease.run and state in ("succeeded", "failed")
-                and result.get("passed") is False and cursor is not None):
-            report_failed_checks(lease, action, cursor)
+        cursor = timeline_cursor(lease.run) if started else kept.get("check_timeline_cursor")
+        passed = result.get("passed")
+        if state == "running" and cursor is not None:
+            stored["check_timeline_cursor"] = cursor
+        elif (row["state"] == "running" and timing and cursor is not None
+              and (timing["run_id"] == lease.run or state == "interrupted")
+              and ((passed is False and state in ("succeeded", "failed"))
+                   or (passed is None and state in ("failed", "interrupted")))):
+            run_id = timing["run_id"]
+            ticket_progress.record_evidence(run_id, failed_checks(run_id, f"{lease.root}/{action}", cursor))
     c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",
               (state, encoded(stored), at, lease.root, action))
     if (row["op"] == "run.wait" and row["state"] == "running" and state == "succeeded"

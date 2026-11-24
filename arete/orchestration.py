@@ -1638,8 +1638,12 @@ class Controller(worker_turns.WorkerTurns):
             self.job.goal, self.job.fix_reply = goal + references, reply + references
             try:
                 with self.selected(setting):
-                    outcome = self.atomic(role, **({"tree": str(self.job.ws), "single": True} if role == "verify"
-                                                   else {"attempt": self.job.reviews + 1}))
+                    if role == "verify":
+                        admitted_run = action.get("run") or self.run.id
+                        outcome = self.atomic(role, tree=str(self.job.ws), single=True,
+                                              progress_attempt=f"{admitted_run}/{action['id']}")
+                    else:
+                        outcome = self.atomic(role, attempt=self.job.reviews + 1)
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
@@ -1656,7 +1660,12 @@ class Controller(worker_turns.WorkerTurns):
                 raise ValueError("; ".join(errors))
             return self.atomic("orchestrate_ask", request=ask).data
         if op == "publication.request":
-            return self.publish(args.get("unverified_measurement"))
+            previous = getattr(self.run, "publication_check_attempt", "")
+            self.run.publication_check_attempt = f"{action.get('run') or self.run.id}/{action['id']}"
+            try:
+                return self.publish(args.get("unverified_measurement"))
+            finally:
+                self.run.publication_check_attempt = previous
         if op == "run.finish":
             if args["reason"] == "noop" and self.data.get("ci_failed"):
                 raise ValueError("CI is still failed; retry CI through publication.request, repair, or finish failed")

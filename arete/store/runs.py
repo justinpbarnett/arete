@@ -158,6 +158,64 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
+DRAFT_READY = "run.draft-review.ready"
+DRAFT_READY_RECEIPT = """
+SELECT e.at FROM events_log e WHERE e.subject = 'run:' || r.id AND e.kind = ?
+    AND json_extract(e.data, '$.pr_url') = r.pr_url
+"""
+
+
+def ticket_attention_runs(*, questions: bool = False, ticket: tuple[str, str] | None = None) -> list[dict]:
+    where = "AND r.repo = ? AND r.issue = ?" if ticket else ""
+    with reader() as c:
+        return [dict(row) for row in c.execute(f"""
+            SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.issue != '' AND r.repo != '' {where}
+                AND COALESCE(r.stop_asked, '') = '' AND {WHOLE_RUN} AND {LIVE_RUN}
+                AND ((r.status = 'pr' AND r.pr_url != '' AND COALESCE(r.environment_retry_of, '') = ''
+                    AND NOT EXISTS ({DRAFT_READY_RECEIPT})) OR (? AND r.status = 'needs-info'
+                    AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
+                        AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
+                        AND (later.started, later.rowid) > (r.started, r.rowid))))
+            ORDER BY r.started DESC, r.rowid DESC
+        """, (*(ticket or ()), DRAFT_READY, questions))]
+
+
+def draft_review_ready_at(run_id: str) -> str | None:
+    with reader() as c:
+        row = c.execute(f"SELECT ({DRAFT_READY_RECEIPT} ORDER BY e.seq LIMIT 1) FROM runs r WHERE r.id = ?",
+                        (DRAFT_READY, run_id)).fetchone()
+        return row[0] if row else None
+
+
+def run_change_at(run_id: str, status: str, *, pr_url: str = "") -> str | None:
+    with reader() as c:
+        row = c.execute("SELECT at FROM events_log WHERE subject = ? AND kind = 'run.changed' "
+                        "AND json_extract(data, '$.status') = ? AND (? = '' OR json_extract(data, '$.pr_url') = ?) "
+                        "ORDER BY ver LIMIT 1", (f"run:{run_id}", status, pr_url, pr_url)).fetchone()
+        return row[0] if row else None
+
+
+def execution_finished(row: dict) -> tuple[str | None, str | None]:
+    subject, status, finished = f"run:{row['id']}", row["status"], row.get("finished")
+    with reader() as c:
+        ended, rejected = c.execute("""
+            SELECT (SELECT json_extract(data, '$.finished') FROM events_log
+                    WHERE subject = :run AND kind = 'run.ended' ORDER BY ver LIMIT 1),
+                   CASE WHEN :status = 'pr' THEN EXISTS (
+                       SELECT 1 FROM events_log WHERE subject = :run AND kind = 'run.changed'
+                       AND json_extract(data, '$.status') = 'rejected' AND json_extract(data, '$.finished') = :finished)
+                   END
+        """, {"run": subject, "status": status, "finished": finished}).fetchone()
+    return ended, None if rejected or status in ("merged", "rejected") else finished
+
+
+def confirm_draft_review_ready(run_id: str, pr_url: str) -> None:
+    with tx() as c:
+        if c.execute(f"SELECT 1 FROM runs r WHERE id = ? AND status = 'pr' AND pr_url = ? "
+                     f"AND NOT EXISTS ({DRAFT_READY_RECEIPT})", (run_id, pr_url, DRAFT_READY)).fetchone():
+            events.emit(DRAFT_READY, f"run:{run_id}", cls="durable", data={"pr_url": pr_url})
+
+
 HOLD_RELEASED = "run.environment-hold.released"
 OWNER_REVIEW_ENDED = "run.environment-hold.owner-review-ended"
 HOLD_LINKS = f"""

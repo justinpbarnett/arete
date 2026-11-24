@@ -87,10 +87,9 @@ function orchestrationDetail(board, place) {
       cell(eligible(a) ? button("Rerun alone", "rerun-action", (b) => retry(a, b), { of: a.id }) : null))), { stack: true })];
 }
 
-function ticketProgressParts(progress) {
-  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing } = progress;
+function ticketProgressParts({ activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing, since }) {
   const unread = Object.entries(prerequisite_issues ?? {}).filter(([, read]) => !read).map(([ref]) => ref);
-  return [el("p", {}, activity, progress.since ? [" · since ", zonedClock(progress.since)] : null),
+  return [el("p", {}, activity, since ? [" · since ", zonedClock(since)] : null),
     blocker ? el("p", {}, el("strong", { text: "Blocker: " }), blocker) : null,
     next_event ? el("p", {}, el("strong", { text: "Next: " }), next_event) : null,
     timing ? el("section", { "aria-label": "Run lineage timing" }, timing.lines.map((text) => el("p", { text }))) : null,
@@ -98,8 +97,8 @@ function ticketProgressParts(progress) {
       pr.deployed_release ? "Deployed prerequisite: " : pr.state === "merged"
         ? "Merged prerequisite (deployment not confirmed): " : `Prerequisite (${pr.state}): `, link(pr.url, pr.key)))) : null,
     unread.length ? el("p", { text: `Prerequisite lookup not confirmed: ${unread.join(", ")}` }) : null,
-    follow_up?.prs?.length ? el("p", {}, el("strong", { text: follow_up.draft ? "Draft follow-up: " : "Follow-up PR: " }),
-      follow_up.prs.map((url) => [" ", link(url, url)])) : null,
+    follow_up?.prs?.length ? el("p", {}, follow_up.draft ? "Draft follow-up: " : "Follow-up PR: ",
+      pullLinks(follow_up.prs.join(" "))) : null,
     updates?.length ? el("ul", { "aria-label": "Recent ticket updates" }, updates.map((update) => el("li", {},
       el("small", { text: zonedClock(update.at) }), " ", update.message))) : null];
 }

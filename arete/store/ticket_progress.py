@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from collections.abc import Iterable
 
 from . import db, events, runs
@@ -23,10 +24,9 @@ def get(repo: str, ticket: str | int) -> dict:
             return {}
         status = json.loads(row["data"])
         newest = runs.newest_live_whole_run(repo, ticket) or {}
-        expected = {"waiting": "pr", "verifying": "running", "owner-review": "pr"}
         state = status["follow_up"]["state"]
-        live = (newest.get("id") == status["attempt"] and not newest.get("stop_asked")
-                and newest["status"] == expected.get(state))
+        expected = {"waiting": "pr", "verifying": "running", "owner-review": "pr"}.get(state)
+        live = newest.get("id") == status["attempt"] and newest["status"] == expected and not newest.get("stop_asked")
         if live and (hold := runs.environment_hold(status["run"])) and hold["released"]:
             live = (state == hold["release_state"] == "owner-review" and not hold["owner_review_ended_at"])
         return {**status, "active": live, "seq": row["seq"], "at": row["at"]}
@@ -61,14 +61,19 @@ def prerequisite_state(previous: dict, reads: dict, deployed: dict, retained: di
     return refs, sorted(pulls.values(), key=lambda p: p["key"])
 
 
+def record_evidence(run_id: str, evidence: Iterable[tuple[str, str, str]]) -> None:
+    if ((run := runs.run_get(run_id)) and run["kind"] == "pipeline" and run["repo"] and run["issue"]
+            and not (run["only_step"] or run["dry_run"] or run["status"] == "dry-run") and (fresh := list(evidence))):
+        record(run["repo"], run["issue"], evidence=fresh)
+
+
 def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence: Iterable[tuple[str, str, str]] = (),
            prerequisite_reads: dict | None = None, only_current: bool = False, declared: bool = False,
            declared_refs: Iterable[str] | None = None) -> None:
     with db.tx() as c:
         history = [json.loads(row["data"]) for row in rows(c, repo, ticket)]
-        previous = history[0] if history else {}
-        prior = {k: v for k, v in previous.items() if k not in ("evidence", "updates")}
-        if only_current and previous.get("run") != (status or {}).get("run"):
+        prior = {k: v for k, v in (history[0] if history else {}).items() if k not in ("evidence", "updates")}
+        if only_current and prior.get("run") != (status or {}).get("run"):
             return
         current = {**prior, **(status or {})}
         if not current.get("follow_up"):
@@ -87,28 +92,25 @@ def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence
                 current["declared_prerequisites"] = sorted(prerequisite_reads)
             elif declared_refs or (declared_refs is not None and "declared_prerequisites" in prior):
                 current["declared_prerequisites"] = sorted(declared_refs)
-            refs, prs = prerequisite_state(previous, prerequisite_reads, deployed, retained)
+            refs, prs = prerequisite_state(prior, prerequisite_reads, deployed, retained)
         current.update(prerequisite_issues=refs, prerequisites=prs)
-        attempts: dict[str, set[str]] = {}
-        for item in history:
-            for cause, attempt in item["evidence"]:
-                attempts.setdefault(cause, set()).add(attempt)
+        attempts = defaultdict(set)
+        for cause, attempt in (pair for item in history for pair in item["evidence"]):
+            attempts[cause].add(attempt)
         fresh, updates = [], []
         for cause, attempt, message in evidence:
-            seen = attempts.setdefault(cause, set())
-            if attempt in seen:
-                continue
-            if seen:
-                updates.append({"kind": "recurring-blocker", "cause": cause, "attempt": attempt,
-                                "message": message})
-            seen.add(attempt)
-            fresh.append([cause, attempt])
+            seen = attempts[cause]
+            if attempt not in seen:
+                if seen:
+                    updates.append(dict(kind="recurring-blocker", cause=cause, attempt=attempt, message=message))
+                seen.add(attempt)
+                fresh.append([cause, attempt])
         known = {u["pr"] for item in history for u in item["updates"] if u["kind"] == "prerequisite-pr"}
         for pr in prs:
             if pr["key"] not in known:
                 delivery = "deployed" if pr["deployed_release"] else pr["state"]
-                updates.append({"kind": "prerequisite-pr", "pr": pr["key"],
-                                "message": f"Found prerequisite PR {pr['url']} ({delivery})."})
+                updates.append(dict(kind="prerequisite-pr", pr=pr["key"],
+                                    message=f"Found prerequisite PR {pr['url']} ({delivery})."))
         if fresh or updates or current != prior:
             events.emit(KIND, subject(repo, ticket), cls="durable", task=str(ticket) if str(ticket).startswith("t-")
                         else None, data={**current, "evidence": fresh, "updates": updates})

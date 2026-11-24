@@ -1,325 +1,225 @@
-import tempfile
-import unittest
+import os
+from collections import Counter
 from contextlib import redirect_stdout
-from datetime import UTC, datetime
 from io import StringIO
-from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from arete import board, config, control, dbstats, paths, pipeline, run_lines, slots, util
-from arete.commands.setup import print_status
-from arete.store import asks, db, events, orchestration, runs, sources, ticket_progress
-from tests.support import workspace_state
-from tests.test_run_timing import clock, stamp
-from tests.test_ticket_progress import poll_dependencies
+from arete import board, config, control, gh, outcomes, pipeline, poll, run_lines, slots
+from arete.commands.common import print_ticket_progress
+from arete.store import asks, runs, sources, ticket_progress
+from tests.test_run_timing import DRAFT, TimingFixture, clock, stamp
+from tests.test_ticket_progress import GITHUB, HEAD, REPO, TICKET, poll_dependencies
 
-REPO = "arete"
-ISSUE = "964"
-RUN = "pip-held"
-AT = "2026-11-24T01:00:00Z"
-DRAFT = "https://github.com/owner/arete/pull/52"
+ISSUE, RUN = str(TICKET), "pip-held"
+READY = dict(state="OPEN", isDraft=False)
 DEPLOYED = "https://github.com/owner/arete/pull/49"
 MERGED = "https://github.com/owner/arete/pull/50"
-ROOT_RUN = "pip-root"
-RETRY_RUN = "pip-retry"
-AS_OF = datetime(2026, 11, 24, 3, tzinfo=UTC)
-DEPLOYMENT_NEXT = "The live release is confirmed to contain the fixes"
-REVIEW_NEXT = "Owner reviews the draft and decides how to unblock verification"
+NEXT_RELEASE = "The live release is confirmed to contain the fixes"
+DRAFT_REVIEW = dict(state="owner-review", prs=[DRAFT], draft=True)
+REVIEW_REASON = "Review requested changes"
 
 
-class ProgressSurfacesTests(unittest.TestCase):
+class ProgressSurfacesTests(TimingFixture):
     def setUp(self):
-        parent = paths.scratch_root(paths.STATE_DIR) if paths.ISOLATED else None
-        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="arete-progress-surfaces-", dir=parent))
-        self.root = Path(folder).resolve()
-        self.cfg = config.Config(repos=[config.Repo(REPO, self.root, github="owner/arete")])
-        self.enterContext(workspace_state(self.root))
-        self.enterContext(patch.object(control, "BEAT_FILE", self.root / "serve-beat.json"))
-        self.enterContext(patch.object(dbstats.Timing, "finished"))
-        self.now = self.enterContext(patch.object(util, "now", return_value=AS_OF))
+        super().setUp()
+        repo = config.Repo(REPO, self.root, github=GITHUB)
+        self.cfg = config.Config(repos=[repo])
         self.enterContext(patch.object(config, "load_or_problem", return_value=(self.cfg, "")))
-        self.skips = {}
-        self.enterContext(patch.object(pipeline, "skipped_tickets", return_value=self.skips))
-        self.holding = self.enterContext(patch.object(slots, "holding", return_value=[]))
-        db.migrate()
+        self.enterContext(patch.object(control, "BEAT_FILE", self.root / "serve-beat.json"))
+        self.enterContext(patch.object(slots, "holding", return_value=[]))
+        self.enterContext(redirect_stdout(StringIO()))
+        self.ticket = Mock(id=ISSUE, url="", title="Time")
+        self.source = Mock(ref=lambda _: f"#{ISSUE}", get=lambda _: self.ticket, blocker=lambda _: "",
+                           reply_since=lambda *_: "Next release")
+        self.queue = poll.RepoQueue(repo, self.source, set(), config.RepoLayer(self.root), Mock())
 
-    def insert(self, run_id, status, **extra):
-        runs.insert_run(run_id, {"kind": "pipeline", "repo": REPO, "issue": ISSUE, "status": status,
-                                 "started": AT, **extra})
+    def sync_ready(self, at, *pulls):
+        with patch.object(outcomes, "sync_outcomes"), patch.object(gh, "pr_merge_details", side_effect=pulls) as read:
+            self.at(at, poll.sync_pr_outcomes, self.cfg)
+        return read
 
-    def hold(self):
-        runs.save_environment_hold(RUN, [("owner/arete", 52, DRAFT, "a" * 40)])
-        state = {"run": RUN, "attempt": RUN, "blocker": {"kind": "verification-environment",
-                                                        "causes": {"tool": "Tool is missing"}},
-                 "next_event": "Prerequisites reach the live release",
-                 "follow_up": {"state": "waiting", "prs": [DRAFT], "draft": True}}
-        reads = {f"owner/arete#{i}": [{"key": f"owner/arete#{i + 7}", "url": url, "state": "merged",
-                                      "merge_commit": "b" * 40, "deployed_release": release}]
-                 for i, url, release in ((42, DEPLOYED, "c" * 40), (43, MERGED, ""))}
-        ticket_progress.record(REPO, ISSUE, state, prerequisite_reads=reads)
-        ticket_progress.record(REPO, ISSUE, {**state, "next_event": DEPLOYMENT_NEXT})
+    def progress(self, run_id, at, **expected):
+        row, = self.at(at, self.status)
+        self.assertEqual(board.run_board(run_id)["ticket_progress"], row)
+        return self.fields(row, **expected)
 
-    def owner_review(self):
-        self.at(5)
-        self.insert(RUN, "pr", started=stamp(0), finished=stamp(5), pr_url=DRAFT)
-        self.hold()
-        self.at(75)
-        self.insert(RETRY_RUN, "pr", started=stamp(60), finished=stamp(70), pr_url=DRAFT, environment_retry_of=RUN)
-        with db.tx():
-            ticket_progress.record(REPO, ISSUE, {
-                "attempt": RETRY_RUN, "next_event": REVIEW_NEXT,
-                "follow_up": {"state": "owner-review", "prs": [DRAFT], "draft": True},
-            })
-            runs.release_environment_hold(RUN, "owner-review")
-        self.at(100)
-        self.insert("pip-unrelated", "done", issue="967", started=stamp(80), finished=stamp(81))
+    def status(self):
+        return board.live_board(None)["ticket_progress"]["rows"]
 
-    def status_progress(self):
-        dashboard = board.live_board(None)["ticket_progress"]
-        self.assertEqual(board.snapshot()["ticket_progress"], dashboard)
-        return dashboard["rows"]
+    def assert_cli(self, rows, *lines):
+        with redirect_stdout(StringIO()) as output:
+            print_ticket_progress(rows)
+        self.assertFalse([line for line in lines if line not in output.getvalue()])
 
-    def queue(self):
-        sources.pass_over(REPO, "965")
-        self.skips["arete#966"] = {"repo": REPO, "id": "966", "why": "Depends on #1000", "since": AT}
-
-    def at(self, seconds):
-        self.now.return_value = clock(seconds)
-
-    def log(self, run_id, seconds, event, **fields):
-        self.at(seconds)
-        with redirect_stdout(StringIO()):
-            run_lines.write(run_id, event, **fields)
-
-    def accept(self, lease, *ops):
-        turn = orchestration.begin(lease, {}, None)
-        version = orchestration.snapshot(lease)["version"]
-        response = {"calls": [{"op": op, "args": {}} for op in ops]}
-        return [row["id"] for row in orchestration.accept(lease, turn, version, response, None)]
-
-    def transition(self, lease, action, seconds, state, **result):
-        self.at(seconds)
-        orchestration.transition(lease, action, state, result)
-
-    def settle(self, run_id, seconds, status, **fields):
-        self.at(seconds)
-        self.assertIsNotNone(runs.settle(run_id, {"status": status, "finished": stamp(seconds), **fields}))
-
-    def store_timed_lineage(self):
-        self.at(0)
-        self.insert(ROOT_RUN, "running", started=stamp(0))
-        first = orchestration.acquire(ROOT_RUN, "", {})
-        left, right = self.accept(first, "worker.start", "worker.start")
-        self.transition(first, left, 2, "running", writing=True, role="build")
-        self.transition(first, right, 4, "running", writing=True, role="build")
-        self.transition(first, left, 8, "succeeded")
-        self.transition(first, right, 10, "succeeded")
-        self.settle(ROOT_RUN, 12, "interrupted")
-        self.at(15)
-        self.insert(RUN, "running", started=stamp(15))
-        self.log(RUN, 15, "route", continues=ROOT_RUN)
-        self.log(RUN, 16, "step_start", step="verify")
-        self.log(RUN, 20, "step_end", step="verify")
+    def test_status_and_run_share_lineage_timing_and_separate_deployment_from_follow_up(self):
+        self.run_row("root", steps=[("build", 2, 8), ("implement", 4, 10)])
+        self.settle("root", 12, "interrupted")
+        self.run_row(RUN, 15, parent=("route", "continues", "root"), steps=[("verify", 16, 20)])
         self.settle(RUN, 22, "pr", pr_url=DRAFT)
+        self.hold_environment(RUN)
+        reads = {f"{GITHUB}#{i}": [dict(key=f"{GITHUB}#{i + 7}", url=url, state="merged",
+                                       merge_commit=HEAD, deployed_release=release)]
+                 for i, url, release in ((42, DEPLOYED, HEAD), (43, MERGED, ""))}
+        ticket_progress.record(REPO, ISSUE, dict(run=RUN, attempt=RUN, next_event=NEXT_RELEASE,
+            blocker=dict(kind="verification-environment", causes={"tool": "Tool is missing"}),
+            follow_up=dict(DRAFT_REVIEW, state="waiting")), prerequisite_reads=reads)
+        self.run_row("dry", 25, environment_retry_of=RUN, status="dry-run", dry_run=1)
+        held = self.progress(RUN, 30, activity="Draft waiting to retry verification", blocker="Tool is missing", next_event=NEXT_RELEASE)
+        timing = self.fields(held["timing"], run_ids=["root", RUN], elapsed_seconds=30, unattributed_seconds=10, overlap_seconds=4)
+        self.assertEqual(timing, board.run_board("root")["ticket_progress"]["timing"])
+        self.assertEqual(board.snapshot()["ticket_progress"]["rows"], [held])
+        self.assert_cli([held], "Blocker: Tool is missing", f"Next: {NEXT_RELEASE}", f"Deployed prerequisite: {DEPLOYED}",
+                        f"Merged prerequisite (deployment not confirmed): {MERGED}", f"Draft follow-up: {DRAFT}", *timing["lines"])
+        self.retry_environment_hold()
 
-    def test_status_and_run_share_stored_lineage_timing_and_preserve_durable_updates(self):
-        self.store_timed_lineage()
-        self.hold()
-        self.at(30)
-        self.queue()
-        self.assertEqual(ticket_progress.get(REPO, ISSUE)["updates"], [])
-        with db.reader() as c:
-            before = events.metadata(c)["head"]
-        detail = board.run_board(RUN)
-        dashboard = board.live_board(None)
-        cli = board.snapshot()
-        ancestor = board.run_board(ROOT_RUN)["ticket_progress"]
-        with db.reader() as c:
-            self.assertEqual(events.metadata(c)["head"], before)
-        rows = {r["issue"]: r for r in dashboard["ticket_progress"]["rows"]}
-        held = rows[ISSUE]
-        self.assertEqual(held, detail["ticket_progress"])
-        self.assertEqual(dashboard["ticket_progress"], cli["ticket_progress"])
-        timing = held["timing"]
-        self.assertEqual(timing, ancestor["timing"])
-        self.assertEqual(timing["run_ids"], [ROOT_RUN, RUN])
-        self.assertEqual(timing["as_of"], stamp(30))
-        self.assertTrue(timing["elapsed_complete"])
+    def retry_environment_hold(self):
+        retry, draft = "retry", dict(DRAFT_REVIEW, state="verifying")
+        self.run_row(retry, 35, environment_retry_of=RUN)
+        self.wait(retry, 35, since=34)
+        self.step(retry, "verify", 36)
+        scope = {"resource": "check-slot", "suite": "suite", "step": "verify", "try": 1}
+        for start, end, blocker, event, wait in (
+            (37, 39, "CI is pending", "CI reports its result", dict(cause="ci")),
+            (40, 43, "A check slot is unavailable", "A check slot becomes available", scope),
+        ):
+            self.wait(retry, start, **wait)
+            self.progress(retry, start, activity="Waiting", blocker=blocker, next_event=event, follow_up=draft)
+            self.wait(retry, end, since=start, **wait)
+        self.progress(retry, 43, activity="Running verify", blocker="")
+        self.log(retry, 44, "step_end", step="verify")
+        self.settle(retry, 47, "pr", pr_url=DRAFT)
+        event = "Owner reviews the draft and decides how to unblock verification"
+        ticket_progress.record(REPO, ISSUE, dict(attempt=retry, next_event=event, follow_up=DRAFT_REVIEW))
+        self.at(50, runs.release_environment_hold, RUN, "owner-review")
+        with patch.object(board, "RECENT_RUNS", 0):
+            self.progress(retry, 55, activity="Draft awaiting owner review after automatic retry", next_event=event)
+            self.move(retry, 63, "merged", "pr", finished=stamp(60))
+            self.assertEqual(self.status(), [])
+        self.project(retry, 70, RUN, elapsed_seconds=60, blockers=[],
+                     categories=dict(queue_wait=18, owner_wait=13, writing=8, checks=9))
 
-        def timing_entries(text):
-            return [entry.strip() for entry in text.replace("·", "\n").splitlines() if entry.strip()]
+    def test_prerequisite_discovery_reaches_status_at_capacity_without_a_run_or_skip(self):
+        for state, visible in (("open", True), ("partial", True), ("removed", False), ("open", True), ("closed", False)):
+            self.assertEqual(poll_dependencies(self.root, state, at_capacity=True), {})
+            rows = self.status()
+            self.assertEqual(len(rows), int(visible), state)
+            for row in rows:
+                self.fields(row, issue="965", run="", blocker="", follow_up=None)
+                self.assertEqual([u["message"] for u in row["updates"]], [f"Found prerequisite PR {DEPLOYED} (open)."])
 
-        expected_timing = ["Run lineage elapsed: 30s", "Writing: 8s", "Checks / verification: 4s",
-                           "Review: 0s", "Owner wait: 0s", "Queue wait: 8s", "Retry: 0s", "Unattributed: 10s",
-                           "Overlap: 4s (already counted in elapsed)", "Writing ×2: 4s"]
-        self.assertEqual(timing_entries("\n".join(timing["lines"])), expected_timing)
-        self.assertEqual(held["activity"], "Draft waiting to retry verification")
-        self.assertEqual(held["blocker"], "Tool is missing")
-        self.assertEqual(held["next_event"], DEPLOYMENT_NEXT)
-        self.assertEqual(held["follow_up"]["prs"], [DRAFT])
-        self.assertEqual([(p["url"], bool(p["deployed_release"])) for p in held["prerequisites"]],
-                         [(DEPLOYED, True), (MERGED, False)])
-        self.assertEqual([u["kind"] for u in held["updates"]], ["prerequisite-pr", "prerequisite-pr"])
-        self.assertEqual(dashboard["live"]["rows"]["runs"], [])
-        self.assertEqual(rows["965"]["run"], "")
-        self.assertEqual(rows["965"]["next_event"], "A run slot becomes available")
-        self.assertEqual(rows["966"]["run"], "")
-        self.assertEqual(rows["966"]["blocker"], "Depends on #1000")
-        self.assertIsNone(rows["965"]["timing"])
-        self.assertIsNone(rows["966"]["timing"])
+    def pick_answer(self, at, *, slots_free, expected):
+        skips = pipeline.SkipLog(pipeline.skipped_tickets())
+        with patch.object(poll.tracker, "for_ticket", return_value=self.source):
+            self.assertEqual(self.at(at, poll.start_pick, self.cfg, self.queue, poll.Pick(ISSUE, "Answer received"),
+                                     skips, False, Counter(), slots_free), expected)
+        poll.save_skips(skips)
+        answer = run_lines.path(RUN).with_name(pipeline.ANSWER_FILE)
+        if answer.exists():
+            os.utime(answer, (clock(21).timestamp(),) * 2)
 
-        rendered = StringIO()
-        with redirect_stdout(rendered):
-            print_status(self.cfg, "", [], cli, {"rows": {"oldest": "", "pins": 0}}, "")
-        text = rendered.getvalue()
-        for line in ("Blocker: Tool is missing", f"Next: {DEPLOYMENT_NEXT}", f"Deployed prerequisite: {DEPLOYED}",
-                     f"Merged prerequisite (deployment not confirmed): {MERGED}", f"Draft follow-up: {DRAFT}",
-                     "arete#965: Queued for a run slot", "arete#966: Blocked before start"):
-            self.assertIn(line, text)
-        cli_entries = timing_entries(text)
-        for entry in expected_timing:
-            self.assertIn(entry, cli_entries)
-        self.assertEqual(text.count("Found prerequisite PR"), 2)
-
-    def test_current_waits_clear_independently_on_run_and_status_surfaces(self):
-        self.at(1)
-        self.insert(RUN, "pr", pr_url=DRAFT, started=stamp(0), finished=stamp(1))
-        self.hold()
-        current = "pip-next"
-        self.insert(current, "running", started=stamp(2))
-        sources.pass_over(REPO, ISSUE)
-        self.log(current, 3, "step_start", step="verify")
-
-        def activity(row):
-            return row["activity"], row["blocker"], row["next_event"]
-
-        def progress(expected):
-            row, = self.status_progress()
-            self.assertEqual(board.run_board(current)["ticket_progress"], row)
-            self.assertEqual(activity(row), expected)
-            return row
-
-        self.log(current, 4, "wait", cause="ci", phase="start", at=stamp(4))
-        waiting = progress(("Waiting", "CI is pending", "CI reports its result"))
-        scope = {"step": "verify", "try": 1}
-        lock = {**scope, "resource": "full-suite-lock", "suite": "first-suite"}
-        slot = {**scope, "resource": "check-slot", "suite": "second-suite"}
-        self.log(current, 5, "wait", cause="slot", phase="start", at=stamp(5), **lock)
-        self.log(current, 6, "wait", cause="ci", phase="end", at=stamp(6), since=stamp(4))
-        lock_wait = ("Waiting", "The full-suite lock is in use", "The full-suite lock becomes available")
-        progress(lock_wait)
-        historical = board.run_board(RUN)["ticket_progress"]
-        self.assertEqual(historical["timing"]["run_ids"], [RUN])
-        self.assertEqual(activity(historical), lock_wait)
-
-        self.log(current, 7, "wait", cause="slot", phase="start", at=stamp(7), **slot)
-        progress(("Waiting", "A check slot is unavailable", "A check slot becomes available"))
-        self.log(current, 9, "wait", cause="slot", phase="end", at=stamp(9), since=stamp(7), **slot)
-        progress(lock_wait)
-        self.log(current, 12, "wait", cause="slot", phase="end", at=stamp(12), since=stamp(5), **lock)
-        active = progress(("Running verify", "", "verify finishes"))
-        self.assertEqual(active["timing"]["run_ids"], [current])
-        self.assertEqual((active["follow_up"], active["since"]), (None, ""))
-        for key in ("prerequisites", "updates"):
-            self.assertEqual(active[key], waiting[key])
-
-    def test_declared_pr_discovery_reaches_status_at_capacity_without_a_run_or_skip(self):
-        self.assertEqual(poll_dependencies(self.root, "open", at_capacity=True), {})
-        self.assertIsNone(runs.newest_live_whole_run(REPO, "965"))
-        progress, = self.status_progress()
-        self.assertEqual((progress["issue"], progress["run"], progress["blocker"]), ("965", "", ""))
-        self.assertIsNone(progress["follow_up"])
-        pr, = progress["prerequisites"]
-        self.assertEqual((pr["url"], pr["state"], pr["deployed_release"]), (DEPLOYED, "open", ""))
-        update, = progress["updates"]
-        self.assertEqual(update["message"], f"Found prerequisite PR {DEPLOYED} (open).")
-        self.assertEqual(poll_dependencies(self.root, "open", at_capacity=True), {})
-        self.assertEqual(self.status_progress(), [progress])
-        self.assertEqual(poll_dependencies(self.root, "removed", at_capacity=True), {})
-        self.assertEqual(self.status_progress(), [])
-
-    def test_owner_review_survives_recent_run_eviction_until_review_ends(self):
-        self.owner_review()
-        with patch.object(board, "RECENT_RUNS", 1):
-            progress, = self.status_progress()
-            self.assertEqual(progress, board.run_board(RETRY_RUN)["ticket_progress"])
-            self.assertEqual((progress["run"], progress["activity"], progress["blocker"], progress["next_event"]),
-                             (RETRY_RUN, "Draft awaiting owner review after automatic retry", "Tool is missing", REVIEW_NEXT))
-            self.assertEqual(progress["follow_up"], {"state": "owner-review", "prs": [DRAFT], "draft": True})
-            self.assertEqual([(p["url"], bool(p["deployed_release"])) for p in progress["prerequisites"]],
-                             [(DEPLOYED, True), (MERGED, False)])
-            runs.end_environment_owner_review(RUN)
-            self.assertEqual(self.status_progress(), [])
-        progress = board.run_board(RETRY_RUN)["ticket_progress"]
-        self.assertEqual(progress["activity"], "Follow-up PR recorded")
-        self.assertEqual(progress["blocker"], "")
-        self.assertNotEqual(progress["next_event"], REVIEW_NEXT)
-        self.assertEqual([p["url"] for p in progress["prerequisites"]], [DEPLOYED, MERGED])
-
-    def test_merged_retry_clears_owner_review_before_the_poller_records_its_end(self):
-        self.owner_review()
-        self.assertTrue(runs.move(RETRY_RUN, "merged", expect=("pr",)))
-        self.assertIsNone(runs.environment_hold(RUN)["owner_review_ended_at"])
-        with patch.object(board, "RECENT_RUNS", 1):
-            self.assertEqual(self.status_progress(), [])
-        progress = board.run_board(RETRY_RUN)["ticket_progress"]
-        self.assertEqual((progress["activity"], progress["blocker"], progress["next_event"]), ("Merged", "", ""))
-
-    def test_classic_tracker_question_is_visible_without_an_ask_or_recent_run(self):
-        self.insert(RUN, "running", started=stamp(0))
-        self.log(RUN, 5, "question", question="Reply on the tracker.", summary="Which release should we target?")
+    def question(self, *, dashboard=False):
+        self.run_row(RUN)
+        question = "Which release should we target?"
+        if dashboard:
+            self.at(5, asks.ask_add, "ask", RUN, REPO, ISSUE, "plan", "plan", question, "", [], {})
+        else:
+            self.log(RUN, 5, "question", summary=question)
         self.settle(RUN, 6, "needs-info")
-        self.insert("pip-unrelated", "done", issue="965", started=stamp(7), finished=stamp(8))
-        self.at(20)
-        self.assertEqual(asks.asks_of(RUN), [])
-        with patch.object(board, "RECENT_RUNS", 1):
-            waiting = board.run_board(RUN)["ticket_progress"]
-            self.assertEqual(waiting["activity"], "Waiting for the owner")
-            self.assertEqual(waiting["blocker"], "Which release should we target?")
-            self.assertEqual(waiting["next_event"], "The owner replies to the question on the tracker")
-            self.assertEqual(board.live_board(None)["ticket_progress"]["rows"], [waiting])
-            self.assertEqual(board.snapshot()["ticket_progress"]["rows"], [waiting])
+        with patch.object(board, "RECENT_RUNS", 0):
+            self.progress(RUN, 6, activity="Waiting for the owner", blocker="An owner answer is needed" if dashboard else question)
 
-            reply = run_lines.path(RUN).with_name(pipeline.ANSWER_FILE)
-            reply.write_text("Target the next release.")
-            answered = board.run_board(RUN)["ticket_progress"]
-            self.assertEqual(answered["activity"], "Owner answered")
-            self.assertEqual(answered["blocker"], "")
-            self.assertEqual(board.live_board(None)["ticket_progress"]["rows"], [])
+    def continue_after_answer(self, at):
+        self.run_row("continued", at, parent=("answer", "asked_in", RUN))
+        pipeline.opening_waits("continued", runs.run_get(RUN), sources.take_passed_over(REPO, ISSUE))
 
-            reply.unlink()
-            self.insert("pip-continuation", "done", started=stamp(10), finished=stamp(12))
-            self.assertEqual(board.live_board(None)["ticket_progress"]["rows"], [])
+    def test_classic_tracker_answer_names_the_recorded_run_slot_blocker(self):
+        self.question()
+        self.pick_answer(21, slots_free=0, expected="held")
+        blocker, event = "No run slot was available", "A run slot becomes available"
+        queued = self.progress(RUN, 30, activity="Owner answered", blocker=blocker, since=stamp(21), next_event=event)
+        self.project(RUN, 30, elapsed_seconds=30, categories=dict(owner_wait=16, queue_wait=9))
+        self.assert_cli([queued], f"Blocker: {blocker}", f"Next: {event}")
+        self.continue_after_answer(32)
+        self.progress("continued", 32, activity="Running", blocker="")
+        self.project("continued", 32, elapsed_seconds=32, categories=dict(owner_wait=16, queue_wait=11))
 
-    def test_publishing_wait_distinguishes_the_merge_lease_from_retaking_a_run_slot(self):
-        self.insert(RUN, "running", started=stamp(0))
-        self.log(RUN, 5, "wait", cause="slot", phase="start", at=stamp(5))
-        markers = {"merge-wait"}
-        self.holding.side_effect = lambda rows, kind, *_: rows if kind in markers else []
-        detail = board.run_board(RUN)["ticket_progress"]
-        self.assertEqual(detail["blocker"], "The repository merge lease is in use")
-        self.assertEqual(detail["next_event"], "The repository merge lease becomes available")
-        self.assertEqual(board.live_board(None)["ticket_progress"]["rows"], [detail])
+    def test_classic_tracker_question_and_post_answer_provider_wait(self):
+        self.question()
+        self.assert_provider_wait(owner_seconds=16)
+        self.continue_after_answer(92)
+        categories = dict(owner_wait=16, queue_wait=70)
+        self.project("continued", 93, elapsed_seconds=93, blockers=[], categories=categories)
+        self.at(94, poll.save_skips, pipeline.SkipLog(pipeline.skipped_tickets()))
+        self.settle("continued", 95, "done")
+        self.project("continued", 100, elapsed_seconds=95, blockers=[], categories=categories)
 
-        markers.add("slot-wait")
-        detail = board.run_board(RUN)["ticket_progress"]
-        self.assertEqual(detail["blocker"], "A run slot is unavailable")
-        self.assertEqual(detail["next_event"], "A run slot becomes available")
+    def test_answered_dashboard_ask_names_the_provider_route_blocker(self):
+        self.question(dashboard=True)
+        self.assertTrue(self.at(10, asks.ask_close, "ask", "answered"))
+        self.assert_provider_wait(owner_seconds=5)
 
-    def test_ordinary_pr_completion_has_final_progress_and_separate_links_without_saved_progress(self):
-        other = "https://github.com/owner/other/pull/19"
-        self.insert(RUN, "running", started=stamp(0))
-        self.log(RUN, 3, "step_start", step="verify")
-        self.at(7)
-        active, = board.live_board(None)["ticket_progress"]["rows"]
-        self.assertEqual(active["activity"], "Running verify")
-        self.assertEqual(active["timing"]["elapsed_seconds"], 7)
+    def assert_provider_wait(self, *, owner_seconds):
+        reason = "plan has no eligible route: subscription is unavailable"
+        with (patch.object(poll.runlimits, "poll_admission", return_value=("", None)),
+              patch.object(poll.intake, "route_ticket", return_value=self.ticket),
+              patch.object(poll, "step_without_route", return_value=reason)):
+            for at in (22, 30):
+                self.pick_answer(at, slots_free=1, expected="blocked")
+        for at in (40, 90):
+            self.progress(RUN, at, activity="Owner answered", blocker=reason, since=stamp(22),
+                          next_event="An eligible provider route becomes available")
+            self.project(RUN, at, elapsed_seconds=at, categories=dict(owner_wait=owner_seconds, queue_wait=at - 22))
 
-        self.log(RUN, 9, "step_end", step="verify")
-        self.settle(RUN, 12, "pr", pr_url=f"{DRAFT} {other}")
-        self.assertFalse(ticket_progress.get(REPO, ISSUE))
-        self.assertEqual(board.live_board(None)["ticket_progress"]["rows"], [])
-        completed = board.run_board(RUN)["ticket_progress"]
-        self.assertEqual(completed["activity"], "Follow-up PR recorded")
-        self.assertEqual(completed["timing"]["elapsed_seconds"], 12)
-        self.assertEqual(completed["follow_up"]["prs"], [DRAFT, other])
+    def draft_case(self, repair_status=None):
+        prs = [DRAFT] if repair_status else [DRAFT, "https://github.com/owner/other/pull/19"]
+        self.run_row(RUN)
+        self.publish_draft(RUN, 10, settled=12, prs=" ".join(prs), held=REVIEW_REASON)
+        current = receipt = RUN
+        activity, blocker, event = "Draft held at publication", REVIEW_REASON, "The owner addresses the blocker or takes over the draft"
+        if repair_status:
+            current = "repair"
+            self.run_row(current, 15, parent=("repair", "source", RUN))
+            self.step(current, "repair", 16, 19)
+            if repair_status == "pr":
+                self.move(RUN, 20, "superseded", "pr")
+                self.publish_draft(current, 20, review={"verdict": "approve"})
+                receipt = current
+                activity, blocker, event = ("Draft awaiting readiness decision", "The repair review approved it, but the PR is still a draft",
+                                            "The owner marks the draft ready for review")
+            else:
+                self.settle(current, 20, "failed", pr_url=DRAFT, report={"prs": prs})
+        for i in range(board.RECENT_RUNS):
+            self.run_row(f"newer-{i}", 29, status="done", issue="965", finished=stamp(29))
+        held = self.progress(current, 30, activity=activity, blocker=blocker, next_event=event,
+                             follow_up=dict(DRAFT_REVIEW, prs=prs))
+        retry = 3 if repair_status else 0
+        owner = 15 if repair_status else 20
+        self.project(current, 30, RUN, elapsed_seconds=30, unattributed_seconds=30 - owner - retry,
+                     overlap_seconds=0, categories=dict(owner_wait=owner, retry=retry))
+        if not repair_status:
+            for partial in ({}, {"state": "OPEN"}, dict(READY, isDraft=True), gh.GhError("unreadable")):
+                self.sync_ready(30, READY, partial)
+                self.assertEqual(self.status(), [held])
+        read = self.sync_ready(35, *([READY] * len(prs)))
+        if repair_status:
+            read.assert_called_once_with(DRAFT, timeout=15, retry=False)
+        self.sync_ready(40).assert_not_called()
+        self.assertEqual(self.status(), [])
+        self.assertEqual(runs.draft_review_ready_at(receipt), stamp(35))
+        self.fields(runs.run_get(receipt), status="pr")
+        cleared = board.run_board(current)["ticket_progress"]
+        self.fields(cleared, activity="Last run failed" if repair_status == "failed" else "Follow-up PR recorded", blocker="")
+        if not repair_status:
+            self.fields(cleared, follow_up=dict(state="pr", prs=prs, draft=None), next_event="Review, merge, or new feedback")
+            self.move(RUN, 51, "merged", "pr", finished=stamp(45))
+        self.project(current, 60, elapsed_seconds=35, blockers=[], overlap_seconds=0,
+                     categories=dict(owner_wait=owner + 5, retry=retry))
+
+    def test_ordinary_review_held_draft_outlives_recent_history_until_ready_is_confirmed(self):
+        self.draft_case()
+
+    def test_successful_repair_waits_for_the_owner_to_make_the_draft_ready(self):
+        self.draft_case("pr")
+
+    def test_failed_repair_without_publication_does_not_hide_the_original_draft(self):
+        self.draft_case("failed")

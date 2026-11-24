@@ -71,8 +71,10 @@ from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
 from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
+from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import ticket_progress as ticket_progress_store
 from .store import triage as triage_store
 from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
@@ -121,6 +123,7 @@ RUN_START_SECONDS = 10
 SLOT_QUEUE_FAILED_EXIT = 75
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
+CHECK_COLOR = re.compile(r"\x1b\[[0-9;:]*m")
 CHECK_LANE_POLL_SECONDS = 2
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
@@ -279,9 +282,7 @@ class AgentRun:
 
     @contextmanager
     def waiting(self, cause: str, **detail):
-        with ExitStack() as stack:
-            if self.budget is not None:
-                stack.enter_context(self.budget.idling(cause))
+        with self.budget.idling(cause) if self.budget is not None else nullcontext():
             if not self.writes_lines:
                 yield
             elif detail:
@@ -526,6 +527,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_owns_checkout: bool = field(default=False, init=False)
+    publication_check_attempt: str = field(default="", init=False)
     catch_up_preserved: set[str] = field(default_factory=set)
     catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
@@ -1146,6 +1148,14 @@ def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
     return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
+def check_diagnostic_fingerprint(stdout: str, stderr: str) -> str:
+    hidden = scrub.secrets()
+    diagnostics = [scrub.replaced(CHECK_COLOR.sub("", stream), hidden).replace("\r\n", "\n").strip()
+                   for stream in (stdout, stderr)]
+    return (orchestration_store.digest(diagnostics)
+            if any(stream.replace(vault.REDACTED, "").strip() for stream in diagnostics) else "")
+
+
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     stdout_room = n - min(len(stderr), n // 2)
     stderr_room = n - min(len(stdout), n // 2)
@@ -1181,34 +1191,16 @@ def check_lane(layer: config.RepoLayer, run: AgentRun, suite: dict):
         yield hold_fds
 
 
-def check_suite(run_id: str) -> dict:
-    suite = {"suite": f"{run_id}/checks/{uuid4().hex}"}
-    if calls := factory.inside(run_id):
-        suite.update(step=calls.step, **{"try": calls.n})
-    return suite
-
-
-def report_check_failures(run: AgentRun, attempt: str, failed: list[tuple[str, str, int]]) -> None:
-    if not failed or not isinstance(run, Run) or run.alone or run.dry_run:
+def report_ticket_progress(run: AgentRun, evidence: Iterator[tuple[str, str, str]], *,
+                           defer_to_checks_action: bool = False) -> None:
+    if not isinstance(run, Run) or run.alone or run.dry_run:
         return
-    from .store import orchestration, ticket_progress
-
     try:
-        owner = run_store.run_get(run.id)
-        if (not owner or owner["kind"] != "pipeline" or not owner["repo"] or not owner["issue"]
-                or owner["only_step"] or owner["dry_run"] or owner["status"] == "dry-run"
-                or orchestration.find(run.id)):
-            return
-        evidence = []
-        hidden = scrub.secrets()
-        for name, command, code in failed:
-            name, command = json.loads(scrub.scrub(json.dumps([name, command], ensure_ascii=False), hidden))
-            cause = "check:" + orchestration.digest([name, command, code])
-            label = outbound.sanitize(outbound.screen(name), 100) or "Configured check"
-            evidence.append((cause, attempt, f"Check {label} failed again (exit {code})."))
-        ticket_progress.record(owner["repo"], owner["issue"], evidence=evidence)
-    except (OSError, sqlite3.Error, NoDatabase, IncompatibleSchema) as error:
-        run.log(f"could not record check progress: {type(error).__name__}")
+        if not (defer_to_checks_action and orchestration_store.find(run.id)):
+            ticket_progress_store.record_evidence(run.id, evidence)
+    except (NoDatabase, OSError, sqlite3.Error, IncompatibleSchema) as error:
+        if not isinstance(error, NoDatabase):
+            run.log(f"could not record ticket progress: {type(error).__name__}")
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
@@ -1225,8 +1217,11 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
-    suite = check_suite(run.id)
-    report, failed, ok = [], [], True
+    suite = {"suite": f"{run.id}/checks/{uuid4().hex}"}
+    if calls := factory.inside(run.id):
+        suite.update({"step": calls.step, "try": calls.n})
+    cursor = orchestration_store.timeline_cursor(run.id)
+    report, ok = [], True
     cleanup_untracked = not defer_failed_cleanup
 
     def execute(items, hold_fds):
@@ -1236,8 +1231,8 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             with record.timed(run.id, "check", name=name, command=cmd, **suite) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 code = check["exit"] = res.returncode
-                if type(code) is int and code != 0:
-                    failed.append((name, cmd, code))
+                if code and (fingerprint := check_diagnostic_fingerprint(res.stdout, res.stderr)):
+                    check["diagnostic_sha"] = fingerprint
             passed = code == 0
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {code})'}")
@@ -1258,7 +1253,10 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             report.append("Targeted pass only; the full suite is still required before publication.")
         cleanup_untracked = cleanup_untracked or ok
     finally:
-        report_check_failures(run, suite["suite"], failed)
+        if not ok and cursor is not None and isinstance(run, Run):
+            attempt = run.publication_check_attempt if run.catch_up_owns_checkout else ""
+            report_ticket_progress(run, orchestration_store.failed_checks(run.id, attempt, cursor, suite["suite"]),
+                                   defer_to_checks_action=not attempt)
         if cleanup_untracked:
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
@@ -4626,10 +4624,29 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
              role="check_repair")
 
 
+def verification_failures(attempt: str, verified: verify.Verified) -> Iterator[tuple[str, str, str]]:
+    unmeasured = {verify.one_line(name).casefold() for name in verified.unmeasured_requirements}
+    hidden = scrub.secrets()
+    for check in verified.failed_checks:
+        if (check.get("passed") is not False or str(check.get("cause") or "").strip().casefold() == "environment"
+                or not all(isinstance(check.get(key), str) and check[key].strip() for key in ("what", "how", "saw"))
+                or verify.one_line(check["what"]).casefold() in unmeasured):
+            continue
+        name, observed = (verify.one_line(scrub.replaced(check[key], hidden)) for key in ("what", "saw"))
+        visible = "".join(char for char in name if char.isprintable())
+        label = outbound.plain(outbound.screen(visible), 100) or "unnamed requirement"
+        cause = "verification:" + orchestration_store.digest([name.casefold(), observed.casefold()])
+        yield cause, attempt, f"In-use verification failed again: {label}."
+
+
 @runlimits.verification
-def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
-    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
-                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
+def check_in_use(b: Build, goal: str, summary: str, *, progress_attempt: str = "") -> verify.Verified:
+    verified = use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
+                           diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
+    if verified.verdict == "fail" and verified.finished and verified.behavior_reached:
+        attempt = progress_attempt or f"{b.run.id}/verify/{uuid4().hex}"
+        report_ticket_progress(b.run, verification_failures(attempt, verified))
+    return verified
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
@@ -4702,6 +4719,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 "blocked", f"Configured drivers require trusted scratch confinement for {names}.",
                 blocked_by=reason, finished=False))
     agent_started, agent_finished = False, False
+    agent_runner = ""
     lifetime = {"stopped": True}
     fixture_blocker = ""
     probes = None
@@ -4757,6 +4775,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
+                agent_runner = getattr(res, "runner", "")
     except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise
@@ -4801,11 +4820,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             return save_verification(run, step, verified, removed) if removed else verified
     else:
         verified = verify.Verified.from_agent(res.structured)
+        if delivery_verification and agent_runner == runner.REPLAY:
+            verified.behavior_reached = False
     if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
-    if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+    if (verified.verdict == "pass" and checked_trees and agent_runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         verified.native_trees = checked_trees
     return save_verification(run, step, verified, removed if agent_started else 0)
