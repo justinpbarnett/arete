@@ -800,7 +800,178 @@ for directory, expected in (('../state/store', 'must be separate'), ('inner-stor
 """)
 
 
+class RegistryMutationBoundaryTests(_SecretChildCase):
+    def test_missing_key_blocks_checks_and_removals_with_present_or_missing_bytes(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'BOUND', 'synthetic-original', 'api_key', 'hand')
+original = secretstore.history('global', 'BOUND')
+read = secretstore.read_item
+for absent in (False, True):
+    def observed(ref, settings, **kwargs):
+        return None if ref.item == secretstore.KEY_ITEM or absent else read(ref, settings, **kwargs)
+    with (mock.patch.object(secretstore, 'read_item', side_effect=observed),
+          mock.patch.object(secretstore, 'remove_item', side_effect=AssertionError('must keep the stored item'))):
+        for change in (secretstore.check, secretstore.remove):
+            with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+                change('global', 'BOUND', 'hand')
+    assert secretstore.get('global', 'BOUND') == row
+    assert secretstore.history('global', 'BOUND') == original and not receipt('BOUND').exists()
+""")
+
+    def test_provider_validation_precedes_publication_and_history_retains_both_operators(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'METADATA', 'synthetic-bytes'
+for change in (lambda: secretstore.put('global', name, value, 'api_key', 'u:'+chr(0xd800)),
+               lambda: secretstore.remove('global', name, 'u:'+chr(0xd800))):
+    with (mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('invalid principal wrote an item')),
+          mock.patch.object(secretstore, 'save_pending', side_effect=AssertionError('invalid principal wrote a receipt')),
+          case.assertRaises(ValueError)):
+        change()
+with case.assertRaises(ValueError):
+    secretstore.put('global', name, value, 'api_key', 'hand', provider=['invalid'])
+assert not receipt(name).exists() and not Path('store').exists()
+secretstore.put('global', name, value, 'api_key', 'hand', provider='one')
+secretstore.put('global', name, value, 'app_private_key', 'u:operator', provider='two')
+notes = secretstore.history('global', name)
+assert [(e['actor'], e['kind'], e['provider']) for e in notes] == [
+    ('hand', 'api_key', 'one'), ('u:operator', 'app_private_key', 'two')]
+assert notes[0]['detail'] != notes[1]['detail'] and value not in str(notes)
+with db.tx() as conn:
+    row = secretstore.credentials.secret(conn, 'global', name)
+    for note in ('{legacy note', '{"note":"imported"}'):
+        secretstore.credentials.secret_event(conn, row, 'checked', 'hand', '2026-01-01T00:00:00Z', detail=note)
+assert [e['detail'] for e in secretstore.history('global', name)[-2:]] == ['{legacy note', '{"note":"imported"}']
+""")
+
+    def test_journal_retirement_commits_its_durability_marker_with_a_reader_open(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+db.enable_wal()
+with db.reader(streaming=True) as reader, db.read_snapshot(reader):
+    assert reader.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+    before = db.metadata(reader).get(secretstore.REGISTRY_SYNC)
+    secretstore.put('global', 'DURABLE', 'synthetic-bytes', 'api_key', 'hand')
+    assert not receipt('DURABLE').exists() and db.metadata(reader).get(secretstore.REGISTRY_SYNC) == before
+with db.reader() as reader:
+    assert db.metadata(reader)[secretstore.REGISTRY_SYNC] != before
+assert event_names('DURABLE') == ['set']
+""")
+
+
+class RegistryBackendRetryTests(_SecretChildCase):
+    def test_retry_after_backend_switch_preserves_original_reference_and_receipt(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name = 'MOVED'
+original = config.secret_settings()
+replacement = config.SecretsConfig(store='keychain')
+physical = {}
+
+def store(ref, _settings, data):
+    physical[str(ref)] = data
+
+def read(ref, _settings, **_kwargs):
+    return physical.get(str(ref))
+
+with (mock.patch.object(secretstore, 'read_item', side_effect=read),
+      mock.patch.object(secretstore, 'write_item', side_effect=store)):
+    secretstore.fingerprint_key(original)
+    with case.assertRaisesRegex(OSError, 'interrupted removal'):
+        with db.tx():
+            first = secretstore.put('global', name, 'synthetic-original', 'api_key', 'hand')
+            with mock.patch.object(secretstore, 'remove_item', side_effect=OSError('interrupted removal')):
+                secretstore.remove('global', name, 'u:operator')
+    before = receipt(name).read_bytes()
+    stored = dict(physical)
+    assert secretstore.get('global', name) is None and physical[first['reference']] == b'synthetic-original'
+    with mock.patch.object(config, 'secret_settings', return_value=replacement), case.assertRaises(secretstore.StoreError):
+        secretstore.put('global', name, 'synthetic-retry', 'api_key', 'hand')
+    assert receipt(name).read_bytes() == before and physical == stored
+    assert secretstore.get('global', name) is None and secretstore.history('global', name) == []
+""")
+
+    def test_disabling_store_preserves_lost_key_error_for_a_registered_secret(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'DEMO', 'synthetic-original', 'api_key', 'hand')
+before = secretstore.history('global', 'DEMO')
+read = secretstore.read_item
+def without_key(ref, settings, **kwargs):
+    return None if ref.item == secretstore.KEY_ITEM else read(ref, settings, **kwargs)
+
+with (mock.patch.object(config, 'secret_settings', return_value=config.SecretsConfig()),
+      mock.patch.object(secretstore, 'read_item', side_effect=without_key),
+      mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('must preserve the existing item'))):
+    for operation in (lambda: secretstore.put('global', 'DEMO', 'synthetic-retry', 'api_key', 'hand'),
+                      lambda: secretstore.remove('global', 'DEMO', 'hand'),
+                      lambda: secretstore.check('global', 'DEMO')):
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            operation()
+assert secretstore.get('global', 'DEMO') == row and secretstore.history('global', 'DEMO') == before
+""")
+
+    def test_new_receipt_directories_are_durable_before_the_backend_write(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+import os
+import stat
+
+name = 'DURABLE'
+synced = set()
+sync, store = os.fsync, secretstore.write_item
+root = config.secret_settings().store_dir
+def identity(path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino)
+
+def observe(fd):
+    sync(fd)
+    info = os.fstat(fd)
+    if stat.S_ISDIR(info.st_mode):
+        synced.add((info.st_dev, info.st_ino))
+
+def publish(ref, settings, data):
+    if ref.item == 'global/' + name:
+        journal = receipt(name)
+        assert journal.is_file()
+        assert all(identity(parent) in synced for parent in
+                   (paths.STATE_DIR, journal.parent.parent, journal.parent))
+    return store(ref, settings, data)
+
+with (mock.patch.object(os, 'fsync', side_effect=observe),
+      mock.patch.object(secretstore, 'write_item', side_effect=publish)):
+    row = secretstore.put('global', name, 'synthetic-bytes', 'api_key', 'hand')
+ref = item_reference(row)
+assert all(identity(path) in synced for path in (root.parent, root, root / ref.tag, root / ref.tag / 'global'))
+assert not receipt(name).exists()
+""")
+
+
 class RegistryKeyContinuityTests(_SecretChildCase):
+    def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
+        self.run_secret_child(r"""
+import sqlite3
+
+marker = Path('retirement-marker').resolve()
+marker.touch(mode=0o600)
+settings = config.secret_settings()
+with db.tx() as conn:
+    ref = str(secretstore.Reference(settings.store, db.metadata(conn)['instance_tag'], secretstore.KEY_ITEM))
+    conn.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?)", (secretstore.KEY_REF, ref))
+
+busy = sqlite3.OperationalError('fixture writer is busy')
+busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+attempts = []
+sync = secretstore.sync_before_cleanup
+
+def transient(*args, **kwargs):
+    attempts.append(1)
+    if len(attempts) < 3:
+        raise busy
+    return sync(*args, **kwargs)
+
+with (mock.patch.object(secretstore, 'sync_before_cleanup', side_effect=transient),
+      mock.patch.object(secretstore, 'referenced_key', side_effect=secretstore.FingerprintKeyMissing) as check):
+    secretstore.retire_local_key(marker, settings, wait_for_writer=True)
+assert len(attempts) == 3 and check.call_count == 1 and marker.exists()
+""")
+
     def test_an_account_fingerprint_without_a_key_requires_reconciliation(self):
         self.run_secret_child(r"""
 with db.tx() as c:

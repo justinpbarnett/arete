@@ -28,10 +28,11 @@ def last_lifecycle(c, secret_id):
     return row["event"] if row else None
 
 
-def change_recorded(c, secret_id, receipt):
+def change_recorded(c, secret_id, operation_id):
     return c.execute("""
-        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed') AND detail = ?
-        """, (secret_id, receipt)).fetchone() is not None
+        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed')
+        AND (detail = ? OR CASE WHEN json_valid(detail) THEN json_extract(detail, '$.id') END = ?)
+        """, (secret_id, operation_id, operation_id)).fetchone() is not None
 
 
 def has_fingerprints(c):

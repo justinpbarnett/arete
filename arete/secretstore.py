@@ -18,7 +18,7 @@ from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, launch_lease, local_paths, paths, util
+from . import config, launch_lease, paths, util
 from .store import credentials, db, writes
 
 NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
@@ -212,51 +212,22 @@ def require_writable_entry(parent: int, name: str) -> None:
 
 
 @contextmanager
-def durable_directory_fd(path: Path, parent: int | None = None, *, create=False):
-    if ".." in path.parts or (parent is not None and path.is_absolute()):
-        raise PermissionError("directory traversal refused")
-    with ExitStack() as stack:
-        if parent is None:
-            parent = stack.enter_context(paths.directory_fd(Path("/")))
-            parts = path.absolute().parts[1:]
-        else:
-            parts = path.parts
-        for index, part in enumerate(parts):
-            created = False
-            if create:
-                try:
-                    os.mkdir(part, 0o700, dir_fd=parent)
-                    created = True
-                except FileExistsError:
-                    pass
-            if created or os.access(".", os.W_OK, dir_fd=parent):
-                fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            parent = local_paths.open_directory(part, parent, index < len(parts) - 1)
-            stack.callback(os.close, parent)
-        yield parent
-
-
-@contextmanager
 def file_parent(path: Path, root: Path, *, create=False, private=False, durable=False):
     if paths.ISOLATED and (paths.confined(root) is None or
                            paths.scratch_root(root) != paths.scratch_root(paths.STATE_DIR)):
         raise StoreError("secret item must stay inside the instance's scratch folder")
-    directory = durable_directory_fd if create or durable else paths.directory_fd
-    with directory(root, create=create) as fd, ExitStack() as stack:
+    durable = create or durable
+    with paths.directory_fd(root, create=create, durable=durable) as fd, ExitStack() as stack:
         parent = path.parent.relative_to(root)
         if private:
             require_private_directory(fd)
             for part in parent.parts:
-                child = stack.enter_context(directory(Path(part), fd, create=create))
+                child = stack.enter_context(paths.directory_fd(Path(part), fd, create=create, durable=durable))
                 require_exact_entry(fd, part, writing=create)
                 require_private_directory(child)
                 fd = child
         else:
-            fd = stack.enter_context(directory(parent, fd, create=create))
+            fd = stack.enter_context(paths.directory_fd(parent, fd, create=create, durable=durable))
         yield fd
 
 
@@ -469,39 +440,45 @@ def sync_before_cleanup(matches, cleanup, *, timeout=0):
         c.execute("COMMIT")
         c.execute("BEGIN IMMEDIATE")
         if matches(c):
-            cleanup()
+            cleanup(c)
 
 
 def retire_committed_local_key(local: Path) -> None:
     if db.in_write():
         db.after_commit(lambda: retire_committed_local_key(local))
         return
-    with suppress(OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error):
-        if not local.exists():
-            return
-        with db.reader(streaming=True) as c:
-            meta = db.metadata(c)
-        if reference := meta.get(KEY_REF):
-            settings = config.secret_settings()
-            if settings.store == "pve_store":
-                key = referenced_key(meta, settings, expected_store="pve_store")
-                retire_local_key(local, key, reference, timeout=30 if sys.platform == "linux" else 0)
+    with suppress(OSError, ValueError, RuntimeError):
+        settings = config.secret_settings()
+        if settings.store == "pve_store":
+            retire_local_key(local, settings, wait_for_writer=sys.platform == "linux")
 
 
-def retire_local_key(local, key, reference, *, timeout=0):
+def retire_local_key(local, settings, reference=None, *, wait_for_writer=False):
     def matches(c):
-        return local.exists() and db.metadata(c).get(KEY_REF) == reference
+        current = db.metadata(c).get(KEY_REF)
+        return local.exists() and current and (reference is None or reference == current)
 
-    def unlink():
+    def unlink(c):
         with file_parent(local, local.parent) as parent:
             if sys.platform == "linux":
                 fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            key = referenced_key(db.metadata(c), settings, expected_store=settings.store)
             if read_file_at(parent, local.name) == key:
                 os.unlink(local.name, dir_fd=parent)
                 os.fsync(parent)
 
-    with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
-        sync_before_cleanup(matches, unlink, timeout=timeout)
+    while True:
+        try:
+            if not local.exists():
+                return
+            sync_before_cleanup(matches, unlink, timeout=5 if wait_for_writer else 0)
+        except sqlite3.OperationalError as error:
+            # The last mount lease has closed. Wait for the writer without holding a lease or transaction.
+            if wait_for_writer and (getattr(error, "sqlite_errorcode", 0) & 0xff) == sqlite3.SQLITE_BUSY:
+                continue
+        except (OSError, ValueError, KeyError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
+            pass
+        return
 
 
 def lookup_key(c, settings, local):
@@ -518,7 +495,7 @@ def lookup_key(c, settings, local):
 def ensure_key(c, settings, local, meta, key, *, recovering=False):
     if reference := meta.get(KEY_REF):
         if meta.get(KEY_LOCAL) and local.exists():
-            db.after_commit(lambda: retire_local_key(local, key, reference))
+            db.after_commit(lambda: retire_local_key(local, settings, reference))
         return key
     fallback = key if key is not None else read_file(local, local.parent, durable=True)
     ref = Reference(settings.store, meta["instance_tag"], KEY_ITEM) if settings.store else None
@@ -534,7 +511,7 @@ def ensure_key(c, settings, local, meta, key, *, recovering=False):
             write_item(ref, settings, key)
         c.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?)", (KEY_REF, str(ref)))
         if fallback is not None:
-            db.after_commit(lambda: retire_local_key(local, key, str(ref)))
+            db.after_commit(lambda: retire_local_key(local, settings, str(ref)))
     else:
         if fallback is None:
             with credential_activation(publishing=True):
@@ -596,8 +573,10 @@ def history(scope, name):
         events = credentials.history(c, row["id"]) if row else []
     for event in events:
         if (detail := event["detail"]) and detail.startswith("{"):
-            operation = json.loads(detail)
-            event.update(kind=operation["kind"], provider=operation["provider"], detail=operation["id"])
+            # Schema 27 also permits arbitrary text in historical event details.
+            with suppress(json.JSONDecodeError, KeyError):
+                operation = json.loads(detail)
+                event.update(kind=operation["kind"], provider=operation["provider"], detail=operation["id"])
     return events
 
 
@@ -659,20 +638,13 @@ def retire_pending(item, raw, expected):
 
     def committed():
         with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
-            sync_before_cleanup(matches, lambda: remove_file(*pending_path(item), private=True))
+            sync_before_cleanup(matches, lambda _c: remove_file(*pending_path(item), private=True))
 
     db.after_commit(committed)
 
 
 def history_detail(kind, provider, operation_id=None):
     return json.dumps(dict(id=operation_id, kind=kind, provider=provider))
-
-
-def change_recorded(c, secret_id, operation_id):
-    return c.execute("""
-        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed')
-        AND (detail = ? OR CASE WHEN json_valid(detail) THEN json_extract(detail, '$.id') END = ?)
-        """, (secret_id, operation_id, operation_id)).fetchone() is not None
 
 
 def save_change(c, scope, name, previous, ref, change):
@@ -698,7 +670,7 @@ def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
     confirmed = list(receipt.get("confirmed", ()))
 
     def recorded(operation):
-        return row is not None and change_recorded(c, row["id"], operation["id"])
+        return row is not None and credentials.change_recorded(c, row["id"], operation["id"])
 
     for change in receipt.get("sets", ()):
         if change["fingerprint"] == fingerprint or recorded(change):
