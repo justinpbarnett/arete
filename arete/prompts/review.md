@@ -56,6 +56,14 @@ real caller takes:
 
 For each blocker set `severity` to `blocker` and `category` to the test it meets, and in `problem` name the path: who
 or what does what, and what goes wrong. If you cannot name that path, it is not a blocker.
+Give each blocker an `acceptance` condition: the exact steps and what a repaired candidate must observably do.
+For a repeatable regression use `verification: check` and give its approved `check` name from the supplied list.
+Name the check that can specifically exercise that path, or can run a focused case added for it; do not invent a
+command. If `classes` is configured, use `check: classes` with one dotted `test_class` for the class or test
+method that exercises the finding. If a runnable approved check is missing, still mark a repeatable case `check`, explain the gap in
+`verification_reason`, and omit `check`. For a different kind of evidence set `verification` to `in_use` (a live
+observation) or `review` (inspection), and give the reason a checked regression is unsuitable in
+`verification_reason`. On re-review, verify a focused result actually covers its finding before closing it.
 
 Before holding on a blocker, check every other path in this diff where the same kind of problem can occur. For example,
 check every place the change writes the same data or every caller of the changed function. List each failing path as

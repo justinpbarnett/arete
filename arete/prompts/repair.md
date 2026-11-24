@@ -37,7 +37,9 @@ Denied paths: $denied.
   Do not duplicate the full suite here; leave it to the checks step.
   Run the test classes for the files you changed by name, for example `$test_classes`;
   a full suite run here waits for a free check lane.
-  Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.
+  Exercise each listed acceptance condition. Reuse the named regression or add only the case it needs under the
+  approved check. Report what you actually ran, any missing baseline, and any required independent observation
+  you could not make. Do not change check policy or work around a sandbox refusal.
 - Shell commands you may run: $commands. Others are refused. If a finding needs one, change nothing for it and say
   in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and pushes, and deletes the

@@ -53,7 +53,8 @@ class WorkerTurns:
         if self.data.get("ci_failed"):
             return "ci_repair"
         catch_up = self.data.get("catch_up_hold", {})
-        if self.job.review.verdict == "request_changes" or catch_up.get("gate") == "review":
+        if (self.job.review.verdict == "request_changes" or catch_up.get("gate") == "review"
+                or self.data.get("repair_state", {}).get("findings")):
             return "review_repair"
         if self.run.repairs or catch_up or self.data.get("denied_feedback"):
             return "check_repair"
@@ -153,6 +154,8 @@ class WorkerTurns:
         candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=sibling)
         data = {"effective": args, "role": role, "writing": writing, "write_paths": args["write_paths"],
                 "turn": action["turn"], "candidate": candidate}
+        if writing and (findings := self.data.get("repair_state", {}).get("findings")):
+            data["repair_findings"] = findings
         try:
             exchange.assign(self.lease, wid, data)
         except Exception:

@@ -15,8 +15,9 @@ The reviewer also left notes. Fix a note only when the fix is small and inside t
 
 $notes
 
-Use a focused reproduction when it helps establish that a blocker is fixed, and read its output and exit code.
-Arete runs targeted checks after each repair and the full repository suite on the final tree before publication.
+Exercise each listed acceptance condition. Reuse the named regression or add only the case it needs under the
+approved check; do not change check policy. Read the output and exit code. Arete rechecks recorded regressions
+before another full review, and still requires the full suite and applicable in-use verification on the final tree.
 Do not duplicate the full suite in this repair step.
 Name exactly what you ran and any environmental limitation; never report an unrun check as passed.
 

@@ -47,6 +47,7 @@ from .verify import Verified
 CI_FAILURES = "ci:failures"
 MAX_CI_FAILURE_CHARS = 24000
 CATCH_UP_FAILURE = "catch-up:failure"
+REPAIR_FINDINGS = "repair:findings"
 MAX_CATCH_UP_FEEDBACK_CHARS = 12000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
@@ -164,6 +165,8 @@ class Controller(worker_turns.WorkerTurns):
             self.data["checked"] = self.job.b.checked
             self.data["report"] = self.job.b.report
             self.data["catch_ups"] = self.job.b.catch_ups
+            if state := self.job.b.repair_state():
+                self.data["repair_state"] = state
         ledger.save(self.lease, self.data)
 
     def atomic(self, name, **kw):
@@ -270,6 +273,7 @@ class Controller(worker_turns.WorkerTurns):
             self.job.verified = Verified.stored(self.data.get("verified", {}))
             self.job.b.checked = self.data.get("checked", {})
             self.job.b.report = self.data.get("report", "")
+            self.job.b.restore_repair_state(self.data.get("repair_state", {}))
             self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.worker_trees = self.data.get("worker_trees", {})
             self.job.b.ignored_denied_paths = self.data.get("ignored_denied_paths", {})
@@ -353,6 +357,8 @@ class Controller(worker_turns.WorkerTurns):
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
+        if self.job.review.blocking():
+            self.job.b.carry_review(self.job.review, f"{self.lease.root}:restored-review")
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
@@ -522,6 +528,8 @@ class Controller(worker_turns.WorkerTurns):
         self.data["stale_actions"] = sorted({*self.data.get("stale_actions", ()),
                                              *(action["id"] for action in ledger.actions(self.lease))})
         self.data["evidence"] = {}
+        if "repair_state" in self.data:
+            self.data["repair_state"] = {**self.data["repair_state"], "receipts": {}}
         self.data["review"] = pipeline.Review.stored({}).asdict()
         self.data["verified"] = asdict(Verified("unverified"))
         for name in ("checked", "report"):
@@ -600,6 +608,8 @@ class Controller(worker_turns.WorkerTurns):
         for action in ledger.actions(self.lease):
             result = action["result"]
             gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+            if gate == "checks" and action.get("request", {}).get("scope") == "focused":
+                gate = None
             old_gate = bool(gate) and action["id"] in stale
             if action["id"] == catch_up.get("action"):
                 self.data["evidence"] = {}
@@ -652,7 +662,12 @@ class Controller(worker_turns.WorkerTurns):
         for worker in self.workers.values():
             self.progress[worker.action] = worker.observations()
             self.reported[worker.action] = worker.report[0]
-        return {**(self.worker_observation(outstanding=True) if self.exchanged else {}),
+        repair = {}
+        if self.job.built is not None and (feedback := self.job.b.repair_feedback()):
+            self.catalog.add_context(REPAIR_FINDINGS, feedback)
+            repair = {"repair_findings": {"ref": REPAIR_FINDINGS, "focused": self.job.b.focused_status(),
+                                         "in_use_pending": self.job.b.in_use_repair_hold(self.job.verified)}}
+        return {**(self.worker_observation(outstanding=True) if self.exchanged else {}), **repair,
                 "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 **({"serial_reason": self.data["serial_reason"]} if self.data.get("serial_reason") else {}),
@@ -792,10 +807,11 @@ class Controller(worker_turns.WorkerTurns):
                 raise ValueError("builder capacity is full")
             logical_id, assignment = self.private_assignment(action, args, prior, writing, role)
             role = assignment["role"]
-        if not self.exchanged and writing and (self.data.get("writes", 0) or self.run.repairs or catch_up or denied_feedback):
+        if not self.exchanged and writing and (self.data.get("writes", 0) or self.run.repairs or catch_up
+                                               or denied_feedback or self.data.get("repair_state")):
             role = ("ci_repair" if self.data.get("ci_failed") else "review_repair"
-                    if catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
-                    else "check_repair")
+                    if (catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
+                        or self.data.get("repair_state", {}).get("findings")) else "check_repair")
         if role != setting.step:
             setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, role, self.run.kind,
                                              {"runner": setting.runner, "model": setting.model,
@@ -837,6 +853,8 @@ class Controller(worker_turns.WorkerTurns):
         if assignment:
             messages = exchange.inbox(self.lease, logical_id)
             prompt += worker_turns.instructions(assignment, messages)
+        if writing and self.job.built is not None and (feedback := self.job.b.repair_feedback()):
+            prompt += f"\n\n## Confirmed findings and required acceptance\n\n{feedback}"
         if writing and denied_feedback:
             prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
         session = NO_SESSION
@@ -1038,6 +1056,13 @@ class Controller(worker_turns.WorkerTurns):
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
+        repair_exhausted = False
+        if pending := self.job.b.focused_hold():
+            repair_exhausted = bool(self.run.budget and self.run.budget.repair_limit_reason())
+            if (not repair_exhausted or not self.run.repo.parts or self.data.get("catch_up_hold")
+                    or self.run.environment_release or pilot.is_pilot_task(str(self.run.tid))
+                    or zte.reserved(str(self.run.tid)) or not self.job.b.focused_draft_hold(self.job.review)):
+                raise ValueError(f"publication needs current focused repair evidence: {pending}")
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -1068,7 +1093,8 @@ class Controller(worker_turns.WorkerTurns):
             self.take_merge_lease(checkout)
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
-        outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section)
+        outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section,
+                              **({"repair_exhausted": True} if repair_exhausted else {}))
         if not outcome.passed:
             self.ending = flows.ended(self.flow, outcome)
             return outcome.data
@@ -1372,6 +1398,7 @@ class Controller(worker_turns.WorkerTurns):
         if hold.verified is not None:
             evidence.append(hold.verified.markdown())
         if hold.review is not None:
+            self.job.b.carry_review(hold.review, f"{self.run.id}:{self.executing}:catch-up")
             evidence.append(hold.review.markdown())
         feedback = "\n\n".join(evidence)
         self.data["catch_up_hold"] = {"action": self.executing, "gate": hold.gate, "reason": reason,
@@ -1611,6 +1638,15 @@ class Controller(worker_turns.WorkerTurns):
         self.barrier()
         if self.exchanged and op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed"):
             self.worker_barrier()
+        if op == "checks.run" and args["scope"] == "focused":
+            b = self.job.b
+            if not b.focused_status():
+                return {"scope": "focused", "outcome": "not applicable", "receipts": {}}
+            b.denied_feedback = self.data.get("denied_feedback", "")
+            pending = b.check_repair_findings(producer=action["id"])
+            self.persist()
+            return {"passed": not pending, "scope": "focused", "pending": pending,
+                    "receipts": dict(b.repair_receipts), "in_use_pending": b.in_use_repair_hold(self.job.verified)}
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
             self.persist()
@@ -1628,6 +1664,8 @@ class Controller(worker_turns.WorkerTurns):
             return {"passed": outcome.passed, **outcome.data}
         if op in ("verification.run", "review.run"):
             role = "verify" if op == "verification.run" else "review"
+            if role == "review" and self.job.built is not None and (pending := self.job.b.focused_hold()):
+                raise ValueError(f"review needs current focused repair evidence: {pending}; run focused checks or delegate repair")
             self.data.setdefault("evidence", {}).pop(role, None)
             self.persist()
             setting = self.catalog.route(args["route_id"], args["effort"], (role,))
@@ -1642,7 +1680,12 @@ class Controller(worker_turns.WorkerTurns):
                                                    else {"attempt": self.job.reviews + 1}))
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
+            if pending := outcome.data.get("focused_hold"):
+                raise ValueError(f"review needs current focused repair evidence: {pending}")
             result = outcome.data.get("verified" if role == "verify" else "review", {})
+            if role == "review" and self.job.review.blocking():
+                self.job.b.carry_review(self.job.review, f"{self.run.id}:{action['id']}")
+                self.persist()
             self.stamp(role, result)
             if outcome.data.get("ending") == "environment-held":
                 self.ending = flows.ended(self.flow, outcome)
@@ -1663,6 +1706,7 @@ class Controller(worker_turns.WorkerTurns):
             if args["reason"] == "delivered":
                 published = self.data.get("published", {})
                 if (published.get("ending") not in ("done", "pr") or self.data.get("ci_failed")
+                        or (self.job.built is not None and self.job.b.focused_hold())
                         or self.data.get("published_tree") != self.fingerprint()
                         or not all(self.current(gate) for gate in ("checks", "verify", "review"))):
                     raise ValueError("delivery has no successful current engine publication")
@@ -1738,6 +1782,8 @@ class Controller(worker_turns.WorkerTurns):
         else:
             if result is not None and not (self.exchanged and action["op"] in ("worker.steer", "worker.reply", "worker.cancel")):
                 gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+                if gate == "checks" and action.get("request", {}).get("scope") == "focused":
+                    gate = None
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
                 state = "failed" if action["op"] != "run.observe" and "error" in result else "succeeded"

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, factory, gh, paths, run_lines, util, workspace
-from .review import Review
+from .review import Review, repair_fields
 
 PLAN_STEPS = ("plan", "revise", "repair")
 MAX_LOG = 200
@@ -38,10 +38,11 @@ def saved_review(run_id: str) -> tuple[Review, int]:
     listed = [p for p in saved.get("problems") or [] if isinstance(p, dict) and str(p.get("text") or "").strip()]
     if saved.get("verdict") != "request_changes" or not listed:
         raise Refused(f"run {run_id} requested changes but saved no findings to repair")
-    found = Review.stored({"verdict": "request_changes", "problems":
-        [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category")}
-         for p in listed]})
-    return found, int(report.get("seq") or 0)
+    seq = int(report.get("seq") or 0)
+    found = Review.stored({"verdict": "request_changes", "trees": saved.get("trees") or {}, "problems":
+        [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category"),
+          **repair_fields(p)} for p in listed]})
+    return found.identify(f"{run_id}:report-{seq}"), seq
 
 
 def saved_plan(run_id: str) -> tuple[str, str, str]:

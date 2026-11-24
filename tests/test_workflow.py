@@ -2562,7 +2562,7 @@ class AutomaticCIRerunFixture:
             for check, caused in self.verdicts.items()
         ], "summary": "Fixed the regression."})
 
-    def fixed(self, build, branch, caused, names, round_number):
+    def fixed(self, build, branch, caused, names, round_number, **_evidence):
         self.assertEqual([red.check.name for red in caused], [name for name, caused in self.verdicts.items() if caused])
         self.build.staged = SimpleNamespace(changed=[self.checkout])
         self.checkout.note_pushed_head("fixed-head")
@@ -2693,8 +2693,8 @@ class AutomaticCIRerunTests(AutomaticCIRerunFixture, unittest.TestCase):
         self.verdicts["dependent"] = True
         ci.failure_note.side_effect = lambda red, _: red.check.name
 
-        def push_fix(*args):
-            self.fixed(*args)
+        def push_fix(*args, review=None, goal=""):
+            self.fixed(*args, review=review, goal=goal)
             self.rerun_jobs[1] = self.job("dependent", 302, "success")
 
         self.push_fix.side_effect = push_fix
@@ -5455,7 +5455,8 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.build = SimpleNamespace(run=run, checked={}, report="", staged=None, build_summary="",
                                      layer=config.RepoLayer(root, verify=config.Verify(), trust_level="automerge"),
                                      ticket=tracker.Ticket("7", "#7", "Edit fixture"), catch_ups=0,
-                                     require_valid_diff=mock.Mock(), check=mock.Mock())
+                                     require_valid_diff=mock.Mock(), check=mock.Mock(),
+                                     check_repair_findings=lambda **_: "", in_use_repair_hold=lambda _: "")
         self.failure = workspace.RunFailed("verification stopped before review")
         self.git = self.enterContext(mock.patch.object(pipeline, "git", side_effect=["published", "tree", "published"]))
         self.uncommitted = self.enterContext(mock.patch.object(workspace, "uncommitted", wraps=workspace.uncommitted,
@@ -6449,7 +6450,8 @@ class MovedBasePublicationFixture:
                         changed=[checkout.github], opened=[checkout.github], pushed=[], ci_stopped=[], build_summary="updated")
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
-                          checked={}, report="", staged=None, catch_ups=0, ci_rerun_requested_heads=set())
+                          checked={}, report="", staged=None, catch_ups=0, ci_rerun_requested_heads=set(),
+                          focused_hold=mock.Mock(return_value=""))
         controller.run, controller.job = run, job
         controller.flow = SimpleNamespace(ctx=job, refusal="", continues="")
         controller.data = {"mode": "orchestrate", "evidence": {"checks": {"result": {"full": True}}}}
@@ -7470,7 +7472,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         staged = pipeline.Staged(counts={"file.txt": 1}, changed=[checkout])
         verified, review = verify.Verified("pass"), Review("approve")
 
-        def watch_ci(*args):
+        def watch_ci(*args, **kwargs):
             self.edit.assert_called_once()
             self.assertIn("Earlier verification.", self.body)
             self.edit.side_effect = self.edit_body
@@ -11054,7 +11056,9 @@ class ReviewTests(unittest.TestCase):
 
     def test_review_answer_without_a_problems_list_does_not_approve(self):
         build = SimpleNamespace(run=mock.Mock(), brief=mock.Mock(), report="", checkouts=[],
-                                staged=SimpleNamespace(patch=""), ws=None, read_bash=[])
+                                staged=SimpleNamespace(patch=""), ws=None, read_bash=[],
+                                repair_commands=dict, repair_feedback=str)
+        build.brief.prompt.return_value = "review prompt"
         build.run.agent.return_value = SimpleNamespace(ok=True, structured={"verdict": "approve", "summary": "Fine."})
         with mock.patch.object(pipeline, "compare_with_fork", return_value=""):
             result = pipeline._review(build, "", mock.Mock())

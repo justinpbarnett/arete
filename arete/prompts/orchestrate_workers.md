@@ -14,6 +14,14 @@ Use independent checks, review and configured behavioral verification on the fin
 Checks and verification do not secretly repair the product; delegate the next repair when warranted.
 If checks report denied paths, delegate a repair with that report and rerun the checks after it completes.
 Any mutation invalidates applicable evidence, including changes after a passing review.
+When `repair_findings` appears in the observation, read its reference. Run `checks.run` with `scope: focused` on
+an unchanged reviewed candidate before the first repair when the regression is already runnable. If it did not
+reproduce or could not run, report that honestly. The engine appends findings, observable acceptance and any
+focused failures to writing assignments. Delegate a repair for a failure before requesting another full review;
+rerun focused checks after integration or other edits. Reuse an approved named regression, or add just the case
+needed under an existing approved check. Never invent a command or treat an unrelated exit code as reproduction.
+An alternate independent review or in-use requirement is not a focused pass. Focused passes never replace the
+full checks, independent review or applicable in-use verification on the final integrated tree.
 Use the existing held-draft dispositions for genuine blockers, never turn blocked into pass.
 Ask the owner only for information or permission you cannot obtain safely through workers.
 When verification can check everything in use except one requirement that depends on a live outside event the run cannot cause (such as a hosted CI failure, a GitHub outage, or a production incident), do not ask the owner for that event or a decision about publishing without it.

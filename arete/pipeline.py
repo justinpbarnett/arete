@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from uuid import uuid4
 
 from . import (
     alerts,
@@ -65,7 +66,15 @@ from . import (
     workspace,
 )
 from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
-from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
+from .review import (
+    CATCH_UP_REVIEW_SCHEMA,
+    REPAIR_SELECTOR_SCHEMA,
+    REVIEW_SCHEMA,
+    Review,
+    catch_up_problems,
+    numbered,
+    permitted_review_patches,
+)
 from .store import asks as asks_store
 from .store import insights as insights_store
 from .store import runs as run_store
@@ -1152,15 +1161,26 @@ def check_lane(layer: config.RepoLayer, run: AgentRun):
         yield hold_fds
 
 
+def selected_class_command(layer: config.RepoLayer, test_class: str) -> str:
+    command = layer.targeted_commands.get("classes")
+    if command and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", test_class, re.ASCII):
+        return shlex.join([*config.class_command_words(command), test_class])
+    return ""
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float, *, selected: set[str] | None = None,
-               defer_failed_cleanup: bool = False) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None, test_class: str = "",
+               defer_failed_cleanup: bool = False, exits: dict[str, int] | None = None) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
         if missing := selected - available.keys():
             raise ValueError(f"unknown selected checks: {', '.join(sorted(missing))}")
         commands = {name: command for name, command in available.items() if name in selected}
+    if test_class:
+        if selected != {"classes"} or not (command := selected_class_command(layer, test_class)):
+            raise ValueError("a focused test selector requires the approved classes command and a dotted test name")
+        commands = {"classes": command}
     if not commands:
         return True, "no checks configured"
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
@@ -1176,6 +1196,8 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             with record.timed(run.id, "check", name=name, command=cmd) as check:
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 check["exit"] = res.returncode
+            if exits is not None:
+                exits[name] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
@@ -1282,6 +1304,208 @@ class Build(TicketWork):
     ignored_denied_paths: dict[str, list[str]] = field(default_factory=dict)
     denied_feedback: str = ""
     on_denied_edit: Callable[[str], None] | None = None
+    repair_findings: dict[str, dict] = field(default_factory=dict)
+    repair_receipts: dict[str, dict] = field(default_factory=dict)
+
+    def repair_state(self) -> dict:
+        return {"findings": dict(self.repair_findings), "receipts": dict(self.repair_receipts)} if self.repair_findings else {}
+
+    def restore_repair_state(self, state: dict) -> None:
+        self.repair_findings.update(state.get("findings", {}))
+        self.repair_receipts.update(state.get("receipts", {}))
+
+    def carry_review(self, review: Review, receipt: str) -> None:
+        found = review.identify(receipt).repair_requirements()
+        fresh = {key: {**requirement, "reviewed_trees": review.trees} for key, requirement in found.items()
+                 if key not in self.repair_findings}
+        if fresh:
+            self.repair_findings.update(fresh)
+            self.run.save("repair-checks.json", self.repair_state())
+
+    def repair_commands(self) -> dict:
+        return self.layer.checks | self.layer.targeted_commands
+
+    def repair_command_sha(self, finding: dict) -> str:
+        name, test_class = finding["check"], finding["test_class"]
+        if name == "classes" and name in self.layer.targeted_commands:
+            command = selected_class_command(self.layer, test_class)
+        else:
+            command = self.repair_commands().get(name) if not test_class else ""
+        return hashlib.sha256(command.encode()).hexdigest() if command else ""
+
+    def unresolved_repair_selectors(self) -> dict[str, dict]:
+        return {key: f for key, f in self.repair_findings.items() if f["verification"] == "check"
+                and (not f["check"] or (f["check"] == "classes" and "classes" in self.layer.targeted_commands
+                                        and not f["test_class"]))
+                and not self.repair_receipts.get(key, {}).get("command_sha")}
+
+    def resolve_repair_selectors(self, staged: Staged) -> None:
+        missing = self.unresolved_repair_selectors()
+        if not missing or not (trees := verification_trees(self)):
+            return
+        names = prompt_loader.code_list(sorted(self.repair_commands())) or "None configured."
+        text = prompt_loader.task_prompt(
+            "Independently resolve missing focused regression selectors only. Do not review the whole change, "
+            "edit files, or close any finding. Read the candidate for an existing focused test or one added "
+            "for this repair. For each finding use the exact ID and select a check from the owner-approved names. "
+            "For `classes`, give one dotted test class or method. Do not supply a command. If none can exercise "
+            "the acceptance condition, explain why and select `review` for independent inspection or `in_use` "
+            "for a behavioral observation via configured verification. If undecidable, leave it unresolved.\n\n"
+            f"Approved names: {names}\nIn-use verification configured: {bool(self.layer.verify)}\n\n"
+            f"Findings: {vault.hidden(json.dumps(missing))}\n\n"
+            f"Candidate diff:\n{util.tail(diffguard.fold_moved(staged.patch), MAX_DIFF_IN_PROMPT)}")
+        step = self.next_step("review_selectors")
+        result = self.run.agent(step, text, self.ws, role="review", read_only=True, persist=False,
+                                json_schema=REPAIR_SELECTOR_SCHEMA)
+        if verification_trees(self) != trees:
+            raise workspace.RunFailed("the candidate changed while selecting focused evidence")
+        if not result.ok or not isinstance(result.structured, dict):
+            return
+        choices = result.structured.get("selectors")
+        if not isinstance(choices, list):
+            return
+        named = [choice for choice in choices if isinstance(choice, dict) and isinstance(choice.get("id"), str)]
+        changed = False
+        for choice in named:
+            key = choice["id"]
+            if key not in missing or sum(c["id"] == key for c in named) != 1:
+                continue
+            fields = {name: choice.get(name, "") for name in ("verification", "check", "test_class", "reason")}
+            if not all(isinstance(value, str) for value in fields.values()):
+                continue
+            requirement = {**missing[key], **{name: value.strip() for name, value in fields.items()}}
+            method = requirement["verification"]
+            if method == "check":
+                if not self.repair_command_sha(requirement):
+                    continue
+            elif (method not in ("review", "in_use") or not requirement["reason"] or requirement["check"]
+                  or requirement["test_class"] or (method == "in_use" and not self.layer.verify)):
+                continue
+            self.repair_findings[key] = {**requirement, "selection": {"tree": trees, "producer": step}}
+            changed = True
+        if changed:
+            self.run.save("repair-checks.json", self.repair_state())
+
+    def focused_status(self) -> dict[str, str]:
+        repeatable = {key: f for key, f in self.repair_findings.items() if f["verification"] not in ("review", "in_use")}
+        if not repeatable:
+            return {}
+        trees = verification_trees(self)
+        status = {}
+        for key, f in repeatable.items():
+            found = self.repair_receipts.get(key)
+            if not found:
+                status[key] = "not run"
+            elif (not trees or trees != found["tree"] or found["check"] != f["check"]
+                  or self.repair_command_sha(f) != found["command_sha"]):
+                status[key] = "stale"
+            else:
+                status[key] = found["outcome"]
+        return status
+
+    def repair_feedback(self) -> str:
+        status = self.focused_status()
+        unresolved = self.unresolved_repair_selectors()
+        lines = []
+        for key, f in self.repair_findings.items():
+            method = f["verification"]
+            if key in status:
+                check = " ".join(filter(None, (f["check"], f["test_class"]))) or "(not specified)"
+                detail = f"Focused check `{check}`: {status[key]}. {f['reason']}".strip()
+                if key in unresolved:
+                    detail += (" Use or add a focused case under an approved check where policy permits; "
+                               "an independent selector step will choose the check or record why it needs "
+                               "another kind of evidence.")
+            else:
+                detail = f"Requires independent {method.replace('_', ' ')}: {f['reason']}"
+            last = self.repair_receipts.get(key, {})
+            report = util.tail(last.get("report", ""), 1500) if last.get("outcome") not in (None, "pass") else ""
+            lines.append(f"{key} {f['file']}: {f['problem']}\nAcceptance: {f['acceptance']}\n{detail}"
+                         + (f"\nLast attempt ({last['outcome']}): {report}" if report else ""))
+        return "\n\n".join(lines)
+
+    def focused_hold(self) -> str:
+        return ", ".join(f"{key} ({status})" for key, status in self.focused_status().items() if status != "pass")
+
+    def focused_draft_hold(self, review: Review) -> str:
+        pending = {key for key, status in self.focused_status().items() if status != "pass"}
+        if (pending and review.verdict == "request_changes" and not review.failed
+                and pending <= {problem.get("finding") for problem in review.blocking()}
+                and review.trees and review.trees == verification_trees(self)):
+            return f"Focused repair evidence is still required: {self.focused_hold()}"
+        return ""
+
+    def check_repair_findings(self, *, producer: str, baseline: bool = False, fresh: bool = False) -> str:
+        pending = [key for key, status in self.focused_status().items()
+                   if status != "fail" and (status != "pass" or fresh) and (not baseline or key not in self.repair_receipts)]
+        if not pending:
+            return self.focused_hold()
+        staged = self.restage()
+        if not baseline and not (staged.denied or staged.earlier_denied or self.denied_feedback):
+            self.resolve_repair_selectors(staged)
+        for key in pending:
+            finding = self.repair_findings[key]
+            if finding["verification"] != "check":
+                continue
+            name, test_class = finding["check"], finding["test_class"]
+            command_sha = self.repair_command_sha(finding)
+            before, exits = verification_trees(self), {}
+            if staged.denied or staged.earlier_denied or self.denied_feedback:
+                report = "The existing check policy requires resolving denied edits first."
+            elif not command_sha:
+                report = "No approved named regression with a valid selector was selected; no command ran."
+            elif not before:
+                report = "Cannot identify the candidate tree; no command ran."
+            else:
+                try:
+                    _, report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout,
+                                           selected={name}, test_class=test_class, exits=exits)
+                except OSError as error:
+                    exits.clear()
+                    report = f"The checked command did not complete: {util.first_line(str(error), 300)}"
+            after = verification_trees(self)
+            code = exits.get(name)
+            outcome = ("changed" if before != after else "pass" if code == 0 and before else
+                       "blocked" if code is None or code in (util.TIMED_OUT, 126, 127) or code < 0 else "fail")
+            reviewed = finding["reviewed_trees"]
+            found = {"finding": key, "tree": before, "after_tree": after, "check": name, "test_class": test_class,
+                     "on_reviewed_tree": before == reviewed if before and reviewed else None,
+                     "command_sha": command_sha, "exit": code, "outcome": outcome,
+                     "report": vault.hidden(report), "producer": producer}
+            self.repair_receipts[key] = found
+            record.mark(self.run.id, "focused_check", **found)
+            self.run.save("repair-checks.json", self.repair_state())
+            if before != after:
+                break
+        return self.focused_hold()
+
+    def retry_focused_repairs(self, producer: str, reply: str) -> tuple[bool, str]:
+        if not self.check_repair_findings(producer=producer):
+            return True, reply
+        tries = self.run.settings("check_repair").tries
+        for _ in range(1, tries):
+            step = self.next_step("review_regression_fix")
+            prompt = prompt_loader.prompt("review_fix", problems=self.repair_feedback(), notes="None.",
+                                          denied=prompt_loader.code_list(self.deny))
+            result = self.resume(step, prompt, role="review_repair")
+            reply = result.text
+            if not result.ok:
+                break
+            if not self.check_repair_findings(producer=step):
+                return True, reply
+        return False, reply
+
+    def in_use_repair_checks(self) -> dict[str, str]:
+        return {key: f["acceptance"] for key, f in self.repair_findings.items() if f["verification"] == "in_use"}
+
+    def in_use_repair_hold(self, verified: verify.Verified) -> str:
+        needed = self.in_use_repair_checks()
+        if not needed:
+            return ""
+        observed = (verified.repair_observations if verified.verdict == "pass" and verified.finished
+                    and not verified.failed_checks and verified.observed_trees
+                    and verified.observed_trees == verification_trees(self) else {})
+        return ", ".join(key for key, acceptance in needed.items() if observed.get(key) != acceptance)
 
     def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
@@ -1340,18 +1564,34 @@ class Build(TicketWork):
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
         before = factory.fingerprint(self.ws)
+        before_trees = self.check_trees(before)
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
                                      defer_failed_cleanup=defer_failed_cleanup)
         if ok:
             after = factory.fingerprint(self.ws)
-            if before and after and before != after:
+            after_trees = self.check_trees(after)
+            if (before and after and before != after) or (before_trees and before_trees != after_trees):
                 self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
                 return False
             if full:
-                self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
+                self.checked = {"tree": after, "trees": after_trees if before_trees else {},
+                                "commands": dict(self.layer.checks), "report": self.report}
             elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
                 self.checked = previous
         return ok
+
+    def check_trees(self, workspace_tree: str) -> dict[str, str]:
+        if workspace_tree and len(self.checkouts) == 1 and self.checkouts[0].wt == self.ws:
+            return {self.checkouts[0].prefix: workspace_tree}
+        return verification_trees(self)
+
+    def full_checks_current(self, trees: dict[str, str]) -> bool:
+        if not trees or self.checked.get("commands") != self.layer.checks:
+            return False
+        if "trees" in self.checked:
+            return self.checked["trees"] == trees
+        return (len(self.checkouts) == 1 and self.checkouts[0].wt == self.ws
+                and self.checked.get("tree") == trees.get(self.checkouts[0].prefix))
 
     def restore_denied_edits(self, staged: Staged, after: str) -> str:
         if staged.fatal_denied:
@@ -2718,16 +2958,30 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     while review.verdict == "request_changes" and n < reviews:
         if problems := review.findings():
             run.story.append(f"Review requested changes:\n{problems}")
-            reply = b.resume(round_name("review_fix", n),
-                             prompt_loader.prompt("review_fix", problems=problems, notes=review.fix_notes(),
-                                                  denied=brief.denied),
+            step = round_name("review_fix", n)
+            b.check_repair_findings(producer=f"{step}:before", baseline=True)
+            reply = b.resume(step, prompt_loader.prompt("review_fix", problems=b.repair_feedback() or problems,
+                                                       notes=review.fix_notes(), denied=brief.denied),
                              role="review_repair").text
-            b.recheck("the review fixes")
-            verified = verify_in_use(b, goal, build_summary)
+            passed, reply = b.retry_focused_repairs(step, reply)
+            if not passed:
+                return _fail(run, "focused review regressions did not pass", reply, b.repair_feedback())
+            for _ in range(max(1, run.settings("check_repair").tries)):
+                b.recheck("the review fixes")
+                verified = verify_in_use(b, goal, build_summary)
+                if not b.check_repair_findings(producer=step):
+                    break
+                passed, reply = b.retry_focused_repairs(step, reply)
+                if not passed:
+                    return _fail(run, "focused review regressions did not pass", reply, b.repair_feedback())
+            else:
+                return _fail(run, "focused regressions and the final checks did not converge", reply, b.repair_feedback())
         n += 1
         review = _review(b, plan_to_review, verified, round_name("review", n), review, reply)
         note_review(run, review, verified)
     draft_why = draft_reason(review, verified, n)
+    if pending := b.in_use_repair_hold(verified):
+        draft_why = draft_why or f"Independent in-use evidence is still required for {pending}."
     note_review(run, review, verified)
     run.facts["held"] = draft_why
     _learn(run, ws, layer.expertise_file, t.title, apply=True)
@@ -2735,6 +2989,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     size = change_size(staged)
     outcome = f"{size}, review {review.verdict}, in use {verified.verdict}"
     written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
+    if review.approved() and (pending := b.focused_hold()):
+        return _fail(run, f"publication needs current focused repair evidence: {pending}", detail=b.repair_feedback())
 
     if run.dry_run:
         run.save("diff.patch", staged.patch)
@@ -2771,7 +3027,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
     heads = {c.github: c.lease for c in staged.changed}
     try:
-        ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
+        ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why, review=review, goal=goal)
     except workspace.RunFailed as e:
         if run.feedback:
             raise
@@ -2796,7 +3052,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                         prepared=flows.prepared_fields(t, branch, checkouts, layer, run.add_dirs, attachments, approval),
                         plan={"plan": plan_text, "goal": verify_goal, "estimate": estimate,
                               "left_for_a_person": left_for_a_person},
-                        build={"summary": build_summary}, review=review.asdict(),
+                        build={"summary": build_summary}, review=review.asdict(), repair_state=b.repair_state(),
                         publication={"draft_why": draft_why, "prs": {c.github: c.pr for c in with_prs},
                                      "heads": heads, "verified": asdict(verified)})
     urls = record_prs(run, branch, with_prs)
@@ -3102,6 +3358,11 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
+        if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
+            raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback(), verified)
+        if pending := b.in_use_repair_hold(verified):
+            raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head,
+                                  b.report, verified)
         review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
         if problem := merge_evidence_problem(b, c, verified, review, head):
             gate, why = problem
@@ -3445,12 +3706,12 @@ CiFix = Callable[[str, str, str], Result]
 
 
 def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.Checkout], with_prs: list[workspace.Checkout],
-             draft_why: str, fix: CiFix | None = None) -> str:
+             draft_why: str, fix: CiFix | None = None, *, review: Review | None = None, goal: str = "") -> str:
     run, max_rounds = b.run, b.run.settings("ci_repair").tries
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
     rounds: list[ci.Round] = []
     try:
-        for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
+        for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix, review=review, goal=goal):
             rounds.append(current)
             publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
     except (owner_asks.Asked, tracker.TaskError):
@@ -3555,7 +3816,7 @@ def published_note(draft_why: str, verified: verify.Verified, opened: list[works
 
 
 def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.Checkout], max_rounds: int,
-              fix: CiFix | None = None) -> Iterator[ci.Round]:
+              fix: CiFix | None = None, *, review: Review | None = None, goal: str = "") -> Iterator[ci.Round]:
     run = b.run
     watched = list(pushed)
     not_caused: dict[tuple[str, str, gh.CheckKey], tuple[str, int, str]] = {}
@@ -3597,7 +3858,7 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
         names = ", ".join(r.label for r in caused)
         if n == max_rounds:
             raise workspace.RunFailed(f"CI still fails after {util.count(max_rounds, 'round')}: {names}", ci.red_list(caused))
-        push_ci_fix(b, branch, caused, names, n)
+        review = push_ci_fix(b, branch, caused, names, n, review=review, goal=goal)
         watched += [c for c in b.staged.changed if c not in watched]
         current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
         run.log(f"ci: pushed a fix for {names}")
@@ -3700,7 +3961,8 @@ class AutomaticCIReruns:
         return True
 
 
-def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int) -> None:
+def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int, *,
+                review: Review | None = None, goal: str = "") -> Review:
     staged = b.restage()
     if staged.empty:
         raise workspace.RunFailed(f"{names} failed, caused by this PR, and the CI fix step changed nothing", ci.red_list(caused))
@@ -3713,7 +3975,47 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
         raise workspace.RunFailed("the checks failed after the CI fix",
                         f"{ci.red_list(caused)}\n\nThe check output is in `{report}` of run `{b.run.id}`.")
     b.require_valid_diff("the CI fix")
-    b.push(branch, ci_fix_message(b, caused))
+    checked = b.checked
+    trees = verification_trees(b)
+    if not b.full_checks_current(trees):
+        raise workspace.RunFailed("the CI fix lacks current full check evidence")
+    if pending := b.check_repair_findings(producer=f"ci-fix:{n}", fresh=True):
+        raise workspace.RunFailed(f"focused review regressions did not pass after the CI fix: {pending}", b.repair_feedback())
+    b.restage(from_base=True)
+    verified = verify_ci_fix(b, goal, trees)
+    plan = b.plan_text + (f"\n\n{NOT_CHECKED_LEFT_FOR_A_PERSON}{b.left_for_a_person}" if b.left_for_a_person else "")
+    reviewed = _review(b, plan, verified, step=b.next_step("review_ci_fix"), before=review)
+    b.run.save(f"ci-repair-round{n}.json", {"trees": trees, "checked": checked, "verified": asdict(verified),
+                                          "review": reviewed.asdict(), "focused": b.repair_state()})
+    if not reviewed.approved() or reviewed.trees != trees or b.focused_hold():
+        raise workspace.RunFailed("the CI fix lacks a current approving independent review", reviewed.markdown())
+    b.require_valid_diff("the reviewed CI fix")
+    if (no_pr := [c.github for c in b.staged.changed if not c.pr]):
+        raise workspace.RunFailed(f"the CI fix changed {', '.join(no_pr)}, where this run has no PR")
+    if trees != verification_trees(b) or trees != index_trees(b.checkouts):
+        raise workspace.RunFailed("the CI fix changed after the evidence was collected")
+
+    def check_commits():
+        heads = {c.prefix: git(["rev-parse", "HEAD^{tree}"], c.wt).strip() for c in b.checkouts}
+        if heads != trees or verification_trees(b) != trees:
+            raise workspace.RunFailed("the CI fix would push a different tree than the one checked and reviewed")
+
+    b.push(branch, ci_fix_message(b, caused), check_targets=check_commits)
+    return reviewed
+
+
+def verify_ci_fix(b: Build, goal: str, trees: dict[str, str]) -> verify.Verified:
+    needed = b.in_use_repair_checks()
+    if not b.layer.verify or ("refactor" in b.ticket.labels and not needed):
+        if needed:
+            raise workspace.RunFailed("the CI fix still needs independent in-use evidence", b.repair_feedback())
+        return (verify.not_configured(b.layer.dir, b.ws) if not b.layer.verify else
+                verify.Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`."))
+    verified = check_in_use(b, goal, b.build_summary)
+    if (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks
+            or verified.observed_trees != trees or b.in_use_repair_hold(verified)):
+        raise workspace.RunFailed("the CI fix lacks a current in-use pass", verified.markdown())
+    return verified
 
 
 def ci_target(c: workspace.Checkout) -> ci.Target:
@@ -4164,6 +4466,8 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     name = b.next_step("ci_fix")
     text = prompt_loader.prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
                   merged_base=merged_base, left_for_a_person=left, denied=prompt_loader.code_list(b.deny))
+    if carried := b.repair_feedback():
+        text += f"\n\nKeep these earlier repairs working:\n\n{carried}"
     res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair", json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
@@ -4460,14 +4764,21 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
         schema = CATCH_UP_REVIEW_SCHEMA
         context = catch_up_review_prompt(b, catch_up, plan, verified, before)
     allowed_tools = prompt_loader.bash_rules(b.read_bash)
+    names = prompt_loader.code_list(sorted(b.repair_commands())) or "None configured."
+    repair = f"\n\nApproved check names for focused regressions: {names}\n"
+    if feedback := b.repair_feedback():
+        repair += "\n\nRepair requirements and focused results (confirm the named check actually covers the path):\n" + feedback
     with context as (text, patches):
+        text += repair
         for _ in range(2):
             res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=schema)
             if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
                 said = res.structured
                 if catch_up is not None:
                     said = {**said, "problems": catch_up_problems(said["problems"], patches)}
-                return Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
+                found = Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
+                b.carry_review(found, f"{b.run.id}:{step}:{uuid4().hex[:12]}")
+                return found
     return Review.failed_step(earlier, before.waived or [], before.trees or {})
 
 
@@ -4564,6 +4875,9 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
 
 @runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
+    if needed := b.in_use_repair_checks():
+        goal += "\n\nObserve each of these repair requirements separately. Use the exact finding ID as the check's `what`:\n"
+        goal += "\n".join(f"- {key}: {acceptance}" for key, acceptance in needed.items())
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
                        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
 
@@ -4592,7 +4906,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     commands = {name: configured.drivers[name] for name in (*drivers.values(), *replay.values())}
     v = verify.with_free_ports(replace(configured, drivers=commands))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
-    checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
+    bind_candidate = delivery_verification and not replay_only and (merge_candidate or isinstance(b, Build))
+    checked_trees = verification_trees(b) if bind_candidate else {}
+    repair_requirements = b.in_use_repair_checks() if delivery_verification and isinstance(b, Build) else {}
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
         return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
@@ -4615,7 +4931,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified = readme_verify.check(run, b.ws, step, signal, checked_trees[""])
             if verified.verdict == "pass":
                 pilot.require(checked_trees == verification_trees(b), "the candidate tree changed during verification")
-                verified.native_trees = checked_trees
+                verified.native_trees = verified.observed_trees = checked_trees
         except pilot.Held as error:
             verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
                                        blocked_by=str(error))
@@ -4638,6 +4954,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 "blocked", f"Configured drivers require trusted scratch confinement for {names}.",
                 blocked_by=reason, finished=False))
     agent_started, agent_finished = False, False
+    observed_candidate = {}
     lifetime = {"stopped": True}
     fixture_blocker = ""
     probes = None
@@ -4693,6 +5010,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
+                if checked_trees:
+                    observed_candidate = verification_trees(b)
     except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise
@@ -4737,13 +5056,17 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             return save_verification(run, step, verified, removed) if removed else verified
     else:
         verified = verify.Verified.from_agent(res.structured)
-    if probes and probes.verdict == "pass" and not replay_only:
-        verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
-        verified.native_trees = checked_trees
+        if observed_candidate == checked_trees:
+            verified.observed_trees = checked_trees
+            verified.repair_observations = verified.observed_repairs(repair_requirements)
+        if merge_candidate:
+            verified.native_trees = checked_trees
+    if probes and probes.verdict == "pass" and not replay_only:
+        verified.checks = probes.checks + verified.checks
     return save_verification(run, step, verified, removed if agent_started else 0)
 
 

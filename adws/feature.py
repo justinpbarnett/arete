@@ -80,47 +80,70 @@ def built(flow, first, prepared=False, patch=False):
     if patch and (why or not outcome.passed):
         job.run.log(f"patch: escalating to the feature flow: {why or 'review needs more than the patch repair budget'}")
         return built(flow, [("plan", {}), ("implement", {"tree": ws, "round": BUILD})], prepared=True)
-    before = factory.fingerprint(ws)
-    if not final_checks(flow, ws):
-        return finish(flow, "failed", why="the final full checks did not converge with review")
-    fixed = fixed or factory.fingerprint(ws) != before
-    if job.review.approved() and (patch or fixed) and not skipped:
-        before = factory.fingerprint(ws)
-        if not (verified := step(flow, "verify", tree=ws)).passed:
-            return ended(flow, verified)
-        if patch and patching.allowed_gap(job.layer, job.ticket, job.verified):
-            job.verified = replace(job.verified, verdict="unverified", summary=(
-                job.verified.summary + "\nThe owner's patch policy permits this environmental gap; it is not a pass."))
-        if (verified_tree := factory.fingerprint(ws)) != before:
-            if not final_checks(flow, ws):
-                return finish(flow, "failed", why="the verification repairs did not converge with review")
-            if factory.fingerprint(ws) != verified_tree:
-                return finish(flow, "failed", why="the final check repairs require new behavioral verification")
-            reviewed = step(flow, "review", attempt=job.reviews + 1, tries=job.reviews + 1)
-            if not reviewed.passed:
-                return finish(flow, "failed", why="the verification repairs need further review", detail=reviewed.feedback)
+    review_needed = False
+    while blocked := final_blocker(flow, ws, patch=patch, fixed=fixed, skipped=skipped, review_needed=review_needed):
+        why, outcome = blocked
+        if not why:
+            return ended(flow, outcome)
+        if not (outcome and outcome.next == "implement" and outcome.data.get("focused_hold") and n < reviews):
+            return finish(flow, "failed", why=why, detail=outcome.feedback if outcome else "")
+        repaired = step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
+        if not repaired.passed:
+            return ended(flow, repaired)
+        n += 1
+        fixed = review_needed = True
+        if not skipped:
+            job.verified = predating_fixes(job.verified)
     if patch and (why := patching.change_refusal(job.layer.patch, job.b.restage().files, job.b.staged.lines)):
         job.run.log(f"patch: escalating to the feature flow: {why}")
         return built(flow, [("plan", {}), ("implement", {"tree": ws, "round": BUILD})], prepared=True)
     return deliver(flow)
 
 
-def final_checks(flow, ws):
+def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
     job = flow.ctx
-    checked = job.b.checked
-    if (checked.get("tree") and checked["tree"] == factory.fingerprint(ws)
-            and checked.get("commands") == job.layer.checks):
-        job.b.report = checked["report"]
-        return True
     before = factory.fingerprint(ws)
-    checked = checked_after(flow, ws, "the final full checks", job.reviews + 1)
-    if not checked.passed:
-        return False
-    if factory.fingerprint(ws) != before:
-        job.verified = predating_fixes(job.verified)
-        reviewed = step(flow, "review", attempt=job.reviews + 1, tries=job.reviews + 1)
-        return reviewed.passed
-    return True
+    if not (checked := final_checks(flow, ws, review_needed=review_needed)).passed:
+        return "the final full checks did not converge with review", checked
+    if skipped or not job.review.approved() or not (patch or fixed or factory.fingerprint(ws) != before):
+        return None
+    before = factory.fingerprint(ws)
+    if not (verified := step(flow, "verify", tree=ws)).passed:
+        return "", verified
+    if patch and patching.allowed_gap(job.layer, job.ticket, job.verified):
+        job.verified = replace(job.verified, verdict="unverified", summary=(
+            job.verified.summary + "\nThe owner's patch policy permits this environmental gap; it is not a pass."))
+    if (verified_tree := factory.fingerprint(ws)) == before:
+        return None
+    if not (checked := final_checks(flow, ws)).passed:
+        return "the verification repairs did not converge with review", checked
+    if factory.fingerprint(ws) != verified_tree:
+        return "the final check repairs require new behavioral verification", None
+    if not (reviewed := review_after_fixes(flow)).passed:
+        return "the verification repairs need further review", reviewed
+    return None
+
+
+def final_checks(flow, ws, *, review_needed=False):
+    job = flow.ctx
+    before = factory.fingerprint(ws)
+    checked = job.b.checked
+    if checked.get("tree") and checked["tree"] == before and checked.get("commands") == job.layer.checks:
+        job.b.report = checked["report"]
+        outcome = factory.Outcome("pass")
+    else:
+        outcome = checked_after(flow, ws, "the final full checks", job.reviews + 1)
+        if not outcome.passed:
+            return outcome
+        if factory.fingerprint(ws) != before:
+            job.verified = predating_fixes(job.verified)
+            review_needed = True
+    return review_after_fixes(flow) if review_needed else outcome
+
+
+def review_after_fixes(flow):
+    attempt = flow.ctx.reviews + 1
+    return step(flow, "review", attempt=attempt, tries=attempt)
 
 
 def predating_fixes(verified):
