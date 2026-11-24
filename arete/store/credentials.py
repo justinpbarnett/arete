@@ -28,9 +28,14 @@ def last_lifecycle(c, secret_id):
     return row["event"] if row else None
 
 
-def removal_recorded(c, secret_id, receipt):
-    return c.execute("SELECT 1 FROM secret_events WHERE secret_id = ? AND event = 'removed' AND detail = ?",
-                     (secret_id, receipt)).fetchone() is not None
+def change_recorded(c, secret_id, receipt):
+    return c.execute("""
+        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed') AND detail = ?
+        """, (secret_id, receipt)).fetchone() is not None
+
+
+def has_secret_fingerprints(c):
+    return bool(c.execute("SELECT EXISTS (SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
 
 
 def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider, *, rotated=False):
