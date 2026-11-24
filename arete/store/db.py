@@ -526,10 +526,12 @@ def owned(mode, timeout, before_commit=None):
             before_commit()
         check()
 
+    callbacks = []
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
+            _OWNER.after_commit = callbacks
             if bounded:
                 check()
                 conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
@@ -546,6 +548,9 @@ def owned(mode, timeout, before_commit=None):
                     conn.set_progress_handler(None, 0)
     finally:
         _OWNER.active = None
+        _OWNER.after_commit = None
+    for callback in callbacks:
+        callback()
 
 
 @contextmanager
@@ -601,6 +606,11 @@ def write_connection():
     if not active or active[:2] != (os.getpid(), "write") or not active[2].in_transaction:
         raise RuntimeError("event emission needs an open write transaction")
     return active[2]
+
+
+def after_commit(callback: Callable[[], None]) -> None:
+    write_connection()
+    _OWNER.after_commit.append(callback)
 
 
 def in_write():
