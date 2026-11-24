@@ -7,8 +7,10 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
+from threading import Lock
 
 from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, util
 from .agent import (
@@ -233,8 +235,22 @@ def _run(
             opened = tuple(add_dirs or ())
             if openrouter_config is not None:
                 opened += (openrouter_config,)
-            cmd = sandbox.claude_confinement(cmd, cwd, opened)
-            proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
+            mounts = ExitStack()
+            release_lock = Lock()
+
+            def release_mount_lease() -> None:
+                with release_lock:
+                    mounts.close()
+
+            def after_mounts(line: str) -> None:
+                release_mount_lease()
+                on_line(line)
+
+            try:
+                cmd = sandbox.claude_confinement(cmd, cwd, opened, mount_lease=mounts)
+                proc = child.stream(cmd, str(cwd), prompt, env, timeout, after_mounts)
+            finally:
+                release_mount_lease()
     except sandbox.ConfinementUnavailable as e:
         return Result(ok=False, session=resume, error=str(e))
     except device_turns.Lost as e:

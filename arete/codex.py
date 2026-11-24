@@ -62,6 +62,9 @@ SHELL_TOOLS = frozenset({"Bash", "shell", "shell_command", "exec_command"})
 KEYCHAIN_COMMAND = re.compile(r"(?<![\w.-])security(?![\w.-])", re.IGNORECASE)
 REDIRECT = re.compile(r"[0-9]*(?:<<<|<<-|<<|<>|<&|>>|>\||>&|[<>])|&>>?")
 ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
+FUNCTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+LITERAL_SHELL_WORD = re.compile(r"""(?:'[^']*'|"(?:[^"$`\\]|\\[\s\S])*"|\\[\s\S]|[^$`'"\\*?\[{}~<>()])+""")
+DISPLAY_FORMAT = re.compile(r"(?!-)(?:[^%]|%[%bsdi])*")
 SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
 SHELL_WORD_BREAKS = " \t\n;|&()<>"
 SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
@@ -913,7 +916,7 @@ def denied_keychain(words: list[str], depth: int, shell: str) -> str:
             return ""
         return guard.reach("security keychain items")
     if program in SHELL_WORDS and (script := inline_shell(args, skip_values=True)) is not None:
-        return keychain_refusal(script, depth + 1, shell=program)
+        return keychain_refusal(script, depth + 1, shell=tool)
     if tool == "eval":
         return keychain_refusal(" ".join(args), depth + 1, shell=shell)
     if program == "find":
@@ -942,10 +945,19 @@ def ansi_c_escape(match: re.Match[bytes]) -> bytes:
     return bytes([number]) if head == ord("x") else chr(number).encode()
 
 
+def path_uses_system_sh(search_path: str) -> bool:
+    for directory in search_path.split(os.pathsep):
+        if not os.path.isabs(directory):
+            return False
+        if executable := shutil.which("sh", path=directory):
+            return executable == "/bin/sh"
+    return False
+
+
 class KeychainShell:
     def __init__(self, source: str, *, shell: str = "bash"):
         self.source = source
-        self.shell = shell
+        self.shell = shell if shell == "/bin/sh" and sys.platform == "darwin" else Path(shell).name.casefold()
         self.pos = 0
         self.refusal = ""
 
@@ -1027,22 +1039,36 @@ class KeychainShell:
         self.pos = start
         return False
 
-    def scan_prefixed_arithmetic(self, depth: int, prefix: str) -> bool:
+    def compound_timing_prefix(self) -> bool:
         start = self.pos
         self.skip_blanks()
-        for_loop = prefix == "for"
-        if prefix == "time":
-            if self.take_literal_word("-p"):
-                self.skip_blanks()
-            for_loop = self.take_literal_word("for")
-            if for_loop:
-                self.skip_blanks()
-        if self.scan_arithmetic(depth, "(("):
+        if self.take_literal_word("-p"):
+            self.skip_blanks()
+        body = self.pos
+        if self.char() == "(" or any(self.take_literal_word(word) for word in (*SHELL_PREFIX, "for", "time")):
+            self.pos = body
             return True
-        if for_loop and self.starts("(("):
-            raise ValueError("unclosed arithmetic for header")
         self.pos = start
         return False
+
+    def scan_function_header(self) -> bool:
+        start = self.pos
+        self.skip_blanks()
+        if name := FUNCTION_NAME.match(self.source, self.pos):
+            self.pos = name.end()
+            self.skip_blanks()
+            if self.pos != name.end() and self.take_literal_word("{"):
+                return True
+        self.pos = start
+        return False
+
+    def scan_arithmetic_for(self, depth: int) -> bool:
+        self.skip_blanks()
+        if not self.starts("(("):
+            return False
+        if not self.scan_arithmetic(depth, "(("):
+            raise ValueError("unclosed arithmetic for header")
+        return True
 
     def ansi_quoted(self) -> str:
         if not (match := ANSI_C_QUOTE.match(self.source, self.pos)):
@@ -1132,26 +1158,32 @@ class KeychainShell:
             for words in pipeline or [[]]:
                 program = Path(words[0]).name.casefold() if words else ""
                 if program in SHELL_WORDS or program in ("", ".", "source", "eval"):
-                    shell = program if program in SHELL_WORDS else self.shell
+                    shell = words[0] if program in SHELL_WORDS else self.shell
                     self.refusal = self.refusal or keychain_refusal(body, depth + 1, shell=shell)
                 elif program in SCRIPT_TOOLS and not (program == "sed" and sed_search(words[1:])):
                     if KEYCHAIN_COMMAND.search(body):
                         self.refusal = self.refusal or guard.reach("security keychain items")
 
-    def commands(self, depth: int, *, closing: bool = False) -> None:
+    def commands(self, depth: int, *, closing: bool = False, initial_path: str = "") -> None:
         if depth > 12:
             raise ValueError("nested shell command")
         words: list[str] = []
         pipeline: list[list[str]] = []
         docs: list[tuple[str, bool, bool, list[list[str]]]] = []
         needs_consumer = False
+        arithmetic = self.shell in ("bash", "/bin/sh")
 
         def finish() -> None:
-            nonlocal needs_consumer
+            nonlocal needs_consumer, initial_path
             if words:
                 command = command_words(words)
                 if command:
+                    if initial_path and words[0] == "sh" and path_uses_system_sh(initial_path):
+                        command[0] = "/bin/sh"
                     pipeline.append(command)
+                fmt = words[1] if len(words) > 1 else ""
+                if words[0] not in (":", "echo") and not (words[0] == "printf" and DISPLAY_FORMAT.fullmatch(fmt)):
+                    initial_path = ""
                 self.refusal = self.refusal or denied_keychain(command, depth, self.shell)
                 needs_consumer = False
 
@@ -1162,6 +1194,7 @@ class KeychainShell:
                 end = self.source.find("\n", self.pos)
                 self.pos = end if end >= 0 else len(self.source)
             elif not (self.starts("<(") or self.starts(">(")) and (redirect := REDIRECT.match(self.source, self.pos)):
+                initial_path = ""
                 self.pos = redirect.end()
                 self.skip_blanks()
                 operation = redirect[0].lstrip("0123456789")
@@ -1171,7 +1204,8 @@ class KeychainShell:
                 if heredoc:
                     raw = self.source[start:self.pos].replace("\\\n", "")
                     docs.append((target, operation == "<<-", raw == target, pipeline))
-            elif not words and self.shell == "bash" and self.scan_arithmetic(depth + 1, "(("):
+            elif not words and arithmetic and self.scan_arithmetic(depth + 1, "(("):
+                initial_path = ""
                 pipeline.append([])
                 needs_consumer = False
             elif ch in ";|&\n()":
@@ -1182,6 +1216,7 @@ class KeychainShell:
                 if ch == "|" and not boolean:
                     needs_consumer = True
                 elif ch == "(":
+                    initial_path = ""
                     self.commands(depth + 1, closing=True)
                     pipeline.append([])
                     needs_consumer = False
@@ -1201,21 +1236,31 @@ class KeychainShell:
                 start = self.pos
                 word = self.word(depth)
                 raw = self.source[start:self.pos].replace("\\\n", "")
-                if (not words and self.shell == "bash" and raw in ("for", "time")
-                        and self.scan_prefixed_arithmetic(depth + 1, raw)):
+                if not words and self.shell == "bash" and (
+                        raw == "time" and self.compound_timing_prefix() or
+                        raw == "function" and self.scan_function_header()):
+                    initial_path = ""
+                    continue
+                if not words and arithmetic and raw == "for" and self.scan_arithmetic_for(depth + 1):
+                    initial_path = ""
                     pipeline.append([])
                     needs_consumer = False
                 elif words or (raw not in SHELL_PREFIX and not ASSIGNMENT.match(raw)):
+                    if initial_path and not LITERAL_SHELL_WORD.fullmatch(raw):
+                        initial_path = ""
                     words.append(word)
+                else:
+                    initial_path = ""
         if closing or docs:
             raise ValueError("unclosed shell group or heredoc")
         finish()
 
 
-def keychain_refusal(command: str, depth: int = 0, *, shell: str = "bash") -> str:
+def keychain_refusal(command: str, depth: int = 0, *, shell: str = "bash", path: str | None = None) -> str:
     scanner = KeychainShell(command, shell=shell)
+    search_path = os.environ.get("PATH", "") if path is None else path
     try:
-        scanner.commands(depth)
+        scanner.commands(depth, initial_path=search_path if depth == 0 and sys.platform == "darwin" else "")
     except ValueError:
         return scanner.refusal or "unparsed shell command"
     return scanner.refusal

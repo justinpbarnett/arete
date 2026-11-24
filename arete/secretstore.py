@@ -4,6 +4,7 @@ import base64
 import binascii
 import ctypes
 import errno
+import fcntl
 import hmac
 import json
 import os
@@ -12,6 +13,7 @@ import secrets
 import sqlite3
 import stat
 import subprocess
+import sys
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -214,18 +216,22 @@ def require_private_file(fd: int) -> None:
     require_no_macos_acl(fd)
 
 
+def read_file_at(parent: int, name: str) -> bytes:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    try:
+        require_private_file(fd)
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            return file.read()
+    finally:
+        os.close(fd)
+
+
 def read_file(path: Path, root: Path, *, private=False) -> bytes | None:
     try:
         with file_parent(path, root, private=private) as parent:
             if private:
                 require_exact_entry(parent, path.name)
-            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-            try:
-                require_private_file(fd)
-                with os.fdopen(fd, "rb", closefd=False) as file:
-                    return file.read()
-            finally:
-                os.close(fd)
+            return read_file_at(parent, path.name)
     except FileNotFoundError:
         return None
 
@@ -357,10 +363,41 @@ def referenced_key(meta, settings, *, expected_store=None):
         raise FingerprintKeyMissing("fingerprint_key_missing") from None
 
 
+@contextmanager
+def local_key_mount_lease(local: Path):
+    with file_parent(local, local.parent, create=True) as parent:
+        fcntl.flock(parent, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(parent, fcntl.LOCK_UN)
+            retire_committed_local_key(local)
+
+
+def committed_key_metadata():
+    with db.reader(streaming=sys.platform == "linux") as c:
+        return db.metadata(c)
+
+
+def retire_committed_local_key(local: Path) -> None:
+    with suppress(OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error):
+        if not local.exists():
+            return
+        meta = committed_key_metadata()
+        if reference := meta.get(KEY_REF):
+            settings = config.secret_settings()
+            if settings.store == "pve_store":
+                key = referenced_key(meta, settings, expected_store="pve_store")
+                retire_local_key(local, key, reference)
+
+
 def retire_local_key(local, key, reference):
-    with suppress(OSError, sqlite3.Error, db.NoDatabase):
-        if read_file(local, local.parent) == key and db.schema_metadata().get(KEY_REF) == reference:
-            remove_file(local, local.parent)
+    with suppress(OSError, sqlite3.Error, db.NoDatabase), file_parent(local, local.parent) as parent:
+        if sys.platform == "linux":
+            fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if read_file_at(parent, local.name) == key and committed_key_metadata().get(KEY_REF) == reference:
+            os.unlink(local.name, dir_fd=parent)
+            os.fsync(parent)
 
 
 def has_fingerprints(c) -> bool:

@@ -8,7 +8,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -142,7 +142,8 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
-def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = ()) -> list[str]:
+def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
+                       mount_lease: ExitStack | None = None) -> list[str]:
     if sys.platform == "darwin" and not can_confine(False):
         raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
     if sys.platform != "linux":
@@ -168,7 +169,14 @@ def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, 
         raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
     if store is not None and work.is_relative_to(store):
         raise ConfinementUnavailable("Claude cannot start inside the secret store")
+    if mount_lease is not None and (protect_fallback or settings.store == "pve_store"):
+        try:
+            mount_lease.enter_context(secretstore.local_key_mount_lease(key))
+        except OSError as error:
+            raise ConfinementUnavailable("Claude could not lease the Linux fingerprint key mask") from error
     masks = linux_fingerprint_mounts(key, roots, settings, required=protect_fallback)
+    if not masks and mount_lease is not None:
+        mount_lease.close()
     if store is not None:
         try:
             with secretstore.file_parent(store / "mount", store, create=True, private=True):

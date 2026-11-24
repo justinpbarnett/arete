@@ -704,6 +704,8 @@ def observed_refresh(route: Route, event: dict) -> None:
     prefixes = [accounts.scope(a, "")[:-2] if a.mode == "subscription" else accounts.scope(a, "credit")
                 for a in (earlier, latest)]
     devices_store.record_refresh(previous, latest.generation, *prefixes)
+    if previous != latest.generation and not (earlier.identity or latest.identity):
+        accounts.record_resolved(latest, refreshed_from=earlier)
     route.refreshed.add(latest.generation)
     route.refreshed_auths.add(latest)
 
