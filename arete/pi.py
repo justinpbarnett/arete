@@ -896,6 +896,9 @@ def _run(
         if add_dirs or resume.id or persist or ask_owner or not sandbox.can_confine(False):
             raise ValueError("private Pi workers require a fresh local confined invocation")
         floor = replace(floor, open=(cwd,))
+        # Private assignments run inside their candidate. External fixture
+        # runtimes belong to the engine's independent checks and verification.
+        read_roots = ()
         call = selected.view
         cmd = sandbox.write_confinement(
             cwd, [call], selected.owner if selected.using_login else None,
@@ -922,6 +925,13 @@ def _run(
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
     if private_worker:
         protection["workspace"] = str(cwd)
+        # The child cannot resolve paths hidden by its OS sandbox. Pin their denied
+        # aliases before launch, separately from the worker's permitted workspace.
+        protection["denied_aliases"] = {
+            path: str(Path(path).resolve())
+            for group in ("roots", "files", "write_roots", "write_files")
+            for path in protection[group]
+        }
         env["ARETE_PI_GUARD_PATHS"] = json.dumps(protection)
         env["TMPDIR"] = str(folder)
     env.pop("ARETE_PI_OBSERVE", None)

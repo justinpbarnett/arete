@@ -1816,6 +1816,7 @@ class AuthorityPrivatePiWorkerTests(_SecretChildCase):
     def test_private_worker_launch_denies_the_configured_file_store(self):
         self.run_secret_child(r"""
 import json
+import os
 import subprocess
 
 from arete import accounts, guard, pi, sandbox
@@ -1835,8 +1836,11 @@ proc = subprocess.CompletedProcess([], 0, json.dumps(reply) + '\n', '')
 with (mock.patch.object(sandbox, 'AUTHORITY', paths.CONFIG_DIR / 'fixture-authority'),
       mock.patch.object(sandbox, 'can_confine', return_value=True),
       mock.patch.object(pi, 'binary', return_value='/fixture/pi'),
+      mock.patch.object(pi.pi_shell, 'channel', wraps=pi.pi_shell.channel) as channel,
       mock.patch.object(pi, 'stream', return_value=(proc, '')) as stream):
-    result = pi.run('fixture prompt', checkout, selected=route, private_worker=True, persist=False, tools=['Read'])
+    result = pi.run('fixture prompt', checkout, selected=route, private_worker=True, persist=False,
+                    tools=['Read', 'Bash'], allowed_tools=['Bash(ls *)'], read_roots=(view,))
+assert channel.call_args.args[0].read_roots == ()
 assert result.ok and result.text == 'fixture reply', result.error
 stream.assert_called_once()
 argv, cwd, env = stream.call_args.args[:3]
@@ -1848,6 +1852,23 @@ assert f'(deny file-read* file-write* file-link (subpath (param "{hidden}")))' i
 protection = json.loads(env['ARETE_PI_GUARD_PATHS'])
 assert str(store) in protection['roots']
 assert protection['open'] == [str(checkout)] and protection['workspace'] == str(checkout)
+assert protection['denied_aliases'][str(store)] == str(store.resolve())
+if sys.platform == 'darwin':
+    import shutil
+    node = shutil.which('node')
+    assert node
+    (checkout / 'notes.txt').write_text('worker input')
+    js = '''
+        const {default: guard} = await import(process.argv[1]);
+        const hooks = {};
+        guard({on: (name, handler) => { hooks[name] = handler; }});
+        const invoke = (toolName, path) => hooks.tool_call({toolName, input: {path}}, {cwd: process.cwd()});
+        if (invoke('read', 'notes.txt')?.block || invoke('edit', 'notes.txt')?.block) process.exit(1);
+        if (!invoke('read', process.argv[2])?.block) process.exit(2);
+    '''
+    sandboxed = [*argv[:argv.index('-p') + 2], node, '--input-type=module', '-e', js,
+                 pi.GUARD_FILE.as_uri(), str(store / 'fixture')]
+    subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']}, check=True, timeout=10)
 nested = store / db.schema_metadata()['instance_tag'] / 'global'
 floor = guard.floor('', checkout, [nested])
 protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
