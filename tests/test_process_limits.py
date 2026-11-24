@@ -54,6 +54,8 @@ from arete import (
     steps,
     tasks,
     tracker,
+    unblock,
+    unblock_watch,
     util,
     vault,
     workspace,
@@ -70,6 +72,7 @@ from arete.store import insights as insights_store
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
+from arete.store import unblock as recovery_store
 from arete.store import zte as zte_store
 from arete.zte_github import Identity, IssueApp
 from tests import support
@@ -1798,6 +1801,38 @@ class OrchestrationWaitTests(Isolated):
 
 
 class BudgetTests(Isolated):
+    def test_monitor_reconsiders_a_park_when_poll_readmission_appears_or_is_spent(self):
+        self.cfg.unblock_repos = (self.repo.name,)
+        self.cfg.replay = config.ReplayConfig(all=True)
+        run = self.made_run()
+        run.budget.park("the repair chain used its 2 repair cycles")
+        record.settle(run.id, "failed")
+        row = run_store.run_get(run.id)
+
+        def inspect():
+            case = recovery_store.get(self.repo.name, self.ticket)
+            unblock_watch.inspect(self.cfg, self.repo, self.ticket, row, [], case)
+            return recovery_store.get(self.repo.name, self.ticket)
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(unblock, "diagnose", return_value={"action": "wait_for", "evidence": ["run"],
+                                                               "reason": "Wait for changed inputs."}) as diagnose):
+            first = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            with foundation.db() as connection:
+                set_task_body(self.ticket, "Revised specification", connection=connection)
+            admitted = inspect()
+            observation = diagnose.call_args.args[-2]["poll_readmission"]
+            self.assertEqual(observation["parked_run"], run.id)
+            self.assertEqual(json.loads(admitted["snapshot"])["poll_readmission"], observation)
+            self.assertEqual(inspect()["generation"], admitted["generation"])
+            _, proof = runlimits.poll_admission(self.repo, self.ticket, self.local.get(self.ticket), run.budget.policy)
+            self.assertFalse(proof.attempted(record=True))
+            spent = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            self.assertEqual([c["generation"] for c in (first, admitted, spent)], [1, 2, 3])
+            self.assertEqual(diagnose.call_count, 3)
+
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
