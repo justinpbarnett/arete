@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import (
@@ -856,14 +856,12 @@ class Job:
                 run.enter("running")
 
     def plan_pr_recovery(self, c: workspace.Checkout, expected: str, head: str, remote: str,
-                         runs: set[str]) -> pr_recovery.Plan:
+                         runs: set[str]) -> None:
         if self.before_pr_recovery:
             self.before_pr_recovery()
         recorded = workspace.head_recorded(workspace.made_before(self.ws), c)
-        plan = pr_recovery.plan(c, self.branch, expected, head, remote, runs, self.run.id,
-                                recorded, diffguard.denied_paths(self.layer))
-        self.pr_plans.append(plan)
-        return plan
+        self.pr_plans.append(pr_recovery.plan(c, self.branch, expected, head, remote, runs, self.run.id,
+                                              recorded, diffguard.denied_paths(self.layer)))
 
     def plan_sibling_prs(self, runs: set[str]) -> None:
         planned = {p.inputs.checkout.github for p in self.pr_plans}
@@ -877,10 +875,7 @@ class Job:
                 c.resumes = True
                 continue
             head = pr_recovery.current_head(c)
-            plan = self.plan_pr_recovery(c, c.lease, head, refs.origin, runs)
-            if plan.inputs.refs.head == c.lease:
-                base = replace(c, base_commit=plan.inputs.refs.base)
-                pr_recovery.check_base_ignore_changes(base, self.branch, head)
+            self.plan_pr_recovery(c, c.lease, head, refs.origin, runs)
 
     def install_pr_plans(self) -> None:
         for plan in self.pr_plans:
@@ -1446,9 +1441,11 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     link = tk.pr_link(t, whole=not job.left_for_a_person)
     opened = [c for c in found if c in staged.changed]
     found = list(opened)
-    stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found}
-    if job.recovery_publication and not job.recovery_publication.effected:
-        job.recovery_publication.recheck()
+    recovery = job.recovery_publication
+    prior_bodies = {c.pr: gh.pr_body(c.pr) for c in (job.with_prs if recovery else found)}
+    stops = {c.github: pipeline.ci.stopped_section(prior_bodies[c.pr]) for c in found}
+    if recovery:
+        recovery.recheck(during="before refreshing PR evidence")
     for c in staged.changed:
         if c in opened:
             gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
@@ -1469,12 +1466,16 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     standing = [c for c in staged.changed if c not in opened]
     pushed = standing if committed else []
     with_prs = job.with_prs
-    pipeline.note_prs(run, job.branch, with_prs)
+    if not recovery:
+        pipeline.note_prs(run, job.branch, with_prs)
     ci_stopped = [c for c in found if stops[c.github]]
     ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
                                          job.left_for_a_person, link, stops, committed,
-                                         measurement_section=measurement_section)
+                                         measurement_section=measurement_section, prior_bodies=prior_bodies)
     drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
+    if recovery:
+        recovery.recheck(during="before recording publication")
+        pipeline.note_prs(run, job.branch, with_prs)
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
 
@@ -1518,6 +1519,8 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outco
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job, before_push)
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push)
     if not job.run.repo.parts:
+        if job.recovery_publication:
+            job.recovery_publication.recheck(during="before recording publication")
         record.note(job.run.id, branch=job.branch)
         if draft_why:
             return end_as("fail", "failed",

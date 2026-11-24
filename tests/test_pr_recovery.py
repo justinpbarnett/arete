@@ -76,10 +76,9 @@ class RecoveryFixture(unittest.TestCase):
         if ignore:
             base = self.commit(src, ".gitignore", ignore)
         self.git(src, "remote", "add", "origin", str(remote))
-        self.git(src, "push", "origin", "main")
         self.git(src, "switch", "-c", "topic")
         accepted = self.commit(src, "accepted.txt", "pushed by Arete\n", owner=self.previous)
-        self.git(src, "push", "origin", "topic")
+        self.git(src, "push", "origin", "main", "topic")
         self.git(src, "switch", "main")
         self.git(self.root, "clone", "--branch", "topic", str(remote), str(other))
         wt.parent.mkdir(parents=True, exist_ok=True)
@@ -104,7 +103,10 @@ class RecoveryFixture(unittest.TestCase):
 
     def pr(self, url, **kw):
         remote = self.remotes[url]
-        head, base = self.git(remote, "rev-parse", "refs/heads/topic", "refs/heads/main").splitlines()
+        try:
+            head, base = ((remote / "refs" / "heads" / name).read_text().strip() for name in ("topic", "main"))
+        except FileNotFoundError:
+            head, base = self.git(remote, "rev-parse", "refs/heads/topic", "refs/heads/main").splitlines()
         return {"url": url, "state": "OPEN", "headRefName": "topic", "isCrossRepository": False,
                 "headRefOid": head, "baseRefName": "main", "baseRefOid": base}
 
@@ -568,6 +570,46 @@ class OpenPRRecoveryResumeTests(ResumeFixture):
         self.spawn.assert_not_called()
 
 
+class RecoveredPublicationBoundaryTests(ResumeFixture):
+    def test_advance_after_confirmed_push_holds_before_refreshing_evidence(self):
+        self.keep()
+        observed = self.advance()
+        self.seed()
+        controllers = self.gate_publication("test -f local.txt && test -f other.txt")
+        heads = []
+
+        def read_body(_):
+            pushed = self.remote_head()
+            if not heads and pushed != observed:
+                self.git(self.other, "pull", "--ff-only", "origin", "topic")
+                heads.append((pushed, self.advance("after-push.txt")))
+            return ""
+
+        with (patch.object(gh, "pr_body", side_effect=read_body),
+              patch.object(gh, "pr_edit_body") as edit):
+            row = self.resume(self.previous)
+        held = self.assert_held(row, pending=True)
+        (pushed, advanced), = heads
+        for text in ("before refreshing PR evidence", pushed, advanced, "Reconcile the partial publication"):
+            self.assertIn(text, row["summary"])
+        self.assertEqual(held["expected_refs"]["head"], pushed)
+        self.assertEqual(held["expected_refs"]["origin"], pushed)
+        self.assertEqual(held["refs"]["head"], advanced)
+        self.assertEqual(held["refs"]["origin"], advanced)
+        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), pushed)
+        self.assertEqual(self.remote_head(), advanced)
+        edit.assert_not_called()
+        gh.pr_comment.assert_not_called()
+        ctl, = controllers
+        actions = orchestration.actions(ctl.lease)
+        self.assertEqual([a["state"] for a in actions], ["succeeded"] * 3 + ["reconciliation-required"])
+        data = orchestration.find(row["id"])["data"]
+        self.assertNotIn("publication", data)
+        self.assertEqual(data["publication_intent"]["pushed"], {self.repo.github: pushed})
+        self.watch()
+        self.spawn.assert_not_called()
+
+
 class SettlementReplyRecoveryTests(ResumeFixture):
     def resume_with_settlement_reply(self, previous, reply_id, *, recovery=""):
         drive = flows.driven
@@ -892,6 +934,38 @@ class MultiCheckoutPublicationRaceTests(MultiCheckoutFixture):
         self.pr_comments.append({"id": 1, "user": {"login": "keeper"}, "body": "Try again without reconciliation."})
         self.watch()
         self.spawn.assert_not_called()
+
+
+class SiblingIgnoreRecoveryTests(MultiCheckoutFixture):
+    def test_sibling_comment_only_ignore_change_resumes_with_private_file_still_ignored(self):
+        name = "side-private.txt"
+        rule = f"/{name}\n"
+        side, other = self.sibling(ignore=rule)
+        private = side.wt / name
+        private.write_text("retained private notes\n")
+        self.keep()
+        self.advance()
+        self.seed()
+        rules_with_comment = f"# Added a comment\n{rule}"
+        base = self.commit(side.src, ".gitignore", rules_with_comment)
+        self.git(side.src, "push", "origin", "main")
+
+        def recovered(ctl):
+            candidate = ctl.job.checkouts[1]
+            self.assertEqual(candidate.recovery_base, base)
+            self.assertTrue(pr_recovery.ancestor(side.wt, base, "HEAD"))
+            self.assertEqual((side.wt / ".gitignore").read_text(), rules_with_comment)
+            self.assertIn(name, workspace.ignored_file_paths(side.wt))
+            self.assertNotIn(candidate.prefix + name, ctl.job.b.restage().files)
+            ctl.ending = ("noop", "Resumed with the sibling's new base", "")
+            return []
+
+        self.decide.side_effect = recovered
+        self.resume(self.previous, expected=0)
+        self.decide.assert_called_once()
+        self.assertEqual(private.read_text(), "retained private notes\n")
+        self.assertEqual(self.git(side.wt, "ls-files", "--", name), "")
+        self.assertEqual(self.git(other, "rev-parse", "HEAD"), side.lease)
 
 
 class MultiCheckoutInstallTests(MultiCheckoutFixture):

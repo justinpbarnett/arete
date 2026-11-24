@@ -669,11 +669,11 @@ class Controller(worker_turns.WorkerTurns):
             "acceptance": self.data["acceptance"], "producer": self.executing, "observed": util.iso()}
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
 
-    def current(self, gate):
+    def current(self, gate, *, tree=None):
         if gate == "checks" and self.data.get("denied_feedback"):
             return False
         found = self.data.get("evidence", {}).get(gate, {})
-        return bool(found and found["tree"] == self.fingerprint()
+        return bool(found and found["tree"] == (self.fingerprint() if tree is None else tree)
                     and self.matches_policy(found["policy"], self.policy_sha())
                     and found.get("acceptance") == self.data["acceptance"])
 
@@ -1126,7 +1126,10 @@ class Controller(worker_turns.WorkerTurns):
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
-        needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
+        gates = ("checks", "review", "verify")
+        recovering = any(c.recovery_head for c in self.job.checkouts)
+        tree = self.fingerprint() if recovering else None
+        needed = [gate for gate in gates if not self.current(gate, tree=tree)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
         if not self.data["evidence"]["checks"]["result"].get("full"):
@@ -1151,20 +1154,18 @@ class Controller(worker_turns.WorkerTurns):
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
         self.check_pilot_publication()
-        if any(c.recovery_head for c in self.job.checkouts):
+        if recovering:
             authors = flows.authors(self.job.continues) | {self.run.id}
             publication = pr_recovery.Publication(self.job.checkouts, self.job.branch, authors,
                                                   record_pushes=self.record_recovery_pushes)
-            staged_tree = ledger.digest(publication.trees)
-            if not all(self.current(gate) and self.data["evidence"][gate]["tree"] == staged_tree
-                       for gate in ("checks", "review", "verify")):
+            tree = self.fingerprint()
+            if tree != ledger.digest(publication.trees) or not all(self.current(gate, tree=tree) for gate in gates):
                 raise ValueError("the staged candidate does not match the reconciled tree's gates; refresh the gates")
             self.job.recovery_publication = publication
-            publication.recheck()
         if catch_up:
             checkout, = self.job.checkouts
             self.take_merge_lease(checkout)
-        self.data["publication_intent"] = {"tree": self.fingerprint()}
+        self.data["publication_intent"] = {"tree": tree if recovering else self.fingerprint()}
         self.persist()
         outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section)
         if not outcome.passed:

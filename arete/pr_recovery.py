@@ -178,9 +178,10 @@ def fresh_feedback_after_hold(row: dict, held: dict, feedback: list[dict]) -> bo
     since = held.get("held_at") or row.get("finished")
     if not since:
         return False
+    seen = {tuple(key) for key in held.get("seen_replies") or ()}
     fresh = [r for r in feedback if r["pr_url"] == held["pr"] and r["pr_state"] == "OPEN"
              and r["status"] == "new" and r["run_id"] is None and is_reply(r["body"] or "")]
-    return bool(reply_keys_since(fresh, since))
+    return any(tuple(key) not in seen for key in reply_keys_since(fresh, since))
 
 
 def decision(run_id: str, _display_comments: str) -> str:

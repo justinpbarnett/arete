@@ -3380,8 +3380,9 @@ def publish_unverified_measurement(run: Run, t: tracker.Ticket, pr: str, section
 
 
 def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True, *,
-                   measurement_section: str = ""):
+                   measurement_section: str = "", prior_bodies: dict[str, str] | None = None):
     stops = stops or {}
+    prior_bodies = prior_bodies or {}
     ci_stopped = []
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
@@ -3391,7 +3392,7 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
                 stop = stops.get(c.github, "")
                 gh.pr_edit_body(c.pr, ci.with_section(text, stop) if stop else text, link=link)
             continue
-        body = gh.pr_body(c.pr)
+        body = prior_bodies[c.pr] if c.pr in prior_bodies else gh.pr_body(c.pr)
         if c in standing and ci.stopped(body):
             ci_stopped.append(c)
         kept, text = synced_pr_body(run, c.pr, body, t, left)

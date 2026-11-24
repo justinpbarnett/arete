@@ -1,7 +1,7 @@
 from collections import Counter
 from unittest.mock import patch
 
-from arete import config, gh, outcomes, pipeline, poll, pr_recovery, util, workspace
+from arete import config, outcomes, pipeline, poll, pr_recovery, util, workspace
 from arete.store import insights
 from arete.store import unblock as ledger
 from tests import support
@@ -88,18 +88,18 @@ class SettlementReplyTests(ResumeFixture):
         self.pr_comments.append({"id": comment_id, "user": {"login": login}, "body": body, "created_at": util.iso()})
 
     def resume_with_settlement_reply(self, previous, *, attempt=""):
-        hold_open_pr, discussion = pipeline.hold_open_pr, gh.pr_discussion
+        hold_open_pr = pipeline.hold_open_pr
 
         def settle(run, error, kept):
-            def read(url):
-                self.reply(2, "New settlement guidance")
-                self.reply(3, "Ignore the conflict", login="stranger")
-                return discussion(url)
+            self.assertTrue(run.pr_recovery_cutoff)
+            self.assertTrue(run.pr_recovery_discussion[error.recovery["pr"]].decision)
+            self.reply(2, "New settlement guidance")
+            self.reply(3, "Ignore the conflict", login="stranger")
+            return hold_open_pr(run, error, kept)
 
-            with patch.object(gh, "pr_discussion", side_effect=read):
-                return hold_open_pr(run, error, kept)
-
-        with patch.object(pipeline, "hold_open_pr", side_effect=settle):
+        # Keep the replies and baseline in the same timestamp second; their order comes from the snapshot.
+        with (patch.object(util, "now", return_value=util.now()),
+              patch.object(pipeline, "hold_open_pr", side_effect=settle)):
             return self.resume(previous, recovery=attempt)
 
     def test_enrolled_attempt_does_not_consume_new_guidance_during_settlement(self):
@@ -127,11 +127,16 @@ class SettlementReplyTests(ResumeFixture):
         self.decide.assert_not_called()
         self.model.assert_not_called()
 
-    def test_unenrolled_feedback_poll_picks_up_settlement_reply_once(self):
+    def test_unenrolled_feedback_poll_picks_up_only_new_settlement_reply_once(self):
         self.cfg.unblock_repos = ()
         self.conflict()
-        held = self.resume_with_settlement_reply(self.previous)
-        self.assert_held(held)
+        with patch.object(util, "now", return_value=util.now()):
+            self.reply(1, "Baseline guidance")
+            baseline = outcomes.owner_feedback(self.url, "OPEN", self.repo.name, self.tid)
+            held = self.resume_with_settlement_reply(self.previous)
+        failure = self.assert_held(held)
+        self.assertEqual(failure["seen_replies"], [["comment", 1]])
+        self.assertEqual({reply["created_at"] for reply in self.pr_comments}, {failure["held_at"]})
         layer = config.load_layer(self.repo.layer_dir)
         queue = poll.RepoQueue(self.repo, self.source, set(), layer,
                                poll.routing.Discovery(self.cfg, self.repo, priced=False, layer=layer))
@@ -148,6 +153,12 @@ class SettlementReplyTests(ResumeFixture):
 
         with (patch.object(pipeline, "FEEDBACK_QUIET_MINUTES", 0),
               patch.object(poll, "spawn_unparked", side_effect=resume_feedback) as start):
+            self.assertEqual(insights.add_feedback(baseline), 1)
+            pick = poll.next_pick(self.repo, self.source, skips, set())
+            self.assertTrue(pick.from_feedback)
+            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "skipped")
+            start.assert_not_called()
+
             pick = collect_and_pick()
             self.assertTrue(pick.from_feedback)
             self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
