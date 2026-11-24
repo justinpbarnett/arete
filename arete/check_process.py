@@ -42,6 +42,17 @@ class DarwinProcesses:
             return info
         return None
 
+    def existed_by(self, pid, at):
+        if info := self.info(pid):
+            return info.status != SZOMB and info.seconds <= int(at)
+        # KERN_PROC_PID exposes the kinfo_proc start timeval even for other users.
+        data = ctypes.create_string_buffer(648)
+        length = ctypes.c_size_t(ctypes.sizeof(data))
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+        if self.lib.sysctl(mib, 4, data, ctypes.byref(length), None, ctypes.c_size_t(0)) or length.value != len(data):
+            return None
+        return data.raw[36] != SZOMB and ctypes.c_long.from_buffer(data).value <= int(at)
+
     def listed(self, query, pid):
         count = 16
         while True:

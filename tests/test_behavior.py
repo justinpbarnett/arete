@@ -1880,13 +1880,15 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 from arete import config, paths, pipeline, record, sandbox, util, workspace
-from arete.store import db, workspaces
+from arete.store import db, runs, workspaces
 from tests.test_behavior import WORKSPACE_GIT_IDENTITY, init_workspace_repo, write_workspace_output
 
 sandbox.AUTHORITY = paths.CONFIG_DIR / 'fixture-authority'
@@ -2608,9 +2610,6 @@ def legacy_record(ws, c, rid, snapshot):
 class WorkspaceCutoverGateTests(_WorkspaceChildCase):
     def test_live_pre_expand_loop_defers_handoff_scheduling_and_workspace_access(self):
         self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
-import subprocess
-import sys
-import time
 from types import SimpleNamespace
 from arete import control, loop_run, serve, serve_guard, tasks
 
@@ -2671,8 +2670,6 @@ assert workspace.head_recorded(workspace.made_before(ws), c) == head
 
     def test_unregistered_inherited_pipeline_blocks_separate_migration(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
-import subprocess
-import sys
 from arete import control, serve
 
 legacy.mkdir()
@@ -2692,8 +2689,6 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LAT
 
     def test_detached_pipeline_lease_blocks_handoff_until_exit(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
-import subprocess
-import sys
 from arete import launch_lease
 
 legacy.mkdir()
@@ -2716,7 +2711,6 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LAT
 class WorkspaceProcessOwnershipTests(_WorkspaceChildCase):
     def test_running_ticket_with_recycled_pid_requires_a_held_ticket_lock(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
-from arete.store import runs
 
 legacy.mkdir()
 lock = runs.run_lock("pipeline", "sample", "7")
@@ -2734,8 +2728,6 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
 
     def test_child_identity_survives_restart_but_does_not_protect_a_recycled_pid(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
-import subprocess
-import sys
 from arete import control, serve
 
 legacy.mkdir()
@@ -2813,7 +2805,6 @@ assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
 class WorkspaceAdmissionHandoffTests(_WorkspaceChildCase):
     def check_lock(self, lock_fixture):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + lock_fixture + r"""
-import subprocess
 from arete import api_check
 
 legacy.mkdir()
@@ -3033,7 +3024,6 @@ class WorkspaceHandoffCommitTests(_WorkspaceChildCase):
     def test_admission_lock_acquired_during_import_rolls_back_contract(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + WORKSPACE_PROVENANCE + r"""
 from contextlib import ExitStack
-from arete.store import runs
 
 seed_saved_fingerprint()
 legacy.mkdir()
@@ -3353,7 +3343,6 @@ class WorkspaceQuarantineRecoveryTests(_WorkspaceChildCase):
     def test_recovery_requires_an_idle_and_vacant_original_path(self):
         self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
 from arete import cli
-from arete.store import runs
 
 worktrees = paths.WORKTREES_DIR
 occupied, linked, vacant = (worktrees / f"sample-{ticket}" for ticket in ("7", "8", "9"))
@@ -3397,7 +3386,6 @@ class WorkspaceRetrySnapshotTests(_WorkspaceChildCase):
     def test_retry_restores_repaired_snapshot_without_moving_checkout(self):
         self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
 from arete import cli
-from arete.store import runs
 
 ws, c = add_checkout("7")
 previous = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
@@ -3438,7 +3426,6 @@ with patch.object(json, "load", side_effect=AssertionError("unexpected snapshot 
 
     def test_retry_identifies_unowned_quarantine_before_taking_ticket_lock(self):
         self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
-from arete.store import runs
 
 ws, c = add_checkout("7")
 rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=25)
@@ -3688,10 +3675,13 @@ beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
 pid = os.getpid()
 util.write_json(beat, {"workspace_contract_children": [pid]})
 os.utime(beat, (946684800, 946684800))
-with (patch.object(db.check_process.DarwinProcesses, "info", return_value=None),
+with (patch.object(db.check_process.DarwinProcesses, "existed_by", return_value=None),
       patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout=""))):
     with db.reader() as c:
         assert f"inherited child {pid}" in db.contract_blockers(c, 28)
+if paths.ON_MAC:
+    with patch.object(db.check_process.DarwinProcesses, "info", return_value=None):
+        assert db.process_existed_by(pid, time.time()) and not db.process_existed_by(pid, 946684800)
 process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
 with patch.object(util, "sh", return_value=process):
     with db.reader() as c:

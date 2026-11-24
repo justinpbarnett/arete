@@ -286,10 +286,8 @@ def process_existed_by(pid, at):
         return False
     try:
         if paths.ON_MAC:
-            info = check_process.DarwinProcesses().info(pid)
-            if info is None:
-                return util.pid_alive(pid)
-            return info.status != check_process.SZOMB and info.seconds <= int(at)
+            existed = check_process.DarwinProcesses().existed_by(pid, at)
+            return util.pid_alive(pid) if existed is None else existed
         found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C", "TZ": "UTC"})
         if not found.stdout.strip():
             return util.pid_alive(pid)
