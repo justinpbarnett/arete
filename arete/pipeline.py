@@ -2176,8 +2176,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 answered_runs = tuple(a["run"] for a in run.answers_due if not owner_asks.supervisor_answered([a]))
                 if run.answering and not run.recovery and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
+            issue_goal = (not dry_run and not run.alone and not run.closed_context
+                          and unblock.active(cfg, repo.name, str(tid)) and not unblock.exclude(repo.name, str(tid)))
+            if issue_goal:
+                from . import issue_goal as goal_store
+
+                enrolled = unblock.ledger.follow(repo.name, str(tid), run.id)
+                if enrolled and not cfg.replay.all:
+                    goal_store.lifecycle(repo.name, tid, "start")
             new_budget = partial(runlimits.Budget, run, runlimits.Policy.of(layer), previous,
-                                 repair_previous=repair_parent, answered_runs=answered_runs,
+                                 repair_previous=repair_parent, answered_runs=answered_runs, issue_goal=issue_goal,
                                  wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                  checkpoint_gate=checkpoint_allowed if zte_grant else None, fixed_gaps=fixed_gaps)
             budget_started = None

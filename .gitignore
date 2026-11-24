@@ -6,3 +6,5 @@ dist/
 .env.*
 arete/loops/merge-check/.state/
 .arete-sandbox/
+
+arete/durable/node_modules/

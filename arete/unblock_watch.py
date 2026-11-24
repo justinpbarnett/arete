@@ -4,7 +4,7 @@ import json
 import re
 import time
 
-from . import config, owner_asks, pipeline, principals, repairs, runlimits, tasks, tracker, unblock, util
+from . import config, issue_goal, owner_asks, pipeline, principals, repairs, runlimits, tasks, tracker, unblock, util
 from .store import asks as asks_store
 from .store import db
 from .store import runs as runs_store
@@ -30,6 +30,10 @@ def blocker(row: dict, saved: dict, asks: list[dict], prs: dict, cycle: list[str
         return "delivery", ""
     if any(pr["state"] == "OPEN" and pr["mergeable"] == "CONFLICTING" for pr in prs.values()):
         return "base-conflict", ""
+    if any(pr["state"] == "OPEN" and pr.get("failing_checks") for pr in prs.values()):
+        return "ci-failure", ""
+    if any(pr["state"] == "OPEN" and pr.get("reviewDecision") == "CHANGES_REQUESTED" for pr in prs.values()):
+        return "review-feedback", ""
     if any(pr["state"] == "OPEN" and pr["isDraft"] for pr in prs.values()):
         report = pipeline.seam_facts(row["id"])
         if report.get("held") or (report.get("review") or {}).get("verdict") == "request_changes":
@@ -66,7 +70,7 @@ def notify_if_needed(cfg, repo, row, asks, case):
 
 def finish_decision(cfg, repo, t, source, row, asks, case, attempt, binding, decision):
     action = decision["action"]
-    grant = unblock.grant_of(repo, row, binding, decision)
+    grant = {"binding": binding, "direction": decision.get("direction", "")}
     if action == "wait_for":
         ledger.decide(case, attempt, decision, {})
         ledger.mark(case, "waiting", decision["reason"], unblock.RECHECK)
@@ -141,50 +145,42 @@ def correct_dependency(repo, source, t, case, attempt, binding, decision):
         ledger.mark(case, "waiting", "Corrected the owner-confirmed declaration; waiting for normal admission")
 
 
-def settled(existing, row, prs):
-    if row and (row["status"] in ("merged", "done", "noop") or (
-            row["status"] == "pr" and prs and all(pr["state"] == "MERGED" or (
-                pr["state"] == "OPEN" and not pr["isDraft"] and pr["mergeable"] == "MERGEABLE")
-                for pr in prs.values()))):
-        ledger.mark(existing, "resolved", "The ticket advanced through its normal gates")
-    elif existing["source"] and any(a["taken_by"] for a in asks_store.asks_of(existing["source"])):
-        ledger.mark(existing, "resolved", "The resumed run consumed the answers")
-    elif existing["cause"] == "dependency-cycle" and row and row["status"] == "running":
-        ledger.mark(existing, "resolved", "The prerequisite cleared and normal admission passed")
-    else:
-        ledger.mark(existing, "waiting", "Waiting for a confirmed delivery or prerequisite change", unblock.RECHECK)
-
-
 def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if not unblock.active(cfg, repo.name, tid) or unblock.exclude(repo.name, tid):
         if existing:
+            issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "Ticket is no longer delegated for recovery")
         return
     source = tracker.for_ticket(cfg, repo, tid)
     t = source.get(tid)
     if row.get("stop_asked") or row.get("status") == "stopped":
         if existing:
+            issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "Run stopped by request")
         return
-    if existing and row.get("status") in ("done", "merged", "noop"):
-        settled(existing, row, {})
+    if not t.open:
+        if existing:
+            issue_goal.lifecycle(repo.name, tid, "finish")
+            ledger.mark(existing, "resolved", "The tracker closed the issue")
         return
     if not unblock.approval(source, t)[0]:
         if existing:
-            ledger.mark(existing, "cancelled", "Ticket is closed or no longer approved")
+            issue_goal.lifecycle(repo.name, tid, "cancel")
+            ledger.mark(existing, "cancelled", "The ticket is no longer approved")
         return
+    if not cfg.replay.all and not issue_goal.exists(repo.name, tid):
+        issue_goal.lifecycle(repo.name, tid, "start")
     attempt = ledger.latest_attempt(existing) if existing else {}
     if (row and attempt.get("child") == row["id"]
             and attempt["grant"].get("binding", {}).get("spec") == runlimits.specification(t)):
         unblock.public_note(repo, source, tid, attempt)
     if row.get("status") in ("running", "interrupted"):
         if existing:
-            if row["status"] == "running" and existing["cause"] == "dependency-cycle" and not t.blocker:
-                settled(existing, row, {})
-            else:
-                ledger.mark(existing, "resuming", f"Continuing in {row['id']}", unblock.INTERVAL)
+            ledger.mark(existing, "resuming", f"Following {row['id']}", unblock.INTERVAL)
         return
     if row and runs_store.environment_hold(row["id"]).get("prs"):
+        if existing:
+            ledger.mark(existing, "waiting", "Waiting for verification environment release", unblock.RECHECK)
         return
     cycle = cycle if t.blocker else []
     if t.blocker and not cycle:
@@ -195,16 +191,24 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     saved = runlimits.metadata(row["id"], "parked.json") if row else {}
     prs = unblock.prs_of(row)
     cause, limit = blocker(row, saved, asks, prs, cycle)
+    if not cause and row.get("status") == "failed" and not row.get("environment_retry_of"):
+        cause = "delivery"
     if not cause and attempt.get("grant") and not attempt.get("child") and row.get("status") == "needs-info":
         cause = "ask" if not any(a["status"] == "open" for a in asks) else ""
     if not cause:
-        if existing:
-            settled(existing, row, prs)
+        if not existing and not row:
+            return
+        case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
+        if prs and all(pr["state"] == "MERGED" for pr in prs.values()):
+            issue_goal.lifecycle(repo.name, tid, "finish")
+            ledger.mark(case, "resolved", "The issue's pull requests merged")
+        else:
+            ledger.mark(case, "waiting", "Monitoring until tracker closure or PR merge", unblock.RECHECK)
         return
     binding = unblock.snapshot(cfg, repo, source, t, row, prs=prs)
     if attempt.get("grant", {}).get("binding") == binding and not attempt["child"]:
         if time.time() >= existing["due"]:
-            result = unblock.plan_launch(cfg, repo, attempt, row)
+            result = tasks.launch_recovery(cfg, repo, row, attempt)
             if result.get("state") == "queued":
                 ledger.mark(existing, "queued", result["why"], unblock.INTERVAL)
             elif result.get("state") == "refused":
@@ -214,6 +218,11 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     case = ledger.observe(repo.name, tid, cause, material(cause, limit, binding, evidence, row), binding)
     if time.time() < case["due"] or case["phase"] == "resuming":
         return
+    if ("reconcile before resuming" in (row.get("summary") or "")
+            and ledger.for_run(row["id"]).get("grant", {}).get("binding", {}).get("policy", binding["policy"])
+            == binding["policy"]):
+        ledger.mark(case, "waiting", "The retained run requires policy reconciliation", unblock.RECHECK)
+        return
     if asks and notify_if_needed(cfg, repo, row, asks, case):
         if not any(a["status"] == "open" and any(q["kind"] in ("choice", "text")
                    for q in owner_asks.unstaged(a)["questions"]) for a in asks):
@@ -221,12 +230,6 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if case["phase"] == "needs_owner" or (attempt.get("decision", {}).get("action") == "wait_for"
             and attempt.get("generation") == case["generation"]):
         ledger.mark(case, case["phase"], case["detail"], unblock.RECHECK)
-        return
-    if not ledger.allowance(case):
-        ledger.mark(case, "waiting", "Autonomous recovery allowance exhausted", unblock.RECHECK)
-        return
-    if not ledger.diagnosis_left(case):
-        ledger.mark(case, "waiting", "Waiting for a material change since the last two diagnoses", unblock.RECHECK)
         return
     attempt_id = ledger.begin(case)
     if not (decision := unblock.diagnose(cfg, repo, {**row, "issue": tid}, attempt_id, evidence, limit)):
@@ -258,6 +261,7 @@ def watch(cfg):
         known = {r.name: r for r in cfg.repos if r.name in cfg.unblock_repos}
         for existing in ledger.cases():
             if existing["repo"] not in known:
+                issue_goal.lifecycle(existing["repo"], existing["ticket"], "cancel")
                 ledger.mark(existing, "cancelled", "Automatic recovery is disabled")
         for repo in known.values():
             scan_repo(cfg, repo)
