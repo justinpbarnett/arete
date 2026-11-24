@@ -527,11 +527,15 @@ class Job:
     check_publication_targets: Callable[[], None] | None = None
 
     @property
+    def requires_behavior_on_block(self) -> bool:
+        return bool(self.patch_mode or patching.specification_refusal(self.ticket)
+                    or patching.sensitive_files(self.layer.patch, self.b.staged.files))
+
+    @property
     def held_reason(self) -> str:
         if self.run.environment_release and not retry_passed(self.verified):
             return "verification did not pass on the live release"
-        if self.verified.verdict == "blocked" and (self.patch_mode or patching.specification_refusal(self.ticket)
-                or patching.sensitive_files(self.layer.patch, self.b.staged.files)):
+        if self.verified.verdict == "blocked" and self.requires_behavior_on_block:
             return "the check in use was blocked; this change requires behavioral evidence"
         return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
@@ -615,6 +619,8 @@ class Job:
         if name == "checks":
             value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
                      self.layer.targeted_commands, bool(kw.get("quick")))
+            if kw.get("focused"):
+                value += (kw["focused"],)
         elif name == "verify":
             verify = self.layer.verify
             value = (verify.policy() if verify else None, self.goal, self.left_for_a_person)
@@ -1151,11 +1157,18 @@ def build(job: Job) -> Outcome:
 
 @factory.step("checks")
 def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, after: str = "",
-           quick: bool = False) -> Outcome:
+           quick: bool = False, focused: dict[str, list[str]] | None = None) -> Outcome:
     job: Job = flow.ctx
     run, b = job.run, job.b
     phase = after or "the build and its fixes"
-    ok = b.check(quick=quick, after=phase)
+    ok = b.check(quick=quick, after=phase, **({"focused": focused} if focused else {}))
+    failures = [{k: v for k, v in item.items() if k != "passed"} for item in b.check_results if not item["passed"]]
+    executed = [item["name"] for item in b.check_results]
+    scope = "failed" if focused else "quick" if quick and set(executed) != set(job.layer.checks) else "full"
+    details = {"scope": scope, "checks_executed": executed, "failed_checks": failures,
+               "policy": job.policy("checks", {"quick": quick, "focused": focused}),
+               "runner_blocked": bool(failures) and all(f.get("capability") == "macos-sandbox-profile"
+                                                        for f in failures)}
     if not after:
         record.note(run.id, attempts=attempt)
     if not ok:
@@ -1163,17 +1176,16 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             run.story.append(f"Checks failed on attempt {attempt}:\n{util.tail(b.report, 2500)}" if attempt < tries
                              else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
-                       data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
-                             "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
+                       data={**details, "report": b.report, "attempts": attempt, "after": after, "story": run.story,
+                             "checked": b.checked})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
     b.require_valid_diff(phase, planned)
     checked_tree = factory.fingerprint(job.ws)
-    full = (b.checked.get("tree") == checked_tree and b.checked.get("commands") == job.layer.checks
+    full = (not focused and b.checked.get("tree") == checked_tree and b.checked.get("commands") == job.layer.checks
             and b.checked.get("report") == b.report)
-    return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
+    return Outcome("pass", data={**details, "report": b.report, "attempts": attempt, "after": after, "story": run.story,
                                  "full": full, "checked_tree": checked_tree,
-                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick}),
-                                 "checked": b.checked})
+                                 "commands": job.layer.checks, "checked": b.checked})
 
 
 def retry_passed(verified: Verified) -> bool:
@@ -1181,7 +1193,7 @@ def retry_passed(verified: Verified) -> bool:
 
 
 @factory.step("verify")
-def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
+def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands: tuple[str, ...] = ()) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
     check_only = single or bool(job.run.environment_release)
@@ -1191,7 +1203,8 @@ def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
         verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
     else:
         check = pipeline.check_in_use if check_only else pipeline.verify_in_use
-        verified = check(b, job.with_left(job.goal), job.build_summary)
+        verified = check(b, job.with_left(job.goal), job.build_summary,
+                         **({"covered_commands": covered_commands} if single and covered_commands else {}))
     if job.run.environment_release and not retry_passed(verified):
         return end_as("stop", "environment-held", verified=asdict(verified),
                       summary="Verification did not pass on the live release. The PR stays a draft.")

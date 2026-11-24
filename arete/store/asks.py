@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 
-from .. import util
+from .. import owner_asks, util
 from .db import db, reader
+
+# Ignore a question from a ticket that has since started another whole run.
+LATEST = """NOT EXISTS (SELECT 1 FROM runs a, runs later
+    WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue
+      AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.rowid > a.rowid)"""
 
 TABLES = {
     "asks": "kept",
@@ -30,12 +35,15 @@ def ask_row(r) -> dict:
 
 
 def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
-            questions: list[dict], session: dict, *, recovery_route: str = "owner") -> None:
+            questions: list[dict], session: dict, *, recovery_route: str = "owner") -> bool:
     with db() as c:
+        first = call != owner_asks.CHECK_RUNNER_CALL or c.execute(
+            f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {LATEST} LIMIT 1", (call,)).fetchone() is None
         c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
                   "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
                    json.dumps(session), recovery_route))
+        return first
 
 
 def ask_get(ask_id: str, connect=reader) -> dict | None:
@@ -62,14 +70,28 @@ def routes_of(runs: list[str], *, connect=reader) -> dict[str, str]:
         return {r["run"]: ("closed", "unblock", "owner")[r["route"]] for r in rows}
 
 
-def open_asks(connect=reader, *, owner_only=False) -> list[dict]:
+def open_asks(connect=reader, *, owner_only=False, group_runners=False) -> list[dict]:
     with connect() as c:
-        return [ask_row(r) for r in c.execute(
+        rows = [ask_row(r) for r in c.execute(
             "SELECT * FROM asks WHERE status = 'open' "
             + ("AND recovery_route='owner' " if owner_only else "")
-            + "AND NOT EXISTS (SELECT 1 FROM runs a, runs later WHERE "
-            "a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue AND "
-            "COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.rowid > a.rowid) ORDER BY asked, rowid")]
+            + f"AND {LATEST} ORDER BY asked, rowid")]
+    if group_runners:
+        shared = [r for r in rows if r["call"] == owner_asks.CHECK_RUNNER_CALL]
+        if len(shared) > 1:
+            shared[0]["why"] += " Affected tickets: " + ", ".join(f"{r['repo']}#{r['ticket']}" for r in shared) + "."
+            return [r for r in rows if r["call"] != owner_asks.CHECK_RUNNER_CALL or r is shared[0]]
+    return rows
+
+
+def ready_runner_tickets(repo: str) -> list[str]:
+    with reader() as c:
+        return [str(r[0]) for r in c.execute(
+            f"""SELECT ticket FROM asks JOIN runs ON runs.id=asks.run
+                WHERE asks.repo=? AND call=? AND asks.status='answered' AND taken_by=''
+                  AND json_extract(asks.answers, '$[0].done')=1 AND runs.status='needs-info' AND {LATEST}
+                  AND NOT EXISTS (SELECT 1 FROM asks other WHERE other.run=asks.run AND other.status='open')
+                ORDER BY asked, asks.rowid""", (repo, owner_asks.CHECK_RUNNER_CALL))]
 
 
 def stage(ask_id: str, answers: dict) -> bool:
@@ -96,8 +118,16 @@ def asks_due(run_ids) -> list[dict]:
 
 def ask_close(ask_id: str, status: str, answers: list[dict] | None = None) -> bool:
     with db() as c:
-        return c.execute("UPDATE asks SET status = ?, answered = ?, answers = ? WHERE id = ? AND status = 'open'",
-                         (status, util.iso(), json.dumps(answers or []), ask_id)).rowcount > 0
+        row = c.execute("SELECT call FROM asks WHERE id=? AND status='open'", (ask_id,)).fetchone()
+        if row is None:
+            return False
+        now, encoded = util.iso(), json.dumps(answers or [])
+        c.execute("UPDATE asks SET status=?, answered=?, answers=? WHERE id=?", (status, now, encoded, ask_id))
+        if (row["call"] == owner_asks.CHECK_RUNNER_CALL and status == "answered" and len(answers or []) == 1
+                and answers[0] == {"header": "macOS runner", "kind": "done", "done": True}):
+            c.execute(f"UPDATE asks SET status='answered', answered=?, answers=? "
+                      f"WHERE status='open' AND call=? AND {LATEST}", (now, encoded, owner_asks.CHECK_RUNNER_CALL))
+        return True
 
 
 def asks_retire(run_id: str, status: str) -> None:

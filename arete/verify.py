@@ -64,6 +64,9 @@ SCHEMA = {
         }},
         "unmeasured_requirements": {"type": "array", "items": {"type": "string"}},
         "blocked_by": {"type": "string"},
+        "missing_capability": {"type": "string"},
+        "missing_tools": {"type": "array", "items": {"type": "string"}},
+        "advisory_gaps": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["verdict", "summary", "checks"],
 }
@@ -189,8 +192,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
         if is_driver:
             saw = saw[:MAX_SAW_CHARS]
         check = {"what": name, "how": public(command), "saw": saw, "passed": passed}
-        if is_driver:
-            check["driver"] = True
+        check["driver" if is_driver else "probe"] = True
         if not passed:
             check["cause"] = cause
         checks.append(check)
@@ -469,15 +471,28 @@ class Verified:
     native_trees: dict[str, str] = field(default_factory=dict)
     behavior_reached: bool = True
     unmeasured_requirements: list[str] = field(default_factory=list)
+    missing_capability: str = ""
+    missing_tools: list[str] = field(default_factory=list)
+    advisory_gaps: list[str] = field(default_factory=list)
+    nonblocking_reason: str = ""
+    nonblocking_trees: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
         said = found.get("verdict")
-        checks = [{k: v for k, v in c.items() if k != "driver"} for c in found.get("checks", []) if isinstance(c, dict)]
+        checks = [{k: v for k, v in c.items() if k not in ("driver", "probe", "evidence_file")} for c in found.get("checks", []) if isinstance(c, dict)]
         names = found.get("unmeasured_requirements")
         unmeasured = [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
                 checks, found.get("blocked_by", "").strip(), unmeasured_requirements=unmeasured)
+        capability = found.get("missing_capability")
+        v.missing_capability = capability.strip()[:2000] if isinstance(capability, str) else ""
+        for key in ("missing_tools", "advisory_gaps"):
+            values = found.get(key)
+            if isinstance(values, list):
+                setattr(v, key, [one_line(item)[:2000] for item in values[:64] if isinstance(item, str) and item.strip()])
+        if any(c.get("passed") is False and c.get("cause") == "change" for c in checks):
+            v.verdict = "fail"
         if v.verdict not in VERDICTS:
             v.verdict = "blocked"
             v.blocked_by = v.blocked_by or f"the verifier's verdict {json.dumps(said)} is not pass, fail or blocked"
@@ -517,6 +532,8 @@ class Verified:
                  "evidence": self.evidence_of(c)} for c in self.checks]
 
     def evidence_of(self, check: dict) -> str:
+        if original := check.get("evidence_file"):
+            return original
         shot = Path(str(check.get("screenshot") or "")).name
         if self.saved and shot and evidence_bytes(Path(self.saved).parent / "evidence", shot, 0) is not None:
             return os.path.abspath(Path(self.saved).parent / "evidence" / shot)
@@ -526,6 +543,8 @@ class Verified:
         if self.verdict == "unverified":
             return self.summary
         lines = [f"**{self.verdict}**: {self.summary}"]
+        if self.nonblocking_reason:
+            lines.append(f"\nThe orchestrator marked the advisory verification gap nonblocking. {self.nonblocking_reason}")
         if self.blocked_by:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()

@@ -117,6 +117,21 @@ function paidParts(t, width) {
   ];
 }
 
+function checkVerificationParts(m) {
+  const ratio = m.full_suite_runs_per_pr ?? "—";
+  const repair = m.completed_repairs
+    ? `${duration(Math.round(m.median_repair_seconds))} median across ${m.completed_repairs} repairs`
+    : "No passing repair recorded";
+  return [
+    el("dl", { class: "w" },
+      fact("Same-blocker verification retries", `${m.repeated_blocked_verifications} ran on unchanged inputs · ${m.suppressed_blocked_retries} suppressed`),
+      fact("Full suite runs per published PR", `${ratio} (${m.full_suite_runs} runs, ${m.published_prs} distinct PRs)`),
+      fact("First failed check to passing repair", `${repair} · ${m.open_check_failures} without a recorded pass`)),
+    el("p", {}, "A passing repair is the next successful focused repair check or full suite in the same run lineage."),
+    m.unclassified_blocked_verifications ? quiet(`${m.unclassified_blocked_verifications} blocked attempts have incomplete input or capability records.`) : null,
+  ];
+}
+
 function drawOutcomes() {
   const panel = outcomesData;
   if (!panel) return SLOW_MS;
@@ -131,6 +146,7 @@ function drawOutcomes() {
   const other = t.days.reduce((n, d) => n + d.other, 0);
   const paid = paidColumn(t.repos);
   const titles = ["Outcomes per day", "Without you or by you", "What you paid", "By repo", "Evals"];
+  if (t.check_verification) titles.push("Checks and verification");
   fill("outcomes-body",
     jumps(titles),
     heading(1, titles[0]),
@@ -150,7 +166,8 @@ function drawOutcomes() {
     heading(5, titles[4]),
     t.evals.length ? table("Mined eval tasks", [["Repo"], ["Tasks", "num c-n"], ["Passed", "num c-n"], ["Pass rate", "num c-rate"], ["Last", "c-time wide-only"]],
       t.evals.map((e) => el("tr", {}, cell(e.repo), cell(e.tasks, "num"), cell(e.passed, "num"), cell(percent(e.pass_rate), "num"), cell(clock(e.last)))))
-      : quiet("No eval ran in this window."));
+      : quiet("No eval ran in this window."),
+    t.check_verification ? [heading(6, titles[5]), checkVerificationParts(t.check_verification)] : null);
   return SLOW_MS;
 }
 

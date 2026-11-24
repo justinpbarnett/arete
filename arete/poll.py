@@ -143,6 +143,12 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                     excluded = excluded | {tid}
                     continue
             return Pick(tid, "restarting after an interruption")
+    for tid in ask_store.ready_runner_tickets(repo.name):
+        if ordinary_history(tid):
+            source = tracker.LocalTracker(repo) if tracker.is_task_id(tid) else tk
+            ticket = source.get(tid)
+            if ticket.open and not ticket.blocker and not other_routes.intersection(ticket.labels):
+                return Pick(tid, "the owner confirmed the shared check runner is ready")
     for tid in feedback_due:
         if ordinary_history(tid):
             return Pick(tid, FEEDBACK_PICK, from_feedback=True)

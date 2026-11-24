@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, replace
 
-from . import config, owner_asks, prompt_loader, routing, steps
+from . import config, owner_asks, prompt_loader, routing, steps, verification_attempts
 from .agent import BUILD_TOOLS, READ_TOOLS, traits_of
 from .store.orchestration import digest
 
@@ -76,10 +76,13 @@ OPERATIONS = {
                               {"worker_id": required(str), "message": required(str)}),
     "worker.cancel": Operation("Stop a worker and confirm producer cleanup before releasing its lease.",
                                {"worker_id": required(str), "reason": required(str)}),
-    "checks.run": Operation("Run owner-configured checks; full checks are required before publication.",
+    "checks.run": Operation("Run owner-configured checks. After a failure, rerun the failing tests first, then request full checks on the repaired candidate.",
                             {"scope": (str, "full")}, {"scope": {"enum": ["quick", "full"]}}),
-    "verification.run": Operation("One independent in-use attempt; never silently repairs implementation.",
-                                   {"goal_refs": (list, []), "route_id": required(str), "effort": required(str)}),
+    "verification.run": Operation("Verify behavior; target exact outstanding requirements after a current baseline.",
+                                   {"goal_refs": (list, []), "route_id": required(str), "effort": required(str),
+                                    "requirements": (list, [])}),
+    "verification.decide": Operation("Record why an independently identified advisory verification gap can ship.",
+                                      {"verification_id": required(str), "reason": required(str)}),
     "review.run": Operation("One independent review of the current tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "review.decide": Operation("Settle the latest code review after full checks. Give each finding ID a decision "
@@ -271,6 +274,8 @@ class Catalog:
                 if (len(args["depends_on"]) > 20 or any(type(dep) is not str or dep not in known
                                                         for dep in args["depends_on"])):
                     raise ValueError("dependencies must name existing actions, not future or cyclic work")
+            if op == "verification.run":
+                args["requirements"] = verification_attempts.names(args.get("requirements", []))
             if op in ("verification.run", "review.run"):
                 self.route(args["route_id"], args["effort"], ("verify" if op.startswith("verification") else "review",))
                 self.refs(args.get("context_refs", args.get("goal_refs", [])))

@@ -445,8 +445,9 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 def asks_view(*, owner_only=True) -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for row in ask_store.open_asks(connect=foundation.reader, owner_only=owner_only)
-                     if (a := owner_asks.unstaged(row))["questions"]]}
+    rows = ask_store.open_asks(connect=foundation.reader, owner_only=owner_only, group_runners=True)
+    return {"asks": [{k: ask[k] for k in keys} for row in rows
+                     if (ask := owner_asks.unstaged(row))["questions"]]}
 
 
 def stage_recovery_answers(group: list[dict], decision: dict, *, scrub) -> None:
