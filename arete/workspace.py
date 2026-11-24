@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import config, gh, paths, record, sandbox, scratch, tracker, util
-from .store import workspaces
+from .store import db, runs, workspaces
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -858,13 +858,25 @@ def prune_repos(cfg: config.Config) -> None:
 
 
 def held_summary() -> dict:
-    candidates = workspaces.by_state("held", "kept", "released")
-    rows = [workspaces.held_entry(row) for row in candidates
-            if row["state"] != "released" or row["last_sweep_error"]]
+    with db.one_read() as c:
+        rows = [held_summary_row(row) for row in workspaces.retained_rows(c)]
     rows.sort(key=lambda row: row["since"])
     oldest = rows[0] if rows else {}
-    return {"count": len(rows), "bytes": sum(r.get("bytes") or 0 for r in rows), "oldest": oldest.get("since", ""),
-            "oldest_name": oldest.get("name", ""), "blocked": sum(1 for r in rows if r.get("blocked")), "rows": rows}
+    return {"count": len(rows), "bytes": sum(row["bytes"] for row in rows), "oldest": oldest.get("since", ""),
+            "oldest_name": oldest.get("name", ""), "blocked": sum(row["blocked"] for row in rows), "rows": rows}
+
+
+def held_summary_row(row: dict) -> dict:
+    run_id = row["owner_run"]
+    run = (runs.run_get(run_id) or {}) if run_id else {}
+    blocked, names = row["state"] == "held", row["held_by"]
+    why = row["last_sweep_error"] or row["kept_reason"]
+    if blocked and not why:
+        why = "workspace removal blocked" + (f" ({', '.join(names[:5])})" if names else "")
+    return dict(name=row["name"], path=str(paths.WORKTREES_DIR / row["name"]), run=run_id,
+                status=run.get("status") or row["kept_reason"],
+                since=run.get("finished") or run.get("started") or row["made_at"],
+                bytes=row["bytes"], blocked=blocked, why=why, names=names)
 
 
 class RunFailed(Exception):
