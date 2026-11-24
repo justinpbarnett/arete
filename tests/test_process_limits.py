@@ -4049,15 +4049,19 @@ class HeldRepairDraftTests(HeldRepairDraftFixture):
 
 
 class HeldSiblingDraftTests(HeldRepairDraftFixture):
-    def check_held_update(self, *, already_committed):
-        job, flow = self.prepare_draft_publication(existing_pr=True)
-        c, = job.checkouts
+    def prepare_sibling(self, job):
         path = self.wt.with_name("sibling")
         shutil.copytree(self.base, path)
         sibling = workspace.Checkout("sibling", "fixture/sibling", path, path, "main")
         self.prepare_branch(job, sibling, "https://github.com/fixture/sibling/pull/1")
         job.checkouts.append(sibling)
         job.run.repo.parts.append(config.Part(sibling.dir, sibling.github))
+        return sibling
+
+    def check_held_update(self, *, already_committed):
+        job, flow = self.prepare_draft_publication(existing_pr=True)
+        c, = job.checkouts
+        sibling = self.prepare_sibling(job)
         job.b.from_base = True
         if already_committed:
             self.git("add", "goal.txt")
@@ -4107,6 +4111,45 @@ class HeldSiblingDraftTests(HeldRepairDraftFixture):
 
     def test_orchestrated_held_unpushed_commit_leaves_an_unchanged_sibling_ready(self):
         self.check_held_update(already_committed=True)
+
+    def test_scripted_retry_holds_adopted_pr_without_pushing_or_drafting_sibling(self):
+        job, flow = self.prepare_draft_publication(existing_pr=True)
+        c, = job.checkouts
+        sibling = self.prepare_sibling(job)
+        job.b.from_base = True
+        self.git("add", "goal.txt")
+        self.git(*util.ARETE_IDENTITY, "commit", "-qm", f"Published update\n\nArete-Run: {job.run.id}")
+        c.note_pushed_head(self.git("rev-parse", "HEAD"))
+        c.pr = ""
+        self.exhaust_focused_review(job)
+        heads = {c.src: c.lease, sibling.src: sibling.lease}
+        states = {self.pr_url: (False, c.lease), sibling.pr: (False, sibling.lease)}
+
+        def convert(url, draft):
+            states[url] = draft, states[url][1]
+
+        with (patch.object(workspace, "remote_head", side_effect=lambda src, _: heads[src]),
+              patch.object(gh, "open_pr_url", return_value=self.pr_url) as find,
+              patch.object(gh, "pr_draft_and_head", side_effect=states.__getitem__) as read,
+              patch.object(gh, "pr_set_draft", side_effect=convert) as draft,
+              patch.object(gh, "pr_body", return_value=""), patch.object(gh, "pr_edit_body"),
+              patch.object(gh, "pr_create") as create,
+              patch.object(pipeline, "commit_and_push") as push,
+              patch.object(pipeline, "sync_pr_bodies", return_value=[]),
+              patch.object(pipeline, "evidence_images", return_value={})):
+            outcome = flows.pr(flow, tree=str(job.ws))
+        self.assertTrue(outcome.passed)
+        find.assert_called_once_with(c.github, job.branch)
+        draft.assert_called_once_with(self.pr_url, True)
+        self.assertEqual([call.args for call in read.call_args_list], [(self.pr_url,), (self.pr_url,)])
+        self.assertEqual(states[self.pr_url], (True, c.lease))
+        self.assertEqual(states[sibling.pr], (False, sibling.lease))
+        create.assert_not_called()
+        push.assert_not_called()
+        self.assertIn(sibling.github, outcome.data["changed"])
+        self.assertEqual(outcome.data["found"], [c.github])
+        self.assertEqual(outcome.data["drafted"], [c.github])
+        self.assertEqual(outcome.data["pushed"], [])
 
 
 class FeedbackInUseDraftTests(HeldRepairDraftFixture):
@@ -4214,14 +4257,18 @@ class LaterRepairFixture(RepairWorkflowFixture):
 
 
 class CiFixFocusedRegressionTests(LaterRepairFixture):
-    def prepare_ci_fix(self, tries):
+    def prepare_ci_candidate(self):
         self.prepare_controller()
         b = self.controller.job.b
-        b.run.step_overrides.update(check_repair={"tries": tries}, ci_repair={"tries": 2})
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         b.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
         self.write("goal.txt", "reached\n")
         self.write("revision.txt", "1 blue\n")
+        return b
+
+    def prepare_ci_fix(self, tries):
+        b = self.prepare_ci_candidate()
+        b.run.step_overrides.update(check_repair={"tries": tries}, ci_repair={"tries": 2})
         before = self.carry_rollback(b)
         self.write("revision.txt", "2 green\n")
         return b, before
@@ -4251,12 +4298,14 @@ class CiFixFocusedRegressionTests(LaterRepairFixture):
               patch.object(pipeline, "publish_ci"), patch.object(pipeline, "stopped_by_ci", return_value=False),
               patch.object(b.run, "waiting", return_value=contextlib.nullcontext()),
               patch.object(b, "resume") as resume, patch.object(b, "push") as push,
+              patch.object(b, "check", wraps=b.check) as full,
               patch.object(pipeline, "_review") as review, patch.object(pipeline, "check_in_use") as in_use,
               patch.object(gh, "pr_draft_and_head", return_value=(False, c.lease)),
               patch.object(pipeline, "set_draft", return_value=True) as draft):
             with self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass"):
                 pipeline.watch_ci(b, Mock(), "fixture-branch", [c], [c], "")
             resume.assert_not_called()
+            full.assert_not_called()
             push.assert_not_called()
             review.assert_not_called()
             in_use.assert_not_called()
@@ -4264,12 +4313,20 @@ class CiFixFocusedRegressionTests(LaterRepairFixture):
         receipt = b.repair_receipts[self.producer]
         self.assertEqual((receipt["outcome"], receipt["exit"], receipt["producer"]), ("fail", 1, "ci-fix:1"))
         self.assertNotEqual(receipt["tree"], before)
-        self.assertEqual(b.checked["tree"], factory.fingerprint(self.wt))
+        self.assertEqual(receipt["tree"], pipeline.verification_trees(b))
+        self.assertFalse(b.full_checks_current(receipt["tree"]))
 
     def test_ci_fix_retries_the_regression_then_reviews_and_pushes_only_the_current_tree(self):
         b, before = self.prepare_ci_fix(2)
         self.layer.verify = config.Verify()
+        self.layer.checks["settings"] = self.layer.targeted_commands["rollback"]
         events = []
+        run_checks = pipeline.run_checks
+
+        def checks(*args, **kwargs):
+            selected = kwargs.get("selected")
+            events.append("full" if selected is None else tuple(sorted(selected)))
+            return run_checks(*args, **kwargs)
 
         def repair(step, prompt, **kwargs):
             events.append("repair")
@@ -4287,63 +4344,88 @@ class CiFixFocusedRegressionTests(LaterRepairFixture):
             events.append("push")
             self.assertNotEqual(pipeline.verification_trees(b), before)
 
-        with (patch.object(b, "resume", side_effect=repair), patch.object(b, "push", side_effect=push),
+        with (patch.object(pipeline, "run_checks", side_effect=checks),
+              patch.object(b, "resume", side_effect=repair), patch.object(b, "push", side_effect=push),
               patch.object(pipeline, "_review", side_effect=review), patch.object(pipeline, "check_in_use", side_effect=observe)):
             pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
-        self.assertEqual(events, ["repair", "verify", "review", "push"])
+        self.assertEqual(events, [("rollback",), "repair", ("rollback",), "full", "verify", "review", "push"])
         self.assertEqual(b.run.budget.repair_calls, 1)
 
     def test_full_and_focused_ci_repairs_share_the_configured_attempts(self):
         b, _ = self.prepare_ci_fix(2)
+        self.write("revision.txt", "1 blue\n")
         self.layer.max_repair_cycles = 2
         b.run.budget = runlimits.Budget(b.run, runlimits.Policy.of(self.layer), "")
         self.layer.checks["ready"] = "test -f ready.txt"
 
-        def repair(step, _prompt, *, role):
+        def repair(step, prompt, *, role):
             self.assertEqual((step, role), ("check_repair", "check_repair"))
+            self.assertIn("ready.txt", prompt)
             b.run.budget.charge(step, role)
             self.write("ready.txt", "ready\n")
+            self.write("revision.txt", "2 green\n")
             return Result(True)
 
         with (patch.object(b, "resume", side_effect=repair) as worker, patch.object(b, "push") as push,
-              patch.object(pipeline, "_review") as review):
-            with self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass"):
+              patch.object(b, "check", wraps=b.check) as full, patch.object(pipeline, "_review") as review):
+            with self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass") as held:
                 pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
+            self.assertIn("saw 2 green", held.exception.detail)
             worker.assert_called_once()
+            full.assert_called_once()
             review.assert_not_called()
             push.assert_not_called()
 
-    def test_ci_fix_preserves_unverified_environment_gap_only_without_carried_findings(self):
-        self.prepare_controller()
-        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
-        b = self.controller.job.b
-        b.checkouts[0].pr = "https://github.com/fixture/repo/pull/1"
-        self.write("goal.txt", "reached\n")
+    def environment_gap(self):
+        return pipeline.verify.Verified("blocked", "Fixture service unavailable.", blocked_by="test app not installed",
+                                        finished=False, behavior_reached=False)
+
+    def test_ci_fix_preserves_unverified_environment_gap_with_or_without_an_inspection_finding(self):
+        b = self.prepare_ci_candidate()
         self.layer.verify = config.Verify()
-        gap = pipeline.verify.Verified("blocked", "Fixture service unavailable.", blocked_by="test app not installed",
-                                       finished=False, behavior_reached=False)
+        gap = self.environment_gap()
 
         def review(_, _plan, verified, **kw):
             self.assertEqual(verified, gap)
             return pipeline.Review("approve", trees=pipeline.verification_trees(b))
 
-        with (patch.object(pipeline, "check_in_use", return_value=gap), patch.object(pipeline, "_review", side_effect=review) as checked,
-              patch.object(b, "push") as push):
-            pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 1)
-            push.assert_called_once()
-            checked.assert_called_once()
-            saved = json.loads((b.run.dir / "ci-repair-round1.json").read_text())
-            self.assertEqual(saved["verified"], asdict(gap))
-            push.reset_mock()
-            checked.reset_mock()
-            b.carry_review(pipeline.Review("request_changes", problems=[{
-                "problem": "Confirm preserved revision.", "severity": "blocker", "verification": "review",
-                "acceptance": self.acceptance,
-            }]), "repair")
-            with self.assertRaisesRegex(workspace.RunFailed, "lacks a current in-use pass"):
-                pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", 2)
-            push.assert_not_called()
-            checked.assert_not_called()
+        for n, inspection in enumerate((False, True), 1):
+            with self.subTest(inspection=inspection):
+                if inspection:
+                    b.carry_review(pipeline.Review("request_changes", problems=[{
+                        "problem": "Confirm preserved revision.", "severity": "blocker", "verification": "review",
+                        "acceptance": self.acceptance,
+                    }]), "repair")
+                with (patch.object(pipeline, "check_in_use", return_value=gap) as observe,
+                      patch.object(pipeline, "_review", side_effect=review) as checked, patch.object(b, "push") as push):
+                    pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", n)
+                    observe.assert_called_once()
+                    checked.assert_called_once()
+                    push.assert_called_once()
+                saved = json.loads((b.run.dir / f"ci-repair-round{n}.json").read_text())
+                self.assertEqual(saved["verified"], asdict(gap))
+
+    def test_ci_fix_holds_when_required_in_use_evidence_is_missing(self):
+        b = self.prepare_ci_candidate()
+        self.layer.verify = config.Verify()
+        b.carry_review(pipeline.Review("request_changes", problems=[{
+            "problem": "The settings page shows the wrong revision.", "severity": "blocker",
+            "verification": "in_use", "acceptance": self.acceptance,
+        }]), "repair")
+        gap = self.environment_gap()
+        smoke = pipeline.verify.Verified("pass", observed_trees=pipeline.verification_trees(b), checks=[{
+            "what": "General smoke check", "how": "Read goal.txt", "saw": "reached", "passed": True,
+        }])
+        for n, verified in enumerate((gap, smoke), 1):
+            with (self.subTest(verdict=verified.verdict),
+                  patch.object(pipeline, "check_in_use", return_value=verified) as observe,
+                  patch.object(pipeline, "_review") as review, patch.object(b, "push") as push):
+                with self.assertRaisesRegex(workspace.RunFailed, "lacks a current in-use pass"):
+                    pipeline.push_ci_fix(b, "fixture-branch", [], "CI fixture", n)
+                observe.assert_called_once()
+                review.assert_not_called()
+                push.assert_not_called()
+                self.assertFalse((b.run.dir / f"ci-repair-round{n}.json").exists())
 
 
 class FixedCatchUpFocusedRegressionTests(LaterRepairFixture):

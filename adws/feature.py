@@ -2,7 +2,7 @@ from dataclasses import replace
 
 from arete import factory, patching
 from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, deliver, ended, finish, retry_environment, step
-from arete.pipeline import round_name
+from arete.pipeline import round_name, verification_trees
 from arete.verify import Verified
 
 SKIPPED_LABEL = "refactor"
@@ -41,16 +41,20 @@ def built(flow, first, prepared=False, patch=False):
         if not (outcome := step(flow, name, **kw)).passed:
             return ended(flow, outcome)
     tries = job.run.settings(CHECK_REPAIR).tries
-    attempt, outcome = 1, step(flow, "checks", tree=ws, attempt=1, tries=tries, **({"quick": True} if patch else {}))
+    extra = {"quick": True} if patch else {}
+    attempt = 1
+    outcome = check_candidate(flow, ws, "build:1", attempt=attempt, tries=tries, **extra)
     while not outcome.passed and attempt < tries:
         attempt += 1
-        if not (fixed := step(flow, "implement", tree=ws, round=f"fix{attempt}", feedback=outcome.feedback,
+        repair_round = f"{REVIEW_FIX}_checks{attempt}" if outcome.data.get("focused_hold") else f"fix{attempt}"
+        if not (fixed := step(flow, "implement", tree=ws, round=repair_round, feedback=outcome.feedback,
                               attempt=attempt, tries=tries)).passed:
             return ended(flow, fixed)
-        outcome = step(flow, "checks", tree=ws, attempt=attempt, tries=tries, **({"quick": True} if patch else {}))
+        outcome = check_candidate(flow, ws, f"build:{attempt}", attempt=attempt, tries=tries, **extra)
     if not outcome.passed:
         step(flow, "learn", tree=ws, apply=False)
-        return finish(flow, "failed", why=f"checks still failing after {attempt} attempts")
+        return finish(flow, "failed", why=f"checks still failing after {attempt} attempts", detail=outcome.feedback)
+    before_verify = verification_trees(job.b) if job.b.repair_findings else {}
     skipped = SKIPPED_LABEL in job.ticket.labels
     if skipped:
         job.verified = Verified("unverified", SKIPPED_TEXT)
@@ -62,18 +66,27 @@ def built(flow, first, prepared=False, patch=False):
     reviews = max(1, job.run.settings("review").tries)
     if patch:
         reviews = min(reviews, job.layer.patch.review_tries)
-    n, outcome = 1, step(flow, "review", attempt=1, tries=reviews)
-    fixed = False
+    n = 1
+    fixed = bool(before_verify and verification_trees(job.b) != before_verify)
+    outcome = checked_after(flow, ws, "in-use verification", n) if fixed else factory.Outcome("pass")
+    if outcome.passed:
+        outcome = step(flow, "review", attempt=n, tries=reviews)
+    elif not outcome.data.get("focused_hold"):
+        return finish(flow, "failed", why="the checks failed after in-use verification", detail=outcome.feedback)
     while not outcome.passed and n < reviews:
         if outcome.feedback:
             repaired = step(flow, "implement", tree=ws, round=round_name(REVIEW_FIX, n), feedback=outcome.feedback)
             if not repaired.passed:
                 return ended(flow, repaired)
             fixed = True
-            if not (checked := checked_after(flow, ws, "the review fixes", n, quick=True)).passed:
-                return finish(flow, "failed", why="the checks failed after the review fixes", detail=checked.feedback)
+            checked = checked_after(flow, ws, "the review fixes", n, quick=True)
             if not skipped:
                 job.verified = predating_fixes(job.verified)
+            if not checked.passed:
+                if not checked.data.get("focused_hold"):
+                    return finish(flow, "failed", why="the checks failed after the review fixes", detail=checked.feedback)
+                n, outcome = n + 1, checked
+                continue
         n += 1
         outcome = step(flow, "review", attempt=n, tries=reviews)
     why = patching.change_refusal(job.layer.patch, job.b.restage().files, job.b.staged.lines) if patch else ""
@@ -102,23 +115,25 @@ def built(flow, first, prepared=False, patch=False):
 
 def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
     job = flow.ctx
-    before = factory.fingerprint(ws)
+    before = verification_trees(job.b)
     if not (checked := final_checks(flow, ws, review_needed=review_needed)).passed:
         return "the final full checks did not converge with review", checked
-    if skipped or not job.review.approved() or not (patch or fixed or factory.fingerprint(ws) != before):
+    checked_trees = verification_trees(job.b)
+    if skipped or not job.review.approved() or not (patch or fixed or checked_trees != before):
         return None
-    before = factory.fingerprint(ws)
     if not (verified := step(flow, "verify", tree=ws)).passed:
         return "", verified
     if patch and patching.allowed_gap(job.layer, job.ticket, job.verified):
         job.verified = replace(job.verified, verdict="unverified", summary=(
             job.verified.summary + "\nThe owner's patch policy permits this environmental gap; it is not a pass."))
-    if (verified_tree := factory.fingerprint(ws)) == before:
+    verified_trees = verification_trees(job.b)
+    if verified_trees and verified_trees == checked_trees:
         return None
     if not (checked := final_checks(flow, ws)).passed:
         return "the verification repairs did not converge with review", checked
-    if factory.fingerprint(ws) != verified_tree:
-        return "the final check repairs require new behavioral verification", None
+    trees = verification_trees(job.b)
+    if not trees or trees != verified_trees or job.verified.verdict != "pass" or job.verified.observed_trees != trees:
+        return "the candidate changed during or after verification and requires new behavioral evidence", None
     if not (reviewed := review_after_fixes(flow)).passed:
         return "the verification repairs need further review", reviewed
     return None
@@ -126,16 +141,20 @@ def final_blocker(flow, ws, *, patch, fixed, skipped, review_needed):
 
 def final_checks(flow, ws, *, review_needed=False):
     job = flow.ctx
-    before = factory.fingerprint(ws)
-    checked = job.b.checked
-    if checked.get("tree") and checked["tree"] == before and checked.get("commands") == job.layer.checks:
-        job.b.report = checked["report"]
+    before = verification_trees(job.b)
+    if job.b.full_checks_current(before):
+        if pending := focused_blocker(job.b, "final-checks"):
+            return pending
+        job.b.report = job.b.checked["report"]
         outcome = factory.Outcome("pass")
     else:
         outcome = checked_after(flow, ws, "the final full checks", job.reviews + 1)
         if not outcome.passed:
             return outcome
-        if factory.fingerprint(ws) != before:
+        trees = verification_trees(job.b)
+        if not job.b.full_checks_current(trees):
+            return factory.Outcome("fail", feedback="The repaired candidate lacks current full checks.")
+        if trees != before:
             job.verified = predating_fixes(job.verified)
             review_needed = True
     return review_after_fixes(flow) if review_needed else outcome
@@ -152,17 +171,29 @@ def predating_fixes(verified):
     return replace(verified, summary=f"{verified.summary}\n\n{PREDATES}".strip())
 
 
+def focused_blocker(build, producer):
+    if build.repair_findings and (pending := build.check_repair_findings(producer=producer)):
+        return factory.Outcome("fail", next="implement", feedback=build.repair_feedback(),
+                               data={"focused_hold": pending, "repair_state": build.repair_state()})
+    return None
+
+
+def check_candidate(flow, ws, producer, **kw):
+    return focused_blocker(flow.ctx.b, producer) or step(flow, "checks", tree=ws, **kw)
+
+
 def checked_after(flow, ws, after, n, quick=False):
     tries = flow.ctx.run.settings(CHECK_REPAIR).tries
     extra = {"quick": True} if quick else {}
-    outcome, attempt = step(flow, "checks", tree=ws, after=after, **extra), 1
-    while not outcome.passed and attempt < tries:
+    attempt = 1
+    outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
+    while not outcome.passed and not outcome.data.get("focused_hold") and attempt < tries:
         attempt += 1
         repaired = step(flow, "implement", tree=ws, round=f"{CHECK_REPAIR}{n}_{attempt}", feedback=outcome.feedback,
                         attempt=attempt, tries=tries)
         if not repaired.passed:
             return repaired
-        outcome = step(flow, "checks", tree=ws, after=after, **extra)
+        outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
     return outcome
 
 

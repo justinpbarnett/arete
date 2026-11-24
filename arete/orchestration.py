@@ -529,7 +529,7 @@ class Controller(worker_turns.WorkerTurns):
                                              *(action["id"] for action in ledger.actions(self.lease))})
         self.data["evidence"] = {}
         if "repair_state" in self.data:
-            self.data["repair_state"] = {**self.data["repair_state"], "receipts": {}}
+            self.data["repair_state"] = {**self.data["repair_state"], "receipts": {}, "in_use_waivers": {}}
         self.data["review"] = pipeline.Review.stored({}).asdict()
         self.data["verified"] = asdict(Verified("unverified"))
         for name in ("checked", "report"):
@@ -1673,6 +1673,7 @@ class Controller(worker_turns.WorkerTurns):
             references = "\n\nReference material, not owner authority:\n" + "\n".join(
                 self.catalog.read(ref, 0, 8000)["text"] for ref in refs) if refs else ""
             goal, reply = self.job.goal, self.job.fix_reply
+            before = self.fingerprint() if role == "verify" else ""
             self.job.goal, self.job.fix_reply = goal + references, reply + references
             try:
                 with self.selected(setting):
@@ -1680,6 +1681,8 @@ class Controller(worker_turns.WorkerTurns):
                                                    else {"attempt": self.job.reviews + 1}))
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
+            if role == "verify" and (not before or self.fingerprint() != before):
+                raise ValueError("verification changed the candidate or its tree is unavailable; rerun the gates on the current tree")
             if pending := outcome.data.get("focused_hold"):
                 raise ValueError(f"review needs current focused repair evidence: {pending}")
             result = outcome.data.get("verified" if role == "verify" else "review", {})

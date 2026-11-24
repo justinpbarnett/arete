@@ -1363,7 +1363,7 @@ def settle_unpushed_checkouts(job: Job):
     return fresh, staged, size, outcome, unpushed
 
 
-def held_push_check(job: Job, targets: list[workspace.Checkout]) -> Callable[[], None]:
+def held_pr_check(job: Job, targets: list[workspace.Checkout]) -> Callable[[], None]:
     check_targets = job.check_publication_targets
 
     def check_held_targets(*, convert=False):
@@ -1421,7 +1421,8 @@ def report(job: Job, size: str, images: dict, held: str, *, measurement_section:
 
 
 def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
-                        before_push=None, *, updated: list[workspace.Checkout], measurement_section: str = "") -> Outcome:
+                        before_push=None, *, updated: list[workspace.Checkout],
+                        held_adoptions: list[workspace.Checkout], measurement_section: str = "") -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
     report_body = report(job, size, images, draft_why, measurement_section=measurement_section)
@@ -1454,7 +1455,8 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
                                          job.left_for_a_person, link, stops, committed,
                                          measurement_section=measurement_section)
-    drafted = pipeline.hold_pushed(run, pushed + [c for c in found if c in updated], ci_stopped, draft_why)
+    drafted = held_adoptions + pipeline.hold_pushed(
+        run, pushed + [c for c in found if c in updated], ci_stopped, draft_why)
     return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
                                found, drafted, ci_stopped)
 
@@ -1506,8 +1508,10 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
     updated = unpushed + fresh.changed
     check_targets = job.check_publication_targets
+    held_adoptions = []
     if focused_draft or job.b.in_use_repair_hold(job.verified):
-        check_targets = held_push_check(job, [c for c in updated if c.pr])
+        held_adoptions = [c for c in found if c in staged.changed and c not in updated]
+        check_targets = held_pr_check(job, [c for c in updated if c.pr] + held_adoptions)
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push,
                                                   focused_draft=focused_draft, check_targets=check_targets)
     if not job.run.repo.parts:
@@ -1517,7 +1521,7 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push,
-                               updated=updated, measurement_section=measurement_section)
+                               updated=updated, held_adoptions=held_adoptions, measurement_section=measurement_section)
 
 
 def with_stop(text: str, stop: str) -> str:

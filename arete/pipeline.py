@@ -500,8 +500,20 @@ class CatchUpFocusedHold(CatchUpGateHold):
     pass
 
 
-class CiFixFocusedHold(workspace.RunFailed):
+class CatchUpRepairParked(runlimits.Parked):
+    def __init__(self, reason: str, repair_tree: str):
+        super().__init__(reason)
+        self.repair_tree = repair_tree
+
+
+class FocusedRepairHold(workspace.RunFailed):
     pass
+
+
+class CiFixFocusedHold(FocusedRepairHold):
+    def __init__(self, failure: FocusedRepairHold, targets: set[tuple[str, str, str]]):
+        super().__init__(failure.why, failure.detail)
+        self.targets = targets
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
@@ -1317,13 +1329,19 @@ class Build(TicketWork):
     on_denied_edit: Callable[[str], None] | None = None
     repair_findings: dict[str, dict] = field(default_factory=dict)
     repair_receipts: dict[str, dict] = field(default_factory=dict)
+    in_use_waivers: dict[str, dict] = field(default_factory=dict)
 
     def repair_state(self) -> dict:
-        return {"findings": dict(self.repair_findings), "receipts": dict(self.repair_receipts)} if self.repair_findings else {}
+        if not self.repair_findings:
+            return {}
+        return {"findings": dict(self.repair_findings), "receipts": dict(self.repair_receipts),
+                **({"in_use_waivers": dict(self.in_use_waivers)} if self.in_use_waivers else {})}
 
     def restore_repair_state(self, state: dict) -> None:
         self.repair_findings.update(state.get("findings", {}))
         self.repair_receipts.update(state.get("receipts", {}))
+        if state:
+            self.in_use_waivers = dict(state.get("in_use_waivers", {}))
 
     def carry_review(self, review: Review, receipt: str) -> None:
         found = review.identify(receipt).repair_requirements()
@@ -1421,6 +1439,7 @@ class Build(TicketWork):
     def repair_feedback(self) -> str:
         status = self.focused_status()
         unresolved = self.unresolved_repair_selectors()
+        waived = self.current_in_use_waivers()
         lines = []
         for key, f in self.repair_findings.items():
             method = f["verification"]
@@ -1431,6 +1450,8 @@ class Build(TicketWork):
                     detail += (" Use or add a focused case under an approved check where policy permits; "
                                "an independent selector step will choose the check or record why it needs "
                                "another kind of evidence.")
+            elif key in waived:
+                detail = f"Independent review waived in-use evidence: {self.in_use_waivers[key]['why']}"
             else:
                 detail = f"Requires independent {method.replace('_', ' ')}: {f['reason']}"
             last = self.repair_receipts.get(key, {})
@@ -1511,18 +1532,51 @@ class Build(TicketWork):
         for _ in range(1, tries):
             if hold_at_limit and (reason := self.focused_repair_limit()):
                 return False, reason
-            step, result = self.repair_focused()
+            try:
+                step, result = self.repair_focused()
+                if after_worker:
+                    after_worker()
+            except runlimits.Parked:
+                if after_worker:
+                    after_worker()
+                raise
             reply = result.text
-            if after_worker:
-                after_worker()
             if not result.ok:
                 break
             if not self.check_repair_findings(producer=step):
                 return True, reply
         return False, reply
 
+    def current_in_use_waivers(self) -> set[str]:
+        trees = verification_trees(self) if self.in_use_waivers else {}
+        return {key for key, waiver in self.in_use_waivers.items() if trees and waiver["tree"] == trees}
+
+    def record_in_use_waivers(self, review: Review, answers, trees: dict[str, str]) -> None:
+        if not trees or review.trees != trees or verification_trees(self) != trees:
+            return
+        named: dict[str, list[dict]] = {}
+        for answer in answers if isinstance(answers, list) else []:
+            if isinstance(answer, dict) and isinstance(answer.get("id"), str):
+                named.setdefault(answer["id"].strip().upper(), []).append(answer)
+        previous = dict(self.in_use_waivers)
+        for problem in review.earlier or []:
+            key = problem.get("finding", "")
+            if self.repair_findings.get(key, {}).get("verification") != "in_use":
+                continue
+            matching = named.get(problem["id"], [])
+            why = matching[0].get("why") if len(matching) == 1 else None
+            if (problem["status"] == "waived" and isinstance(why, str) and why.strip()
+                    and problem.get("category") in ("issue", "regression")):
+                self.in_use_waivers[key] = {"tree": trees, "why": vault.hidden(why.strip())}
+            else:
+                self.in_use_waivers.pop(key, None)
+        if self.in_use_waivers != previous:
+            self.run.save("repair-checks.json", self.repair_state())
+
     def in_use_repair_checks(self) -> dict[str, str]:
-        return {key: f["acceptance"] for key, f in self.repair_findings.items() if f["verification"] == "in_use"}
+        waived = self.current_in_use_waivers()
+        return {key: f["acceptance"] for key, f in self.repair_findings.items()
+                if f["verification"] == "in_use" and key not in waived}
 
     def in_use_repair_hold(self, verified: verify.Verified) -> str:
         needed = self.in_use_repair_checks()
@@ -1716,8 +1770,8 @@ class Build(TicketWork):
                         attempts += 1
                         if result.ok:
                             continue
-                    raise CiFixFocusedHold(f"focused review regressions did not pass after {after}: {pending}",
-                                           self.repair_feedback())
+                    raise FocusedRepairHold(f"focused review regressions did not pass after {after}: {pending}",
+                                            self.repair_feedback())
                 staged = self.staged
             ok = self.check(after=after, staged=staged)
             if ok or attempts >= tries:
@@ -1728,8 +1782,8 @@ class Build(TicketWork):
                         prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
                                checks=self.check_commands, denied=prompt_loader.code_list(self.deny)), role="check_repair")
 
-    def recheck(self, after: str) -> None:
-        if not self.check_with_repairs(after=after)[0]:
+    def recheck(self, after: str, *, focused: str = "") -> None:
+        if not self.check_with_repairs(after=after, focused=focused)[0]:
             raise workspace.RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
@@ -3006,13 +3060,18 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             if not passed:
                 return _fail(run, "focused review regressions did not pass", reply, b.repair_feedback())
             for _ in range(max(1, run.settings("check_repair").tries)):
-                b.recheck("the review fixes")
+                b.recheck("the review fixes", focused=step)
+                checked_trees = verification_trees(b)
                 verified = verify_in_use(b, goal, build_summary)
-                if not b.check_repair_findings(producer=step):
+                if b.check_repair_findings(producer=step):
+                    passed, reply = b.retry_focused_repairs(step, reply)
+                    if not passed:
+                        return _fail(run, "focused review regressions did not pass", reply, b.repair_feedback())
+                    continue
+                trees = verification_trees(b)
+                if not b.repair_findings or (b.full_checks_current(trees) and (
+                        trees == checked_trees or trees == verified.observed_trees)):
                     break
-                passed, reply = b.retry_focused_repairs(step, reply)
-                if not passed:
-                    return _fail(run, "focused review regressions did not pass", reply, b.repair_feedback())
             else:
                 return _fail(run, "focused regressions and the final checks did not converge", reply, b.repair_feedback())
         n += 1
@@ -3030,6 +3089,10 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     outcome = f"{size}, review {review.verdict}, in use {verified.verdict}"
     written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
     focused_pending = b.focused_hold()
+    if n > 1 and b.repair_findings:
+        trees = verification_trees(b)
+        if not b.full_checks_current(trees) or (review.approved() and review.trees != trees):
+            return _fail(run, "the repaired candidate lacks current full checks or independent review")
     if review.approved() and focused_pending:
         return _fail(run, f"publication needs current focused repair evidence: {focused_pending}", detail=b.repair_feedback())
 
@@ -3397,6 +3460,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     wt = c.wt.resolve()
     worktree_files = catch_up_paths(c.wt)
     check_files = None
+    head = ""
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -3420,6 +3484,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         verified = check_in_use(b, goal, b.build_summary)
         if pending := b.check_repair_findings(producer=f"catch-up:{head}"):
             raise CatchUpGateHold("checks", f"focused regressions need repair: {pending}", head, b.repair_feedback(), verified)
+        if b.repair_findings and not b.full_checks_current(verification_trees(b)):
+            raise CatchUpGateHold("checks", "the candidate lacks current full checks after verification", head, b.report, verified)
         if pending := b.in_use_repair_hold(verified):
             raise CatchUpGateHold("verify", f"independent in-use evidence is still required for {pending}", head,
                                   b.report, verified)
@@ -3443,8 +3509,11 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         log_catch_up_failure(run, "failed", error)
         gate_hold = error if isinstance(error, CatchUpGateHold) else None
-        repair_tree = gate_hold.repair_tree if gate_hold else ""
-        if gate_hold and (repair_tree or gate_hold.head != c.merge):
+        repair_tree = error.repair_tree if isinstance(error, (CatchUpGateHold, CatchUpRepairParked)) else ""
+        held_head = gate_hold.head if gate_hold else ""
+        if isinstance(error, runlimits.Parked) and head and (repair_tree or head != c.merge):
+            held_head = head
+        if held_head and (repair_tree or held_head != c.merge):
             run.catch_up_repair_held = True
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
@@ -3452,7 +3521,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         tracked_restored = paths_restored = False
         try:
             abort_merge(c.wt)
-            restore_head = gate_hold.head if gate_hold else before.lease
+            restore_head = held_head or before.lease
             if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
                     or workspace.uncommitted(c.wt, tracked_only=True)):
                 git(["reset", "--hard", restore_head], c.wt)
@@ -3473,7 +3542,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                 log_catch_up_failure(run, "cleanup could not restore the repair edits", failed)
         if gate_hold:
             gate_hold.candidate_restored = tracked_restored and paths_restored
-        else:
+        if not held_head:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
         if tracked_restored and paths_restored and _termination is None:
@@ -3509,26 +3578,29 @@ def repair_caught_up_head(b: Build, c: workspace.Checkout, head: str) -> str:
         nonlocal repair_tree
         repair_tree = catch_up_repair_tree(b, c, base_tree)
 
-    passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True, after_worker=checkpoint)
-    if not passed:
-        raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
-                                 "\n\n".join(filter(None, (b.repair_feedback(), reply))), repair_tree=repair_tree)
-    trees = verification_trees(b)
-    repaired = trees != {c.prefix: base_tree}
-    if repaired:
-        b.require_valid_diff("repairing the moved base", from_base=True)
-    if not b.check(staged=b.staged, defer_failed_cleanup=True) or not b.full_checks_current(trees):
-        why = "the layer's local checks failed" + (" after the focused repair" if repaired else "")
-        raise CatchUpGateHold("checks", why, head, b.report, repair_tree=repair_tree)
-    if not repaired:
-        return head
-    if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
-        raise workspace.RunFailed("the catch-up repair changed after the checks")
-    util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
-    repaired = git(["rev-parse", "HEAD"], c.wt).strip()
-    if git(["rev-parse", f"{repaired}^{{tree}}"], c.wt).strip() != trees[c.prefix] or workspace.uncommitted(c.wt):
-        raise workspace.RunFailed("the catch-up repair committed a different candidate than the checks covered")
-    return repaired
+    try:
+        passed, reply = b.retry_focused_repairs(f"catch-up:{head}", "", hold_at_limit=True, after_worker=checkpoint)
+        if not passed:
+            raise CatchUpFocusedHold("checks", f"focused regressions need repair: {b.focused_hold()}", head,
+                                     "\n\n".join(filter(None, (b.repair_feedback(), reply))), repair_tree=repair_tree)
+        trees = verification_trees(b)
+        repaired = trees != {c.prefix: base_tree}
+        if repaired:
+            b.require_valid_diff("repairing the moved base", from_base=True)
+        if not b.check(staged=b.staged, defer_failed_cleanup=True) or not b.full_checks_current(trees):
+            why = "the layer's local checks failed" + (" after the focused repair" if repaired else "")
+            raise CatchUpGateHold("checks", why, head, b.report, repair_tree=repair_tree)
+        if not repaired:
+            return head
+        if b.focused_hold() or trees != index_trees(b.checkouts) or git(["rev-parse", "HEAD"], c.wt).strip() != head:
+            raise workspace.RunFailed("the catch-up repair changed after the checks")
+        util.git_as_owner(["commit", "-q", "-m", f"Repair focused regressions after catching up\n\nArete-Run: {b.run.id}"], c.wt)
+        repaired_head = git(["rev-parse", "HEAD"], c.wt).strip()
+        if git(["rev-parse", f"{repaired_head}^{{tree}}"], c.wt).strip() != trees[c.prefix] or workspace.uncommitted(c.wt):
+            raise workspace.RunFailed("the catch-up repair committed a different candidate than the checks covered")
+        return repaired_head
+    except runlimits.Parked as error:
+        raise CatchUpRepairParked(str(error), repair_tree) from error
 
 
 def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str, *,
@@ -3837,12 +3909,15 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
     except Exception as e:
         failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         if isinstance(failed, CiFixFocusedHold):
-            drafted = [c for c in with_prs if (state := own_draft_state(run, c)) is True
+            targets = [c for c in with_prs if (c.github, c.pr, c.lease) in failed.targets]
+            drafted = [c for c in targets if (state := own_draft_state(run, c)) is True
                        or (state is False and set_draft(run, c, True))]
         else:
-            drafted = [c for c in with_prs if set_draft(run, c, True)]
-        ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
-        publish_ci(run, b.ticket, with_prs, ci.section(rounds, max_rounds, ending))
+            targets = with_prs
+            drafted = [c for c in targets if set_draft(run, c, True)]
+        if targets:
+            ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, targets)}"
+            publish_ci(run, b.ticket, targets, ci.section(rounds, max_rounds, ending))
         if failed is e:
             raise
         raise failed from e
@@ -4099,7 +4174,13 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int,
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise workspace.RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
-    if not b.check_with_repairs(after="the CI fix", focused=f"ci-fix:{n}")[0]:
+    try:
+        ok, _ = b.check_with_repairs(after="the CI fix", focused=f"ci-fix:{n}")
+    except FocusedRepairHold as error:
+        targets = {(r.target.github, r.target.pr, r.target.sha) for r in caused}
+        targets.update((c.github, c.pr, c.lease) for c in b.restage().changed if c.pr)
+        raise CiFixFocusedHold(error, targets) from error
+    if not ok:
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
         raise workspace.RunFailed("the checks failed after the CI fix",
@@ -4884,7 +4965,15 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
             reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
     before = before or Review.stored({})
     if catch_up is None:
-        earlier = before.blocking()
+        earlier = list(before.blocking())
+        if isinstance(b, Build) and b.in_use_waivers:
+            current = b.current_in_use_waivers()
+            listed = {p.get("finding") for p in earlier}
+            for p in reversed(before.waived or []):
+                key = p.get("finding")
+                if key in b.in_use_waivers and key not in current and key not in listed:
+                    earlier.append(p)
+                    listed.add(key)
         schema = REVIEW_SCHEMA
         text = b.brief.prompt(
             "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
@@ -4900,6 +4989,8 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
     repair = f"\n\nApproved check names for focused regressions: {names}\n"
     if feedback := b.repair_feedback():
         repair += "\n\nRepair requirements and focused results (confirm the named check actually covers the path):\n" + feedback
+    waiver_trees = (verification_trees(b) if isinstance(b, Build) and any(
+        b.repair_findings.get(p.get("finding"), {}).get("verification") == "in_use" for p in earlier) else {})
     with context as (text, patches):
         text += repair
         for _ in range(2):
@@ -4910,6 +5001,8 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
                     said = {**said, "problems": catch_up_problems(said["problems"], patches)}
                 found = Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
                 b.carry_review(found, f"{b.run.id}:{step}:{uuid4().hex[:12]}")
+                if waiver_trees:
+                    b.record_in_use_waivers(found, said.get("earlier"), waiver_trees)
                 return found
     return Review.failed_step(earlier, before.waived or [], before.trees or {})
 
@@ -4990,7 +5083,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         if attempt == tries:
             break
         repair_in_use(b, attempt + 1, tries, verified)
-        b.recheck("fixing what the check in use found")
+        b.recheck("fixing what the check in use found", focused=f"verify-fix:{attempt + 1}")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
     raise workspace.RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",
