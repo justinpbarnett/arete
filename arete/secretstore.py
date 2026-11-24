@@ -236,7 +236,10 @@ def private_file(info: os.stat_result) -> bool:
 
 
 def require_private_file(fd: int) -> None:
-    if not private_file(os.fstat(fd)):
+    info = os.fstat(fd)
+    if info.st_nlink == 0:
+        raise FileNotFoundError("secret item was removed")
+    if not private_file(info):
         raise StoreError("secret item must be a private regular file with mode 0600")
     require_no_macos_acl(fd)
 
@@ -626,8 +629,9 @@ def lookup_key(c, settings, local, meta):
     return meta, None
 
 
-def key_context(c, settings, local):
-    meta = db.metadata(c)
+def key_context(c, settings, local, meta=None):
+    if meta is None:
+        meta = db.metadata(c)
     pending = pending_journals(meta["instance_tag"], settings)
     meta, key = lookup_key(c, settings, local, meta)
     if pending:
@@ -705,13 +709,20 @@ def fingerprint_key(settings: config.SecretsConfig | None = None) -> bytes:
     settings = config.secret_settings() if settings is None else settings
     local = local_key_path()
     migrate_registry()
+    pinned = db.transaction_mode() == "read"
     try:
-        with db.reader() as c:
-            meta, key, _ = key_context(c, settings, local)
-            if meta.get(KEY_REF):
-                if not meta.get(KEY_LOCAL) or not local.exists():
-                    return key
-            elif key is not None and not settings.store:
+        with ExitStack() as cleanup, db.reader() as c:
+            meta = db.metadata(c)
+            if reference := meta.get(KEY_REF):
+                key = referenced_key(meta, settings)
+                if not pinned and meta.get(KEY_LOCAL) and local.exists():
+                    if db.in_write():
+                        db.after_commit(lambda: retire_local_key(local, settings, reference))
+                    else:
+                        cleanup.callback(retire_local_key, local, settings, reference)
+                return key
+            meta, key, _ = key_context(c, settings, local, meta)
+            if key is not None and (not settings.store or meta.get(KEY_REF) or (pinned and meta.get(KEY_LOCAL))):
                 return key
     except db.NoDatabase:
         if not paths.ISOLATED:
