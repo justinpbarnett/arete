@@ -281,6 +281,15 @@ def snapshot(cfg, repo, source, t, row, *, prs=None, recovery=None) -> dict:
     if held := pr_recovery.blocked(row):
         binding["pr_recovery"] = (recovery if recovery is not None
                                   else pr_recovery_observation(repo, source, t, row, held))
+    if repo.pipeline and row.get("status") == "failed" and runlimits.metadata(row["id"], "parked.json"):
+        layer = config.load_layer(repo.layer_dir)
+        _, proof = runlimits.poll_admission(repo, t.id, t, runlimits.Policy.of(layer))
+        if proof and proof.run_id == row["id"]:
+            binding["poll_readmission"] = {
+                "parked_run": proof.run_id,
+                "changed": "branch heads" if proof.branch else "ticket specification or budget policy",
+                "proof": runlimits.readmission_key(asdict(proof)),
+            }
     return binding
 
 

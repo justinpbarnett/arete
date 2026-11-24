@@ -100,7 +100,7 @@ def launch():
     drained = False
     try:
         with ExitStack() as cleanup:
-            root = Path(tempfile.mkdtemp(prefix="arete-api-check-")).resolve()
+            root = Path(tempfile.mkdtemp(prefix="arete-api-check-", dir=Path("/tmp").resolve()))
             read, write = os.pipe()
             cleanup.callback(os.close, read)
             cleanup.callback(os.close, write)
@@ -276,7 +276,8 @@ class Check:
         require(not problems, ", ".join(problems))
         for op in self.published["operations"]:
             route = re.sub(r"\{\w+\}", "route-check", op["path"])
-            headers, _ = self.request("PUT", route, status=405)
+            method = "OPTIONS" if contract.match("PUT", route) else "PUT"
+            headers, _ = self.request(method, route, status=405)
             require(op["method"] in headers.get("Allow", "").split(", "),
                     f"{op['name']} {route}: registered method missing from Allow")
 
@@ -418,7 +419,7 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, contract, dashboard, paths, principals, record, replay, triage
+        from . import agent, contract, dashboard, paths, principals, record, replay, secretstore, triage
         from .sighting import Sighting
         from .store import chats, incidents, insights, runs, tokens
         from .store import triage as triage_store
@@ -433,6 +434,7 @@ class Check:
         stopped = record.start("loop", pid=0)
         session = record.start("session")
         fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
+        secretstore.put("global", "DEMO_KEY", "fixture-contract-key", "api_key", "hand")
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
@@ -442,8 +444,7 @@ class Check:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
             resource = name.partition(".")[0]
-            target = {**identities, "id": identities.get(resource, ""),
-                      **(values if resource == "config" else {}),
+            target = {**values, **identities, "id": identities.get(resource, ""),
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -459,7 +460,8 @@ class Check:
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
-                denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401}
+                denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401,
+                          "secret.set": 426, "secret.remove": 403}
                 if name in denied:
                     self.request(method, path, values, headers=key, status=denied[name])
                     continue
@@ -531,7 +533,7 @@ def worker(lifeline):
             require(not paths.DB_FILE.exists(), "state database already exists")
             (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
-            body = "\n".join(config) + "\n"
+            body = "\n".join(config) + '\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
             config_fixture_git("init", "-q", "-b", "main")
             config_fixture_git("add", "--", "config.toml")

@@ -54,6 +54,8 @@ from arete import (
     steps,
     tasks,
     tracker,
+    unblock,
+    unblock_watch,
     util,
     vault,
     workspace,
@@ -70,8 +72,10 @@ from arete.store import insights as insights_store
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
+from arete.store import unblock as recovery_store
 from arete.store import zte as zte_store
 from arete.zte_github import Identity, IssueApp
+from tests import support
 from tests.harness import set_task_body
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -1549,7 +1553,7 @@ class PolicyRestartLineageTests(Isolated):
             ledger.transition(lease, action["id"], state, result)
         return action
 
-    def saved(self):
+    def saved(self, *, policy_changed=True):
         controller = self.controller()
         prepared = factory.Outcome("pass", data={
             "layer": str(self.repo.layer_dir), "checkouts": [self.checkout.to_row()],
@@ -1564,19 +1568,24 @@ class PolicyRestartLineageTests(Isolated):
         with patch.object(controller, "atomic", side_effect=prepare_step):
             self.assertIsNone(controller.prepare())
         evidence, produced = {}, {}
+        policy = self.OLD_POLICY if policy_changed else controller.policy_sha()
+        tree = "old-tree" if policy_changed else controller.fingerprint()
         args = {"checks": {"scope": "full"}, "verify": {"route_id": "verify", "effort": "low"},
                 "review": {"route_id": "review", "effort": "low"}}
         for op, gate in self.GATES:
-            evidence[gate] = {"tree": "old-tree", "policy": self.OLD_POLICY, "result": {"summary": f"old {gate}"},
+            evidence[gate] = {"tree": tree, "policy": policy, "result": {"summary": f"old {gate}"},
                               "acceptance": controller.data["acceptance"], "producer": "d0000-0",
                               "observed": "2026-11-20T00:00:00Z"}
-            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate])
+            details = {"verdict": "pass"} if gate == "verify" else {}
+            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate],
+                                 **details)
             produced[gate] = action["id"]
         job = controller.job
         job.review = pipeline.Review.stored({"verdict": "approve", "summary": "old review", "problems": []})
         job.verified, job.reviews, job.ci_result = pipeline.verify.Verified("pass", "old verify"), 1, "old ci"
+        controller.data.pop("review_method", None)  # This saved lineage predates the Standards/Spec review.
         controller.data.update(evidence=evidence, checked={"tree": "old-tree"}, report="old checks",
-                               policy_sha=self.OLD_POLICY)
+                               policy_sha=policy)
         controller.persist()
         record.move(controller.run.id, "failed", ("running",))
         return controller, produced
@@ -1593,12 +1602,46 @@ class PolicyRestartLineageTests(Isolated):
             return results[name]
 
         with (patch.object(controller, "atomic", side_effect=atomic),
-              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: SimpleNamespace(step=roles[0]))):
-            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "verify", "effort": "low"},
+              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: controller.run.settings(roles[0]))):
+            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "model:verify:0", "effort": "low"},
                                                      {"route_id": "review", "effort": "low"})):
                 done = self.action(controller, op, args)
                 self.assertIsNone(controller.dispatch(done))
         return atomic_calls
+
+    def test_legacy_continuation_replaces_only_its_review_and_preserves_the_new_review_on_resume(self):
+        prior, produced = self.saved(policy_changed=False)
+        resumed = self.controller(prior.run.id)
+        self.assertIsNone(resumed.prepare())
+        self.assertTrue(resumed.run.code_review)
+        self.assertEqual(resumed.data["stale_actions"], [produced["review"]])
+        self.assertTrue(resumed.current("checks"))
+        self.assertTrue(resumed.current("verify"))
+        self.assertFalse(resumed.current("review"))
+        self.assertIsNone(resumed.job.review.verdict)
+        self.assertEqual(resumed.latest_code_review(), {})
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: review$"):
+            resumed.publish()
+
+        report = {"method": "code-review", "verdict": "pending", "summary": "fresh finding", "problems": [],
+                  "findings": [{"id": "spec-1", "axis": "Spec", "file": "example.py", "finding": "Missing case"}]}
+        outcome = factory.Outcome("pass", data={"review": report, "attempt": 1})
+        fresh = self.action(resumed, "review.run", {"route_id": "review", "effort": "low"})
+
+        def review_step(name, **kwargs):
+            self.assertTrue(kwargs["code_review"])
+            resumed.job.take(name, outcome, stored=False)
+            return outcome
+
+        with (patch.object(resumed, "atomic", side_effect=review_step),
+              patch.object(orchestration.Catalog, "route", return_value=SimpleNamespace(step="review"))):
+            self.assertIsNone(resumed.dispatch(fresh))
+        record.move(resumed.run.id, "stopped", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(repeated.data["evidence"]["review"]["producer"], fresh["id"])
+        self.assertEqual(repeated.job.review.verdict, "pending")
+        self.assertTrue(repeated.current("review"))
 
     def test_changed_policy_at_a_decision_boundary_reruns_every_gate_before_the_merge_gate(self):
         prior, produced = self.saved()
@@ -1616,7 +1659,7 @@ class PolicyRestartLineageTests(Isolated):
         for gate in produced:
             self.assertFalse(resumed.current(gate))
             self.assertNotIn(produced[gate], resumed.catalog.context)
-        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review, verify"):
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review$"):
             resumed.publish()
 
         fresh = {
@@ -1624,8 +1667,8 @@ class PolicyRestartLineageTests(Isolated):
                                                     "checked": {"tree": "fresh-tree", "commands": {}}}),
             "verify": factory.Outcome("pass", data={"verified": {"verdict": "pass", "summary": "fresh verify"},
                                                     "names": []}),
-            "review": factory.Outcome("pass", data={"review": {"verdict": "approve", "summary": "fresh review",
-                                                               "problems": []}, "attempt": 1}),
+            "review": factory.Outcome("pass", data={"review": {"method": "code-review", "verdict": "approve",
+                                                               "summary": "fresh review", "problems": []}, "attempt": 1}),
         }
         self.assertEqual(self.rerun_gates(resumed, fresh), ["checks", "verify", "review"])
         for gate, old_action in produced.items():
@@ -1797,6 +1840,38 @@ class OrchestrationWaitTests(Isolated):
 
 
 class BudgetTests(Isolated):
+    def test_monitor_reconsiders_a_park_when_poll_readmission_appears_or_is_spent(self):
+        self.cfg.unblock_repos = (self.repo.name,)
+        self.cfg.replay = config.ReplayConfig(all=True)
+        run = self.made_run()
+        run.budget.park("the repair chain used its 2 repair cycles")
+        record.settle(run.id, "failed")
+        row = run_store.run_get(run.id)
+
+        def inspect():
+            case = recovery_store.get(self.repo.name, self.ticket)
+            unblock_watch.inspect(self.cfg, self.repo, self.ticket, row, [], case)
+            return recovery_store.get(self.repo.name, self.ticket)
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(unblock, "diagnose", return_value={"action": "wait_for", "evidence": ["run"],
+                                                               "reason": "Wait for changed inputs."}) as diagnose):
+            first = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            with foundation.db() as connection:
+                set_task_body(self.ticket, "Revised specification", connection=connection)
+            admitted = inspect()
+            observation = diagnose.call_args.args[-2]["poll_readmission"]
+            self.assertEqual(observation["parked_run"], run.id)
+            self.assertEqual(json.loads(admitted["snapshot"])["poll_readmission"], observation)
+            self.assertEqual(inspect()["generation"], admitted["generation"])
+            _, proof = runlimits.poll_admission(self.repo, self.ticket, self.local.get(self.ticket), run.budget.policy)
+            self.assertFalse(proof.attempted(record=True))
+            spent = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            self.assertEqual([c["generation"] for c in (first, admitted, spent)], [1, 2, 3])
+            self.assertEqual(diagnose.call_count, 3)
+
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
@@ -3379,17 +3454,25 @@ class ParkedRetryBudgetTests(Isolated):
 class DeniedWorkerEditsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
-        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
+        root = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
+        with support.workspace_state(root):
+            foundation.migrate()
+            cls.workspace_db_seed = paths.DB_FILE.read_bytes()
+        cls.base = root / "repo"
+        cls.base.mkdir()
         (cls.base / "guarded.txt").write_text("base\n")
         (cls.base / "removed.txt").write_text("base\n")
         util.git(["init", "-q", "-b", "main", "--template="], cls.base)
         util.git(["add", "."], cls.base)
         util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
 
-    def prepare_controller(self):
+    def prepare_controller(self, *, real_ledger=False):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(support.workspace_state(root))
+        paths.ensure_dirs()
+        paths.DB_FILE.write_bytes(self.workspace_db_seed)
         self.wt = root / "repo"
         shutil.copytree(self.base, self.wt)
         repo = config.Repo("fixture/repo", self.wt, tracker="local")
@@ -3397,14 +3480,13 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                                       deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
                                       checks={"goal": 'test "$(cat goal.txt)" = reached'})
         cfg = config.Config(replay=config.ReplayConfig(all=True))
-        run_dir = root / "runs" / "fixture"
+        run_dir = paths.RUNS_DIR / "fixture"
         run_dir.mkdir(parents=True)
         self.run_fixture = pipeline.Run(id="fixture", repo=repo, dir=run_dir, tracker=tracker.LocalTracker(repo),
                                         tid="1", path="orchestrate")
         job = flows.Job(cfg, self.run_fixture, self.wt, ticket=tracker.Ticket("1", "#1", "Fixture goal"),
                         checkouts=[workspace.Checkout("", repo.name, repo.path, self.wt, "main")])
         self.run_fixture.workspace = self.wt, job.checkouts
-        self.enterContext(patch.object(paths, "RUNS_DIR", run_dir.parent))
         self.enterContext(patch.object(paths, "CHECK_LOCKS_DIR", root / "check-locks"))
         self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
         self.enterContext(patch.multiple(record, mark=Mock(), note=Mock()))
@@ -3418,9 +3500,10 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.enterContext(patch.multiple(workspace, note_made=Mock(), kept_work=Mock(return_value=""),
                                          scratch_left=Mock(return_value=[]), drop_untracked_bytecode=Mock()))
         self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
-        self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
-                                         save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
-                                             "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
+        if not real_ledger:
+            self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
+                                             save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
+                                                 "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
         job.use_layer(self.layer)
         self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
         flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
@@ -3474,6 +3557,84 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                          route_id="model:build:0", effort=model.effort or "low")
             self.assertTrue(controller.collect())
             return worker.call_args.args[2]["role"]
+
+    def test_failed_test_runs_before_full_suite_on_the_final_candidate(self):
+        self.prepare_controller(real_ledger=True)
+        ctl = self.controller
+        ctl.data["acceptance"] = "fixture"
+
+        def check(**args):
+            turn = ledger.begin(ctl.lease, {}, 100)
+            action, = ledger.accept(ctl.lease, turn, ledger.snapshot(ctl.lease)["version"], {"calls": [{
+                "op": "checks.run", "args": OPERATIONS["checks.run"].arguments(args)}]}, 100)
+            self.assertIsNone(ctl.dispatch(action))
+            return ledger.actions(ctl.lease)[-1]["result"]
+
+        selector = "test_order.OrderTests.test_rollback"
+        script = self.wt.parent / "check.py"
+        script.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "if Path('goal.txt').read_text().strip() != 'fixed':\n"
+            "    if sys.argv[1:] or Path('goal.txt').read_text().strip() != 'class only':\n"
+            "        print('test_rollback (test_order.OrderTests.test_rollback)')\n"
+            "    print('AssertionError: wrong order')\n"
+            "    print('Failed classes: test_order.OrderTests')\n"
+            "    print('Ran 3 tests in 0.04s: FAILED')\n"
+            "    sys.exit(1)\n"
+            "if sys.argv[1:] not in ([], ['test_order.OrderTests.test_rollback']): sys.exit(2)\n")
+        self.layer.checks = {"lint": "true", "behavior": shlex.join([sys.executable, str(script)])}
+        self.layer.targeted_commands = {"classes": self.layer.checks["behavior"]}
+
+        self.write("goal.txt", "class only")
+        failed = check()
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["remaining_checks"], [{"name": "behavior", "selectors": ["test_order.OrderTests"]}])
+        self.assertFalse(failed["runner_blocked"])
+
+        narrowed = check()
+        self.assertEqual(narrowed["remaining_checks"], [{"name": "behavior", "selectors": [selector]}])
+        reproduced = check()
+        self.assertEqual((reproduced["scope"], reproduced["checks_executed"]), ("failed", ["behavior"]))
+        repeated = check()
+        self.assertEqual(repeated["reused_checks"], ledger.actions(ctl.lease)[-2]["id"])
+        self.assertEqual(repeated["checks_executed"], [])
+        ctl.recover()
+        self.assertFalse(ctl.current("checks"))
+        self.assertEqual(check()["reused_checks"], repeated["reused_checks"])
+
+        self.write("goal.txt", "fixed")
+        first = check()
+        self.assertEqual((first["scope"], first["passed"], first["full"]), ("failed", True, False))
+        self.assertEqual(first["checks_executed"], ["behavior"])
+        self.assertIn(selector, first["report"])
+        self.write("another.txt", "later integration")
+        self.assertEqual(check()["scope"], "failed")
+
+        final = check(scope="quick")
+        self.assertEqual((final["scope"], final["passed"], final["full"]), ("full", True, True))
+        self.assertEqual(final["checks_executed"], ["lint", "behavior"])
+        self.assertEqual(final["remaining_checks"], [])
+
+        producer = ctl.data["evidence"]["checks"]["producer"]
+        self.assertEqual(check()["reused_checks"], producer)
+        ctl.recover()
+        self.assertTrue(ctl.current("checks"))
+        self.assertEqual(check(scope="quick")["reused_checks"], producer)
+        with patch.object(ctl.run, "action", producer):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["acceptance"] = "owner confirmed the runner is ready"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["ci_failed"] = True
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data.pop("ci_failed")
+        with patch.object(ctl.run, "environment_release", "new release"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        with patch.object(ctl.run, "path", "pilot"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        self.layer.checks["new"] = "true"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
+        self.write("another.txt", "changed again")
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
 
     def test_second_worker_passes_checks_without_the_denied_paths(self):
         self.prepare_controller()

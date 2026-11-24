@@ -25,6 +25,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from select import select
 from socket import SHUT_WR, SO_SNDBUF, SOL_SOCKET, create_connection, socket, socketpair
+from textwrap import indent
 from types import SimpleNamespace
 from unittest import mock
 
@@ -60,12 +61,17 @@ def fixture_bearer(person):
 
 
 class _SecretChildCase(unittest.TestCase):
-    def run_secret_child(self, entry, *, keychain=False):
+    adapter_only = False
+
+    def run_secret_child(self, entry, *, keychain=False, schema=None):
         folder = tempfile.TemporaryDirectory(suffix=".noindex", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
-        root = Path(self.enterContext(folder)) / f"{paths.SCRATCH_PREFIX}1234567890abcdef{paths.SCRATCH_SUFFIX}"
-        root.mkdir(mode=0o700)
+        root = Path(self.enterContext(folder))
+        if self.adapter_only:
+            root = root / f"{paths.SCRATCH_PREFIX}1234567890abcdef{paths.SCRATCH_SUFFIX}"
+            root.mkdir(mode=0o700)
         env = api_check.isolated_env(root)
-        env[paths.SCRATCH_ENV] = str(root)
+        if self.adapter_only:
+            env[paths.SCRATCH_ENV] = str(root)
         env["ARETE_DRIVE_FLUSH"] = "0"
         store = "keychain" if keychain else "pve_store"
         (root / "config/config.toml").write_text(f'[secrets]\nstore = "{store}"\nstore_dir = "../store"\n')
@@ -107,25 +113,282 @@ from pathlib import Path
 from unittest import mock
 
 from arete import config, paths, secretstore
+from arete.store import db
 
 case = unittest.TestCase()
-assert paths.ISOLATED
 """
+        if self.adapter_only:
+            init += "assert paths.ISOLATED\n"
         if keychain:
             init += """
 fixture_security = str(Path.cwd() / 'bin/fixture-security')
 run = secretstore.subprocess.run
+subprocess_error = secretstore.subprocess.SubprocessError
 
 def run_fixture_only(argv, **kwargs):
     case.assertEqual(argv[0], fixture_security)
     return run(argv, **kwargs)
 
+native_keychain_program = config.keychain_program
 config.keychain_program = lambda: fixture_security
+secretstore.subprocess = mock.Mock(wraps=secretstore.subprocess)
+secretstore.subprocess.SubprocessError = subprocess_error
 secretstore.subprocess.run = run_fixture_only
 """
-        command = api_check.child_command(api_check.SOURCE, init + entry)
+        if schema is None:
+            if not self.adapter_only:
+                init += "db.migrate()\n"
+        else:
+            init += f"""
+chain = [migration for migration in db.migrations.load() if migration.n <= {schema!r}]
+with mock.patch.object(db.migrations, 'load', return_value=chain):
+    db.migrate()
+
+def assert_schema(version):
+    with db.reader() as c:
+        assert c.execute('PRAGMA user_version').fetchone()[0] == version
+        assert c.execute('SELECT MAX(n) FROM schema_migrations').fetchone()[0] == version
+        exists = c.execute("SELECT 1 FROM sqlite_schema WHERE name = 'secrets'").fetchone()
+        assert bool(exists) == (version >= 27)
+
+assert_schema({schema!r})
+"""
+        script = init + entry
+        if schema is not None:
+            script = "from arete import api_check\nwith api_check.offline():\n" + indent(script, "    ")
+        command = api_check.child_command(api_check.SOURCE, script)
         done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+SECRET_RECOVERY_FIXTURE = r"""
+import sqlite3
+
+def reject_change(write, *args):
+    with db.tx() as c:
+        c.execute("CREATE TRIGGER reject_secret_change BEFORE INSERT ON events_log "
+                  "WHEN NEW.kind = 'credential.changed' BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+    with case.assertRaisesRegex(sqlite3.IntegrityError, 'injected failure'):
+        write('global', *args)
+    with db.tx() as c:
+        c.execute('DROP TRIGGER reject_secret_change')
+
+def item_reference(row):
+    return secretstore.parse_reference(row['reference'], db.schema_metadata()['instance_tag'])
+
+def receipt(name):
+    return paths.STATE_DIR / 'secret-writes/global' / name
+
+def event_names(name):
+    return [e['event'] for e in secretstore.history('global', name)]
+"""
+
+
+class SecretWriteTests(_SecretChildCase):
+    def test_validation_reference_and_value_stays_outside_state_and_logs(self):
+        self.run_secret_child(r"""
+import json
+
+for scope, name, value in [('global', 'SHORT', '1234567'), ('global', 'LINES', '12345678\nagain'),
+                           ('principal:u:1234abcd', 'DENIED', 'fixture-value'),
+                           ('repo:a/../b', 'DENIED', 'fixture-value'), ('global', 'bad', 'fixture-value')]:
+    with case.assertRaises(ValueError):
+        secretstore.put(scope, name, value, 'api_key', 'hand')
+assert not Path('store').exists() and secretstore.items() == []
+with db.reader() as c:
+    assert not c.execute('SELECT 1 FROM secret_events').fetchone()
+    assert not c.execute("SELECT 1 FROM events_log WHERE kind = 'credential.changed'").fetchone()
+
+value = 'synthetic-pem-first-line\nsynthetic-pem-second-line\n'
+row = secretstore.put('repo:Demo', 'PEM', value, 'app_private_key', 'hand')
+meta = db.schema_metadata()
+prefix = 'pve_store:arete/' + meta['instance_tag'] + '/'
+assert row['reference'] == prefix + 'repo:Demo/PEM'
+assert meta['fingerprint_key_ref'] == prefix + 'global/FINGERPRINT_KEY'
+item = Path('store') / meta['instance_tag'] / 'repo:Demo/PEM'
+assert item.read_bytes() == secretstore.read('repo:Demo', 'PEM') == value.encode()
+assert item.stat().st_mode & 0o777 == 0o600 and Path('store').stat().st_mode & 0o777 == 0o700
+assert row['fingerprint'] == secretstore.fingerprint(value)
+with db.reader() as c:
+    changed = c.execute("SELECT * FROM events_log WHERE kind = 'credential.changed'").fetchone()
+    assert changed['subject'] == 'secret:repo:Demo/PEM'
+    assert json.loads(changed['data']) == {k: row[k] for k in ('name', 'scope', 'fingerprint')}
+for directory in ('state', 'logs'):
+    for path in Path(directory).rglob('*'):
+        if path.is_file():
+            assert b'synthetic-pem-' not in path.read_bytes(), path
+""")
+
+    def test_failed_insert_rolls_back_then_check_recovers_first_set_and_rotation(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+old = secretstore.put('global', 'ROTATION', 'fixture-original', 'api_key', 'hand')
+cases = [('ROTATION', 'fixture-rotation', old, ['set', 'rotated', 'checked']),
+         ('FIRST_SET', 'fixture-first-set', None, ['set', 'checked'])]
+with db.tx():
+    for name, value, _, _ in cases:
+        reject_change(secretstore.put, name, value, 'api_key', 'u:1234abcd')
+for name, _, previous, _ in cases:
+    assert secretstore.get('global', name) == previous and event_names(name) == (['set'] if previous else [])
+with (mock.patch.object(secretstore, 'write_item', side_effect=OSError('injected store failure')),
+      case.assertRaisesRegex(OSError, 'injected store failure')):
+    secretstore.put('global', 'FIRST_SET', 'fixture-retry-value', 'api_key', 'hand')
+for name, value, _, expected in cases:
+    with db.tx():
+        row = secretstore.check('global', name)
+        assert receipt(name).exists()
+    assert not receipt(name).exists()
+    assert row['check_ok'] and row['status'] == 'set' and row['fingerprint'] == secretstore.fingerprint(value)
+    assert row['set_by'] == 'u:1234abcd' and event_names(name) == expected
+removed = secretstore.remove('global', 'FIRST_SET', 'hand')
+assert removed['status'] == 'missing' and removed['missing_since'] and secretstore.read('global', 'FIRST_SET') is None
+assert event_names('FIRST_SET')[-1] == 'removed'
+""")
+
+
+class RegistryReceiptTests(_SecretChildCase):
+    def test_same_bytes_recover_metadata_after_rollback(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'METADATA', 'fixture-original'
+actor = 'u:1234abcd'
+old = secretstore.put('global', name, value, 'api_key', 'hand', provider='fixture-old')
+
+def replace_metadata(scope, name):
+    secretstore.put(scope, name, value, 'app_private_key', actor, provider='fixture-new')
+
+reject_change(replace_metadata, name)
+assert secretstore.get('global', name) == old and event_names(name) == ['set']
+assert receipt(name).exists()
+row = secretstore.check('global', name)
+assert row['kind'] == 'app_private_key' and row['provider'] == 'fixture-new' and row['set_by'] == actor
+assert row['fingerprint'] == old['fingerprint'] and row['version'] == old['version'] + 1
+assert row['status'] == 'set' and row['check_ok'] and row['rotated_at'] == row['set_at']
+assert event_names(name) == ['set', 'rotated', 'checked']
+assert secretstore.history('global', name)[1]['actor'] == actor
+assert not receipt(name).exists()
+""")
+
+    def test_committed_receipt_is_not_replayed_after_drift_and_restoration(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'RESTORED', 'fixture-current'
+secretstore.put('global', name, 'fixture-original', 'api_key', 'hand')
+settings = config.secret_settings()
+with mock.patch.object(secretstore, 'remove_file', side_effect=OSError('injected cleanup failure')):
+    published = secretstore.put('global', name, value, 'app_private_key', 'u:1234abcd')
+    assert receipt(name).exists()
+    ref = item_reference(published)
+    secretstore.write_item(ref, settings, b'fixture-drift')
+    drifted = secretstore.check('global', name)
+    assert drifted['status'] == 'missing' and receipt(name).exists()
+secretstore.write_item(ref, settings, value.encode())
+restored = secretstore.check('global', name)
+assert restored['status'] == 'set' and restored['check_ok']
+assert restored['version'] == drifted['version'] + 1
+assert restored['set_at'] == published['set_at'] and restored['set_by'] == published['set_by']
+assert event_names(name) == ['set', 'rotated', 'checked', 'checked']
+assert not receipt(name).exists()
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM events_log WHERE kind = 'credential.changed' AND subject = ?",
+                     ('secret:global/' + name,)).fetchone()[0] == 2
+""")
+
+    def test_same_byte_retry_stopped_before_intent_keeps_original_attribution(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value, actor = 'SAME_RETRY', 'fixture-first-value', 'u:1234abcd'
+reject_change(secretstore.put, name, value, 'api_key', actor)
+assert secretstore.get('global', name) is None and event_names(name) == []
+with (mock.patch.object(secretstore, 'save_pending', side_effect=OSError('injected intent failure')) as write,
+      case.assertRaisesRegex(OSError, 'injected intent failure')):
+    secretstore.put('global', name, value, 'app_private_key', 'hand', provider='fixture-retry')
+write.assert_called_once()
+row = secretstore.check('global', name)
+assert row['kind'] == 'api_key' and row['provider'] is None and row['set_by'] == actor
+assert row['fingerprint'] == secretstore.fingerprint(value) and row['check_ok']
+assert event_names(name) == ['set', 'checked'] and secretstore.history('global', name)[0]['actor'] == actor
+assert not receipt(name).exists()
+""")
+
+
+class RegistryReceiptChainTests(_SecretChildCase):
+    def test_rollback_preserves_two_operators_and_a_later_value(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, first, last = 'CHAIN', 'synthetic-first', 'synthetic-later'
+with case.assertRaisesRegex(RuntimeError, 'outer rollback'):
+    with db.tx():
+        secretstore.put('global', name, first, 'api_key', 'hand')
+        with mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('unchanged bytes')):
+            secretstore.put('global', name, first, 'app_private_key', 'u:operator', provider='demo')
+        secretstore.put('global', name, last, 'api_key', 'hand')
+        raise RuntimeError('outer rollback')
+assert secretstore.get('global', name) is None
+row = secretstore.check('global', name)
+assert row['version'] == 3 and row['check_ok'] and row['fingerprint'] == secretstore.fingerprint(last)
+for _ in range(2):
+    changes = [(e['event'], e['actor']) for e in secretstore.history('global', name) if e['event'] != 'checked']
+    assert changes == [('set', 'hand'), ('rotated', 'u:operator'), ('rotated', 'hand')]
+    secretstore.check('global', name)
+""")
+
+
+class RegistryRemovalTests(_SecretChildCase):
+    def test_removal_records_existing_bytes_and_recovers_after_rollback(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+actor, retry_actor = 'u:1234abcd', 'hand'
+settings = config.secret_settings()
+for name in ('DRIFT', 'RETRY', 'CHECK_THEN_RETRY'):
+    row = secretstore.put('global', name, 'fixture-original', 'api_key', actor)
+    ref = item_reference(row)
+    item, _ = secretstore.file_location(ref, settings)
+    if name == 'DRIFT':
+        secretstore.write_item(ref, settings, b'fixture-external-change')
+        assert secretstore.check('global', name)['status'] == 'missing' and item.exists()
+    else:
+        reject_change(secretstore.remove, name, actor)
+        assert not item.exists() and receipt(name).exists()
+        assert secretstore.get('global', name) == row and event_names(name) == ['set']
+        if name == 'CHECK_THEN_RETRY':
+            assert secretstore.check('global', name, retry_actor)['status'] == 'missing'
+    removed = secretstore.remove('global', name, actor if name == 'DRIFT' else retry_actor)
+    assert removed['status'] == 'missing' and not item.exists() and not receipt(name).exists()
+    assert secretstore.remove('global', name, retry_actor) == removed
+    event, = (e for e in secretstore.history('global', name) if e['event'] == 'removed')
+    assert event['actor'] == actor
+    with db.reader() as c:
+        assert c.execute("SELECT count(*) FROM events_log WHERE kind = 'credential.changed' AND subject = ?",
+                         ('secret:global/' + name,)).fetchone()[0] == 2
+""")
+
+
+class SecretRotationTests(_SecretChildCase):
+    def test_replacing_bytes_after_mismatched_check_records_rotation(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+settings = config.secret_settings()
+for name in ('DIRECT', 'RECOVERED', 'ABSENT'):
+    original = secretstore.put('global', name, 'fixture-original', 'api_key', 'hand')
+    ref = item_reference(original)
+    if name == 'ABSENT':
+        secretstore.remove_item(ref, settings)
+    else:
+        secretstore.write_item(ref, settings, b'fixture-external-change')
+    failed_check = secretstore.check('global', name)
+    assert failed_check['status'] == 'missing' and not failed_check['check_ok']
+    value = 'fixture-replacement'
+    if name == 'RECOVERED':
+        reject_change(secretstore.put, name, value, 'api_key', 'hand')
+        assert secretstore.get('global', name) == failed_check
+        row = secretstore.check('global', name)
+    else:
+        row = secretstore.put('global', name, value, 'api_key', 'hand')
+    assert row['status'] == 'set' and row['missing_since'] is None
+    assert row['version'] == failed_check['version'] + 1
+    assert row['fingerprint'] == secretstore.fingerprint(value)
+    assert secretstore.read('global', name) == value.encode()
+    history = secretstore.history('global', name)
+    event = 'set' if name == 'ABSENT' else 'rotated'
+    assert [e['event'] for e in history[:3]] == ['set', 'checked', event]
+    assert history[2]['fingerprint_after'] == row['fingerprint']
+    assert row['rotated_at'] == (None if name == 'ABSENT' else row['set_at'])
+    assert len(history) == (4 if name == 'RECOVERED' else 3)
+""")
 
 
 SECRET_KEYCHAIN_SELECTION_FIXTURE = r"""
@@ -151,6 +414,8 @@ def assert_keychain_denied():
 
 
 class SecretRedirectedKeychainTests(_SecretChildCase):
+    adapter_only = True
+
     def test_redirected_roots_cannot_select_or_call_the_host_keychain(self):
         self.run_secret_child(SECRET_KEYCHAIN_SELECTION_FIXTURE + r"""
 for setting in ('redirect_config', 'redirect_state', 'isolated'):
@@ -173,7 +438,26 @@ with owner_installation() as sandboxed:
 """)
 
 
+SECRET_OWNER_FILE_FIXTURE = r"""
+from arete.store import credentials
+
+def seed_owner_file(actor):
+    value = 'synthetic owned item'
+    file = paths.STATE_DIR / 'owner-item'
+    file.write_text(value)
+    file.chmod(0o600)
+    fingerprint = secretstore.fingerprint(value)
+    ref = secretstore.Reference('owner_file', db.schema_metadata()['instance_tag'], file.name)
+    with db.tx() as c:
+        row = credentials.save_secret(c, 'global', 'OWNED', 'signing_key', ref.store, str(ref),
+                                      fingerprint, actor, 'fixture', None)
+    return file, value, row
+"""
+
+
 class SecretBackendLocationTests(_SecretChildCase):
+    adapter_only = True
+
     def test_config_validates_store_choice_and_location(self):
         self.run_secret_child(r"""
 config.load()
@@ -289,6 +573,8 @@ with (alias_fixture, mock.patch.multiple(paths, ISOLATED=False, LOG_DIR=logs),
 
 
 class SecretBackendPrimitivesTests(_SecretChildCase):
+    adapter_only = True
+
     def test_file_store_does_not_cross_scope_case_aliases(self):
         self.run_secret_child(r"""
 settings = config.secret_settings()
@@ -378,6 +664,8 @@ assert all(argv in (find, delete) and stdin == '' for argv, stdin in calls[1:])
 
 
 class SecretBackendAclTests(_SecretChildCase):
+    adapter_only = True
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS filesystem ACLs")
     def test_file_store_rejects_macos_acls(self):
         self.run_secret_child(r"""
@@ -452,6 +740,1142 @@ for acl, error, message in ((123, 0, 'must not have macOS ACLs'),
 """)
 
 
+class SecretBackendTests(_SecretChildCase):
+    def test_keychain_uses_instance_service_and_sends_base64_on_stdin(self):
+        self.run_secret_child(r"""
+import base64
+import json
+
+value = 'synthetic-keychain-pem\nsecond-line'
+row = secretstore.put('global', 'PEM', value, 'app_private_key', 'hand')
+assert secretstore.read('global', 'PEM') == value.encode()
+meta = db.schema_metadata()
+service = 'arete/' + meta['instance_tag']
+assert row['reference'] == f'keychain:{service}/global/PEM'
+assert meta['fingerprint_key_ref'] == f'keychain:{service}/global/FINGERPRINT_KEY'
+encoded = base64.b64encode(value.encode()).decode()
+log = Path('security-calls.jsonl')
+calls = [json.loads(line) for line in log.read_text().splitlines()]
+assert any(argv == ['-i'] and service in stdin and encoded in stdin for argv, stdin in calls)
+assert any(argv[:3] == ['find-generic-password', '-s', service] for argv, stdin in calls)
+assert all(value.splitlines()[0] not in ' '.join(argv) and encoded not in ' '.join(argv) for argv, stdin in calls)
+with (mock.patch.object(paths, 'ISOLATED', True),
+      mock.patch.object(config, 'keychain_program', native_keychain_program)):
+    assert paths.ISOLATED
+    assert config.secrets_table({'store': 'keychain'}, paths.CONFIG_FILE).store is None
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.read_item(secretstore.parse_reference(row['reference'], meta['instance_tag']), config.SecretsConfig())
+assert len(calls) == len(log.read_text().splitlines())
+""", keychain=True)
+
+    def test_owner_file_backend_is_confined_and_internal_items_cannot_be_removed(self):
+        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
+file, value, row = seed_owner_file('hand')
+assert secretstore.read('global', 'OWNED') == value.encode()
+before = secretstore.check('global', 'OWNED')
+assert before['check_ok']
+for name in ('FINGERPRINT_KEY', 'OWNED'):
+    with case.assertRaises(secretstore.InternalSecret):
+        secretstore.remove('global', name, 'hand')
+assert file.read_text() == value and secretstore.get('global', 'OWNED') == before
+assert secretstore.fingerprint(value) == row['fingerprint']
+tag = db.schema_metadata()['instance_tag']
+for text in (f'owner_file:arete/{tag}/../outside', 'owner_file:arete/other/owner-item'):
+    with case.assertRaises(ValueError):
+        secretstore.parse_reference(text, tag)
+""")
+
+    def test_config_refuses_store_inside_state_config_or_git_work_tree(self):
+        self.run_secret_child(r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
+config.load()
+assert config.secret_settings().store_dir == Path('store').resolve()
+Path('checkout').mkdir()
+Path('checkout/.git').write_text('gitdir: fixture-worktree-metadata\n')
+for directory, expected in (('../state/store', 'must be separate'), ('inner-store', 'must be separate'),
+                            ('../checkout/nested/store', 'outside git repositories and work trees')):
+    paths.CONFIG_FILE.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{directory}"\n')
+    with case.assertRaisesRegex(ValueError, expected):
+        config.load()
+""")
+
+
+class RegistryMutationBoundaryTests(_SecretChildCase):
+    def test_missing_key_blocks_checks_and_removals_with_present_or_missing_bytes(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'BOUND', 'synthetic-original', 'api_key', 'hand')
+original = secretstore.history('global', 'BOUND')
+read = secretstore.read_item
+for absent in (False, True):
+    def observed(ref, settings, **kwargs):
+        return None if ref.item == secretstore.KEY_ITEM or absent else read(ref, settings, **kwargs)
+    with (mock.patch.object(secretstore, 'read_item', side_effect=observed),
+          mock.patch.object(secretstore, 'remove_item', side_effect=AssertionError('must keep the stored item'))):
+        for change in (secretstore.check, secretstore.remove):
+            with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+                change('global', 'BOUND', 'hand')
+    assert secretstore.get('global', 'BOUND') == row
+    assert secretstore.history('global', 'BOUND') == original and not receipt('BOUND').exists()
+""")
+
+    def test_provider_validation_precedes_publication_and_history_retains_both_operators(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name, value = 'METADATA', 'synthetic-bytes'
+for change in (lambda: secretstore.put('global', name, value, 'api_key', 'u:'+chr(0xd800)),
+               lambda: secretstore.remove('global', name, 'u:'+chr(0xd800))):
+    with (mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('invalid principal wrote an item')),
+          mock.patch.object(secretstore, 'save_pending', side_effect=AssertionError('invalid principal wrote a receipt')),
+          case.assertRaises(ValueError)):
+        change()
+with case.assertRaises(ValueError):
+    secretstore.put('global', name, value, 'api_key', 'hand', provider=['invalid'])
+assert not receipt(name).exists() and not Path('store').exists()
+secretstore.put('global', name, value, 'api_key', 'hand', provider='one')
+secretstore.put('global', name, value, 'app_private_key', 'u:operator', provider='two')
+notes = secretstore.history('global', name)
+assert [(e['actor'], e['kind'], e['provider']) for e in notes] == [
+    ('hand', 'api_key', 'one'), ('u:operator', 'app_private_key', 'two')]
+assert notes[0]['detail'] != notes[1]['detail'] and value not in str(notes)
+with db.tx() as conn:
+    row = secretstore.credentials.secret(conn, 'global', name)
+    for note in ('{legacy note', '{"note":"imported"}'):
+        secretstore.credentials.secret_event(conn, row, 'checked', 'hand', '2026-01-01T00:00:00Z', detail=note)
+assert [e['detail'] for e in secretstore.history('global', name)[-2:]] == ['{legacy note', '{"note":"imported"}']
+""")
+
+    def test_journal_retirement_commits_its_durability_marker_with_a_reader_open(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+db.enable_wal()
+with db.reader(streaming=True) as reader, db.read_snapshot(reader):
+    assert reader.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+    before = db.metadata(reader).get(secretstore.REGISTRY_SYNC)
+    secretstore.put('global', 'DURABLE', 'synthetic-bytes', 'api_key', 'hand')
+    assert not receipt('DURABLE').exists() and db.metadata(reader).get(secretstore.REGISTRY_SYNC) == before
+with db.reader() as reader:
+    assert db.metadata(reader)[secretstore.REGISTRY_SYNC] != before
+assert event_names('DURABLE') == ['set']
+""")
+
+
+class RegistryBackendRetryTests(_SecretChildCase):
+    def test_retry_after_backend_switch_preserves_original_reference_and_receipt(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+name = 'MOVED'
+original = config.secret_settings()
+replacement = config.SecretsConfig(store='keychain')
+physical = {}
+
+def store(ref, _settings, data):
+    physical[str(ref)] = data
+
+def read(ref, _settings, **_kwargs):
+    return physical.get(str(ref))
+
+with (mock.patch.object(secretstore, 'read_item', side_effect=read),
+      mock.patch.object(secretstore, 'write_item', side_effect=store)):
+    secretstore.fingerprint_key(original)
+    with case.assertRaisesRegex(OSError, 'interrupted removal'):
+        with db.tx():
+            first = secretstore.put('global', name, 'synthetic-original', 'api_key', 'hand')
+            with mock.patch.object(secretstore, 'remove_item', side_effect=OSError('interrupted removal')):
+                secretstore.remove('global', name, 'u:operator')
+    before = receipt(name).read_bytes()
+    stored = dict(physical)
+    assert secretstore.get('global', name) is None and physical[first['reference']] == b'synthetic-original'
+    with mock.patch.object(config, 'secret_settings', return_value=replacement), case.assertRaises(secretstore.StoreError):
+        secretstore.put('global', name, 'synthetic-retry', 'api_key', 'hand')
+    assert receipt(name).read_bytes() == before and physical == stored
+    assert secretstore.get('global', name) is None and secretstore.history('global', name) == []
+""")
+
+    def test_disabling_store_preserves_lost_key_error_for_a_registered_secret(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'DEMO', 'synthetic-original', 'api_key', 'hand')
+before = secretstore.history('global', 'DEMO')
+read = secretstore.read_item
+def without_key(ref, settings, **kwargs):
+    return None if ref.item == secretstore.KEY_ITEM else read(ref, settings, **kwargs)
+
+with (mock.patch.object(config, 'secret_settings', return_value=config.SecretsConfig()),
+      mock.patch.object(secretstore, 'read_item', side_effect=without_key),
+      mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('must preserve the existing item'))):
+    for operation in (lambda: secretstore.put('global', 'DEMO', 'synthetic-retry', 'api_key', 'hand'),
+                      lambda: secretstore.remove('global', 'DEMO', 'hand'),
+                      lambda: secretstore.check('global', 'DEMO')):
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            operation()
+assert secretstore.get('global', 'DEMO') == row and secretstore.history('global', 'DEMO') == before
+""")
+
+    def test_new_receipt_directories_are_durable_before_the_backend_write(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+import os
+import stat
+
+name = 'DURABLE'
+synced = set()
+sync, store = os.fsync, secretstore.write_item
+root = config.secret_settings().store_dir
+def identity(path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino)
+
+def observe(fd):
+    sync(fd)
+    info = os.fstat(fd)
+    if stat.S_ISDIR(info.st_mode):
+        synced.add((info.st_dev, info.st_ino))
+
+def publish(ref, settings, data):
+    if ref.item == 'global/' + name:
+        journal = receipt(name)
+        assert journal.is_file()
+        assert all(identity(parent) in synced for parent in
+                   (paths.STATE_DIR, journal.parent.parent, journal.parent))
+    return store(ref, settings, data)
+
+with (mock.patch.object(os, 'fsync', side_effect=observe),
+      mock.patch.object(secretstore, 'write_item', side_effect=publish)):
+    row = secretstore.put('global', name, 'synthetic-bytes', 'api_key', 'hand')
+ref = item_reference(row)
+assert all(identity(path) in synced for path in (root.parent, root, root / ref.tag, root / ref.tag / 'global'))
+assert not receipt(name).exists()
+""")
+
+
+class RegistryUncommittedPublicationTests(_SecretChildCase):
+    def test_read_agrees_with_committed_metadata_after_a_rolled_back_rotation(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+row = secretstore.put('global', 'SAMPLE', 'sample-original', 'api_key', 'hand')
+reject_change(secretstore.put, 'SAMPLE', 'sample-replacement', 'api_key', 'u:operator')
+assert secretstore.get('global', 'SAMPLE') == row
+assert secretstore.read('global', 'SAMPLE') is None
+assert event_names('SAMPLE') == ['set']
+assert secretstore.check('global', 'SAMPLE')['check_ok']
+assert secretstore.read('global', 'SAMPLE') == b'sample-replacement'
+assert event_names('SAMPLE') == ['set', 'rotated', 'checked']
+""")
+
+    def test_a_pending_first_set_preserves_lost_key_evidence_across_all_addresses(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+read = secretstore.read_item
+def missing_key(ref, settings, **kwargs):
+    return None if ref.item == secretstore.KEY_ITEM else read(ref, settings, **kwargs)
+
+with (mock.patch.object(secretstore, 'read_item', side_effect=missing_key),
+      mock.patch.object(secretstore, 'write_item', side_effect=AssertionError('unexpected replacement'))):
+    for operation in (secretstore.fingerprint_key,
+                      lambda: secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'hand')):
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            operation()
+assert receipt('FIRST').read_bytes() == before and not receipt('SECOND').exists()
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+""")
+
+    def test_switching_file_directories_before_the_first_commit_preserves_the_original_journal(self):
+        self.run_secret_child(SECRET_RECOVERY_FIXTURE + r"""
+reject_change(secretstore.put, 'FIRST', 'sample-original', 'api_key', 'hand')
+before = receipt('FIRST').read_bytes()
+other = Path.cwd() / 'alternate-store'
+settings = config.SecretsConfig(store='pve_store', store_dir=other)
+with mock.patch.object(config, 'secret_settings', return_value=settings):
+    with case.assertRaises(secretstore.StoreError):
+        secretstore.put('global', 'SECOND', 'sample-other', 'api_key', 'u:operator')
+assert not other.exists() and receipt('FIRST').read_bytes() == before
+assert secretstore.items() == [] and secretstore.KEY_REF not in db.schema_metadata()
+assert secretstore.check('global', 'FIRST')['check_ok']
+assert secretstore.read('global', 'FIRST') == b'sample-original'
+""")
+
+
+class RegistryHandoffReadTests(_SecretChildCase):
+    def test_pinned_reader_keeps_its_fingerprint_and_owner_file_through_key_relocation(self):
+        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
+from concurrent.futures import ThreadPoolExecutor
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+db.enable_wal()
+file, value, row = seed_owner_file('hand')
+paths.CONFIG_FILE.write_text(configured)
+with db.one_read() as reader:
+    before = db.metadata(reader)
+    assert secretstore.KEY_LOCAL in before and secretstore.KEY_REF not in before
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(secretstore.fingerprint_key).result(timeout=5)
+    assert not paths.FINGERPRINT_KEY_FILE.exists() and db.metadata(reader) == before
+    assert secretstore.fingerprint(value) == row['fingerprint']
+    assert secretstore.read('global', 'OWNED') == value.encode()
+""")
+
+    def test_committed_binding_serves_a_pinned_reader_when_cleanup_is_deferred(self):
+        self.run_secret_child(SECRET_OWNER_FILE_FIXTURE + r"""
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+file, value, row = seed_owner_file('hand')
+paths.CONFIG_FILE.write_text(configured)
+with mock.patch.object(secretstore, 'retire_local_key'):
+    secretstore.fingerprint_key()
+assert paths.FINGERPRINT_KEY_FILE.exists()
+with db.one_read() as reader, mock.patch.object(secretstore, 'pending_journals') as journals:
+    assert db.metadata(reader)[secretstore.KEY_REF]
+    assert secretstore.fingerprint(value) == row['fingerprint']
+    assert secretstore.read('global', 'OWNED') == value.encode()
+    journals.assert_not_called()
+assert secretstore.fingerprint(value) == row['fingerprint'] and not paths.FINGERPRINT_KEY_FILE.exists()
+""")
+
+    def test_concurrently_retired_file_descriptor_counts_as_a_missing_name(self):
+        self.run_secret_child(r"""
+marker = Path.cwd() / 'ordinary-marker'
+marker.write_bytes(b'read fixture')
+marker.chmod(0o600)
+validate = secretstore.require_private_file
+
+def retire_after_open(fd):
+    marker.unlink()
+    validate(fd)
+
+with mock.patch.object(secretstore, 'require_private_file', side_effect=retire_after_open):
+    assert secretstore.read_file(marker, marker.parent) is None
+""")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "confined SQLite runs on macOS")
+class RegistryIsolatedReadTests(_SecretChildCase):
+    adapter_only = True
+
+    def test_missing_local_binding_reports_the_named_error_from_an_isolated_reader(self):
+        self.run_secret_child(r"""
+from arete.store import credentials
+
+db.migrate()
+with db.tx() as c:
+    c.execute("INSERT INTO schema_meta (key,value) VALUES (?,?)", (secretstore.KEY_LOCAL, "0" * 64))
+    ref = secretstore.Reference('owner_file', db.metadata(c)['instance_tag'], 'sample.txt')
+    credentials.save_secret(c, 'global', 'COLOR', 'sample', ref.store, str(ref), '1' * 64,
+                            'hand', 'fixture', None)
+for read in (lambda: secretstore.fingerprint('sample'), lambda: secretstore.read('global', 'COLOR')):
+    with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+        read()
+assert not paths.FINGERPRINT_KEY_FILE.exists()
+""")
+
+
+class RegistryKeyContinuityTests(_SecretChildCase):
+    def test_final_lease_retries_a_busy_writer_and_rechecks_the_committed_backend(self):
+        self.run_secret_child(r"""
+import sqlite3
+
+marker = Path('retirement-marker').resolve()
+marker.touch(mode=0o600)
+settings = config.secret_settings()
+with db.tx() as conn:
+    ref = str(secretstore.Reference(settings.store, db.metadata(conn)['instance_tag'], secretstore.KEY_ITEM))
+    conn.execute("INSERT INTO schema_meta (key, value) VALUES (?, ?)", (secretstore.KEY_REF, ref))
+
+busy = sqlite3.OperationalError('fixture writer is busy')
+busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+attempts = []
+sync = secretstore.sync_before_cleanup
+
+def transient(*args, **kwargs):
+    attempts.append(1)
+    if len(attempts) < 3:
+        raise busy
+    return sync(*args, **kwargs)
+
+with (mock.patch.object(secretstore, 'sync_before_cleanup', side_effect=transient),
+      mock.patch.object(secretstore, 'referenced_key', side_effect=secretstore.FingerprintKeyMissing) as check):
+    secretstore.retire_local_key(marker, settings, wait_for_writer=True)
+assert len(attempts) == 3 and check.call_count == 1 and marker.exists()
+""")
+
+    def test_an_account_fingerprint_without_a_key_requires_reconciliation(self):
+        self.run_secret_child(r"""
+with db.tx() as c:
+    account = tuple(c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+                              "VALUES ('demo:subscription', 'demo', 'sample', 'subscription', 'u:demo', 'personal', "
+                              "'fixture-fingerprint', 'fixture-time') RETURNING *").fetchone())
+with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+    secretstore.fingerprint('fixture-input')
+with db.reader() as c:
+    assert tuple(c.execute('SELECT * FROM accounts').fetchone()) == account
+    assert not c.execute('SELECT 1 FROM secrets').fetchone()
+assert secretstore.KEY_REF not in db.schema_metadata() and not paths.FINGERPRINT_KEY_FILE.exists()
+assert not Path('store').exists()
+""")
+
+
+class SecretFingerprintTests(_SecretChildCase):
+    def test_fingerprints_are_per_instance_and_a_lost_key_cannot_be_reminted(self):
+        self.run_secret_child(r"""
+from arete import accounts
+
+value = 'fixture-fingerprint-input'
+row = secretstore.put('global', 'EXAMPLE', value, 'api_key', 'hand')
+first = secretstore.fingerprint(value)
+assert first == row['fingerprint'] and first != accounts.fingerprint(value)
+meta = db.schema_metadata()
+second = Path('state2').resolve()
+with mock.patch.multiple(paths, STATE_DIR=second, DB_FILE=second / 'arete.db',
+                         FINGERPRINT_KEY_FILE=second / 'fingerprint-fixture', LOCKS_DIR=second / 'locks'):
+    db.migrate()
+    assert secretstore.fingerprint(value) != first
+    assert db.schema_metadata()['instance_tag'] != meta['instance_tag']
+key = Path('store') / meta['fingerprint_key_ref'].removeprefix('pve_store:arete/')
+key.unlink()
+with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+    secretstore.fingerprint(value)
+assert not key.exists() and db.schema_metadata()['fingerprint_key_ref'] == meta['fingerprint_key_ref']
+with db.tx() as c:
+    c.execute('DELETE FROM schema_meta WHERE key = ?', (secretstore.KEY_REF,))
+with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+    secretstore.fingerprint(value)
+assert not key.exists() and secretstore.KEY_REF not in db.schema_metadata()
+""")
+
+    def test_local_key_moves_to_store_only_after_reference_commits(self):
+        self.run_secret_child(r"""
+file = paths.STATE_DIR / 'fingerprint-fixture'
+value = 'fixture-local-value'
+assert paths.FINGERPRINT_KEY_FILE.name == 'fingerprint.key'
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', file):
+    configured = paths.CONFIG_FILE.read_text()
+    paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+    with case.assertRaisesRegex(secretstore.StoreMissing, 'secret_store_missing'):
+        secretstore.put('global', 'EXAMPLE', value, 'api_key', 'hand')
+    before = secretstore.fingerprint(value)
+    data = file.read_bytes()
+    assert len(data) == 32 and file.stat().st_mode & 0o777 == 0o600
+    assert 'fingerprint_key_ref' not in db.schema_metadata()
+    paths.CONFIG_FILE.write_text(configured)
+    with case.assertRaisesRegex(RuntimeError, 'rollback fixture'):
+        with db.tx():
+            assert secretstore.fingerprint(value) == before
+            assert file.read_bytes() == data
+            raise RuntimeError('rollback fixture')
+    assert file.read_bytes() == data and 'fingerprint_key_ref' not in db.schema_metadata()
+    assert secretstore.fingerprint(value) == before
+    ref = db.schema_metadata()['fingerprint_key_ref']
+    assert (Path('store') / ref.removeprefix('pve_store:arete/')).read_bytes() == data
+    assert not file.exists()
+""")
+
+    def test_missing_fallback_after_configuration_does_not_adopt_an_unbound_key(self):
+        self.run_secret_child(r"""
+from arete import accounts
+from arete.store import principals
+
+principals.seed_owner('fixture@example.invalid')
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    auth = accounts.pi('fixture', {'key': 'synthetic-provider-key'})
+    assert accounts.record(auth)
+    paths.FINGERPRINT_KEY_FILE.unlink()
+    paths.CONFIG_FILE.write_text(settings)
+    configured = config.secret_settings()
+    ref = secretstore.Reference(configured.store, db.schema_metadata()['instance_tag'], secretstore.KEY_ITEM)
+    secretstore.write_item(ref, configured, b'x' * 32)
+    with mock.patch.object(secretstore, 'write_item') as write:
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            accounts.record(auth)
+        with db.tx() as c:
+            c.execute('DELETE FROM schema_meta WHERE key = ?', (secretstore.KEY_LOCAL,))
+        with case.assertRaisesRegex(secretstore.FingerprintKeyMissing, 'fingerprint_key_missing'):
+            accounts.record(auth)
+        write.assert_not_called()
+    assert 'fingerprint_key_ref' not in db.schema_metadata()
+""")
+
+
+class AuthoritySchemaTests(_SecretChildCase):
+    def test_secret_tables_are_strict_and_subscription_requires_personal_holder(self):
+        self.run_secret_child(r"""
+import sqlite3
+
+with db.tx() as c:
+    tables = {row['name']: row['strict'] for row in c.execute('PRAGMA table_list')}
+    assert [tables[name] for name in ('secrets', 'secret_events', 'accounts')] == [1, 1, 1]
+    sql = ("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+           "VALUES ('demo:subscription', 'demo', 'fixture-identity', 'subscription', ?, ?, 'fixture-hmac', 'fixture-time')")
+    for holder, usage in (('u:1234abcd', 'workspace'), ('owner', 'personal')):
+        with case.assertRaises(sqlite3.IntegrityError):
+            c.execute(sql, (holder, usage))
+    c.execute(sql, ('u:1234abcd', 'personal'))
+with case.assertRaises(ValueError):
+    secretstore.validate_account_id('fixture@example.invalid')
+secretstore.validate_account_id('demo:subscription:2')
+""")
+
+
+class SecretRegistryMigrationTests(_SecretChildCase):
+    def test_schema_27_preserves_workspace_worker_and_acknowledged_message(self):
+        self.run_secret_child(r"""
+tables = ('workspaces', 'orchestration_workers', 'orchestration_messages')
+
+def snapshot(c):
+    rows = [dict(c.execute(f'SELECT * FROM {table}').fetchone()) for table in tables]
+    for legacy_column in ('legacy_mtime_ns', 'legacy_owner'):
+        rows[0].pop(legacy_column, None)
+    return rows
+
+with db.tx() as c:
+    c.execute("INSERT INTO workspaces (name, owner_run, state, made_at) "
+              "VALUES ('fixture-checkout', 'fixture-run', 'kept', '2026-11-23T12:00:00Z')")
+    c.execute("INSERT INTO orchestration_workers (root,id,attempt,generation,phase,data) "
+              "VALUES ('fixture-run', 'worker-1', 'turn-1', 2, 'completed', ?)", ('{"summary":"fixture"}',))
+    c.execute("INSERT INTO orchestration_messages (root,id,worker,kind,body,reply_to,action,state,attempt,history) "
+              "VALUES ('fixture-run', 'steer-1', 'worker-1', 'steer', 'fixture guidance', '', "
+              "'action-1', 'acknowledged', 'turn-1', ?)", ('[{"state":"acknowledged","action":"turn-1"}]',))
+    before = snapshot(c)
+
+row = secretstore.put('global', 'DEMO_KEY', 'synthetic-upgrade-value', 'api_key', 'hand')
+assert_schema(db.LATEST)
+with db.reader() as c:
+    assert snapshot(c) == before
+assert secretstore.get('global', 'DEMO_KEY') == row
+""", schema=26)
+
+
+SECRET_ROUTED_ACCOUNT_FIXTURE = r"""
+from types import SimpleNamespace
+
+from arete import accounts, pi, runner
+from arete.agent import Result
+from arete.store import principals
+
+login = 'fixture@example.invalid'
+
+def launch_picked(auth, credential, *, agent='pi', model='demo', billing='free', route=None, result=None):
+    candidate = SimpleNamespace(runner=agent, provider=auth.provider, model=model, credential=credential, billing=billing,
+                                effort='', tier='', position=0, requested=True)
+    pick = runner.Picked(candidate, auth, route, 'demo', '', {auth}, None)
+    with (mock.patch.object(runner, 'pick', return_value=(pick, [])),
+          mock.patch.object(runner, 'launch_kwargs', return_value={}),
+          mock.patch.object(runner, 'launch_env', return_value=[]),
+          mock.patch.object(runner, 'attempt', return_value=result or Result(ok=True)) as attempt):
+        launched = runner.run('fixture prompt', Path.cwd(), runner=agent, model=model, cfg=config.Config())
+    attempt.assert_called_once()
+    return launched
+
+def assert_no_accounts():
+    with db.reader() as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 0
+"""
+
+
+class AuthorityAccountTests(_SecretChildCase):
+    def test_fresh_headless_run_enrolls_the_login_under_an_owner_principal(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+from dataclasses import replace
+from arete import tailnet
+from arete.agent import Session
+
+assert principals.owner() == 'hand'
+auth = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-account'}, 'fixture')
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    result = launch_picked(auth, 'cli_login', agent='codex',
+                           result=Result(ok=True, session=Session(id='fixture', runner='codex')))
+    assert result.ok and result.session.account == runner.account_of(auth)
+    with db.reader() as c:
+        first, = map(dict, c.execute('SELECT * FROM accounts'))
+        assert c.execute('SELECT count(*) FROM principal_logins').fetchone()[0] == 0
+        assert c.execute('SELECT count(*) FROM tokens').fetchone()[0] == 0
+    paths.CONFIG_FILE.write_text(settings)
+    assert accounts.record(auth) == first
+holder = principals.owner()
+assert first['id'] == 'openai-codex:subscription' and first['holder'] == holder and holder.startswith('u:')
+assert first['usage'] == 'personal'
+assert first['identity'] != auth.identity and first['fingerprint'] != auth.credential
+assert principals.for_login(login) is None
+host = SimpleNamespace(seed_identity=mock.Mock(return_value=(login, 'Fixture Owner')))
+tailnet.seed_owner(host, config.Config())
+tailnet.seed_owner(host, config.Config())
+host.seed_identity.assert_called_once()
+assert principals.owner() == principals.for_login(login) == holder
+rotated = accounts.record(replace(auth, credential='synthetic-rotation'))
+assert rotated['id'] == first['id'] and rotated['identity'] == first['identity']
+assert rotated['fingerprint'] != first['fingerprint'] and rotated['version'] == first['version'] + 1
+other = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'another-fixture'}, 'fixture')
+assert accounts.record(other)['id'] == first['id'] + ':2'
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM events_log WHERE subject = 'account:openai-codex:subscription' "
+                     "AND kind = 'credential.changed'").fetchone()[0] == 2
+""")
+
+    def test_keyless_local_route_records_no_account(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+principals.seed_owner(login)
+auth = accounts.pi('ollama')
+route = pi.Route('ollama', 'demo', auth, local=True)
+assert launch_picked(auth, 'local', model='ollama/demo', route=route).ok
+assert_no_accounts()
+assert not Path('store').exists()
+""")
+
+    def test_registry_keychain_failure_keeps_the_resolved_provider_launch(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import subprocess
+
+principals.seed_owner(login)
+key = 'synthetic-provider-key'
+auth = accounts.pi('openai', {'key': key})
+route = pi.Route('openai', 'demo', auth, key=key)
+locked = subprocess.CompletedProcess([], 1, b'', b'fixture locked')
+with (mock.patch.object(paths, 'ISOLATED', False),
+      mock.patch.object(secretstore, 'security', return_value=locked) as backend,
+      case.assertLogs('arete.accounts', 'WARNING') as warnings):
+    assert launch_picked(auth, 'api_key', billing='paid', route=route).ok
+backend.assert_called_once()
+assert len(warnings.output) == 1 and 'StoreError' in warnings.output[0]
+assert_no_accounts()
+assert 'fingerprint_key_ref' not in db.schema_metadata()
+""", keychain=True)
+
+
+class AuthorityAccountRefreshTests(_SecretChildCase):
+    def test_two_workers_and_a_pinned_retry_keep_one_confirmed_login(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+route = pi.Route(provider, 'fixture', first, owner=owner)
+pi.observed_refresh(route, {'provider': provider, 'before': before, 'after': after})
+refreshed = accounts.record(latest)
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
+    def test_confirmed_refresh_reconciles_after_the_worker_lease(self):
+        self.run_secret_child(SECRET_ROUTED_ACCOUNT_FIXTURE + r"""
+import json
+import os
+import subprocess
+from arete import sandbox
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+provider = 'github-copilot'
+owner = Path.cwd() / 'fixture-login.json'
+def selected(label):
+    data = {'type': 'oauth', 'access': 'synthetic-' + label}
+    return data, accounts.pi(provider, data, str(owner))
+
+before, first = selected('before')
+after, latest = selected('after')
+original = accounts.record(first)
+provisional = accounts.record(latest)
+assert original['id'] != provisional['id']
+with db.tx() as c:
+    c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+              "VALUES ('SAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'missing', ?)", (provisional['id'],))
+owner.write_text(json.dumps({provider: before}))
+route = pi.Route(provider, provider + '/fixture', first, owner=owner, using_login=True, view=Path.cwd())
+
+def stream(cmd, cwd, env, *_args, pass_fds):
+    paths.CONFIG_FILE.write_text(configured)
+    event = {'provider': provider, 'before': before, 'after': after}
+    writer, ack = pass_fds
+    os.write(writer, json.dumps(event).encode() + b'\n')
+    assert os.read(ack, 1) == b'1'
+    with db.tx(timeout=1) as c:
+        assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert secretstore.KEY_REF not in db.schema_metadata()
+    reply = {'type': 'agent_end', 'messages': [{'role': 'assistant', 'content': []}]}
+    return subprocess.CompletedProcess(cmd, 0, json.dumps(reply), ''), ''
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(pi, 'stream', side_effect=stream),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi')):
+    result = pi.run('fixture', Path.cwd(), selected=route, persist=False)
+assert result.ok, result.error
+assert secretstore.KEY_REF in db.schema_metadata()
+with db.reader() as c:
+    refreshed, = map(dict, c.execute('SELECT * FROM accounts'))
+assert refreshed['id'] == original['id'] and refreshed['fingerprint'] != original['fingerprint']
+assert accounts.record(latest) == refreshed
+assert accounts.record(first) == refreshed
+unrelated = accounts.record(selected('unrelated')[1])
+assert unrelated['id'] not in (original['id'], provisional['id'])
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
+    assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
+SECRET_HTTP_FIXTURE = r"""
+import json
+from types import SimpleNamespace
+
+from arete import contract, dashboard, idempotency, tailnet
+from arete.store import principals, tokens
+from tests.test_behavior import VersionedApiTests, fixture_bearer
+
+login = 'fixture@example.invalid'
+actor = principals.seed_owner(login)
+bearer = fixture_bearer(actor).removeprefix('Bearer ')
+logins = tailnet.Logins(mock.Mock())
+logins.of = lambda _: login
+server = SimpleNamespace(node=SimpleNamespace(names={'127.0.0.1'}), logins=logins, tls=object())
+root = '/api/v1/secrets'
+item = root + '/global/DEMO_KEY'
+pairings = '/api/v1/auth/pairings'
+
+def request(method, at, payload=b'', *, token=None, cookie=None, key='request-demo', media='application/json',
+            handler=dashboard.Handler, csrf=True, status=200, code=None, reason=None, allow=None):
+    headers = {'Connection': 'close'}
+    if method != 'GET':
+        headers.update({'Content-Type': media, 'Content-Length': str(len(payload)), 'Idempotency-Key': key})
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    if cookie:
+        headers.update({'Cookie': cookie, 'Origin': 'https://127.0.0.1'})
+        if csrf:
+            headers['X-Arete'] = '1'
+    actual_status, response, raw = VersionedApiTests.wire_exchange(method, at, headers, payload, server=server, handler=handler)
+    answer = json.loads(raw)
+    expected = (status, code, reason, allow)
+    actual = (actual_status, answer.get('code'), answer.get('reason'), response.get('Allow'))
+    assert all(want is None or got == want for got, want in zip(actual, expected)), (method, at, expected, actual, answer)
+    return response, answer
+
+def assert_shape(operation, result):
+    contract.validate(result, contract.BY_NAME[operation]['result'])
+
+def browser_session():
+    _, pairing = request('POST', pairings, token=bearer, status=201)
+    claim = json.dumps({'code': pairing['code']}).encode()
+    headers, _ = request('POST', pairings + '/claim', claim, key='request-claim', status=201)
+    return headers['Set-Cookie'].split(';')[0]
+"""
+
+
+class SecretApiTests(_SecretChildCase):
+    def test_every_secret_route_requires_a_store_and_principal_is_reserved(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+settings = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+for method, at in [('GET', root), ('GET', item), ('GET', item + '/history'), ('PUT', item + '/value'),
+                   ('DELETE', item), ('POST', item + '/check')]:
+    request(method, at, token=bearer, status=501, code='secret_store_missing')
+paths.CONFIG_FILE.write_text(settings)
+request('GET', root + '/principal%3Au%3A1234abcd/DEMO_KEY', token=bearer, status=404, code='not_found')
+""")
+
+    def test_only_a_paired_browser_sets_values_and_responses_are_metadata(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+value = b'fixture-api-token'
+write = dict(payload=value, media='text/plain', key='request-set')
+for tls, status, code, reason in [(None, 426, 'tls_required', None), (object(), 403, 'forbidden', 'presence_required')]:
+    server.tls = tls
+    request('PUT', item + '/value', token=bearer, status=status, code=code, reason=reason, **write)
+assert secretstore.get('global', 'DEMO_KEY') is None and not Path('store').exists()
+cookie = browser_session()
+_, result = request('PUT', item + '/value', cookie=cookie, **write)
+row = secretstore.get('global', 'DEMO_KEY')
+assert result['secret']['fingerprint'] == row['fingerprint']
+request('PUT', item + '/value', cookie=cookie, **write)
+with db.reader() as conn:
+    event, = conn.execute("SELECT actor, data FROM events_log WHERE kind = 'credential.changed'").fetchall()
+    assert event['actor'] == actor
+    assert json.loads(event['data']) == {'name': 'DEMO_KEY', 'scope': 'global', 'fingerprint': row['fingerprint']}
+    receipt = conn.execute("SELECT * FROM idempotency WHERE key = 'request-set'").fetchone()
+    expected = idempotency.fingerprint('PUT', '/api/v1/secrets/{scope}/{name}/value',
+                                       {'scope': 'global', 'name': 'DEMO_KEY'}, {'fingerprint': row['fingerprint']})
+    assert receipt['request_sha'] == expected
+    assert value not in receipt['response']
+
+def assert_redacted(operation, result):
+    assert_shape(operation, result)
+    body = json.dumps(result)
+    assert value.decode() not in body and row['reference'] not in body
+
+_, result = request('GET', item, token=bearer)
+assert_redacted('secret.get', result)
+_, reader = tokens.issue(actor, 'Read fixture', ['read'])
+request('POST', item + '/check', token=reader, key='request-check', status=403, code='scope_missing')
+_, checker = tokens.issue(actor, 'Check fixture', ['config:activate'])
+_, result = request('POST', item + '/check', token=checker, key='request-check')
+assert result['secret']['check_ok'] is True, result
+_, result = request('DELETE', item, cookie=cookie, key='request-delete')
+assert result['secret']['present'] is False and secretstore.read('global', 'DEMO_KEY') is None, result
+_, result = request('GET', item + '/history', token=bearer)
+assert_redacted('secret.history', result)
+assert [event['event'] for event in result['history']] == ['set', 'checked', 'removed']
+
+from arete import accounts
+
+accounts.record(accounts.Auth('api_key', credential='synthetic-account-login', provider='demo'), secret_id=row['id'])
+_, result = request('GET', '/api/v1/accounts', token=bearer)
+assert_shape('account.list', result)
+assert result['accounts'] == [{'id': 'demo:api_key', 'service': 'demo', 'mode': 'api_key',
+                               'usage': 'personal', 'holder': actor, 'secret_name': 'DEMO_KEY'}]
+""")
+
+    def test_removal_refuses_fingerprint_key_and_owner_file(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + SECRET_OWNER_FILE_FIXTURE + r"""
+cookie = browser_session()
+file, value, row = seed_owner_file(actor)
+key = secretstore.fingerprint_key()
+meta = db.schema_metadata()
+ref = secretstore.parse_reference(meta['fingerprint_key_ref'], meta['instance_tag'])
+for name in ('FINGERPRINT_KEY', 'OWNED'):
+    request('DELETE', f'{root}/global/{name}', cookie=cookie, key=f'remove-{name}', status=409, code='secret_internal')
+assert secretstore.get('global', 'OWNED') == row and not secretstore.history('global', 'OWNED')
+assert secretstore.read_item(ref, config.secret_settings()) == key
+assert file.read_bytes() == value.encode()
+""")
+
+
+class AuthorityRegistryAdmissionTests(_SecretChildCase):
+    def test_scratch_read_admission_excludes_the_registry_directly_and_in_batches(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+from arete import verify_faults
+
+(paths.STATE_DIR.parent / '.arete-owned').write_bytes(verify_faults.MARKER + b'\n')
+scratch = dashboard.handlers().open
+assert scratch is not dashboard.Handler
+server.tls = None
+request('GET', '/api/v1/runs', handler=scratch)
+batch = '/api/v1/batch'
+reads = [{'operation': 'meta.get'}]
+request('POST', batch, json.dumps({'requests': reads}).encode(), handler=scratch)
+for operation, route in [('secret.list', root), ('account.list', '/api/v1/accounts')]:
+    request('GET', route, handler=scratch, status=401, code='unauthenticated')
+    body = json.dumps({'requests': [*reads, {'operation': operation}]}).encode()
+    request('POST', batch, body, handler=scratch, status=401, code='unauthenticated')
+    request('POST', batch, body, token=bearer, handler=scratch)
+""")
+
+    def test_unsupported_put_reports_allow_and_registry_put_still_requires_admission(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+_, reader = tokens.issue(actor, 'Read fixture', ['read'])
+unsupported = dict(status=405, code='method_not_allowed')
+for route, allow in [('/api/v1/meta', 'GET'), ('/api/v1/batch', 'POST'), (item, 'GET, DELETE')]:
+    request('PUT', route, token=reader, allow=allow, **unsupported)
+
+cookie = browser_session()
+request('PUT', item, cookie=cookie, csrf=False, allow='GET, DELETE', **unsupported)
+write = dict(payload=b'fixture-registry-value', media='text/plain')
+for token, status, code, reason in [(None, 401, 'unauthenticated', None), (reader, 403, 'forbidden', 'presence_required')]:
+    request('PUT', item + '/value', token=token, status=status, code=code, reason=reason, **write)
+request('PUT', item + '/value', cookie=cookie, csrf=False, status=403, code='csrf', **write)
+assert secretstore.get('global', 'DEMO_KEY') is None
+""")
+
+
+class AuthorityAccountIsolationTests(_SecretChildCase):
+    def test_resolved_account_refuses_state_from_another_instance(self):
+        self.run_secret_child(r"""
+from arete import accounts
+
+auth = accounts.Auth('api_key', credential='fixture-account', provider='openrouter')
+with (mock.patch.object(paths, 'STATE_DIR', Path.cwd() / 'other-state'),
+      mock.patch.object(db, 'tx') as transaction, mock.patch.object(config, 'secret_settings') as settings):
+    accounts.record_resolved(auth)
+    transaction.assert_not_called()
+    settings.assert_not_called()
+""")
+
+
+SECRET_GUARD_FIXTURE = r"""
+import json
+import time
+from contextlib import redirect_stdout
+from io import StringIO
+from threading import Event
+from types import SimpleNamespace
+
+from arete import codex, guard, pi_shell, sandbox, scratch
+from arete.commands.hooks import cmd_guard
+
+store = config.secret_settings().store_dir
+assert store in sandbox.authority_roots() and store in scratch.hidden_folders()
+row = secretstore.put('global', 'DEMO_KEY', 'synthetic-guard-value', 'api_key', 'hand')
+ref = secretstore.parse_reference(row['reference'], db.schema_metadata()['instance_tag'])
+path, _ = secretstore.file_location(ref, config.secret_settings())
+work = Path.cwd() / 'workspace'
+work.mkdir()
+args = SimpleNamespace(scratch='', scratch_id='', scratch_saves='', judge=False, open=[work], closed=[])
+
+def check(tool, **values):
+    payload = {'tool_name': tool, 'tool_input': values, 'cwd': str(work)}
+    with mock.patch('sys.stdin', StringIO(json.dumps(payload))), redirect_stdout(StringIO()) as out:
+        assert cmd_guard(args) == 0
+    return json.loads(out.getvalue())['hookSpecificOutput']['permissionDecision'] if out.getvalue() else ''
+
+def codex_check(command):
+    return codex.guard_reason({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': str(work)}, False, [])
+
+shell = pi_shell.Shell(work, (), guard.floor('', work, ()), ('Bash',), (), {}, (), False, time.monotonic() + 30)
+"""
+
+
+class AuthoritySecretGuardTests(_SecretChildCase):
+    def test_agent_hooks_deny_interactive_keychain_and_external_store(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+for command in ('security -i', 'security', 'security find-generic-password -s ' + ref.service,
+                'env -u ARETE_FIXTURE security -i', 'nice -n 5 /usr/bin/security', 'timeout 2 security -i',
+                "bash -lc 'env -u ARETE_FIXTURE security'", '>fixture-output security -i'):
+    assert check('Bash', command=command) == 'deny'
+    assert codex_check(command)
+    with case.assertRaisesRegex(ValueError, 'security keychain items'):
+        shell.execute({'command': command}, Event())
+assert check('Read', file_path=str(path)) == 'deny'
+assert check('Bash', command=f'cat {path}') == 'deny'
+assert check('Read', file_path=str(work / 'ordinary.txt')) == ''
+alternate = store.with_name(store.name.upper()) / path.relative_to(store)
+assert check('Read', file_path=str(alternate)) == 'deny'
+assert check('Bash', command=f'cat {alternate}') == 'deny'
+assert check('Grep', path=str(store.parent), pattern='fixture') == 'deny'
+assert check('Grep', path=str(work), pattern='fixture') == ''
+args.open.append(path.parent)
+assert check('Read', file_path=str(path)) == 'deny'
+""")
+
+    def test_claude_lab_checkout_is_open_inside_closed_grading_context(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+assert check('Grep', path='..', pattern='fixture') == 'deny'
+assert check('Glob', pattern='../**/*') == 'deny'
+closed = Path.cwd() / 'outer-state'
+checkout = closed / 'trial' / 'checkout'
+checkout.mkdir(parents=True)
+args.closed = [closed]
+args.open.append(checkout)
+assert check('Read', file_path=str(checkout / 'README.md')) == ''
+assert check('Bash', command=f'cat {checkout}/README.md') == ''
+assert check('Grep', path=str(checkout), pattern='fixture') == ''
+assert check('Read', file_path=str(closed / 'other-context.txt')) == 'deny'
+assert check('Bash', command=f'cat {closed}/other-context.txt') == 'deny'
+""")
+
+    def test_all_three_agents_allow_public_certificate_verification_and_security_searches(self):
+        self.run_secret_child(SECRET_GUARD_FIXTURE + r"""
+for command in ('rg -n security .', "grep -R 'security' .",
+                'env -u ARETE_FIXTURE rg security .', "bash -lc 'rg -n security .'",
+                'security verify-cert -c public.crt', '/usr/bin/security -q verify-cert -c public.crt'):
+    assert check('Bash', command=command) == '', command
+    assert codex_check(command) == '', command
+    with mock.patch.object(pi_shell.Shell, 'profile', side_effect=RuntimeError('admitted')):
+        with case.assertRaisesRegex(RuntimeError, 'admitted'):
+            shell.execute({'command': command}, Event())
+""")
+
+
+SECRET_LINUX_CLAUDE_FIXTURE = r"""
+import os
+import subprocess
+
+from arete import accounts, claude, sandbox
+
+store = config.secret_settings().store_dir
+state = paths.STATE_DIR.resolve()
+key = secretstore.local_key_path()
+bwrap = '/usr/bin/bwrap'
+store_mask = ['--tmpfs', str(store), '--remount-ro', str(store)]
+key_mask = ['--ro-bind', os.devnull, str(key)]
+
+def linux_checkout(parent=paths.WORKTREES_DIR):
+    checkout = parent / 'checkout'
+    checkout.mkdir(parents=True)
+    return checkout
+
+def run_claude(checkout, **options):
+    return claude.run('fixture', checkout, auth=accounts.Auth(), passing=[], persist=False, **options)
+
+@contextmanager
+def linux_claude(*, error=''):
+    stdout = '' if error else '{"type":"result","result":"fixture"}'
+    fixture = subprocess.CompletedProcess([], int(bool(error)), stdout, error)
+    with (mock.patch.object(sandbox.sys, 'platform', 'linux'),
+          mock.patch.object(sandbox.shutil, 'which', return_value=bwrap) as which,
+          mock.patch.object(claude, 'binary', return_value='/fixture/claude'),
+          mock.patch.object(sandbox.WorkerLease, 'command', lambda _, cmd: cmd),
+          mock.patch.object(claude.child, 'stream', return_value=fixture) as stream):
+        yield which, stream
+
+def assert_missing_bwrap(which, stream, checkout, **options):
+    which.return_value = None
+    refused = run_claude(checkout, **options)
+    assert not refused.ok and 'requires bubblewrap' in refused.error
+    stream.assert_not_called()
+    which.return_value = bwrap
+
+def assert_linux_policy(argv, env, checkout, masks, extra=()):
+    from arete import guard
+
+    end = argv.index('--')
+    policy = argv[:end]
+    assert argv[end - 2:end + 2] == ['--chdir', str(checkout), '--', '/fixture/claude']
+    assert ['--ro-bind', '/', '/'] == policy[policy.index('--new-session') + 1:policy.index('--proc')]
+    assert policy[policy.index('--proc'):policy.index('--dev') + 2] == ['--proc', '/proc', '--dev', '/dev']
+    readonly = {tuple(policy[i + 1:i + 3]) for i, flag in enumerate(policy) if flag == '--ro-bind'}
+    assert (str(state), str(state)) in readonly
+    assert ('/dev/null', str(key)) in readonly if '--ro-bind' in masks else ('/dev/null', str(key)) not in readonly
+    profile = Path(env.get('CLAUDE_CONFIG_DIR') or Path(env['HOME']) / '.claude').resolve()
+    added = {Path(argv[i + 1]).resolve() for i, flag in enumerate(argv[:-1]) if flag == '--add-dir'}
+    allowed = {checkout.resolve(), profile, Path(env['TMPDIR']), *extra, *added,
+               *(p.resolve() for p in guard.run_folders(env.get('ARETE_RUN_ID', '')))}
+    writes = {Path(policy[i + 2]) for i, flag in enumerate(policy) if flag == '--bind'}
+    assert writes == {p for p in allowed if allowed.isdisjoint(p.parents)}, (writes, allowed)
+    assert all(state != p and not state.is_relative_to(p) for p in writes)
+    if masks:
+        assert policy[-len(masks) - 2:-2] == list(masks)
+
+def assert_mounts(stream, checkout, *masks):
+    argv, _, _, env, *_ = stream.call_args.args
+    assert argv[0] == bwrap
+    assert {'--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-ipc',
+            '--die-with-parent', '--new-session'} <= set(argv)
+    assert argv[argv.index('--cap-drop') + 1] == 'ALL'
+    assert_linux_policy(argv, env, checkout, masks)
+    if '--tmpfs' in masks:
+        assert store.stat().st_mode & 0o777 == 0o700
+"""
+
+
+class AuthorityLinuxStoreTests(_SecretChildCase):
+    def test_linux_claude_runs_inside_store_confinement_or_fails_closed(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+checkout = linux_checkout()
+with linux_claude(error='fixture: namespace unavailable') as (which, stream):
+    assert_missing_bwrap(which, stream, checkout, tools=['Bash'])
+    blocked = run_claude(checkout, tools=['Bash'])
+    stream.assert_called_once()
+    assert_mounts(stream, checkout, *store_mask)
+    assert not blocked.ok and 'namespace unavailable' in blocked.error
+""")
+
+
+    def test_codex_publication_waits_for_the_old_profile(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+from arete import codex
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+
+def launch(cmd, *_args, **_kwargs):
+    assert str(store) not in ' '.join(cmd)
+    paths.CONFIG_FILE.write_text(configured)
+    with case.assertRaises(secretstore.CredentialActivationBusy):
+        secretstore.fingerprint_key()
+    assert not store.exists()
+    return subprocess.CompletedProcess(cmd, 0, '{"type":"thread.started","thread_id":"fixture"}\n', '')
+
+with (mock.patch.object(sandbox.sys, 'platform', 'linux'), mock.patch.object(codex, 'launch', side_effect=launch),
+      mock.patch.object(codex, 'binary', return_value='/fixture/codex')):
+    assert codex.run('fixture', linux_checkout(), auth=accounts.Auth(), persist=False).ok
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires native Linux descendant supervision")
+    def test_keyless_claude_relay_drains_background_work_before_publication(self):
+        self.run_secret_child(SECRET_LINUX_CLAUDE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+work = linux_checkout()
+launcher = Path.cwd() / 'fixture-launcher'
+launcher.write_text(r'''#!/bin/sh
+sleep 60 &
+echo $! > child.pid
+printf '%s\n' '{"type":"result","session_id":"fixture"}'
+''')
+launcher.chmod(0o700)
+with (mock.patch.object(sandbox.shutil, 'which', return_value=str(launcher)),
+      mock.patch.object(claude, 'binary', return_value='/fixture/claude')):
+    result = run_claude(work)
+assert result.ok and result.session.id == 'fixture'
+with case.assertRaises(ProcessLookupError):
+    os.kill(int((work / 'child.pid').read_text()), 0)
+assert len(secretstore.fingerprint_key()) == 32
+""")
+
+
+class AuthorityPrivatePiWorkerTests(_SecretChildCase):
+    def test_private_worker_launch_denies_the_configured_file_store(self):
+        self.run_secret_child(r"""
+import json
+import os
+import subprocess
+
+from arete import accounts, guard, pi, sandbox
+
+secretstore.put('global', 'DEMO_KEY', 'synthetic-worker-value', 'api_key', 'hand')
+store = config.secret_settings().store_dir
+checkout = paths.WORKTREES_DIR / 'worker'
+view = paths.STATE_DIR / 'pi-view'
+checkout.mkdir()
+view.mkdir()
+route = pi.Route('ollama', 'ollama/demo', accounts.pi('ollama'), local=True,
+                 view=view, owner=view / 'auth.json')
+reply = {'type': 'agent_end', 'messages': [
+    {'role': 'assistant', 'content': [{'type': 'text', 'text': 'fixture reply'}]},
+]}
+proc = subprocess.CompletedProcess([], 0, json.dumps(reply) + '\n', '')
+with (mock.patch.object(sandbox, 'AUTHORITY', paths.CONFIG_DIR / 'fixture-authority'),
+      mock.patch.object(sandbox, 'can_confine', return_value=True),
+      mock.patch.object(pi, 'binary', return_value='/fixture/pi'),
+      mock.patch.object(pi.pi_shell, 'channel', wraps=pi.pi_shell.channel) as channel,
+      mock.patch.object(pi, 'stream', return_value=(proc, '')) as stream):
+    result = pi.run('fixture prompt', checkout, selected=route, private_worker=True, persist=False,
+                    tools=['Read', 'Bash'], allowed_tools=['Bash(ls *)'], read_roots=(view,))
+assert channel.call_args.args[0].read_roots == ()
+assert result.ok and result.text == 'fixture reply', result.error
+stream.assert_called_once()
+argv, cwd, env = stream.call_args.args[:3]
+assert argv[0] == '/usr/bin/sandbox-exec' and cwd == str(checkout)
+params = dict(arg.split('=', 1) for flag, arg in zip(argv, argv[1:]) if flag == '-D')
+hidden, = [name for name, path in params.items() if name.startswith('H') and path == str(store)]
+profile = argv[argv.index('-p') + 1]
+assert f'(deny file-read* file-write* file-link (subpath (param "{hidden}")))' in profile
+protection = json.loads(env['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['roots']
+assert protection['open'] == [str(checkout)] and protection['workspace'] == str(checkout)
+assert protection['denied_aliases'][str(store)] == str(store.resolve())
+if sys.platform == 'darwin':
+    import shutil
+    node = shutil.which('node')
+    assert node
+    (checkout / 'notes.txt').write_text('worker input')
+    js = '''
+        const {default: guard} = await import(process.argv[1]);
+        const hooks = {};
+        guard({on: (name, handler) => { hooks[name] = handler; }});
+        const invoke = (toolName, path) => hooks.tool_call({toolName, input: {path}}, {cwd: process.cwd()});
+        if (invoke('read', 'notes.txt')?.block || invoke('edit', 'notes.txt')?.block) process.exit(1);
+        if (!invoke('read', process.argv[2])?.block) process.exit(2);
+    '''
+    sandboxed = [*argv[:argv.index('-p') + 2], node, '--input-type=module', '-e', js,
+                 pi.GUARD_FILE.as_uri(), str(store / 'fixture')]
+    subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']}, check=True, timeout=10)
+nested = store / db.schema_metadata()['instance_tag'] / 'global'
+floor = guard.floor('', checkout, [nested])
+protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
+assert str(store) in protection['files'] and str(nested) not in protection['open']
+""")
+
+
 WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
                           "-c", "commit.gpgsign=false"]
 
@@ -465,16 +1889,6 @@ def init_workspace_repo(src):
     util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qm", "sample"], src)
 
 
-def write_workspace_record(ws, made, *, after=0):
-    source = workspace.made_record(ws)
-    source.parent.mkdir(exist_ok=True)
-    source.write_text(json.dumps(made))
-    if after:
-        modified = after + 1_000_000
-        os.utime(source, ns=(modified, modified))
-    return source
-
-
 def write_workspace_output(ws, content):
     output = ws / ".venv/output"
     output.parent.mkdir()
@@ -482,32 +1896,21 @@ def write_workspace_output(ws, content):
     return output
 
 
-def deny_workspace_record_reads(*folders):
-    sources = {workspace.made_record(ws) for ws in folders}
-    open_file = os.open
-
-    def deny(path, *args, **kwargs):
-        if path in sources:
-            raise PermissionError("record read denied")
-        return open_file(path, *args, **kwargs)
-
-    return mock.patch.object(os, "open", deny)
-
-
 WORKSPACE_CHILD = """
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 from arete import config, paths, pipeline, record, sandbox, util, workspace
-from arete.store import db, workspaces
-from tests.test_behavior import (WORKSPACE_GIT_IDENTITY, deny_workspace_record_reads, init_workspace_repo,
-                                 write_workspace_output, write_workspace_record)
+from arete.store import db, runs, workspaces
+from tests.test_behavior import WORKSPACE_GIT_IDENTITY, init_workspace_repo, write_workspace_output
 
 sandbox.AUTHORITY = paths.CONFIG_DIR / 'fixture-authority'
 case = unittest.TestCase()
@@ -525,163 +1928,44 @@ class _WorkspaceChildCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
-    def test_owner_rows_match_legacy_records_and_single_step_keeps_owner(self):
-        self.run_child(r"""
-repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
-cfg = config.Config(repos=[repo])
-ws = paths.WORKTREES_DIR / "sample-app-7"
-ws.mkdir()
-run = pipeline.Run("sample-run", repo, paths.RUNS_DIR / "sample-run", tracker=None, tid=7)
-c = workspace.Checkout("api", "test/sample", repo.path / "api", ws / "api", "main", onto="saved")
-legacy = {"run": "sample-run", "repo": "sample-app", "ticket": "7", "created": "2026-01-01T00:00:00Z",
-          "checkouts": [{"dir": "api", "github": "test/sample", "src": str(c.src), "wt": str(c.wt)}]}
-(ws / "sample.txt").write_text("sample\n")
-made = {"sample.txt": "old-fingerprint", "\0head api/": "old-head", "\0salt": "old-salt", "\0owner": legacy}
-file = write_workspace_record(ws, made)
-assert workspaces.backfill(cfg) == 1
-assert workspace.made_before(ws) == made
-owner = workspace.WorkspaceOwner.from_row(workspace.made_before(ws)["\0owner"])
-assert owner.checkouts == [workspace.Checkout(c.dir, c.github, c.src, c.wt, "")]
-made_owner = pipeline.workspace_owner(run, ws, [c])
-assert json.dumps(made_owner.to_row()) == json.dumps(legacy)
-run.alone = True
-assert pipeline.workspace_owner(run, ws, [c]) == owner
-workspace.note_made(ws, [c], made_owner)
-saved = json.loads(file.read_text())
-assert saved == workspace.made_before(ws)
-assert saved["\0owner"] == legacy
-assert saved["sample.txt"] == workspace.fingerprint(ws / "sample.txt", saved["\0salt"])
-""")
-
-
-class WorkspaceBackfillTests(_WorkspaceChildCase):
-    def test_newer_legacy_owner_reclaims_a_released_workspace_before_sweep(self):
-        self.run_child(WORKSPACE_REPO + r"""
-ws, c, old, wid = checkout("7", "pr")
-util.git(["worktree", "lock", str(ws)], src)
-with case.assertRaisesRegex(OSError, "locked"):
-    workspace.remove_workspace(ws, [c], by=old)
-released = workspaces.get(wid)
-assert released["state"] == "released" and released["release_excluded"] == []
-util.git(["worktree", "unlock", str(ws)], src)
-
-base = util.git(["rev-parse", "HEAD"], ws).strip()
-(ws / "notes.txt").write_text("kept by a legacy run\n")
-util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qam", "keep edits"], ws)
-head = util.git(["rev-parse", "HEAD"], ws).strip()
-new = record.start("pipeline", repo=repo.name, issue="7", status="done")
-owner = workspace.WorkspaceOwner(new, repo.name, "7", released["made_at"], [c])
-output = write_workspace_output(ws, "generated by the newer owner")
-digest = workspace.fingerprint(output.parent, "legacy-salt")
-write_workspace_record(ws, {workspace.OWNER_KEY: owner.to_row(), workspace.SALT_KEY: "legacy-salt",
-                             workspace.head_key(c): head, workspace.onto_key(c): base, ".venv/": digest},
-                       after=released["legacy_mtime_ns"])
-
-workspaces.sweep(cfg)
-row = workspaces.get(wid)
-assert (row["owner_run"], row["state"], row["kept_reason"]) == (new, "kept", "done"), row
-assert row["release_excluded"] is None and not row["released_at"] and row["sweep_attempts"] == 0, row
-assert row["heads"] == {"": head} and row["onto"] == {"": base}, row
-assert workspaces.files(wid) == {".venv/": digest}
-assert registered(ws) and (ws / "notes.txt").read_text() == "kept by a legacy run\n"
-assert output.read_text() == "generated by the newer owner"
-""")
-
-    def test_sweep_reimports_newer_json_for_existing_workspace(self):
-        self.run_child(r"""
-ws = paths.WORKTREES_DIR / "legacy-7"
-ws.mkdir(parents=True)
-before = {"old": "old-fingerprint", "\0head ": "old-head", "\0salt": "old-salt"}
-write_workspace_record(ws, before)
-cfg = config.Config()
-assert workspaces.backfill(cfg) == 1
-row = workspaces.open_for(ws.name)
-assert workspace.made_before(ws) == before
-updated = {"new": "new-fingerprint", "\0head ": "new-head", "\0salt": "new-salt", "\0onto ": "base"}
-write_workspace_record(ws, updated, after=row["legacy_mtime_ns"])
-workspaces.sweep(cfg)
-refreshed = workspaces.open_for(ws.name)
-assert refreshed["id"] == row["id"] and refreshed["legacy_mtime_ns"] > row["legacy_mtime_ns"]
-assert workspaces.files(row["id"]) == {"new": "new-fingerprint"}
-assert workspace.made_before(ws) == updated
-assert workspaces.backfill(cfg) == 0
-""")
-
-    def test_imports_legacy_records_without_removal(self):
+class WorkspaceOwnerRowTests(_WorkspaceChildCase):
+    def test_single_step_preserves_workspace_owner_and_records_files(self):
         self.run_child(r"""
 db.migrate()
 repo = config.Repo("sample-app", Path.cwd() / "repo", parts=[config.Part("api", "test/sample")])
-cfg = config.Config(repos=[config.Repo("sample", Path.cwd() / "short"), repo])
-src = repo.path / "api"
-init_workspace_repo(src)
+ws = paths.WORKTREES_DIR / "sample-app-7"
+ws.mkdir()
+run = pipeline.Run("sample-run", repo, paths.RUNS_DIR / "sample-run", tracker=None, tid=7)
+c = workspace.Checkout("api", "test/sample", repo.path / "api", ws / "api", "main")
+pipeline.claim_workspace(run, ws, [c])
+row = workspaces.open_for(ws.name)
+owner = workspaces.owner_of(row)
+assert (owner.run, owner.repo, owner.ticket, owner.checkouts) == (run.id, repo.name, "7", [replace(c, base="")])
 
-def checkout(ticket):
-    folder = paths.WORKTREES_DIR / f"{repo.name}-{ticket}"
-    c = workspace.Checkout("api", "test/sample", src, folder / "api", "main")
-    workspace.add_worktree(c, f"fixture-{ticket}", "main")
-    (c.wt / "notes.txt").write_text(f"ticket {ticket}\n")
-    return folder, c
-
-merged, a = checkout("7")
-waiting, b = checkout("8")
-orphan, _ = checkout("9")
-started = "2026-01-01T00:00:00Z"
-finished = "2026-01-01T00:01:00Z"
-run_id = record.start("pipeline", repo=repo.name, issue="7", started=started, finished=finished, status="merged")
-record.start("pipeline", repo=repo.name, issue="7", started=finished, status="running")
-record.start("pipeline", repo="sample", issue="app-8", status="done")
-record.start("pipeline", repo=repo.name, issue="8", status="needs-info")
-owner = workspace.WorkspaceOwner(run_id, repo.name, "7", started, [a]).to_row()
-records = {}
-for folder, c, salt in ((merged, a, "merged-salt"), (waiting, b, "waiting-salt")):
-    made = {"api/notes.txt": workspace.fingerprint(c.wt / "notes.txt", salt),
-            "\0salt": salt, "\0head api/": util.git(["rev-parse", "HEAD"], c.wt).strip()}
-    if folder == merged:
-        made.update({"\0owner": owner, "\0onto api/": "saved-base",
-                     "\0retained": {"roots": ["scratch-root"], "names": ["api/notes.txt"]}})
-    records[folder] = (write_workspace_record(folder, made).read_bytes(), made)
-(a.wt / "notes.txt").write_text("edited after the fingerprint was recorded\n")
-folders = (merged, waiting, orphan)
-registrations = util.git(["worktree", "list", "--porcelain"], src)
-assert all(f"worktree {folder / 'api'}" in registrations.splitlines() for folder in folders)
-
-assert workspaces.backfill(cfg) == 2
-rows = [workspaces.open_for(folder.name) for folder in (merged, waiting)]
-saved_edits, kept = rows
-assert [row["state"] for row in rows] == ["kept", "kept"], rows
-assert saved_edits["owner_run"] == run_id and saved_edits["kept_reason"] == "merged"
-assert saved_edits["made_at"] == started and saved_edits["checkouts"] == owner["checkouts"]
-assert saved_edits["onto"] == {"api/": "saved-base"}
-assert saved_edits["retained"] == records[merged][1]["\0retained"]
-assert (kept["repo"], kept["ticket"], kept["owner_run"], kept["kept_reason"]) == ("sample-app", "8", "", "needs-info")
-assert kept["checkouts"] == workspace.WorkspaceOwner("", repo.name, "8", "", [b]).to_row()["checkouts"]
-assert workspaces.open_for(orphan.name) is None
-for row, folder in zip(rows, (merged, waiting), strict=True):
-    assert row["bytes"] == workspace.tree_bytes(folder) > 0
-    made = records[folder][1]
-    assert workspace.made_before(folder) == made
-    assert row["salt"] == made["\0salt"] and row["heads"] == {"api/": made["\0head api/"]}
-    assert workspaces.files(row["id"]) == {"api/notes.txt": made["api/notes.txt"]}
-
-assert workspaces.backfill(cfg) == 0
-assert [workspaces.open_for(folder.name) for folder in (merged, waiting)] == rows
-workspaces.change(saved_edits, state="removed")
-assert workspaces.backfill(cfg) == 0
-assert workspaces.open_for(merged.name) is None
-with db.reader() as c:
-    assert c.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 2
-    assert c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'workspace.changed'").fetchone()[0] == 3
-assert all((folder / "api/notes.txt").is_file() for folder in folders)
-assert all(workspace.made_record(folder).read_bytes() == saved for folder, (saved, _) in records.items())
-assert util.git(["worktree", "list", "--porcelain"], src) == registrations
+step = pipeline.Run("single-step", repo, paths.RUNS_DIR / "single-step", tracker=None, tid=7)
+step.alone = True
+pipeline.claim_workspace(step, ws, [c])
+assert pipeline.workspace_owner(step, ws, [c]) == owner
+output = ws / "sample.txt"
+output.write_text("sample\n")
+workspace.note_made(ws, [c], owner)
+row = workspaces.get(row["id"])
+assert (row["owner_run"], row["checkouts"]) == (run.id, owner.checkout_rows())
+assert workspaces.files(row["id"]) == {"sample.txt": workspace.fingerprint(output, row["salt"])}
 """)
 
 
 class WorkspaceMigrationTests(_WorkspaceChildCase):
-    def test_first_workspace_read_migrates_an_older_database(self):
+    def test_moved_database_needs_an_explicit_snapshot_directory(self):
         self.run_child(workspace_schema(23) + """
 ws = paths.WORKTREES_DIR / "sample"
+(paths.backups_dir() / "instance.json").unlink()
+with case.assertRaisesRegex(db.IncompatibleSchema, "--workspace-snapshots"):
+    workspace.made_before(ws)
+assert schema_version() == 27
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir()
+assert not db.migrate(workspace_snapshots=legacy)
 assert workspace.made_before(ws) == {}
 assert schema_version() == db.LATEST
 wid = workspaces.claim(ws, "sample", "7", "live-run")
@@ -689,6 +1973,29 @@ assert workspaces.get(wid)["state"] == "live"
 workspaces.keep(ws, "failed")
 assert workspaces.claim(ws, "sample", "7", "next-run") == wid
 assert workspaces.get(wid)["owner_run"] == "next-run"
+""")
+
+    def test_missing_database_with_legacy_files_still_needs_explicit_input(self):
+        self.run_child(r"""
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir()
+snapshot = legacy / "sample.json"
+snapshot.write_text("{}")
+assert db.migrate()
+with db.reader() as conn:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+assert snapshot.read_text() == "{}"
+""")
+
+    def test_new_install_can_apply_the_contract_without_snapshot_input(self):
+        self.run_child(r"""
+from arete import control, install
+
+install.write_serve_guard()
+util.write_json(paths.DB_FILE.with_name(control.BEAT_FILE.name), {"schema": db.LATEST, "pid": os.getpid()})
+assert not db.migrate()
+with db.reader() as conn:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
 """)
 
 
@@ -751,14 +2058,13 @@ assert changes == [(1, "derived", {"old": None, "new": live}), (2, "derived", {"
 """)
 
 
-WORKSPACE_REPO = r"""
+WORKSPACE_REPO_SETUP = r"""
 src = Path.cwd() / "repo"
 init_workspace_repo(src)
 util.git(["remote", "add", "origin", str(src)], src)
 util.git(["update-ref", "refs/remotes/origin/main", "HEAD"], src)
 repo = config.Repo("sample", src, github="test/sample")
 cfg = config.Config(repos=[repo])
-db.migrate()
 
 def add_checkout(ticket, *, onto="", part=""):
     ws = paths.WORKTREES_DIR / f"sample-{ticket}"
@@ -776,6 +2082,8 @@ def checkout(ticket, status, *, onto="", part=""):
 def registered(ws):
     return f"worktree {ws}" in util.git(["worktree", "list", "--porcelain"], src).splitlines()
 """
+
+WORKSPACE_REPO = WORKSPACE_REPO_SETUP + "\ndb.migrate()\n"
 
 
 WORKSPACE_FLOW = r"""
@@ -801,71 +2109,58 @@ def run_local_workflow(finish, *, pr=""):
 """
 
 
+class WorkspaceContractSourceTests(_WorkspaceChildCase):
+    def test_workspace_json_paths_and_helpers_are_retired(self):
+        self.run_child(r"""
+import ast
+
+from arete import workspace
+
+removed = {"made_record", "cleanup_worktrees", "HELD_FILE", "held_entry"}
+root = Path(workspace.__file__).parent
+for source in root.rglob("*.py"):
+    for node in ast.walk(ast.parse(source.read_bytes(), filename=str(source))):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assert node.name not in removed | {"blocked_by"}, source
+        if isinstance(node, ast.Name):
+            assert node.id not in removed, source
+        if isinstance(node, ast.Attribute):
+            assert node.attr not in removed, source
+        if isinstance(node, ast.alias):
+            assert node.name not in removed, source
+        if isinstance(node, ast.Constant):
+            assert node.value != "held-workspaces.json", source
+            if node.value == "\0owner":
+                assert source.name == "m0028_workspaces_contract.py", source
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath":
+            assert not (ast.unparse(node.func.value).split(".")[-1] == "STATE_DIR" and node.args
+                        and isinstance(node.args[0], ast.Constant) and node.args[0].value == "workspaces"), source
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if isinstance(node.right, ast.Constant) and node.right.value == "workspaces":
+                if ast.unparse(node.left).split(".")[-1] == "STATE_DIR":
+                    assert source.name == "m0028_workspaces_contract.py", source
+""")
+
+
 class WorkspaceUntrackedRemovalTests(_WorkspaceChildCase):
     def test_direct_removal_does_not_adopt_a_valid_legacy_snapshot(self):
         self.run_child(WORKSPACE_REPO + r"""
 ws, c = add_checkout("7")
 output = write_workspace_output(ws, "keep me")
-rid = record.start("pipeline", repo=repo.name, issue="7", status="done")
-owner = workspace.WorkspaceOwner(rid, repo.name, "7", util.iso(), [c])
 salt = "legacy-salt"
-made = {workspace.OWNER_KEY: owner.to_row(), workspace.SALT_KEY: salt,
-        ".venv/": workspace.fingerprint(output.parent, salt)}
-source = write_workspace_record(ws, made)
-assert not workspaces.open_for(ws.name)
-release = workspace.remove_workspace(ws, [c], by=rid)
+made = {"\0salt": salt, ".venv/": workspace.fingerprint(output.parent, salt)}
+source = paths.STATE_DIR.joinpath("workspaces", f"{ws.name}.json")
+source.parent.mkdir()
+source.write_text(json.dumps(made))
+workspaces.sweep(cfg)
+assert workspaces.open_for(ws.name) is None
+
+release = workspace.remove_workspace(ws, [c])
 row = workspaces.open_for(ws.name)
 assert release == workspace.Release("held", [".venv/"]), release
 assert row["state"] == "held" and row["held_by"] == [".venv/"] and not row["owner_run"], row
 assert row["bytes"] == workspace.tree_bytes(ws) > 0 and not workspaces.files(row["id"]), row
 assert json.loads(source.read_text()) == made and output.read_text() == "keep me" and registered(ws)
-""")
-
-
-class WorkspaceMalformedLegacyTests(_WorkspaceChildCase):
-    def test_stable_malformed_record_revokes_snapshot_and_allows_clean_resume(self):
-        self.run_child(WORKSPACE_REPO + r"""
-ws, c, rid, wid = checkout("7", "failed", onto="old-base")
-output = ws / "notes.txt"
-output.write_text("previous run's output")
-workspace.note_made(ws, [c])
-row = workspaces.get(wid)
-assert row["onto"] == {"": "old-base"}
-assert "notes.txt" in workspaces.files(wid)
-source = workspace.made_record(ws)
-source.write_text('{"partial":')
-older = row["legacy_mtime_ns"] - 1_000_000_000
-os.utime(source, ns=(older, older))
-with workspaces.ticket_lock(repo.name, "7") as got:
-    assert got
-    assert workspace.made_before(ws) == {}
-    assert workspace.kept_onto(ws, [c], "fixture-7") == {}
-    assert "notes.txt" in workspace.kept_work(ws, [c], src, [])
-    output.write_text("original\n")
-    why = workspace.kept_work(ws, [c], src, [])
-    assert why == "", why
-    run = pipeline.Run("resumed-run", repo, paths.RUNS_DIR / "resumed-run", tracker=None, tid="7")
-    pipeline.claim_workspace(run, ws, [c])
-row = workspaces.get(wid)
-assert row["state"] == "live" and row["owner_run"] == run.id
-assert not row["salt"] and not row["heads"] and not row["onto"] and not workspaces.files(wid)
-""")
-
-    def test_unreadable_record_reads_empty_and_removal_records_the_hold(self):
-        self.run_child(WORKSPACE_REPO + r"""
-ws, c, rid, wid = checkout("7", "failed", onto="old-base")
-output = write_workspace_output(ws, "keep me")
-workspace.note_made(ws, [c])
-
-with deny_workspace_record_reads(ws):
-    assert workspace.made_before(ws) == {}
-    assert workspace.kept_onto(ws, [c], "fixture-7") == {}
-    result = workspace.remove_workspace(ws, [c])
-    row = workspaces.get(wid)
-    assert result == workspace.Release("held", [".venv/"]), result
-    assert row["state"] == "held" and row["held_by"] == [".venv/"], row
-    assert row["bytes"] == workspace.tree_bytes(ws) > 0 and row["owner_run"] == rid
-assert output.read_text() == "keep me" and registered(ws)
 """)
 
 
@@ -957,7 +2252,7 @@ assert not ws.exists() and not registered(clean.wt)
 
 
 class WorkspaceSweepErrorTests(_WorkspaceChildCase):
-    def test_sweep_errors_count_kept_and_released_workspaces_as_blocked(self):
+    def test_sweep_retries_kept_and_released_workspaces_after_errors(self):
         self.run_child(WORKSPACE_REPO + r"""
 kept, kept_checkout, _, kept_id = checkout("7", "done")
 workspaces.keep(kept, "done")
@@ -969,13 +2264,14 @@ workspaces.release(released, [c])
 util.git(["worktree", "lock", str(released)], src)
 workspaces.sweep(cfg)
 summary = workspace.held_summary()
-assert summary["blocked"] == 2, summary
-entries = {entry["name"]: entry for entry in summary["rows"]}
-for ws, wid, state, error in ((kept, kept_id, "kept", "index"), (released, released_id, "released", "locked")):
+assert summary["blocked"] == 0, summary
+entry, = summary["rows"]
+assert entry["name"] == kept.name and not entry["blocked"]
+assert entry["why"] == workspaces.get(kept_id)["last_sweep_error"]
+for wid, state, error in ((kept_id, "kept", "index"), (released_id, "released", "locked")):
     row = workspaces.get(wid)
-    entry = entries[ws.name]
     assert row["state"] == state and row["sweep_attempts"] == 1, row
-    assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+    assert error in row["last_sweep_error"], row
 
 index.write_bytes(original_index)
 util.git(["worktree", "unlock", str(released)], src)
@@ -1004,16 +2300,18 @@ def sweep():
 
 def check_failures(error):
     summary = dashboard.get_health(None, [], {})["workspaces"]["rows"]
-    assert summary["blocked"] == len(rows), summary
+    assert summary["blocked"] == 0, summary
     entries = {entry["name"]: entry for entry in summary["rows"]}
     for ws, wid, state in rows:
         row = workspaces.get(wid)
         assert row["state"] == state and row["sweep_attempts"] == 1 and row["last_sweep_at"], row
-        entry = entries[ws.name]
-        assert entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        if state == "kept":
+            entry = entries[ws.name]
+            assert not entry["blocked"] and entry["why"] == row["last_sweep_error"] and error in entry["why"], entry
+        else:
+            assert ws.name not in entries
         assert ws.is_dir() and registered(ws)
-    check = heartbeat.check_workspaces()[0]
-    assert not check.ok and f"{len(rows)} blocked" in check.detail and error in check.detail, check
+    assert heartbeat.check_workspaces()[0].ok
 
 def check_retry():
     sweep()
@@ -1027,21 +2325,6 @@ def check_retry():
 
 
 class WorkspaceSweepInspectionTests(_WorkspaceChildCase):
-    def test_differing_older_records_report_errors_until_reconciled(self):
-        self.run_child(WORKSPACE_SWEEP_RETRY + r"""
-records = []
-for ws, wid, _ in rows:
-    made = workspace.made_before(ws)
-    older = workspaces.get(wid)["legacy_mtime_ns"] - 1_000_000_000
-    write_workspace_record(ws, {**made, "\0head ": "stale-head"}, after=older)
-    records.append((ws, made, older))
-sweep()
-check_failures("legacy workspace record is older")
-for ws, made, older in records:
-    write_workspace_record(ws, made, after=older)
-check_retry()
-""")
-
     def test_inspection_permission_error_leaves_rows_and_retries(self):
         self.run_child(WORKSPACE_SWEEP_RETRY + r"""
 from arete.store import runs
@@ -1069,84 +2352,16 @@ check_retry()
 assert workspaces.get(ended_id)["state"] == "removed" and not registered(ended)
 """)
 
-    def test_missing_folder_becomes_removed_even_if_legacy_unlink_fails(self):
+    def test_missing_folder_becomes_removed(self):
         self.run_child(r"""
-cfg = config.Config()
 ws = paths.WORKTREES_DIR / "sample-7"
 wid = workspaces.create(ws.name, state="released", last_sweep_error="earlier error")["id"]
-made = {"\0head ": "unimported legacy head"}
-source = write_workspace_record(ws, made, after=time.time_ns() + 1_000_000_000)
-with patch.object(workspaces, "unlink_record", side_effect=PermissionError("unlink denied")) as unlink:
-    workspaces.sweep(cfg)
-    unlink.assert_called_once_with(ws)
+workspaces.sweep(config.Config())
 row = workspaces.get(wid)
 assert row["state"] == "removed" and row["removed_at"] and not row["last_sweep_error"], row
-assert not workspace.held_summary()["rows"] and json.loads(source.read_text()) == made
+assert not workspace.held_summary()["rows"]
 ws.mkdir()
-assert workspaces.backfill(cfg) == 0 and workspace.made_before(ws) == {} and workspaces.open_for(ws.name) is None
-""")
-
-
-class WorkspaceSweepFallbackTests(_WorkspaceChildCase):
-    def test_unreadable_regular_records_use_guards_and_unsafe_records_stay(self):
-        self.run_child(WORKSPACE_REPO + r"""
-clean, _, _, clean_id = checkout("1", "done", onto="old-base")
-edited, c, _, edited_id = checkout("2", "done")
-notes = edited / "notes.txt"
-notes.write_text("recorded edit")
-workspace.note_made(edited, [c])
-unsafe, _, _, unsafe_id = checkout("3", "done")
-source = workspace.made_record(unsafe)
-source.unlink()
-source.symlink_to("unavailable")
-
-with deny_workspace_record_reads(clean, edited):
-    workspaces.sweep(cfg)
-row = workspaces.get(edited_id)
-assert row["state"] == "held" and row["held_by"] == ["notes.txt"] and not workspaces.files(edited_id), row
-assert notes.read_text() == "recorded edit"
-assert registered(unsafe) and "expected a regular file" in workspaces.get(unsafe_id)["last_sweep_error"]
-row = workspaces.get(clean_id)
-assert row["state"] == "removed" and not registered(clean), row
-""")
-
-    def test_truncated_records_import_ticket_owner_without_fingerprints(self):
-        self.run_child(WORKSPACE_REPO + r"""
-def legacy(ticket):
-    ws, _ = add_checkout(ticket)
-    record.start("pipeline", repo=repo.name, issue=ticket, status="merged")
-    write_workspace_record(ws, {}).write_text('{"partial":')
-    return ws
-
-cfg.repos.append(config.Repo("sample-app", src))
-clean, edited = legacy("app-1"), legacy("2")
-(edited / "notes.txt").write_text("local edit")
-assert workspaces.backfill(cfg) == 2
-for ws, ticket in ((clean, "app-1"), (edited, "2")):
-    row = workspaces.open_for(ws.name)
-    assert (row["repo"], row["ticket"], workspace.made_before(ws)) == (repo.name, ticket, {}), row
-workspaces.sweep(cfg)
-assert workspaces.open_for(edited.name)["held_by"] == ["notes.txt"]
-assert (edited / "notes.txt").read_text() == "local edit"
-assert not clean.exists() and not registered(clean), workspaces.open_for(clean.name)
-""")
-
-    def test_valid_ownerless_records_use_run_history_on_backfill_and_first_read(self):
-        self.run_child(WORKSPACE_REPO + r"""
-cfg.repos.append(config.Repo("sample-t", src))
-made = {"\0head ": "legacy-head", "\0salt": "legacy-salt"}
-for ticket, first_read in (("t-a123", True), ("t-b123", False)):
-    ws, c = add_checkout(ticket)
-    record.start("pipeline", repo=repo.name, issue=ticket, status="merged")
-    write_workspace_record(ws, made)
-    if first_read:
-        with patch.object(config, "load", return_value=cfg):
-            assert workspace.made_before(ws) == made
-    else:
-        assert workspaces.backfill(cfg) == 1
-    row = workspaces.open_for(ws.name)
-    assert (row["repo"], row["ticket"], row["kept_reason"]) == (repo.name, ticket, "merged"), row
-    assert workspaces.owner_of(row).checkouts[0].wt == c.wt and workspace.made_before(ws) == made
+assert workspace.made_before(ws) == {} and workspaces.open_for(ws.name) is None
 """)
 
 
@@ -1168,7 +2383,7 @@ workspaces.sweep(cfg)
 row = workspaces.get(wid)
 assert row["state"] == "released" and row["sweep_attempts"] == 1
 assert "locked" in row["last_sweep_error"] and registered(ws), row
-assert not heartbeat.check_workspaces()[0].ok
+assert heartbeat.check_workspaces()[0].detail == "none held"
 
 util.git(["worktree", "unlock", str(ws)], src)
 workspaces.sweep(cfg)
@@ -1176,67 +2391,6 @@ row = workspaces.get(wid)
 assert row["state"] == "removed" and row["sweep_attempts"] == 2 and not row["last_sweep_error"], row
 assert not ws.exists() and not registered(ws)
 assert not workspace.held_summary()["rows"] and heartbeat.check_workspaces()[0].ok
-""")
-
-    def test_newer_legacy_head_supersedes_release_before_sweep(self):
-        self.run_child(WORKSPACE_REPO + r"""
-ws, c, _, wid = checkout("9", "pr")
-row = workspaces.release(ws, [c])
-assert row["state"] == "released" and not row["last_sweep_error"], row
-assert not workspace.held_summary()["rows"]
-made = workspace.made_before(ws)
-legacy_run = "legacy-run-without-history"
-util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "resumed on old code"], c.wt)
-made[workspace.OWNER_KEY]["run"] = legacy_run
-made["\0head "] = util.git(["rev-parse", "HEAD"], c.wt).strip()
-write_workspace_record(ws, made, after=row["legacy_mtime_ns"])
-
-assert workspaces.backfill(cfg) == 1
-row = workspaces.get(wid)
-assert (row["state"], row["owner_run"]) == ("kept", legacy_run), row
-assert workspace.made_before(ws) == made
-workspaces.sweep(cfg)
-assert registered(c.wt) and ws.is_dir()
-assert workspaces.get(wid)["state"] == "kept" and workspaces.get(wid)["sweep_attempts"] == 0
-""")
-
-    def test_terminal_sweep_keeps_legacy_single_step_snapshots_and_their_earlier_owner(self):
-        self.run_child(WORKSPACE_REPO + r"""
-for ticket, change in [("7", "fingerprint"), ("8", "omitted onto"), ("9", "selected onto")]:
-    ws, c, earlier, wid = checkout(ticket, "done", part="api" if change == "omitted onto" else "")
-    checkouts = [c]
-    if change == "omitted onto":
-        omitted = replace(c, dir="web", wt=ws / "web", onto=util.git(["rev-parse", "HEAD"], src).strip())
-        workspace.add_worktree(omitted, "omitted", c.origin_base)
-        checkouts.append(omitted)
-        owner = replace(workspaces.owner_of(workspaces.get(wid)), checkouts=checkouts)
-        workspace.note_made(ws, checkouts, owner)
-    made = workspace.made_before(ws)
-    release_owner = record.start("pipeline", repo=repo.name, issue=ticket, status="done")
-    workspaces.claim(ws, repo.name, ticket, release_owner, checkouts=checkouts)
-    released = workspaces.release(ws, [c])
-    assert released["state"] == "released" and made[workspace.OWNER_KEY]["run"] == earlier
-    record.start("pipeline", repo=repo.name, issue=ticket, status="done", only_step="build")
-
-    if change == "fingerprint":
-        output = write_workspace_output(c.wt, "single-step output")
-        made[".venv/"] = workspace.fingerprint(output.parent, made[workspace.SALT_KEY])
-    else:
-        head_key = workspace.head_key(c)
-        if change == "selected onto":
-            made[workspace.onto_key(c)] = made[head_key]
-        util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "single-step edits"], c.wt)
-        made[head_key] = util.git(["rev-parse", "HEAD"], c.wt).strip()
-    write_workspace_record(ws, made, after=released["legacy_mtime_ns"])
-
-    for _ in range(2):
-        workspaces.sweep(cfg)
-        row = workspaces.get(wid)
-        assert all(registered(checkout.wt) for checkout in checkouts), (change, row)
-        assert (row["state"], row["owner_run"], row["sweep_attempts"]) == ("kept", earlier, 0), (change, row)
-        assert row["checkouts"] == released["checkouts"] and workspace.made_before(ws) == made, row
-    if change == "fingerprint":
-        assert output.read_text() == "single-step output"
 """)
 
 
@@ -1271,6 +2425,48 @@ assert runs.run_get(rid)["status"] == "stopped"
 assert any(line.get("event") == "report" and line.get("status") == "stopped" for line in run_lines.read(rid))
 row = workspaces.get(wid)
 assert row["state"] == "live" and ws.is_dir() and registered(ws), row
+""")
+
+
+class WorkspaceWaitingCleanupTests(_WorkspaceChildCase):
+    def test_stopping_without_prepare_preserves_detached_commit(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from arete import flows, tasks
+from arete.store import runs, tasks as task_store
+
+ticket = task_store.task_add(repo.name, "Preserve detached work")
+ws, c, rid, wid = checkout(ticket, "needs-info")
+util.git(["checkout", "--detach"], ws)
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "saved while waiting"], ws)
+head = util.git(["rev-parse", "HEAD"], ws)
+assert head.strip() != workspace.head_recorded(workspace.made_before(ws), c)
+assert not flows.prepared_data(rid) and not workspace.uncommitted(ws)
+
+result = tasks.let_go(cfg, repo, runs.run_get(rid), "stopped")
+assert result["state"] == "stopped" and "was left in place" in result["why"], result
+assert registered(ws) and util.git(["rev-parse", "HEAD"], ws) == head
+assert workspaces.get(wid)["state"] != "removed"
+""")
+
+    def test_expiring_after_sweep_preserves_replacement_checkout(self):
+        self.run_child(WORKSPACE_REPO + r"""
+from arete import flows, tasks
+from arete.store import runs, tasks as task_store
+
+ticket = task_store.task_add(repo.name, "Preserve replacement worktree")
+ws = paths.WORKTREES_DIR / f"sample-{ticket}"
+c = workspace.Checkout("", repo.github, src, ws, "main")
+rid = record.start("pipeline", repo=repo.name, issue=ticket, status="needs-info")
+wid = workspaces.claim(ws, repo.name, ticket, rid, checkouts=[c])
+workspaces.sweep(cfg)
+assert workspaces.get(wid)["state"] == "removed"
+workspace.add_worktree(c, "replacement", c.origin_base)
+with patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}):
+    with patch.object(pipeline.Run, "say"):
+        result = tasks.let_go(cfg, repo, runs.run_get(rid), "expired")
+assert "was left in place" in result["why"], result
+assert registered(ws) and util.git(["symbolic-ref", "--short", "HEAD"], ws).strip() == "replacement"
+assert workspaces.open_for(ws.name) is None
 """)
 
 
@@ -1324,9 +2520,7 @@ assert workspaces.get(first_id)["state"] == "removed"
 wid = workspaces.open_for(wt.name)["id"]
 c = workspace.Checkout("", repo.github, src, wt, "main")
 workspace.note_made(wt, [c])
-made = workspace.made_before(wt)
-made[workspace.OWNER_KEY]["checkouts"] = []
-write_workspace_record(wt, made, after=workspace.made_record(wt).stat().st_mtime_ns)
+workspaces.change(workspaces.get(wid), checkouts=[])
 util.git(["worktree", "lock", str(wt)], src)
 workspace.remove_worktree(repo, wt, owner="cleanup-run")
 row = workspaces.get(wid)
@@ -1351,7 +2545,7 @@ hand.write_text("edited by hand")
 assert not flows.prepared_data(rid)
 assert tasks.kept_folder_removed(repo, "7", rid).state == "held"
 row = workspaces.get(wid)
-assert row["checkouts"] == row["release_excluded"] == [], row
+assert [checkout["wt"] for checkout in row["checkouts"]] == [str(wt)] and row["release_excluded"] == [], row
 assert (wt / ".git").is_file() and (wt / "notes.txt").is_file() and registered(wt)
 workspaces.sweep(cfg)
 row = workspaces.get(wid)
@@ -1420,6 +2614,1036 @@ assert schema_version() == {version}
 """
 
 
+LEGACY_WORKSPACE_RECORD = r"""
+legacy = paths.STATE_DIR / "workspaces"
+
+def legacy_record(ws, c, rid, snapshot):
+    owner = workspace.WorkspaceOwner(rid, repo.name, ws.name.removeprefix(f"{repo.name}-"), [c])
+    path = legacy / f"{ws.name}.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({**snapshot, "\0owner": {
+        "repo": repo.name, "ticket": owner.ticket, "run": rid, "checkouts": owner.checkout_rows(),
+    }}))
+    return path
+"""
+
+
+class WorkspaceCutoverGateTests(_WorkspaceChildCase):
+    def test_live_pre_expand_loop_defers_handoff_scheduling_and_workspace_access(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+from types import SimpleNamespace
+from arete import control, loop_run, serve, serve_guard, tasks
+
+ws, c = add_checkout("7")
+rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=24)
+server = serve.Server()
+server.contracts_waiting = True
+server.with_dashboard = True
+server.live = server.every_loop = [SimpleNamespace(name="fixture")]
+legacy.mkdir()
+paths.CONFIG_FILE.write_text(f"[serve]\nworkspace_snapshots = {json.dumps(str(legacy))}\n")
+server.cfg = config.load()
+tip = "2" * 40
+server.started_head = tip[:12]
+receipt = serve_guard.Receipt(str(paths.PACKAGE_DIR.parent), "main", "1" * 40, tip,
+                              "fixture/arete", time.time(), starts=1)
+serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, vars(receipt))
+with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
+    loop = record.start("loop", pid=child.pid, schema_version=24, started="2026-01-01T00:00:00Z")
+    with (patch.object(server, "guard", return_value=True) as stage,
+          patch.object(serve, "dashboard_answers", return_value=True) as dashboard,
+          patch.object(serve_guard, "at_tip", return_value=True),
+          patch.object(server, "restart_for_new_code") as restart):
+        assert db.migrate()
+        server.acknowledge_deploy(server.tick())
+        assert server.contracts_waiting
+        assert [call.args[0] for call in stage.call_args_list] == ["tick:load"]
+        dashboard.assert_not_called()
+        restart.assert_not_called()
+    assert not serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT)["healthy"]
+    (paths.STATE_DIR / serve_guard.RECEIPT).unlink()
+    assert schema_version() == 27
+    with case.assertRaises(db.IncompatibleSchema):
+        workspaces.sweep(cfg)
+    with case.assertRaises(db.IncompatibleSchema):
+        workspaces.claim(ws, repo.name, "7", rid, checkouts=[c])
+    spawn = Mock()
+    with case.assertRaises(control.Refused):
+        tasks.spawn_pending(repo.name, "7", spawn)
+    spawn.assert_not_called()
+    with (patch.object(control, "working_loop", return_value=server.live[0]),
+          case.assertRaises(control.Refused)):
+        loop_run.launch("fixture", cfg=cfg)
+    head = util.git(["rev-parse", "HEAD"], ws).strip()
+    legacy_record(ws, c, rid, {workspace.head_key(c): head})
+    record.settle(loop, "done", end_line="done")
+    assert child.poll() is None and db.migrate()
+    assert schema_version() == 27
+    child.communicate(timeout=5)
+
+with patch.object(server, "guard", return_value={}) as stage:
+    stage.side_effect = lambda label, *_: True if label == "tick:load" else {}
+    assert server.tick() and not server.contracts_waiting
+    assert {"loop:fixture", "stage:dispatch", "stage:workspaces"} <= {call.args[0] for call in stage.call_args_list}
+assert schema_version() == db.LATEST
+assert workspace.head_recorded(workspace.made_before(ws), c) == head
+""")
+
+    def test_unregistered_inherited_pipeline_blocks_separate_migration(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import control, serve
+
+legacy.mkdir()
+with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
+    beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+    util.write_json(beat, {"schema": db.LATEST, "pid": os.getpid(), "workspace_contract_children": [child.pid]})
+    assert serve.startup_beat() == {(child.pid, None)}
+    assert control.database_beat()["workspace_contract_child_identities"] == {}
+    with db.reader() as conn:
+        assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        with patch.dict(os.environ, {db.INHERITED_SERVE_CHILDREN: str(child.pid)}):
+            assert db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA) == [f"inherited child {child.pid}"]
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    child.communicate(timeout=5)
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
+""")
+
+    def test_detached_pipeline_lease_blocks_handoff_until_exit(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import launch_lease
+
+legacy.mkdir()
+with launch_lease.acquiring("sample", "7") as lease:
+    child = subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"],
+                             stdin=subprocess.PIPE, start_new_session=True, pass_fds=(lease.fd,))
+with child:
+    try:
+        assert os.getsid(child.pid) == child.pid
+        with db.reader() as conn:
+            assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+            assert db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA) == [f"launch lease {launch_lease.filename('sample', '7')}"]
+        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    finally:
+        child.communicate(timeout=3)
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
+""")
+
+
+class WorkspaceProcessOwnershipTests(_WorkspaceChildCase):
+    def test_running_ticket_with_recycled_pid_requires_a_held_ticket_lock(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+
+legacy.mkdir()
+lock = runs.run_lock("pipeline", "sample", "7")
+with workspaces.ticket_lock("sample", "7") as held:
+    assert held
+    rid = record.start("pipeline", repo="sample", issue="7", lock=lock, schema_version=24)
+    with db.reader() as conn:
+        assert rid in db.contract_blockers(conn, db.WORKSPACE_CONTRACT_SCHEMA)
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+
+assert runs.run_get(rid)["pid"] == os.getpid() and util.pid_alive(os.getpid())
+assert not util.lock_is_held(lock)
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+""")
+
+    def test_child_identity_survives_restart_but_does_not_protect_a_recycled_pid(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import control, serve
+
+legacy.mkdir()
+with (subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child,
+      util.hold_lock("serve") as held):
+    try:
+        identity = db.process_identity(child.pid)
+        assert identity is not None
+        expected = {(child.pid, identity)}
+        server = serve.Server()
+        server.lock = held
+        assert not serve.startup_beat()
+        handoff = {}
+
+        def capture_exec(*args):
+            handoff.update({name: os.environ[name] for name in
+                            (serve.RESTARTED_FOR_NEW_CODE, db.INHERITED_SERVE_IDENTITIES)})
+            raise OSError("exec boundary")
+
+        with patch.object(serve.os, "execv", side_effect=capture_exec), case.assertRaisesRegex(OSError, "exec boundary"):
+            server.restart_for_new_code()
+        assert handoff[serve.RESTARTED_FOR_NEW_CODE] == str(child.pid)
+        assert db.heartbeat_serve_children(control.database_beat()) == expected
+        with patch.dict(os.environ, handoff):
+            assert db.inherited_serve_children() == expected
+            assert serve.startup_beat() == expected
+            restarted = serve.Server()
+            assert restarted.reloaded and restarted.inherited == {child.pid}
+            assert restarted.workspace_contract_children == expected
+            restarted.beat()
+        assert db.heartbeat_serve_children(control.database_beat()) == expected
+        assert serve.startup_beat() == expected
+        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+
+        replacement = (identity[0], identity[1] + 1)
+        with patch.object(db, "process_identity", return_value=replacement):
+            assert util.pid_alive(child.pid)
+            assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+            assert not serve.startup_beat()
+            restarted.beat()
+            assert control.database_beat()["workspace_contract_children"] == []
+            with patch.dict(os.environ, handoff):
+                assert db.inherited_serve_children() == {(child.pid, None)}
+    finally:
+        child.communicate(timeout=3)
+""")
+
+    def test_stale_serve_heartbeat_does_not_override_a_free_lock(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import control
+
+legacy.mkdir()
+beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+pid = os.getpid()
+with util.hold_lock("serve"):
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    util.write_json(beat, {"schema": db.LATEST, "pid": pid})
+    os.utime(beat, (1, 1))
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid} has not reported its schema"]
+    util.write_json(beat, {"schema": db.LATEST, "pid": pid + 1})
+    assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    util.write_json(beat, {"pid": pid})
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid} has not reported its schema"]
+    util.write_json(beat, {"schema": 27, "pid": pid})
+    with db.reader() as conn:
+        assert db.contract_blockers(conn, 28) == [f"serve {pid}"]
+
+assert util.pid_alive(pid) and not util.lock_is_held("serve")
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+""")
+
+
+class WorkspaceAdmissionHandoffTests(_WorkspaceChildCase):
+    def check_lock(self, lock_fixture):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + lock_fixture + r"""
+from arete import api_check
+
+legacy.mkdir()
+entry = '''
+from arete import util
+import sys
+with util.lock(sys.argv[1]) as got:
+    assert got
+    print("locked", flush=True)
+    sys.stdin.read()
+'''
+command = api_check.child_command(paths.PACKAGE_DIR.parent, entry, name)
+with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True) as child:
+    try:
+        assert child.stdout.readline().strip() == b"locked"
+        assert os.getsid(child.pid) == child.pid
+        with db.reader() as c:
+            assert c.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+            assert db.contract_blockers(c, 28) == [f"held lock {name}"]
+        assert db.migrate(workspace_snapshots=legacy) and schema_version() == 27
+    finally:
+        child.communicate(timeout=3)
+assert child.returncode == 0
+assert (paths.LOCKS_DIR / f"{name}.lock").exists()
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+""")
+
+    def test_detached_rule_lock_blocks_contract_without_run_row(self):
+        self.check_lock("from arete import miner\nname = miner.RULE_LOCK\n")
+
+    def test_local_pipeline_ticket_lock_blocks_contract_before_registration(self):
+        self.check_lock("from arete.store import runs\nname = runs.run_lock('pipeline', 'sample', '7')\n")
+
+    def test_local_loop_lock_blocks_contract_before_registration(self):
+        self.check_lock("from arete.store import loops\nname = loops.loop_lock('sample/local')\n")
+
+
+class WorkspaceContractRollbackTests(_WorkspaceChildCase):
+    def test_contract_prevents_incompatible_startup_rollback(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import install, serve_guard
+
+checkout = Path.cwd() / "checkout"
+init_workspace_repo(checkout)
+previous = util.git(["rev-parse", "HEAD"], checkout).strip()
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "candidate"], checkout)
+tip = util.git(["rev-parse", "HEAD"], checkout).strip()
+legacy.mkdir()
+installed = install.serve_guard_file()
+installed.write_text("# outdated copied guard\n")
+assert not db.migrate(workspace_snapshots=legacy)
+assert installed.read_bytes() == Path(serve_guard.__file__).read_bytes()
+receipt = serve_guard.Receipt(str(checkout), "main", previous, tip, "fixture/arete", 0, starts=3)
+serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, vars(receipt))
+assert not serve_guard.rollback_if_unhealthy(paths.STATE_DIR, checkout, paths.LOG_DIR, receipt)
+assert util.git(["rev-parse", "HEAD"], checkout).strip() == tip
+assert not serve_guard.hold_path(paths.STATE_DIR, tip).exists()
+assert schema_version() == db.LATEST
+""")
+
+
+class WorkspaceCutoverInputTests(_WorkspaceChildCase):
+    def test_in_place_upgrade_schedules_after_automatically_checking_its_snapshot_directory(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from types import SimpleNamespace
+from arete import serve, serve_guard
+
+server = serve.Server()
+server.with_dashboard = False
+server.contracts_waiting = True
+receipt = serve_guard.Receipt(str(paths.PACKAGE_DIR.parent), "main", "1" * 40, "2" * 40,
+                              "fixture/arete", time.time(), starts=1)
+server.started_head = receipt.tip[:12]
+server.live = server.every_loop = [SimpleNamespace(name="fixture")]
+receipt_path = paths.STATE_DIR / serve_guard.RECEIPT
+serve_guard.write(receipt_path, vars(receipt))
+
+def handle(label, *_):
+    if label == "tick:load":
+        server.cfg = config.load()
+        return True
+    return {}
+
+with (patch.object(server, "guard", side_effect=handle) as stage,
+      patch.object(serve_guard, "at_tip", return_value=True),
+      patch.object(serve_guard, "git_bytes", return_value=Path(db.workspace_contract.__file__).read_bytes())):
+    server.acknowledge_deploy(server.tick())
+    assert serve_guard.read(receipt_path)["healthy"] and not server.contracts_waiting
+    assert {"loop:fixture", "stage:dispatch", "stage:workspaces"} <= {call.args[0] for call in stage.call_args_list}
+assert schema_version() == db.LATEST and not legacy.exists()
+""")
+
+    def test_receipt_for_another_checkout_does_not_block_handoff(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import serve_guard
+
+legacy.mkdir()
+receipt_path = paths.STATE_DIR / serve_guard.RECEIPT
+receipt = serve_guard.Receipt(str(Path.cwd() / "old-checkout"), "main", "1" * 40, "2" * 40,
+                              "fixture/arete", time.time(), starts=1)
+serve_guard.write(receipt_path, vars(receipt))
+assert not db.migrate(workspace_snapshots=legacy)
+assert schema_version() == db.LATEST
+assert serve_guard.read(receipt_path) == vars(receipt)
+""")
+
+    def test_receipt_for_older_tip_does_not_block_handoff(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import serve_guard
+
+legacy.mkdir()
+checkout = Path.cwd() / "checkout"
+init_workspace_repo(checkout)
+old = util.git(["rev-parse", "HEAD"], checkout).strip()
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "advanced"], checkout)
+receipt = serve_guard.Receipt(str(checkout), "main", "1" * 40, old, "fixture/arete", time.time(), starts=1)
+serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, vars(receipt))
+with patch.object(paths, "PACKAGE_DIR", checkout / "arete"):
+    assert not db.migrate(workspace_snapshots=legacy)
+assert schema_version() == db.LATEST
+assert serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT) == vars(receipt)
+""")
+
+WORKSPACE_PROVENANCE = r"""
+from contextlib import redirect_stdout
+from io import StringIO
+
+def seed_saved_fingerprint():
+    with db.tx() as conn:
+        conn.execute("INSERT INTO workspaces (name, state, made_at, legacy_mtime_ns) VALUES ('sample-7', 'kept', ?, 1)",
+                     (util.iso(),))
+        conn.execute("INSERT INTO workspace_files SELECT id, 'notes.txt', 'saved' FROM workspaces")
+
+def assert_deferred(output):
+    assert "--workspace-snapshots DIR" in output and "workspace_snapshots" in output, output
+    assert schema_version() == 27
+    with db.reader() as conn:
+        assert conn.execute("SELECT legacy_mtime_ns FROM workspaces").fetchone()[0] == 1
+        assert [tuple(row) for row in conn.execute("SELECT name, fingerprint FROM workspace_files")] == [("notes.txt", "saved")]
+"""
+
+
+class WorkspaceSnapshotProvenanceTests(_WorkspaceChildCase):
+    def test_missing_explicit_cli_and_config_sources_never_fall_back(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + WORKSPACE_PROVENANCE + r"""
+seed_saved_fingerprint()
+legacy.mkdir()
+legacy.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "native"}))
+explicit = paths.STATE_DIR / "operator-snapshots"
+assert not db.workspace_handoff_ready(explicit)
+with redirect_stdout(StringIO()) as out:
+    assert db.migrate(workspace_snapshots=explicit)
+assert_deferred(out.getvalue())
+assert str(explicit) in out.getvalue()
+paths.CONFIG_FILE.write_text(f"[serve]\nworkspace_snapshots = {json.dumps(str(explicit))}\n")
+with redirect_stdout(StringIO()) as out:
+    assert db.migrate()
+assert_deferred(out.getvalue())
+explicit.mkdir()
+explicit.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "explicit"}))
+assert db.workspace_handoff_ready(explicit)
+assert not db.migrate() and schema_version() == 28
+row = workspaces.open_for("sample-7")
+assert workspaces.files(row["id"]) == {"notes.txt": "explicit"}
+""")
+
+    def test_invalid_config_does_not_discard_explicit_source(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + WORKSPACE_PROVENANCE + r"""
+seed_saved_fingerprint()
+legacy.mkdir()
+legacy.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "native"}))
+explicit = paths.STATE_DIR / "operator-snapshots"
+paths.CONFIG_FILE.write_text(f'max_parallel = "invalid"\n[serve]\nworkspace_snapshots = {json.dumps(str(explicit))}\n')
+with redirect_stdout(StringIO()) as out:
+    assert db.migrate()
+assert_deferred(out.getvalue())
+assert "valid config" in out.getvalue()
+explicit.mkdir()
+explicit.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "explicit"}))
+assert not db.migrate(workspace_snapshots=explicit) and schema_version() == 28
+assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "explicit"}
+""")
+
+    def test_restoring_foreign_db_needs_explicit_source_despite_identity_stamp(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + WORKSPACE_PROVENANCE + r"""
+from arete import backup
+from tests import support
+
+destination_id = db.schema_metadata()["instance_id"]
+with support.workspace_state(Path.cwd() / "foreign"):
+    with patch.object(db.migrations, "load", return_value=chain[:27]):
+        db.migrate()
+    assert db.schema_metadata()["instance_id"] != destination_id
+    seed_saved_fingerprint()
+    foreign_source = paths.STATE_DIR / "workspaces"
+    foreign_source.mkdir()
+    foreign_source.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "source"}))
+    saved_db = backup.snapshot("fixture")
+
+legacy.mkdir()
+wrong = legacy / "sample-7.json"
+wrong.write_text(json.dumps({"notes.txt": "destination"}))
+backup.restore(saved_db)
+assert db.schema_metadata()["instance_id"] == destination_id
+assert json.loads((paths.backups_dir() / "instance.json").read_text())["instance_id"] == destination_id
+assert not db.workspace_handoff_ready(None)
+with redirect_stdout(StringIO()) as out:
+    assert db.migrate()
+assert_deferred(out.getvalue())
+assert not db.migrate(workspace_snapshots=foreign_source) and schema_version() == 28
+assert wrong.read_text() == json.dumps({"notes.txt": "destination"})
+assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "source"}
+""")
+
+
+class WorkspaceHandoffCommitTests(_WorkspaceChildCase):
+    def test_admission_lock_acquired_during_import_rolls_back_contract(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + WORKSPACE_PROVENANCE + r"""
+from contextlib import ExitStack
+
+seed_saved_fingerprint()
+legacy.mkdir()
+legacy.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "new"}))
+lock = runs.run_lock("pipeline", "sample", "7")
+contract = chain[-1]
+with ExitStack() as held:
+    def import_then_start(conn, folder, **kwargs):
+        contract.apply(conn, folder, **kwargs)
+        assert held.enter_context(util.lock(lock))
+    with (patch.object(db.migrations, "load", return_value=[*chain[:-1], replace(contract, apply=import_then_start)]),
+          redirect_stdout(StringIO()) as out):
+        assert db.migrate(workspace_snapshots=legacy)
+    assert f"held lock {lock}" in out.getvalue()
+    assert schema_version() == 27
+    with db.reader() as conn:
+        assert conn.execute("SELECT fingerprint FROM workspace_files").fetchone()[0] == "saved"
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "new"}
+""")
+
+
+class WorkspaceFreshInputTests(_WorkspaceChildCase):
+    def test_fresh_store_marker_cannot_hide_snapshots_that_appear_before_the_contract(self):
+        self.run_child(LEGACY_WORKSPACE_RECORD + r"""
+assert db.migrate(contracts=False)
+legacy.mkdir()
+snapshot = legacy / "sample.json"
+snapshot.write_text("{}")
+assert not db.migrate()
+with db.reader() as conn:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+assert snapshot.read_text() == "{}"
+""")
+
+
+class WorkspaceLegacyHandoffTests(_WorkspaceChildCase):
+    def test_json_only_local_commit_can_resume_after_handoff(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+onto = util.git(["rev-parse", "HEAD"], ws).strip()
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "parked commit"], ws)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=24)
+saved = {workspace.head_key(c): head, workspace.onto_key(c): onto}
+legacy_record(ws, c, rid, saved)
+
+assert not db.migrate()
+row = workspaces.open_for(ws.name)
+assert row["state"] == "kept" and row["owner_run"] == rid
+assert workspace.made_before(ws) == saved
+assert workspace.kept_or_cleared(ws, [c], src, [], "fixture-7") == {str(ws): onto}
+""")
+
+    def test_newer_legacy_snapshot_cancels_stale_release(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=24)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+output = write_workspace_output(ws, "newer snapshot")
+salt = "legacy-salt"
+digest = workspace.fingerprint(output.parent, salt)
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, released_at, repo, ticket, owner_run, checkouts, "
+                 "heads, salt, legacy_mtime_ns, release_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (ws.name, "released", util.iso(), util.iso(), repo.name, "7", rid,
+                  json.dumps(workspace.WorkspaceOwner(rid, repo.name, "7", [c]).checkout_rows()),
+                  json.dumps({"": head}), salt, 1, "[]"))
+    conn.execute("INSERT INTO workspace_files SELECT id, '.venv/', 'older' FROM workspaces WHERE name = ?", (ws.name,))
+newer = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=24)
+path = legacy_record(ws, c, newer, {workspace.SALT_KEY: salt, workspace.head_key(c): head, ".venv/": digest})
+assert not db.migrate(workspace_snapshots=legacy)
+workspaces.sweep(cfg)
+row = workspaces.open_for(ws.name)
+assert (row["state"], row["kept_reason"], row["sweep_attempts"]) == ("kept", "legacy resume", 0), row
+assert row["owner_run"] == newer and row["release_excluded"] is None, row
+assert registered(ws) and output.read_text() == "newer snapshot"
+assert workspaces.files(row["id"]) == {".venv/": digest}
+
+path.write_text("{}")
+workspaces.sweep(cfg)
+assert workspaces.files(row["id"]) == {".venv/": digest}
+""")
+
+    def test_resumed_claim_preserves_owner_and_selection_with_previous_snapshot(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+expected = {}
+for ticket in ("7", "8"):
+    ws, c = add_checkout(ticket)
+    head = util.git(["rev-parse", "HEAD"], ws).strip()
+    earlier = record.start("pipeline", repo=repo.name, issue=ticket, status="failed", schema_version=25)
+    path = legacy_record(ws, c, earlier, {workspace.head_key(c): head, workspace.onto_key(c): head})
+    old_snapshot = json.loads(path.read_text())
+    current = record.start("pipeline", repo=repo.name, issue=ticket, status="failed", schema_version=25)
+    expected[ticket] = current, head
+    selected = workspace.WorkspaceOwner(current, repo.name, ticket, [replace(c, github="test/current")]).checkout_rows()
+    with db.tx() as conn:
+        conn.execute("INSERT INTO workspaces (name, state, made_at, kept_reason, repo, ticket, owner_run, checkouts, "
+                     "heads, onto, legacy_owner, legacy_mtime_ns) VALUES (?, 'kept', ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (ws.name, util.iso(), repo.name, ticket, current, json.dumps(selected), json.dumps({"": head}),
+                      json.dumps({"": head}), json.dumps(old_snapshot["\0owner"]), path.stat().st_mtime_ns))
+    if ticket == "8":
+        legacy_record(ws, c, earlier, {workspace.head_key(c): "stale-head"})
+        os.utime(path, (time.time() + 1, time.time() + 1))
+
+assert not db.migrate(workspace_snapshots=legacy)
+for ticket, (rid, head) in expected.items():
+    row = workspaces.open_for(f"sample-{ticket}")
+    assert (row["owner_run"], row["state"], row["kept_reason"]) == (rid, "kept", "failed"), row
+    assert row["checkouts"][0]["github"] == "test/current" and row["release_excluded"] is None, row
+    assert row["heads"] == row["onto"] == {"": head}, row
+""")
+
+
+class WorkspaceReconciliationHandoffTests(_WorkspaceChildCase):
+    def test_missing_and_stable_malformed_records_revoke_fingerprints(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+for ticket in ("7", "8"):
+    ws, c = add_checkout(ticket)
+    rid = record.start("pipeline", repo=repo.name, issue=ticket, status="failed", schema_version=25)
+    path = legacy_record(ws, c, rid, {"notes.txt": "old"})
+    with db.tx() as conn:
+        conn.execute("INSERT INTO workspaces (name, state, made_at, repo, ticket, owner_run, heads, salt, "
+                     "legacy_mtime_ns) VALUES (?, 'kept', ?, ?, ?, ?, ?, ?, ?)",
+                     (ws.name, util.iso(), repo.name, ticket, rid, json.dumps({"": "old"}), "old", 1))
+        conn.execute("INSERT INTO workspace_files SELECT id, 'notes.txt', 'old' FROM workspaces WHERE name = ?", (ws.name,))
+    if ticket == "7":
+        path.unlink()
+    else:
+        path.write_text("{")
+assert not db.migrate(workspace_snapshots=legacy)
+for ticket in ("7", "8"):
+    ws = paths.WORKTREES_DIR / f"sample-{ticket}"
+    row = workspaces.open_for(ws.name)
+    assert row["state"] == "kept" and workspace.made_before(ws) == {}
+    assert workspaces.files(row["id"]) == {}
+    assert workspace.kept_work(ws, [workspace.Checkout("", repo.github, src, ws, "")], src, []) == ""
+    (ws / "new.txt").write_text("unrecorded")
+    assert "new.txt" in workspace.kept_work(ws, [workspace.Checkout("", repo.github, src, ws, "")], src, [])
+""")
+
+    def test_recorded_legacy_owner_newer_snapshot_cancels_release(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+old = legacy_record(ws, c, rid, {workspace.head_key(c): "old"})
+owner = json.loads(old.read_text())["\0owner"]
+current = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, released_at, repo, ticket, owner_run, checkouts, "
+                 "heads, legacy_owner, legacy_mtime_ns, release_excluded) VALUES (?, 'released', ?, ?, ?, '7', ?, ?, ?, ?, ?, '[]')",
+                 (ws.name, util.iso(), util.iso(), repo.name, current, json.dumps(owner["checkouts"]),
+                  json.dumps({"": "old"}), json.dumps(owner), old.stat().st_mtime_ns))
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+legacy_record(ws, c, rid, {workspace.head_key(c): head, workspace.onto_key(c): head})
+os.utime(old, ns=(old.stat().st_mtime_ns + 1000000000, old.stat().st_mtime_ns + 1000000000))
+assert not db.migrate(workspace_snapshots=legacy)
+row = workspaces.open_for(ws.name)
+assert row["state"] == "kept" and row["owner_run"] == rid and row["heads"] == {"": head}
+workspaces.sweep(cfg)
+assert registered(ws) and workspace.kept_onto(ws, [c], "fixture-7") == {str(ws): head}
+""")
+
+
+class WorkspaceLegacyScratchHandoffTests(_WorkspaceChildCase):
+    def test_poll_refreshes_fingerprints_for_json_only_scratch_snapshot(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + SCRATCH_RECORD + r"""
+from arete import poll
+
+cfg.repos = [replace(repo, tracker="local")]
+ws, c = add_checkout("7")
+rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=24)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+output = write_workspace_output(ws, "before")
+salt = "legacy-salt"
+with scratch_records():
+    root, lease = pending_scratch(ws, rid)
+    try:
+        before = workspace.fingerprint(output.parent, salt)
+        path = legacy_record(ws, c, rid, {workspace.SALT_KEY: salt, workspace.head_key(c): head, ".venv/": before,
+                             workspace.RETAINED_KEY: {"roots": [root.name], "names": [".venv/"]}})
+    finally:
+        os.close(lease)
+    output.write_text("after scratch settled")
+    assert not db.migrate(workspace_snapshots=legacy)
+    with (patch.object(scratch, "holders", return_value=[]), patch.object(config, "load", return_value=cfg)):
+        assert poll.poll() == 0
+    assert any(data["state"] == "done" for data in scratch.records())
+
+row = workspaces.open_for(ws.name)
+assert row["owner_run"] == rid and row["retained"] == {}, row
+assert workspaces.files(row["id"]) == {".venv/": workspace.fingerprint(output.parent, salt)}
+assert json.loads(path.read_text())[".venv/"] == before
+assert not workspace.kept_work(ws, [c], src, [])
+""")
+
+
+class WorkspaceHandoffSafetyTests(_WorkspaceChildCase):
+    def test_changed_snapshot_retains_unknown_and_earlier_single_step_owners(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+earlier = record.start("pipeline", repo=repo.name, issue="8", status="failed", schema_version=24)
+for ticket, owner in (("7", "missing-run"), ("8", earlier)):
+    ws, c = add_checkout(ticket)
+    rid = record.start("pipeline", repo=repo.name, issue=ticket, status="done", schema_version=25, only_step="build")
+    with db.tx() as conn:
+        conn.execute("INSERT INTO workspaces (name, state, made_at, released_at, repo, ticket, owner_run, checkouts, "
+                     "legacy_mtime_ns, release_excluded) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (ws.name, "released", util.iso(), util.iso(), repo.name, ticket, rid,
+                      json.dumps(workspace.WorkspaceOwner(rid, repo.name, ticket, [c]).checkout_rows()), 1, "[]"))
+    legacy_record(ws, c, owner, {workspace.head_key(c): util.git(["rev-parse", "HEAD"], ws).strip()})
+
+assert not db.migrate(workspace_snapshots=legacy)
+workspaces.sweep(cfg)
+for ticket, owner in (("7", "missing-run"), ("8", earlier)):
+    row = workspaces.open_for(f"{repo.name}-{ticket}")
+    assert (row["owner_run"], row["state"], row["sweep_attempts"]) == (owner, "kept", 0), row
+""")
+
+    def test_conflicting_malformed_and_nonregular_snapshots_only_hold_their_own_workspaces(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+snapshot = legacy_record(ws, c, rid, {workspace.head_key(c): "1" * 40})
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, released_at, repo, ticket, owner_run, heads, "
+                 "legacy_mtime_ns) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (ws.name, "released", util.iso(), util.iso(), repo.name, "7", rid,
+                  json.dumps({"": head}), snapshot.stat().st_mtime_ns + 1_000_000_000))
+
+bad = {"broken": "invalid workspace snapshot", "shape": "invalid workspace snapshot fields",
+       "linked": "regular workspace snapshot", "fifo": "regular workspace snapshot"}
+for name in (*bad, "healthy"):
+    (paths.WORKTREES_DIR / name).mkdir()
+(legacy / "broken.json").write_text("{")
+(legacy / "shape.json").write_text(json.dumps({"\0retained": {"names": "../outside"}}))
+(legacy / "linked.json").symlink_to(snapshot)
+os.mkfifo(legacy / "fifo.json")
+(legacy / "healthy.json").write_text("{}")
+
+assert not db.migrate(workspace_snapshots=legacy)
+assert schema_version() == db.LATEST
+workspaces.sweep(cfg)
+assert registered(ws)
+for name, detail in {key: value for key, value in bad.items() if key not in ("broken", "shape")}.items() | {ws.name: "conflicts with its recorded version"}.items():
+    folder = paths.WORKTREES_DIR / name
+    row = workspaces.open_for(name)
+    assert (row["state"], row["kept_reason"], row["sweep_attempts"]) == (
+        "held", workspaces.SNAPSHOT_UNAVAILABLE, 0), row
+    assert detail in row["last_sweep_error"], row
+    assert workspace.remove_workspace(folder, [], by="sweep").state == "held"
+    assert folder.is_dir()
+assert workspaces.open_for(ws.name)["heads"] == {"": head}
+assert workspaces.open_for("broken") is None and workspaces.open_for("shape") is None
+assert workspaces.open_for("healthy")["state"] == "kept"
+""")
+
+
+class WorkspaceUnreadableSnapshotTests(_WorkspaceChildCase):
+    def test_unreadable_snapshots_hold_their_workspaces_and_allow_other_rows_to_proceed(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+rid = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+unreadable = legacy_record(ws, c, rid, {workspace.head_key(c): head})
+untracked = paths.WORKTREES_DIR / "untracked"
+untracked.mkdir()
+old = time.time() - 8 * 86400
+os.utime(untracked, (old, old))
+untracked_snapshot = legacy / f"{untracked.name}.json"
+untracked_snapshot.write_text("{}")
+unstatable = paths.WORKTREES_DIR / "unstatable"
+unstatable.mkdir()
+os.utime(unstatable, (old, old))
+unstatable_snapshot = legacy / f"{unstatable.name}.json"
+unstatable_snapshot.write_text("{}")
+healthy, checkout = add_checkout("8")
+good = record.start("pipeline", repo=repo.name, issue="8", status="failed", schema_version=25)
+legacy_record(healthy, checkout, good, {workspace.head_key(checkout): head})
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, released_at, repo, ticket, owner_run, heads, "
+                 "legacy_mtime_ns, remove_asked_by) VALUES (?, 'released', ?, ?, ?, '7', ?, ?, ?, 'earlier-request')",
+                 (ws.name, util.iso(), util.iso(), repo.name, rid, json.dumps({"": head}), unreadable.stat().st_mtime_ns))
+    conn.execute("INSERT INTO workspaces (name, state, made_at, legacy_mtime_ns) VALUES ('gone', 'released', ?, -1)",
+                 (util.iso(),))
+
+open_file, stat_file = os.open, os.stat
+def deny_open(path, *args, **kwargs):
+    if kwargs.get("dir_fd") is not None and path in (unreadable.name, untracked_snapshot.name):
+        raise PermissionError("workspace snapshot cannot be read")
+    return open_file(path, *args, **kwargs)
+
+def deny_stat(path, *args, **kwargs):
+    if kwargs.get("dir_fd") is not None and path == unstatable_snapshot.name:
+        raise PermissionError("workspace snapshot cannot be inspected")
+    return stat_file(path, *args, **kwargs)
+
+with (patch.object(os, "open", side_effect=deny_open), patch.object(os, "stat", side_effect=deny_stat)):
+    assert not db.migrate(workspace_snapshots=legacy)
+assert schema_version() == db.LATEST
+workspaces.sweep(cfg)
+for name in (ws.name, untracked.name, unstatable.name):
+    row = workspaces.open_for(name)
+    assert (row["state"], row["kept_reason"], row["sweep_attempts"], row["remove_asked_by"]) == (
+        "held", workspaces.SNAPSHOT_UNAVAILABLE, 0, ""), row
+assert workspaces.open_for(healthy.name)["owner_run"] == good
+assert workspace.head_recorded(workspace.made_before(healthy), checkout) == head
+assert {row["name"] for row in workspaces.by_state("removed")} == {"gone"}
+assert workspace.made_before(ws) == {} and not workspaces.refresh_released(ws, "fixture")
+assert workspace.remove_workspace(ws, [c], by=rid).state == "held"
+assert registered(ws) and untracked.is_dir() and unstatable.is_dir() and unreadable.is_file()
+assert workspace.held_summary()["blocked"] == 3
+""")
+
+
+class WorkspaceQuarantineRecoveryTests(_WorkspaceChildCase):
+    def test_recovery_requires_an_idle_and_vacant_original_path(self):
+        self.run_child(workspace_schema(27) + LEGACY_WORKSPACE_RECORD + r"""
+from arete import cli
+
+worktrees = paths.WORKTREES_DIR
+occupied, linked, vacant = (worktrees / f"sample-{ticket}" for ticket in ("7", "8", "9"))
+occupied.mkdir()
+(occupied / "unpublished.txt").write_text("preserve this")
+linked.symlink_to(occupied / "not-there")
+legacy.mkdir()
+with db.tx() as conn:
+    for ws in (occupied, linked, vacant):
+        (legacy / f"{ws.name}.json").symlink_to("missing")
+        conn.execute("INSERT INTO workspaces (name, state, made_at, repo, ticket) "
+                     "VALUES (?, 'kept', ?, 'sample', ?)", (ws.name, util.iso(), ws.name.removeprefix("sample-")))
+assert not db.migrate(workspace_snapshots=legacy)
+parser = cli.parser()
+
+def recover(ws):
+    args = parser.parse_args(["migrate", "--retire-quarantined-workspace", ws.name])
+    return args.fn(args)
+
+assert recover(occupied) == recover(linked) == 1
+row = workspaces.open_for(vacant.name)
+assert row["kept_reason"] == workspaces.SNAPSHOT_UNAVAILABLE
+workspaces.sweep(config.Config())
+assert workspaces.open_for(vacant.name)["id"] == row["id"]
+with util.lock(runs.run_lock("pipeline", "sample", "9")) as held:
+    assert held and recover(vacant) == 1
+rid = record.start("pipeline", repo="sample", issue="9")
+assert recover(vacant) == 1
+record.settle(rid, "done")
+with patch.object(json, "load", side_effect=AssertionError("unexpected legacy read")):
+    assert recover(vacant) == 0
+assert (occupied / "unpublished.txt").read_text() == "preserve this" and linked.is_symlink()
+assert all(p.is_symlink() for p in legacy.glob("*.json"))
+assert {r["name"] for r in workspaces.by_state("held")} == {occupied.name, linked.name}
+assert workspaces.open_for(vacant.name) is None and workspaces.get(row["id"])["state"] == "removed"
+assert workspaces.claim(vacant, "sample", "9", "next") != row["id"]
+""")
+
+
+class WorkspaceRetrySnapshotTests(_WorkspaceChildCase):
+    def test_retry_restores_repaired_snapshot_without_moving_checkout(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+from arete import cli
+
+ws, c = add_checkout("7")
+previous = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=25)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+path = legacy_record(ws, c, rid, {workspace.head_key(c): head, workspace.onto_key(c): head})
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, removed_at, repo, ticket, owner_run) "
+                 "VALUES (?, 'removed', ?, '2026-01-01T00:00:00Z', ?, '7', ?)",
+                 (ws.name, util.iso(), repo.name, previous))
+    conn.execute("INSERT INTO workspaces (name, state, made_at, repo, ticket, owner_run, checkouts) "
+                 "VALUES (?, 'kept', ?, ?, '7', ?, ?)",
+                 (ws.name, util.iso(), repo.name, rid, json.dumps(workspace.WorkspaceOwner(rid, repo.name, '7', [c]).checkout_rows())))
+open_file = os.open
+def deny(pathname, *args, **kwargs):
+    if kwargs.get("dir_fd") is not None and pathname == path.name:
+        raise PermissionError("temporary denial")
+    return open_file(pathname, *args, **kwargs)
+with patch.object(os, "open", side_effect=deny):
+    assert not db.migrate(workspace_snapshots=legacy)
+row = workspaces.open_for(ws.name)
+assert row["kept_reason"] == workspaces.SNAPSHOT_UNAVAILABLE
+parser = cli.parser()
+args = parser.parse_args(["migrate", "--retry-quarantined-workspace", ws.name, "--workspace-snapshots", str(legacy)])
+with util.lock(runs.run_lock("pipeline", repo.name, "7")) as held:
+    assert held and args.fn(args) == 1
+original = json.loads(path.read_text())
+wrong = {**original, "\0owner": {**original["\0owner"], "run": "replacement"}}
+path.write_text(json.dumps(wrong))
+assert args.fn(args) == 1 and workspaces.open_for(ws.name) == row
+path.write_text(json.dumps(original))
+assert args.fn(args) == 0
+assert workspace.kept_onto(ws, [c], "fixture-7") == {str(ws): head}
+assert registered(ws) and workspaces.open_for(ws.name)["state"] == "kept"
+with patch.object(json, "load", side_effect=AssertionError("unexpected snapshot read")):
+    assert workspace.head_recorded(workspace.made_before(ws), c) == head
+""")
+
+    def test_retry_identifies_unowned_quarantine_before_taking_ticket_lock(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+
+ws, c = add_checkout("7")
+rid = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=25)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+path = legacy_record(ws, c, rid, {workspace.head_key(c): head})
+open_file = os.open
+def deny(pathname, *args, **kwargs):
+    if kwargs.get("dir_fd") is not None and pathname == path.name:
+        raise PermissionError("temporary denial")
+    return open_file(pathname, *args, **kwargs)
+with patch.object(os, "open", side_effect=deny):
+    assert not db.migrate(workspace_snapshots=legacy)
+assert workspaces.open_for(ws.name)["repo"] == ""
+with util.lock(runs.run_lock("pipeline", repo.name, "7")) as held:
+    assert held
+    with case.assertRaises(ValueError):
+        workspaces.retry_quarantine(ws.name, legacy)
+workspaces.retry_quarantine(ws.name, legacy)
+assert workspaces.open_for(ws.name)["owner_run"] == rid
+assert workspace.head_recorded(workspace.made_before(ws), c) == head
+""")
+
+
+class WorkspaceHandoffReplacementTests(_WorkspaceChildCase):
+    def test_stale_snapshot_cannot_revive_removed_waiting_workspace(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+from arete import flows, tasks
+from arete.store import runs, tasks as task_store
+
+ticket = task_store.task_add(repo.name, "Preserve the replacement checkout")
+ws, c = add_checkout(ticket)
+rid = record.start("pipeline", repo=repo.name, issue=ticket, status="needs-info", schema_version=25)
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, removed_at, repo, ticket, owner_run) "
+                 "VALUES (?, 'removed', ?, ?, ?, ?, ?)",
+                 (ws.name, util.iso(), util.iso(), repo.name, ticket, rid))
+original = util.git(["rev-parse", "HEAD"], ws).strip()
+stale = legacy_record(ws, c, rid, {workspace.head_key(c): original})
+os.utime(stale, (time.time() + 10, time.time() + 10))
+util.git(["checkout", "--detach"], ws)
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "replacement work"], ws)
+replacement = util.git(["rev-parse", "HEAD"], ws)
+
+assert not db.migrate(workspace_snapshots=legacy)
+assert workspaces.open_for(ws.name) is None and stale.is_file()
+with (patch.object(flows, "prepared_data", return_value={"checkouts": [c.to_row()]}),
+      patch.object(pipeline.Run, "say")):
+    result = tasks.let_go(cfg, repo, runs.run_get(rid), "expired")
+assert "was left in place" in result["why"], result
+assert registered(ws) and util.git(["rev-parse", "HEAD"], ws) == replacement
+""")
+
+    def test_removal_cutoff_only_accepts_a_newer_snapshot_from_a_newer_run(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+for ticket in ("7", "8"):
+    ws, c = add_checkout(ticket)
+    head = util.git(["rev-parse", "HEAD"], ws).strip()
+    removed = record.start("pipeline", repo=repo.name, issue=ticket, status="done", schema_version=25)
+    current = record.start("pipeline", repo=repo.name, issue=ticket, status="failed", schema_version=25)
+    path = legacy_record(ws, c, current, {workspace.head_key(c): head, workspace.onto_key(c): head})
+    cutoff = path.stat().st_mtime_ns - (1 if ticket == "8" else 0)
+    with db.tx() as conn:
+        conn.execute("INSERT INTO workspaces (name, state, made_at, removed_at, repo, ticket, owner_run, "
+                     "legacy_mtime_ns) VALUES (?, 'removed', ?, ?, ?, ?, ?, ?)",
+                     (ws.name, util.iso(), "2026-01-01T00:00:00Z", repo.name, ticket, removed, cutoff))
+
+assert not db.migrate(workspace_snapshots=legacy)
+workspaces.sweep(cfg)
+assert workspaces.open_for("sample-7") is None
+row = workspaces.open_for(ws.name)
+assert (row["owner_run"], row["state"], row["sweep_attempts"]) == (current, "kept", 0), row
+assert workspace.kept_or_cleared(ws, [c], src, [], "fixture-8") == {str(ws): head}
+assert registered(paths.WORKTREES_DIR / "sample-7") and registered(ws)
+""")
+
+    def test_ownerless_snapshot_does_not_attach_to_an_active_replacement(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + r"""
+ws, c = add_checkout("7")
+old = record.start("pipeline", repo=repo.name, issue="7", status="done", schema_version=25)
+current = record.start("pipeline", repo=repo.name, issue="7", status="failed", schema_version=25)
+util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "replacement commit"], ws)
+head = util.git(["rev-parse", "HEAD"], ws).strip()
+legacy.mkdir()
+(legacy / f"{ws.name}.json").write_text(json.dumps({workspace.head_key(c): head}))
+with db.tx() as conn:
+    conn.execute("INSERT INTO workspaces (name, state, made_at, removed_at, repo, ticket, owner_run, legacy_mtime_ns) "
+                 "VALUES (?, 'removed', ?, ?, ?, '7', ?, 1)",
+                 (ws.name, util.iso(), "2026-01-01T00:00:00Z", repo.name, old))
+    conn.execute("INSERT INTO workspaces (name, state, made_at, repo, ticket, owner_run, legacy_mtime_ns) "
+                 "VALUES (?, 'kept', ?, ?, '7', ?, -1)", (ws.name, util.iso(), repo.name, current))
+
+assert not db.migrate(workspace_snapshots=legacy)
+assert workspaces.open_for(ws.name)["owner_run"] == current
+assert workspace.made_before(ws) == {}
+assert "not on origin" in workspace.kept_work(ws, [c], src, [])
+assert registered(ws)
+""")
+
+
+IMPORTED_WAITING_WORKSPACE = r"""
+from arete import tasks
+from arete.store import asks, runs, tasks as task_store
+
+repo = replace(repo, tracker="local")
+cfg.repos = [repo]
+
+def waiting_workspace(key):
+    ticket = task_store.task_add(repo.name, "Waiting on an answer", reserved_id=f"t-{key:04x}")
+    ws, c = add_checkout(ticket)
+    branch = f"fixture-{ticket}"
+    rid = record.start("pipeline", repo=repo.name, issue=ticket, status="needs-info", schema_version=24, branch=branch)
+    head = util.git(["rev-parse", "HEAD"], ws).strip()
+    asks.ask_add(f"ask-{key}", rid, repo.name, ticket, "build", "", "Need a choice", "", [], {})
+    return ticket, ws, c, rid, {workspace.head_key(c): head}
+"""
+
+
+class WorkspaceImportedWaitingCleanupTests(_WorkspaceChildCase):
+    def test_clean_imported_waiting_workspaces_are_removed_on_stop_expiry_and_close(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + IMPORTED_WAITING_WORKSPACE + r"""
+fixtures = []
+for key, action in enumerate(("stopped", "expired", "closed"), 1):
+    ticket, ws, c, rid, saved = waiting_workspace(key)
+    output = write_workspace_output(ws, "generated by the waiting run")
+    saved.update({workspace.SALT_KEY: "legacy-salt", ".venv/": workspace.fingerprint(output.parent, "legacy-salt")})
+    legacy_record(ws, c, rid, saved)
+    fixtures.append((ticket, ws, rid, action))
+assert not db.migrate(workspace_snapshots=legacy)
+
+with patch.object(pipeline.Run, "say"):
+    for ticket, ws, rid, action in fixtures:
+        before = workspaces.open_for(ws.name)
+        assert before["owner_run"] == rid and before["state"] == "kept"
+        result = tasks.let_go(cfg, repo, runs.run_get(rid), action)
+        assert "its work folder is removed" in result["why"], result
+        assert asks.asks_of(rid)[0]["status"] == ("expired" if action == "expired" else "stopped")
+        assert workspaces.get(before["id"])["state"] == "removed"
+        assert not ws.exists() and not registered(ws)
+        assert util.git(["show-ref", "--verify", f"refs/heads/fixture-{ticket}"], src).strip()
+""")
+
+    def test_retired_ask_sweep_retries_without_removing_operator_edits(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + IMPORTED_WAITING_WORKSPACE + r"""
+_, ws, c, rid, saved = waiting_workspace(1)
+edit = ws / "notes.txt"
+edit.write_text("operator changed the tracked file\n")
+saved.update({workspace.SALT_KEY: "legacy-salt", "notes.txt": workspace.fingerprint(edit, "legacy-salt")})
+legacy_record(ws, c, rid, saved)
+assert not db.migrate(workspace_snapshots=legacy)
+row = workspaces.open_for(ws.name)
+workspaces.sweep(cfg)
+assert workspaces.get(row["id"])["sweep_attempts"] == 0
+asks.asks_retire(rid, "expired")
+util.git(["update-index", "--assume-unchanged", "notes.txt"], ws)
+assert not workspace.uncommitted(ws, tracked_only=True)
+workspaces.sweep(cfg)
+assert workspaces.get(row["id"])["state"] == "held"
+assert edit.read_text() == "operator changed the tracked file\n" and registered(ws)
+util.git(["update-index", "--no-assume-unchanged", "notes.txt"], ws)
+workspaces.sweep(cfg)
+assert workspaces.get(row["id"])["state"] == "held" and registered(ws)
+util.git(["restore", "notes.txt"], ws)
+workspaces.sweep(cfg)
+assert workspaces.get(row["id"])["state"] == "removed"
+assert not ws.exists() and not registered(ws)
+""")
+
+    def test_unproven_checkout_owner_and_operator_keeps_survive_retirement(self):
+        self.run_child(workspace_schema(27) + WORKSPACE_REPO_SETUP + LEGACY_WORKSPACE_RECORD + IMPORTED_WAITING_WORKSPACE + r"""
+fixtures = []
+for key, uncertainty in enumerate(("ownerless", "detached", "operator"), 1):
+    ticket, ws, c, rid, saved = waiting_workspace(key)
+    path = legacy_record(ws, c, rid, saved)
+    if uncertainty == "ownerless":
+        path.write_text(json.dumps(saved))
+    elif uncertainty == "detached":
+        util.git(["checkout", "--detach"], ws)
+    else:
+        with db.tx() as conn:
+            conn.execute("INSERT INTO workspaces (name, state, kept_reason, made_at, repo, ticket, owner_run) "
+                         "VALUES (?, 'kept', 'operator', ?, ?, ?, ?)", (ws.name, util.iso(), repo.name, ticket, rid))
+    fixtures.append((ws, rid, uncertainty))
+with patch.object(config, "load_or_problem", return_value=(cfg, "")):
+    assert not db.migrate(workspace_snapshots=legacy)
+with patch.object(pipeline.Run, "say"):
+    for ws, rid, uncertainty in fixtures:
+        result = tasks.let_go(cfg, repo, runs.run_get(rid), "expired")
+        assert "was left in place" in result["why"], result
+        row = workspaces.open_for(ws.name)
+        assert row["owner_run"] == rid
+        if uncertainty == "operator":
+            assert row["kept_reason"] == "operator"
+workspaces.sweep(cfg)
+assert all(registered(ws) and ws.is_dir() for ws, _, _ in fixtures)
+""")
+
+
 class SecretRegistryExpansionTests(_WorkspaceChildCase):
     def test_expand_preserves_existing_rows_and_is_idempotent(self):
         self.run_child(workspace_schema(26) + """
@@ -1462,6 +3686,58 @@ with db.tx() as c:
 """)
 
 
+class WorkspaceLegacyChildIdentityTests(_WorkspaceChildCase):
+    def test_a_legacy_pid_newer_than_its_heartbeat_file_can_be_released(self):
+        self.run_child(workspace_schema(27) + r"""
+import subprocess
+from arete import control
+
+beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+pid = os.getpid()
+util.write_json(beat, {"workspace_contract_children": [pid]})
+os.utime(beat, (946684800, 946684800))
+with (patch.object(db.check_process.DarwinProcesses, "existed_by", return_value=None),
+      patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 1, stdout=""))):
+    with db.reader() as c:
+        assert f"inherited child {pid}" in db.contract_blockers(c, 28)
+if paths.ON_MAC:
+    with patch.object(db.check_process.DarwinProcesses, "info", return_value=None):
+        assert db.process_existed_by(pid, time.time()) and not db.process_existed_by(pid, 946684800)
+process = subprocess.CompletedProcess([], 0, stdout="S  Wed Jan 02 00:00:00 2002")
+with patch.object(util, "sh", return_value=process):
+    with db.reader() as c:
+        assert f"inherited child {pid}" not in db.contract_blockers(c, 28)
+""")
+
+
+class WorkspaceProcessInventoryTests(_WorkspaceChildCase):
+    def test_serve_records_the_current_child_identity_before_workspace_activation(self):
+        self.run_child(workspace_schema(27) + r"""
+import subprocess
+import sys
+from arete import control, serve
+
+with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as child:
+    try:
+        identity = db.process_identity(child.pid)
+        assert identity is not None
+        observed = serve.restart_children()
+        assert (child.pid, identity) in observed
+        beat = paths.DB_FILE.with_name(control.BEAT_FILE.name)
+        util.write_json(beat, {"pid": os.getpid(), "schema": 27, **db.workspace_child_fields(observed)})
+        assert (child.pid, identity) in serve.startup_beat()
+        with db.reader() as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+            assert f"inherited child {child.pid}" in db.contract_blockers(conn, 28)
+    finally:
+        child.communicate(timeout=3)
+assert not serve.startup_beat()
+with db.reader() as conn:
+    assert not db.contract_blockers(conn, 28)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+""")
+
+
 class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
     def test_authorized_file_rule_records_filing_before_workspace_access(self):
         self.run_child(workspace_schema() + r"""
@@ -1471,7 +3747,9 @@ from arete.commands.tasks import cmd_file_rule
 from arete.store import approvals
 
 repo = config.Repo("sample", paths.WORKTREES_DIR)
-cfg = config.Config(repos=[repo])
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir(exist_ok=True)
+cfg = config.Config(repos=[repo], workspace_snapshots=legacy)
 rid = record.start("miner", status="done")
 approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
                                 change="Add a rule", why="fixture"), "approve")
@@ -1479,7 +3757,7 @@ proposal, = approvals.proposals(status=["approve"])
 assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == 24
+    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     assert approvals.proposal(p["id"])["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.LATEST
@@ -1537,6 +3815,7 @@ def read_health(handlers, cfg, port, inside_serve, host):
         data = json.load(response)
         assert response.status == 200, data
         panel = data.get("health", data)["workspaces"]
+        assert panel.keys() == {"rows"}, panel
         assert [row["name"] for row in panel.get("rows", {}).get("rows", [])] == ["saved"], panel
 
 with patch.object(tailnet, "serve", side_effect=read_health):
@@ -1558,35 +3837,30 @@ with patch.object(workspace, "fingerprint", side_effect=OSError("fingerprint fai
 row = workspaces.get(wid)
 assert row["owner_run"] == rid and not (row["salt"] or row["heads"] or row["onto"] or row["retained"])
 assert workspaces.files(wid) == {} and workspace.made_before(ws) == {}
-assert not workspace.made_record(ws).exists()
 assert "fingerprint failed" in (run_dir / "run.log").read_text()
 """)
 
-    def test_snapshot_keeps_rollback_json_in_sync_with_row(self):
+    def test_snapshot_records_fingerprints_heads_and_onto(self):
         self.run_child(WORKSPACE_REPO + r"""
 ws, c, rid, wid = checkout("7", "failed", onto="saved-base")
-(ws / "output").write_text("run output")
+output = ws / "output"
+output.write_text("run output")
 workspace.note_made(ws, [c])
 row = workspaces.get(wid)
-saved = json.loads(workspace.made_record(ws).read_text())
-assert saved["\0salt"] == row["salt"] and row["salt"]
-assert saved["\0head "] == row["heads"][""] == util.git(["rev-parse", "HEAD"], ws).strip()
-assert saved["\0onto "] == row["onto"][""] == "saved-base"
-assert workspaces.files(wid) == {"output": saved["output"]}
-assert saved == workspace.made_before(ws)
+assert row["owner_run"] == rid and row["salt"]
+assert row["heads"] == {"": util.git(["rev-parse", "HEAD"], ws).strip()}
+assert row["onto"] == {"": "saved-base"}
+assert workspaces.files(wid) == {"output": workspace.fingerprint(output, row["salt"])}
 """)
 
-    def test_identical_record_with_restored_mtime_allows_guarded_resume(self):
+    def test_recorded_snapshot_allows_guarded_resume(self):
         self.run_child(WORKSPACE_REPO + r"""
 from arete import flows
 
-ws, c, _, wid = checkout("7", "failed", onto="saved-base")
+ws, c, _, _ = checkout("7", "failed", onto="saved-base")
 output = ws / "notes.txt"
 output.write_text("recorded edits")
 workspace.note_made(ws, [c])
-source = workspace.made_record(ws)
-older = workspaces.get(wid)["legacy_mtime_ns"] - 1_000_000_000
-os.utime(source, ns=(older, older))
 run = pipeline.Run("force-resume", repo, paths.RUNS_DIR / "force-resume", tracker=None, tid="7")
 
 def resume():
@@ -1699,26 +3973,20 @@ with scratch_records():
 
     def test_legacy_done_resume_without_onto_survives_scratch_cleanup(self):
         self.run_child(WORKSPACE_REPO + SCRATCH_RECORD + r"""
-ws, c, _, wid = checkout("7", "pr")
-made = workspace.made_before(ws)
-released = workspaces.release(ws, [c])
-assert released["state"] == "released" and workspace.onto_key(c) not in made
-
-rid = record.start("pipeline", repo=repo.name, issue="7", status="done")
-made[workspace.OWNER_KEY]["run"] = rid
+ws, c, rid, wid = checkout("7", "done")
 (ws / "notes.txt").write_text("legacy edits\n")
 util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qam", "legacy edits"], ws)
-made[workspace.head_key(c)] = util.git(["rev-parse", "HEAD"], ws).strip()
 output = write_workspace_output(ws, "before scratch settled")
-made[".venv/"] = workspace.fingerprint(output.parent, made[workspace.SALT_KEY])
 
 with scratch_records():
     root, lease = pending_scratch(ws, rid)
     try:
-        made[workspace.RETAINED_KEY] = {"roots": [root.name], "names": [".venv/"]}
-        write_workspace_record(ws, made, after=released["legacy_mtime_ns"])
-        assert workspaces.backfill(cfg) == 1
-        assert workspaces.get(wid)["state"] == "kept" and workspace.scratch_left(ws, [c])
+        workspace.note_made(ws, [c])
+        workspaces.change(workspaces.get(wid), state="kept", kept_reason="legacy resume",
+                          retained={"roots": [root.name], "names": [".venv/"]})
+        made = workspace.made_before(ws)
+        assert workspace.onto_key(c) not in made
+        assert workspace.scratch_left(ws, [c])
     finally:
         os.close(lease)
     output.write_text("after scratch settled")
@@ -1744,6 +4012,103 @@ with scratch_records():
     util.git(["worktree", "unlock", str(ws)], src)
     workspaces.sweep(cfg)
     assert workspaces.get(wid)["state"] == "removed" and not registered(ws), workspaces.get(wid)
+""")
+
+
+class WorkspaceHealthSummaryTests(_WorkspaceChildCase):
+    def test_summary_reads_kept_and_held_without_writes(self):
+        self.run_child(r"""
+from arete import heartbeat
+
+db.migrate()
+assert heartbeat.check_workspaces() == [heartbeat.Check("workspaces:held", True, "none held", "warn")]
+older, newer = "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"
+workspaces.create("obstructed", state="held", bytes=3_000_000, made_at=newer,
+                  held_by=["manual.txt"], last_sweep_error="cannot inspect checkout")
+workspaces.create("retained", state="kept", bytes=2_000_000, made_at=older, kept_reason="operator")
+workspaces.create("released", state="released", bytes=8_000_000, made_at=older, last_sweep_error="locked")
+
+connect = db.connect_db
+def readonly(path, readonly=False, **kwargs):
+    assert readonly, "workspace health opened a writable connection"
+    return connect(path, readonly=readonly, **kwargs)
+
+with (patch.object(db, "migrate_on_demand", side_effect=AssertionError("health must not migrate")),
+      patch.object(db, "connect_db", side_effect=readonly) as opened):
+    summary = workspace.held_summary()
+    assert opened.called
+assert summary == dict(count=2, bytes=5_000_000, oldest=older, oldest_name="retained", blocked=1, rows=[
+    dict(name="retained", path=str(paths.WORKTREES_DIR / "retained"), run="", status="operator",
+         since=older, bytes=2_000_000, blocked=False, why="operator", names=[]),
+    dict(name="obstructed", path=str(paths.WORKTREES_DIR / "obstructed"), run="", status="",
+         since=newer, bytes=3_000_000, blocked=True, why="cannot inspect checkout", names=["manual.txt"]),
+]), summary
+
+for row in workspaces.by_state("held"):
+    workspaces.change(row, state="removed")
+with patch.object(util, "now", return_value=util.parse_iso(newer)):
+    assert heartbeat.check_workspaces() == [heartbeat.Check(
+        "workspaces:held", True, "1 held, 2 MB, oldest 24 h ago (retained)", "warn")]
+""")
+
+    def test_heartbeat_reads_schema_24_workspace_without_migrating(self):
+        self.run_child(workspace_schema() + r"""
+from arete import heartbeat
+
+t = util.iso(util.parse_iso("2026-01-01T00:00:00+00:00"))
+rid = record.start("pipeline", started=t, finished=t, status="failed")
+with db.tx() as c:
+    c.execute("INSERT INTO workspaces (name, state, kept_reason, owner_run, made_at) VALUES (?,?,?,?,?)",
+              ("saved", "kept", "failed", rid, t))
+
+connect = db.connect_db
+def readonly(path, readonly=False, **kwargs):
+    assert readonly, "standalone heartbeat opened a writable connection"
+    return connect(path, readonly=readonly, **kwargs)
+
+with (patch.object(db, "connect_db", side_effect=readonly),
+      patch.object(util, "now", return_value=util.parse_iso(t))):
+    assert heartbeat.check_workspaces() == [heartbeat.Check(
+        "workspaces:held", True, "1 held, 0 MB, oldest 0 h ago (saved)", "warn")]
+assert schema_version() == 24
+""")
+
+
+class WorkspaceScratchHealthTests(_WorkspaceChildCase):
+    def test_done_workspace_with_pending_scratch_warns_in_health(self):
+        self.run_child(WORKSPACE_REPO + WORKSPACE_FLOW + SCRATCH_RECORD + r"""
+from contextlib import ExitStack
+
+from arete import board, heartbeat
+
+with scratch_records(), ExitStack() as leases:
+    def finish(flow, ws):
+        write_workspace_output(ws, "before scratch settled")
+        root, lease = pending_scratch(ws, flow.ctx.run.id)
+        leases.callback(os.close, lease)
+        root.mkdir()
+        return flows.finish(flow, "done", summary="finished with scratch pending")
+
+    code, ws, run = run_local_workflow(finish)
+    assert code == 0 and run["status"] == "done", (code, run)
+    row = workspaces.open_for(ws.name)
+    assert row["state"] == "held" and any(name.startswith(paths.SCRATCH_PREFIX) for name in row["held_by"]), row
+    with (patch.object(util, "now", return_value=util.parse_iso(run["finished"])),
+          patch.object(board.control, "serve_beat", return_value={}),
+          patch.object(board.control, "fleet", return_value=[])):
+        blocked_by = ", ".join(row["held_by"])
+        detail = f"1 held, {heartbeat.size_words(row['bytes'])}, oldest 0 h ago ({ws.name})"
+        checks = heartbeat.check_workspaces()
+        assert checks == [heartbeat.Check(
+            "workspaces:held", False, f"{detail}; 1 blocked: {ws.name}: held by {blocked_by}", "warn")], checks
+        panel = board.health_board()["workspaces"]
+        assert panel["held"] == 1, panel
+        panel = panel["rows"]
+        assert panel["count"] == panel["blocked"] == 1, panel
+        entry, = panel["rows"]
+        assert (entry["name"], entry["run"], entry["status"], entry["since"], entry["names"]) == (
+            ws.name, run["id"], "done", run["finished"], row["held_by"]), entry
+        assert entry["why"] == f"workspace removal blocked ({blocked_by})", entry
 """)
 
 
@@ -1807,7 +4172,7 @@ assert server.swept == 600 and server.workspaces_swept == 1202
 class WorkspaceOrphanTests(_WorkspaceChildCase):
     def test_old_file_bearing_folder_is_listed_in_inbox(self):
         self.run_child(r"""
-from arete import inbox
+from arete import board, inbox
 
 cfg = config.Config(repos=[config.Repo("sample", Path.cwd()), config.Repo("sample-app", Path.cwd())])
 db.migrate()
@@ -1824,10 +4189,13 @@ assert (row["state"], row["repo"], row["owner_run"], row["held_by"]) == ("held",
 assert workspaces.open_for("sample-app-young") is None
 item, = inbox.list()
 assert item["kind"] == "workspace" and item["id"] == row["id"]
+entry, = board.health_board()["workspaces"]["rows"]["rows"]
+assert entry["blocked"] and entry["why"] == "workspace removal blocked (notes.txt)", entry
 """)
 
     def test_cleanup_removes_only_stale_folders_with_no_file_and_no_recorded_root(self):
         self.run_child(SCRATCH_RECORD + r"""
+db.migrate()
 folders = {name: paths.WORKTREES_DIR / name for name in ("empty", "young", "recorded", "file")}
 for folder in folders.values():
     (folder / "empty-subdir").mkdir(parents=True)
@@ -1928,6 +4296,25 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
         self.assertTrue(self.registered(ws))
 
 
+class WorkspaceBranchRetentionTests(_WorkspaceWorkflowCase):
+    def test_removal_preserves_branch_and_add_worktree_reuses_it(self):
+        ws, c, _ = self.checkout("7", "done")
+        branch = "arete/7"
+        ref = f"refs/heads/{branch}"
+        util.git([*WORKSPACE_GIT_IDENTITY, "commit", "--allow-empty", "-qm", "kept local tip"], c.wt)
+        head = util.git(["rev-parse", "HEAD"], c.wt)
+
+        self.assertEqual(workspace.remove_workspace(ws, [c]), workspace.Release("removed"))
+        self.assertFalse(ws.exists())
+        self.assertFalse(self.registered(c.wt))
+        self.assertEqual(util.git(["rev-parse", ref], c.src), head)
+
+        workspace.add_worktree(c, branch, "main")
+        self.assertTrue(self.registered(c.wt))
+        self.assertEqual(util.git(["symbolic-ref", "HEAD"], c.wt).strip(), ref)
+        self.assertEqual(util.git(["rev-parse", "HEAD"], c.wt), util.git(["rev-parse", "main"], c.src))
+
+
 class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
     def test_owning_release_retry_preserves_omitted_checkout_and_contents(self):
         ws, selected, run = self.checkout("7", "pr", part="api")
@@ -1978,8 +4365,7 @@ class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
         self.assertFalse(self.registered(closed.wt))
         self.assertFalse(ws.exists())
 
-    def test_retry_keeps_excluded_worktree_after_snapshot_and_legacy_reconciliation(self):
-        older = record.start("pipeline", repo=self.repo.name, issue="7", status="failed")
+    def test_retry_keeps_excluded_worktree_after_snapshot(self):
         ws, selected, run = self.checkout("7", "pr", part="api")
         closed = replace(selected, dir="closed", wt=ws / "closed")
         workspace.add_worktree(closed, "closed-pr", "main")
@@ -2005,12 +4391,6 @@ class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
 
         workspace.note_made(ws, [selected], earlier, excluded={closed.wt})
         self.assertEqual(workspaces.get(wid)["checkouts"], row["checkouts"])
-        legacy = workspace.made_record(ws)
-        made = json.loads(legacy.read_text())
-        self.assertEqual(made[workspace.OWNER_KEY]["checkouts"], earlier.checkout_rows())
-        made[workspace.OWNER_KEY]["run"] = older
-        modified = legacy.stat().st_mtime_ns
-        write_workspace_record(ws, made, after=modified)
         (closed.wt / "hand.txt").write_text("keep\n")
         git(["worktree", "unlock", str(selected.wt)], selected.src)
 
@@ -2020,7 +4400,6 @@ class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
         self.assertEqual((final["state"], final["kept_reason"], final["sweep_attempts"]), ("kept", "operator", 1), final)
         self.assertEqual(final["checkouts"], row["checkouts"])
         self.assertEqual(final["owner_run"], run.id)
-        self.assertGreater(final["legacy_mtime_ns"], modified)
         self.assertFalse(selected.wt.exists())
         self.assertFalse(self.registered(selected.wt))
         self.assertTrue(self.registered(closed.wt))
@@ -2065,7 +4444,7 @@ class WorkspaceRemovalGuardTests(_WorkspaceWorkflowCase):
         self.assertFalse(ws.exists())
         self.assertEqual(workspace.made_before(ws), {})
 
-    def test_excluded_checkout_keeps_surviving_workspace_and_record(self):
+    def test_excluded_checkout_keeps_surviving_workspace_and_snapshot(self):
         ws, c, _ = self.checkout("8", "done", part="api")
         saved = workspace.made_before(ws)
         excluded = ws / "closed"
@@ -4272,6 +6651,20 @@ class WaitReconnectTests(unittest.TestCase):
 
 
 class DashboardSnapshotTests(unittest.TestCase):
+    def test_explicit_hold_removes_only_the_held_ticket_from_the_inbox(self):
+        repo = config.Repo("fixture", Path("."), github="example/fixture")
+        source = triage.GitHubSource(repo.github, [repo])
+        candidates = [triage.Candidate(f"fixture#{n}", str(n), f"Ticket {n}", "", "") for n in (1, 2)]
+        rows = [triage.row(source, c, repo=repo.name, kind=triage.FEATURE, ready=1, code=1) for c in candidates]
+        view = {"rows": rows, "sent": [], "research": {}}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(triage, "sources", return_value=[source]), \
+                mock.patch.object(triage, "META_FILE", Path(directory) / "triage.json"):
+            for held, expected in [([], ["fixture#1", "fixture#2"]), (["fixture#1"], ["fixture#2"]),
+                                   ([], ["fixture#1", "fixture#2"])]:
+                util.write_json(triage.META_FILE, {"label_holds": {source.name: held}})
+                ready = dashboard.board.ready_in_one_click(view)
+                self.assertEqual([r["ref"] for r in ready], expected)
+
     def test_event_client_surface(self):
         web = Path(__file__).resolve().parents[1] / "arete" / "web"
         source = (web / "ui-events.js").read_text() + (web / "ui-live.js").read_text()
@@ -4826,7 +7219,7 @@ class VersionedApiTests(unittest.TestCase):
               mock.patch.object(dashboard, "start_poll_without_failing_the_send", return_value="Poll queued."),
               mock.patch.object(dashboard.api_http, "log_request"),
               mock.patch.object(accounts, "read", side_effect=forbidden),
-              mock.patch.object(jira.Client, "from_env", side_effect=forbidden),
+              mock.patch.object(jira, "credentials", side_effect=forbidden),
               mock.patch("urllib.request.urlopen", side_effect=forbidden),
               mock.patch.object(gh, "gh", side_effect=forbidden),
               mock.patch.object(gh, "gh_json", side_effect=lookup),
@@ -5103,11 +7496,15 @@ class VersionedApiTests(unittest.TestCase):
         return self.wire_request("POST", path, headers, payload)
 
     def wire_request(self, method, path, headers, payload=b""):
-        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
         if method != "GET":
             if self.authorization is None:
                 self.authorization = fixture_bearer(self.actor)
-            request.append(f"Authorization: {self.authorization}\r\n")
+            headers = {"Authorization": self.authorization, **headers}
+        return self.wire_exchange(method, path, headers, payload)
+
+    @staticmethod
+    def wire_exchange(method, path, headers, payload, *, server=None, handler=None):
+        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
         request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
         incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
@@ -5118,10 +7515,11 @@ class VersionedApiTests(unittest.TestCase):
 
         connection = mock.Mock(makefile=lambda *args: incoming, sendall=outgoing.extend, send=send,
                                gettimeout=lambda: None)
-        logins = tailnet.Logins(mock.Mock())
-        logins.of = lambda _: "fixture@example.test"
-        server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
-        dashboard.Handler(connection, ("127.0.0.1", 0), server)
+        if server is None:
+            logins = tailnet.Logins(mock.Mock())
+            logins.of = lambda _: "fixture@example.test"
+            server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
+        (handler or dashboard.Handler)(connection, ("127.0.0.1", 0), server)
         response = HTTPResponse(SimpleNamespace(makefile=lambda *args: BytesIO(outgoing)))
         response.begin()
         return response.status, dict(response.getheaders()), response.read()
@@ -5148,8 +7546,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 59)
-        self.assertEqual(len({op["name"] for op in operations}), 59)
+        self.assertEqual(len(operations), 66)
+        self.assertEqual(len({op["name"] for op in operations}), 66)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -6534,8 +8932,9 @@ class CredentialClaimTests(_CredentialCase):
 
 class ApiCredentialCutoverTests(unittest.TestCase):
     def test_admitted_requests_need_credentials(self):
-        with tempfile.TemporaryDirectory(prefix="arete-read-auth-") as directory:
-            root = Path(directory).resolve()
+        with tempfile.TemporaryDirectory(prefix="arete-read-auth-", dir=Path("/tmp").resolve(),
+                                         ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
             entry = "from tests.test_behavior import ApiCredentialCutoverTests; ApiCredentialCutoverTests().check_routes()"
             done = subprocess.run(api_check.child_command(api_check.SOURCE, entry), cwd=root,
                                   env=api_check.isolated_env(root), capture_output=True, text=True,
@@ -6548,9 +8947,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
         with api_check.offline():
             db.migrate()
             login = "owner@example.invalid"
-            principals.seed_owner(login)
-            token_store.init_owner()
-            bearer = credential_files.read_client(db.schema_metadata()["instance_tag"])
+            bearer = fixture_bearer(principals.seed_owner(login))
             address = "127.0.0.1"
             logins = tailnet.Logins(SimpleNamespace(whois=lambda _: (login, "fixture-node")))
             server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=logins, tls=None,
@@ -6577,7 +8974,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
 
             runs = "/api/v1/runs"
             request("GET", runs, 401, code="unauthenticated")
-            allowed = request("GET", runs, 200, headers={"Authorization": f"Bearer {bearer}"})
+            allowed = request("GET", runs, 200, headers={"Authorization": bearer})
             self.assertEqual(allowed["runs"], [])
             meta = {"/api/meta", "/api/v1/meta"}
             pairing_start = "/api/v1/auth/pairings"
@@ -6599,7 +8996,9 @@ class ApiCredentialCutoverTests(unittest.TestCase):
                 if method == "GET" or not actions:
                     routes.append((method, path))
                 routes.extend((method, path + "/" + re.sub(r"\{\w+\}", "fixture", action)) for action in actions)
-            routes += [("GET", path) for path in ("/api/v1/events", "/api/v1/principals", "/api/v1/principals/me")]
+            routes.extend(("GET", path) for path in (
+                "/api/v1/events", "/api/runs/fixture/events", "/api/v1/principals", "/api/v1/principals/me",
+            ))
             for method, path in routes:
                 if path == mcp_protocol.PATH:
                     continue
@@ -6617,7 +9016,7 @@ class ApiCredentialCutoverTests(unittest.TestCase):
             self.assertNotIn("text", pending)
             self.assertEqual(len(logins.credentials.issues["fixture-node"]), 1)
             start_key = {"Idempotency-Key": "fixture-pairing-start"}
-            bearer_headers = {"Authorization": f"Bearer {bearer}", **start_key}
+            bearer_headers = {"Authorization": bearer, **start_key}
             pairing_code = request("POST", pairing_start, 201, body={}, headers=bearer_headers)
             request("POST", pairing_claim, 201, body={"code": pairing_code["code"]},
                     headers={"Idempotency-Key": "fixture-pairing-claim"})

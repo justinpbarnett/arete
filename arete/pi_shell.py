@@ -165,6 +165,8 @@ class Shell:
             raise ValueError("command is outside this step's Bash permissions; patterned grants need one simple command")
         if why := codex.git_write(command, list(self.denied)):
             raise ValueError(f"Arete owns publication and git mutation: {why}")
+        if why := codex.keychain_refusal(command, path=self.env.get("PATH", "")):
+            raise ValueError(why)
         if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
                                self.judge, self.floor):
             raise ValueError(why)

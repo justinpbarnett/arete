@@ -28,6 +28,7 @@ from . import (
     alerts,
     browser,
     check_process,
+    check_repair,
     ci,
     config,
     context,
@@ -541,6 +542,7 @@ class Run(AgentRun):
     environment_release: str = ""
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
+    code_review: bool = False
     pr_recovery_cutoff: str = field(default="", init=False)
     pr_recovery_discussion: dict[str, RecoveryDiscussion] = field(default_factory=dict, init=False)
     pr_recovery_ticket_replies: list[unblock.TicketReply] | None = field(default=None, init=False)
@@ -801,15 +803,13 @@ class Run(AgentRun):
 
 def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner:
     row = workspaces.open_for(ws.name)
-    earlier = workspaces.owner_of(row) if row and (row["owner_run"] or row["legacy_owner"]) else None
+    earlier = workspaces.owner_of(row) if row and row["owner_run"] else None
     if run.alone and earlier:
         return earlier
-    created = earlier.created if earlier else ""
-    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
+    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), checkouts)
 
 
 def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
-    workspace.made_before(ws)
     owner = workspace_owner(run, ws, checkouts)
     workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
     run.workspace = ws, checkouts
@@ -1248,13 +1248,27 @@ def check_lane(layer: config.RepoLayer, run: AgentRun):
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float, *, selected: set[str] | None = None,
-               defer_failed_cleanup: bool = False) -> tuple[bool, str]:
+               defer_failed_cleanup: bool = False, focused: dict[str, list[str]] | None = None,
+               results: list[dict] | None = None) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
         if missing := selected - available.keys():
             raise ValueError(f"unknown selected checks: {', '.join(sorted(missing))}")
         commands = {name: command for name, command in available.items() if name in selected}
+    if focused:
+        available = layer.checks | layer.targeted_commands
+        commands = {}
+        for name, selectors in focused.items():
+            if name not in available:
+                raise ValueError(f"unknown selected check: {name}")
+            if selectors:
+                prefix = check_repair.classes_command(layer, name)
+                if not prefix or not all(isinstance(s, str) and check_repair.SELECTOR.fullmatch(s) for s in selectors):
+                    raise ValueError("focused tests require a configured runner and dotted test names")
+                commands[name] = shlex.join([*prefix, *selectors])
+            else:
+                commands[name] = available[name]
     if not commands:
         return True, "no checks configured"
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
@@ -1271,6 +1285,10 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
+            if results is not None:
+                detail = ({"name": name} if passed else check_repair.failed_check(
+                    layer, name, res.stdout + "\n" + res.stderr, res.returncode))
+                results.append({**detail, "passed": passed})
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
             if not passed:
@@ -1285,7 +1303,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 execute(slow, hold_fds)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
-        if selected is not None and set(commands) != set(layer.checks):
+        if focused or (selected is not None and set(commands) != set(layer.checks)):
             report.append("Targeted pass only; the full suite is still required before publication.")
         cleanup_untracked = cleanup_untracked or ok
     finally:
@@ -1384,6 +1402,7 @@ class Build(TicketWork):
     left_for_a_person: str = ""
     check_commands: str = NO_CHECKS
     checked: dict = field(default_factory=dict)
+    check_results: list[dict] = field(default_factory=list)
     from_base: bool = False
     plan_text: str = ""
     build_summary: str = ""
@@ -1424,8 +1443,10 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False, after: str = "the build and its fixes",
-              staged: Staged | None = None, defer_failed_cleanup: bool = False) -> bool:
+              staged: Staged | None = None, defer_failed_cleanup: bool = False,
+              focused: dict[str, list[str]] | None = None) -> bool:
         previous, self.checked = self.checked, {}
+        self.check_results = []
         self.report = "Checks started but did not complete; no passing result from this attempt."
         try:
             self.run.save("checks.md", self.report)
@@ -1435,7 +1456,8 @@ class Build(TicketWork):
             elif self.denied_feedback:
                 self.report = self.denied_feedback
             else:
-                return self.check_commands_on_tree(staged, quick, previous, defer_failed_cleanup=defer_failed_cleanup)
+                return self.check_commands_on_tree(staged, quick, previous, defer_failed_cleanup=defer_failed_cleanup,
+                                                   focused=focused)
         except BaseException as e:
             self.checked = {}
             self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -1447,16 +1469,16 @@ class Build(TicketWork):
         return False
 
     def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict, *,
-                               defer_failed_cleanup: bool = False) -> bool:
+                               defer_failed_cleanup: bool = False, focused: dict[str, list[str]] | None = None) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
-        full = selected is None or selected == set(self.layer.checks)
+        full = not focused and (selected is None or selected == set(self.layer.checks))
         before = checkout_trees(self.checkouts)
         if not before:
             self.report = "Checks did not run: could not fingerprint every participating checkout."
             return False
         git_before = check_git_state(self.checkouts)
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
-                                     defer_failed_cleanup=defer_failed_cleanup)
+                                     defer_failed_cleanup=defer_failed_cleanup, focused=focused, results=self.check_results)
         pr_recovery.check_staging(self.checkouts)
         after = checkout_trees(self.checkouts)
         if not after:
@@ -1962,6 +1984,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         tid = tk.normalize(tid)
     except ValueError as e:
         print(f"{repo_name}: {e}")
+        return 1
+    try:
+        db.require_workspace_contract()
+    except db.IncompatibleSchema as e:
+        print(str(e))
         return 1
     if not script:
         recovery_child = launch_lease.recovery(repo.name, str(tid))
@@ -2637,7 +2664,9 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
          asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
     from . import unblock
 
-    recover = (not run.dry_run and not run.alone and unblock.active(run.config, run.repo.name, str(run.tid))
+    shared_runner = bool(asked) and all(a.get("call") == owner_asks.CHECK_RUNNER_CALL for a in asked)
+    recover = (not shared_runner and not run.dry_run and not run.alone
+               and unblock.active(run.config, run.repo.name, str(run.tid))
                and not unblock.exclude(run.repo.name, str(run.tid)))
     if recover and not asked:
         question = owner_asks.text_ask(summary)
@@ -2646,15 +2675,17 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     for ask in asked or [{}]:
         run_lines.write(run.id, "question", question=comment, summary=summary[:300], recovery=recover, **ask)
     if asked and session is not None and not run.dry_run:
+        notify_owner = not shared_runner
         for ask in asked:
-            asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
+            first = asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
                           ask.get("why", ""), ask.get("tried", ""), ask["questions"], session,
                           recovery_route="unblock" if recover else "owner")
-        if not recover:
+            notify_owner = notify_owner or first
+        if not recover and notify_owner:
             run.say(outbound.screen(comment))
         run.enter("needs-info")
         devices.release(run.id, run.log)
-        if not recover:
+        if not recover and notify_owner:
             alerts.ask_notice(run.where, summary)
             for note in webpush.ask_opened(run.config, [a["ask_id"] for a in asked]):
                 run.log(note)
@@ -3286,6 +3317,9 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         check_files = catch_up_paths(c.wt)
+        if getattr(run, "code_review", False) is True:
+            raise CatchUpGateHold("review", "the base changed; run the configured checks and review this candidate",
+                                  head, "")
         if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
@@ -3386,13 +3420,19 @@ def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verifi
 
 def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Verified,
                            review: Review, head: str) -> tuple[str, str] | None:
-    if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
+    from . import code_review
+
+    review_only = (getattr(b.run, "code_review", False) is True and code_review.completed(review)
+                   and not code_review.requires_behavior(b) and (verified == code_review.unverified()
+                   or verified.verdict == "blocked" and bool(verified.nonblocking_reason)))
+    if not review_only and (verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks):
         return "verify", "native behavioral verification did not pass"
     if not head:
         return "verify", "this run has no published head to verify"
     tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
     trees = {c.prefix: tree}
-    if not tree or verified.native_trees != trees:
+    if not tree or (not review_only and verified.native_trees != trees) or (
+            verified.nonblocking_reason and verified.nonblocking_trees != trees):
         return "verify", "there is no native behavioral pass for the published tree"
     if not review.approved() or review.trees != trees:
         return "review", "the published tree lacks a current approving review"
@@ -4716,7 +4756,13 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
-            reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
+            reply: str = "", *, catch_up: workspace.Checkout | None = None,
+            skill: bool = False, spec: str = "") -> Review:
+    if skill:
+        from . import code_review
+
+        return code_review.run_axes(b, util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+                                    index_trees(b.checkouts), spec)
     before = before or Review.stored({})
     if catch_up is None:
         earlier = before.blocking()
@@ -4834,13 +4880,14 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
 
 
 @runlimits.verification
-def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
-    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
+def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[str, ...] = ()) -> verify.Verified:
+    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000], covered_commands=covered_commands,
                        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
-                require_released: bool = False, *, replay_drivers: set[str] | None = None, **values) -> verify.Verified:
+                require_released: bool = False, *, replay_drivers: set[str] | None = None,
+                covered_commands: tuple[str, ...] = (), **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
@@ -4857,6 +4904,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
             blocked_by=", ".join(f"journey:{name}" for name in unknown)))
     selected = {name: feature_map[name] for name in requested}
+    if covered_commands:
+        configured = replace(configured, probes={name: cmd for name, cmd in configured.probes.items()
+                                                 if name not in covered_commands})
+        selected = {name: journey for name, journey in selected.items() if f"journey:{name}" not in covered_commands}
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
     replay = {name: journey.driver for name in replay_drivers or ()
               if (journey := configured.feature_map.get(name)) and journey.driver in configured.drivers}
@@ -4957,7 +5008,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     env_example=verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
-                    journeys=journeys.guidance(selected or feature_map), **values),
+                    journeys=journeys.guidance(selected if requested or covered_commands else feature_map), **values),
                                 b.ws, role=role,
                                 allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                                 disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
@@ -5012,7 +5063,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
-    if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+    measured = verified.verdict == "pass" or (getattr(run, "code_review", False) is True and verified.verdict == "blocked"
+                                            and any(c.get("passed") is True for c in verified.checks))
+    if (measured and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         verified.native_trees = checked_trees
     return save_verification(run, step, verified, removed if agent_started else 0)
@@ -5108,7 +5161,7 @@ def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified, 
 def draft_reason(review: Review, verified: verify.Verified, reviews: int = 0) -> str:
     approved = review.approved()
     refused = REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}")
-    if verified.verdict == "blocked" and (not approved or refused):
+    if verified.verdict == "blocked" and (not approved or refused and not verified.nonblocking_reason):
         return "the check in use was blocked"
     if approved:
         return ""

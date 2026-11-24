@@ -358,6 +358,7 @@ class Config:
     dashboard_owner: str = ""
     dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
+    workspace_snapshots: InitVar[Path | None] = field(default=None, kw_only=True)
     queues: dict[str, int] = field(default_factory=dict)
     pricing: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     local_providers: list[str] = field(default_factory=lambda: ["ollama"])
@@ -383,8 +384,9 @@ class Config:
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
-    def __post_init__(self, zte_repo: str | None) -> None:
+    def __post_init__(self, zte_repo: str | None, workspace_snapshots: Path | None) -> None:
         self.zte_repo = self.arete_repo if zte_repo is None else zte_repo
+        self.workspace_snapshots = workspace_snapshots
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -1270,6 +1272,12 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     serve = data.get("serve", {})
     if "loop_dirs" in serve:
         cfg.loop_dirs = [paths.expand(d) for d in serve["loop_dirs"]]
+    if "workspace_snapshots" in serve:
+        value = serve["workspace_snapshots"]
+        snapshots = paths.expand(value) if isinstance(value, str) else None
+        if snapshots is None or not snapshots.is_absolute():
+            raise ValueError("[serve] workspace_snapshots must be an absolute directory path")
+        cfg.workspace_snapshots = snapshots
     cfg.queues = {str(k): max(1, int(v)) for k, v in (serve.get("queues") or {}).items()}
     cfg.daily_budget_usd = float(serve["daily_budget_usd"]) if serve.get("daily_budget_usd") else None
     cfg.session_idle_hours = float(serve.get("session_idle_hours", cfg.session_idle_hours))

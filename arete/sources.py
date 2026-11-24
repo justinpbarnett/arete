@@ -426,4 +426,21 @@ def signature(line: str) -> str:
     return text[:300]
 
 
-SOURCES: dict[str, Source] = {"github": GitHub(), "jira": Jira(), "log": Log(), "command": Command()}
+class ClosedSpecs(Source):
+    scope = ("tracker",)
+
+    def problems(self, source, loop, cfg):
+        problems = super().problems(source, loop, cfg)
+        if source.get("tracker") not in ("github", "jira"):
+            problems.append("a closed-specs source needs tracker = github or jira")
+        return problems
+
+    def fetch(self, loop, source, cfg, sid, cursor):
+        from . import spec_retro
+
+        return spec_retro.closed_specs(cfg, source["tracker"], sid), None
+
+
+SOURCES: dict[str, Source] = {
+    "github": GitHub(), "jira": Jira(), "log": Log(), "command": Command(), "closed-specs": ClosedSpecs(),
+}

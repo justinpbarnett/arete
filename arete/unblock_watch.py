@@ -310,6 +310,8 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
                 ledger.mark(existing, "waiting", result["why"], unblock.RECHECK)
         return
     evidence = unblock.evidence_for(t, row, saved, asks, prs, cycle)
+    if cause == "budget" and "poll_readmission" in binding:
+        evidence["poll_readmission"] = binding["poll_readmission"]
     if candidate:
         evidence["merge_candidate"] = candidate
     elif cause == "merge-verification":

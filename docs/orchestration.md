@@ -5,6 +5,45 @@ The controller chooses bounded actions and supervises delegates; Arete retains p
 A separate planner, learning pass and documentation pass are optional, not hidden prerequisites.
 An explicitly invoked fixed or custom script keeps its strategy.
 
+## Code review
+
+New and resumed orchestrated tickets finish with the repository’s full checks and a two-part code review.
+Two fresh read-only reviewers inspect the same staged candidate against its pinned base.
+Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
+This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
+
+A clean report can go straight to publication. With findings, the orchestrator decides which ones need work.
+It delegates repairs, runs full checks on the resulting candidate, then calls `review.decide` with the source review action ID
+and a `fixed` or `nonblocking` decision and reason for each finding. The action ledger retains the original findings
+and the delivery report includes the decisions. Repairs to those findings can proceed without a second full code review.
+A material scope or base change calls for a fresh review. Configured probes and explicit journey IDs require behavioral
+verification. The orchestrator can also request it for ticket acceptance or a specific uncertainty.
+When an older ticket resumes, its next publication requires a fresh Standards and Spec review.
+Its previous reviews remain in the action history. Current checks, retained work and owner decisions carry forward.
+A release-specific verification retry uses its original evidence requirements.
+
+## Check repairs and verification retries
+
+After a configured check fails, the next check run exercises the failed command on the repaired candidate.
+For an Arete Python test run with identifiable failures, it runs the named methods or classes first.
+A focused pass is evidence for the repair. Publication still requires the full suite on the final integrated tree.
+Repeated requests can reuse that full pass or an identical focused failure on unchanged inputs. An explicit
+operator rerun executes the checks again.
+When every failure points to the same macOS sandbox profile installation problem, the owner sees one runner
+question listing the affected tickets. Confirming readiness releases the eligible tickets to retry independently.
+
+Behavioral verification records the scenarios observed, the remaining requirements and the missing capability.
+The controller can request a follow-up by exact requirement name. Compatible evidence carries forward, and
+switching models on the same blocked tool surface reuses the recorded result. For a required behavior, the
+controller can select an approved runner with the missing capability or request the fixture or access it needs.
+For a supplemental scenario the verifier identified as advisory, the controller can record its reason to proceed
+with `verification.decide`. The PR retains the gap and decision. Each required behavior still needs evidence.
+
+The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
+runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
+a comparable runner fingerprint appear as unclassified. When an existing run needs new behavioral evidence
+and its last report predates environment tracking, it takes one fresh baseline before a focused follow-up.
+
 ## Select or revert
 
 Set the layer deliberately:
@@ -52,7 +91,8 @@ The model retains the runner's filesystem confinement, JEV/tool checks and close
 ## Worker questions and parallel builders
 
 Set `max_builders` in the repository layer to opt new orchestrated lineages into worker protocol 2.
-Start a pilot at one and use two for a comparison on independent work.
+Set worker and builder limits to fit the resources available to each run. For example, this layer
+allows three active workers, up to two of whom can write concurrently.
 
 ```toml
 [orchestration]
@@ -66,7 +106,9 @@ pinned per lineage. Private workers read repository instructions inside their ch
 session, without external instruction files or MCP servers. Provider admission and layer payment policy apply.
 
 Both limits take integers from 1 through 10000. Each active worker occupies a worker slot.
-The builder ceiling is the smaller limit. The controller can use fewer slots.
+The builder ceiling is the smaller limit. Within a ticket, the controller can start independent
+assignments together when their inputs are ready and their write paths are disjoint. A change that
+depends on another builder's edits waits for those edits to be integrated.
 Omitting `max_builders` selects the original protocol and its exclusive writer. Setting it to one keeps the
 question and receipt protocol with serial builders. Existing lineages retain their recorded mode and ceilings.
 Local Pi on macOS and replay support private turns. Unavailable confinement, unsupported build routes,
@@ -183,6 +225,7 @@ Recursive secret exclusions remain active while ordinary directory creation and 
 Reads are limited to the granted workspace/directories, the installed Arete/Python/Node/uv runtimes and operating-system-managed tool/library/configuration roots, not arbitrary host directories.
 Hard-linked regular files in granted workspaces and mutable runtime read roots are excluded and commands cannot create hard links; hard-link-dependent fixtures are unsupported on this route.
 Owner-configured `[agent] read_roots` in a repository layer can admit absolute paths for additional read-only command runtimes, such as a verification wrapper outside the workspace.
+Private builder shell commands use the candidate and standard command runtimes. The independent verifier can use the additional read-only roots.
 These roots receive the same recursive-secret, hard-link and protected-path restrictions, never a write grant or trusted cleanup authority.
 They are part of the pinned layer policy and cannot be supplied by a model's shell request.
 Runtime roots must be outside all agent-writable trees, including shared temporary and runner-support directories; their canonical targets are pinned before model execution and a changed target is refused.
@@ -265,9 +308,9 @@ to accepted delivery, acceptance rate and cost per acceptance including failed a
 size, uncertainty, controller calls, owner interventions and rework. Trial timing includes that ticket's own waits.
 Measure queue delay for other tickets in the same worker pool separately.
 
-The proposed threshold for promoting two builders to the default is at least 20% lower median accepted-delivery
-time on eligible tickets, with acceptance at least as high and cost per acceptance at most as high. Keep two
-opt-in while the model-backed comparison is inconclusive. Setting the layer cap to one rolls back new runs.
+For the one-versus-two comparison, the proposed threshold is at least 20% lower median time to accepted
+delivery on eligible tickets, with acceptance at least as high and cost per acceptance at most as high.
+Setting the layer cap to one returns new runs to serial builds.
 
 Shared finite experiment limits govern admitted calls, concurrent token/spend reservations and elapsed time.
 A grant only narrows a launch's existing limits.

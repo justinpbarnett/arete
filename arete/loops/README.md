@@ -90,6 +90,8 @@ approve = false                # true holds it until you approve it on the dashb
 # type = "loop":   loop = "fix-it"; hands each finding to that loop as a finding event
 ```
 
+Ticket emits use GitHub by default. Set `tracker = "configured"` to use the target repository's configured tracker. For Jira, Arete files a Task in the configured project, assigns it to the connected account and adds the repository's route label. A retry checks for the original ticket before sending.
+
 ## Source history
 
 A source's history (which events it has seen, and where a log was read to) follows its `name`, or its position in the `[[source]]` list when it has none. A loop with more than one source needs a name on each: lowercase letters, digits and dashes, not only digits, not `webhook`, and not repeated in the loop.
@@ -187,6 +189,34 @@ arete loop try NAME               # run once now with every emit held; event loo
 arete loop enable NAME            # turn it on
 arete loop list | status NAME | start NAME | stop RUN | feed RUN -f
 ```
+
+## Closed-spec retrospectives
+
+The bundled `mine` loop polls GitHub and Jira every five minutes for parent specs carrying the `spec`
+label in repositories enrolled for both delivery and mining. It accepts specs created by the authenticated
+tracker user. GitHub closure and Jira's Done status category both qualify. When repositories share a Jira
+project, the spec's route label selects the target repository.
+
+Each tracker establishes its own baseline on its first successful poll. Subsequent polls enumerate closed
+specs across all pages. A spec that closes during an outage can be picked up when polling resumes if it is
+still closed. The tracker and issue identity is claimed when the event is queued. Editing a closed spec or
+reopening and closing it again does not schedule another retro. The shared loop queue retains failed inputs
+for inspection and requeue. Arete saves the accepted findings per spec before publication and reuses them
+on retry.
+
+The product review sees the parent and issue-scoped summaries, run observations, and stored PR feedback
+from its repository. Related child tickets in other enrolled repositories contribute delivery measurements.
+A separate factory review receives only stage and signal counts so it can propose Arete improvements
+without exposing private project details. Findings go to the relevant repository's configured tracker.
+The factory's aggregate distinguishes recorded failures and repairs from additional successful passes, and
+reports when a child ticket goes through another run. Each target's repository layer may supply optional
+review questions in `retro.md` (the first 8 KiB of a regular UTF-8 file). The product review reads the
+product's questions; the separate factory review reads Arete's own layer. The normal evidence and
+publication criteria apply to both. Local and remote reviews use separate working directories for each role.
+The spec link accompanies product findings. Findings do not inherit the spec label. A closure with no
+supported improvements can produce zero tickets.
+
+`arete mine` remains available for an on-demand pass over transcripts and harness corrections.
 
 ## Merged base use checks
 

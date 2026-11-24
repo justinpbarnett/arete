@@ -31,6 +31,7 @@ from . import (
 from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
 from .store import approvals as approvals_store
+from .store import db
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import runs as runs_store
@@ -892,6 +893,7 @@ def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
 
 
 def file_rule(proposal_id: int) -> str:
+    db.require_workspace_contract()
     with util.lock(RULE_LOCK, wait=True):
         p = approvals_store.proposal(proposal_id)
         if not p or not approvals_store.move_proposal(proposal_id, ("approve", "filing"), "filing"):

@@ -87,7 +87,7 @@ def mergecheck_reset(loop: Loop, item: dict) -> str:
 
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
-RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+RESTARTED_FOR_NEW_CODE = foundation.INHERITED_SERVE_CHILDREN
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = serve_guard.LOCK_FD
 ALERT_TICKS = 9
@@ -274,6 +274,20 @@ def child_pids() -> set[int]:
     return {int(p) for p in found.stdout.split()} if found.returncode == 0 else set()
 
 
+def restart_children() -> foundation.ServeChildren:
+    reap_children()
+    children = set()
+    for pid in child_pids():
+        identity = foundation.process_identity(pid)
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                confirmed = foundation.process_identity(pid)
+                children.add((pid, identity if identity == confirmed else None))
+        except ChildProcessError:
+            continue
+    return children
+
+
 def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     last = util.parse_iso(last_fire)
     if loop.trigger.every:
@@ -333,13 +347,16 @@ class Server:
         self.db_lock = threading.Lock()
         self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
                           "finished_at": None, "error": None}
-        restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
-        self.loaded = restarted_with is not None
-        self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
+        restarted = RESTARTED_FOR_NEW_CODE in os.environ
+        self.loaded = restarted
+        self.workspace_contract_children = foundation.live_serve_children(foundation.inherited_serve_children())
+        self.inherited = {pid for pid, _ in self.workspace_contract_children}
+        os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
+        os.environ.pop(foundation.INHERITED_SERVE_IDENTITIES, None)
         self.pruned = self.swept = self.workspaces_swept = self.rotated = 0.0
         self.checked_closed = 0.0
         self.ticks = 0
-        self.reloaded = restarted_with is not None
+        self.reloaded = restarted
         self.failing: dict[str, dict] = {}
         self.logged: dict[str, str] = {}
         self.every_loop: list[Loop] = []
@@ -435,6 +452,8 @@ class Server:
             self.contracts_waiting = foundation.migrate()
         foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
+            return False
+        if self.contracts_waiting:
             return False
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
@@ -562,7 +581,7 @@ class Server:
             finished, self.deployment = self.deployment, None
             finished.result()
         now = time.monotonic()
-        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
+        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem and not self.contracts_waiting:
             self.deploy_at = now
             self.deployment = self.pool.submit(self.deploy_if_ready, self.cfg)
 
@@ -577,7 +596,10 @@ class Server:
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
             self.say(f"deploy: {receipt.tip} is healthy")
         elif receipt.expired():
-            self.restart_for_new_code()
+            if reason := serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous):
+                self.note_once(f"deploy: code-only rollback refused because {reason}")
+            else:
+                self.restart_for_new_code()
 
     def deploy_if_ready(self, cfg: config.Config) -> None:
         try:
@@ -1109,19 +1131,27 @@ class Server:
             if busy := self.busy_with():
                 self.note_once(f"new code waits to load: {busy}")
                 return
-            reap_children()
-            still_running = child_pids()
+            still_running = restart_children()
+            children = foundation.live_serve_children(self.workspace_contract_children | still_running)
+            self.workspace_contract_children = children
+            beat = util.read_json(control.BEAT_FILE, {})
+            if not isinstance(beat, dict):
+                beat = {}
+            util.write_json(control.BEAT_FILE, {**beat, **foundation.workspace_child_fields(children)})
             self.say(f"new code: serve {os.getpid()} restarts itself" + (
                 f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
-            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
+            fields = foundation.workspace_child_fields(still_running)
             fd = self.lock.fileno()
             os.set_inheritable(fd, True)
             os.environ[SERVE_LOCK_FD] = str(fd)
+            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, fields[foundation.WORKSPACE_CHILD_PIDS]))
+            os.environ[foundation.INHERITED_SERVE_IDENTITIES] = json.dumps(fields[foundation.WORKSPACE_CHILD_IDENTITIES])
             try:
                 os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
             except BaseException:
                 os.set_inheritable(fd, False)
-                os.environ.pop(SERVE_LOCK_FD, None)
+                for name in (SERVE_LOCK_FD, RESTARTED_FOR_NEW_CODE, foundation.INHERITED_SERVE_IDENTITIES):
+                    os.environ.pop(name, None)
                 raise
         finally:
             dashboard.POSTS_IN_FLIGHT.reopen()
@@ -1138,7 +1168,7 @@ class Server:
         every_loop, live = self.every_loop, self.live
         failing = {key: dict(found) for key, found in self.failing.items()}
         at = util.iso()
-        if not failing:
+        if not failing and not self.contracts_waiting:
             self.last_ok = at
         try:
             pending = len(loop_store.pending())
@@ -1151,6 +1181,7 @@ class Server:
             tickets = len(slots.holding(rows, "pipeline"))
         except Exception:
             tickets = None
+        self.workspace_contract_children = foundation.live_serve_children(self.workspace_contract_children)
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1160,7 +1191,10 @@ class Server:
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
             "running": running, "tickets": tickets, "poll_errors": dict(self.errors),
-            "tick_ok": not failing, "last_ok": self.last_ok, "failing": failing, "reloaded": self.reloaded,
+            "tick_ok": not failing and not self.contracts_waiting, "last_ok": self.last_ok,
+            "failing": failing, "reloaded": self.reloaded,
+            "workspace_contract_waiting": self.contracts_waiting,
+            **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
@@ -1191,18 +1225,29 @@ def cleanup_legacy() -> None:
             pass
 
 
+def startup_beat() -> foundation.ServeChildren:
+    beat, seen = util.read_json_snapshot(control.BEAT_FILE, {})
+    if not isinstance(beat, dict):
+        beat = {}
+    inherited = foundation.heartbeat_serve_children(beat, seen) | foundation.inherited_serve_children()
+    children = foundation.live_serve_children(inherited)
+    if beat.get("pid") != os.getpid():
+        beat = {}
+    util.write_json(control.BEAT_FILE, {**beat, "pid": os.getpid(), "schema": foundation.LATEST,
+                                       **foundation.workspace_child_fields(children),
+                                       "db": beat.get("db") or {
+                                           **dbstats.empty_collection(), "status": "initial",
+                                           "requested_at": None, "finished_at": None, "error": None}})
+    return children
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     codebase.load()
     rotation_notes = install.rotate_own_log()
     with principals.acting("hand"):
         held = take_serve_lock()
         try:
-            beat = util.read_json(control.BEAT_FILE, {})
-            if beat.get("pid") == os.getpid():
-                util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
-                                                  "db": beat.get("db") or {
-                                                      **dbstats.empty_collection(), "status": "initial",
-                                                      "requested_at": None, "finished_at": None, "error": None}})
+            inherited = startup_beat()
             try:
                 with util.lock("migrate", wait=True):
                     backup.recover_restore()
@@ -1217,6 +1262,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
                 report_rollbacks(paths.PACKAGE_DIR.parent, lambda line: print(line, file=sys.stderr))
                 raise SystemExit(1) from e
             server = Server()
+            server.workspace_contract_children = inherited
             server.contracts_waiting = contracts_waiting
             server.lock = held
             server.with_dashboard = with_dashboard

@@ -66,6 +66,24 @@ SCHEMA = {
 }
 
 
+CHECK_RUNNER_CALL = "checks.macos-sandbox-profile"
+
+
+def check_runner_request(result: dict) -> dict | None:
+    failures = result.get("failed_checks", [])
+    if not (result.get("runner_blocked") and failures
+            and all(item.get("capability") == "macos-sandbox-profile" for item in failures)):
+        return None
+    return {
+        "questions": [{"header": "macOS runner", "kind": "done",
+                       "question": "Is the approved macOS check runner ready to install the Pi worker sandbox profile?",
+                       "steps": ["Make the configured check command run on a macOS runner that supports the profile.",
+                                 "Confirm readiness here to retry the checks for all affected tickets on this host."]}],
+        "why": "The required checks could not run on this host. Each ticket needs its own passing check result.",
+        "tried": "The check runner reported a sandbox profile installation failure.",
+    }
+
+
 def text_of(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 

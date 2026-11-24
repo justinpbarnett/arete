@@ -64,6 +64,7 @@
         "properties": {
           "type": {"type": "string", "enum": ["ticket", "pr", "push", "loop"]},
           "repo": {"type": "string"},
+          "tracker": {"type": "string", "enum": ["github", "configured"], "description": "Ticket destination. Configured uses the registered repo's GitHub Issues or Jira project."},
           "labels": {"$ref": "source.json#/$defs/names"},
           "prefix": {"type": "string"},
           "draft": {"type": "boolean"},

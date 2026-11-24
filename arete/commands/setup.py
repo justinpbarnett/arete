@@ -4,6 +4,7 @@ import json
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 
 from .. import __version__, client, config, paths, routing, steps
 from ..store import db as foundation
@@ -230,11 +231,25 @@ def cmd_uninstall(args) -> int:
 
 def cmd_migrate(args) -> int:
     try:
-        foundation.migrate(contracts=not args.no_contracts)
+        if args.retry_quarantined_workspace is not None:
+            from ..store import workspaces
+
+            if args.workspace_snapshots is None:
+                raise ValueError("retry requires --workspace-snapshots DIR")
+            workspaces.retry_quarantine(args.retry_quarantined_workspace, args.workspace_snapshots)
+            print(f"Restored snapshot for {args.retry_quarantined_workspace}")
+            return 0
+        if args.retire_quarantined_workspace is not None:
+            from ..store import workspaces
+
+            workspaces.retire_quarantine(args.retire_quarantined_workspace)
+            print(f"Retired quarantine for {args.retire_quarantined_workspace}")
+            return 0
+        waiting = foundation.migrate(contracts=not args.no_contracts, workspace_snapshots=args.workspace_snapshots)
     except Exception as e:
         print(f"arete migrate: {e}", file=sys.stderr)
         return 1
-    return 0
+    return int(waiting and args.workspace_snapshots is not None)
 
 
 def cmd_doctor(args) -> int:
@@ -294,7 +309,14 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_uninstall)
 
     p = sub.add_parser("migrate", help="apply pending database migrations")
-    p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    p.add_argument("--workspace-snapshots", type=Path, metavar="DIR",
+                   help="hand off or retry legacy workspace snapshots from this directory")
+    mode.add_argument("--retire-quarantined-workspace", metavar="NAME",
+                      help="retire a workspace quarantine after preserving and moving the workspace aside")
+    mode.add_argument("--retry-quarantined-workspace", metavar="NAME",
+                      help="retry a repaired legacy snapshot for an idle quarantined workspace")
     p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("prompts", help="validate prompt templates and list their required inputs, without model calls")
