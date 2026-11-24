@@ -611,7 +611,8 @@ def finding_text(f: dict) -> str:
 def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
     from . import mergecheck, releasejourneys
 
-    if mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop):
+    if (mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop)
+            or run.loop.origin == "arete" and run.loop.name == "mine"):
         return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}
@@ -767,6 +768,8 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     events = classify(run, events)
     if arrived and not events:
         return "skipped", f"the classifier passed none of {util.count(arrived, 'event')}"
+    if loop.origin == "arete" and loop.name == "mine":
+        return spec_retro_loop(run, events)
     memory = loop_store.loop_state(loop.name)["data"]
     res = run.agent("watch", watch_prompt(run, events, memory), agent_dir(run), tools=loop.tools,
                     json_schema=WATCH_SCHEMA)
@@ -781,6 +784,22 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     if not run.trial and isinstance(answer.get("state"), dict):
         loop_store.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
+    return finish_watch(run, events, found, fresh, summary)
+
+
+def spec_retro_loop(run: LoopRun, events: list[dict]) -> tuple[str, str]:
+    from . import spec_retro
+
+    found = []
+    for e in events:
+        if e.get("source") not in ("mine#github-specs", "mine#jira-specs") or e["type"] != "spec.closed":
+            raise ValueError("A spec retrospective requires a closed parent from its configured tracker")
+        found.extend(spec_retro.review(run, e, agent_dir(run), WATCH_SCHEMA))
+    return finish_watch(run, events, found, new_findings(run, found), f"Reviewed {util.count(len(events), 'closed spec')}")
+
+
+def finish_watch(run: LoopRun, events: list[dict], found: list[dict], fresh: list[dict], summary: str) -> tuple[str, str]:
+    loop = run.loop
     outcome = {"summary": summary, "trust": weakest_trust(events)}
     if fresh:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)

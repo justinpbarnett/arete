@@ -34,6 +34,24 @@ class JiraUnsure(JiraError):
     pass
 
 
+def site_url(env_file: Path | None) -> str:
+    base = os.environ.get("JIRA_BASE_URL")
+    if not base and env_file:
+        base = util.read_env_file(env_file).get("JIRA_BASE_URL")
+    if not base:
+        raise JiraError("no Jira site configured for ticket publication")
+    return checked_base(base)
+
+
+def checked_base(value: str) -> str:
+    base = value.rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if (parts.scheme not in ("http", "https") or not parts.netloc or parts.username is not None
+            or parts.password is not None or parts.query or parts.fragment):
+        raise JiraError("JIRA_BASE_URL must be a full HTTP(S) URL without credentials, query, or fragment")
+    return base
+
+
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
     if paths.ISOLATED:
         raise JiraError(paths.ISOLATED_LOGINS)
@@ -43,11 +61,7 @@ def credentials(env_file: Path | None) -> tuple[str, str, str]:
     if missing:
         where = f" or in {env_file}" if env_file else "; or name an env file in [jira] env_file"
         raise JiraError(f"missing {', '.join(missing)}: set them in the environment{where}")
-    base = vals[0].rstrip("/")
-    parts = urllib.parse.urlsplit(base)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise JiraError(f"JIRA_BASE_URL {base!r} is not a full URL; write it like https://your-site.atlassian.net")
-    return base, vals[1], vals[2]
+    return checked_base(vals[0]), vals[1], vals[2]
 
 
 def parse_time(s: str) -> datetime:
@@ -222,6 +236,29 @@ class Client:
                 raise JiraUnsure(f"Jira comment reply was lost; check the ticket before sending again: {e}",
                                  getattr(e, "status", 0)) from e
         return self.comment_url(key, posted["id"]) if return_url and isinstance(posted, dict) and posted.get("id") else None
+
+    def find_task_marker(self, project: str, account: str, marker: str) -> str:
+        # A single alphanumeric word survives Jira's description tokenization.
+        if not re.fullmatch(r"areteemit[a-f0-9]{64}", marker):
+            raise ValueError("invalid ticket publication marker")
+        query = (f"project = {json.dumps(project)} AND creator = {json.dumps(account)} "
+                 f'AND description ~ "{marker}"')
+        issues = self.search(query, ["description"], limit=1, include=lambda issue:
+                             marker in adf.to_text((issue.get("fields") or {}).get("description")).splitlines())
+        return self.browse_url(issues[0]["key"]) if issues else ""
+
+    def create_task(self, project: str, account: str, title: str, body: str, labels: list[str]) -> str:
+        fields = {"project": {"key": project}, "issuetype": {"name": "Task"}, "assignee": {"accountId": account},
+                  "summary": outbound.screen(title), "description": adf.from_markdown(outbound.screen(body)),
+                  "labels": labels}
+        try:
+            result = self.request("POST", "/rest/api/3/issue", body={"fields": fields})
+        except (ValueError, UnicodeError) as error:
+            raise JiraUnsure("Jira returned an unreadable reply after creating the task") from error
+        key = result.get("key") if isinstance(result, dict) else None
+        if not isinstance(key, str) or not KEY_RE.fullmatch(key) or key.rsplit("-", 1)[0] != project.upper():
+            raise JiraUnsure("Jira did not confirm the created task key")
+        return self.browse_url(key)
 
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]

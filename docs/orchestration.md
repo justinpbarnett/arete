@@ -52,7 +52,8 @@ The model retains the runner's filesystem confinement, JEV/tool checks and close
 ## Worker questions and parallel builders
 
 Set `max_builders` in the repository layer to opt new orchestrated lineages into worker protocol 2.
-Start a pilot at one and use two for a comparison on independent work.
+Set worker and builder limits to fit the resources available to each run. For example, this layer
+allows three active workers, up to two of whom can write concurrently.
 
 ```toml
 [orchestration]
@@ -66,7 +67,9 @@ pinned per lineage. Private workers read repository instructions inside their ch
 session, without external instruction files or MCP servers. Provider admission and layer payment policy apply.
 
 Both limits take integers from 1 through 10000. Each active worker occupies a worker slot.
-The builder ceiling is the smaller limit. The controller can use fewer slots.
+The builder ceiling is the smaller limit. Within a ticket, the controller can start independent
+assignments together when their inputs are ready and their write paths are disjoint. A change that
+depends on another builder's edits waits for those edits to be integrated.
 Omitting `max_builders` selects the original protocol and its exclusive writer. Setting it to one keeps the
 question and receipt protocol with serial builders. Existing lineages retain their recorded mode and ceilings.
 Local Pi on macOS and replay support private turns. Unavailable confinement, unsupported build routes,
@@ -266,9 +269,9 @@ to accepted delivery, acceptance rate and cost per acceptance including failed a
 size, uncertainty, controller calls, owner interventions and rework. Trial timing includes that ticket's own waits.
 Measure queue delay for other tickets in the same worker pool separately.
 
-The proposed threshold for promoting two builders to the default is at least 20% lower median accepted-delivery
-time on eligible tickets, with acceptance at least as high and cost per acceptance at most as high. Keep two
-opt-in while the model-backed comparison is inconclusive. Setting the layer cap to one rolls back new runs.
+For the one-versus-two comparison, the proposed threshold is at least 20% lower median time to accepted
+delivery on eligible tickets, with acceptance at least as high and cost per acceptance at most as high.
+Setting the layer cap to one returns new runs to serial builds.
 
 Shared finite experiment limits govern admitted calls, concurrent token/spend reservations and elapsed time.
 A grant only narrows a launch's existing limits.
