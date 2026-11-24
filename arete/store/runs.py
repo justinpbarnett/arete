@@ -8,7 +8,7 @@ from datetime import timedelta
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
-from .db import db, migration_applied, reader, tx
+from .db import WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -520,11 +520,17 @@ def _prune(c, days, lines_days):
     c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
     for row in c.execute(f"SELECT id FROM runs WHERE {FIRINGS} AND started < ?", (since,)).fetchall():
         writes.update("runs", row["id"], {}, delete=True, kind="run.deleted")
+    keep_workers = (
+        "AND NOT EXISTS (SELECT 1 FROM orchestration_workers w JOIN orchestrations o ON o.root=w.root "
+        "WHERE w.phase NOT IN ('completed','integrated','cancelled') "
+        "AND EXISTS (SELECT 1 FROM json_each(o.data,'$.runs') WHERE value=runs.id)) "
+    ) if migration_applied(WORKER_EXCHANGE_SCHEMA, c) else ""
     eligible = c.execute(
         "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
         "AND status NOT IN ('running', 'pr', 'needs-info') "
         "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-        "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
+        + keep_workers
+        + "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
         "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
         "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
         "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "

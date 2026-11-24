@@ -4,7 +4,8 @@ import json
 import re
 import time
 
-from . import config, issue_goal, owner_asks, pipeline, principals, repairs, runlimits, tasks, tracker, unblock, util
+from . import config, gh, issue_goal, merge_review, owner_asks, pilot, pipeline, principals, repairs, runlimits, slots
+from . import tasks, tracker, unblock, util
 from .store import asks as asks_store
 from .store import db
 from .store import runs as runs_store
@@ -54,6 +55,7 @@ def material(cause: str, limit: str, binding: dict, evidence: dict, row: dict) -
     review = run.get("review") or {}
     return unblock.digest([issue, comments, binding["policy"], binding["heads"], binding["prs"], cause, limit,
                            review.get("verdict"), review.get("problems"), evidence.get("dependencies"),
+                           *([unblock.digest(evidence["merge_candidate"])] if "merge_candidate" in evidence else []),
                            [{"kind": q["kind"], "question": q.get("question"), "name": q.get("name")}
                             for a in unblock.asks_of(row) for q in a["questions"]]])
 
@@ -68,9 +70,14 @@ def notify_if_needed(cfg, repo, row, asks, case):
     return bool(secret_asks)
 
 
-def finish_decision(cfg, repo, t, source, row, asks, case, attempt, binding, decision):
+def finish_decision(cfg, repo, t, source, row, asks, case, attempt, binding, decision, candidate=None):
     action = decision["action"]
     grant = {"binding": binding, "direction": decision.get("direction", "")}
+    if action == "merge":
+        if case["cause"] != "merge-review" or not candidate:
+            raise ValueError("This observation has no verified merge candidate")
+        ledger.decide(case, attempt, decision, {**grant, "proof": unblock.digest(candidate)})
+        return
     if action == "wait_for":
         ledger.decide(case, attempt, decision, {})
         ledger.mark(case, "waiting", decision["reason"], unblock.RECHECK)
@@ -110,6 +117,8 @@ def finish_decision(cfg, repo, t, source, row, asks, case, attempt, binding, dec
         return
     if case["cause"] in ("ask", "dependency-cycle"):
         raise ValueError("resolve the question or prerequisite before retrying")
+    if case["cause"] in ("merge-review", "merge-verification"):
+        grant["merge_verification"] = True
     if action == "clarify" and (body := unblock.local_revision(source, t, decision["direction"])):
         grant.update(local_body=body, local_spec=runlimits.digest(t.title, body))
     elif action == "clarify":
@@ -147,6 +156,47 @@ def correct_dependency(repo, source, t, case, attempt, binding, decision):
 
 def all_merged(prs):
     return bool(prs) and all(pr["state"] == "MERGED" for pr in prs.values())
+
+
+def land(repo, tid, case, attempt, candidate):
+    decision = attempt["decision"]
+    if (not candidate or decision.get("action") != "merge" or "merge_candidate" not in decision.get("evidence", ())
+            or any(decision.get(key) != candidate[key] for key in ("head", "base"))
+            or attempt["grant"].get("proof") != unblock.digest(candidate)):
+        return
+    with util.lock(runs_store.run_lock("pipeline", repo.name, tid)) as ticket, util.lock(
+            slots.merge_lock(candidate["github"])) as merge:
+        if not ticket or not merge:
+            ledger.mark(case, "waiting", "Waiting for the delivery or merge in progress", unblock.INTERVAL)
+            return
+        cfg = config.load()
+        if not unblock.active(cfg, repo.name, tid) or unblock.exclude(repo.name, tid):
+            return
+        current = cfg.repo(repo.name)
+        latest = ledger.get(repo.name, tid)
+        if (latest.get("generation") != case["generation"] or latest["phase"] in ("resolved", "cancelled")
+                or ledger.latest_attempt(latest).get("id") != attempt["id"]):
+            return
+        row = runs_store.newest_live_whole_run(repo.name, tid) or {}
+        source = tracker.for_ticket(cfg, current, tid)
+        t = source.get(tid)
+        if row.get("stop_asked") or t.blocker or not unblock.approval(source, t)[0]:
+            return
+        prs = unblock.prs_of(row)
+        binding = unblock.snapshot(cfg, current, source, t, row, prs=prs)
+        if binding != attempt["grant"]["binding"]:
+            return
+        cause, fresh = merge_review.assess(cfg, current, t, row, prs)
+        if cause != "merge-review" or fresh != candidate:
+            return
+        hold = gh.pr_merge_auto(candidate["github"], gh.pr_number(candidate["url"]), candidate["head"],
+                                candidate["target"], candidate["base"], track_moved_base=True,
+                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)))
+        if hold:
+            ledger.mark(case, "waiting", unblock.safe(hold), unblock.RECHECK)
+        else:
+            issue_goal.lifecycle(repo.name, tid, "finish")
+            ledger.mark(case, "resolved", "The issue orchestrator merged the verified PR")
 
 
 def inspect(cfg, repo, tid, row, cycle, existing) -> None:
@@ -203,6 +253,9 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     asks = unblock.asks_of(row)
     saved = runlimits.metadata(row["id"], "parked.json") if row else {}
     cause, limit = blocker(row, saved, asks, prs, cycle)
+    candidate = {}
+    if not cause:
+        cause, candidate = merge_review.assess(cfg, repo, t, row, prs)
     if not cause and attempt.get("grant") and not attempt.get("child") and row.get("status") == "needs-info":
         cause = "ask" if not any(a["status"] == "open" for a in asks) else ""
     if not cause:
@@ -212,8 +265,13 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
         ledger.mark(case, "waiting", "Monitoring until tracker closure or PR merge", unblock.RECHECK)
         return
     binding = unblock.snapshot(cfg, repo, source, t, row, prs=prs)
-    if attempt.get("grant", {}).get("binding") == binding and not attempt["child"]:
+    grant = attempt.get("grant", {})
+    same_proof = "proof" not in grant or (candidate and grant["proof"] == unblock.digest(candidate))
+    if grant.get("binding") == binding and same_proof and not attempt["child"]:
         if time.time() >= existing["due"]:
+            if attempt["decision"].get("action") == "merge":
+                land(repo, tid, existing, attempt, candidate)
+                return
             result = tasks.launch_recovery(cfg, repo, row, attempt)
             if result.get("state") == "queued":
                 ledger.mark(existing, "queued", result["why"], unblock.INTERVAL)
@@ -221,6 +279,10 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
                 ledger.mark(existing, "waiting", result["why"], unblock.RECHECK)
         return
     evidence = unblock.evidence_for(t, row, saved, asks, prs, cycle)
+    if candidate:
+        evidence["merge_candidate"] = candidate
+    elif cause == "merge-verification":
+        evidence["merge_verification"] = "Refresh the current PR against its target and run the normal publication gates."
     case = ledger.observe(repo.name, tid, cause, material(cause, limit, binding, evidence, row), binding)
     if time.time() < case["due"] or case["phase"] == "resuming":
         return
@@ -251,7 +313,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if unblock.snapshot(fresh, repo, source, t, newest) != binding:
         return
     try:
-        finish_decision(fresh, repo, t, source, row, asks, case, attempt_id, binding, decision)
+        finish_decision(fresh, repo, t, source, row, asks, case, attempt_id, binding, decision, candidate)
     except ValueError as error:
         ledger.mark(case, "waiting", unblock.safe(error, 300), unblock.RECHECK)
 

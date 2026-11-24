@@ -102,6 +102,9 @@ class Worker:
     def allow(self, limits: dict | None = None) -> None:
         send(self.channel, {"allow": True, "limits": limits})
 
+    def refuse(self, reason: str) -> None:
+        send(self.channel, {"allow": False, "reason": reason})
+
     def observations(self) -> list[dict]:
         for path in record.record_files(self.run_id):
             if not path.name.startswith(record.slug(self.step)):
@@ -139,6 +142,25 @@ def reports_progress(event: dict) -> bool:
                     for block in record.blocks(message.get("content"))))
 
 
+def turn_outcome(message, offered, refs):
+    value = message.get("structured")
+    if value is None:
+        value = json.loads(message.get("text", ""))
+    if (not isinstance(value, dict) or value.keys() - {"version", "outcome", "text", "ack_ids", "evidence_refs"}
+            or type(value.get("version")) is not int or value["version"] != 2
+            or value.get("outcome") not in ("done", "question", "handoff")
+            or not isinstance(value.get("text"), str) or not value["text"].strip() or len(value["text"]) > 16000):
+        raise ValueError("invalid version 2 worker outcome")
+    ack = value.get("ack_ids")
+    if (not isinstance(ack, list) or len(ack) != len(offered) or any(type(mid) is not str for mid in ack)
+            or set(ack) != set(offered)):
+        raise ValueError("ack_ids must acknowledge exactly the messages offered to this attempt")
+    evidence = value.get("evidence_refs", [])
+    if not isinstance(evidence, list) or len(evidence) > 20 or any(type(r) is not str or r not in refs for r in evidence):
+        raise ValueError("worker cited evidence outside its admitted references")
+    return value
+
+
 class PolicyChanged(ValueError):
     pass
 
@@ -173,6 +195,11 @@ def worker_settings_digest(value, serialize, *, include_check_limit: bool = Fals
         config.remove_controller_only_settings(data)
         if not include_check_limit:
             data.pop("max_parallel_checks", None)
+    if isinstance(value, config.RepoLayer):
+        data.get("orchestration", {}).pop("max_builders", None)
+        data.get("orchestration", {}).pop("private_worker_model", None)
+        if serialize is explicit and not data.get("orchestration"):
+            data.pop("orchestration", None)
     return settings_digest(data)
 
 
@@ -260,7 +287,8 @@ def main() -> None:
             send(channel, {"event": "launch", "step": step, "role": role, "route": route})
             grant = inbox.get()
             if not isinstance(grant, dict) or grant.get("allow") is not True:
-                raise ValueError("worker launch was not admitted")
+                raise ValueError(grant.get("reason", "worker launch was not admitted") if isinstance(grant, dict)
+                                 else "worker launch was not admitted")
             return grant.get("limits")
 
         run.launch_gate = admission
@@ -271,9 +299,18 @@ def main() -> None:
             if launch["role"] != "orchestrate" or not unblock.active(cfg, repo.name, ticket):
                 raise PolicyChanged("issue orchestrator is no longer enabled")
             goal = {"issue_session": (issue_goal.identity(repo.name, ticket), launch["goal_event"])}
+        if launch.get("private_worker"):
+            goal.update(private_worker=True, persist=False, ask_owner=False, add_dirs=[])
         result = run.agent(launch["step"], launch["prompt"], Path(launch["cwd"]), role=launch["role"],
                            allowed_tools=launch["rules"], disallowed_tools=routing.NO_GIT_WRITES,
                            wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"], **goal)
+        if launch.get("private_worker") and result.ok:
+            try:
+                result.structured = turn_outcome({"text": result.text, "structured": result.structured},
+                                                 launch["offered_ids"], launch["evidence_refs"])
+                result.text = result.structured["text"]
+            except (ValueError, TypeError) as error:
+                result.ok, result.error, result.text, result.structured = False, str(error), "", None
         send(channel, {"event": "result", "ok": result.ok, "text": result.text[:65536],
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
                        "cost_usd": run.cost, "paid_usd": run.paid, "turns": result.turns,

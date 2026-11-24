@@ -10,6 +10,7 @@ from typing import TextIO
 from uuid import uuid4
 
 from . import (
+    builder_workspaces,
     codebase,
     config,
     delegation,
@@ -18,6 +19,7 @@ from . import (
     flows,
     gh,
     journeys,
+    merge_review,
     outbound,
     owner_asks,
     pilot,
@@ -29,14 +31,17 @@ from . import (
     runlimits,
     slots,
     util,
+    worker_turns,
     workspace,
     zte,
 )
 from .agent import NO_SESSION, Session, json_from_text
-from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, help_text
+from .orchestration_api import BUNDLES, PROTOCOL, WORKER_PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
 from .store import insights as insights_store
 from .store import orchestration as ledger
+from .store import triage as triage_store
+from .store import worker_exchange as exchange
 from .verify import Verified
 
 CI_FAILURES = "ci:failures"
@@ -77,6 +82,8 @@ class RetargetedPR(ValueError):
 def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     effective = config.policy_dict(layer)
     effective.pop("factory_path")
+    effective["orchestration"].pop("max_builders", None)
+    effective["orchestration"].pop("private_worker_model", None)
     if layer.required_check is None:
         effective.pop("required_check")
     if layer.verify:
@@ -91,22 +98,31 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
                                                 "closed_context": closed_context}, default=str)))
 
 
-class Controller:
+class Controller(worker_turns.WorkerTurns):
     issue_goal = False
     merge_lease: TextIO | None = None
     starts_new_lineage = False
 
-    def __init__(self, flow):
+    def __init__(self, flow, *, max_builders=None):
         self.flow, self.job = flow, flow.ctx
         self.run = self.job.run
         self.workers, self.progress, self.reported = {}, {}, {}
+        configured = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
+        if max_builders is not None:
+            configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
+        tid = str(getattr(self.run, "tid", ""))
+        private = (configured.max_builders and self.run.path == "orchestrate"
+                   and not pilot.is_pilot_task(tid) and not zte.reserved(tid))
+        protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
-                                    {"protocol": PROTOCOL, "mode": self.run.path, "evidence": {}})
+                                    {"protocol": protocol, "mode": self.run.path, "evidence": {}})
         self.data = ledger.snapshot(self.lease)["data"]
-        if self.data.get("protocol") != PROTOCOL or self.data.get("mode") != self.run.path:
+        self.protocol = self.data.get("protocol")
+        if self.protocol not in (PROTOCOL, WORKER_PROTOCOL) or self.data.get("mode") != self.run.path:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
-        self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(
-            pipeline.config.load_layer(self.run.repo.layer_dir).orchestration)))
+        self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(configured)))
+        if not self.exchanged:
+            self.policy = replace(self.policy, max_builders=None)
         if self.run.recovery.get("allowance"):
             base = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
             extra = self.run.recovery["allowance"]
@@ -128,6 +144,14 @@ class Controller:
     @property
     def action_limit(self):
         return None if self.issue_goal else self.policy.max_actions
+
+    def configured_limits(self):
+        limits = asdict(self.policy)
+        if not self.exchanged:
+            limits.pop("max_builders", None)
+        if not self.exchanged or not self.policy.private_worker_model:
+            limits.pop("private_worker_model", None)
+        return limits
 
     def persist(self):
         self.data["job"] = {name: getattr(self.job, name) for name in STATE_FIELDS}
@@ -184,16 +208,23 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
+        merge_verification = self.run.recovery.get("merge_verification") is True
         prepared = self.data.get("prepared")
         restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
         if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
             return "noop", closed, ""
         self.flow.matching = False
-        run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
         if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
+            if merge_verification and not pending_push:
+                ticket = self.run.tracker.get(self.run.tid)
+                prepared["ticket"] = asdict(ticket)
+                prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
+                self.data["goal_base"] = f"Check the issue and owner's answers in use:\n{ticket.title}\n{ticket.body}"
+                if feedback := self.data.get("feedback"):
+                    self.data["goal_base"] += f"\n\nCheck the owner's PR feedback:\n{pipeline.feedback_markdown(feedback)}"
             layer_dir, source_file = Path(prepared["layer"]), None
             if not layer_dir.exists():
                 for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
@@ -307,19 +338,25 @@ class Controller:
         self.job.goal = pipeline.triage_goal(goal, self.job.approval)
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
+        if self.exchanged and not prepared and (reason := self.serial_reason()):
+            self.protocol = self.data["protocol"] = PROTOCOL
+            self.policy = replace(self.policy, max_builders=None)
+            self.data["serial_reason"] = reason
+            self.run.log(f"using the serial writer before dispatch: {reason}")
+        run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
         lineage, old_lineage = self.lineage()
         self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
-        self.data["limits"] = asdict(self.policy)
+        self.data["limits"] = self.configured_limits()
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.run.environment_release:
+        if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
-        elif restore_prs:
+        if restore_prs:
             try:
                 self.merge_restored_bases()
             except delegation.PolicyChanged as error:
@@ -496,18 +533,21 @@ class Controller:
         tid = str(getattr(self.run, "tid", ""))
         pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
         restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
-        self.catalog = Catalog(self.job)
+        self.catalog = Catalog(self.job, self.protocol, self.policy.private_worker_model) if self.exchanged else Catalog(self.job)
         policy = self.policy_sha()
         saved_policy = self.data.get("policy_sha")
         if saved_policy is not None and self.matches_policy(saved_policy, policy):
             policy = saved_policy
-        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
+        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations(self.protocol)),
                  "policy_sha": policy,
-                 "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
+                 "controller_prompt": ledger.digest(prompt_loader.template(self.controller_prompt).template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
         old = {key: self.data[key] for key, value in found.items() if key in self.data and self.data[key] != value}
         changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
+        if self.exchanged and old.keys() - REFRESHABLE_LINEAGE:
+            if any(w["phase"] not in exchange.CLOSED for w in exchange.workers(self.lease).values()):
+                raise factory.Refused(f"{changes}; outstanding private assignments need reconciliation before resuming")
         if old.keys() - REFRESHABLE_LINEAGE and not restarts:
             raise factory.Refused(f"{changes}; reconcile before resuming")
         if why := self.continuation_blocker(decision_boundary=bool(old)):
@@ -599,6 +639,8 @@ class Controller:
             self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         if catch_up:
             self.catalog.add_context(CATCH_UP_FAILURE, catch_up["feedback"])
+        if self.exchanged:
+            self.recover_workers()
         for action in ledger.actions(self.lease):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
@@ -610,8 +652,10 @@ class Controller:
         for worker in self.workers.values():
             self.progress[worker.action] = worker.observations()
             self.reported[worker.action] = worker.report[0]
-        return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
+        return {**(self.worker_observation(outstanding=True) if self.exchanged else {}),
+                "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
+                **({"serial_reason": self.data["serial_reason"]} if self.data.get("serial_reason") else {}),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
@@ -621,7 +665,7 @@ class Controller:
                              "result": self.excerpt(a)} for a in actions[-limit:]],
                 "progress": self.progress, "evidence": {name: {**value, "current": self.current(name)}
                                                         for name, value in self.data.get("evidence", {}).items()},
-                "limits": {**asdict(self.policy), "max_decisions": self.decision_limit,
+                "limits": {**self.configured_limits(), "max_decisions": self.decision_limit,
                            "max_actions": self.action_limit, "decisions_used": snapshot["turns"],
                            "launches_used": snapshot["launches"], "actions_used": len(all_actions),
                            "repair_cycles": self.run.budget.repair_calls if self.run.budget else 0},
@@ -670,13 +714,17 @@ class Controller:
                 self.run.launch_done(controller.step, bool(result.get("ok")))
         return result
 
+    @property
+    def controller_prompt(self):
+        return "orchestrate_workers" if self.exchanged else "orchestrate"
+
     def decide(self):
         observation = self.observe()
         turn = ledger.begin(self.lease, observation, self.decision_limit)
         observation["decision_id"] = turn
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
-        prompt = prompt_loader.prompt("orchestrate", api=help_text(), observation=json.dumps(observation))
+        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol), observation=json.dumps(observation))
         result = {}
         for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
             request = delegation.request(self.job, turn, prompt, setting, (), [])
@@ -702,6 +750,8 @@ class Controller:
                 response = json_from_text(result.get("text", ""))
             calls = self.catalog.validate(response, turn, observation["state_version"],
                                           {a["id"]: a for a in ledger.actions(self.lease)})
+            if self.exchanged:
+                self.preflight(calls["calls"])
             actions = ledger.accept(self.lease, turn, observation["state_version"], calls, self.action_limit)
             self.data.pop("error", None)
             if self.run.answers_due:
@@ -720,23 +770,37 @@ class Controller:
 
     def worker_start(self, action, args, prior=None):
         known = {item["id"]: item for item in ledger.actions(self.lease)}
-        if any(known[dep]["state"] != "succeeded" for dep in args["depends_on"]):
+        if not self.exchanged and any(known[dep]["state"] != "succeeded" for dep in args["depends_on"]):
             raise ValueError("a dependency has not succeeded")
         setting, name, writing = self.catalog.worker(args)
         writing = writing and args["tool_bundle"] == "write"
-        if len(self.workers) >= self.policy.max_workers or (self.workers and (
+        if len(self.workers) >= self.policy.max_workers or (not self.exchanged and self.workers and (
                 writing or any(worker.writing for worker in self.workers.values()))):
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
         role = setting.step
         catch_up = self.data.get("catch_up_hold", {})
         denied_feedback = self.data.get("denied_feedback", "")
-        if writing and (self.data.get("writes", 0) or self.run.repairs or catch_up or denied_feedback):
+        assignment = None
+        if self.exchanged:
+            ws = exchange.workers(self.lease)
+            for dep in args["depends_on"]:
+                owner = known[dep]["result"].get("worker_id")
+                ready = ws[owner]["phase"] in {"integrated", "completed"} if owner else known[dep]["state"] == "succeeded"
+                if not ready:
+                    raise ValueError(f"dependency {dep} is unfinished")
+            if writing and sum(w.writing for w in self.workers.values()) >= self.policy.builder_limit:
+                raise ValueError("builder capacity is full")
+            logical_id, assignment = self.private_assignment(action, args, prior, writing, role)
+            role = assignment["role"]
+        if not self.exchanged and writing and (self.data.get("writes", 0) or self.run.repairs or catch_up or denied_feedback):
             role = ("ci_repair" if self.data.get("ci_failed") else "review_repair"
                     if catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
                     else "check_repair")
+        if role != setting.step:
             setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, role, self.run.kind,
                                              {"runner": setting.runner, "model": setting.model,
-                                              "provider": setting.provider, "effort": setting.effort})
+                                              "provider": setting.provider, "effort": setting.effort,
+                                              **(self.catalog.private_route if assignment else {})})
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
@@ -749,8 +813,9 @@ class Controller:
         if prior:
             contexts += "\n\nPrevious worker result:\n" + prior["result"].get("text", "")[:8000]
         goal = args["goal"]
-        queued = self.data.setdefault("steering", {}).pop((prior or action)["id"], [])
-        goal += "\n" + "\n".join(queued) if queued else ""
+        if not self.exchanged:
+            queued = self.data.setdefault("steering", {}).pop((prior or action)["id"], [])
+            goal += "\n" + "\n".join(queued) if queued else ""
         if name in ("delegate", "investigate") and self.job.triage:
             contexts = "\n\n".join(filter(None, (self.job.triage, contexts)))
         direction = self.run.recovery.get("direction")
@@ -763,17 +828,29 @@ class Controller:
             inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
+        if assignment:
+            private = builder_workspaces.folder(assignment["candidate"]["token"])
+            inputs.update(workspace=str(private), class_check="")
         if not writing:
             inputs["class_check"] = ""
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
+        if assignment:
+            messages = exchange.inbox(self.lease, logical_id)
+            prompt += worker_turns.instructions(assignment, messages)
         if writing and denied_feedback:
             prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
         session = NO_SESSION
         previous = (prior or {}).get("result", {})
-        if previous.get("runner") == setting.runner and previous.get("model") == setting.model:
+        if not assignment and previous.get("runner") == setting.runner and previous.get("model") == setting.model:
             session = Session(**previous.get("session", {}))
         request = delegation.request(self.job, action["id"], prompt, setting, tools,
                                      prompt_loader.bash_rules(self.job.builder_bash) if writing else [], session)
+        if assignment:
+            if self.catalog.private_route:
+                request["overrides"].update(self.catalog.private_route)
+            request.update(cwd=str(private), private_worker=True, offered_ids=[m["id"] for m in messages],
+                           evidence_refs=args["context_refs"], closed_context=[
+                *self.run.closed_context, str(self.job.ws), *(str(c.src) for c in self.job.checkouts)])
         if writing:
             b = self.job.b
             if not b.worker_trees and not denied_feedback:
@@ -786,8 +863,13 @@ class Controller:
         worker = delegation.Worker(self.run, action["id"], request)
         worker.writing, worker.effective = writing, args
         try:
-            ledger.transition(self.lease, action["id"], "running", {"pid": worker.pid, "identity": worker.identity,
-                                                                  "effective": args, "writing": writing, "role": role})
+            receipt = {"pid": worker.pid, "identity": worker.identity, "effective": args, "writing": writing, "role": role}
+            if assignment:
+                worker.logical_id, worker.role, worker.admitted = logical_id, role, False
+                worker.offered = [m["id"] for m in messages]
+                exchange.started(self.lease, logical_id, action["id"], receipt)
+            else:
+                ledger.transition(self.lease, action["id"], "running", receipt)
         except BaseException:
             worker.close()
             raise
@@ -800,6 +882,13 @@ class Controller:
         for key, worker in list(self.workers.items()):
             for message in worker.receive():
                 if message.get("event") == "launch":
+                    budget = self.run.budget
+                    if self.exchanged and budget and worker.role in runlimits.REPAIRS and not budget.issue_goal:
+                        reserved = sum(other is not worker and other.role in runlimits.REPAIRS and not other.admitted
+                                       for other in self.workers.values())
+                        if budget.repair_calls + budget.prior_repairs + reserved >= budget.policy.max_repair_cycles:
+                            worker.refuse("the remaining repair allowance is exhausted or reserved for admitted siblings")
+                            continue
                     if self.run.budget:
                         self.run.budget.charge(message["step"], message["role"])
                     grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
@@ -809,6 +898,9 @@ class Controller:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
                     if self.run.feedback and not self.run.step_started:
                         run_lines.write(self.run.id, "work_start")
+                    if self.exchanged and not worker.admitted:
+                        exchange.dispatched(self.lease, worker.logical_id, key, worker.offered)
+                        worker.admitted = True
                     worker.allow(grant)
                     self.run.step_started = True
                     if (self.run.budget and worker.writing and message["role"] in runlimits.REPAIRS
@@ -824,6 +916,11 @@ class Controller:
                     self.run.cost += message.get("cost_usd", 0)
                     self.run.paid += message.get("paid_usd", 0)
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
+                    if self.exchanged:
+                        phase = self.settle_turn(worker, message)
+                        run_lines.write(self.run.id, "action", action=key, worker=worker.logical_id, phase=phase)
+                        changed = True
+                        continue
                     if worker.writing:
                         checkouts = self.job.checkouts
                         excluded = self.run.closed_checkout_paths
@@ -851,6 +948,10 @@ class Controller:
                 del self.workers[key]
                 if self.run.launch_done:
                     self.run.launch_done(worker.step, False)
+                if self.exchanged:
+                    self.settle_turn(worker, {"event": "error", "error": "worker ended without a durable result"})
+                    changed = True
+                    continue
                 ledger.transition(self.lease, key, "interrupted", {"effective": worker.effective,
                                   "error": "worker ended without a durable result", "usage_unknown": True})
                 changed = True
@@ -919,7 +1020,8 @@ class Controller:
                 util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
                 for c in checkouts
             ):
-                if (self.run.environment_release and not self.data.get("ci_failed")
+                merge_verification = self.run.recovery.get("merge_verification") is True
+                if ((self.run.environment_release or merge_verification) and not self.data.get("ci_failed")
                         and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
                     whole = staged if b.from_base else b.restage(from_base=True)
                     return b.validate_diff(whole, after, from_base=True)
@@ -929,6 +1031,8 @@ class Controller:
         b.validate_diff(staged, after)
 
     def publish(self, unverified_measurement: dict | None = None):
+        if self.exchanged:
+            self.worker_barrier()
         self.barrier()
         if pending := ledger.catch_up_push(self.data):
             return self.reconcile_catch_up(pending)
@@ -1207,7 +1311,7 @@ class Controller:
                             return failure
                         self.run.retry_gate_evidence()
                         continue
-                elif hold and self.data.get("catch_up_hold"):
+                elif hold and hold != merge_review.PENDING and self.data.get("catch_up_hold"):
                     return {"park": True, "error": hold}
                 pipeline.report_automerge(self.run, checkout, hold)
                 self.clear_catch_up_hold()
@@ -1452,6 +1556,18 @@ class Controller:
         args, op = action["request"], action["op"]
         if op == "worker.start":
             return self.worker_start(action, args)
+        if self.exchanged and op == "worker.messages":
+            page = self.worker_observation(**args)
+            return {k: page[k] for k in ("messages", "message_cursor", "more_messages")}
+        if self.exchanged and op in ("worker.reply", "worker.steer"):
+            return exchange.queue(self.lease, action, self.validate_scope)
+        if op == "worker.continue" and self.exchanged:
+            w = exchange.workers(self.lease)[args["worker_id"]]
+            prior = next(a for a in ledger.actions(self.lease) if a["id"] == w["id"])
+            effective = {**w["data"]["effective"], **args["settings"], "goal": args["message"]}
+            prior = {**prior, "result": {**prior["result"], "text": w["data"].get("summary", "") +
+                                         "\n" + w["data"].get("reason", "")}}
+            return self.worker_start(action, effective, prior)
         if op == "worker.continue":
             prior = next(a for a in ledger.actions(self.lease) if a["id"] == args["worker_id"])
             if prior["state"] not in ledger.TERMINAL or "effective" not in prior["result"]:
@@ -1465,14 +1581,20 @@ class Controller:
             self.data.setdefault("steering", {}).setdefault(args["worker_id"], []).append(args["message"])
             return {"queued": True, "applies": "next worker turn", "worker_id": args["worker_id"]}
         if op == "worker.cancel":
-            if worker := self.workers.get(args["worker_id"]):
+            attempt = args["worker_id"]
+            if self.exchanged:
+                attempt = exchange.workers(self.lease)[args["worker_id"]]["attempt"]
+            if worker := self.workers.get(attempt):
                 worker.close()
-                del self.workers[args["worker_id"]]
+                del self.workers[attempt]
                 if self.run.launch_done:
                     self.run.launch_done(worker.step, False)
-                ledger.transition(self.lease, args["worker_id"], "cancelled",
-                                  {"reason": args["reason"], "effective": worker.effective, "usage_unknown": True})
-                return {"cancelled": args["worker_id"], "quiescent": True}
+                if not self.exchanged:
+                    ledger.transition(self.lease, attempt, "cancelled", {"reason": args["reason"],
+                                      "effective": worker.effective, "usage_unknown": True})
+                    return {"cancelled": args["worker_id"], "quiescent": True}
+            if self.exchanged:
+                return exchange.cancel(self.lease, args["worker_id"], action["id"], args["reason"], receipt=True)
             return {"cancelled": False, "worker_id": args["worker_id"], "quiescent": True}
         if op == "catalog.list":
             return self.catalog.list(**args)
@@ -1487,6 +1609,8 @@ class Controller:
         if op == "run.wait":
             return self.wait_workers(args["timeout_seconds"])
         self.barrier()
+        if self.exchanged and op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed"):
+            self.worker_barrier()
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
             self.persist()
@@ -1571,7 +1695,8 @@ class Controller:
     def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":
             return
-        if action["op"] != "worker.start" and action["op"] != "worker.continue":
+        if action["op"] not in ("worker.start", "worker.continue") and not (
+                self.exchanged and action["op"] in ("worker.steer", "worker.reply", "worker.cancel")):
             ledger.transition(self.lease, action["id"], "running", {"input_stamp": {
                 "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}})
         refusal = None
@@ -1593,6 +1718,12 @@ class Controller:
         except ValueError as error:
             refusal = error
             result = {"error": str(error)[:2000]}
+            if self.exchanged and action["op"] in ("worker.start", "worker.continue"):
+                wid = action["request"].get("worker_id", action["id"])
+                found = exchange.workers(self.lease).get(wid)
+                if found and found["phase"] == "assigned" and found["attempt"] == action["id"]:
+                    exchange.change(self.lease, wid, "parked", reason=result["error"])
+                    result.update(worker_id=wid, effective=found["data"]["effective"])
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
             if action["id"] in self.workers:
@@ -1605,7 +1736,7 @@ class Controller:
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
             raise
         else:
-            if result is not None:
+            if result is not None and not (self.exchanged and action["op"] in ("worker.steer", "worker.reply", "worker.cancel")):
                 gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
@@ -1634,9 +1765,12 @@ class Controller:
                 snapshot = ledger.snapshot(self.lease)
                 turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.decision_limit)
                 requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
-                response = {"version": PROTOCOL, "decision_id": turn, "state_version": snapshot["version"],
+                response = {"version": self.protocol, "decision_id": turn, "state_version": snapshot["version"],
                             "rationale": f"{requester} of {prior['id']}",
                             "calls": [{"op": prior["op"], "args": prior["request"]}]}
+                if self.exchanged and prior["op"] in ("worker.start", "worker.continue"):
+                    self.worker_barrier()
+                    response["calls"] = [{"op": "worker.start", "args": prior["result"]["effective"]}]
                 try:
                     response = self.catalog.validate(response, turn, snapshot["version"], known,
                                                      enforce_size_limit=False)
@@ -1657,11 +1791,17 @@ class Controller:
                         self.collect()
                         time.sleep(0.05)
                     result = next(a for a in ledger.actions(self.lease) if a["id"] == rerun["id"])
+                    if self.exchanged and (wid := result["result"].get("worker_id")):
+                        phase = exchange.workers(self.lease)[wid]["phase"]
+                        if phase not in ("integrated", "completed"):
+                            return "failed", f"{wid} ended its standalone attempt {phase}; resume the controller", ""
                     return ("step" if result["state"] == "succeeded" else "failed",
                             f"{rerun['id']} {result['state']}; dependent evidence must be refreshed", "")
             while not self.ending:
                 self.collect()
                 pending = [a for a in ledger.actions(self.lease) if a["state"] == "accepted"]
+                if self.exchanged and not pending:
+                    self.resume_ready()
                 for action in pending or self.decide():
                     self.dispatch(action)
                     if self.ending:
@@ -1699,9 +1839,16 @@ class Controller:
                     self.run.launch_done(worker.step, False)
                 ledger.transition(self.lease, key, "interrupted", {"effective": worker.effective,
                                   "error": "controller stopped", "usage_unknown": True})
+                if self.exchanged:
+                    exchange.change(self.lease, worker.logical_id, "parked", resume_interrupted=True,
+                                    reason="controller stopped; candidate retained")
                 del self.workers[key]
             except BaseException as error:
                 errors.append(error)
+        if self.exchanged:
+            for w in exchange.workers(self.lease).values():
+                if w["phase"] not in exchange.CLOSED and not w["data"].get("reason"):
+                    exchange.change(self.lease, w["id"], w["phase"], reason="controller ended; retained for continuation")
         self.release_merge_lease()
         if errors:
             raise errors[0]
@@ -1713,8 +1860,8 @@ def orchestrate_ask(flow, request):
     return factory.Outcome("pass")
 
 
-def orchestrate(flow):
-    return Controller(flow).drive()
+def orchestrate(flow, *, max_builders=None):
+    return Controller(flow, max_builders=max_builders).drive()
 
 
 def single_worker(flow):

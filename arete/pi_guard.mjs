@@ -167,6 +167,8 @@ export default function (pi) {
             if (writing) rememberWrites();
             const blocked = (path, stat = info(path)) => {
                 const real = canonical(path);
+                if (metadata.workspace && (!within(resolve(metadata.workspace), path)
+                    || !within(canonical(metadata.workspace), real))) return true;
                 if (secret(path) || secret(real) || (stat?.isFile() && stat.nlink > 1)) return true;
                 if (writing && metadata.write_roots.some(root => within(resolve(root), path)
                     || within(canonical(root), real))) return true;

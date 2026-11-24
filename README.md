@@ -1064,7 +1064,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
-| `[orchestration]` | Finite adaptive limits: `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, `progress_seconds = 30`; each is an integer from 1 to 10000. See [Orchestration](docs/orchestration.md). |
+| `[orchestration]` | `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, and `progress_seconds = 30`. Set `max_builders = 1` to pilot addressed worker turns, or `2` to allow two private builders on independent work. Each configured limit takes an integer from 1 to 10000. [Orchestration](docs/orchestration.md) |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
@@ -1313,9 +1313,13 @@ Disable new supervised admissions by removing the repository from `repos` or set
 
 Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
 GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
-JEV must complete its risk screen on the diff and not hold it.
+JEV must complete its risk screen on the diff.
+For approved issues enrolled in durable orchestration on an `automerge` repo, the issue orchestrator decides whether to merge, request revisions or wait.
+It receives the risk assessment, verified behavior, review and diff for the exact head and base. Its decision and reason are recorded with the issue.
+The host rechecks authorization, GitHub readiness and CI before performing an approved squash merge.
+On other delivery paths a JEV risk hold leaves the merge with a person.
 Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
-It never arms a later merge and leaves changes spanning repositories for a person.
+The durable monitor can pick up a verified PR when its checks turn green. Changes spanning repositories require separate merge coordination.
 Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
 #### One-shot delivery pilot with owner merge
@@ -2325,7 +2329,7 @@ auto_per_refresh = 50
 
 `auto` defaults to false and allows ready owner-authored GitHub issues and assigned Jira tickets into their configured pipeline repos.
 It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receives its repository route label.
-`agent:auto` preserves the requirement for a person to merge even if label publication succeeds before the local approval record is saved.
+`agent:auto` records automatic admission even if label publication succeeds before the local approval record is saved.
 JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
 `no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
 Issues labelled `loop` stay with their dedicated loop-intake workflow.
@@ -2336,7 +2340,7 @@ Research and person work stay on their existing routes rather than acquiring `ag
 The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
 Existing `[jira] auto = true` remains supported and retains its own `auto_per_refresh` limit and sprint scope, including when the new general switch is on.
 Automatic admission never increases concurrency, bypasses dependencies or changes run budgets.
-A PR from automatic triage never automerges, whatever the repo's trust level.
+For enrolled issues in an `automerge` repo, the durable issue orchestrator reviews the assumptions and checks from triage before deciding whether to merge. On other paths, a person merges PRs from automatic triage.
 Sent tickets remain on the board for seven days with their pipeline status and PR.
 
 `route_fixes` defaults to false and independently enables classification of already-approved issues before scheduling or direct execution.

@@ -826,6 +826,8 @@ def _run(
     issue_session: tuple[str, str] | None = None,
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
+    private_worker: bool = False,
+    private_hidden: tuple[Path, ...] = (),
     native_observation: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
@@ -873,7 +875,18 @@ def _run(
                selected.provider, launch_model, effort]
     confined = False
     writing = sorted(WRITING & set(names))
-    if writing or observing:
+    if private_worker:
+        if add_dirs or resume.id or persist or ask_owner or not sandbox.can_confine(False):
+            raise ValueError("private Pi workers require a fresh local confined invocation")
+        floor = replace(floor, open=(cwd,))
+        call = selected.view
+        cmd = sandbox.write_confinement(
+            cwd, [call], selected.owner if selected.using_login else None,
+            agent_roots=False, private_temporary=True, peers=paths.WORKTREES_DIR,
+            hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR, *private_hidden),
+            state=(paths.STATE_DIR, (cwd, call, selected.owner, paths.PACKAGE_DIR))) + cmd
+        confined = True
+    elif writing or observing:
         if not sandbox.can_confine(False):
             return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot run confined commands here",
                           session=resume, runner="pi", model=model)
@@ -889,6 +902,10 @@ def _run(
                        delegation_only=delegation_only, shell=pi_shell.TOOL in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
+    if private_worker:
+        protection["workspace"] = str(cwd)
+        env["ARETE_PI_GUARD_PATHS"] = json.dumps(protection)
+        env["TMPDIR"] = str(folder)
     env.pop("ARETE_PI_OBSERVE", None)
     if observing:
         env["ARETE_PI_OBSERVE"] = native_observation

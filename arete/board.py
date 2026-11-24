@@ -379,7 +379,7 @@ def run_rows(rows: list[dict]) -> list[dict]:
              "loop": r.get("loop") or "", "repo": r["repo"] or ""} for r in rows]
 
 
-def run_board(run_id: str) -> dict:
+def run_board(run_id: str, *, messages_after=0) -> dict:
     with foundation.one_read():
         if not re.fullmatch(r"\w[\w.-]*", run_id):
             raise NotARunId(f"'{run_id}' is not an id.")
@@ -404,7 +404,7 @@ def run_board(run_id: str) -> dict:
                        for m in models.values()),
                       key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["billing"]))
         spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
-        adaptive = orchestration_store.view(run_id, connect=foundation.reader)
+        adaptive = orchestration_store.view(run_id, connect=foundation.reader, messages_after=messages_after)
         if adaptive:
             adaptive["workspace_retained"] = not flows.action_workspace_refusal(run_id)
         recovery = unblock_store.get(r["repo"], str(r["issue"]), connect=foundation.reader) if r["issue"] else {}

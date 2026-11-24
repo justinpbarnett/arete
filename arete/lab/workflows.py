@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 from .. import agent, codebase, config, factory, flows, paths, pipeline, record, util, workspace
@@ -22,11 +23,18 @@ EXECUTORS = ("fixed", "single-worker", "orchestrated")
 def designed(data: dict, carried=None, follow=False):
     if data.get("executor") != "workflow" or "atom" in data or follow:
         raise experiment.Refused("whole-workflow designs use executor = 'workflow', no atom and no optimizer")
-    modes, arms = {}, {}
+    modes, arms, caps = {}, {}, {}
     for name, arm in experiment.section(data, "arms").items():
         if not isinstance(arm, dict) or arm.get("executor") not in EXECUTORS:
             raise experiment.Refused(f"arms.{name}.executor must be one of {', '.join(EXECUTORS)}")
-        modes[name], arms[name] = arm["executor"], {key: value for key, value in arm.items() if key != "executor"}
+        if "max_builders" in arm:
+            if arm["executor"] != "orchestrated":
+                raise experiment.Refused(f"arms.{name}.max_builders requires the orchestrated executor")
+            try:
+                caps[name] = config.orchestration_table({"max_builders": arm["max_builders"]}).max_builders
+            except ValueError as error:
+                raise experiment.Refused(str(error)) from error
+        modes[name], arms[name] = arm["executor"], {k: v for k, v in arm.items() if k not in ("executor", "max_builders")}
     normalized = {key: value for key, value in data.items() if key != "executor"}
     exp = experiment.designed({**normalized, "atom": "build", "arms": arms}, carried)
     if exp.extras:
@@ -38,11 +46,13 @@ def designed(data: dict, carried=None, follow=False):
     exp.design["workflow_sha"] = fingerprint(exp.cfg, exp.layer)
     for name, mode in modes.items():
         exp.design["arms"][name]["executor"] = mode
+        if name in caps:
+            exp.design["arms"][name]["max_builders"] = caps[name]
     for role in ("orchestrate", "plan", "verify", "review", "check_repair", "review_repair", "ci_repair"):
         setting = pipeline.steps.resolve(exp.cfg, exp.layer, role)
         exp.design.setdefault("workflow_settings", {})[role] = experiment.effective(exp.cfg, setting)
     exp.digest = experiment.sha_json(exp.design)[:12]
-    exp.make_run = lambda designed, arm, given: experiment.TrialRun(**given, executor=modes[arm])
+    exp.make_run = lambda designed, arm, given: experiment.TrialRun(**given, executor=modes[arm], max_builders=caps.get(arm))
     return exp
 
 
@@ -113,6 +123,12 @@ def child():
     budget = CandidateBudget(spec["limits"], repo.name, ticket, root, layer.orchestration.max_workers)
     path = {"fixed": "feature", "single-worker": "single_worker", "orchestrated": "orchestrate"}[spec["executor"]]
     drive = pipeline.flow_function(cfg, path)
+    if "max_builders" in spec:
+        from .. import orchestration
+
+        if path != "orchestrate":
+            raise ValueError("builder trial cap requires the orchestrated executor")
+        drive = partial(orchestration.orchestrate, max_builders=spec["max_builders"])
     code = pipeline.run_issue(repo.name, ticket, dry_run=True,
                               script=pipeline.Script(path, drive, overrides=spec["overrides"]),
                               admission=budget.admit, launch_done=budget.done,
@@ -124,6 +140,14 @@ def child():
                "workspace": prepared.get("checkouts", [{}])[0].get("wt", ""), "launches": budget.calls,
                "unknown_usage": bool(budget.unknown_usd or budget.unknown_tokens or budget.pending),
                "facts": pipeline.seam_facts(row["id"])}
+    if spec.get("max_builders"):
+        from ..store import orchestration
+
+        detail = orchestration.view(row["id"]) or {}
+        summary["workers"] = {"max_builders": spec["max_builders"],
+                              "peak_builders": max((a["result"].get("active_builders", 0)
+                                                    for a in detail.get("actions", [])), default=0),
+                              "conflicts": sum(w.get("conflicts", 0) for w in detail.get("workers", []))}
     util.write_durably(root / "result.json", json.dumps(summary).encode(), 0o600)
 
 
@@ -131,7 +155,12 @@ def execute(cfg, run, layer, wt, task):
     if run.executor not in EXECUTORS:
         raise workspace.RunFailed("unknown workflow executor")
     root = Path(tempfile.mkdtemp(prefix="workflow-", dir=run.dir))
-    private = root / "config"
+    runtime = root
+    if run.max_builders is not None:
+        # The parent experiment state (including grading material) stays closed to every model.
+        # Keep the child runtime outside that boundary so its private worktrees can be opened.
+        runtime = Path(tempfile.mkdtemp(prefix="workflow-runtime-", dir=paths.STATE_DIR.parent))
+    private = runtime / "config"
     private.mkdir(mode=0o700)
     repo_name = "workflow-" + root.name.removeprefix("workflow-")
     origin = root / "origin.git"
@@ -153,9 +182,12 @@ def execute(cfg, run, layer, wt, task):
                "overrides": run.step_overrides, "limits": limits,
                "closed_context": [str(paths.STATE_DIR), str(paths.CONFIG_DIR), str(paths.WORKTREES_DIR),
                                   str(run.repo.path), str(layer.dir / "evals")]}
+    if run.max_builders is not None:
+        request["runtime"] = str(runtime)
+        request["max_builders"] = run.max_builders
     util.write_durably(root / "request.json", json.dumps(request).encode(), 0o600)
-    environment = {**os.environ, "ARETE_CONFIG_DIR": str(private), "ARETE_STATE_DIR": str(root / "state"),
-                   "ARETE_LOG_DIR": str(root / "logs"), "ARETE_WORKTREES_DIR": str(root / "worktrees")}
+    environment = {**os.environ, "ARETE_CONFIG_DIR": str(private), "ARETE_STATE_DIR": str(runtime / "state"),
+                   "ARETE_LOG_DIR": str(runtime / "logs"), "ARETE_WORKTREES_DIR": str(runtime / "worktrees")}
     environment.pop("ARETE_RUN_ID", None)
     command = [sys.executable, "-I", "-c", (f"import sys;sys.path.insert(0,{str(paths.PACKAGE_DIR.parent)!r});"
                "from arete.lab.workflows import child;child()"), str(root)]
@@ -193,6 +225,7 @@ def execute(cfg, run, layer, wt, task):
                      "worker_calls": sum(row["step"].startswith("worker-") for row in imported),
                      "owner_interventions": int(result["run"]["status"] == "needs-info"),
                      "workflow_status": result["run"]["status"], "engine_facts": result["facts"]}
+    run.execution.update(result.get("workers", {}))
     if result["unknown_usage"]:
         run.stopped_by = "workflow reported uncertain usage; reconcile before continuing the experiment"
     if result["unknown_usage"] or result["run"]["status"] != "dry-run":

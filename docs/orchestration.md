@@ -49,6 +49,64 @@ Like the main engine, it applies the selected runner's model confinement rather 
 Its fixed engine entrypoint, isolated imports, immutable policy checks, parent-admitted launches and supervised process group remain separate from model tools and execution.
 The model retains the runner's filesystem confinement, JEV/tool checks and closed-context restrictions.
 
+## Worker questions and parallel builders
+
+Set `max_builders` in the repository layer to opt new orchestrated lineages into worker protocol 2.
+Start a pilot at one and use two for a comparison on independent work.
+
+```toml
+[orchestration]
+max_workers = 3
+max_builders = 2
+```
+
+Layers using a different runner for ordinary build or plan steps can select a local Pi model specifically for
+private workers with `private_worker_model = "openai/gpt-6.2-sol"` under `[orchestration]`. The route is
+pinned per lineage. Private workers read repository instructions inside their checkout and run with Pi's fresh
+session, without external instruction files or MCP servers. Provider admission and layer payment policy apply.
+
+Both limits take integers from 1 through 10000. Each active worker occupies a worker slot.
+The builder ceiling is the smaller limit. The controller can use fewer slots.
+Omitting `max_builders` selects the original protocol and its exclusive writer. Setting it to one keeps the
+question and receipt protocol with serial builders. Existing lineages retain their recorded mode and ceilings.
+Local Pi on macOS and replay support private turns. Unavailable confinement, unsupported build routes,
+submodules, tracked credentials, shared copy inputs or closed checkouts select the serial protocol during
+preparation. The run log records the reason.
+
+Each writing assignment declares a goal, concrete checkout-relative files or directories, and a focused
+acceptance check. A directory claim includes its descendants. In a workspace with several checkouts, prefix each
+claim with its checkout directory. A batch of disjoint starts shares a snapshot of the currently accepted files.
+Each turn gets a private working directory. Git objects and indexes belong to the engine. A fresh invocation
+receives its retained files, previous summary, and the messages addressed to it.
+
+A worker ends a turn with one version-2 JSON object. For example:
+
+```json
+{"version":2,"outcome":"question","text":"Which status should a paused task display?","ack_ids":[]}
+```
+
+The other outcomes are `done` and `handoff`. A question holds its files and claim, and releases its compute
+slot. Use `worker.reply` with the logical worker ID, question ID and answer. An optional replacement
+`write_paths` list revises the claim after the engine checks it. The scheduler admits ready turns before
+requesting another decision. Use `worker.steer` to guide an active sibling at its next turn. A saved message is
+`queued`. A launch carrying it is `dispatched`. The receiving worker returns the offered IDs in `ack_ids`
+before the engine records `acknowledged`. A failed or malformed turn retains its messages for one automatic
+retry. A second failure parks the worker for an explicit continuation. Waiting for an owner answer preserves
+the logical worker and its files across controller generations. Use `worker.messages` with a sequence cursor
+to page the exchange.
+
+The Actions view shows logical worker, current attempt, phase, open question and message history.
+An integrated candidate contributes its summary to the combined build. Clean edits can finish in either order.
+A conflict keeps the original candidate. Continue that worker to resolve a textual conflict against the accepted
+tree, or correct a rejected path inside the private copy. Cancel a superseded assignment to release the claim.
+The engine checks the combined tree before publication. Standalone reruns require settled workers and receive
+fresh candidates.
+
+Integration records each checkout's preimage and postimage before applying changes. Resume an interrupted run
+with the existing continuation command. If a checkout matches neither image, the worker reports
+`reconciliation-required`. Inspect the retained candidate and delivery files before restoring a recorded image
+and resuming. Publishing and final gates require every worker to settle.
+
 ## Follow and control
 
 Use the ordinary task-start, status, wait, lines, stop, answer, resume, records and cost surfaces.
@@ -99,13 +157,15 @@ Unknown fields, unauthorized routes/context, oversized payloads and invalid depe
 Repeated identical receipts are idempotent; conflicting content under the same identity is refused.
 Catalog prices that are unavailable remain unknown rather than zero.
 
-Read-only delegates may overlap within `max_workers`; implementation and mutation-capable gates serialize.
+In protocol 1, read-only delegates may overlap within `max_workers` and writers serialize.
+In protocol 2, independent private workers can overlap. Mutation-capable gates run on the settled delivery tree.
 Every provider launch requests parent admission, including route fallback.
 The controller records all inference launches.
 Issue goals have unlimited cumulative decisions, actions, verification time, active runtime and repair cycles.
 Other runs charge fallback launches against the launch ceiling.
 An exempt wait releases one launch charge, and malformed responses consume admitted work.
-Writing again consumes a semantic repair allowance regardless of the worker's name.
+A new writing assignment after the initial split consumes a repair allowance regardless of its name.
+Continuations retain the role of their original assignment. Every repair launch is charged.
 Existing run/verification deadlines, data/payment policy and device/run admission remain authoritative.
 Adaptive structured review/verification excludes transports with hidden ungateable schema-restatement launches.
 Pi returns its structured answer from the admitted invocation or fails that call without launching a restatement.
@@ -197,6 +257,17 @@ The single-worker executor omits planning/controller inference while retaining i
 Hidden acceptance files are installed only after candidate execution finishes, and grading stays independent and fixed.
 Candidate tools are denied the original source repository and parent experiment state/config/worktrees.
 Whole-workflow arms share registered prompts/context; atom-only prompt/context overrides and optimizers are refused.
+
+Paired orchestrated arms may each specify `max_builders`. For example, use `executor = "orchestrated"` for
+both arms, with caps of one and two. Pin the same task commits, routes, acceptance checks and budgets. Trial
+outcomes record the configured ceiling, peak admitted builders and conflict count. Compare median elapsed time
+to accepted delivery, acceptance rate and cost per acceptance including failed attempts. Report the paired sample
+size, uncertainty, controller calls, owner interventions and rework. Trial timing includes that ticket's own waits.
+Measure queue delay for other tickets in the same worker pool separately.
+
+The proposed threshold for promoting two builders to the default is at least 20% lower median accepted-delivery
+time on eligible tickets, with acceptance at least as high and cost per acceptance at most as high. Keep two
+opt-in while the model-backed comparison is inconclusive. Setting the layer cap to one rolls back new runs.
 
 Shared finite experiment limits govern admitted calls, concurrent token/spend reservations and elapsed time.
 A grant only narrows a launch's existing limits.

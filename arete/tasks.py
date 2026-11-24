@@ -772,6 +772,14 @@ def adaptive_action(row: dict, action: str) -> dict:
     if source:
         lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
         found = next((a for a in orchestration.actions(lease) if a["id"] == action), None)
+        if found and source["data"].get("protocol") == 2:
+            from .store import worker_exchange
+
+            if any(w["phase"] not in worker_exchange.CLOSED for w in worker_exchange.workers(lease).values()):
+                raise control.Refused("resume the controller to settle outstanding workers before rerunning an action")
+            if found["state"] not in orchestration.TERMINAL or (
+                    found["op"] in ("worker.start", "worker.continue") and not found["result"].get("effective")):
+                raise control.Refused("the action has no finished invocation to rerun")
         if found and found["op"] in ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"):
             return found
     raise control.Refused("adaptive controls require a worker/check/review/verification action ID from run details, "
