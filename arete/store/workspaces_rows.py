@@ -15,8 +15,6 @@ from .. import workspace_rows as workspace
 from . import asks, events, runs, writes
 from .db import reader, require_workspace_contract
 
-TABLES = {"workspaces": "kept, including removed rows", "workspace_files": "with workspace"}
-
 JSON_FIELDS = ("checkouts", "held_by", "heads", "onto", "retained", "release_excluded")
 CHANGE_FIELDS = ("state", "kept_reason", "owner_run")
 WRITABLE = frozenset((*JSON_FIELDS, *CHANGE_FIELDS, "repo", "ticket", "remove_asked_by", "made_at",

@@ -117,10 +117,13 @@ WORKSPACE_CONTRACT_SCHEMA = 28
 
 
 def workspace_rows_installed():
-    if not paths.DB_FILE.is_file():
+    try:
+        with closing(connect_db(paths.DB_FILE, readonly=True)) as c:
+            return c.execute("PRAGMA user_version").fetchone()[0] >= WORKSPACE_CONTRACT_SCHEMA
+    except (OSError, sqlite3.Error):
+        # Recovery commands must still start when the database is unavailable.
+        # A schema-27 process refuses the schema-28 writer floor on every new database.
         return False
-    with closing(connect_db(paths.DB_FILE, readonly=True)) as c:
-        return c.execute("PRAGMA user_version").fetchone()[0] >= WORKSPACE_CONTRACT_SCHEMA
 
 
 # A process keeps one workspace protocol throughout its lifetime. The activation
@@ -200,6 +203,8 @@ def migrate(contracts=True):
         conn.row_factory = sqlite3.Row
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= WORKSPACE_CONTRACT_SCHEMA and not WORKSPACE_ROWS_ACTIVE:
+                raise IncompatibleSchema("restart this process to use schema 28 workspace rows")
             migrations.validate(conn, chain, version)
             conn.close()
             conn = None
