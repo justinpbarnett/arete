@@ -13,7 +13,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .. import config, paths, util, workspace
-from . import events, runs, writes
+from . import db, events, runs, writes
 from .db import migrate_on_demand, reader
 
 TABLES = {"workspaces": "kept, including removed rows", "workspace_files": "with workspace"}
@@ -824,3 +824,11 @@ def sweep(cfg: config.Config) -> None:
                 _sweep_unowned(cfg, folder, cutoff)
     finally:
         workspace.prune_repos(cfg)
+
+
+# When rolling back after cutover, the installed database owns workspace state.
+if db.WORKSPACE_ROWS_ACTIVE:
+    import sys
+    from . import workspaces_rows
+
+    sys.modules[__name__] = workspaces_rows

@@ -7,7 +7,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -113,8 +113,24 @@ TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["ru
                 "orchestration_actions": ("at",)}
 TIME_GLOB = time_shape.TIME_GLOB
 
+WORKSPACE_CONTRACT_SCHEMA = 28
+
+
+def workspace_rows_installed():
+    try:
+        with closing(connect_db(paths.DB_FILE, readonly=True)) as c:
+            return c.execute("PRAGMA user_version").fetchone()[0] >= WORKSPACE_CONTRACT_SCHEMA
+    except (OSError, sqlite3.Error):
+        # Recovery commands must still start when the database is unavailable.
+        # A schema-27 process refuses the schema-28 writer floor on every new database.
+        return False
+
+
+# A process keeps one workspace protocol throughout its lifetime. The activation
+# release waits for users of the legacy protocol before committing the contract.
+WORKSPACE_ROWS_ACTIVE = workspace_rows_installed()
 _CHAIN = migrations.load()
-LATEST = _CHAIN[-1].n
+LATEST = _CHAIN[-1].n if WORKSPACE_ROWS_ACTIVE else WORKSPACE_CONTRACT_SCHEMA - 1
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
 SECRET_REGISTRY_SCHEMA = 27
@@ -187,12 +203,16 @@ def migrate(contracts=True):
         conn.row_factory = sqlite3.Row
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= WORKSPACE_CONTRACT_SCHEMA and not WORKSPACE_ROWS_ACTIVE:
+                raise IncompatibleSchema("restart this process to use schema 28 workspace rows")
             migrations.validate(conn, chain, version)
             conn.close()
             conn = None
             snapshot = None
             started_chain = False
             for migration in chain:
+                if migration.n == WORKSPACE_CONTRACT_SCHEMA and not WORKSPACE_ROWS_ACTIVE:
+                    break
                 if migration.n <= version:
                     continue
                 if migration.phase == "contract":
@@ -590,3 +610,7 @@ def enable_wal():
             raise RuntimeError("arete.db refused WAL mode")
     finally:
         conn.close()
+
+
+def require_workspace_contract():
+    migrate_on_demand(WORKSPACE_CONTRACT_SCHEMA)

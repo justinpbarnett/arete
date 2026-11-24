@@ -525,6 +525,43 @@ class _WorkspaceChildCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class WorkspaceRollbackProtocolTests(_WorkspaceChildCase):
+    def test_bridge_keeps_legacy_writes_until_a_fresh_process_observes_the_contract(self):
+        self.run_child(r"""
+import subprocess
+import sys
+
+db.migrate()
+with db.one_read() as conn:
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 27
+workspaces.create("parked", state="held", held_by=["operator-note"], kept_reason="operator")
+legacy = paths.STATE_DIR / "workspaces"
+legacy.mkdir(exist_ok=True)
+contract = db.migrations.load()[-1]
+with db.tx() as conn:
+    contract.apply(conn, legacy)
+    conn.execute("INSERT INTO schema_migrations (n,name,area,phase,sha256,applied,backup,seconds) "
+                 "VALUES (?,?,?,?,?,?,'',0)", (contract.n, contract.name, contract.area, contract.phase,
+                                                  contract.sha256, util.iso()))
+    conn.execute("UPDATE schema_meta SET value = '28' WHERE key = 'schema_version'")
+    conn.execute("PRAGMA user_version = 28")
+with case.assertRaises(db.IncompatibleSchema):
+    db.migrate()
+
+code = '''from arete import workspace
+from arete.store import db, workspaces
+assert db.LATEST == 28 and not db.migrate()
+assert workspace.held_summary()["rows"][0]["names"] == ["operator-note"]
+row = workspaces.open_for("parked")
+assert workspaces.change(row, kept_reason="retained after rollback")["version"] == row["version"] + 1
+'''
+result = subprocess.run([sys.executable, "-IB", "-c",
+                         "import sys; sys.path.insert(0, sys.argv[1]); " + code, str(paths.PACKAGE_DIR.parent)],
+                        text=True, capture_output=True, timeout=5)
+assert result.returncode == 0, result.stderr
+""")
+
+
 class WorkspaceOwnerRecordTests(_WorkspaceChildCase):
     def test_owner_rows_match_legacy_records_and_single_step_keeps_owner(self):
         self.run_child(r"""

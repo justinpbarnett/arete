@@ -934,3 +934,11 @@ def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str]
                         git(["worktree", "remove", "--force", str(c.wt)], c.src)
                 add_worktree(c, branch, start_of(c, starting_branch))
             clone["resumed"] = c.resumes
+
+
+# When rolling back after cutover, the installed database owns workspace state.
+if db.WORKSPACE_ROWS_ACTIVE:
+    import sys
+    from . import workspace_rows
+
+    sys.modules[__name__] = workspace_rows
