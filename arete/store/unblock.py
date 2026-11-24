@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import timedelta
 
 from .. import util
 from .db import db, reader, tx
@@ -49,6 +48,17 @@ def get(repo: str, ticket: str, *, connect=reader) -> dict:
     return dict(row) if row else {}
 
 
+def follow(repo: str, ticket: str, run: str) -> bool:
+    with tx() as c:
+        result = c.execute("""INSERT INTO unblock_cases
+                  (repo,ticket,source,cause,fingerprint,generation,snapshot,phase,detail,updated)
+                  VALUES (?,?,?,'goal','monitor',1,'{}','resuming','Following delivery',?)
+                  ON CONFLICT(repo,ticket) DO UPDATE SET source=excluded.source, phase='resuming',
+                  detail=excluded.detail, due=0, updated=excluded.updated
+                  WHERE unblock_cases.phase IN ('resolved','cancelled')""", (repo, ticket, run, util.iso()))
+        return bool(result.rowcount)
+
+
 def observe(repo: str, ticket: str, cause: str, fingerprint: str, snapshot: dict) -> dict:
     with tx() as c:
         current = get(repo, ticket, connect=db)
@@ -82,21 +92,9 @@ def begin(case: dict) -> str:
     return attempt
 
 
-def diagnosis_left(case: dict, *, connect=reader) -> bool:
-    with connect() as c:
-        total = c.execute("SELECT COALESCE(SUM(launched), 0) FROM unblock_attempts "
-                          "WHERE repo=? AND ticket=? AND fingerprint=?",
-                          (case["repo"], case["ticket"], case["fingerprint"])).fetchone()[0]
-        return total < 2
-
-
 def launched(attempt: str) -> bool:
     with tx() as c:
-        row = c.execute("SELECT * FROM unblock_attempts WHERE id=?", (attempt,)).fetchone()
-        if not diagnosis_left(row, connect=db):
-            return False
-        c.execute("UPDATE unblock_attempts SET launched=launched+1 WHERE id=?", (attempt,))
-        return True
+        return bool(c.execute("UPDATE unblock_attempts SET launched=launched+1 WHERE id=?", (attempt,)).rowcount)
 
 
 def decide(case: dict, attempt: str, decision: dict, grant: dict) -> None:
@@ -122,20 +120,10 @@ def latest_attempt(case: dict) -> dict:
                                 (case["repo"], case["ticket"], case["generation"])).fetchone())
 
 
-def allowance(case: dict, *, connect=reader) -> bool:
-    since = (util.now() - timedelta(days=1)).isoformat()
-    with connect() as c:
-        same, today = c.execute("SELECT COUNT(CASE WHEN fingerprint=? THEN 1 END), "
-                                "COUNT(CASE WHEN used>=? THEN 1 END) FROM unblock_attempts "
-                                "WHERE repo=? AND ticket=? AND child<>''",
-                                (case["fingerprint"], since, case["repo"], case["ticket"])).fetchone()
-    return same < 2 and today < 3
-
-
 def register(case: dict, attempt: str, run: str) -> None:
     with tx() as c:
         current = get(case["repo"], case["ticket"], connect=db)
-        if current.get("generation") != case["generation"] or not allowance(case, connect=db):
+        if current.get("generation") != case["generation"]:
             raise ValueError("recovery grant no longer available")
         if not c.execute("UPDATE unblock_attempts SET child=?, used=? WHERE id=? AND child=''",
                          (run, util.iso(), attempt)).rowcount:

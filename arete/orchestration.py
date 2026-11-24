@@ -92,6 +92,7 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
 
 
 class Controller:
+    issue_goal = False
     merge_lease: TextIO | None = None
     starts_new_lineage = False
 
@@ -116,8 +117,17 @@ class Controller:
         inherited = self.data.get("step_overrides", {})
         self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
                                   for role in inherited.keys() | self.run.step_overrides.keys()}
+        self.issue_goal = getattr(self.run.budget, "issue_goal", False) is True
         self.catalog = None
         self.last_progress, self.ending = -inf, None
+
+    @property
+    def decision_limit(self):
+        return None if self.issue_goal else self.policy.max_decisions
+
+    @property
+    def action_limit(self):
+        return None if self.issue_goal else self.policy.max_actions
 
     def persist(self):
         self.data["job"] = {name: getattr(self.job, name) for name in STATE_FIELDS}
@@ -611,7 +621,8 @@ class Controller:
                              "result": self.excerpt(a)} for a in actions[-limit:]],
                 "progress": self.progress, "evidence": {name: {**value, "current": self.current(name)}
                                                         for name, value in self.data.get("evidence", {}).items()},
-                "limits": {**asdict(self.policy), "decisions_used": snapshot["turns"],
+                "limits": {**asdict(self.policy), "max_decisions": self.decision_limit,
+                           "max_actions": self.action_limit, "decisions_used": snapshot["turns"],
                            "launches_used": snapshot["launches"], "actions_used": len(all_actions),
                            "repair_cycles": self.run.budget.repair_calls if self.run.budget else 0},
                 "error": self.data.get("error", "")}
@@ -638,7 +649,7 @@ class Controller:
                         grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                             if self.run.launch_gate else None
                         if not retried:
-                            ledger.launched(self.lease, self.policy.max_decisions)
+                            ledger.launched(self.lease, self.decision_limit)
                         if self.run.feedback and not self.run.step_started:
                             run_lines.write(self.run.id, "work_start")
                         controller.allow(grant)
@@ -661,7 +672,7 @@ class Controller:
 
     def decide(self):
         observation = self.observe()
-        turn = ledger.begin(self.lease, observation, self.policy.max_decisions)
+        turn = ledger.begin(self.lease, observation, self.decision_limit)
         observation["decision_id"] = turn
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
@@ -670,6 +681,8 @@ class Controller:
         for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
             request = delegation.request(self.job, turn, prompt, setting, (), [])
             request.update(step=f"orchestrate-{turn}", cwd=str(place))
+            if self.issue_goal:
+                request.update(goal_ticket=str(self.run.tid), goal_event=f"{self.run.id}/{turn}")
             result = self.controller_turn(turn, request, retried=retry > 0)
             if not stalled_before_reply(result):
                 break
@@ -689,7 +702,7 @@ class Controller:
                 response = json_from_text(result.get("text", ""))
             calls = self.catalog.validate(response, turn, observation["state_version"],
                                           {a["id"]: a for a in ledger.actions(self.lease)})
-            actions = ledger.accept(self.lease, turn, observation["state_version"], calls, self.policy.max_actions)
+            actions = ledger.accept(self.lease, turn, observation["state_version"], calls, self.action_limit)
             self.data.pop("error", None)
             if self.run.answers_due:
                 ask_store.asks_taken([a["id"] for a in self.run.answers_due], self.run.id)
@@ -742,7 +755,7 @@ class Controller:
             contexts = "\n\n".join(filter(None, (self.job.triage, contexts)))
         direction = self.run.recovery.get("direction")
         if (writing or name == "plan") and isinstance(direction, str) and direction:
-            contexts += "\n\nArete unblocker guidance (does not change acceptance criteria):\n" + direction
+            contexts += "\n\nIssue orchestrator guidance (does not change acceptance criteria):\n" + direction
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
@@ -1596,7 +1609,8 @@ class Controller:
                 gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
-                ledger.transition(self.lease, action["id"], "failed" if "error" in result else "succeeded", result)
+                state = "failed" if action["op"] != "run.observe" and "error" in result else "succeeded"
+                ledger.transition(self.lease, action["id"], state, result)
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
@@ -1618,7 +1632,7 @@ class Controller:
                 if prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL:
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
                 snapshot = ledger.snapshot(self.lease)
-                turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.policy.max_decisions)
+                turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.decision_limit)
                 requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
                 response = {"version": PROTOCOL, "decision_id": turn, "state_version": snapshot["version"],
                             "rationale": f"{requester} of {prior['id']}",
@@ -1629,7 +1643,7 @@ class Controller:
                 except (ValueError, TypeError) as error:
                     ledger.reject(self.lease, turn, str(error)[:2000])
                     raise factory.Refused(f"cannot rerun {prior['id']} under the current catalog: {error}") from error
-                rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.policy.max_actions)[0]
+                rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.action_limit)[0]
                 self.dispatch(rerun)
                 if self.run.environment_release:
                     if self.ending:

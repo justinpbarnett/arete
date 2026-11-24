@@ -113,10 +113,10 @@ def save(lease: Lease, data: dict) -> None:
                   (encoded(data), util.iso(), lease.root))
 
 
-def begin(lease: Lease, observation: dict, maximum: int) -> str:
+def begin(lease: Lease, observation: dict, maximum: int | None) -> str:
     with tx() as c:
         row = fenced(c, lease)
-        if row["turns"] - unchanged_waits(c, lease.root) >= maximum:
+        if maximum is not None and row["turns"] - unchanged_waits(c, lease.root) >= maximum:
             raise Limit(f"controller used its {maximum} decision allowance")
         turn = f"d{row['turns'] + 1:04d}"
         c.execute("INSERT INTO orchestration_turns VALUES (?,?,?,?,?,?,?)",
@@ -139,10 +139,10 @@ def pending(lease: Lease) -> list[dict]:
             "SELECT * FROM orchestration_turns WHERE root = ? AND state = 'pending'", (lease.root,))]
 
 
-def launched(lease: Lease, maximum: int) -> None:
+def launched(lease: Lease, maximum: int | None) -> None:
     with tx() as c:
         row = fenced(c, lease)
-        if row["launches"] - unchanged_waits(c, lease.root) >= maximum:
+        if maximum is not None and row["launches"] - unchanged_waits(c, lease.root) >= maximum:
             raise Limit(f"controller used its {maximum} inference-launch allowance")
         c.execute("UPDATE orchestrations SET launches = launches + 1 WHERE root = ?", (lease.root,))
 
@@ -154,7 +154,7 @@ def reject(lease: Lease, turn: str, error: str) -> None:
                   (encoded({"error": error}), lease.root, turn))
 
 
-def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) -> list[dict]:
+def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int | None) -> list[dict]:
     body = encoded(response)
     with tx() as c:
         current = fenced(c, lease)
@@ -166,12 +166,13 @@ def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) 
             if earlier["response"] != body:
                 raise Conflict("decision identity reused with different content")
             return [decoded(r) for r in c.execute(
-                "SELECT * FROM orchestration_actions WHERE root = ? AND turn = ? ORDER BY id", (lease.root, turn))]
+                "SELECT * FROM orchestration_actions WHERE root = ? AND turn = ? ORDER BY rowid", (lease.root, turn))]
         if earlier["state"] != "pending" or current["version"] != version:
             raise Conflict("stale decision state")
-        count = c.execute("SELECT count(*) FROM orchestration_actions WHERE root = ?", (lease.root,)).fetchone()[0]
-        if count + len(response["calls"]) > maximum:
-            raise Limit(f"run used its {maximum} action allowance")
+        if maximum is not None:
+            count = c.execute("SELECT count(*) FROM orchestration_actions WHERE root = ?", (lease.root,)).fetchone()[0]
+            if count + len(response["calls"]) > maximum:
+                raise Limit(f"run used its {maximum} action allowance")
         for n, call in enumerate(response["calls"]):
             c.execute("INSERT INTO orchestration_actions VALUES (?,?,?,?,?,'accepted',?,?,?)",
                       (lease.root, f"{turn}-{n}", turn, lease.run, call["op"], encoded(call["args"]),
@@ -180,13 +181,13 @@ def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) 
                   (body, lease.root, turn))
         c.execute("UPDATE orchestrations SET version = version + 1, at = ? WHERE root = ?", (util.iso(), lease.root))
         return [decoded(r) for r in c.execute(
-            "SELECT * FROM orchestration_actions WHERE root = ? AND turn = ? ORDER BY id", (lease.root, turn))]
+            "SELECT * FROM orchestration_actions WHERE root = ? AND turn = ? ORDER BY rowid", (lease.root, turn))]
 
 
 def actions(lease: Lease, connect=reader) -> list[dict]:
     with connect() as c:
         fenced(c, lease)
-        return [decoded(r) for r in c.execute("SELECT * FROM orchestration_actions WHERE root = ? ORDER BY id",
+        return [decoded(r) for r in c.execute("SELECT * FROM orchestration_actions WHERE root = ? ORDER BY rowid",
                                              (lease.root,))]
 
 
@@ -220,7 +221,7 @@ def view(run_id: str, connect=reader) -> dict | None:
         if not found:
             return None
         actions = [decoded(row) for row in c.execute(
-            "SELECT * FROM orchestration_actions WHERE root = ? ORDER BY id", (found["root"],))]
+            "SELECT * FROM orchestration_actions WHERE root = ? ORDER BY rowid", (found["root"],))]
         return {"root": found["root"], "current_run": found["current_run"], "generation": found["generation"],
                 "mode": found["data"].get("mode", "orchestrate"),
                 "version": found["version"], "decisions": found["turns"] - unchanged_waits(c, found["root"]),

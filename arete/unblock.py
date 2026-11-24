@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from . import (alerts, config, delegation, environment, factory, flows, gh, launch_lease, outbound,
                owner_asks, paths, pilot, pipeline, principals, prompt_loader, queueing, record, run_lines, runlimits,
-               steps, tasks, tracker, util, vault, webpush, zte)
+               steps, tracker, util, vault, webpush, zte)
 from .agent import json_from_text
 from .store import asks as asks_store
 from .store import db
@@ -22,11 +22,9 @@ from .store import unblock as ledger
 INTERVAL = 20
 RECHECK = 120
 ACTOR = "rule:unblock"
-HIGH = ("high", "xhigh", "max")
 OWNER_DIRECTIVE = "Arete owner action: "
 DEPENDENCY_DIRECTIVE = "Arete dependency correction: remove "
 EXCLUDED_LABELS = {"no-agent", "agent:hold", tracker.ZTE_LABEL}
-CONTROLLER_LIMITS = {"max_decisions", "max_actions"}
 ACTIONS = {"retry": {"direction", "limit"}, "clarify": {"direction", "limit"}, "answer": {"answers"},
            "wait_for": set(), "needs_owner": {"asks"}}
 
@@ -88,12 +86,17 @@ def prs_of(row: dict) -> dict:
         # Only use PRs on the checkouts already configured for this ticket.
         cfg = config.load()
         repo = cfg.repo(row["repo"])
-        if gh.pr_repo(url).casefold() not in {p.github.casefold() for p in repo.parts}:
+        if gh.pr_repo(url).casefold() not in {repo.github.casefold(), *(p.github.casefold() for p in repo.parts)}:
             raise ValueError("saved PR does not match a configured checkout")
-        pr = gh.pr_merge_details(url, timeout=20, retry=False)
+        pr = gh.pr_merge_details(url, timeout=20, retry=False, watch_checks=True)
         if not pr.get("headRefOid") or not pr.get("state"):
             raise ValueError("the current PR could not be confirmed")
-        out[url] = {k: pr.get(k) for k in ("state", "isDraft", "headRefOid", "baseRefOid", "mergeable", "mergeStateStatus")}
+        out[url] = {k: pr.get(k) for k in ("state", "isDraft", "headRefOid", "baseRefOid", "mergeable",
+                                          "mergeStateStatus", "reviewDecision")}
+        out[url]["failing_checks"] = sorted(check.get("name") or check.get("context") or "check"
+                                            for check in pr.get("statusCheckRollup") or ()
+                                            if (check.get("conclusion") or check.get("state")) in
+                                            ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"))
     return out
 
 
@@ -141,7 +144,7 @@ def snapshot(cfg, repo, source, t, row, *, prs=None) -> dict:
 
 
 def evidence_for(t, row, saved, asks, prs, cycle) -> dict:
-    packet = {"ticket": {"id": t.id, "title": safe(t.title, 300), "description": safe(t.body, 6000)},
+    packet = {"ticket": {"id": t.id, "kind": t.kind, "title": safe(t.title, 300), "description": safe(t.body, 6000)},
               "comments": safe(t.comments, 4000)}
     if cycle:
         packet["dependencies"] = {"cycle": cycle}
@@ -197,22 +200,16 @@ def decision_of(raw, evidence: dict, limit: str) -> dict:
     return result
 
 
-def setting_for(cfg, repo):
+def setting_for(cfg, repo, kind=""):
     layer = config.load_layer(repo.layer_dir)
-    configured = cfg.unblock_step
-    isolated = replace(cfg, steps={"orchestrate": configured}, kinds={})
-    resolved = steps.resolve(isolated, replace(layer, steps={}, kinds={}), "orchestrate",
-                             overrides={"tries": 1, "timeout_minutes": min(configured.get("timeout_minutes", 5), 10)})
-    if resolved.effort not in HIGH or configured.get("effort") not in HIGH:
-        raise ValueError("[unblock.step] needs high or greater reasoning effort")
-    # Only explicitly configured routes are admitted, never an automatic replacement.
-    return layer, replace(resolved, fallback=False)
+    return layer, steps.resolve(cfg, layer, "orchestrate", kind)
 
 
 def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict | None:
-    layer, setting = setting_for(cfg, repo)
-    report = record.start("unblock", repo=repo.name, issue=str(row.get("issue", "")), lock="ticket-unblock")
-    run = pipeline.AgentRun(report, repo, paths.RUNS_DIR / report, cfg=cfg, layer=layer)
+    kind = evidence["ticket"].get("kind", "")
+    layer, setting = setting_for(cfg, repo, kind)
+    report = record.start("orchestrator", repo=repo.name, issue=str(row.get("issue", "")), lock="ticket-unblock")
+    run = pipeline.AgentRun(report, repo, paths.RUNS_DIR / report, cfg=cfg, layer=layer, kind=kind)
     run.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     place = run.dir / "controller"
     place.mkdir(mode=0o700)
@@ -220,7 +217,7 @@ def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict |
                                   verification_policy=prompt_loader.VERIFICATION_POLICY)
     request = delegation.request(SimpleNamespace(run=run, cfg=cfg, layer=layer, ws=place), "unblock", prompt,
                                  setting, (), [])
-    request["step"] = "unblock"
+    request.update(step="orchestrate-monitor", goal_ticket=str(row["issue"]), goal_event=attempt)
     request["closed_context"] = [str(repo.path), str(paths.WORKTREES_DIR)]
     result, status, summary = {}, "failed", "no recovery decision"
     worker = None
@@ -231,9 +228,8 @@ def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict |
                 if msg.get("event") == "launch":
                     route = msg["route"]
                     if (route.get("runner") != setting.runner or route.get("model") != setting.model
-                            or route.get("effort") not in HIGH and setting.runner != "replay"
                             or not ledger.launched(attempt)):
-                        raise ValueError("unblock route or unchanged-blocker launch allowance not admitted")
+                        raise ValueError("issue orchestrator route was not admitted")
                     worker.allow()
                 else:
                     result = msg
@@ -258,18 +254,6 @@ def diagnose(cfg, repo, row, attempt: str, evidence: dict, limit: str) -> dict |
             runs_store.settle(report, {"status": status, "summary": summary, "finished": util.iso(),
                                        "cost_usd": result.get("cost_usd", 0)})
     return None
-
-
-def grant_of(repo, row, binding, decision) -> dict:
-    limit = decision.get("limit", "")
-    layer = config.load_layer(repo.layer_dir)
-    prior = runlimits.metadata(row["id"], "budget.json").get("recovery", {}) if row else {}
-    allowance = dict(prior)
-    if limit in runlimits.LIMIT_TRANCHES:
-        allowance[limit] = allowance.get(limit, 0) + min(getattr(layer, limit), runlimits.LIMIT_TRANCHES[limit])
-    elif limit in CONTROLLER_LIMITS:
-        allowance[limit] = allowance.get(limit, 0) + getattr(layer.orchestration, limit)
-    return {"binding": binding, "allowance": allowance, "direction": decision.get("direction", "")}
 
 
 def route_owner(cfg, row, asks, text: str) -> None:
@@ -336,14 +320,6 @@ def local_revision(source, t, direction: str) -> str:
     if queueing.dependencies(t) != queueing.dependencies(updated) or tracker.batch_ids(t) != tracker.batch_ids(updated):
         raise ValueError("a recovery clarification cannot change ticket directives")
     return body if isinstance(source, tracker.LocalTracker) else ""
-
-
-def plan_launch(cfg, repo, attempt: dict, row: dict) -> dict:
-    case = ledger.get(repo.name, str(row["issue"]))
-    if not ledger.allowance(case):
-        ledger.mark(case, "waiting", "Autonomous recovery allowance exhausted", RECHECK)
-        return {}
-    return tasks.launch_recovery(cfg, repo, row, attempt)
 
 
 def child_grant(cfg, repo, source, tid, *, force, script, dry_run) -> tuple[dict, dict]:
@@ -413,7 +389,7 @@ def inherited(row: dict, specification) -> dict:
 
 def brief(run, text: str) -> str:
     direction = run.recovery.get("direction", "")
-    return "\n\n".join(filter(None, (text, f"## Recovery guidance from the Arete unblocker\n\n{direction}" if direction else "")))
+    return "\n\n".join(filter(None, (text, f"## Recovery guidance from the issue orchestrator\n\n{direction}" if direction else "")))
 
 
 def public_note(repo, source, tid, attempt):

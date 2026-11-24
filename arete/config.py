@@ -1175,10 +1175,8 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.unblock_step = step_table(unblock.get("step", {}), "[unblock.step]")
     if enabled:
         cfg.unblock_repos = tuple(dict.fromkeys(repos))
-        if not cfg.unblock_repos or not any(k in cfg.unblock_step for k in ("model", "tier")):
-            raise ValueError("[unblock] needs an explicit repo allowlist and [unblock.step] model or tier")
-        if cfg.unblock_step.get("effort") not in ("high", "xhigh", "max"):
-            raise ValueError("[unblock.step] needs high or greater reasoning effort")
+        if not cfg.unblock_repos:
+            raise ValueError("[unblock] needs an explicit repo allowlist")
     cfg.replay = replay_table(data.get("replay") or {}, ignored)
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research = research_table(data.get("research") or {}, ignored)

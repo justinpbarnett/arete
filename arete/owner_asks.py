@@ -394,7 +394,7 @@ def answered_lines(rows: list[dict], why: bool = False) -> str:
     for row in rows:
         for q, a in zip(row["questions"], row["answers"], strict=True):
             n += 1
-            actor = " (Arete unblocker)" if a.get("by") == "rule:unblock" else ""
+            actor = " (issue orchestrator)" if a.get("by") == "rule:unblock" else ""
             out.append(f"{n}. {q['header']}: {q['question']}\n   Answer{actor}: {answer_words(q, a)}")
             if actor and a.get("basis"):
                 out.append(f"   Basis: {a['basis']}")
