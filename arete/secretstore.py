@@ -18,6 +18,7 @@ from . import config, paths, util
 NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 SCOPE = re.compile(r"global|(?:repo|line|device|connector):[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
+ACCOUNT_ID = re.compile(r"[a-z0-9][a-z0-9:_-]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
@@ -46,6 +47,11 @@ def validate(scope: str, name: str) -> None:
 def address(scope: str, name: str) -> str:
     validate(scope, name)
     return f"secret:{scope}/{name}"
+
+
+def validate_account_id(label: str) -> None:
+    if not isinstance(label, str) or not ACCOUNT_ID.fullmatch(label):
+        raise ValueError("invalid account id")
 
 
 def validate_value(value: str, kind: str) -> None:

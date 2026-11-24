@@ -5510,6 +5510,33 @@ assert principals.for_login('unrelated@example.test') is None and principals.own
 """)
 
 
+class AuthorityStoredAccountTests(_WorkspaceChildCase):
+    def test_confirmed_account_keeps_references_and_retired_labels(self):
+        self.run_child("""
+from arete.store import credentials, principals as people
+
+db.migrate()
+with db.tx() as c:
+    owner = people.ensure_local_owner(c)
+    def save(identity, fingerprint):
+        return credentials.save_account(c, 'sample:subscription', 'sample', 'subscription', owner,
+                                        'personal', identity, fingerprint, None)
+    first = save('login-1', 'first')
+    provisional = save('login-2', 'next')
+    secret = c.execute("INSERT INTO secrets (name, scope, kind, store, reference, status, account_id) "
+                       "VALUES ('EXAMPLE', 'global', 'api_key', 'pve_store', 'fixture', 'set', ?) RETURNING id",
+                       (provisional['id'],)).fetchone()[0]
+    kept = credentials.reconcile_logins(c, 'sample', 'subscription', ['login-1', 'login-2'], owner)
+    assert kept['id'] == first['id']
+    assert c.execute("SELECT account_id FROM secrets WHERE id = ?", (secret,)).fetchone()[0] == first['id']
+    assert save('login-1', 'next')['id'] == first['id']
+    assert save('other-login', 'other')['id'] == 'sample:subscription:3'
+    assert {r['id'] for r in credentials.account_rows(c)} == {first['id'], 'sample:subscription:3'}
+    assert c.execute("SELECT count(*) FROM events_log WHERE subject = ? AND kind = 'credential.changed'",
+                     ('account:' + provisional['id'],)).fetchone()[0] == 2
+""")
+
+
 class PrincipalTests(unittest.TestCase):
     def test_principal_gate(self):
         owner = principals.seed_owner("fixture@example.test")
