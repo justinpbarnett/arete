@@ -8,7 +8,7 @@ class SecretRegistryUpgradeTests(_SecretChildCase):
     def test_first_direct_registry_get_upgrades_schema_26(self):
         self.run_schema_26("""
 headers, result = request('GET', root, token=bearer)
-assert_schema(27)
+assert_schema(db.LATEST)
 assert_shape('secret.list', result)
 assert result['secrets'] == []
 assert result['seq'] == headers['Arete-Seq']
@@ -40,7 +40,7 @@ def read_during_commit(*args):
 
 with mock.patch.object(api, 'secret_read', side_effect=read_during_commit):
     headers, result = request('POST', route, payload, token=bearer)
-assert_schema(27)
+assert_schema(db.LATEST)
 assert_shape('batch.run', result)
 first, registry, last = result['results']
 assert registry['secrets'] == []
