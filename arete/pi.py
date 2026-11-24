@@ -705,7 +705,7 @@ def observed_refresh(route: Route, event: dict) -> None:
                 for a in (earlier, latest)]
     devices_store.record_refresh(previous, latest.generation, *prefixes)
     if previous != latest.generation and not (earlier.identity or latest.identity):
-        accounts.record_resolved(latest, refreshed_from=earlier)
+        accounts.record_resolved(latest, refresh_only=True)
     route.refreshed.add(latest.generation)
     route.refreshed_auths.add(latest)
 

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import paths, secretstore
-from .store import credentials, db, principals
+from .store import credentials, db, devices, principals
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 LOOKUP_TIMEOUT = 3
@@ -196,7 +196,7 @@ def scope(auth: Auth, limit: str, unknown: str = "") -> str:
     return "subscription-v1:" + json.dumps([auth.family, account, limit], separators=(",", ":")) if account else ""
 
 
-def record(auth: Auth, *, secret_id: int | None = None, refreshed_from: Auth | None = None) -> dict | None:
+def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False) -> dict | None:
     who = auth.identity or auth.credential
     if not (auth.provider and auth.mode and who) or not paths.DB_FILE.exists():
         return None
@@ -211,22 +211,25 @@ def record(auth: Auth, *, secret_id: int | None = None, refreshed_from: Auth | N
         if holder is None:
             return None
         key = secretstore.fingerprint_key()
-        identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
-                                      auth.identity or (secret_id if secret_id is not None else who))
-        if refreshed_from is not None:
-            prior = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, refreshed_from.credential)
-            moved = c.execute("UPDATE OR IGNORE accounts SET identity = ? "
-                              "WHERE provider = ? AND mode = ? AND identity = ? AND secret_id IS NULL",
-                              (identity, auth.provider, auth.mode, prior))
-            if not moved.rowcount:
+        if not auth.identity and secret_id is None and auth.mode == "subscription":
+            login = scope(auth, "")
+            aliases = devices.linked_scopes(login, devices.refresh_links(c))
+            identities = {s: secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, s)
+                          for s in aliases}
+            existing = credentials.reconcile_logins(c, auth.provider, auth.mode, identities.values(), holder)
+            if refresh_only and existing is None:
                 return None
+            identity = existing or identities[login]
+        else:
+            identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
+                                          auth.identity or (secret_id if secret_id is not None else who))
         digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
         return credentials.save_account(c, label, auth.provider, auth.mode, holder, "personal", identity, digest,
                                         secret_id)
 
 
-def record_resolved(auth: Auth, *, refreshed_from: Auth | None = None) -> None:
+def record_resolved(auth: Auth, *, refresh_only: bool = False) -> None:
     try:
-        record(auth, refreshed_from=refreshed_from)
+        record(auth, refresh_only=refresh_only)
     except (OSError, secretstore.StoreMissing) as error:
         LOG.warning("Could not record a resolved account (%s)", type(error).__name__)
