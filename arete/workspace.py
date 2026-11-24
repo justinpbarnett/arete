@@ -251,12 +251,19 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
             return Release("held", [str(e)])
         if row:
             excluded = {Path(wt) for wt in row["release_excluded"]}
-            if by and by != "sweep" and by == row["owner_run"]:
+            if row["kept_reason"] != workspaces.LEGACY_WAITING and by and by != "sweep" and by == row["owner_run"]:
                 note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
         made = made_before(ws) if row else {}
         force = by == "sweep" and bool(row and row["remove_asked_by"])
+        options = {}
+        if row and row["kept_reason"] == workspaces.LEGACY_WAITING:
+            owner = runs.run_get(row["owner_run"])
+            if not owner or not checkouts:
+                return Release("held", ["."])
+            options["waiting"] = (row["heads"], owner.get("branch") or "")
+            force, edits = False, True
         try:
-            release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force, edits=edits)
+            release = remove_checkouts(ws, checkouts, made, excluded=excluded, force=force, edits=edits, **options)
         except OSError as e:
             if row:
                 workspaces.record_release_error(ws, row, e)
@@ -265,15 +272,50 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
         return release
 
 
+def waiting_checkout_blockers(ws: Path, checkouts: list[Checkout], waiting: tuple[dict[str, str], str] | None) -> list[str]:
+    if waiting is None:
+        return []
+    heads, branch = waiting
+    return [c.dir or "." for c in checkouts if not matches_waiting_checkout(ws, c, heads.get(c.prefix), branch)]
+
+
+def matches_waiting_checkout(ws: Path, c: Checkout, head: str | None, branch: str) -> bool:
+    attached, unsafe = checkout_attachment(ws, c.wt)
+    if unsafe is not None:
+        return False
+    if not attached:
+        return not os.path.lexists(c.wt)
+    try:
+        if not stat.S_ISREG((c.wt / ".git").lstat().st_mode):
+            return False
+        common = [git(["rev-parse", "--path-format=absolute", "--git-common-dir"], d).strip() for d in (c.wt, c.src)]
+        current = git(["symbolic-ref", "-q", "--short", "HEAD"], c.wt, check=False).strip()
+        return bool(head and common[0] == common[1] and current and (not branch or branch == current)
+                    and git(["rev-parse", "HEAD"], c.wt).strip() == head and clean_waiting_index(c.wt))
+    except (OSError, RuntimeError):
+        return False
+
+
+def clean_waiting_index(wt: Path) -> bool:
+    if uncommitted(wt, tracked_only=True):
+        return False
+    return all(entry.startswith("H ") and not entry.startswith("H 160000 ")
+               for entry in util.git_records(["ls-files", "--stage", "-v"], wt))
+
+
 def remove_checkouts(ws: Path, checkouts: list[Checkout], made: dict, *, excluded: Collection[Path],
-                     force: bool, edits: bool = False) -> Release:
+                     force: bool, edits: bool = False, waiting: tuple[dict[str, str], str] | None = None) -> Release:
     if names := workspace_blockers(ws, checkouts, edits, excluded=excluded, made=made, force=force, strict=True):
+        return Release("held", names)
+    if names := waiting_checkout_blockers(ws, checkouts, waiting):
         return Release("held", names)
     for index, c in enumerate(checkouts):
         target_last = checkouts[:index] + checkouts[index + 1:] + [c]
         with util.repo_lock(c.src):
             if names := workspace_blockers(ws, target_last, edits, excluded=excluded, made=made, target=c, force=force,
                                            strict=True):
+                return Release("held", names)
+            if names := waiting_checkout_blockers(ws, [c], waiting):
                 return Release("held", names)
             attached, unsafe = checkout_attachment(ws, c.wt)
             if unsafe is not None:

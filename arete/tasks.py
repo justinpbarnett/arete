@@ -564,18 +564,23 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
-    try:
-        checkouts = [workspace.Checkout.from_row(c)
-                     for c in flows.prepared_data(run_id).get("checkouts") or []]
-    except (TypeError, KeyError):
-        checkouts = None
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
         row = workspaces.open_for(ws.name)
         if not row:
             return None if os.path.lexists(ws) else workspace.Release("removed")
-        if row["owner_run"] != run_id or row["kept_reason"] == workspaces.LEGACY_RESUME:
+        if row["owner_run"] != run_id or row["kept_reason"] in (workspaces.LEGACY_RESUME, "operator"):
             return None
+        if row["kept_reason"] == workspaces.LEGACY_WAITING:
+            latest = run_store.newest_whole_run(repo.name, tid)
+            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, tid):
+                return workspaces.remove_imported_waiting(ws, row)
+            return None
+        try:
+            checkouts = [workspace.Checkout.from_row(c)
+                         for c in flows.prepared_data(run_id).get("checkouts") or []]
+        except (TypeError, KeyError):
+            checkouts = None
         if not checkouts:
             checkouts = workspaces.owner_of(row).checkouts
             if not checkouts and os.path.lexists(ws):

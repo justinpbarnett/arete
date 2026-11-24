@@ -16,12 +16,19 @@ class MalformedSnapshot(InvalidSnapshot):
     pass
 
 
+def unrestored(conn):
+    from arete import backup
+
+    epoch = conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()
+    return epoch is not None and epoch[0] == "0" and not backup.pending_restore()
+
+
 def snapshot_source(conn, explicit):
     from arete import paths
 
     if explicit is not None:
         return explicit
-    if paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve():
+    if not unrestored(conn) or paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve():
         return None
     meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('instance_id', 'new_workspace_store')"))
     try:
@@ -36,11 +43,12 @@ def snapshot_source(conn, explicit):
     if (meta.get("new_workspace_store") == "0" or not isinstance(marker, dict)
             or not meta.get("instance_id") or marker.get("instance_id") != meta["instance_id"]):
         return None
-    folder = paths.STATE_DIR.resolve() / "workspaces"
-    if not folder.exists() and conn.execute(
-            "SELECT 1 FROM workspaces WHERE state != 'removed' AND legacy_mtime_ns > 0 LIMIT 1").fetchone():
-        return None
-    return folder
+    return paths.STATE_DIR.resolve() / "workspaces"
+
+
+def may_be_missing(conn, explicit):
+    return not explicit and not conn.execute(
+        "SELECT 1 FROM workspaces WHERE state != 'removed' AND legacy_mtime_ns > 0 LIMIT 1").fetchone()
 
 
 def signature(st):
@@ -228,6 +236,20 @@ def current_workspace(conn, ws):
                                            (ws.name,)).fetchone())
 
 
+def imported_keep_reason(owner, owner_data, run, heads, connect):
+    from arete.store import runs, workspaces
+
+    if (owner_data is not None and owner.repo and owner.ticket and owner.checkouts
+            and run.get("status") in ("needs-info", "stopped") and not run.get("dry_run")
+            and all(heads.get(c.prefix) for c in owner.checkouts)
+            and not any(c.wt.is_relative_to(other.wt) for c in owner.checkouts for other in owner.checkouts
+                        if c is not other)):
+        latest = runs.ticket_runs(owner.repo, owner.ticket, limit=1, connect=connect, whole=True)
+        if latest and latest[0]["id"] == owner.run:
+            return workspaces.LEGACY_WAITING
+    return workspaces.LEGACY_RESUME
+
+
 def import_snapshot(conn, ws, row, path, before, made):
     from arete import util, workspace
     from arete.store import runs, workspaces
@@ -259,8 +281,9 @@ def import_snapshot(conn, ws, row, path, before, made):
         created = owner_data.get("created") if isinstance(owner_data, dict) else ""
         made_at = created or run.get("started") or util.iso(datetime.fromtimestamp(modified / 1e9, UTC))
         fingerprints = fields.pop("files")
+        reason = imported_keep_reason(owner, owner_data, run, fields["heads"], connect)
         workspaces._insert(conn, ws.name, workspaces._encode(
-            dict(state="kept", kept_reason=workspaces.LEGACY_RESUME, made_at=made_at, bytes=workspace.tree_bytes(ws),
+            dict(state="kept", kept_reason=reason, made_at=made_at, bytes=workspace.tree_bytes(ws),
                  **identity, **fields)), fingerprints)
         return
 
@@ -283,10 +306,13 @@ def import_snapshot(conn, ws, row, path, before, made):
         fields.update(identity)
     elif changed and row["state"] == "released":
         fields.update({key: identity[key] for key in ("owner_run", "repo", "ticket")})
-    if takeover or (row["state"] == "released" and changed):
+    if row["kept_reason"] != "operator" and (takeover or (row["state"] == "released" and changed)):
         if takeover:
             fields["release_excluded"] = None
         fields.update(keep_fields())
+        if (fields.get("owner_run") == owner.run and not row["release_excluded"]
+                and fields.get("checkouts", row["checkouts"]) == identity["checkouts"]):
+            fields["kept_reason"] = imported_keep_reason(owner, owner_data, run, fields["heads"], connect)
     update(conn, row, fields)
 
 
@@ -305,7 +331,7 @@ def keep_fields():
 
 
 @contextmanager
-def snapshot_directory(folder):
+def snapshot_directory(folder, *, allow_missing=False):
     from arete import paths
 
     folder = Path(folder).absolute()
@@ -318,6 +344,8 @@ def snapshot_directory(folder):
         try:
             fd = os.open(folder.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         except FileNotFoundError:
+            if not allow_missing:
+                raise
             fd = None
         try:
             yield fd
@@ -340,8 +368,6 @@ def recovery_snapshot(folder, ws):
 
     filename = f"{ws.name}.json"
     with snapshot_directory(folder) as fd:
-        if fd is None:
-            raise ValueError(f"{ws.name} snapshot is missing")
         before = os.stat(filename, dir_fd=fd, follow_symlinks=False)
         made = read_snapshot(folder, fd, filename, before)
         owner = recorded_owner(folder / filename, ws, made.get("\0owner", {}))
@@ -365,12 +391,12 @@ def verify_snapshot(conn, ws, folder, fd, version):
         quarantine(conn, ws, current_workspace(conn, ws), f"{folder / name}: snapshot changed during handoff")
 
 
-def apply(conn, folder=None):
+def apply(conn, folder=None, *, allow_missing=False):
     from arete import paths
     from arete.store import principals
 
     if folder is not None:
-        with snapshot_directory(folder) as fd, principals.acting("hand"):
+        with snapshot_directory(folder, allow_missing=allow_missing) as fd, principals.acting("hand"):
             files = snapshot_names(fd)
             names = {name.removesuffix(".json") for name in files}
             names.update(r[0] for r in conn.execute("SELECT name FROM workspaces WHERE state != 'removed' "

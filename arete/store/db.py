@@ -140,6 +140,10 @@ class IncompatibleSchema(RuntimeError):
     pass
 
 
+class WorkspaceHandoffPending(RuntimeError):
+    pass
+
+
 def refuse_empty_file() -> None:
     if paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0:
         return
@@ -176,9 +180,18 @@ def contract_blockers(conn, n):
     if workspace_contract:
         children = set(beat.get("workspace_contract_children", [])) | inherited_serve_children()
         blockers.extend(f"inherited child {pid}" for pid in sorted(children) if util.pid_alive(pid))
+        blockers.extend(workspace_admission_blockers())
     if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
         blockers.append(f"serve {beat.get('pid')}")
     return blockers
+
+
+def workspace_admission_blockers():
+    for file in sorted(paths.LOCKS_DIR.iterdir()):
+        name = file.stem
+        if (file.suffix == ".lock" and (name == "file-rule" or name.startswith(("run-", "loop-")))
+                and util.lock_is_held(name)):
+            yield f"held lock {name}"
 
 
 def inherited_serve_children():
@@ -205,7 +218,7 @@ def run_process_alive(row):
         return util.pid_alive(pid)
 
 
-def workspace_handoff_blockers(conn, snapshots):
+def workspace_handoff_blockers(conn, source, *, explicit=False):
     from .. import control, serve_guard
 
     blockers = contract_blockers(conn, WORKSPACE_CONTRACT_SCHEMA)
@@ -217,23 +230,37 @@ def workspace_handoff_blockers(conn, snapshots):
     receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
     if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
         blockers.append("deploy health acknowledgement")
-    if snapshots is None and not new_workspace_store(conn):
-        blockers.append(WORKSPACE_HANDOFF)
+    if problem := workspace_source_blocker(conn, source, explicit=explicit):
+        blockers.append(problem)
     return blockers
+
+
+def workspace_source_blocker(conn, source, *, explicit):
+    if source is None:
+        return "" if new_workspace_store(conn) else f"supply {WORKSPACE_HANDOFF}"
+    try:
+        allow_missing = workspace_contract.may_be_missing(conn, explicit)
+        with workspace_contract.snapshot_directory(source, allow_missing=allow_missing):
+            return ""
+    except (OSError, ValueError) as e:
+        return workspace_source_problem(source, e)
+
+
+def workspace_source_problem(source, error):
+    return f"snapshot directory {source}: {util.first_line(str(error), 300)}; supply {WORKSPACE_HANDOFF}"
 
 
 def new_workspace_store(conn):
     return (conn.execute("SELECT 1 FROM schema_meta WHERE key = 'new_workspace_store' AND value = '1'").fetchone() is not None
-            and workspace_store_is_new())
+            and workspace_contract.unrestored(conn) and workspace_store_is_new())
 
 
 def workspace_handoff_ready(snapshots: Path | None) -> bool:
     with reader() as conn:
-        snapshots = workspace_contract.snapshot_source(conn, snapshots)
-        if snapshots is None:
-            return new_workspace_store(conn)
-    with workspace_contract.snapshot_directory(snapshots):
-        return True
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SECRET_REGISTRY_SCHEMA:
+            return False
+        source = workspace_contract.snapshot_source(conn, snapshots)
+        return not workspace_source_blocker(conn, source, explicit=snapshots is not None)
 
 
 def execute_statements(conn, sql):
@@ -284,12 +311,20 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
                     if not contracts:
                         return True
                     if migration.n == WORKSPACE_CONTRACT_SCHEMA and workspace_snapshots is None:
-                        workspace_snapshots = config.load_or_problem()[0].workspace_snapshots
+                        cfg, problem = config.load_or_problem()
+                        if problem:
+                            print(f"migration {migration.name} waits for valid config "
+                                  f"({util.first_line(problem, 300)}); supply {WORKSPACE_HANDOFF}", flush=True)
+                            return True
+                        workspace_snapshots = cfg.workspace_snapshots
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
                     try:
-                        blockers = (workspace_handoff_blockers(conn, workspace_contract.snapshot_source(conn, workspace_snapshots))
-                                    if migration.n == WORKSPACE_CONTRACT_SCHEMA else contract_blockers(conn, migration.n))
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA:
+                            source = workspace_contract.snapshot_source(conn, workspace_snapshots)
+                            blockers = workspace_handoff_blockers(conn, source, explicit=workspace_snapshots is not None)
+                        else:
+                            blockers = contract_blockers(conn, migration.n)
                     finally:
                         conn.close()
                         conn = None
@@ -306,14 +341,19 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
                     with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
                         if migration.n == WORKSPACE_CONTRACT_SCHEMA:
                             source = workspace_contract.snapshot_source(writer, workspace_snapshots)
-                            if blockers := workspace_handoff_blockers(writer, source):
+                            explicit = workspace_snapshots is not None
+                            if blockers := workspace_handoff_blockers(writer, source, explicit=explicit):
                                 print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
                                 return True
                             from .. import install
 
                             if paths.DB_FILE.parent == paths.STATE_DIR and install.serve_guard_file().exists():
                                 install.write_serve_guard()
-                            migration.apply(writer, source)
+                            allow_missing = workspace_contract.may_be_missing(writer, explicit)
+                            try:
+                                migration.apply(writer, source, allow_missing=allow_missing)
+                            except OSError as e:
+                                raise WorkspaceHandoffPending(workspace_source_problem(source, e)) from e
                         elif migration.sql is not None:
                             execute_statements(writer, migration.sql)
                         else:
@@ -328,6 +368,11 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
                         writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                                        (str(migration.n),))
                         writer.execute(f"PRAGMA user_version = {migration.n}")
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA and (blockers := contract_blockers(writer, migration.n)):
+                            raise WorkspaceHandoffPending(", ".join(blockers))
+                except WorkspaceHandoffPending as e:
+                    print(f"migration {migration.name} waits for {e}", flush=True)
+                    return True
                 except BaseException as e:
                     raise migrations.Refused(f"{migration.name}: {e}") from e
                 version = migration.n

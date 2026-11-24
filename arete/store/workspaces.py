@@ -11,7 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .. import config, paths, util, workspace
-from . import events, runs, writes
+from . import asks, events, runs, writes
 from .db import reader, require_workspace_contract
 
 TABLES = {"workspaces": "kept, including removed rows", "workspace_files": "with workspace"}
@@ -25,6 +25,7 @@ FOLDER_LOCKS: ContextVar[frozenset[Path]] = ContextVar("workspace_folder_locks",
 TICKET_LOCKS: ContextVar[frozenset[str]] = ContextVar("workspace_ticket_locks", default=frozenset())
 SWEEP_STATES = ("live", "released", "held", "kept")
 LEGACY_RESUME = "legacy resume"
+LEGACY_WAITING = "imported waiting run"
 SNAPSHOT_UNAVAILABLE = "legacy workspace snapshot quarantined"
 
 
@@ -360,7 +361,8 @@ def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
                            if selected and c.wt not in selected and os.path.lexists(c.wt)}
                 earlier = {Path(wt) for wt in row["release_excluded"] or ()}
                 selection = _release_selection(checkouts, set(excluded) | omitted | (earlier - selected))
-            return _change_current(row, state="released", kept_reason="", **selection)
+            reason = LEGACY_WAITING if row["kept_reason"] == LEGACY_WAITING else ""
+            return _change_current(row, state="released", kept_reason=reason, **selection)
     return None
 
 
@@ -446,7 +448,7 @@ def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | No
         elif row and excluded:
             change(row, state="kept", kept_reason="operator", held_by=[], bytes=size, last_sweep_error="")
         elif row:
-            change(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
+            change(row, state="removed", kept_reason="", held_by=[], bytes=0, last_sweep_error="")
 
 
 def record_release_error(ws: Path, row: dict, error: OSError) -> None:
@@ -479,6 +481,21 @@ def _owner_status(row: dict) -> str:
     return (owner or {}).get("status") or ""
 
 
+def remove_imported_waiting(ws: Path, row: dict) -> workspace.Release:
+    checkouts = owner_of(row).checkouts
+    excluded = {Path(wt) for wt in row["release_excluded"] or ()}
+    return workspace.remove_workspace(ws, checkouts, excluded=excluded, edits=True)
+
+
+def _waiting_ask_retired(row: dict) -> bool:
+    latest = runs.newest_whole_run(row["repo"], row["ticket"])
+    if not latest or latest["id"] != row["owner_run"] or latest["status"] not in ("needs-info", "stopped"):
+        return False
+    history = asks.asks_of(latest["id"])
+    return (any(a["status"] in ("stopped", "expired") for a in history)
+            and not any(a["status"] == "open" or (a["status"] == "answered" and not a["taken_by"]) for a in history))
+
+
 def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
     if row["kept_reason"] == SNAPSHOT_UNAVAILABLE:
         return
@@ -493,6 +510,10 @@ def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
         _change_current(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
         return
     if row["kept_reason"] == "operator":
+        return
+    if row["kept_reason"] == LEGACY_WAITING:
+        if _waiting_ask_retired(row) and _sweep_attempt(row) is not None:
+            remove_imported_waiting(ws, row)
         return
     checkouts = owner_of(row).checkouts
     excluded = {Path(wt) for wt in row["release_excluded"] or ()}
