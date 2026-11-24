@@ -390,10 +390,12 @@ def owned(mode, timeout, before_commit=None):
             before_commit()
         check()
 
+    callbacks = []
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
+            _OWNER.after_commit = callbacks
             if bounded:
                 check()
                 conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
@@ -410,6 +412,9 @@ def owned(mode, timeout, before_commit=None):
                     conn.set_progress_handler(None, 0)
     finally:
         _OWNER.active = None
+        _OWNER.after_commit = None
+    for callback in callbacks:
+        callback()
 
 
 @contextmanager
@@ -467,9 +472,20 @@ def write_connection():
     return active[2]
 
 
-def in_write():
+def after_commit(callback: Callable[[], None]) -> None:
+    write_connection()
+    _OWNER.after_commit.append(callback)
+
+
+def transaction_mode():
     active = getattr(_OWNER, "active", None)
-    return bool(active and active[:2] == (os.getpid(), "write") and active[2].in_transaction)
+    if active and active[0] == os.getpid() and active[2].in_transaction:
+        return active[1]
+    return None
+
+
+def in_write():
+    return transaction_mode() == "write"
 
 
 def ensure_schema() -> None:
