@@ -2843,14 +2843,21 @@ Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-fi
 {
   "destination": "arete-serve",
   "path": "/api/v1/cohorts/example",
-  "assertions": [{"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending", "/overdue": true}}],
+  "assertions": [
+    {
+      "field": "/report/pending_overdue",
+      "count": "/report/members",
+      "where": {"/status": "pending"},
+      "before": {"member": "/deadline", "response": "/report/observed"}
+    }
+  ],
   "recovery": [{"field": "/report/cohort/name", "equals": "example"}]
 }
 ```
 
 The default binding follows the enrolled ticket's single merged factory PR to its configured target. A private policy can instead pin a full `revision` for a known release. When several commits fast-forward together, each matching goal is checked against the running tip. The normal local client exercises the protected read on the revision that answered the request. Each receipt records the goal, policy fingerprint, requested path, verified fields, revision, timestamp and outcome.
 
-A filtered count can compare a member timestamp with another field from the very same response. Add `"before": {"member": "/deadline", "response": "/report/observed"}` to the count assertion and use `"where": {"/status": "pending"}` to measure pending deadlines strictly before the reported observation time. Both timestamps need UTC offsets. A readmitted member can be pending past its deadline even if a previous delivery was on time.
+The assertion counts pending member rows whose `deadline` is strictly before `observed` in the same response. Both timestamps need UTC offsets. A readmitted member can be pending past its deadline even if a previous delivery was on time.
 
 Before moving the checkout, the prior release must pass the recovery assertion. A wrong result on the new release keeps the ticket open and invokes the existing code-only rollback guard. A dirty checkout or incompatible database holds the release. After a successful rollback the running previous version rechecks its recovery assertion. The previous version must already contain this feature to perform that confirmation. `arete release status REPO TICKET` reports the receipt. `arete release observe REPO TICKET --revision SHA` reruns the enrolled check for the authorized revision.
 
