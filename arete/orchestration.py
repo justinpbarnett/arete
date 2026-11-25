@@ -922,6 +922,42 @@ class Controller(worker_turns.WorkerTurns):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
 
+    def resolved_pr_conflicts(self, actions):
+        # A recovery grant names the remote revisions that conflicted. Verify their local merge
+        # from Git itself, including when a restart happened before the controller saved its state.
+        conflicts = {url: pr for url, pr in self.run.recovery.get("binding", {}).get("prs", {}).items()
+                     if pr.get("mergeable") == "CONFLICTING"}
+        if not conflicts or not self.default_code_review:
+            return {}
+        trees = {}
+        merged = {}
+        for checkout in self.job.checkouts:
+            trees[checkout.github] = factory.fingerprint(checkout.wt)
+            pr = conflicts.get(checkout.pr)
+            if not pr:
+                continue
+            if checkout.lease != pr.get("headRefOid") or checkout.base_commit != pr.get("baseRefOid"):
+                return {}
+            # Both tracking refs were fetched during preparation. A newer fetch or local edit
+            # invalidates this handoff; publication independently checks the remote again.
+            refs = util.git(["rev-parse", "--revs-only", checkout.origin_base, f"origin/{self.job.branch}"], checkout.wt)
+            if refs.splitlines() != [checkout.base_commit, checkout.lease]:
+                return {}
+            head, tree, *parents = util.git(["show", "-s", "--format=%H %T %P", "HEAD"], checkout.wt).split()
+            if parents != [checkout.lease, checkout.base_commit] or tree != trees[checkout.github]:
+                return {}
+            merged[checkout.pr] = {"pr_head": checkout.lease, "base": checkout.base_commit, "merge": head, "tree": tree}
+        if merged.keys() != conflicts.keys() or not all(trees.values()):
+            return {}
+        stamp = {"tree": ledger.digest(trees), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}
+        stale = set(self.data.get("stale_actions", ()))
+        last = next((a for a in reversed(actions) if a["op"] == "checks.run" and a["id"] not in stale
+                     and a["state"] in ("succeeded", "failed") and a["result"].get("input_stamp") == stamp), {})
+        result = last.get("result", {})
+        partial_pass = result.get("passed") is True and result.get("scope") in ("quick", "failed")
+        return {"merges": merged, "checks_action": last.get("id", ""), "run_full_checks": not last or partial_pass,
+                "status": "Arete resolved the conflicts locally. Use the current checks to continue recovery."}
+
     def observe(self, limit=20, after=0):
         all_actions = ledger.actions(self.lease)
         actions = [a for a in all_actions if a["result"].get("revision", 0) > after]
@@ -936,6 +972,7 @@ class Controller(worker_turns.WorkerTurns):
                 "review_method": self.data.get("review_method", "legacy") if self.uses_code_review else "legacy",
                 "required_gates": self.required_gates(),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
+                **({"resolved_pr_conflicts": receipt} if (receipt := self.resolved_pr_conflicts(all_actions)) else {}),
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
@@ -1001,6 +1038,13 @@ class Controller(worker_turns.WorkerTurns):
         observation = self.observe()
         turn = ledger.begin(self.lease, observation, self.decision_limit)
         observation["decision_id"] = turn
+        receipt = observation.get("resolved_pr_conflicts")
+        if (receipt and receipt["run_full_checks"] and not (self.run.answers_due or self.run.feedback or self.workers)
+                and all(w["phase"] in exchange.CLOSED for w in observation.get("workers", []))):
+            response = {"version": self.protocol, "decision_id": turn, "state_version": observation["state_version"],
+                        "rationale": "Check the locally resolved PR before continuing recovery.",
+                        "calls": [{"op": "checks.run", "args": {"scope": "full"}}]}
+            return ledger.accept(self.lease, turn, observation["state_version"], response, self.action_limit)
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
         prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol), observation=json.dumps(observation))

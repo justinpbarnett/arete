@@ -109,6 +109,44 @@ def ensure_label(repo: str, name: str, color: str = "5319e7", description: str =
         return f"{name}: {e}"
 
 
+def read_blocking_links(issues: list[dict]) -> None:
+    by_id = {row["id"]: row for row in issues if isinstance(row.get("id"), str) and row["id"]}
+    query = ("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Issue { id blockedBy(first: 100) "
+             "{ totalCount nodes { number state url } } } } }")
+    for ids in itertools.batched(by_id, 100):
+        payload = Outgoing(json.dumps({"query": query, "variables": {"ids": ids}}))
+        try:
+            reply = json.loads(gh(["api", "graphql", "--input", "-"], input=payload, timeout=15, retry=False))
+        except (GhError, ValueError):
+            continue
+        data = reply.get("data") if isinstance(reply, dict) else None
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        if isinstance(nodes, list):
+            for node in nodes:
+                if isinstance(node, dict) and node.get("id") in ids:
+                    by_id[node["id"]]["blockedBy"] = node.get("blockedBy")
+
+
+def with_blocking_links(args: list[str]):
+    fields = args.index("--json") + 1
+    projected = args.copy()
+    projected[fields] += ",blockedBy"
+    try:
+        data = gh_json(projected)
+    except GhError as error:
+        if 'Unknown JSON field: "blockedBy"' not in str(error):
+            raise
+        projected[fields] = args[fields] + ",id"
+        data = gh_json(projected)
+        read_blocking_links([row for row in (data if isinstance(data, list) else [data]) if isinstance(row, dict)])
+    # An unavailable projection must hold admission even when the ticket itself is readable.
+    for issue in data if isinstance(data, list) else [data]:
+        if not isinstance(issue, dict):
+            raise GhError("GitHub issue lookup returned no issue metadata")
+        issue.setdefault("blockedBy", None)
+    return data
+
+
 def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, author: str = "", *,
            search: str = "") -> list[dict]:
     args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit),
@@ -119,13 +157,41 @@ def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, aut
         args += ["--author", author]
     if search:
         args += ["--search", search]
-    return gh_json(args) or []
+    return (with_blocking_links(args) if label == "agent" else gh_json(args)) or []
 
 
 def issue(repo: str, number: int) -> dict:
-    return gh_json(
-        ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author,updatedAt"]
+    return with_blocking_links(
+        ["issue", "view", str(number), "--repo", repo, "--json",
+         "number,title,body,labels,url,comments,state,author,updatedAt"]
     )
+
+
+def open_issue_blockers(repo: str, number: int, issue: dict) -> list[int | str]:
+    connection = issue.get("blockedBy", {"nodes": [], "totalCount": 0})
+    missing = f"could not read all GitHub blocking links for {repo}#{number}"
+    if not isinstance(connection, dict):
+        raise GhError(missing)
+    nodes, count = connection.get("nodes"), connection.get("totalCount")
+    if not isinstance(nodes, list) or type(count) is not int or count < 0:
+        raise GhError(missing)
+    if len(nodes) != count:
+        nodes = api_list(f"repos/{repo}/issues/{number}/dependencies/blocked_by")
+        if len(nodes) != count:
+            raise GhError(missing)
+    blockers = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise GhError(missing)
+        state = str(node.get("state", "")).upper()
+        link = re.fullmatch(r"https://[^/]+/([\w.-]+/[\w.-]+)/issues/([1-9][0-9]*)",
+                            node.get("html_url") or node.get("url") or "")
+        if not link or state not in {"OPEN", "CLOSED"} or int(link[2]) != node.get("number"):
+            raise GhError(missing)
+        if state == "OPEN":
+            other, dependency = link[1].casefold(), int(link[2])
+            blockers.append(dependency if other == repo.casefold() else f"{other}#{dependency}")
+    return blockers
 
 
 def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:

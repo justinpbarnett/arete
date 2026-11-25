@@ -425,6 +425,7 @@ class QueueScoringTests(unittest.TestCase):
 
     def issue(self, number, *labels, body="", created="2026-11-21T00:00:00Z", author="fixture"):
         return {"number": number, "title": f"Issue {number}", "body": body, "createdAt": created,
+                "blockedBy": {"nodes": [], "totalCount": 0},
                 "author": {"login": author}, "labels": [{"name": name} for name in ("agent", *labels)]}
 
     def next_ticket(self):
@@ -496,9 +497,9 @@ class QueueScoringTests(unittest.TestCase):
         self.assertIs(self.source.is_open(1001), False)
         self.assertEqual(github.call_args_list, [
             mock.call(["issue", "list", "--repo", "fixture/repo", "--state", "open", "--limit", "1000", "--json",
-                       "number,title,body,labels,url,createdAt,updatedAt,author", "--label", "agent"]),
+                       "number,title,body,labels,url,createdAt,updatedAt,author,blockedBy", "--label", "agent"]),
             mock.call(["issue", "view", "1001", "--repo", "fixture/repo", "--json",
-                       "number,title,body,labels,url,comments,state,author,updatedAt"]),
+                       "number,title,body,labels,url,comments,state,author,updatedAt,blockedBy"]),
         ])
 
     def test_poll_preserves_candidate_cycle_ranking_with_unrelated_in_flight_issue(self):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -78,6 +78,7 @@ class Ticket:
     blocker: str = ""
     images: list[Image] = field(default_factory=list)
     github_repo: str = ""
+    github_blockers: list[int | str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
@@ -155,8 +156,7 @@ class GitHubTracker:
     def __init__(self, repo: config.Repo):
         self.repo = repo
         self.owner = repo.github.split("/")[0]
-        self._bodies: dict[str, str] = {}
-        self._labels: dict[str, list[str]] = {}
+        self._tickets: dict[str, Ticket] = {}
         self._open: dict[int, bool | None] = {}
         self._open_agent_tickets: list[Ticket] = []
 
@@ -180,21 +180,30 @@ class GitHubTracker:
     def open_agent_tickets(self) -> tuple[Ticket, ...]:
         return tuple(self._open_agent_tickets)
 
+    def remember(self, tid: str, issue: dict) -> Ticket:
+        tid = str(tid)
+        ticket = Ticket(tid, self.ref(tid), issue.get("title") or "", body=issue.get("body") or "",
+                        url=issue.get("url", ""), created=issue.get("createdAt", ""),
+                        labels=[label["name"] for label in issue.get("labels", [])], github_repo=self.repo.github)
+        try:
+            ticket.github_blockers = gh.open_issue_blockers(self.repo.github, int(tid), issue)
+        except (gh.GhError, TypeError, ValueError) as error:
+            ticket.blocker = f"it waits on GitHub blocking links that Arete could not read: {error}"
+        self._tickets[tid] = ticket
+        return ticket
+
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         failed = self.label_name("failed")
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
-        self._bodies, self._labels, self._open = {}, {}, {}
+        self._tickets, self._open = {}, {}
         self._open_agent_tickets = []
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             tid = str(i["number"])
-            self._bodies[tid] = i.get("body") or ""
-            self._open[int(i["number"])] = True
-            names = {lb["name"] for lb in i.get("labels", [])}
-            self._labels[tid] = sorted(names)
-            ticket = Ticket(tid, self.ref(tid), i["title"], body=self._bodies[tid],
-                            url=i.get("url", ""), created=i.get("createdAt", ""), labels=self._labels[tid].copy(),
-                            github_repo=self.repo.github)
+            ticket = self.remember(tid, i)
+            self._open[int(tid)] = True
+            ticket.labels.sort()
+            names = set(ticket.labels)
             self._open_agent_tickets.append(ticket)
             if (names & skip or not self.by_owner(i)
                     or failed in names and not (parked and parked(tid))):
@@ -216,21 +225,20 @@ class GitHubTracker:
         return bool(login) and login.lower() == self.owner.lower()
 
     def blocker(self, tid: str) -> str:
-        body = self._bodies.get(tid)
-        if body is None:
-            issue = gh.issue(self.repo.github, int(tid)) or {}
-            body = issue.get("body") or ""
-            self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
-        ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
-        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
-            self.ticket_waits(tid, body))
+        ticket = self._tickets.get(tid) or self.remember(tid, gh.issue(self.repo.github, int(tid)) or {})
+        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(
+            lambda: batch_ids(ticket)) or self.ticket_wait_blocker(ticket)
 
-    def ticket_waits(self, tid: str, body: str) -> list[tuple[str, int]]:
-        return list(dict.fromkeys(github_waits(body, self.repo.github) + run_store.environment_waits(self.repo.name, tid)))
-
-    def wait_blocker(self, waits: list[tuple[str, int]]) -> str:
+    def ticket_wait_blocker(self, ticket: Ticket, *, include_environment: bool = True) -> str:
+        if ticket.blocker:
+            return ticket.blocker
         own = self.repo.github.casefold()
-        return wait_blocker([n if repo == own else f"{repo}#{n}" for repo, n in waits], self.wait_is_open)
+        waits = github_waits(ticket.body, own)
+        if include_environment:
+            waits.extend(run_store.environment_waits(self.repo.name, ticket.id))
+        refs = [n if repo == own else f"{repo}#{n}" for repo, n in waits]
+        native = set(ticket.github_blockers)
+        return wait_blocker([*refs, *ticket.github_blockers], lambda ref: ref in native or self.wait_is_open(ref))
 
     def wait_is_open(self, ref: int | str) -> bool | None:
         if isinstance(ref, int):
@@ -258,9 +266,8 @@ class GitHubTracker:
             if LABEL not in labels or ZTE_LABEL in labels or not self.by_owner(i):
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
-            self._bodies[str(i["number"])] = full.get("body") or ""
-            self._labels[str(i["number"])] = [lb["name"] for lb in full.get("labels", [])]
-            if ZTE_LABEL in self._labels[str(i["number"])]:
+            ticket = self.remember(str(i["number"]), full)
+            if ZTE_LABEL in ticket.labels:
                 continue
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
                     if self.by_owner(c) and c.get("createdAt")]
@@ -281,20 +288,17 @@ class GitHubTracker:
 
     def get(self, tid: str) -> Ticket:
         i = gh.issue(self.repo.github, int(tid))
-        labels = [lb["name"] for lb in i.get("labels", [])]
-        self._bodies[str(tid)] = i.get("body") or ""
-        self._labels[str(tid)] = labels
+        ticket = self.remember(tid, i)
+        labels = ticket.labels
         author = (i.get("author") or {}).get("login", "")
         comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
                     if self.by_owner(c)]
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
-            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
-            self.ticket_waits(str(i["number"]), i.get("body") or ""))
-        ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
-                      comments=comments_text(comments), open=i.get("state") == "OPEN",
-                      kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
-                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker, github_repo=self.repo.github)
+            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
+        ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
+                         open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
+                         updated=i.get("updatedAt") or "", blocker=blocker)
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
