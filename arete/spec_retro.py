@@ -54,12 +54,11 @@ def github_specs(repos, sid):
 def jira_specs(repos, sid, cfg):
     projects = {}
     for repo in repos:
-        project = repo.jira_project or cfg.jira.project
-        if not project:
+        route = tracker.JiraTracker(repo, cfg.jira)
+        if not route.project:
             raise jira.JiraError(f"Missing Jira project for {repo.name}")
-        projects.setdefault(project, []).append(repo)
-    for project, targets in projects.items():
-        client = tracker.JiraTracker(targets[0], cfg.jira).client
+        projects.setdefault((route.client, route.project), []).append(repo)
+    for (client, project), targets in projects.items():
         jql = f'project = {json.dumps(project)} AND creator = currentUser() AND labels = "spec" AND statusCategory = Done'
         rows = client.search(jql, ["summary", "description", "issuetype", "labels", "parent",
                                    "statuscategorychangedate"], limit=sys.maxsize)
@@ -96,7 +95,7 @@ def closed_specs(cfg, kind, sid):
 def require_source(cfg, repo, event):
     ref = event["data"]["ref"]
     if repo.tracker == "jira":
-        if (not jira.KEY_RE.fullmatch(ref) or ref.split("-", 1)[0] != (repo.jira_project or cfg.jira.project)
+        if (not jira.KEY_RE.fullmatch(ref) or ref.rsplit("-", 1)[0] != tracker.jira_project(repo, cfg.jira)
                 or event["url"] != tracker.JiraTracker(repo, cfg.jira).client.browse_url(ref)):
             raise ValueError("Jira spec moved outside its configured project or site")
     elif (event["key"] != f"{repo.github.casefold()}#{int(ref)}"
@@ -113,7 +112,8 @@ def ticket_scopes(cfg, repo, event):
         for row in client.search(f'parent = "{ref}"', ["labels"], limit=sys.maxsize):
             project = row["key"].split("-", 1)[0]
             labels = set(row["fields"].get("labels") or [])
-            candidates = [r for r in eligible if (r.jira_project or cfg.jira.project) == project]
+            candidates = [r for r in eligible if tracker.jira_project(r, cfg.jira) == project
+                          and (not r.jira_site or r.jira_site == client.base)]
             routed = [r for r in candidates if tracker.route_label(r) in labels]
             if len(routed) == 1:
                 scopes.append((routed[0].name, row["key"]))

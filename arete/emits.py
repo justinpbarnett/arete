@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 
-from . import config, gh, idempotency, jira, outbound, screening, sources, tracker, util
+from . import config, gh, idempotency, jira, outbound, screening, sources, ticket_publication, util
 from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
-from .store import db as foundation
 from .store import loops as loop_store
 
 SEVERITIES = ("low", "medium", "high", "critical")
@@ -110,96 +107,7 @@ def configured_ticket_target(cfg: config.Config, name: str) -> dict:
     repo = config_repo(cfg, name) if name else None
     if not repo:
         raise ValueError(f"configured ticket emit needs a registered target repo: {name!r}")
-    if repo.tracker == "github" and repo.github:
-        return {"tracker": "github", "github": repo.github}
-    if repo.tracker == "jira":
-        project = repo.jira_project or cfg.jira.project
-        if project:
-            return {"tracker": "jira", "project": project, "route": tracker.route_label(repo),
-                    "site": jira.site_url(cfg.jira.env_file)}
-        raise ValueError(f"{repo.name} has no Jira project configured")
-    raise ValueError(f"{repo.name} needs a configured GitHub or Jira destination")
-
-
-def publish_configured_ticket(item: dict, cfg: config.Config, approval) -> str:
-    """Reuse the finding's own receipt across automatic sends and approval retries."""
-    key = item["publication_key"]
-    try:
-        with idempotency.owning("loop.ticket", key, key, "/loops/configured-ticket") as context:
-            with foundation.tx():
-                row = idempotency.matching_claim(context)
-                if row and row["status"]:
-                    return json.loads(row["response"])
-                receipt = idempotency.Publication(context, row)
-                if receipt.pending is None:
-                    receipt.remember({"destination": item["destination"]})
-            return send_configured_ticket(item, cfg, receipt, approval)
-    except (idempotency.Unconfirmed, idempotency.InFlight) as error:
-        # Automatic deliveries retain failed sends for a later reconciliation.
-        raise RuntimeError(str(error)) from error
-
-
-def send_configured_ticket(item: dict, cfg: config.Config, receipt, approval) -> str:
-    target = receipt.pending["destination"]
-    if target != item["destination"]:
-        raise ValueError("The queued ticket's destination differs from its earlier publication receipt")
-    marker = "areteemit" + hashlib.sha256(receipt.marker.encode()).hexdigest()
-    body = item["body"] + "\n\n" + marker
-    if approval:
-        body = approval.text(body)
-
-    if target["tracker"] == "jira":
-        client = jira.Client.from_env(cfg.jira.env_file)
-        if client.base != target["site"]:
-            raise jira.JiraError("the queued ticket belongs to a different Jira site")
-        account = client.me().get("accountId")
-        if not account or (receipt.pending.get("account") and receipt.pending["account"] != account):
-            raise jira.JiraError("cannot confirm the Jira account for this ticket")
-        found = client.find_task_marker(target["project"], account, marker)
-        labels = list(dict.fromkeys([*item["labels"], target["route"]]))
-
-        def create():
-            return client.create_task(target["project"], account, item["title"], body, labels)
-    else:
-        account = ""
-        github = target["github"]
-        found = gh.find_issue_marker(github, marker)
-
-        def create():
-            number = gh.issue_create(github, item["title"], body, item["labels"], single_attempt=True)
-            return gh.issue_url(github, number)
-
-    if not found:
-        receipt.require_unsent()
-        if target["tracker"] == "github":
-            for label in item["labels"]:
-                gh.ensure_label(github, label, restyle=False)
-        with foundation.tx():
-            # Recheck under the write lock: another process may have finished the lookup first.
-            row = idempotency.matching_claim(receipt.context)
-            if row["status"]:
-                return json.loads(row["response"])
-            receipt.pending = json.loads(row["response"])
-            receipt.require_unsent()
-            if account:
-                if receipt.pending.get("account") not in (None, account):
-                    raise jira.JiraError("cannot confirm the Jira account for this ticket")
-                receipt.remember({**receipt.pending, "account": account})
-            if approval and not (approval.pending or {}).get("send_started"):
-                if approval.pending is None:
-                    approval.remember({})
-                approval.begin_send()
-            receipt.begin_send()
-        try:
-            found = create()
-        except (gh.GhUnsure, jira.JiraUnsure):
-            raise
-        except (gh.GhError, jira.JiraError):
-            # A definite rejection can be retried once the reported problem is fixed.
-            receipt.remember({**receipt.pending, "send_started": False})
-            raise
-    receipt.complete(json.dumps(found).encode())
-    return found
+    return ticket_publication.target_for(cfg, repo)
 
 
 class Ticket(Emit):
@@ -245,12 +153,14 @@ class Ticket(Emit):
         delivery = {}
         if spec.get("tracker") == "configured":
             identity = [loop.name, spec["repo"], f.get("fingerprint_key") or f["fingerprint"]]
-            key = idempotency.fingerprint("POST", "/loops/configured-ticket", {}, identity)
+            key = idempotency.fingerprint("POST", ticket_publication.LOOP_ROUTE, {}, identity)
             delivery = {"destination": spec["destination"], "publication_key": key}
-        default_labels = [] if delivery else ["agent"]
+        labels = as_list(spec.get("labels", [] if delivery else ["agent"]))
+        if spec.get("destination", {}).get("tracker", "github") == "github" and "github_labels" in spec:
+            labels = list(dict.fromkeys([*labels, *as_list(spec["github_labels"])]))
         return {**delivery, "repo": spec["repo"], "title": outbound.plain(spec.get("prefix", "") + f["title"], 120),
                 "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
-                "labels": as_list(spec.get("labels", default_labels)), "trust": outcome.get("trust", ""), "run": run_id}
+                "labels": labels, "trust": outcome.get("trust", ""), "run": run_id}
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         if why := super().held(spec, item, cfg):
@@ -267,7 +177,7 @@ class Ticket(Emit):
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
                 *, publication=None) -> str:
         if "destination" in item:
-            return publish_configured_ticket(item, cfg, publication)
+            return ticket_publication.finding(item, cfg, publication)
         repo = publication.pending.get("repo") if publication else ""
         if not repo:
             repo = sources.github_name(cfg, item["repo"])
@@ -324,6 +234,9 @@ class PullRequest(Emit):
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
                 *, publication=None) -> str:
+        repo = config_repo(cfg, item["repo"])
+        if repo and repo.target_branch and (item["base"] != repo.target_branch or item["branch"] == repo.target_branch):
+            raise ValueError(f"the queued PR must target {repo.target_branch} from a separate work branch")
         if publication:
             if url := gh.find_pr_marker(item["repo"], item["branch"], publication.marker):
                 return url
