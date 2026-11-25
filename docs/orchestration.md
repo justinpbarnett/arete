@@ -321,3 +321,25 @@ Missing or uncertain usage stops the experiment for reconciliation and leaves ch
 Results include total actual usage, controller/worker breakdowns, owner interventions, accepted outcomes and cost per acceptance, including failed attempts.
 Legacy manifests without `executor` retain their atom behavior and design shape.
 Replay demonstrates execution mechanics, not native isolation, model quality or an economic advantage for orchestration.
+
+### Hosted macOS check for Arete
+
+A suppressed nested macOS sandbox profile can block the behavior suite before the worker-isolation assertion runs.
+The local owner can enroll Arete’s own GitHub repository by creating `hosted-macos.toml` in the private Arete config
+directory. Set `repo = "justinpbarnett/arete"` and set `workflow_blob` to the quoted Git blob ID printed by
+`git rev-parse origin/main:.github/workflows/ci.yml` after the candidate-check workflow reaches protected main.
+Removing the file disables new requests. Changing the workflow requires a new owner pin.
+
+An authorized orchestrated ticket on this repo can then request the existing read-only `arete-checks` macOS job
+when its only failing check is the recognized behavior-suite profile denial. Arete applies its full outbound diff
+and stored-secret checks. A dedicated `arete-check/` branch carries a snapshot of the admitted tree, with its
+public base as the only parent. A separate commit supplies main’s protected workflow definition. Local WIP history
+and private runner data stay on the host. Each tree, policy and workflow pin identifies one branch, including across
+a retry or restart. The GitHub job retains its existing time limit and installs uv and Node. It runs the full suite
+and observes the individual isolation test completing without a skip.
+
+The check action and its run folder (`hosted-check.json`) record the candidate tree and commit, policy digest,
+workflow blob, GitHub run and attempt, conclusion and a zero exit on success. Cancelled, missing, failed, incomplete
+and stale results keep the gate closed. The other check commands still run locally. A hosted pass lets the ordinary
+independent review and behavioral-verification gates proceed. An already-held ticket uses the existing runner
+readiness confirmation to resume once the enrolled route is available.
