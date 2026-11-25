@@ -78,6 +78,10 @@ def unaffected(source, remote, key, saved, parent, ticket, ref):
         return False
     nodes = saved["data"]["plan"]["children"]
     blocked = set(updates)
+    if pending := saved["data"].get("pending_amendment"):
+        blocked.update(pending["open"])
+        blocked.update(pending["corrections"])
+        blocked.update(dependent for _, dependent in pending["edges"])
     for name in spec_graph.ordered({n["key"]: set(n["requires"]) for n in nodes}):
         node = next(n for n in nodes if n["key"] == name)
         if blocked.intersection(node["requires"]):
@@ -152,6 +156,8 @@ def plan_amendment(source, remote, key, saved, updates, version):
             node["requires"].append(correction)
             if name in node.get("release_requires", []):
                 node["release_requires"].append(correction)
+            if artifact := node.get("artifacts", {}).get(name):
+                node["artifacts"][correction] = artifact.copy()
             edges.append([correction, node["key"]])
     spec_graph.ordered({n["key"]: set(n["requires"]) for n in plan["children"]})
     return {"version": version, "plan": plan, "open": open_nodes, "corrections": corrections, "edges": edges}
