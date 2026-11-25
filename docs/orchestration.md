@@ -336,10 +336,14 @@ and stored-secret checks. A dedicated `arete-check/` branch carries a snapshot o
 public base as the only parent. A separate commit supplies main’s protected workflow definition. Local WIP history
 and private runner data stay on the host. Each tree, policy and workflow pin identifies one branch, including across
 a retry or restart. The GitHub job retains its existing time limit and installs uv and Node. It runs the full suite
-and observes the individual isolation test completing without a skip.
+on the candidate with the published test runner. Candidates that change this runner require another route.
+Before candidate setup or tests execute, GitHub separately projects the entire test directory from the candidate’s
+public comparison base onto a clean copy of the candidate product. An isolated Python interpreter runs the named
+worker-isolation witness from that protected copy. Candidate changes to the witness or its test support cannot
+supply this result. A missing, skipped or expected-failure witness holds the gate.
 
 The check action and its run folder (`hosted-check.json`) record the candidate tree and commit, policy digest,
-workflow blob, GitHub run and attempt, conclusion and a zero exit on success. Cancelled, missing, failed, incomplete
+workflow blob and directory digest, protected witness base and tests digest, GitHub run and attempt, conclusion and a zero exit on success. Cancelled, missing, failed, incomplete
 and stale results keep the gate closed. The other check commands still run locally. A hosted pass lets the ordinary
 independent review and behavioral-verification gates proceed. An already-held ticket uses the existing runner
 readiness confirmation to resume once the enrolled route is available.

@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Select check candidate
         if: startsWith(github.ref, 'refs/heads/arete-check/')
         run: git checkout --detach "$GITHUB_SHA^2"
@@ -34,19 +34,25 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
-      - run: uv sync --locked
-      - name: Existing behavior checks
-        run: uv run --locked python -m tests.parallel --timeout 30
-      - name: Observe the worker isolation check
+      - name: Observe the protected worker isolation check
         if: startsWith(github.ref, 'refs/heads/arete-check/')
         run: |
-          uv run --locked python - <<'PYTHON'
+          witness="$RUNNER_TEMP/arete-protected-witness"
+          git worktree add --quiet --detach "$witness" "$GITHUB_SHA^2"
+          git -C "$witness" restore --source="$GITHUB_SHA^2^" --staged --worktree -- tests
+          cd "$RUNNER_TEMP"
+          uv --no-config run --isolated --no-project --python 3.13 python -IB - "$witness" <<'PYTHON'
+          import sys
           import unittest
+          sys.path.append(sys.argv[1])
           name = "tests.test_behavior.AuthorityPrivatePiWorkerTests.test_private_worker_launch_denies_the_configured_file_store"
           suite = unittest.defaultTestLoader.loadTestsFromName(name)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           raise SystemExit(not (result.wasSuccessful() and result.testsRun == 1 and not result.skipped and not result.expectedFailures))
           PYTHON
+      - run: uv sync --locked
+      - name: Existing behavior checks
+        run: uv run --locked python -m tests.parallel --timeout 30
       - name: Python lint, compilation and imports
         run: |
           sh tools/lint-arete

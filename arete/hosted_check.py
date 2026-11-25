@@ -69,7 +69,14 @@ def prepare(job, tree, workflow_blob, policy):
                   "the candidate or its public comparison base changed")
     # Only the admitted tree and an already public parent go to GitHub. Local
     # history can contain discarded intermediate edits and must stay local.
-    key = hashlib.sha256(f"{tree}:{policy}:{workflow_blob}".encode()).hexdigest()
+    # The ordinary full suite still includes the candidate's new test cases.
+    # Its discovery command must be the same one that the published base used.
+    controls = ("tests/parallel.py", "tests/_parallel_site", "tests/__init__.py")
+    pilot.require(not git(wt, "diff", "--name-only", base, tree, "--", *controls),
+                  "the candidate changes the protected full-suite runner")
+    witness_tree = git(wt, "rev-parse", f"{base}:tests")
+    workflows = git(wt, "rev-parse", f"{main}:.github/workflows")
+    key = hashlib.sha256(f"{tree}:{base}:{policy}:{workflows}".encode()).hexdigest()
     branch = PREFIX + key
     ref = "refs/heads/" + branch
 
@@ -101,11 +108,13 @@ def prepare(job, tree, workflow_blob, policy):
     pilot.require(git(wt, "merge-base", parent, main) == parent
                   and git(wt, "show", "-s", "--format=%s", marker) == f"Arete candidate check {key}"
                   and git(wt, "rev-parse", f"{marker}^{{tree}}") == git(wt, "rev-parse", f"{parent}^{{tree}}")
-                  and git(wt, "rev-parse", f"{parent}:{WORKFLOW}") == workflow_blob
+                  and git(wt, "rev-parse", f"{parent}:.github/workflows") == workflows
+                  and git(wt, "rev-parse", f"{candidate}^1") == base
                   and git(wt, "rev-parse", f"{candidate}^{{tree}}") == tree,
                   "the hosted check request does not match the admitted candidate and workflow")
     return {"repo": REPO, "branch": branch, "head": marker, "candidate": candidate, "tree": tree,
-            "policy": policy, "workflow_blob": workflow_blob, "status": "pending"}
+            "policy": policy, "workflow_blob": workflow_blob, "workflows_tree": workflows, "witness_base": base,
+            "witness_tests": witness_tree, "status": "pending"}
 
 
 def result(receipt):
@@ -126,7 +135,7 @@ def result(receipt):
         receipt["status"] = row["conclusion"]
         if row["conclusion"] == "success":
             jobs = gh.workflow_attempt_jobs(REPO, receipt["head"], run, attempt, retry=False, timeout=20)
-            required = {"Select check candidate", "Existing behavior checks", "Observe the worker isolation check",
+            required = {"Select check candidate", "Existing behavior checks", "Observe the protected worker isolation check",
                         "Python lint, compilation and imports", "JavaScript syntax"}
             pilot.require(len(jobs) == 1 and jobs[0]["name"] == "arete-checks" and jobs[0]["conclusion"] == "success"
                           and "macos-15" in jobs[0]["labels"]
