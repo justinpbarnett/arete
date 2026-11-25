@@ -2841,7 +2841,7 @@ Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-fi
 {
   "destination": "arete-serve",
   "path": "/api/v1/cohorts/example",
-  "assertions": [{"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending", "/overdue": true}}],
+  "assertions": [{"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending"}, "before": {"member": "/deadline", "response": "/report/observed"}}],
   "recovery": [{"field": "/report/cohort/name", "equals": "example"}]
 }
 ```
