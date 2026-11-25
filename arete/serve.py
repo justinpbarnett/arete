@@ -608,6 +608,8 @@ class Server:
                     return
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, {**serve_guard.original(paths.STATE_DIR, receipt), "healthy": True})
             self.say(f"deploy: {receipt.tip} is healthy")
+            if codebase.RELEASE == receipt.tip:
+                install.refresh_serve_guard(checkout, receipt.tip)
         elif receipt.expired():
             if reason := serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous):
                 self.note_once(f"deploy: code-only rollback refused because {reason}")
