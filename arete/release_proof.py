@@ -126,7 +126,7 @@ def validate(data):
                 need(isinstance(suffix, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", suffix)
                      and server_url(data["staging"]).hostname.endswith("." + suffix), "invalid preview hostname suffix")
             need(isinstance(data.get("qa"), list) and bool(data["qa"])
-                 and all(isinstance(s, str) and NAME.fullmatch(s) for s in data["qa"]),
+                 and all(isinstance(s, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", s) for s in data["qa"]),
                  "configure the authorized QA tracker accounts")
             need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
 
@@ -299,7 +299,7 @@ def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=
             record = proof
         previous = serve_guard.read(location / "latest.json")
         serve_guard.write(location / "latest.json", record)
-    if not recovery and destination == data["destination"]:
+    if not recovery:
         try:
             from . import cohorts
         except ImportError:
