@@ -16,33 +16,57 @@ def version(ticket: tracker.Ticket) -> str:
 CRITERION = re.compile(r"^\s*(?:[-*]\s*)?(?:\[[ xX]\]\s*)?(AC-\d+)\s*[:—-]\s*.+$")
 
 
+def criteria(body):
+    shared, named = [], {}
+    for line in body.splitlines():
+        match = CRITERION.fullmatch(line)
+        if not match:
+            shared.append(line)
+        elif match[1] in named:
+            return [], {}
+        else:
+            named[match[1]] = line.strip()
+    return shared, named
+
+
+def unchanged_criteria(before, after):
+    old_shared, old = criteria(before.body)
+    new_shared, new = criteria(after.body)
+    if before.title != after.title or before.owner_comments != after.owner_comments or old_shared != new_shared:
+        return {}
+    return {key: line for key, line in old.items() if new.get(key) == line}
+
+
+def prior_answers(before, after, notes):
+    if version(before) == version(after):
+        return list(notes), [], []
+    unchanged = unchanged_criteria(before, after)
+    _, previous = criteria(before.body)
+    _, current = criteria(after.body)
+    supersedes = re.compile(r"\b(?:supersedes?|replaces?|overrides?) (?:the )?(?:earlier|previous|prior|old) "
+                            r"(?:owner(?:'s)? )?(?:answer|decision|clarification)s?\b", re.I)
+    replaced = {key for key, line in current.items() if key in previous and line != previous[key]
+                and supersedes.search(line)}
+    retained, retired, unresolved = [], [], []
+    for note in notes:
+        keys = set(re.findall(r"\bAC-\d+\b", note))
+        if keys and keys <= unchanged.keys():
+            retained.append(note)
+        elif keys and keys <= replaced:
+            retired.append(note)
+        else:
+            unresolved.append(note)
+    return retained, retired, unresolved
+
+
 def independent_workers(before, after, workers):
     """Keep a private duty only when all edits are confined to other named criteria."""
-    if before.title != after.title or before.owner_comments != after.owner_comments:
-        return set()
-
-    def split(body):
-        shared, criteria = [], {}
-        for line in body.splitlines():
-            match = CRITERION.fullmatch(line)
-            if not match:
-                shared.append(line)
-            elif match[1] in criteria:
-                return [], {}
-            else:
-                criteria[match[1]] = line.strip()
-        return shared, criteria
-
-    old_shared, old = split(before.body)
-    new_shared, new = split(after.body)
-    if old_shared != new_shared or not old or not new:
-        return set()
-    unaffected = {k for k in old.keys() & new.keys() if old[k] == new[k]}
+    unaffected = unchanged_criteria(before, after)
     keep = set()
     for wid, worker in workers.items():
         assignment = worker["data"]["effective"]
         check = assignment.get("acceptance_check", "").strip()
-        if (check in unaffected or any(check == old[k] for k in unaffected)) and not assignment.get("depends_on"):
+        if (check in unaffected or check in unaffected.values()) and not assignment.get("depends_on"):
             keep.add(wid)
     return keep
 

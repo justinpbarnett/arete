@@ -2742,7 +2742,8 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     from . import unblock
 
     shared_runner = bool(asked) and all(a.get("call") == owner_asks.CHECK_RUNNER_CALL for a in asked)
-    recover = (not shared_runner and not run.dry_run and not run.alone and not run.spec_root
+    scope_question = any(a.get("call", "").startswith("requirements.") for a in asked or [])
+    recover = (not shared_runner and not scope_question and not run.dry_run and not run.alone and not run.spec_root
                and unblock.active(run.config, run.repo.name, str(run.tid))
                and not unblock.exclude(run.repo.name, str(run.tid)))
     if recover and not asked:

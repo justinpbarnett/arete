@@ -370,12 +370,14 @@ class Controller(worker_turns.WorkerTurns):
             self.run.story.append(feedback)
             self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
-        if self.run.answers_due:
-            answer = owner_asks.fresh_note(self.run.answers_due)
+        answers = [a for a in self.run.answers_due or [] if not a.get("call", "").startswith("requirements.")]
+        if answers:
+            answer = owner_asks.fresh_note(answers)
             self.run.story.append(answer)
             notes = self.data.setdefault("owner_answers", [])
-            if not self.is_spec or answer not in notes:
-                notes.append(answer)
+            for note in owner_asks.decision_notes(answers):
+                if note not in notes:
+                    notes.append(note)
         self.acceptance_goal()
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
@@ -451,6 +453,34 @@ class Controller(worker_turns.WorkerTurns):
             self.atomic("orchestrate_ask", request=request, call=call)
         return "needs-info", reason, ""
 
+    def reconcile_answers(self, old, ticket):
+        notes = ask_store.individual_scope_notes(self.data.get("runs", []), self.data.get("owner_answers", []))
+        retained, retired, uncertain = requirement_revision.prior_answers(old, ticket, notes)
+        if not uncertain:
+            return retained, retired, None
+        key = ledger.digest([self.lease.root, requirement_revision.version(ticket), uncertain])
+        call = f"requirements.decisions.{key}"
+        keep, revised = "Keep the listed decisions", "Use the revised ticket"
+        asked = ask_store.carry_scope_ask(self.run.repo.name, self.run.tid, call, self.run.id)
+        if asked and asked["status"] in ("answered", "taken") and len(asked["answers"]) == 1:
+            answer = asked["answers"][0]
+            if not answer.get("by", "").startswith("rule:"):
+                if answer.get("picked") == [keep]:
+                    return [*retained, *uncertain], retired, None
+                if answer.get("picked") == [revised]:
+                    return retained, [*retired, *uncertain], None
+        reason = "The revised ticket leaves the applicability of these earlier owner decisions unresolved."
+        if not asked and not (self.run.dry_run or self.run.alone or self.run.owner_questions_blocked):
+            request = {"questions": [{"header": "Prior scope", "kind": "choice",
+                       "question": reason + "\n\n" + "\n\n".join(uncertain),
+                       "options": [{"label": revised, "description": "Recommended. The current ticket replaces these "
+                                    "decisions. Add any detail you want to retain to its requirements."},
+                                   {"label": keep, "description": "I confirm all the listed decisions still apply to this revision."}]}],
+                       "why": "Previously accepted decisions must be reconciled with the owner's current scope.",
+                       "tried": "Kept decisions tied to unchanged checks and retired decisions the ticket explicitly supersedes."}
+            self.atomic("orchestrate_ask", request=request, call=call)
+        return retained, retired, ("needs-info", reason, "")
+
     def refresh_requirements(self, prepared, pending_push):
         if not self.default_code_review:  # Reserved pilot and ZTE tasks have their own immutable grant.
             return None
@@ -480,6 +510,9 @@ class Controller(worker_turns.WorkerTurns):
                        for a in actions)
                 or any(w["phase"] in ("integrating", "reconciliation-required") for wid, w in workers.items() if wid not in keep)):
             return self.scope_question(ticket, "An earlier publication or worker integration has unsettled effects.")
+        retained_notes, retired_notes, waiting = self.reconcile_answers(old, ticket)
+        if waiting:
+            return waiting
         reason = "the owner revised the ticket requirements"
         for worker, w in workers.items():
             if worker not in keep and w["phase"] not in exchange.CLOSED:
@@ -494,7 +527,11 @@ class Controller(worker_turns.WorkerTurns):
         self.discard_gate_state()
         self.data["superseded_actions"] = sorted({*self.data.get("superseded_actions", ()),
                                                   *superseded})
-        for key in ("scope_revoked", "definition", "spec_source", "owner_answers", "published", "published_tree", "ci_retry", "ci_failed",
+        self.data["owner_answers"] = retained_notes
+        if retired_notes:
+            history = self.data.setdefault("retired_owner_answers", {}).setdefault(previous, [])
+            history.extend(note for note in retired_notes if note not in history)
+        for key in ("scope_revoked", "definition", "spec_source", "published", "published_tree", "ci_retry", "ci_failed",
                     "ci_failures", "verification_required_for", "denied_feedback"):
             self.data.pop(key, None)
         job = self.data.get("job", {})
