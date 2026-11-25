@@ -63,7 +63,7 @@ def candidate(job, done: dict, policy: str, acceptance: str, trees: dict) -> dic
                 or c.pr and gh.pr_repo(c.pr).casefold() != c.github.casefold()):
             raise ValueError("a release checkout does not match the verified spec tree")
         targets.append({"pr": c.pr, "repo": c.github, "base": c.base, "tree": tree, "head": head})
-    return {"definition": done, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
+    return {"definition": done, "source_format": 2, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
             "landing": landing_policy(job.run.tracker), "targets": targets, "behavior": observed}
 
 
@@ -191,15 +191,11 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
               f"Reply with `Spec evidence {request['token']}` on its own first line, followed by `How:` and `Saw:` "
               "lines describing how you checked it and what matched the expected outcome. Do not include secrets.")
     for body, url, created in comments(tk, claim["issue"]):
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if (len(lines) != 3 or lines[0] != f"Spec evidence {request['token']}" or not url or not created
-                or jira.parse_time(created) <= util.parse_iso(request["since"])):
-            continue
-        has_how, has_saw = lines[1].startswith("How:"), lines[2].startswith("Saw:")
-        how, saw = (line.partition(":")[2].strip()[:2000] for line in lines[1:])
-        if has_how and has_saw and how and saw:
+        observed = tracker.spec_observation(body)
+        if (observed and observed[0] == request["token"] and url and created
+                and jira.parse_time(created) > util.parse_iso(request["since"])):
             return {"method": "publisher's delivery-point observation", "landed": request["landed"],
-                    "how": how, "saw": saw, "source": url}
+                    "how": observed[1][:2000], "saw": observed[2][:2000], "source": url}
     return {}
 
 
@@ -208,9 +204,18 @@ def settle(cfg, repo, claim: dict) -> None:
     if (runs.run_get(run) or {}).get("status") in (None, "running"):
         return
     tk = tracker.for_ticket(cfg, repo, tid)
-    t = tk.get(tid)
+    saved = {}
+    if "source_format" not in data:
+        state = orchestration.find(run).get("data", {})
+        saved = state.get("prepared", {}).get("ticket", {})
+    legacy = (saved.get("id") == tid and data["source"] == orchestration.digest([saved.get("title"), saved.get("body")]))
+    t = tk.get(tid, saved_comments=saved.get("comments", "")) if legacy else tk.get(tid)
+    if legacy:
+        same_source = t.saved_scope_matches and (t.title, t.body) == (saved["title"], saved["body"])
+    else:
+        same_source = source_version(t) == data["source"]
     if (t.spec_identity != claim["identity"] or tracker.spec_blocker(cfg, tk, t, require_open=False)
-            or source_version(t) != data["source"] or landing_policy(tk) != data["landing"]):
+            or not same_source or landing_policy(tk) != data["landing"]):
         return
     if claim["state"] == "published":
         observed = data.get("delivery") or at_delivery(claim, tk)
