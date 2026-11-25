@@ -5004,14 +5004,15 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
 
 
 @runlimits.verification
-def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[str, ...] = ()) -> verify.Verified:
+def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[str, ...] = (), delivery_token="") -> verify.Verified:
     return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000], covered_commands=covered_commands,
-                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
+                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+                       **({"delivery_token": delivery_token} if delivery_token else {}))
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, *, replay_drivers: set[str] | None = None,
-                covered_commands: tuple[str, ...] = (), **values) -> verify.Verified:
+                covered_commands: tuple[str, ...] = (), delivery_token="", **values) -> verify.Verified:
     from . import candidate_observer, pilot, readme_verify, release_proof, zte
 
     run, configured = b.run, b.layer.verify
@@ -5152,7 +5153,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     journeys=journeys.guidance(selected if requested or covered_commands else feature_map), **values),
                                 b.ws, role=role,
                                 allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
-                                disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
+                                disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.candidate_schema(delivery_token),
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
@@ -5199,7 +5200,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         if not drivers:
             return save_verification(run, step, verified, removed) if removed else verified
     else:
-        verified = verify.Verified.from_agent(res.structured)
+        verified = verify.Verified.from_agent(res.structured, delivery_token=delivery_token)
     if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
     if candidate and candidate.verdict == "pass":

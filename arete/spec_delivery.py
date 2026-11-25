@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import replace
+from pathlib import Path
 from urllib.parse import quote
 
-from . import gh, jira, outbound, release_proof, requirement_revision, tracker, util, vault, verify
+from . import gh, jira, outbound, paths, pilot, release_proof, requirement_revision, tracker, util, vault, verify, zte
 from .store import orchestration, runs, specs, workspaces
 
 GUIDANCE = (
@@ -65,6 +67,61 @@ def obligation(repo, ticket, done, identity=""):
     return {"repo": repo, "ticket": ticket.id, "identity": identity or ticket.spec_identity, "source": source_version(ticket),
             "definition": orchestration.digest(done),
             "destination": target, "path": policy["path"], "policy": release_proof.digest(policy)}
+
+
+def delivery_declarations(ticket):
+    return [line.strip().removeprefix("Delivery observation:").strip() for line in ticket.body.splitlines()
+            if line.strip().startswith("Delivery observation:")]
+
+
+def declared_observations(ticket, promise):
+    rows = delivery_declarations(ticket)
+    if not rows:
+        return {}, ""
+    release_proof.need(bool(promise), "the declared delivery observation needs a protected native enrollment")
+    name = f"Protected release receipt for {promise['destination']} {promise['path']} under policy {promise['policy']}"
+    release_proof.need(rows == [name], f"the only enrolled delivery observation is: {name}")
+    checks = requirement_revision.criteria(ticket.body)[1]
+    release_proof.need(bool(checks), "declare distinct AC-N candidate checks alongside the protected delivery observation")
+    return checks, name
+
+
+def superseded_observations(actions, revised, carried, superseded, promise):
+    """Identify prior verifier findings that the publisher may explicitly replace with revised checks."""
+    if not carried or not declared_observations(revised, promise)[0]:
+        return {}
+    declared = (revised.title + "\n" + revised.body + "\n" + (revised.owner_comments or "")).casefold()
+    found = {}
+    for action in actions:
+        result = action["result"]
+        if (action["id"] in superseded or action["op"] != "verification.run" or action["state"] != "succeeded"
+                or not result.get("operation_passed") or not result.get("native_trees") or result.get("verification_requirements")
+                or result.get("delivery_obligation") != promise or result.get("pending_delivery") != orchestration.digest(promise)):
+            continue
+        stamp = result.get("evidence", {})
+        report = Path(result.get("saved") or "")
+        if (stamp.get("producer") != action["id"] or stamp.get("result", {}).get("saved") != str(report)
+                or report.parent != paths.RUNS_DIR / action["run"] or not re.fullmatch(r"verify(?:[1-9][0-9]*)?\.md", report.name)):
+            continue
+        try:
+            raw = json.loads(zte.private_bytes(report.with_suffix(".json"), 2_000_000))
+        except (OSError, ValueError, pilot.Held):
+            continue
+        if (not isinstance(raw, dict) or raw.get("ok") is not True or raw.get("runner") not in ("claude", "codex", "pi")
+                or not isinstance(raw.get("structured"), dict)):
+            continue
+        try:
+            payload = raw["structured"]
+            typed = any(isinstance(v, dict) for v in (payload.get("unmeasured_requirements") or []))
+            measured = verify.Verified.from_agent(payload, delivery_token=result["pending_delivery"] if typed else "")
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if measured.verdict != "pass" or measured.pending_delivery != result["pending_delivery"]:
+            continue
+        for name in measured.unmeasured_requirements:
+            if name in carried and name in result.get("unattempted_requirements", []) and name.casefold() not in declared:
+                found.setdefault(name, []).append({"action": action["id"], "report": orchestration.digest(raw["structured"])})
+    return found
 
 
 def candidate_instructions(promise):
