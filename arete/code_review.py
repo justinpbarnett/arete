@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import replace
 
-from . import factory, journeys, prompt_loader, util, verification_attempts
+from . import factory, journeys, prompt_loader, verification_attempts
+from .pipeline import base_of_head
 from .review import Review
 from .verify import Verified
 
@@ -47,7 +48,7 @@ def completed(review):
 
 
 def bases(checkouts):
-    return {c.prefix: util.git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() for c in checkouts}
+    return {c.prefix: base_of_head(c) for c in checkouts}
 
 
 def candidate_trees(checkouts):

@@ -5401,6 +5401,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "mcp": "mcp_stdio", "mcp-ask": "owner_asks", "mcp-config": "commands.api",
         "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
         "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
+        "release enroll": "release_proof", "release observe": "release_proof", "release status": "release_proof",
         "release-journeys": "releasejourneys", "replay sample": "replay",
         "repo enroll": "commands.setup", "repo publish": "commands.setup", "repo show": "commands.setup",
         "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",

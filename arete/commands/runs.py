@@ -22,6 +22,16 @@ def cmd_merge_check(args) -> int:
     return mergecheck.command(args)
 
 
+def cmd_release(args) -> int:
+    from .. import release_proof
+
+    try:
+        return release_proof.command(args)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        print(f"arete release: {error}", file=sys.stderr)
+        return 1
+
+
 def cmd_release_journeys(args) -> int:
     from .. import releasejourneys
 
@@ -169,6 +179,18 @@ def register(sub) -> None:
     p.add_argument("repo", nargs="?", default="", help="configured repository; otherwise read events on stdin")
     p.add_argument("--dry-run", action="store_true", help="preview saved checks without starting anything")
     p.set_defaults(fn=cmd_merge_check)
+
+    group = sub.add_parser("release", help="enroll and observe protected checks on the running release")
+    actions = group.add_subparsers(dest="action", required=True)
+    for name in ("enroll", "status", "observe"):
+        action = actions.add_parser(name)
+        action.add_argument("repo")
+        action.add_argument("ticket")
+        if name == "enroll":
+            action.add_argument("--policy-file", required=True)
+        elif name == "observe":
+            action.add_argument("--revision", required=True)
+        action.set_defaults(fn=cmd_release)
 
     p = sub.add_parser("release-journeys", help="exercise configured journeys against a pinned release build")
     p.add_argument("--config", help="journey TOML file, defaults to release-journeys.toml in the Arete config directory")

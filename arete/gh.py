@@ -620,8 +620,8 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
-def pr_set_draft(url: str, draft: bool) -> None:
-    gh(["pr", "ready", url, *(["--undo"] if draft else [])])
+def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = False) -> None:
+    gh(["pr", "ready", url, *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
 
 
 def pr_close(url: str) -> None:
@@ -674,8 +674,10 @@ class BaseTipChanged(str):
 
 
 def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True,
-                     watch_checks: bool = False) -> dict:
+                     watch_checks: bool = False, identity: bool = False) -> dict:
     fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title,reviewDecision"
+    if identity:
+        fields += ",url,headRefName,isCrossRepository"
     if watch_checks:
         fields += ",statusCheckRollup"
     args = ["pr", "view", pr, "--json", fields]

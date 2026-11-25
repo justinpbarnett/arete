@@ -387,7 +387,10 @@ class GitHubTracker:
                 raise TaskError(ZTE_QUEUE)
             if SPEC_LABEL in labels or spec_store.find(self.repo.name, tid, identity=github_issue_identity(self.repo.github, tid)):
                 raise TaskError(f"#{tid} is a spec and cannot be closed by a batch")
-        return "\n".join(f"Closes #{tid}" for tid in ids)
+        from . import release_proof
+
+        return "\n".join(f"Refs #{tid}" if release_proof.required(self.repo.name, tid) else f"Closes #{tid}"
+                         for tid in ids)
 
 
 class JiraTracker:

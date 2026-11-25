@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from . import gh, jira, outbound, tracker, util, vault, verify
+from . import gh, jira, outbound, release_proof, tracker, util, vault, verify
 from .store import orchestration, runs, specs, workspaces
 
 GUIDANCE = (
@@ -169,6 +169,15 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     if not landed:
         return {}
     done = data["definition"]
+    if release_proof.required(tk.repo.name, claim["issue"]):
+        if len(landed) != 1 or landed[0]["repo"].casefold() != tk.repo.github.casefold():
+            return {}
+        proof = release_proof.evidence(tk.repo.name, claim["issue"], landed[0]["commit"])
+        if not proof:
+            return {}
+        return {"method": "protected release observation", "landed": landed, "how": f"Observed {proof['path']} "
+                f"on {proof['destination']} at {proof['revision']}", "saw": f"All protected assertions matched. "
+                f"Receipt {proof['receipt_id']}."}
     if not done.get("environment") and all(t["exact_tree"] for t in landed):
         return {"method": "verified candidate tree matches the landed tree", "landed": landed, **data["behavior"]}
     if not (request := data.get("observation_request")):

@@ -15,6 +15,7 @@ from . import (
     jira,
     paths,
     pipeline,
+    pr_recovery,
     prompt_loader,
     record,
     tracker,
@@ -46,7 +47,7 @@ def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[
     talk = gh.pr_discussion(url)
 
     def from_owner(item: dict) -> bool:
-        return (item.get("user") or {}).get("login") == owner and not gh.has_arete_mark(item.get("body"))
+        return bool(owner) and (item.get("user") or {}).get("login") == owner and not gh.has_arete_mark(item.get("body"))
 
     reviews = {r["id"]: r for r in talk.reviews}
     lines_in_review = Counter(c.get("pull_request_review_id") for c in talk.line_comments)
@@ -104,14 +105,25 @@ def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict
 
 
 def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
+    from . import unblock
+
     for url, pr in zip(urls, prs):
         updated = pr.get("updatedAt", "")
         fresh[url] = seen.get(url, "")
         if updated and seen.get(url) == updated:
             continue
         try:
-            rows = owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"]))
-            judge_feedback(cfg, r["repo"], url, rows)
+            state = pr.get("state", "")
+            rows = owner_feedback(url, state, r["repo"], str(r["issue"]))
+            if rows and state == "OPEN":
+                newest = run_store.newest_live_whole_run(r["repo"], r["issue"]) or {}
+                eligible = rows
+                if held := pr_recovery.blocked(newest):
+                    repo = next((repo for repo in cfg.repos if repo.name == r["repo"]), None)
+                    attached = unblock.recovery_checkouts(repo, newest)[1] if repo else {}
+                    eligible = unblock.replies_after_hold(newest, held, rows, attached)
+                if eligible:
+                    judge_feedback(cfg, r["repo"], url, eligible)
             added = insights_store.add_feedback(rows)
         except gh.GhError as e:
             print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
