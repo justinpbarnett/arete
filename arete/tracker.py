@@ -805,15 +805,19 @@ def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
 
 
+DELIVERY_DIRECTION = re.compile(r"Assign release observation [0-9a-f]{24} to delivery")
+
+
 def reply_text(comments: list[tuple[datetime, str]], since: str, *, strict: bool = False) -> str:
     cutoff = util.parse_iso(since)
     return "\n\n".join(body.strip() for when, body in sorted(comments, key=lambda c: c[0])
-                       if (when > cutoff if strict else when >= cutoff) and body.strip() and not from_arete(body))
+                       if (when > cutoff if strict else when >= cutoff) and body.strip()
+                       and not from_arete(body) and not DELIVERY_DIRECTION.fullmatch(body.strip()))
 
 
 def answered(comments: list[tuple[datetime, str]]) -> bool:
     asked = [when for when, body in comments if from_arete(body)]
-    replies = [when for when, body in comments if not from_arete(body)]
+    replies = [when for when, body in comments if not from_arete(body) and not DELIVERY_DIRECTION.fullmatch(body.strip())]
     return bool(asked and replies) and max(replies) > max(asked)
 
 
@@ -840,9 +844,6 @@ def graph_resolution(body: str):
             return None
         mapped[match[1]].append(match[2])
     return header[1], mapped
-
-
-DELIVERY_DIRECTION = re.compile(r"Assign release observation [0-9a-f]{24} to delivery")
 
 
 def scope_comments(comments: list[tuple[str, str, str]]) -> str:

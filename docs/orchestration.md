@@ -51,7 +51,8 @@ If the existing evidence includes a successful observation of each local check, 
 can offer the spec publisher an `owner_delivery_directions` entry for that exact remaining requirement.
 The publisher can assign it to the enrolled release check by posting the supplied line alone on the native
 ticket. Arete verifies the publisher and current comment, retains the historical evidence, and requires fresh
-observations of all the previous candidate checks. Other missing requirements still need candidate evidence.
+observations of all the previous candidate checks. A separate open owner question still needs its own reply
+on the dashboard or through `arete answer`. Other missing requirements still need candidate evidence.
 
 The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
 runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
