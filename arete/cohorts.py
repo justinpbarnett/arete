@@ -276,6 +276,7 @@ def facts(repo, tickets):
 
 def report(name):
     now = util.now()
+    observed = util.iso(now)
     with ledger() as conn:
         stored = conn.execute("SELECT * FROM cohorts WHERE name=?", (name,)).fetchone()
         if not stored:
@@ -308,7 +309,7 @@ def report(name):
             verified = deliveries[-1] if deliveries else None
             terminal = next((r for r in reversed(obs) if r["kind"] in ("failed", "verified", "pending")), None)
             status = {"verified": "verified", "failed": "failed"}.get(terminal["kind"] if terminal else "", "pending")
-            through = verified["at"] if status == "verified" else util.iso(now)
+            through = verified["at"] if status == "verified" else observed
             first = next((r for r in obs if r["kind"] == "touch" and r["at"] <= through), None)
             # An empty trace has no authority to establish absence of manual tracker/PR actions.
             audited = status == "verified" and any(
@@ -356,9 +357,10 @@ def report(name):
         counts[g["status"]][g["provenance"]] += 1
     return dict(
         cohort=cohort,
-        observed=util.iso(now),
+        observed=observed,
         arrivals=sum(m["source"] != "replacement" for group in groups.values() for m in group),
         goals=len(goals),
+        pending_overdue=sum(g["status"] == "pending" and g["deadline"] < observed for g in goals),
         outcomes=counts,
         members=goals,
         intake_complete=not cohort["label"] or cohort["scanned"] >= cohort["closes"],
