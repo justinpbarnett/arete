@@ -5406,6 +5406,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "release-journeys": "releasejourneys", "replay sample": "replay",
         "repo enroll": "commands.setup", "repo publish": "commands.setup", "repo show": "commands.setup",
         "repo staging-profile": "commands.setup",
+        "repo standing-production": "commands.setup",
         "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
         "upload-guard": "uploads", "webhook secret": "webhooks.secret",
@@ -5429,6 +5430,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "repo publish fixture spec --title Example --body-file - --key fixture-spec": "commands.setup",
         "repo show fixture --json": "commands.setup",
         "repo staging-profile fixture --policy-file policy.json": "commands.setup",
+        "repo standing-production fixture --after-issue 7 --promise-file smoke.json": "commands.setup",
     }
 
     @classmethod

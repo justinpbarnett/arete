@@ -128,13 +128,7 @@ def validate(data):
                 gates = data["checks"]
                 need(isinstance(gates, dict) and set(gates) == {"pr", "staging"}, "declare PR and staging checks")
                 for gate in gates.values():
-                    need(isinstance(gate, dict) and set(gate) == {"app_id", "required", "allow_skipped"} and
-                         type(gate["app_id"]) is int and gate["app_id"] > 0, "bind checks to a GitHub app ID")
-                    for names in (gate["required"], gate["allow_skipped"]):
-                        need(isinstance(names, list) and len(names) <= 30 and all(isinstance(n, str) and 0 < len(n) <= 100
-                             for n in names), "checks need explicit job names")
-                    need(gate["required"] and not set(gate["required"]).intersection(gate["allow_skipped"]),
-                         "require a passing job and use distinct optional job names")
+                    validate_checks(gate)
             if suffix := data.get("immutable_host_suffix"):
                 need(isinstance(suffix, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", suffix)
                      and server_url(data["staging"]).hostname.endswith("." + suffix), "invalid preview hostname suffix")
@@ -142,6 +136,28 @@ def validate(data):
                  and all(isinstance(s, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", s) for s in data["qa"]),
                  "configure the authorized QA tracker accounts")
             need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
+
+
+def validate_checks(gate):
+    need(isinstance(gate, dict) and set(gate) == {"app_id", "required", "allow_skipped"} and
+         type(gate["app_id"]) is int and gate["app_id"] > 0, "bind checks to a GitHub app ID")
+    for names in (gate["required"], gate["allow_skipped"]):
+        need(isinstance(names, list) and len(names) <= 30 and all(isinstance(n, str) and 0 < len(n) <= 100
+             for n in names), "checks need explicit job names")
+    need(gate["required"] and not set(gate["required"]).intersection(gate["allow_skipped"]),
+         "require a passing job and use distinct optional job names")
+
+
+def install_observer(value, observer_file):
+    if observer_file:
+        program = Path(observer_file).read_bytes()
+        need(len(program) <= 65536 and hashlib.sha256(program).hexdigest() == value.get("observer_sha256"),
+             "protected observer does not match the policy fingerprint")
+        dest = observer_location(value["observer_sha256"])
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        util.write_bytes_atomic(dest, program)
+    if "observer_sha256" in value:
+        observer_bytes(value)
 
 
 def install(repo, ticket, source, observer_file=None):
@@ -159,15 +175,7 @@ def install(repo, ticket, source, observer_file=None):
              "the goal must use an enabled pipeline consistent with the saved environment ceiling")
         if value["destination"] == "staging":
             need(repo.landing == "pr" and repo.target_branch != value["production_branch"], "use PR landing on a separate staging branch")
-    if observer_file:
-        program = Path(observer_file).read_bytes()
-        need(len(program) <= 65536 and hashlib.sha256(program).hexdigest() == value.get("observer_sha256"),
-             "protected observer does not match the policy fingerprint")
-        dest = observer_location(value["observer_sha256"])
-        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        util.write_bytes_atomic(dest, program)
-    if "observer_sha256" in value:
-        observer_bytes(value)
+    install_observer(value, observer_file)
     with util.lock("release-" + key(repo.name, ticket), wait=True):
         need(release_profile.current(repo) == profile, "the release profile changed during enrollment")
         serve_guard.write(file, {"repository_profile": digest(profile), "promise": promise} if profile else value)
@@ -376,10 +384,17 @@ def completion(repo: str, ticket: str, revision: str) -> dict | None:
     if data["destination"] != "staging":
         return evidence(repo, ticket, revision)
     state = serve_guard.read(state_dir(repo, ticket) / "promotion.json") or {}
+    if revision not in (state.get("revision"), state.get("staged_revision")) and serve_guard.SHA.fullmatch(revision or ""):
+        state = serve_guard.read(state_dir(repo, ticket) / revision / "completed-promotion.json") or {}
+    if state.get("graph_parent") and state.get("staged_revision") == revision:
+        revision = state.get("revision")
+    if not serve_guard.SHA.fullmatch(revision or ""):
+        return None
     if (state.get("phase"), state.get("revision"), state.get("policy")) != ("production_verified", revision, digest(data)):
         return None
     receipt = serve_guard.read(state_dir(repo, ticket) / revision / "production" / "behavior" / "latest.json") or {}
-    return receipt if receipt.get("status") == "verified" and receipt.get("receipt_id") == state.get("production_receipt") else None
+    return receipt if (receipt.get("status") == "verified" and receipt.get("receipt_id") == state.get("production_receipt")
+                       and receipt.get("revision") == revision) else None
 
 
 def for_delivery(repo, ticket, revision, environment):
@@ -584,6 +599,56 @@ def progress(repo, ticket):
             "completion": completion(repo.name, ticket, revision) if revision else None}
 
 
+def new_release_run(repo, ticket, run_id):
+    """A reopened factory issue gets a new promotion, with its previous receipts still addressable."""
+    folder = state_dir(repo.name, ticket)
+    file = folder / "promotion.json"
+    if not file.is_file():
+        return
+    with util.lock("promote-" + key(repo.name, ticket), wait=True):
+        state = serve_guard.read(file) or {}
+        if not state.get("standing_authority") or state.get("phase") != "production_verified":
+            return
+        latest = run_store.newest_live_whole_run(repo.name, ticket)
+        previous = completion(repo.name, ticket, state.get("revision", ""))
+        if (not latest or latest["id"] != run_id or not previous or latest["started"] < previous["at"]
+                or (serve_guard.read(folder / "tracker-completion.json") or {}).get("run") == run_id):
+            return
+        for revision in {state.get("revision"), state.get("staged_revision")} - {None, ""}:
+            need(serve_guard.SHA.fullmatch(revision), "invalid historical production revision")
+            serve_guard.write(folder / revision / "completed-promotion.json", state)
+        serve_guard.write(file, {"phase": "waiting", "run": run_id})
+
+
+def finish_standing(repo, ticket, tk, receipt):
+    """Cache an observed ordinary tracker closure for this release and its factory admission."""
+    from . import unblock
+
+    folder = state_dir(repo.name, ticket)
+    file = folder / "tracker-completion.json"
+    with util.lock("promote-" + key(repo.name, ticket), wait=True):
+        state = serve_guard.read(folder / "promotion.json") or {}
+        if state.get("phase") != "production_verified" or state.get("production_receipt") != receipt["receipt_id"]:
+            return
+        if (serve_guard.read(file) or {}).get("receipt") == receipt["receipt_id"]:
+            return
+        run = run_store.newest_live_whole_run(repo.name, ticket)
+        if not run or run["started"] > receipt["at"]:
+            return
+        item = tk.get(ticket)
+        if item.is_spec or item.blocker:
+            return
+        if item.open:
+            if not unblock.approval(tk, item)[0]:
+                return
+            tk.require_ordinary(ticket)
+            reason = f"Verified {receipt['path']} on production at {receipt['revision']}. Receipt {receipt['receipt_id']}."
+            gh.issue_close(repo.github, int(ticket), gh.marked(reason))
+            if gh.issue_state(repo.github, int(ticket)) != "CLOSED":
+                return
+        serve_guard.write(file, {"run": run["id"], "receipt": receipt["receipt_id"]})
+
+
 def finish_verified(cfg, repo, ticket, revision, delivered=None):
     from . import tracker, unblock
 
@@ -591,6 +656,11 @@ def finish_verified(cfg, repo, ticket, revision, delivered=None):
     if not proof:
         return
     tk = tracker.for_ticket(cfg, repo, ticket)
+    if isinstance(tk, tracker.GitHubTracker) and proof.get("destination") == "production":
+        state = serve_guard.read(state_dir(repo.name, ticket) / "promotion.json") or {}
+        if state.get("standing_authority"):
+            finish_standing(repo, ticket, tk, proof)
+            return
     item = tk.get(ticket)
     if "spec" in item.labels or item.blocker or not unblock.approval(tk, item)[0]:
         return

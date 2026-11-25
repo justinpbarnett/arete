@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
-from . import gh, jira, outbound, paths, pilot, release_proof, requirement_revision, tracker, util, vault, verify, zte
+from . import config, gh, jira, outbound, paths, pilot, release_profile, release_proof, requirement_revision, tracker, util, vault, verify, zte
 from .store import orchestration, runs, specs, workspaces
 
 GUIDANCE = (
@@ -39,6 +39,9 @@ def protected_environment(repo, ticket, requested):
     aliases = {str(policy[point]).rstrip("/").casefold(): point for point in options if point in policy}
     value = requested.strip().rstrip("/").casefold()
     if not value:
+        if default == "staging" and release_profile.standing_file(repo).exists():
+            if release_profile.standing(config.load_required().repo(repo), ticket):
+                return "production"
         return default
     if (target := (options | aliases).get(value)):
         return target

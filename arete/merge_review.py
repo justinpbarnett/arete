@@ -67,7 +67,7 @@ def nominate(b, checkout, verified, review, base_sha, about):
 
 
 def assess(cfg, repo, ticket, row, prs):
-    from . import release_proof
+    from . import release_lane, release_proof
 
     if (cfg.replay.all or paths.ISOLATED or row.get("status") != "pr" or row.get("dry_run")
             or row.get("only_step") or len(prs) != 1):
@@ -96,7 +96,7 @@ def assess(cfg, repo, ticket, row, prs):
             or not isinstance(candidate.get("rerun"), bool)
             or not {"tree", "review", "verification", "observed", "risk", "diff_excerpt", "diff_truncated"} <= candidate.keys()):
         return "merge-verification", {}
-    if release_proof.missing_staging_promise(repo, ticket.id):
+    if release_proof.missing_staging_promise(repo, ticket.id) or release_lane.merge_hold(repo, ticket.id, binding["base"]):
         return "", {}
     number = gh.pr_number(url)
     _, hold = gh.merge_readiness(binding["github"], number, binding["head"], binding["target"], binding["base"],

@@ -1,4 +1,4 @@
-"""Observe an enrolled staging deployment and promote its QA-approved revision."""
+"""Observe and promote an exact staging revision under its enrolled authority."""
 from __future__ import annotations
 
 import json
@@ -6,9 +6,11 @@ import logging
 import re
 import secrets
 import sqlite3
+from contextlib import nullcontext
 from urllib.parse import quote, urlencode
 
 from . import adf, cohorts, config, gh, jira, release_profile, release_proof as proof, serve_guard, tracker, util
+from .store import specgraphs, specs
 
 NEUTRAL = {"thanks", "thank you", "looks good", "lgtm", "ack"}
 EXPLICIT = {"promote this to production", "push this to production", "moving this to push to production on the sheet"}
@@ -66,6 +68,37 @@ def observe_staging(repo, ticket, revision, *, pinned=""):
 
     return proof.observe(repo.name, ticket, revision, pinned=pinned or proof.digest(policy),
                          origin=origin if policy.get("immutable_host_suffix") else None, check_destination=check_destination)
+
+
+def production_checks_passed(repo, state):
+    """The staging and production pushes share a SHA, but only the production push can satisfy this gate."""
+    revision, target = state["revision"], state["production_branch"]
+    gate = state["production_checks"]
+    query = urlencode({"head_sha": revision, "branch": target, "event": "push", "per_page": 100})
+    base = f"repos/{repo.github}"
+    runs = gh.actions_rows(f"{base}/actions/runs?{query}", "workflow_runs", timeout=20, retry=False)
+    if not runs:
+        return False
+    passed = set()
+    for run in runs:
+        if ((run.get("head_sha"), run.get("head_branch"), run.get("event"), run.get("status"), run.get("conclusion"))
+                != (revision, target, "push", "completed", "success") or type(run.get("check_suite_id")) is not int):
+            return False
+        suite = run["check_suite_id"]
+        checks = gh.actions_rows(f"{base}/check-suites/{suite}/check-runs?filter=latest&per_page=100",
+                                 "check_runs", timeout=20, retry=False)
+        for check in checks:
+            if (check.get("head_sha") != revision or (check.get("check_suite") or {}).get("id") != suite
+                    or check.get("status") != "completed"):
+                return False
+            name = check.get("name")
+            issuer = (check.get("app") or {}).get("id")
+            if check.get("conclusion") == "success":
+                if issuer == gate["app_id"]:
+                    passed.add(name)
+            elif check.get("conclusion") != "skipped" or issuer != gate["app_id"] or name not in gate["allow_skipped"]:
+                return False
+    return passed.issuperset(gate["required"])
 
 
 def branch(repo, name):
@@ -171,18 +204,53 @@ def note(tk, repo, ticket, state, state_file, policy, proof_row):
     serve_guard.write(state_file, state)
 
 
-def promotion_base(repo, ticket, revision, production):
+def verified_graph_revisions(repo, graph_key):
+    """The exact child revisions that passed this native graph's protected staging checks."""
+    revisions = set()
+    for child, _ in specgraphs.children(graph_key).values():
+        scope, ticket = specgraphs.destination(graph_key.scope, child)
+        if scope != graph_key.scope:
+            continue
+        state = serve_guard.read(proof.state_dir(repo.name, ticket) / "promotion.json") or {}
+        if state.get("phase") != "staged_for_parent" or state.get("graph_parent") != graph_key.parent:
+            continue
+        revision = state["revision"]
+        receipt = proof.evidence(repo.name, ticket, revision)
+        if (receipt and receipt.get("revision") == revision and receipt.get("destination") == "staging"
+                and receipt["receipt_id"] == state["staging_receipt"]):
+            revisions.add(revision)
+    return revisions
+
+
+def promotion_range(repo, ticket, revision, production, *, require_staging=False):
     from . import spec_graph_delivery
     if (graph := spec_graph_delivery.promotion_target(repo, ticket)) is None:
-        return parent(repo, revision)
+        return parent(repo, revision), []
     proof.need(graph.get("commit") == revision, "the verified graph release changed")
     approved = set(graph["children"])
+    members = []
     cursor = revision
     while cursor != production:
         proof.need(cursor in approved, "the staged range contains a change outside the verified spec graph")
         approved.remove(cursor)
+        members.append(cursor)
         cursor = parent(repo, cursor)
-    return production
+    if require_staging:
+        graph_key = specgraphs.GraphKey("github:" + repo.github.casefold(), str(ticket))
+        proof.need(set(members) <= verified_graph_revisions(repo, graph_key),
+                   "waiting for each graph child to verify its exact staged revision")
+    return production, members
+
+
+def graph_parent(tk, ticket):
+    from . import spec_tracker
+
+    remote = spec_tracker.adapter(tk)
+    key = specgraphs.membership(remote.scope, ticket) if remote else None
+    if key:
+        proof.need(key.scope == remote.scope, "the child and its graph have different repository enrollments")
+        return key.parent
+    return ""
 
 
 def after_handoff(state, approvals):
@@ -201,19 +269,30 @@ def ready(cfg, repo, ticket, policy, state):
     proof.need(current == repo and current.pipeline and current.landing == "pr", "repository enrollment changed")
     _, _, scope, approvals = authority(cfg, repo, ticket, policy, revision)
     proof.need(scope == state["scope"], "scope changed after staging; deploy the corrected revision for fresh QA")
-    choices = after_handoff(state, approvals)
-    proof.need(choices, "waiting for a new QA instruction for the tested revision")
+    approval = None
+    if state.get("standing_authority"):
+        require_standing(repo, ticket, state)
+    else:
+        choices = after_handoff(state, approvals)
+        proof.need(choices, "waiting for a new QA instruction for the tested revision")
+        approval = min(choices, key=lambda row: (row["at"], int(row["id"])))
     proof.need(repo.unattended_environment == "staging" and repo.target_branch != target
                and proof.digest(proof.goal(repo.name, ticket)) == state["policy"], "release policy changed")
     proof.need(branch(repo, repo.target_branch) == revision and selected_revision(repo, ticket) == revision,
                "the staging branch or goal changed; fresh QA is required")
     production = branch(repo, target)
-    proof.need(promotion_base(repo, ticket, revision, production) == production == proof.deployed_revision(policy, policy["production"]),
+    base, _ = promotion_range(repo, ticket, revision, production, require_staging=bool(state.get("standing_authority")))
+    proof.need(base == production == proof.deployed_revision(policy, policy["production"]),
                "promotion would include other unapproved changes or production identity is unconfirmed")
     proof.need(gh.merge_ci_passed(repo.github, revision, stage_checks=policy.get("checks", {}).get("staging")), "checks on the staged revision must pass before promotion")
     proof.need(proof.deployed_revision(policy, policy["staging"]) == revision
                and preview(repo, policy, revision) == state["origin"], "the tested staging deployment changed")
-    return min(choices, key=lambda row: (row["at"], int(row["id"])))
+    return approval
+
+
+def require_standing(repo, ticket, state):
+    grant = release_profile.standing(repo, ticket)
+    proof.need(grant and grant["id"] == state["standing_authority"], "standing production authorization changed")
 
 
 def score_approval(cfg, repo, ticket, state):
@@ -264,7 +343,7 @@ def _advance(cfg, repo, ticket, file):
                and repo.target_branch != policy["production_branch"], "no eligible staging enrollment")
     state = serve_guard.read(file) or {}
     state.pop("waiting", None)
-    if state.get("phase") == "production_verified":
+    if state.get("phase") in ("production_verified", "staging_only"):
         return state
     # Reconcile sends first, even when a subsequent comment, policy or branch changed.
     if state.get("phase") == "promotion_intent":
@@ -273,8 +352,23 @@ def _advance(cfg, repo, ticket, file):
             serve_guard.write(file, state)
         elif branch(repo, state["production_branch"]) != state["parent"]:
             raise proof.Held("production moved during promotion; reconcile the release")
+    if state.get("phase") == "staged_for_parent":
+        tk, _, scope, _ = authority(cfg, repo, ticket, policy, state["revision"])
+        proof.need(scope == state["scope"] and graph_parent(tk, ticket) == state["graph_parent"],
+                   "the staged graph child changed")
+        parent_state = serve_guard.read(proof.state_dir(repo.name, state["graph_parent"]) / "promotion.json") or {}
+        integrated = parent_state.get("revision", "")
+        proof.need(state["revision"] in parent_state.get("graph_revisions", []) and
+                   proof.completion(repo.name, state["graph_parent"], integrated),
+                   "waiting for the parent to verify the integrated production revision")
+        state.update(phase="observing_production", staged_revision=state["revision"],
+                     revision=integrated, production_branch=policy["production_branch"])
+        serve_guard.write(file, state)
     if state.get("phase") == "observing_production":
         proof.need(state["policy"] == proof.digest(policy), "release policy changed during promotion")
+        if state.get("standing_authority"):
+            proof.need(branch(repo, state["production_branch"]) == state["revision"]
+                       and production_checks_passed(repo, state), "waiting for the exact production push and its required checks")
         found = proof.observe(repo.name, ticket, state["revision"], destination="production", pinned=state["policy"])
         if found["status"] == "verified":
             state.update(phase="production_verified", production_receipt=found["receipt_id"])
@@ -289,6 +383,8 @@ def _advance(cfg, repo, ticket, file):
     if state.get("revision") != revision:
         proof.need(state.get("phase") != "promotion_intent", "an earlier promotion needs reconciliation")
         state = {"revision": revision, "policy": proof.digest(policy), "scope": scope, "phase": "observing_staging"}
+        if grant := release_profile.standing(repo, ticket):
+            state.update(standing_authority=grant["id"], production_checks=grant["production_checks"])
         serve_guard.write(file, state)
     proof.need(state["policy"] == proof.digest(policy) and state["scope"] == scope,
                "the tested behavior changed; a corrected staging revision and fresh QA are required")
@@ -298,18 +394,37 @@ def _advance(cfg, repo, ticket, file):
             state["waiting"] = found["reason"]
             return state
         state.update(origin=found.get("origin") or policy["staging"].rstrip("/"), staging_receipt=found["receipt_id"])
-        note(tk, repo, ticket, state, file, policy, found)
-        return state
+        if not state.get("standing_authority"):
+            note(tk, repo, ticket, state, file, policy, found)
+            return state
+        claim = specs.find(repo.name, ticket)
+        if claim.get("data", {}).get("definition", {}).get("environment") == "staging":
+            state["phase"] = "staging_only"
+            serve_guard.write(file, state)
+            return state
+        if parent_ticket := graph_parent(tk, ticket):
+            state.update(phase="staged_for_parent", graph_parent=parent_ticket)
+            serve_guard.write(file, state)
+            return state
+        state["phase"] = "staging_verified"
+        serve_guard.write(file, state)
     approval = ready(cfg, repo, ticket, policy, state)
     result = observe_staging(repo, ticket, revision, pinned=state["policy"])
     proof.need(result["status"] == "verified", "the staged behavior no longer passes its protected check")
     proof.need(ready(cfg, repo, ticket, policy, state) == approval, "QA authorization changed during verification")
-    state.update(phase="promotion_intent", approval=approval["id"], approval_comment=approval,
-                 parent=promotion_base(repo, ticket, revision, branch(repo, policy["production_branch"])),
-                 production_branch=policy["production_branch"])
+    if approval:
+        state.update(approval=approval["id"], approval_comment=approval)
+    base, graph_revisions = promotion_range(repo, ticket, revision, branch(repo, policy["production_branch"]),
+                                           require_staging=bool(state.get("standing_authority")))
+    if graph_revisions:
+        state["graph_revisions"] = graph_revisions
+    state.update(phase="promotion_intent", parent=base, production_branch=policy["production_branch"])
     serve_guard.write(file, state)
     # A non-forced update of a direct child cannot land unrelated work if the branch races.
     api = f"repos/{repo.github}/git/refs/heads/{quote(state['production_branch'], safe='/')}"
-    gh.gh(["api", api, "--method", "PATCH", "--input", "-"],
-          input=gh.Outgoing(json.dumps({"sha": revision, "force": False})), write=True, retry=False, timeout=20)
+    with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+        if state.get("standing_authority"):
+            require_standing(repo, ticket, state)
+        gh.gh(["api", api, "--method", "PATCH", "--input", "-"],
+              input=gh.Outgoing(json.dumps({"sha": revision, "force": False})), write=True, retry=False, timeout=20)
     return state

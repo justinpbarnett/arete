@@ -2472,6 +2472,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 answered_runs = tuple(a["run"] for a in run.answers_due if not owner_asks.supervisor_answered([a]))
                 if run.answering and not run.recovery and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
+            if not dry_run and not run.alone and not run.closed_context and not (flow and flow.refusal):
+                from . import release_profile
+                release_profile.admit(repo, str(tid), run.id)
             issue_goal = (not dry_run and not run.alone and not run.closed_context and not spec_ticket
                           and unblock.active(cfg, repo.name, str(tid)) and not unblock.exclude(repo.name, str(tid)))
             if issue_goal:
@@ -3633,7 +3636,7 @@ def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
 
 def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, base_sha: str, about: str, *,
                      track_moved_base: bool) -> str:
-    from . import release_proof
+    from . import release_lane, release_proof
 
     patch = checkout_patch(c, [], f"{base_sha}..{head}")
     if not patch:
@@ -3644,6 +3647,8 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return "JEV could not judge the diff"
     if risk.hold:
         return risk.hold
+    if hold := release_lane.merge_hold(b.run.repo, getattr(b.ticket, "id", None), base_sha):
+        return hold
     return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
                             **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
 
