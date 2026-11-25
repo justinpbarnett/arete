@@ -17,13 +17,14 @@ ARETE_SUITE = f"if [ -f tests/parallel.py ]; then {PARALLEL}; else uv run python
 MACOS_PROFILE = "macos-sandbox-profile"
 SANDBOX_DENIAL = "sandbox-exec: sandbox_apply: Operation not permitted"
 TRACEBACK_MARGIN = r"(?(margin)(?P=margin)\| )"
-EXCEPTION_NAME = r"(?:[A-Za-z_]\w*\.(?:<locals>\.)?)*[A-Za-z_]\w*"
+EXCEPTION_NAME_PART = r"[^.\s:<>]+"
+EXCEPTION_NAME = rf"(?:{EXCEPTION_NAME_PART}\.(?:<locals>\.)?)*{EXCEPTION_NAME_PART}"
 TRACEBACK_EXCEPTION = re.compile(
     r"^(?:(?P<margin> +)(?:\+ Exception Group |\| (?:Exception Group )?))?"
     r"Traceback \(most recent call last\):\r?\n"
     rf'{TRACEBACK_MARGIN}  File "[^\r\n]+", line \d+\b[^\r\n]*\r?\n'
     rf"(?:{TRACEBACK_MARGIN}[ \t][^\r\n]*\r?\n)*"
-    rf"{TRACEBACK_MARGIN}(?P<exception>{EXCEPTION_NAME}(?::[ \t][^\r\n]*|:)?)[ \t]*\r?$",
+    rf"{TRACEBACK_MARGIN}(?P<exception>(?P<name>{EXCEPTION_NAME})(?::[ \t][^\r\n]*|:)?)[ \t]*\r?$",
     re.ASCII | re.MULTILINE,
 )
 
@@ -74,7 +75,8 @@ def failed_check(layer, name, output, exit_code):
             failure["capability"] = MACOS_PROFILE
         else:
             for match in TRACEBACK_EXCEPTION.finditer(output):
-                failure["reason"] = match["exception"].rstrip()[:300]
+                if all(part.isidentifier() for part in match["name"].split(".") if part != "<locals>"):
+                    failure["reason"] = match["exception"].rstrip()[:300]
         return failure
     summary = summaries[-1]
     identifiers = summary[1].split(", ")
@@ -119,10 +121,10 @@ def historical_failures(layer, report):
     """Older checks receipts have only the engine-formatted Markdown report."""
     failures = []
     for name, command in (layer.checks | layer.targeted_commands).items():
-        section = re.search(rf"^### {re.escape(name)} failed: `{re.escape(command)}` exit (-?\d+)\n(`{{3,}})\n"
-                            r"(.*?)^\2$", report, re.MULTILINE | re.DOTALL)
+        section = re.search(rf"^### {re.escape(name)} failed: `{re.escape(command)}` exit (?P<exit_code>-?\d+)\n"
+                            r"(?P<fence>`{3,}|''')\n(?P<output>.*?)^(?P=fence)$", report, re.MULTILINE | re.DOTALL)
         if section:
-            failures.append(failed_check(layer, name, section[3], int(section[1])))
+            failures.append(failed_check(layer, name, section["output"], int(section["exit_code"])))
     return failures
 
 
