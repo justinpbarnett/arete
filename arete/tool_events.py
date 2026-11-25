@@ -7,6 +7,7 @@ import re
 import secrets
 import socket
 import sys
+import time
 from datetime import UTC, datetime
 
 from . import paths, refusals, util
@@ -14,6 +15,10 @@ from . import paths, refusals, util
 INGEST_MARK = "_arete_ingest"
 WORKER_HOOK_SOCKET = "ARETE_WORKER_HOOK_SOCKET"
 MAX_HOOK_EVENT = 64 * 1024
+WORKER_JUDGE_CAPABILITY = "ARETE_WORKER_JUDGE_CAPABILITY"
+MAX_JUDGE_REQUEST = 768 * 1024
+MAX_JUDGE_REPLY = 32 * 1024
+JUDGE_WAIT = 38
 
 BASH_CLASSES = [
     ("missing_tool", r"command not found"),
@@ -123,14 +128,45 @@ def append_hook_event(event):
 
 
 @contextlib.contextmanager
-def worker_hook_sink(env):
+def socket_service(server):
+    import threading
+
+    with server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def judge_frame(peer, limit, deadline):
+    raw = bytearray()
+    while len(raw) <= limit:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        peer.settimeout(left)
+        chunk = peer.recv(min(16384, limit + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+        if b"\n" in chunk:
+            if len(raw) <= limit and raw.endswith(b"\n") and raw.count(b"\n") == 1:
+                return json.loads(raw.decode("utf-8"))
+            break
+    raise ValueError("invalid worker judge frame")
+
+
+@contextlib.contextmanager
+def worker_hook_sink(env, judge=None):
     if sys.platform != "linux":
         yield None
         return
 
     import socketserver
     import tempfile
-    import threading
     from pathlib import Path
 
     class HookRequest(socketserver.StreamRequestHandler):
@@ -153,20 +189,70 @@ def worker_hook_sink(env):
             except (OSError, ValueError, RecursionError):
                 return
 
-    with tempfile.TemporaryDirectory(prefix="arete-w-") as folder:
+    capability = secrets.token_hex(32)
+    run_id = env.get("ARETE_RUN_ID", "")
+
+    class JudgeRequest(socketserver.BaseRequestHandler):
+        def handle(self):
+            try:
+                request = judge_frame(self.request, MAX_JUDGE_REQUEST, time.monotonic() + 2)
+                if not isinstance(request, dict):
+                    return
+                supplied = request.pop("capability", None)
+                if (not isinstance(supplied, str) or len(supplied) != len(capability) or not supplied.isascii()
+                        or not secrets.compare_digest(supplied, capability) or request.pop("run", None) != run_id):
+                    return
+                reply = json.dumps(judge(request), allow_nan=False, ensure_ascii=False).encode(errors="backslashreplace")
+                reply += b"\n"
+                if len(reply) <= MAX_JUDGE_REPLY:
+                    self.request.settimeout(1)
+                    self.request.sendall(reply)
+            except Exception:
+                return
+
+    env.pop(WORKER_JUDGE_CAPABILITY, None)
+    with tempfile.TemporaryDirectory(prefix="arete-w-") as folder, contextlib.ExitStack() as opened:
         root = Path(folder).resolve()
         temporary = root / "tmp"
         temporary.mkdir(mode=0o700)
         address = str(root / "hook")
-        with socketserver.UnixStreamServer(address, HookRequest) as server:
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
-            thread.start()
-            try:
-                env.update({WORKER_HOOK_SOCKET: address, "TMPDIR": str(temporary)})
-                yield temporary
-            finally:
-                server.shutdown()
-                thread.join()
+        opened.enter_context(socket_service(socketserver.UnixStreamServer(address, HookRequest)))
+        if judge is not None:
+            with contextlib.suppress(OSError):
+                opened.enter_context(socket_service(socketserver.UnixStreamServer(str(root / "judge"), JudgeRequest)))
+                env[WORKER_JUDGE_CAPABILITY] = capability
+        env.update({WORKER_HOOK_SOCKET: address, "TMPDIR": str(temporary)})
+        yield temporary
+
+
+def in_worker() -> bool:
+    return bool(os.environ.get(WORKER_HOOK_SOCKET))
+
+
+def has_worker_judge() -> bool:
+    return in_worker() and bool(os.environ.get(WORKER_JUDGE_CAPABILITY))
+
+
+def worker_judge_request(op, cwd, state, **fields):
+    address = os.environ.get(WORKER_HOOK_SOCKET)
+    capability = os.environ.get(WORKER_JUDGE_CAPABILITY)
+    if not address or not capability:
+        return {}
+    try:
+        line = (json.dumps({"op": op, "cwd": str(cwd), "state": state, **fields,
+                            "run": os.environ.get("ARETE_RUN_ID", ""), "capability": capability},
+                           ensure_ascii=False) + "\n").encode(errors="backslashreplace")
+        if len(line) > MAX_JUDGE_REQUEST:
+            return {}
+        end = time.monotonic() + JUDGE_WAIT
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(2)
+            peer.connect(os.path.join(os.path.dirname(address), "judge"))
+            peer.sendall(line)
+            reply = judge_frame(peer, MAX_JUDGE_REPLY, end)
+            return reply if isinstance(reply, dict) else {}
+    except (OSError, ValueError, RecursionError):
+        return {}
 
 
 def send_hook_event(event, address):

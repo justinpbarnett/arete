@@ -152,6 +152,7 @@ def config_digest(cfg: config.Config, policy_sha: str) -> str:
 
 
 def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.RepoLayer, str]:
+    from . import secret_move
     from .orchestration import policy_fingerprint
 
     repo = cfg.repo(cfg.zte_repo)
@@ -165,9 +166,10 @@ def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.Re
     limits = layer.orchestration
     target = policy.identity.name
     if policy.production_issue_base and policy.issue_app:
+        key = cfg.github_app.private_key or secret_move.configured_path(config.read_data(), "github_app")
         pilot.require(cfg.github_app.app_id != str(policy.issue_app.app)
                       and cfg.github_app.installation_id != str(policy.issue_app.installation)
-                      and (cfg.github_app.private_key is None or cfg.github_app.private_key.resolve() != ISSUE_KEY),
+                      and (key is None or key.resolve() != ISSUE_KEY.resolve()),
                       "the production issue App is reserved for the release supervisor")
     pilot.require(repo.github == target and repo.pipeline and len(repo.parts) == 1 and not repo.parts[0].dir
                   and repo.parts[0].github == target and repo.layer and layer.base_branch in ("", "main")

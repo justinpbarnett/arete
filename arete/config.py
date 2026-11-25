@@ -157,6 +157,8 @@ class JiraConfig:
     auto_per_refresh: int = 3
     sprint_only: bool = True
     skip_types: list[str] = field(default_factory=list)
+    base_url: str = ""
+    email: str = ""
 
 
 @dataclass(frozen=True)
@@ -173,7 +175,21 @@ class GithubApp:
     private_key: Path | None = None
 
     def missing(self) -> list[str]:
-        return [name for name in ("app_id", "installation_id", "private_key") if not getattr(self, name)]
+        from . import secret_move, secretstore
+
+        missing = [name for name in ("app_id", "installation_id") if not getattr(self, name)]
+        present = not paths.ISOLATED and bool(os.environ.get("GITHUB_APP_PRIVATE_KEY"))
+        if not present:
+            row = secretstore.registered("global", "GITHUB_APP_PRIVATE_KEY")
+            if row is not None:
+                present = row["status"] == "set"
+            else:
+                old = secret_move.fallback(self.private_key)
+                present = bool(old and (not paths.ISOLATED or paths.confined(old)) and old.is_file()
+                               and not old.resolve().is_relative_to(paths.ZTE_AUTHORITY.resolve()))
+        if not present:
+            missing.append(secretstore.address("global", "GITHUB_APP_PRIVATE_KEY"))
+        return missing
 
 
 @dataclass
@@ -427,6 +443,11 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
+        if isinstance(value, Config):
+            jira = data["jira"]
+            for name in ("base_url", "email"):
+                if jira[name] == "":
+                    del jira[name]
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
     if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
@@ -1143,8 +1164,12 @@ def load_required() -> Config:
 
 
 def jira_table(j: dict) -> JiraConfig:
+    from . import secret_move
+
     return JiraConfig(
-        env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
+        env_file=secret_move.fallback(secret_move.configured_path({"jira": j}, "jira")),
+        base_url=j.get("base_url", ""),
+        email=j.get("email", ""),
         project=j.get("project", ""),
         transitions=moves_table(j, "transitions", {"merged": "merges move tickets through [jira.landed]",
                                                             DELIVERED: "research tickets move through [jira.research]"}),
@@ -1182,10 +1207,12 @@ def jev_table(jv: dict, ignored: list[str] | None = None) -> JevConfig:
 
 
 def github_app_table(app: dict) -> GithubApp:
+    from . import secret_move
+
     found = GithubApp(
         app_id=str(app.get("app_id", "")).strip(),
         installation_id=str(app.get("installation_id", "")).strip(),
-        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
+        private_key=secret_move.fallback(secret_move.configured_path({"github_app": app}, "github_app")),
     )
     if found.installation_id and not found.installation_id.isdigit():
         raise ValueError("[github_app] installation_id must be digits only")

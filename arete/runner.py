@@ -33,6 +33,8 @@ from . import (
     routing,
     sandbox,
     scrub,
+    secret_move,
+    secretstore,
     steps,
     uploads,
     util,
@@ -105,11 +107,12 @@ def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo |
 
 def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: config.Repo | None = None) -> str:
     passing = environment.passed(cfg, repo) if passing is None else passing
-    if not (cfg.jev.guard and jev.ready(cfg, [repo])) or jev.key(claude.agent_env(passing)):
+    if not (cfg.jev.guard and jev.ready(cfg, [repo])) or claude.agent_env(passing).get(jev.KEY_NAME):
         return ""
-    return (f"the guard has no judge: JEV's key is only in the server's environment, which an agent no longer gets, so "
-            f"the guard judges no command; its directory floor and secret file rules remain active; put {jev.KEY_NAME} in "
-            f"{paths.short_path(pi.KEYS_FILE)}")
+    if not secretstore.registered("global", jev.KEY_NAME) and secret_move.pi_env().get(jev.KEY_NAME):
+        return ""
+    return (f"the confined guard may not reach JEV's credential at {jev.KEY_ADDRESS}; "
+            "its directory floor and secret file rules remain active")
 
 
 def authentication(model: str, run_with: str = "", *, cfg: config.Config | None = None,
@@ -616,11 +619,20 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
         selected = None
         api_key = ""
         if candidate.runner == "pi":
-            selected = trip.pinned.get(key) or discovery.probe(candidate.model, candidate.mode)
+            selected = trip.pinned.get(key) or discovery.materialize(candidate.model, candidate.mode)
+            if selected.error or selected.token_error:
+                skipped.append(passed_over(candidate, "refused", scrub.scrub(selected.token_error or selected.error,
+                                                                              selected.hidden)))
+                continue
             auth, name = selected.auth, selected.model
         elif candidate.credential == "cli_key" and candidate.mode == "api_key":
-            api_key = discovery.cli_key_route(candidate).key
-            auth, name = discovery.cli_key_auth(candidate), candidate.model
+            credential = discovery.cli_key_route(candidate, materialize=True)
+            if not credential.key or credential.error or credential.token_error:
+                reason = credential.token_error or credential.error or f"no key at {pi.key_setting(credential.provider)}"
+                skipped.append(passed_over(candidate, "refused", scrub.scrub(reason, credential.hidden)))
+                continue
+            api_key = credential.key
+            auth, name = discovery.cli_key_auth(candidate, credential), candidate.model
         elif candidate.runner == "claude":
             auth, name = discovery.claude_auth(), candidate.model
         elif candidate.runner == "codex":
@@ -955,7 +967,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                 res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"),
                                   prompt=prompt)
             elif which == "codex":
-                protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR]
+                protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR, *secret_move.protected_config_files()]
                 res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,
                                   on_line=meter.watching(rec.line), hidden=[*found, *protected], auth=auth, **kw)
             else:
@@ -1031,7 +1043,14 @@ def origin(cwd: Path | str, cfg: config.Config, target: devices.Device) -> dict:
 
 def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.Config) -> list[Path]:
     found = [paths.HOME / name for name in (".netrc", ".pgpass", ".npmrc", ".pypirc", ".aws/credentials")]
-    found += [cfg.jira.env_file] if cfg.jira.env_file else []
+    old_jira = secret_move.fallback(cfg.jira.env_file)
+    row = secretstore.registered("global", "JIRA_API_TOKEN") if old_jira else None
+    skipped = secret_move.external_files()
+    if old_jira:
+        if row and row["status"] == "set":
+            skipped.add(old_jira.resolve())
+        else:
+            found.append(old_jira)
     for folder in [] if target.remote else folders:
         for here, subfolders, names in os.walk(folder):
             subfolders[:] = [d for d in subfolders if d not in SECRET_SEARCH_SKIPS]
@@ -1039,14 +1058,22 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
                 subfolders.clear()
                 continue
             found += [Path(here, n) for n in names if sandbox.secret_path(n)]
-    return found
+    return [file for file in found if not skipped or file.resolve() not in skipped]
 
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
                  repo: config.Repo | None, scratch: tuple[str, ...] = (), *, floor: guard.Floor,
                  closed_context: tuple[Path, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
-    if guard.wanted(kw.get("tools")):
+    bash = runs_bash(kw)
+    wanted = guard.wanted(kw.get("tools"))
+    confined = sys.platform == "linux"
+    allowed = bash and cfg.jev_allowed([repo])
+    ask = ask_jev and allowed and (bool(jev.worker_key()) if confined else
+                                  jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])))
+    if confined and allowed and (wanted and cfg.jev.guard or ask):
+        kw["worker_jev"] = jev.WorkerPolicy(cfg, repo, wanted and cfg.jev.guard, ask)
+    if wanted:
         kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
         if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
@@ -1056,9 +1083,9 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:
                     hook["command"] = verification_scratch.hook_command(hook["command"], list(scratch))
-        if runs_bash(kw) and (note := judge_note(cfg, kw["passing"], repo)):
+        if not confined and bash and (note := judge_note(cfg, kw["passing"], repo)):
             say(note)
-    if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
+    if ask:
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), jev_ask.rule()]
         browser.with_note(kw, jev_ask.note())
     if uploads.granted(kw.get("allowed_tools")):

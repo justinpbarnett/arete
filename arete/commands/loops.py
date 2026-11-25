@@ -213,18 +213,25 @@ def devices_probe(args) -> int:
 
 
 def cmd_webhook(args) -> int:
-    from .. import control, tailnet, webhooks
+    from .. import api, tailnet
 
-    loop = control.working_loop(args.name)
-    if not loop.trigger.webhook:
-        print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
-              file=sys.stderr)
+    path = f"/api/v1/loops/{quote(args.name, safe='')}"
+    if args.rotate:
+        reply = client.call("POST", path + "/webhook/rotate")
+        print(client.field(reply, "text", kind=str))
+        return 0
+    if remote := client.configured_server():
+        reply = client.call("GET", path)
+        base = client.address(remote)
+    else:
+        reply = api.execute("loop.get", {"id": args.name})
+        base = tailnet.url(tailnet.this_node(), config.load().dashboard_port)
+    detail = client.field(client.field(reply, "loop"), "detail")
+    if not (hook := detail.get("webhook_path")):
+        print(f"{args.name} has no webhook; set `webhook = true` under [trigger]", file=sys.stderr)
         return 1
-    key = webhooks.secret(loop.name)
-    node = tailnet.this_node()
-    print(f"POST {tailnet.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
-    print(f"X-Arete-Token: {key}")
-    print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
+    print(f"POST {base}{hook}")
+    print(f"secret_present: {json.dumps(bool(detail.get('secret_present')))}")
     return 0
 
 
@@ -283,7 +290,7 @@ def register(sub) -> None:
     a.add_argument("name", metavar="NAME", help="a device name")
     a.set_defaults(fn=devices_probe, local_read=False)
 
-    p = sub.add_parser("webhook", help="print the URL and token for a loop's webhook")
-    p.add_argument("action", choices=("secret",))
-    p.add_argument("name")
-    p.set_defaults(fn=cmd_webhook)
+    p = sub.add_parser("webhook", help="show a loop's webhook status, or rotate its secret")
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("--rotate", action="store_true", help="mint a new secret and show it once")
+    p.set_defaults(fn=cmd_webhook, local_read=lambda args: not args.rotate and not client.configured_server())

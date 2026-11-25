@@ -5,7 +5,7 @@ from urllib.parse import unquote
 
 from . import (
     api_http, board, codebase, config, configitems, contract, control, credential_http, events, pi, record,
-    refusals, secretstore, settings, tasks, tool_events, triage, util,
+    refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -136,7 +136,7 @@ def secret_set_options(scope, name):
             provider = "jira"
         else:
             provider = next((p for p, key in pi.KEY_NAMES.items() if key == name), None)
-    elif scope.startswith("line:") and name == "WEBHOOK_SECRET":
+    elif scope.startswith(("line:", "connector:loop.")) and name == "WEBHOOK_SECRET":
         kind, provider = "webhook_secret", "webhook"
     elif scope.startswith("repo:"):
         kind = "repo_answer"
@@ -157,7 +157,7 @@ def set_secret(handler, op, target):
     except UnicodeDecodeError:
         raise contract.Problem("invalid_input", "The value must be valid UTF-8.") from None
     kind, _ = secret_set_options(scope, name)
-    secret_input(secretstore.validate_value, value, kind)
+    secret_input(secretstore.validate_set, scope, name, value, kind)
 
     def change():
         kind, provider = secret_set_options(scope, name)
@@ -175,6 +175,8 @@ def prepare(name, values):
         credential_http.secret_access(values.get("scope", ""))
         if "name" in values:
             secret_input(secretstore.validate, values["scope"], values["name"])
+    if name == "webhook.rotate":
+        credential_http.secret_access("")
     if name == "hook.ingest":
         for i, event in enumerate(values["events"]):
             event_timestamp(event["ts"], f"input.events[{i}].ts")
@@ -204,7 +206,9 @@ def execute(name, values, handler=None):
 
         return dashboard.record_usage(handler, values)
     reads = values["requests"] if name == "batch.run" else ()
-    if credential_http.registry_operation(name) or any(credential_http.registry_operation(r["operation"]) for r in reads):
+    requested = {name, *(r["operation"] for r in reads)}
+    if any(credential_http.registry_operation(op) for op in requested) or (
+            "loop.get" in requested and config.secret_settings().store):
         secretstore.migrate_registry()
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
@@ -348,16 +352,25 @@ def command(handler, op, values, path_values, *, claim=None):
     return handler.keyed_action(op["method"], op["path"], path_values, action,
                                 atomic=not read_only and name not in ("run.stop", "serve.install"),
                                 status=op["success_status"],
-                                redact=name in ("token.issue", "token.rotate"), claim=claim, read_only=read_only)
+                                redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
+                                claim=claim, read_only=read_only)
+
+
+def remove_secret(scope, name):
+    prepare("secret.remove", {"scope": scope, "name": name})
+    return secret_result(scope, name, secretstore.remove(scope, name, principals.current()))
 
 
 def mutation(name, values, handler):
     from . import dashboard
 
-    if name in ("secret.remove", "secret.check"):
+    if name == "secret.remove":
+        result = remove_secret(values["scope"], values["name"])
+    elif name == "secret.check":
         scope, secret = values["scope"], values["name"]
-        change = secretstore.remove if name == "secret.remove" else secretstore.check
-        result = secret_result(scope, secret, change(scope, secret, principals.current()))
+        result = secret_result(scope, secret, secretstore.check(scope, secret, principals.current()))
+    elif name == "webhook.rotate":
+        result = {"text": webhooks.rotate(values["loop"], principals.current())}
     elif name.startswith(("token.", "pairing.")) or name in ("principal.revoke", "session.end"):
         result = credential_http.write_operation(name, values, handler)
     elif name.startswith("task.") or name == "comment.create":

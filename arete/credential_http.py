@@ -20,8 +20,8 @@ from .store import idempotency as claims
 COOKIE = "__Host-arete_session"
 PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
-TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set"}
-PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove"}
+TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set", "webhook.rotate"}
+PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate"}
 WRITES = ("POST", "PATCH", "PUT", "DELETE")
 SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|config:activate")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
@@ -162,7 +162,7 @@ def require_tls(op):
 
 
 def registry_operation(name):
-    return isinstance(name, str) and (name.startswith("secret.") or name == "account.list")
+    return isinstance(name, str) and (name.startswith("secret.") or name in ("account.list", "webhook.rotate"))
 
 
 def origin_of(scheme, host):
@@ -268,7 +268,7 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
     if requires_credential and credential is None:
         raise unauthenticated(handler, write, secure)
-    if name.startswith("secret."):
+    if name.startswith("secret.") or name == "webhook.rotate":
         secret_access(unquote(handler.operation[1].get("scope", "")))
     if name == "pairing.start" and (credential is None or credential.kind != "session"):
         with db.reader() as c:

@@ -132,7 +132,6 @@ def batch_ids(t: Ticket) -> list[str]:
     return [own, *sorted(set(named) - {own}, key=int)]
 
 
-_clients: dict[str, jira.Client] = {}
 
 
 def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
@@ -354,13 +353,13 @@ class JiraTracker:
         self.cfg = jcfg
         self.project = repo.jira_project or jcfg.project
         self.route = route_label(repo)
+        self._client: jira.Client | None = None
 
     @property
     def client(self) -> jira.Client:
-        key = str(self.cfg.env_file or "")
-        if key not in _clients:
-            _clients[key] = jira.Client.from_env(self.cfg.env_file)
-        return _clients[key]
+        if self._client is None:
+            self._client = jira.Client.from_env(self.cfg)
+        return self._client
 
     @property
     def queue_hint(self) -> str:

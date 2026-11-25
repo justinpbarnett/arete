@@ -4,19 +4,22 @@ import base64
 import functools
 import itertools
 import json
+import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import timedelta
 from urllib.parse import urlencode
 
-from . import config, outbound, paths, util
+from . import accounts, config, outbound, paths, secret_move, secretstore, util
 
 ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
@@ -739,25 +742,72 @@ def base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def key_signature(app: config.GithubApp, signing_input: bytes, *, timeout: float = 30) -> bytes:
-    failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
-    if paths.ISOLATED and paths.confined(app.private_key) is None:
-        raise GhError("isolated arete uses no key of this machine; put the [github_app] private_key in the scratch folder")
+APP_KEY = "GITHUB_APP_PRIVATE_KEY"
+
+
+def key_pipe_sign(key, data, timeout):
+    read_fd, write_fd = os.pipe()
+
+    def feed():
+        with suppress(BrokenPipeError), os.fdopen(write_fd, "wb") as pipe:
+            pipe.write(key)
+
+    writer = threading.Thread(target=feed, name="app-key-pipe")
+    writer.start()
     try:
-        res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signing_input,
-                             capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise GhError(f"{failed}: {e}") from None
+        return subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_fd}"], input=data,
+                              pass_fds=(read_fd,), capture_output=True, timeout=timeout, check=False)
+    finally:
+        os.close(read_fd)
+        writer.join()
+
+
+def app_key(app):
+    if not paths.ISOLATED and (key := os.environ.get(APP_KEY)):
+        return key.encode()
+    try:
+        row, key = secretstore.lookup("global", APP_KEY)
+        if row is not None:
+            return key.encode()
+        if old := secret_move.fallback(app.private_key):
+            if not old.resolve().is_relative_to(paths.ZTE_AUTHORITY.resolve()):
+                return paths.read_confined(old)
+    except (OSError, ValueError):
+        pass
+    return b""
+
+
+def key_signature(app: config.GithubApp, signing_input: bytes, *, timeout: float = 30, key=None) -> bytes:
+    address = secretstore.address("global", APP_KEY)
+    key = app_key(app) if key is None else key
+    if not key:
+        raise GhError(f"No usable GitHub App signing key at {address}")
+    return sign_result(lambda: key_pipe_sign(key, signing_input, timeout), address)
+
+
+def sign_result(run, source):
+    try:
+        res = run()
+    except (OSError, subprocess.SubprocessError):
+        raise GhError(f"openssl could not sign with {source}") from None
     if res.returncode != 0:
-        raise GhError(f"{failed}: {util.first_line(res.stderr.decode(errors='replace')) or f'exit {res.returncode}'}")
+        raise GhError(f"openssl could not sign with {source} (exit {res.returncode})")
     return res.stdout
 
 
-def app_jwt(app: config.GithubApp, *, timeout: float = 30) -> str:
+def app_jwt(app: config.GithubApp, *, timeout: float = 30, key=None, key_file=None) -> str:
     now = int(time.time())
     signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
         {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
-    return f"{signed}.{base64url(key_signature(app, signed.encode(), timeout=timeout))}"
+    if key_file is not None:
+        if paths.ISOLATED and paths.confined(key_file) is None:
+            raise GhError(paths.ISOLATED_LOGINS)
+        signature = sign_result(lambda: subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(key_file)], input=signed.encode(), capture_output=True,
+            timeout=timeout, check=False), "the release supervisor App key")
+    else:
+        signature = key_signature(app, signed.encode(), timeout=timeout, **({"key": key} if key is not None else {}))
+    return f"{signed}.{base64url(signature)}"
 
 
 def clone_token(app: config.GithubApp, repo: str) -> str:
@@ -792,10 +842,16 @@ def token_overreach(reply: dict, repo: str) -> str:
 
 
 def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+    if not paths.ISOLATED and (key := os.environ.get(APP_KEY)):
+        row = None
+        jwt = app_jwt(app, key=key.encode())
+    else:
+        row, key = secretstore.lookup("global", APP_KEY)
+        jwt = app_jwt(app, key=key.encode()) if row is not None else app_jwt(app)
     body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
     request = urllib.request.Request(
         f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
-        method="POST", headers={"Authorization": f"Bearer {app_jwt(app)}", "Accept": "application/vnd.github+json",
+        method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
                                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
     try:
         with urllib.request.urlopen(request, timeout=30) as res:
@@ -808,7 +864,11 @@ def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
         return token_reply(app, repo, retry=False)
     except ValueError:
         return {}
-    return reply if isinstance(reply, dict) else {}
+    if not isinstance(reply, dict):
+        return {}
+    if reply.get("token"):
+        accounts.record_workspace(row, "github", "app")
+    return reply
 
 
 def http_message(e: urllib.error.HTTPError) -> str:

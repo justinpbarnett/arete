@@ -43,6 +43,8 @@ from . import (
     record,
     routing,
     runner,
+    secret_move,
+    secretstore,
     serve_guard,
     sessions,
     slots,
@@ -70,6 +72,8 @@ DEPLOY_API_TIMEOUT = 20
 PILOT_LOCK = "pilot-doc-fix"
 PRUNE_SECONDS = 3600
 ROTATE_SECONDS = 3600
+SECRET_MOVE_SECONDS = 3600
+SECRET_CHECK_SECONDS = 86400
 APPROVAL_RETRY_SECONDS = 900
 SWEEP_SECONDS = 300
 WORKSPACE_SWEEP_SECONDS = 600
@@ -355,6 +359,9 @@ class Server:
         os.environ.pop(foundation.INHERITED_SERVE_IDENTITIES, None)
         self.pruned = self.swept = self.workspaces_swept = self.rotated = 0.0
         self.checked_closed = 0.0
+        self.secret_moved_at: float | None = None
+        self.secrets_checked_at: float | None = None
+        self.secret_migration: dict = {}
         self.ticks = 0
         self.reloaded = restarted
         self.failing: dict[str, dict] = {}
@@ -455,6 +462,8 @@ class Server:
             return False
         if self.contracts_waiting:
             return False
+        self.guard("stage:secret-move", self.move_secrets_when_due)
+        self.guard("stage:secret-check", self.check_secrets_when_due)
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
@@ -476,8 +485,60 @@ class Server:
         )
         for name, action, args in stages:
             self.guard(f"stage:{name}", action, *args)
-        tick_stages = {"stage:reap", *(f"stage:{name}" for name, _, _ in stages)}
-        return states is not None and not any(key in tick_stages or key.startswith("loop:") for key in self.failing)
+        tick_stages = {"stage:reap", "stage:secret-move", "stage:secret-check",
+                       *(f"stage:{name}" for name, _, _ in stages)}
+        return states is not None and not any(key in tick_stages or key.startswith(("loop:", "secret-check:"))
+                                              for key in self.failing)
+
+    def move_secrets_when_due(self) -> None:
+        now = time.monotonic()
+        if not config.secret_settings().store:
+            self.secret_moved_at = None
+            self.secret_migration = {}
+            return
+        if self.secret_moved_at is not None and now - self.secret_moved_at < SECRET_MOVE_SECONDS:
+            return
+        prior = self.secret_migration
+        if prior.get("retired") and not prior.get("pending") and (
+                prior.get("push_registered") or not paths.PUSH_KEY_FILE.exists()):
+            result = dict(prior)
+        else:
+            if not self.checkout_update.acquire(blocking=False):
+                return
+            try:
+                if serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent) is not None:
+                    return
+                result = secretstore.move_files()
+            finally:
+                self.checkout_update.release()
+            if result is None:
+                return
+        if result.get("retired"):
+            try:
+                result["ignored"] = secret_move.ignored_notes(config.read_data())
+            except FileNotFoundError:
+                result["ignored"] = []
+        previous = {entry for key in ("notes", "problems", "ignored") for entry in prior.get(key, ())}
+        for key in ("notes", "problems", "ignored"):
+            for entry in result.get(key, ()):
+                if entry not in previous:
+                    self.say(entry)
+        self.secret_moved_at = now
+        self.secret_migration = result
+
+    def check_secrets_when_due(self) -> None:
+        now = time.monotonic()
+        if not config.secret_settings().store:
+            self.secrets_checked_at = None
+            self.settle("secret-check:", set())
+            return
+        if self.secrets_checked_at is not None and now - self.secrets_checked_at < SECRET_CHECK_SECONDS:
+            return
+        rows = [row for row in secretstore.items() if row["status"] == "set"]
+        self.settle("secret-check:", {str(row["id"]) for row in rows})
+        for row in rows:
+            self.guard(f"secret-check:{row['id']}", secretstore.check, row["scope"], row["name"])
+        self.secrets_checked_at = now
 
     def reap(self) -> None:
         for row in record.reap(tickets=False):
@@ -677,6 +738,9 @@ class Server:
                 self.restore_deploy(src, base, tip, recovery, error)
                 if prior and serve_guard.at_tip(src, prior):
                     serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(prior))
+                elif serve_guard.at_tip(src, replace(receipt, tip=recovery.head)):
+                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT,
+                                      asdict(replace(receipt, settled="fast_forward_failed")))
                 self.deploy_refused(src, tip, str(error))
                 return
         self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
@@ -1196,6 +1260,7 @@ class Server:
             "workspace_contract_waiting": self.contracts_waiting,
             **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
+            "secret_migration": self.secret_migration,
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
         })
@@ -1273,6 +1338,9 @@ def run(with_dashboard: bool = True) -> NoReturn:
         for note in rotation_notes:
             server.say(note)
         server.report_config()
+        if not server.contracts_waiting and not server.config_problem:
+            server.guard("stage:secret-move", server.move_secrets_when_due)
+            server.read_config()
         for note in start_notes(server.cfg):
             server.say(note)
         if with_dashboard:

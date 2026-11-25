@@ -131,7 +131,8 @@ A hard kill or a power loss leaves it marked as still sending until `arete serve
 Approving a push again is safe, because it rebases onto origin first and a commit already there drops out; check a ticket on GitHub or Jira before approving it again.
 A `loop` emit hands each finding to another loop, so one loop can find and another can fix.
 [arete/loops/README.md](arete/loops/README.md) has the rules for both.
-A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook secret NAME` prints the URL and its token.
+A loop with `[trigger] webhook = true` takes events at `/hook/<loop>`; `arete webhook NAME` prints the URL and whether a secret is set, without showing or creating a secret.
+`arete webhook NAME --rotate` requests a new secret that is shown only once. Rotation requires HTTPS and owner presence; a CLI bearer token alone cannot rotate it.
 A delivery counts once by its `X-GitHub-Delivery` or `X-Request-Id`, and a post with neither counts once per 10 minutes by the hash of its body.
 
 ## On-call
@@ -2428,6 +2429,21 @@ arete never makes, changes or removes a `tailscale serve` mapping. A mapping on 
 A second dashboard on the same state folder and port waits and changes nothing.
 With HTTPS on, scratch state asks for no certificate.
 
+### Remove a stored repo secret
+
+With a configured store, CLI bearer tokens get `403 presence_required` without changing either copy. With neither a store nor an explicit server, `arete secrets rm REPO NAME` still removes the legacy entry locally.
+
+In the [paired owner browser](#pair-a-browser-and-log-in-a-cli), open the target server's HTTPS dashboard. In that tab's developer console, substitute the repo and secret **name** (not its value) and verify the target before running:
+
+```js
+const repo = "demo", name = "DEMO_TOKEN";
+const path = `/api/v1/secrets/${encodeURIComponent(`repo:${repo}`)}/${encodeURIComponent(name)}`;
+const result = await fetch(path, { method: "DELETE", headers: { "X-Arete": "1", "Idempotency-Key": crypto.randomUUID() } });
+console.log(result.status, await result.json());
+```
+
+The request uses the browser session, not a CLI token. `secret.present: false` confirms removal of both the registry item and any legacy copy.
+
 ### Pair a browser and log in a CLI
 
 1. Set `https = true` under `[dashboard]`. Once serve has a TLS listener, run `arete pair` on the serve host for the first pairing. Open the link in a browser signed in to the same tailnet login and submit the six-digit code. The code expires after five minutes.
@@ -2688,7 +2704,7 @@ These commands contact serve and print JSON. All but `task show` print one JSON 
 | `arete answer RUN_ID "TEXT"` | `POST /api/runs/RUN_ID/answer`; for a parked ask whose questions are not secrets, it answers every question with the text |
 | `arete answer RUN_ID [--ask ID] [--json BODY]` | `GET /api/asks`, then `POST /api/asks/ASK_ID/answer` for the run's oldest open ask; with no `--json` it prompts per question on stderr, reading a secret without echo or from a pipe; `--json` refuses a secret value |
 | `arete secrets REPO` | lists the names of the secrets stored for REPO, never a value |
-| `arete secrets rm REPO NAME` | removes one stored secret; exits 1 when REPO has none by that name |
+| `arete secrets rm REPO NAME` | removes a legacy repo secret locally only when neither a store nor an explicit server is configured; for server removal, see [Remove a stored repo secret](#remove-a-stored-repo-secret) |
 | `arete rotate-authority` | re-signs every scratch record and the browser pin under a new verification signing secret, then swaps it in; exits 1 and names the blocker while a run, an attempt lease or an engine lock is live |
 | `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
 | `arete repair RUN_ID` | `POST /api/runs/RUN_ID/repair` |

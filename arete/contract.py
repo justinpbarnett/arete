@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 6
+MINOR = 7
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -47,7 +47,8 @@ RUN["properties"]["version"] = INTEGER
 NULL_TEXT = {"type": ["string", "null"]}
 LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
             "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
-            "prompt": STRING, "model": STRING, "state": mapping(JSON), "runs": array(RUN)},
+            "prompt": STRING, "model": STRING, "state": mapping(JSON), "runs": array(RUN),
+            "webhook_path": STRING, "secret_present": BOOLEAN},
            ["name", "enabled"])
 INCIDENT = obj({**dict.fromkeys(("state", "phase", "waiting", "class", "source", "repo", "signature", "first_seen",
                                "last_seen", "decision", "reason", "decided", "retry_at", "recovery", "closed",
@@ -258,6 +259,9 @@ OPERATIONS += [
     secret_operation("remove", "", {}, "DELETE", internal=True),
     {**secret_operation("check", "/check", {}, "POST", internal=True), "scope": "config:activate"},
     operation("account.list", "accounts", envelope({"accounts": array(ACCOUNT)})),
+    operation("webhook.rotate", "loops/{loop}/webhook/rotate", envelope({"text": STRING}),
+              obj({"loop": STRING}), {"loop": "example"}, "POST",
+              errors=(*AUTH_ERRORS, "secret_store_missing", "secret_internal")),
     operation("config.list", "config/{kind}", envelope({"items": array(obj(CONFIG_ITEM))}),
               obj({"kind": CONFIG_KIND}), {"kind": "step_settings"}),
     operation("config.read", "config/{kind}/{name}",

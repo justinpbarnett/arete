@@ -22,7 +22,7 @@ def history(c, secret_id):
 
 def last_lifecycle(c, secret_id):
     row = c.execute("""
-        SELECT event FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed')
+        SELECT event FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'moved', 'removed')
         ORDER BY id DESC LIMIT 1
         """, (secret_id,)).fetchone()
     return row["event"] if row else None
@@ -30,7 +30,7 @@ def last_lifecycle(c, secret_id):
 
 def change_recorded(c, secret_id, operation_id):
     return c.execute("""
-        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'removed')
+        SELECT 1 FROM secret_events WHERE secret_id = ? AND event IN ('set', 'rotated', 'moved', 'removed')
         AND (detail = ? OR CASE WHEN json_valid(detail) THEN json_extract(detail, '$.id') END = ?)
         """, (secret_id, operation_id, operation_id)).fetchone() is not None
 
@@ -40,17 +40,21 @@ def has_fingerprints(c):
                           "SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
 
 
-def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider, *, rotated=False):
+def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider,
+                *, rotated=False, managed_by=None):
     return dict(c.execute("""
-        INSERT INTO secrets (scope, name, kind, store, reference, fingerprint, status, set_by, set_at, provider, rotated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'set', ?, ?, ?, ?)
+        INSERT INTO secrets (scope, name, kind, store, reference, fingerprint, status, set_by, set_at,
+                             provider, rotated_at, managed_by)
+        VALUES (?, ?, ?, ?, ?, ?, 'set', ?, ?, ?, ?, ?)
         ON CONFLICT (name, scope) DO UPDATE SET
             kind = excluded.kind, fingerprint = excluded.fingerprint, status = 'set', missing_since = NULL,
             set_by = excluded.set_by, set_at = excluded.set_at, version = secrets.version + 1,
             provider = COALESCE(excluded.provider, secrets.provider),
-            rotated_at = COALESCE(excluded.rotated_at, secrets.rotated_at)
+            rotated_at = COALESCE(excluded.rotated_at, secrets.rotated_at),
+            managed_by = COALESCE(excluded.managed_by, secrets.managed_by)
         RETURNING *
-        """, (scope, name, kind, store, reference, fingerprint, actor, at, provider, at if rotated else None)).fetchone())
+        """, (scope, name, kind, store, reference, fingerprint, actor, at, provider, at if rotated else None,
+              managed_by)).fetchone())
 
 
 def mark_checked(c, row, ok, at, *, recovered=False):
@@ -119,12 +123,12 @@ def save_account(c, label, provider, mode, holder, usage, identity, fingerprint,
 
     previous = c.execute("SELECT * FROM accounts WHERE provider = ? AND mode = ? AND identity = ?",
                          (provider, mode, identity)).fetchone()
-    fields = (holder, fingerprint, secret_id)
+    fields = (holder, fingerprint, secret_id, usage)
     if previous:
-        if tuple(previous[field] for field in ("holder", "fingerprint", "secret_id")) == fields:
+        if tuple(previous[field] for field in ("holder", "fingerprint", "secret_id", "usage")) == fields:
             return dict(previous)
         row = c.execute("""
-            UPDATE accounts SET holder = ?, fingerprint = ?, secret_id = ?, version = version + 1
+            UPDATE accounts SET holder = ?, fingerprint = ?, secret_id = ?, usage = ?, version = version + 1
             WHERE id = ? RETURNING *
             """, (*fields, previous["id"])).fetchone()
     else:

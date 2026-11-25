@@ -28,6 +28,8 @@ from . import (
     run_lines,
     runlimits,
     runner,
+    secret_move,
+    secretstore,
     slots,
     tracker,
     util,
@@ -500,15 +502,30 @@ def answer_ask(ask_id: str, body) -> dict:
         except (ValueError, TypeError) as e:
             raise control.Refused(str(e)) from None
         given = owner_asks.secret_values(remaining, body)
-        if problems := [f"{name}: {why}" for name, value in given.items()
-                        if (why := runner.reserved(name) or vault.unfit(value))]:
-            raise control.Refused("; ".join(problems) + "; nothing was stored")
+        scope = f"repo:{repo.name}"
+        store = config.secret_settings().store if given else None
+        for name, value in given.items():
+            try:
+                if why := runner.reserved(name):
+                    raise ValueError(why)
+                if store:
+                    secretstore.validate_set(scope, name, value, "repo_answer")
+                elif why := vault.unfit(value):
+                    raise ValueError(why)
+            except (ValueError, secretstore.InternalSecret) as error:
+                raise control.Refused(f"{name}: {error}; nothing was stored") from None
         free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
         command = continuing(cfg, repo, row)
-        try:
-            vault.put_all(repo.name, given)
-        except OSError as e:
-            raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
+        if given:
+            try:
+                if store:
+                    with secretstore.registry(write=True):
+                        for name, value in given.items():
+                            secretstore.put(scope, name, value, "repo_answer", principals.current(), managed_by="external")
+                else:
+                    secret_move.put_legacy_repo(repo.name, given)
+            except (OSError, ValueError, secretstore.StoreMissing) as error:
+                raise control.Refused(f"could not store {', '.join(given)} ({error}); the ask stays open") from None
         if not ask_store.ask_close(ask_id, "answered", answers):
             raise AlreadyResolved(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
         if more := ask_store.asks_of(row["id"], "open"):

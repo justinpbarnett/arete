@@ -164,6 +164,8 @@
       "type": "object",
       "properties": {
         "env_file": {"type": "string"},
+        "base_url": {"type": "string"},
+        "email": {"type": "string"},
         "project": {"type": "string"},
         "auto": {"type": "boolean"},
         "sprint_only": {"type": "boolean"},

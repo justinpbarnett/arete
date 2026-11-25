@@ -116,7 +116,7 @@ def configured_ticket_target(cfg: config.Config, name: str) -> dict:
         project = repo.jira_project or cfg.jira.project
         if project:
             return {"tracker": "jira", "project": project, "route": tracker.route_label(repo),
-                    "site": jira.site_url(cfg.jira.env_file)}
+                    "site": jira.site_url(cfg.jira)}
         raise ValueError(f"{repo.name} has no Jira project configured")
     raise ValueError(f"{repo.name} needs a configured GitHub or Jira destination")
 
@@ -149,7 +149,7 @@ def send_configured_ticket(item: dict, cfg: config.Config, receipt, approval) ->
         body = approval.text(body)
 
     if target["tracker"] == "jira":
-        client = jira.Client.from_env(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira)
         if client.base != target["site"]:
             raise jira.JiraError("the queued ticket belongs to a different Jira site")
         account = client.me().get("accountId")

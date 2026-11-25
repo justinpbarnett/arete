@@ -13,9 +13,8 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from http.client import RemoteDisconnected
-from pathlib import Path
 
-from . import adf, outbound, paths, util
+from . import accounts, adf, config, outbound, paths, secret_move, secretstore, util
 
 ENV_KEYS = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
 TIMEOUT = 30
@@ -34,10 +33,10 @@ class JiraUnsure(JiraError):
     pass
 
 
-def site_url(env_file: Path | None) -> str:
-    base = os.environ.get("JIRA_BASE_URL")
-    if not base and env_file:
-        base = util.read_env_file(env_file).get("JIRA_BASE_URL")
+def site_url(cfg: config.JiraConfig) -> str:
+    base_env = ENV_KEYS[0]
+    source = {} if paths.ISOLATED else os.environ
+    base = source.get(base_env) or cfg.base_url or _legacy_env(cfg).get(base_env)
     if not base:
         raise JiraError("no Jira site configured for ticket publication")
     return checked_base(base)
@@ -52,16 +51,34 @@ def checked_base(value: str) -> str:
     return base
 
 
-def credentials(env_file: Path | None) -> tuple[str, str, str]:
-    if paths.ISOLATED:
-        raise JiraError(paths.ISOLATED_LOGINS)
-    from_file = util.read_env_file(env_file) if env_file else {}
-    vals = [os.environ.get(k) or from_file.get(k, "") for k in ENV_KEYS]
-    missing = [k for k, v in zip(ENV_KEYS, vals) if not v]
+def _legacy_env(cfg: config.JiraConfig) -> dict[str, str]:
+    legacy = secret_move.fallback(cfg.env_file)
+    return util.read_env_file(legacy) if legacy else {}
+
+
+def credentials(cfg: config.JiraConfig) -> tuple[str, str, str]:
+    return credential_source(cfg)[0]
+
+
+def credential_source(cfg: config.JiraConfig):
+    base_env, email_env, token_env = ENV_KEYS
+    source = {} if paths.ISOLATED else os.environ
+    base = source.get(base_env) or cfg.base_url
+    email = source.get(email_env) or cfg.email
+    token, row = source.get(token_env, ""), None
+    if not token:
+        row, token = secretstore.lookup("global", token_env)
+    if not base or not email or (not token and row is None):
+        old = _legacy_env(cfg)
+        base = base or old.get(base_env, "")
+        email = email or old.get(email_env, "")
+        if row is None:
+            token = token or old.get(token_env, "")
+    missing = [setting for value, setting in ((base, "[jira] base_url"), (email, "[jira] email"),
+               (token, secretstore.address("global", token_env))) if not value]
     if missing:
-        where = f" or in {env_file}" if env_file else "; or name an env file in [jira] env_file"
-        raise JiraError(f"missing {', '.join(missing)}: set them in the environment{where}")
-    return checked_base(vals[0]), vals[1], vals[2]
+        raise JiraError(f"missing {', '.join(missing)}; set them in the environment or at the named settings")
+    return (checked_base(base), email, token), row
 
 
 def parse_time(s: str) -> datetime:
@@ -73,6 +90,7 @@ def parse_time(s: str) -> datetime:
 
 class AuthStaysOnHost(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_local_if_isolated(newurl)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
             new.remove_header("Authorization")
@@ -82,16 +100,25 @@ class AuthStaysOnHost(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(AuthStaysOnHost)
 
 
+def require_local_if_isolated(url):
+    if paths.ISOLATED and urllib.parse.urlsplit(url).hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise JiraError(paths.ISOLATED_LOGINS)
+
+
 class Client:
     def __init__(self, base_url: str, email: str, token: str):
         self.base = base_url.rstrip("/")
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+        self._secret_row: dict | None = None
         self._me: dict | None = None
         self._statuses: dict[str, set[str]] = {}
 
     @classmethod
-    def from_env(cls, env_file: Path | None) -> Client:
-        return cls(*credentials(env_file))
+    def from_env(cls, cfg: config.JiraConfig) -> Client:
+        values, row = credential_source(cfg)
+        found = cls(*values)
+        found._secret_row = row
+        return found
 
     def browse_url(self, key: str) -> str:
         return f"{self.base}/browse/{key}"
@@ -106,6 +133,7 @@ class Client:
     def _send(self, method: str, path: str, params: dict | None = None, body=None,
               accept: str = "application/json") -> bytes:
         url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        require_local_if_isolated(url)
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Authorization": self._auth, "Accept": accept}
         if data is not None:
@@ -114,7 +142,11 @@ class Client:
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:
-                    return r.read()
+                    raw = r.read()
+                    if self._secret_row and urllib.parse.urlsplit(r.geturl()).netloc == urllib.parse.urlsplit(url).netloc:
+                        accounts.record_workspace(self._secret_row, "jira", "api_key")
+                        self._secret_row = None
+                    return raw
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
                 if method == "POST" and e.code >= 500:
