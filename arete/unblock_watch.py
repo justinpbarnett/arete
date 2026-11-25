@@ -190,14 +190,15 @@ def land(repo, tid, case, attempt, candidate):
         cause, fresh = merge_review.assess(cfg, current, t, row, prs)
         if cause != "merge-review" or fresh != candidate:
             return
+        from . import release_proof
+
         hold = gh.pr_merge_auto(candidate["github"], gh.pr_number(candidate["url"]), candidate["head"],
                                 candidate["target"], candidate["base"], track_moved_base=True,
-                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)))
+                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)),
+                                **release_proof.pr_check_options(current, tid, candidate["github"], candidate["target"]))
         if hold:
             ledger.mark(case, "waiting", unblock.safe(hold), unblock.RECHECK)
         else:
-            from . import release_proof
-
             if release_proof.required(repo.name, tid):
                 ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
                 return
@@ -249,7 +250,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
 
     if not t.open and release_proof.required(repo.name, tid):
         release = release_proof.progress(repo, str(tid))
-        if not release or not release["evidence"]:
+        if not release or not release["completion"]:
             if existing:
                 ledger.mark(existing, "waiting", "Tracker closed while protected delivery evidence is pending", unblock.RECHECK)
             return
@@ -271,7 +272,7 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     if all_merged(prs):
         if release_proof.required(repo.name, tid):
             release = release_proof.progress(repo, str(tid))
-            if not release or not release["evidence"]:
+            if not release or not release["completion"]:
                 case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
                 ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
                 return
