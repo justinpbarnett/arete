@@ -93,7 +93,10 @@ def authority(cfg, repo, ticket, policy, revision):
     tk = tracker.for_ticket(cfg, repo, ticket)
     proof.need(isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)), "the release needs its enrolled tracker")
     t = tk.get(ticket)
-    proof.need(unblock.approval(tk, t)[0] and not t.blocker, "ticket is closed, no longer authorized, or blocked")
+    if t.is_spec:
+        proof.need(not tracker.spec_blocker(cfg, tk, t), "spec is closed, no longer authorized, or blocked")
+    else:
+        proof.need(unblock.approval(tk, t)[0] and not t.blocker, "ticket is closed, no longer authorized, or blocked")
     allowed = set(policy["qa"])
     notes = comments(repo, ticket, tk)
     approvals, changes = [], []
@@ -104,11 +107,13 @@ def authority(cfg, repo, ticket, policy, revision):
         line = body.strip()
         directive = APPROVE.fullmatch(line)
         if directive or line.rstrip(".!").casefold() in EXPLICIT:
+            if not directive and policy.get("qa_require_revision"):
+                continue
             if (not directive or directive[1] == revision) and (not edited or util.parse_iso(edited) == util.parse_iso(at)):
                 approvals.append((util.parse_iso(at), cid))
         elif line.rstrip(".!").casefold() not in NEUTRAL:
             changes.append((who, cid, line))
-    return tk, t, proof.digest([t.title, t.body, sorted(changes)]), approvals
+    return tk, t, proof.digest([t.spec_identity, t.title, t.body, sorted(changes)]), approvals
 
 
 def note(tk, repo, ticket, state, state_file, policy, proof_row):
