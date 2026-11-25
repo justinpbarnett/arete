@@ -71,8 +71,7 @@ def independent_workers(before, after, workers):
     return keep
 
 
-def github_conflict(tk: tracker.GitHubTracker, ticket: tracker.Ticket) -> str:
-    """Bind the newly read title, body and comments to their content editors."""
+def github_issue_pages(tk: tracker.GitHubTracker, tid: str) -> list[dict]:
     owner, repo = tk.repo.github.split("/")
     query = """query($owner:String!,$repo:String!,$number:Int!,$endCursor:String) {
       repository(owner:$owner,name:$repo) { issue(number:$number) {
@@ -80,22 +79,31 @@ def github_conflict(tk: tracker.GitHubTracker, ticket: tracker.Ticket) -> str:
         timelineItems(last:1,itemTypes:[RENAMED_TITLE_EVENT]) {
           nodes {... on RenamedTitleEvent {currentTitle actor {login}}}
         }
-        comments(first:100,after:$endCursor) {nodes {body createdAt lastEditedAt author {login} editor {login}}
+        comments(first:100,after:$endCursor) {nodes {url body createdAt lastEditedAt author {login} editor {login}}
           pageInfo {hasNextPage endCursor}}
       }}
     }"""
     pages = gh.gh_json(["api", "graphql", "--paginate", "--slurp", "-f", gh.outgoing(f"query={query}"),
                         "-f", gh.outgoing(f"owner={owner}"),
-                        "-f", gh.outgoing(f"repo={repo}"), "-F", gh.outgoing(f"number={int(ticket.id)}")]) or []
+                        "-f", gh.outgoing(f"repo={repo}"), "-F", gh.outgoing(f"number={int(tid)}")]) or []
+    if not isinstance(pages, list) or not pages:
+        raise gh.GhError("GitHub did not return the issue's content authority")
+    items = [((page.get("data") or {}).get("repository") or {}).get("issue") for page in pages]
+    if not all(isinstance(item, dict) and isinstance((item.get("comments") or {}).get("nodes"), list) for item in items):
+        raise gh.GhError("GitHub did not return the issue and its comment authority")
+    return items
+
+
+def github_conflict(tk: tracker.GitHubTracker, ticket: tracker.Ticket) -> str:
+    """Bind the newly read title, body and comments to their content editors."""
     publisher = (gh.me() if ticket.is_spec else tk.owner).casefold()
 
     def authorized(actor):
         return bool(publisher and (actor or {}).get("login", "").casefold() == publisher)
 
     comments = []
-    for page in pages:
-        item = ((page.get("data") or {}).get("repository") or {}).get("issue")
-        if (not item or not authorized(item.get("author")) or item["title"].strip() != ticket.title
+    for item in github_issue_pages(tk, ticket.id):
+        if (not authorized(item.get("author")) or item["title"].strip() != ticket.title
                 or (item["body"] or "(no description)") != ticket.body):
             return "the issue changed while the new requirements were being read"
         renamed = item["timelineItems"]["nodes"]
@@ -106,7 +114,7 @@ def github_conflict(tk: tracker.GitHubTracker, ticket: tracker.Ticket) -> str:
         for c in item["comments"]["nodes"]:
             if authorized(c.get("author")) and c["body"].strip() and not tracker.from_arete(c["body"]) and not gh.has_arete_mark(c["body"]):
                 comments.append(c)
-    if not pages or any(c["lastEditedAt"] and not authorized(c["editor"]) for c in comments[-tracker.MAX_COMMENTS:]):
+    if any(c["lastEditedAt"] and not authorized(c["editor"]) for c in comments[-tracker.MAX_COMMENTS:]):
         return "the tracker could not confirm the authorship of the current requirement comments"
     expected = tracker.scope_comments([(c["author"]["login"] if ticket.is_spec else tk.owner, c["createdAt"], c["body"])
                                        for c in comments])

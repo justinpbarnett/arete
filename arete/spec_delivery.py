@@ -126,6 +126,24 @@ def comments(tk: tracker.Tracker, tid: str):
     return []
 
 
+def confirmed_observation(tk, tid, body, url):
+    if isinstance(tk, tracker.GitHubTracker):
+        for item in requirement_revision.github_issue_pages(tk, tid):
+            for comment in item["comments"]["nodes"]:
+                if comment["url"] == url:
+                    return (comment["body"] == body and tk.by_publisher(comment, True)
+                            and (not comment["lastEditedAt"] or tk.by_publisher({"author": comment["editor"]}, True)))
+    if isinstance(tk, tracker.JiraTracker):
+        me = tk.client.me().get("accountId")
+        for comment in tk.client.comments(tid):
+            if tk.client.comment_url(tid, comment["id"]) == url:
+                editor = (comment.get("updateAuthor") or {}).get("accountId")
+                edited = comment.get("updated") not in (None, comment.get("created"))
+                return bool(me and comment.get("body") == body and (comment.get("author") or {}).get("accountId") == me
+                            and (editor == me or not editor and not edited))
+    return False
+
+
 def save(claim: dict, *, state: str = "") -> None:
     after = state or claim["state"]
     if not specs.advance(claim["identity"], claim["run"], claim["state"], after, claim["data"]):
@@ -210,7 +228,8 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     for body, url, created in comments(tk, claim["issue"]):
         observed = tracker.spec_observation(body)
         if (observed and observed[0] == request["token"] and url and created
-                and jira.parse_time(created) > util.parse_iso(request["since"])):
+                and jira.parse_time(created) > util.parse_iso(request["since"])
+                and confirmed_observation(tk, claim["issue"], body, url)):
             return {"method": "publisher's delivery-point observation", "landed": request["landed"],
                     "how": observed[1][:2000], "saw": observed[2][:2000], "source": url}
     return {}
