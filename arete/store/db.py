@@ -125,6 +125,7 @@ WORKER_EXCHANGE_SCHEMA = 26
 SECRET_REGISTRY_SCHEMA = 27
 WORKSPACE_CONTRACT_SCHEMA = 28
 SPEC_DELIVERY_SCHEMA = 29
+SPEC_GRAPH_SCHEMA = 30
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -133,9 +134,10 @@ type ProcessIdentity = tuple[str, int]
 type ServeChildren = set[tuple[int, ProcessIdentity | None]]
 WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] workspace_snapshots "
                      "or from arete migrate --workspace-snapshots DIR")
-# Each capability migrates at its own entry point. Unrelated writers can use older databases.
+# Unrelated writers can use older databases. Spec graph migrations are serve-owned.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
-             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA))
+             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
+                             SPEC_GRAPH_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -406,10 +408,12 @@ def workspace_store_is_new():
             and not any(paths.RUNS_DIR.iterdir()) and not any(paths.WORKTREES_DIR.iterdir()))
 
 
-def migrate(contracts=True, *, workspace_snapshots: Path | None = None):
+def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through: int | None = None):
     from .. import backup, config
 
     chain = migrations.load()
+    if through is not None:
+        chain = [migration for migration in chain if migration.n <= through]
     paths.ensure_dirs()
     with util.lock("migrate", wait=True):
         refuse_empty_file()
@@ -509,7 +513,8 @@ def _schema_key(identity, needed):
             getattr(identity, "st_birthtime", None), LATEST, needed)
 
 
-def checked_connection(*, timeout: float | None = None, on_demand: bool = False, needed: int | None = None):
+def checked_connection(*, timeout: float | None = None, on_demand: bool = False, needed: int | None = None,
+                       initialize_isolated: bool = True):
     from .. import backup
 
     needed = NEEDED if needed is None else needed
@@ -518,9 +523,9 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
-        if not on_demand and (not paths.ISOLATED or timeout is not None):
+        if not on_demand and (not initialize_isolated or not paths.ISOLATED or timeout is not None):
             raise missing_database() from None
-        migrate()
+        migrate(through=max(needed, WORKSPACE_CONTRACT_SCHEMA) if on_demand else None)
         identity = paths.DB_FILE.stat()
     if identity.st_size == 0:
         refuse_empty_file()
@@ -536,9 +541,9 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if on_demand and version < needed:
                 conn.close()
-                migrate()
-                return checked_connection(timeout=timeout, needed=needed)
-            if paths.ISOLATED and version == 0 and timeout is None:
+                migrate(through=max(needed, WORKSPACE_CONTRACT_SCHEMA))
+                return checked_connection(timeout=timeout, needed=needed, initialize_isolated=initialize_isolated)
+            if initialize_isolated and paths.ISOLATED and version == 0 and timeout is None:
                 conn.close()
                 migrate()
                 return checked_connection(needed=needed)
@@ -752,7 +757,11 @@ def migrate_on_demand(needed: int = WORKSPACE_SNAPSHOT_SCHEMA) -> None:
             return
     except FileNotFoundError:
         pass
-    checked_connection(on_demand=True, needed=needed).close()
+    checked_connection(on_demand=needed <= SPEC_DELIVERY_SCHEMA, needed=needed).close()
+
+
+def require_spec_graph_schema() -> None:
+    checked_connection(needed=SPEC_GRAPH_SCHEMA, initialize_isolated=False).close()
 
 
 def require_workspace_contract() -> None:

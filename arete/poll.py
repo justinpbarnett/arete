@@ -28,6 +28,7 @@ from . import (
     routing,
     runlimits,
     spec_delivery,
+    spec_graph,
     steps,
     tracker,
     util,
@@ -109,6 +110,9 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 claim = spec_store.find(repo.name, tid)
                 if claim and (not t.is_spec or claim["state"] != "building"):
                     continue
+            if owned := spec_graph.queue_blocker(source, tid):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, owned, repo.name)
+                continue
             if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
@@ -134,7 +138,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
 
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
-                and not run_store.issue_running(repo.name, tid))
+                and not run_store.issue_running(repo.name, tid) and not spec_graph.queue_blocker(tk, tid))
 
     def ordinary_history(tid):
         return eligible_again(tid) and (not isinstance(tk, tracker.GitHubTracker) or tracker.is_task_id(tid)
@@ -273,7 +277,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
 
 
 def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None, *,
-                    continues: str = "", spec: bool = False) -> bool | None:
+                   spec: bool = False, source: tracker.Tracker | None = None, continues: str = "") -> bool | None:
     """Return True for a spawn, None for existing work, False for an oncall refusal."""
     from . import control, tasks
 
@@ -281,7 +285,8 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
         if not got or str(tid) in oncall.parked(repo_name):
             return False
         with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
-            if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
+            if ((source and spec_graph.queue_blocker(source, tid)) or tasks.pending_start(repo_name, str(tid))
+                    or run_store.issue_running(repo_name, tid)):
                 return None
             command = None
             if continues:
@@ -393,6 +398,9 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
+    if owned := spec_graph.queue_blocker(source, tid, native=True):
+        skips.note(name, tracker.Ticket(str(tid), source.ref(tid), ""), owned, repo.name)
+        return "skipped"
     ticket = source.get(tid)
     claim = (spec_store.find(repo.name, str(tid), identity=ticket.spec_identity)
              if not isinstance(source, tracker.LocalTracker) else {})
@@ -463,8 +471,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        spawned = (spawn_unparked(repo.name, tid, readmission, continues=continues) if continues
-                   else spawn_unparked(repo.name, tid, readmission, **({"spec": True} if ticket.is_spec else {})))
+        spawned = spawn_unparked(repo.name, tid, readmission, source=source, **({"spec": True} if ticket.is_spec else {}),
+                                 **({"continues": continues} if continues else {}))
         if spawned is None:
             return "skipped"
         if not spawned:
@@ -524,6 +532,8 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
         repo = queue.repo
         for row in run_store.environment_holds(repo.name):
             try:
+                if spec_graph.queue_blocker(queue.tracker, row["issue"], native=True):
+                    continue
                 can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
                 if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
                     queue.selected.add(str(row["issue"]))

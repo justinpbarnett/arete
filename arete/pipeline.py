@@ -544,6 +544,7 @@ class Run(AgentRun):
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
     code_review: bool = False
+    scope_revoked: bool = False
     spec_root: str = ""
     spec_identity: str = ""
     pr_recovery_cutoff: str = field(default="", init=False)
@@ -756,8 +757,10 @@ class Run(AgentRun):
         others = [s for s in self.tracker.states if s != status]
         labeled = self.tracker.label(self.tid, add=[status], remove=others)
         record.note(self.id, label_pending=status if labeled else "")
+        from . import release_proof
+
         guarded_jira = isinstance(self.tracker, tracker.JiraTracker) and (
-            self.spec_root or spec_store.find(self.repo.name, str(self.tid)))
+            self.spec_root or spec_store.find(self.repo.name, str(self.tid)) or release_proof.required(self.repo.name, self.tid))
         moved = (self.tracker.move(self.tid, status, keep_open=True) if guarded_jira
                  else self.tracker.move(self.tid, status))
         for err in (labeled, moved):
@@ -1893,7 +1896,7 @@ def parked_review_lines(folder: Path) -> list[str]:
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
                *, echo_end: bool = True) -> None:
     failure = run.failure if run.failure is not None else {"class": "work"}
-    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs):
+    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs or run.scope_revoked):
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
@@ -1981,7 +1984,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, launch_lease, pilot, unblock, zte
+    from . import flows, launch_lease, pilot, spec_graph, unblock, zte
     from .store import db, orchestration
     from .store import zte as zte_store
 
@@ -2014,6 +2017,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        try:
+            poll_launch = launch_lease.from_poll(repo.name, str(tid))
+            ordinary_launch = poll_launch or bool(script and script.environment_release)
+            if owned := spec_graph.queue_blocker(tk, tid):
+                print(f"{name}: {owned}")
+                return 2
+        except (PermissionError, *spec_graph.READ_ERRORS) as error:
+            print(f"{name}: could not confirm ticket ownership: {error}")
+            return 2
         retry_of = {}
         fixed_gaps = ()
         spec_ticket = None
@@ -2133,9 +2145,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
-            from_poll = launch_lease.from_poll(repo.name, str(tid))
-            poll_failure = (latest["id"] if from_poll and not (dry_run or force or retry_of or readmission) and latest
-                            and latest["status"] == "failed" and not latest["dry_run"] else "")
+            poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
+                            and latest["status"] == "failed" and not latest["dry_run"]
+                            and poll_launch else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -2278,12 +2290,32 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     print(f"{name}: {error}")
                     return 2
+            elif ordinary_launch and not tracker.is_task_id(tid):
+                try:
+                    owned = spec_graph.queue_blocker(tk, tid, native=True)
+                except spec_graph.READ_ERRORS as error:
+                    slot.free()
+                    print(f"{name}: could not confirm ticket ownership: {error}")
+                    return 2
+                if owned:
+                    slot.free()
+                    print(f"{name}: {owned}")
+                    return 2
+                with db.tx():
+                    owned = spec_graph.queue_blocker(tk, tid)
+                    if not owned:
+                        run_id = start()
+                if owned:
+                    slot.free()
+                    print(f"{name}: {owned}")
+                    return 2
+                launch_lease.registered(repo.name, str(tid))
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=from_poll,
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=poll_launch,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
@@ -2741,7 +2773,8 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     from . import unblock
 
     shared_runner = bool(asked) and all(a.get("call") == owner_asks.CHECK_RUNNER_CALL for a in asked)
-    recover = (not shared_runner and not run.dry_run and not run.alone and not run.spec_root
+    scope_question = any(a.get("call", "").startswith("requirements.") for a in asked or [])
+    recover = (not shared_runner and not scope_question and not run.dry_run and not run.alone and not run.spec_root
                and unblock.active(run.config, run.repo.name, str(run.tid))
                and not unblock.exclude(run.repo.name, str(run.tid)))
     if recover and not asked:
@@ -3271,6 +3304,9 @@ def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
 def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                   track_moved_base: bool = False, require_pinned_base: bool = False) -> str | None:
     run = b.run
+    from . import spec_graph_delivery
+    if reason := spec_graph_delivery.active_child_blocker(run, b.ticket):
+        return reason
     try:
         if require_pinned_base:
             return unpinned_merge_hold(c, fetch_merge_base(c))
@@ -3531,6 +3567,8 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
 
     if len(b.checkouts) != 1:
         return merge_review.MULTIPLE
+    if hold := release_proof.missing_staging_promise(b.run.repo, getattr(b.ticket, "id", None)):
+        return hold
     head = c.lease
     if hold := merge_evidence_hold(b, c, verified, review, head):
         return hold

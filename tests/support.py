@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-from arete import config, dbstats, paths, sandbox
+from arete import config, dbstats, gh, paths, sandbox
 from arete.store import db as foundation
 
 
@@ -17,6 +17,21 @@ def workspace_state(root):
                              LOCKS_DIR=state / "locks", RUNS_DIR=state / "runs", LOG_DIR=root / "logs",
                              WORKTREES_DIR=root / "fixtures", SERVER_FILE=state / "server.json"):
         yield
+
+
+def parentless_github_issue(repo, number, issue_view):
+    path = f"repos/{repo.casefold()}/issues/{number}"
+
+    def api(args):
+        assert args[:1] == ["api"] and args[2:] == ["--hostname", "github.com"], args
+        if args[1] == f"{path}/parent":
+            raise gh.GhError("HTTP 404")
+        assert args[1] == path, args
+        issue = issue_view(repo, int(number))
+        return {**issue, "id": int(number), "state": issue["state"].lower(),
+                "repository_url": f"{gh.GITHUB_API}/repos/{repo}"}
+
+    return api
 
 
 def isolate_live_state():

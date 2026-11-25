@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from . import gh, jira, outbound, release_proof, tracker, util, vault, verify
+from . import gh, jira, outbound, release_proof, requirement_revision, tracker, util, vault, verify
 from .store import orchestration, runs, specs, workspaces
 
 GUIDANCE = (
@@ -25,6 +25,23 @@ def definition(values: dict) -> dict:
     return found
 
 
+def protected_environment(repo, ticket, requested):
+    policy = release_proof.goal(repo, ticket)
+    if not policy:
+        return requested
+    default = policy["destination"]
+    options = {default: default}
+    if default == "staging":
+        options["production"] = "production"
+    aliases = {str(policy[point]).rstrip("/").casefold(): point for point in options if point in policy}
+    value = requested.strip().rstrip("/").casefold()
+    if not value:
+        return default
+    if (target := (options | aliases).get(value)):
+        return target
+    raise ValueError("Use the enrolled final delivery point: " + " or ".join(options))
+
+
 def describe(done: dict) -> str:
     return (f"## Definition of done\n\n{done['criterion']}\n\nObserve it by: {done['procedure']}"
             + (f"\n\nRequired runtime: {done['environment']}" if done.get("environment") else ""))
@@ -44,7 +61,7 @@ def behavior(report: verify.Verified, done: dict) -> dict:
 
 
 def source_version(ticket: tracker.Ticket) -> str:
-    return orchestration.digest([ticket.title, ticket.body])
+    return requirement_revision.version(ticket)
 
 
 def landing_policy(tk: tracker.Tracker) -> list[list[str]]:
@@ -63,7 +80,7 @@ def candidate(job, done: dict, policy: str, acceptance: str, trees: dict) -> dic
                 or c.pr and gh.pr_repo(c.pr).casefold() != c.github.casefold()):
             raise ValueError("a release checkout does not match the verified spec tree")
         targets.append({"pr": c.pr, "repo": c.github, "base": c.base, "tree": tree, "head": head})
-    return {"definition": done, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
+    return {"definition": done, "source_format": 2, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
             "landing": landing_policy(job.run.tracker), "targets": targets, "behavior": observed}
 
 
@@ -109,6 +126,24 @@ def comments(tk: tracker.Tracker, tid: str):
     return []
 
 
+def confirmed_observation(tk, tid, body, url):
+    if isinstance(tk, tracker.GitHubTracker):
+        for item in requirement_revision.github_issue_pages(tk, tid):
+            for comment in item["comments"]["nodes"]:
+                if comment["url"] == url:
+                    return (comment["body"] == body and tk.by_publisher(comment, True)
+                            and (not comment["lastEditedAt"] or tk.by_publisher({"author": comment["editor"]}, True)))
+    if isinstance(tk, tracker.JiraTracker):
+        me = tk.client.me().get("accountId")
+        for comment in tk.client.comments(tid):
+            if tk.client.comment_url(tid, comment["id"]) == url:
+                editor = (comment.get("updateAuthor") or {}).get("accountId")
+                edited = comment.get("updated") not in (None, comment.get("created"))
+                return bool(me and comment.get("body") == body and (comment.get("author") or {}).get("accountId") == me
+                            and (editor == me or not editor and not edited))
+    return False
+
+
 def save(claim: dict, *, state: str = "") -> None:
     after = state or claim["state"]
     if not specs.advance(claim["identity"], claim["run"], claim["state"], after, claim["data"]):
@@ -119,7 +154,10 @@ def save(claim: dict, *, state: str = "") -> None:
 def post_once(claim: dict, tk: tracker.Tracker, kind: str, body: str) -> str:
     data, tid = claim["data"], claim["issue"]
     notes = data.setdefault("notes", {})
-    marker = "Arete spec receipt " + orchestration.digest([claim["root"], claim["run"], kind])[:32]
+    marker_fields = [claim["root"], claim["run"], kind]
+    if data.get("amended"):
+        marker_fields.append(data["amended"])
+    marker = "Arete spec receipt " + orchestration.digest(marker_fields)[:32]
     if notes.get(kind):
         return notes[kind]
     if kind in notes:
@@ -162,6 +200,9 @@ def public_text(tk: tracker.Tracker, text: str) -> str:
 
 def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     data = claim["data"]
+    if data.get("graph"):
+        from . import spec_graph_delivery
+        return spec_graph_delivery.integrated(tk, claim)
     landed = reached(data)
     if not landed:
         return {}
@@ -188,15 +229,12 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
               f"Reply with `Spec evidence {request['token']}` on its own first line, followed by `How:` and `Saw:` "
               "lines describing how you checked it and what matched the expected outcome. Do not include secrets.")
     for body, url, created in comments(tk, claim["issue"]):
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if (len(lines) != 3 or lines[0] != f"Spec evidence {request['token']}" or not url or not created
-                or jira.parse_time(created) <= util.parse_iso(request["since"])):
-            continue
-        has_how, has_saw = lines[1].startswith("How:"), lines[2].startswith("Saw:")
-        how, saw = (line.partition(":")[2].strip()[:2000] for line in lines[1:])
-        if has_how and has_saw and how and saw:
+        observed = tracker.spec_observation(body)
+        if (observed and observed[0] == request["token"] and url and created
+                and jira.parse_time(created) > util.parse_iso(request["since"])
+                and confirmed_observation(tk, claim["issue"], body, url)):
             return {"method": "publisher's delivery-point observation", "landed": request["landed"],
-                    "how": how, "saw": saw, "source": url}
+                    "how": observed[1][:2000], "saw": observed[2][:2000], "source": url}
     return {}
 
 
@@ -205,9 +243,22 @@ def settle(cfg, repo, claim: dict) -> None:
     if (runs.run_get(run) or {}).get("status") in (None, "running"):
         return
     tk = tracker.for_ticket(cfg, repo, tid)
-    t = tk.get(tid)
+    saved = {}
+    if "source_format" not in data:
+        state = orchestration.find(run).get("data", {})
+        saved = state.get("prepared", {}).get("ticket", {})
+    legacy = (saved.get("id") == tid and data["source"] == orchestration.digest([saved.get("title"), saved.get("body")]))
+    t = tk.get(tid, saved_comments=saved.get("comments", "")) if legacy else tk.get(tid)
+    if data.get("graph"):
+        from . import spec_amendments
+        if not spec_amendments.reconcile(tk, claim, t):
+            return
+    if legacy:
+        same_source = t.saved_scope_matches and (t.title, t.body) == (saved["title"], saved["body"])
+    else:
+        same_source = source_version(t) == data["source"]
     if (t.spec_identity != claim["identity"] or tracker.spec_blocker(cfg, tk, t, require_open=False)
-            or source_version(t) != data["source"] or landing_policy(tk) != data["landing"]):
+            or not same_source or landing_policy(tk) != data["landing"]):
         return
     if claim["state"] == "published":
         observed = data.get("delivery") or at_delivery(claim, tk)
@@ -244,6 +295,6 @@ def sync(cfg) -> None:
             try:
                 repo = cfg.repo(repo_name)
                 settle(cfg, repo, claim)
-            except (KeyError, gh.GhError, jira.JiraError, tracker.TaskError) as error:
+            except (KeyError, ValueError, OSError, gh.GhError, jira.JiraError, tracker.TaskError) as error:
                 print(f"{util.iso()} {tracker.issue_name(repo_name, tid)}: spec delivery held: "
                       f"{outbound.sanitize(str(error), 300)}")

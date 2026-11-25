@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import adf, cli, config, emits, enrollment, gh, jira, loop_run, loops, paths, push, serve, tracker, workspace
+from arete import adf, cli, config, emits, enrollment, gh, jira, loop_run, loops, paths, push, release_proof, serve, tracker, workspace
 from arete.commands import setup
 from arete.store import loops as loop_store
 from support import isolate_live_state
@@ -132,6 +132,38 @@ class EnrollAndPublish(unittest.TestCase):
         key = key or f"{self.id().split('.')[-1]}/{repo}/{kind}"
         return self.call("publish", repo, kind, "--title", f"A {kind}", "--body-file", self.body,
                          "--key", key, *options, status=status)
+
+    def test_profile_enrollment_persists_repository_authority_and_holds_unverified_tracker_delivery(self):
+        source = self.root / "profile.json"
+        profile = {"destination": "staging", "staging": "https://qa.example.com", "production": "https://example.com",
+                   "production_branch": "main", "identity_path": "/sha.json", "qa": ["publisher", "qa-user"]}
+        source.write_text(json.dumps(profile))
+        out = self.enroll("profiled", "me/profiled", "--unattended-environment", "staging", "--staging-profile", str(source))
+        self.assertEqual(out["staging_profile"], profile)
+        repo = config.load_required().repo("profiled")
+        tk = tracker.GitHubTracker(repo)
+        self.assertEqual(tk.pr_link(tracker.Ticket("1", "#1", "Verify the interface"), True), "Refs #1")
+        self.assertIn("promise", release_proof.missing_staging_promise(repo, "1"))
+        self.assertEqual(release_proof.progress(repo, "1")["status"], "waiting_for_promise")
+        scenarios = [{"field": "/ready", "equals": True}]
+        promise = {"path": "/api/ready", "instructions": "Open the page.", "assertions": scenarios, "recovery": scenarios}
+        goal = self.root / "ticket.json"
+        for override in ({"qa": ["other"]}, {"production_branch": "other"}, {"production": "https://other.example.com"}):
+            goal.write_text(json.dumps({**promise, **override}))
+            with self.assertRaises(release_proof.Held):
+                release_proof.install(repo, "1", goal)
+        goal.write_text(json.dumps({**promise, "qa": ["publisher"]}))
+        original = release_proof.install(repo, "1", goal)["policy"]
+        self.assertEqual(original, release_proof.digest(release_proof.goal("profiled", "1")))
+        self.assertEqual(release_proof.missing_staging_promise(repo, "1"), "")
+        self.assertEqual(release_proof.goal("profiled","1")["qa"], ["publisher"])
+        self.assertIn("promise", release_proof.missing_staging_promise(repo, "2"))
+        source.write_text(json.dumps({**profile, "qa": ["publisher"]}))
+        self.call("staging-profile", "profiled", "--policy-file", str(source))
+        self.assertIn("promise", release_proof.missing_staging_promise(repo, "1"))
+        self.assertIsNone(release_proof.goal("profiled", "1"))
+        # Even when the ticket's effective QA subset is identical, receipts bind to its updated repository authority.
+        self.assertNotEqual(original, release_proof.install(repo, "1", goal)["policy"])
 
     def test_defaults_overrides_and_policy_round_trip(self):
         personal = self.enroll("personal", "me/blog", "--landing", "direct-push", "--unattended-environment", "staging")
