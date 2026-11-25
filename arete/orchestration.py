@@ -1298,10 +1298,10 @@ class Controller(worker_turns.WorkerTurns):
             if action["state"] == "succeeded":
                 if gate == "checks" and not old_gate and self.uses_code_review and not result.get("reused_checks"):
                     if "remaining_checks" in result:
-                        self.data["remaining_checks"] = result["remaining_checks"]
+                        self.data["remaining_checks"] = check_repair.retry_targets(result["remaining_checks"])
                     elif result.get("passed") is False:
-                        self.data["remaining_checks"] = check_repair.historical_failures(
-                            self.job.layer, result.get("report", ""))
+                        self.data["remaining_checks"] = check_repair.retry_targets(check_repair.historical_failures(
+                            self.job.layer, result.get("report", "")))
                     elif result.get("full"):
                         self.data.pop("remaining_checks", None)
                 if result.get("writing"):
@@ -1510,6 +1510,27 @@ class Controller(worker_turns.WorkerTurns):
         if self.workers:
             raise ValueError("workers are still active; wait for confirmed completion or cancellation first")
 
+    def current_check_diagnostics(self, actions, assignment=None):
+        latest = next((a for a in reversed(actions) if a["op"] == "checks.run"
+                       and a["state"] not in ("accepted", "running")), None)
+        if (not latest or latest["state"] != "succeeded" or latest["id"] in self.data.get("stale_actions", ())
+                or latest["id"] in self.data.get("superseded_actions", ())):
+            return ""
+        result = latest["result"]
+        failures = result.get("failed_checks", [])
+        stamp = result.get("input_stamp", {})
+        tree = stamp.get("tree")
+        if (result.get("passed") is not False or not failures or not tree
+                or stamp.get("acceptance") != self.data["acceptance"] or stamp.get("policy") != self.policy_sha()
+                or tree != self.fingerprint()):
+            return ""
+        if assignment:
+            pinned = {c.github: part["tree"] for c, part in
+                      zip(self.job.checkouts, assignment["candidate"]["parts"], strict=True)}
+            if tree != ledger.digest(pinned):
+                return ""
+        return check_repair.diagnostics(failures)
+
     def worker_start(self, action, args, prior=None):
         known = {item["id"]: item for item in ledger.actions(self.lease)}
         if not self.exchanged and any(known[dep]["state"] != "succeeded" for dep in args["depends_on"]):
@@ -1584,8 +1605,15 @@ class Controller(worker_turns.WorkerTurns):
         if assignment:
             messages = exchange.inbox(self.lease, logical_id)
             prompt += worker_turns.instructions(assignment, messages)
-        if writing and denied_feedback:
-            prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
+        if writing:
+            if denied_feedback:
+                prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
+            if (not assignment or not prior) and (diagnostics := self.current_check_diagnostics(known.values(), assignment)):
+                prompt += f"\n\n## Current candidate check failures (reference only)\n\n{diagnostics}"
+            prompt = check_repair.builder_prompt(prompt)
+            if assignment:
+                prompt += ("\n\nThe shared check launcher targets the delivery checkout, not this private workspace. "
+                           "Do not use its result to verify private edits.")
         session = NO_SESSION
         previous = (prior or {}).get("result", {})
         if not assignment and previous.get("runner") == setting.runner and previous.get("model") == setting.model:
@@ -2597,7 +2625,7 @@ class Controller(worker_turns.WorkerTurns):
                     remaining = []
                 elif failures := outcome.data.get("failed_checks"):
                     skipped = [item for item in remaining if item["name"] not in outcome.data["checks_executed"]]
-                    remaining = [*failures, *skipped]
+                    remaining = check_repair.retry_targets([*failures, *skipped])
                     if skipped:
                         outcome.data["runner_blocked"] = False
                 self.data["remaining_checks"] = remaining
