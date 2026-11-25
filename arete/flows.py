@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import (
+    check_repair,
     config,
     diffguard,
     document,
@@ -1200,8 +1201,8 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
                 "again on it")
     run.story.append(f"Review findings of run {found.run_id} to repair:\n{findings}")
-    res = run.agent("repair", job.brief.prompt(
-        "repair", plan=found.plan, source=found.run_id, findings=findings, checks=job.checks),
+    prompt = job.brief.prompt("repair", plan=found.plan, source=found.run_id, findings=findings, checks=job.checks)
+    res = run.agent("repair", check_repair.builder_prompt(prompt),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
@@ -1235,8 +1236,7 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
     if round.startswith(REVIEW_FIX):
         prompt = prompt_loader.prompt(REVIEW_FIX, problems=feedback, notes=job.review.fix_notes(), denied=denied)
     else:
-        prompt = prompt_loader.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
-                                      checks=b.check_commands, denied=denied)
+        prompt = pipeline.check_fix_prompt(attempt, tries, feedback, b.check_commands, b.deny)
     res = b.resume(round, prompt, role=atom)
     return Outcome("pass" if res.ok else "fail", data={"round": round, "reply": res.text},
                    session=run.sessions.get(BUILD, NO_SESSION))
@@ -1244,8 +1244,8 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
 
 def build(job: Job) -> Outcome:
     run, layer = job.run, job.layer
-    res = run.agent(BUILD, job.brief.prompt(
-        BUILD, plan=job.plan_text, checks=job.checks, estimate=job.estimate, verify=job.goal),
+    prompt = job.brief.prompt(BUILD, plan=job.plan_text, checks=job.checks, estimate=job.estimate, verify=job.goal)
+    res = run.agent(BUILD, check_repair.builder_prompt(prompt),
                     job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
@@ -1277,7 +1277,6 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
         result = hosted["status"]
         description = hosted.get("error") or hosted.get("url") or "waiting for GitHub"
         b.report += f"\n\n### GitHub-hosted macOS check: {result}\n{description}"
-        run.save("checks.md", b.report)
         if (result == "success" and hosted.get("exit") == 0
                 and (scope != "full" or set(executed) == set(job.layer.checks))):
             failures = []
@@ -1285,7 +1284,9 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             if scope == "full":
                 b.checked = {"tree": before, "commands": dict(job.layer.checks), "report": b.report}
         elif result == "failure":
-            failures = [{"name": "behavior", "selectors": []}]
+            failures = [{"name": "behavior", "selectors": [], "exit": hosted.get("exit")}]
+            b.report += "\n\n" + check_repair.diagnostics(failures)
+        run.save("checks.md", b.report)
     details = {"scope": scope, "checks_executed": executed, "failed_checks": failures,
                "policy": job.policy("checks", {"quick": quick, "focused": focused}),
                "runner_blocked": bool(failures) and all(f.get("capability") == "macos-sandbox-profile"
@@ -1296,8 +1297,9 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
         record.note(run.id, attempts=attempt)
     if not ok:
         if not after:
-            run.story.append(f"Checks failed on attempt {attempt}:\n{util.tail(b.report, 2500)}" if attempt < tries
-                             else "Checks still failing after the last attempt.")
+            retrying = attempt < tries
+            heading = f"Checks failed on attempt {attempt}:" if retrying else "Checks still failing after the last attempt."
+            run.story.append(pipeline.check_failure_story(heading, failures, b.report if retrying else ""))
         return Outcome("fail", next="implement", feedback=b.report,
                        data={**details, "report": b.report, "attempts": attempt, "after": after, "story": run.story,
                              "checked": b.checked})
