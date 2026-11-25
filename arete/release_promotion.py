@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
+import sqlite3
 from urllib.parse import quote, urlencode
 
-from . import adf, config, gh, jira, release_profile, release_proof as proof, serve_guard, tracker, util
+from . import adf, cohorts, config, gh, jira, release_profile, release_proof as proof, serve_guard, tracker, util
 
 NEUTRAL = {"thanks", "thank you", "looks good", "lgtm", "ack"}
 EXPLICIT = {"promote this to production", "push this to production", "moving this to push to production on the sheet"}
@@ -92,16 +94,7 @@ def comments(repo, ticket, tk):
              else r["body"], r.get("created", ""), r.get("updated", ""), str(r.get("id", ""))) for r in rows]
 
 
-def authority(cfg, repo, ticket, policy, revision):
-    from . import unblock
-
-    tk = tracker.for_ticket(cfg, repo, ticket)
-    proof.need(isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)), "the release needs its enrolled tracker")
-    t = tk.get(ticket)
-    if t.is_spec:
-        proof.need(not tracker.spec_blocker(cfg, tk, t), "spec is closed, no longer authorized, or blocked")
-    else:
-        proof.need(unblock.approval(tk, t)[0] and not t.blocker, "ticket is closed, no longer authorized, or blocked")
+def review_comments(tk, repo, ticket, policy, revision):
     allowed = set(policy["qa"])
     notes = comments(repo, ticket, tk)
     approvals, changes = [], []
@@ -114,10 +107,27 @@ def authority(cfg, repo, ticket, policy, revision):
         if directive or line.rstrip(".!").casefold() in EXPLICIT:
             if not directive and policy.get("qa_require_revision"):
                 continue
-            if (not directive or directive[1] == revision) and (not edited or util.parse_iso(edited) == util.parse_iso(at)):
-                approvals.append((util.parse_iso(at), cid))
+            if (cid.isdigit() and (not directive or directive[1] == revision)
+                    and (not edited or util.parse_iso(edited) == util.parse_iso(at))):
+                url = (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
+                       else tk.client.comment_url(ticket, cid))
+                approvals.append({"id": cid, "at": cohorts.timestamp(at), "url": url, "actor": who})
         elif line.rstrip(".!").casefold() not in NEUTRAL:
             changes.append((who, cid, line))
+    return changes, approvals
+
+
+def authority(cfg, repo, ticket, policy, revision):
+    from . import unblock
+
+    tk = tracker.for_ticket(cfg, repo, ticket)
+    proof.need(isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)), "the release needs its enrolled tracker")
+    t = tk.get(ticket)
+    if t.is_spec:
+        proof.need(not tracker.spec_blocker(cfg, tk, t), "spec is closed, no longer authorized, or blocked")
+    else:
+        proof.need(unblock.approval(tk, t)[0] and not t.blocker, "ticket is closed, no longer authorized, or blocked")
+    changes, approvals = review_comments(tk, repo, ticket, policy, revision)
     return tk, t, proof.digest([t.spec_identity, t.title, t.body, sorted(changes)]), approvals
 
 
@@ -175,6 +185,13 @@ def promotion_base(repo, ticket, revision, production):
     return production
 
 
+def after_handoff(state, approvals):
+    anchor = re.search(r"(?:issuecomment-|focusedCommentId=)([0-9]+)(?:$|[&#])", state["handoff"])
+    if anchor:
+        return [row for row in approvals if int(row["id"]) > int(anchor[1])]
+    return [row for row in approvals if util.parse_iso(row["at"]) > util.parse_iso(state["qa_since"])]
+
+
 def ready(cfg, repo, ticket, policy, state):
     revision, target = state["revision"], policy["production_branch"]
     try:
@@ -184,10 +201,7 @@ def ready(cfg, repo, ticket, policy, state):
     proof.need(current == repo and current.pipeline and current.landing == "pr", "repository enrollment changed")
     _, _, scope, approvals = authority(cfg, repo, ticket, policy, revision)
     proof.need(scope == state["scope"], "scope changed after staging; deploy the corrected revision for fresh QA")
-    after = util.parse_iso(state["qa_since"])
-    anchor = re.search(r"(?:issuecomment-|focusedCommentId=)([0-9]+)(?:$|[&#])", state["handoff"])
-    choices = [(at, cid) for at, cid in approvals
-               if (cid.isdigit() and int(cid) > int(anchor[1]) if anchor else at > after)]
+    choices = after_handoff(state, approvals)
     proof.need(choices, "waiting for a new QA instruction for the tested revision")
     proof.need(repo.unattended_environment == "staging" and repo.target_branch != target
                and proof.digest(proof.goal(repo.name, ticket)) == state["policy"], "release policy changed")
@@ -199,7 +213,28 @@ def ready(cfg, repo, ticket, policy, state):
     proof.need(gh.merge_ci_passed(repo.github, revision, stage_checks=policy.get("checks", {}).get("staging")), "checks on the staged revision must pass before promotion")
     proof.need(proof.deployed_revision(policy, policy["staging"]) == revision
                and preview(repo, policy, revision) == state["origin"], "the tested staging deployment changed")
-    return max(choices)[1]
+    return min(choices, key=lambda row: (row["at"], int(row["id"])))
+
+
+def score_approval(cfg, repo, ticket, state):
+    cid = state.get("approval")
+    if not cid or state.get("approval_scored") == cid or not cohorts.location().is_file():
+        return
+    receipt = state.get("approval_comment")
+    if not receipt:
+        # Earlier promotion receipts have only an ID. A closed ticket still has its review history.
+        policy = proof.goal(repo.name, ticket)
+        tk = tracker.for_ticket(cfg, repo, ticket)
+        if (not isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)) or not policy
+                or proof.digest(policy) != state.get("policy") or not state.get("handoff") or not state.get("qa_since")):
+            return
+        _, approvals = review_comments(tk, repo, ticket, policy, state["revision"])
+        receipt = next((r for r in after_handoff(state, approvals) if r["id"] == cid), None)
+        if not receipt:
+            return
+        state["approval_comment"] = receipt
+    if cohorts.record_production_qa(repo.name, ticket, state["revision"], receipt):
+        state["approval_scored"] = cid
 
 
 def advance(cfg, repo, ticket):
@@ -213,6 +248,10 @@ def advance(cfg, repo, ticket):
             state = serve_guard.read(file) or {"phase": "waiting"}
             # Only controlled hold reasons may enter a release receipt.
             state["waiting"] = str(error) if isinstance(error, proof.Held) else type(error).__name__
+        try:
+            score_approval(cfg, repo, ticket, state)
+        except (OSError, ValueError, sqlite3.Error, gh.GhError, jira.JiraError):
+            logging.getLogger(__name__).exception("Could not reconcile production QA accounting for %s/%s", repo.name, ticket)
         if serve_guard.read(file) != state:
             serve_guard.write(file, state)
         return state
@@ -265,7 +304,8 @@ def _advance(cfg, repo, ticket, file):
     result = observe_staging(repo, ticket, revision, pinned=state["policy"])
     proof.need(result["status"] == "verified", "the staged behavior no longer passes its protected check")
     proof.need(ready(cfg, repo, ticket, policy, state) == approval, "QA authorization changed during verification")
-    state.update(phase="promotion_intent", approval=approval, parent=promotion_base(repo, ticket, revision, branch(repo, policy["production_branch"])),
+    state.update(phase="promotion_intent", approval=approval["id"], approval_comment=approval,
+                 parent=promotion_base(repo, ticket, revision, branch(repo, policy["production_branch"])),
                  production_branch=policy["production_branch"])
     serve_guard.write(file, state)
     # A non-forced update of a direct child cannot land unrelated work if the branch races.
