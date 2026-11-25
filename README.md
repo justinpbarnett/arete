@@ -2812,3 +2812,20 @@ If a classic dashboard sidebar or questions request fails, the view can still re
 - Triage writes to a ticket only to approve it: the labels of an auto approval, or the answers and labels you send from the dashboard. Its board goes only to a private repo.
 - Each verifier server runs on its own port and is stopped with its whole process group after the step.
 - A JEV answer settles a question alone only at or over `confidence`; under it, the model decides. A hold or a guard stop, which a person can undo, takes a lower line.
+
+### Verify the promised behavior on a running release
+
+Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-file FILE`. Arete copies this policy to its private configuration directory outside the worker checkout. A self-deploy policy might read as follows.
+
+```json
+{
+  "destination": "arete-serve",
+  "path": "/api/v1/cohorts/example",
+  "assertions": [{"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending", "/overdue": true}}],
+  "recovery": [{"field": "/report/cohort/name", "equals": "example"}]
+}
+```
+
+The default binding follows the enrolled ticket's single merged factory PR to its configured target. A private policy can instead pin a full `revision` for a known release. When several commits fast-forward together, each matching goal is checked against the running tip. The normal local client exercises the protected read on the revision that answered the request. Each receipt records the goal, policy fingerprint, requested path, verified fields, revision, timestamp and outcome.
+
+Before moving the checkout, the prior release must pass the recovery assertion. A wrong result on the new release keeps the ticket open and invokes the existing code-only rollback guard. A dirty checkout or incompatible database holds the release. After a successful rollback the running previous version rechecks its recovery assertion. The previous version must already contain this feature to perform that confirmation. `arete release status REPO TICKET` reports the receipt. `arete release observe REPO TICKET --revision SHA` reruns the enrolled check for the authorized revision.

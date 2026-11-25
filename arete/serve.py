@@ -41,6 +41,7 @@ from . import (
     pilot,
     principals,
     record,
+    release_proof,
     routing,
     runner,
     serve_guard,
@@ -588,11 +589,23 @@ class Server:
     def acknowledge_deploy(self, completed: bool | None) -> None:
         checkout = paths.PACKAGE_DIR.parent
         receipt = serve_guard.pending(paths.STATE_DIR, checkout)
-        if (receipt is None or not receipt.starts or self.started_head != receipt.tip[:12]
+        if receipt is None:
+            if completed:
+                release_proof.confirm_restore(self.cfg.arete_repo, checkout, self.started_head, completed)
+            return
+        if (not receipt.starts or self.started_head != receipt.tip[:12]
                 or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()
                 or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
+            if receipt.release_checks:
+                verdict = release_proof.assess(self.cfg.arete_repo, receipt)
+                if verdict != "verified":
+                    if verdict == "failed" and not self.busy_with():
+                        release_proof.restore_or_hold(checkout, receipt, self.say)
+                    else:
+                        self.note_once(f"deploy: {receipt.tip} waiting for protected release evidence ({verdict})")
+                    return
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
             self.say(f"deploy: {receipt.tip} is healthy")
         elif receipt.expired():
@@ -606,6 +619,7 @@ class Server:
             self.deploy(cfg)
         finally:
             report_rollbacks(paths.PACKAGE_DIR.parent, self.say)
+            release_proof.advance(cfg)
 
     def deploy(self, cfg: config.Config) -> None:
         if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)) or not repo.allows_unattended_deploy("production"):
@@ -639,9 +653,9 @@ class Server:
                 ):
                     self.deploy_refused(src, tip, reason)
                     return
-                self.deploy_tip(src, base, ref, tip, github)
+                self.deploy_tip(src, base, ref, tip, github, repo)
 
-    def deploy_tip(self, src: Path, base: str, ref: str, tip: str, github: str) -> None:
+    def deploy_tip(self, src: Path, base: str, ref: str, tip: str, github: str, repo: config.Repo) -> None:
         if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
             return
         if not self.deploy_ready(src, base, tip):
@@ -668,7 +682,14 @@ class Server:
                 self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
             prior = serve_guard.pending(paths.STATE_DIR, src)
             previous = prior.previous if prior and prior.branch == base and prior.tip == recovery.head else recovery.head
-            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time())
+            if prior and prior.release_checks:
+                self.deploy_refused(src, tip, "an earlier protected release is still awaiting its decision")
+                return
+            checks = release_proof.on_tip(repo, base, tip, previous)
+            if checks and not release_proof.known_good(repo.name, previous, checks):
+                self.deploy_refused(src, tip, "previous release did not pass its protected recovery check")
+                return
+            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time(), release_checks=checks)
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(receipt))
             try:
                 util.deploy_fast_forward(src, tip)
