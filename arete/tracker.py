@@ -85,6 +85,7 @@ class Ticket:
     spec_identity: str = ""
     owner_comments: str | None = None
     saved_scope_matches: bool = False
+    graph_body: str | None = None
 
     @property
     def is_spec(self) -> bool:
@@ -825,9 +826,25 @@ def spec_observation(body: str) -> tuple[str, str, str] | None:
     return (token[1], how, saw) if how and saw else None
 
 
+def graph_resolution(body: str):
+    lines = body.strip().splitlines()
+    header = re.fullmatch(r"Graph amendment ([0-9a-f]{24})", lines[0]) if lines else None
+    if not header or not 2 <= len(lines) <= 21:
+        return None
+    if lines[1:] == ["No child acceptance changes"]:
+        return header[1], {}
+    mapped = {}
+    for line in lines[1:]:
+        match = re.fullmatch(r"([a-z][a-z0-9-]{0,39}): (\S[^\r\n]{0,999})", line)
+        if not match or match[2] in mapped.setdefault(match[1], []):
+            return None
+        mapped[match[1]].append(match[2])
+    return header[1], mapped
+
+
 def scope_comments(comments: list[tuple[str, str, str]]) -> str:
     return comments_text([c for c in comments if c[0] != "Arete" and c[2].strip() and not from_arete(c[2])
-                          and not gh.has_arete_mark(c[2]) and not spec_observation(c[2])
+                          and not gh.has_arete_mark(c[2]) and not spec_observation(c[2]) and not graph_resolution(c[2])
                           and not re.fullmatch(r"Promote [0-9a-f]{40} to production", c[2].strip())])
 
 

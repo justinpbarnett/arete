@@ -47,7 +47,7 @@ from .store import triage as triage_store
 from .store import workspaces
 from .verify import Verified
 
-TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels", "owner_comments")
+TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels", "owner_comments", "graph_body")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
 CHECK_REPAIR = "check_repair"
@@ -990,7 +990,8 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     cfg, run = job.cfg, job.run
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        from . import spec_amendments
+        t = spec_amendments.child_ticket(tk, intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log))
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     spec_root = spec_store.run_root(run)
@@ -1492,7 +1493,9 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
 
 def publication_outcome(job: Job, staged, summary, committed, draft_why="", report_body="", opened=(), pushed=(),
                         found=(), drafted=(), ci_stopped=()) -> Outcome:
-    data = {"summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
+    from .store.orchestration import digest
+    graph = job.ticket.body[len(job.ticket.graph_body) + 2:] if isinstance(getattr(job.ticket, "graph_body", None), str) else ""
+    data = {**({"graph_contract": digest(graph)} if graph else {}), "summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
             "opened": [c.github for c in opened], "pushed": [c.github for c in pushed], "draft_why": draft_why,
             "changed": [c.github for c in staged.changed], "report_body": report_body,
             "committed_lines": job.b.committed_lines, "heads": {c.github: c.lease for c in staged.changed},
@@ -1585,7 +1588,7 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outco
     job: Job = flow.ctx
     run = job.run
     from . import spec_graph_delivery
-    spec_graph_delivery.require_active_child(run)
+    spec_graph_delivery.require_active_child(run, job.ticket)
     require_environment_owner_clear(job)
     run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     recovery = job.recovery_publication

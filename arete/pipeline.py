@@ -3305,7 +3305,7 @@ def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, re
                   track_moved_base: bool = False, require_pinned_base: bool = False) -> str | None:
     run = b.run
     from . import spec_graph_delivery
-    if reason := spec_graph_delivery.active_child_blocker(run):
+    if reason := spec_graph_delivery.active_child_blocker(run, b.ticket):
         return reason
     try:
         if require_pinned_base:

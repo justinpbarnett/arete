@@ -37,6 +37,11 @@ def usable(repo, node, mapped, graph, *, released=False):
     from . import release_proof
 
     ticket = mapped[node][0]
+    if contract := graph.get("amended_contracts", {}).get(node):
+        from .store.orchestration import digest
+        latest = runs.newest_live_whole_run(repo, ticket) or {}
+        if not latest or flows.publication(latest["id"]).get("graph_contract") != digest(contract):
+            return []
     landed = child_landing(repo, ticket, graph["targets"])
     if released and (not landed or not all(release_proof.evidence(repo, ticket, t["commit"]) for t in landed)):
         return []
@@ -61,31 +66,36 @@ def satisfied_native(source, child, blockers):
             usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []))}
 
 
-def active_child_blocker(run):
+def active_child_blocker(run, ticket=None):
     source = getattr(run, "tracker", None)
-    if not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)) or tracker.is_task_id(run.tid):
+    if (not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)) or tracker.is_task_id(run.tid)
+            or not specgraphs.tracks_ticket(source.repo.name, str(run.tid))):
         return ""
     remote = spec_tracker.adapter(source)
     if not remote or not (key := specgraphs.membership(remote.scope, str(run.tid))):
         return ""
-    return ready(source, remote, key, str(run.tid))
+    from . import spec_amendments
+    return ready(source, remote, key, str(run.tid)) or spec_amendments.before_acceptance(run, ticket)
 
 
-def require_active_child(run):
-    if reason := active_child_blocker(run):
+def require_active_child(run, ticket=None):
+    if reason := active_child_blocker(run, ticket):
         raise factory.Refused(reason)
 
 
-def current_parent(source, remote, key, saved):
-    from . import spec_graph
+def current_parent(source, remote, key, saved, child=""):
+    from . import spec_amendments, spec_graph
 
     data = saved["data"]
     parent = remote.read(key.parent)
     ticket = source.get(key.parent)
     if (not saved["complete"] or remote.scope != data["destination"] or remote.account() != data["account"]
-            or parent.native_id != data["native_id"] or spec_graph.body_identity(parent) != data["parent"]
-            or spec_delivery.source_version(ticket) != data["ticket_version"] or not spec_graph.authorized(ticket, parent)):
+            or parent.native_id != data["native_id"] or not spec_graph.authorized(ticket, parent)):
         raise spec_tracker.Held("the published parent identity, scope or pickup authority changed")
+    if (data.get("pending_amendment") or spec_graph.body_identity(parent) != data["parent"]
+            or spec_delivery.source_version(ticket) != data["ticket_version"]):
+        if not child or not spec_amendments.unaffected(source, remote, key, saved, parent, ticket, child):
+            raise spec_tracker.Held("the published parent requirements changed; waiting for the affected child contract")
     return parent
 
 
@@ -97,7 +107,7 @@ def ready(source, remote, key, ref):
         return "the parent spec graph is still being published"
     data, mapped = saved["data"], specgraphs.children(key)
     try:
-        parent = current_parent(source, remote, key, saved)
+        parent = current_parent(source, remote, key, saved, ref)
         by_ref = {r: name for name, (r, _) in mapped.items()}
         name = by_ref[ref]
         item = remote.read(ref)

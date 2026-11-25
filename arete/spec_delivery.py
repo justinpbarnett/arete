@@ -154,7 +154,10 @@ def save(claim: dict, *, state: str = "") -> None:
 def post_once(claim: dict, tk: tracker.Tracker, kind: str, body: str) -> str:
     data, tid = claim["data"], claim["issue"]
     notes = data.setdefault("notes", {})
-    marker = "Arete spec receipt " + orchestration.digest([claim["root"], claim["run"], kind])[:32]
+    marker_fields = [claim["root"], claim["run"], kind]
+    if data.get("amended"):
+        marker_fields.append(data["amended"])
+    marker = "Arete spec receipt " + orchestration.digest(marker_fields)[:32]
     if notes.get(kind):
         return notes[kind]
     if kind in notes:
@@ -246,6 +249,10 @@ def settle(cfg, repo, claim: dict) -> None:
         saved = state.get("prepared", {}).get("ticket", {})
     legacy = (saved.get("id") == tid and data["source"] == orchestration.digest([saved.get("title"), saved.get("body")]))
     t = tk.get(tid, saved_comments=saved.get("comments", "")) if legacy else tk.get(tid)
+    if data.get("graph"):
+        from . import spec_amendments
+        if not spec_amendments.reconcile(tk, claim, t):
+            return
     if legacy:
         same_source = t.saved_scope_matches and (t.title, t.body) == (saved["title"], saved["body"])
     else:
