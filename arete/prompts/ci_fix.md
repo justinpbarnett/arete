@@ -5,15 +5,14 @@ $failures
 
 Denied paths: $denied.
 
-For each check, first decide whether this PR caused the failure. CI also fails for reasons outside the PR: a shared
-test database or service that drifted, a flaky test, an expired secret, an outage. The base result helps, and its
-date matters: a check that passed on the base weeks ago may fail there now. Compare what failed with what the PR
-changes: $diff. Run each command on its own, with no pipe or `&&`, since Bash allows only the listed commands.
+After investigating each failed check, decide whether this PR caused the failure. CI also fails for reasons outside
+the PR: a shared test database or service that drifted, a flaky test, an expired secret, an outage. The base result
+helps, and its date matters: a check that passed on the base weeks ago may fail there now. Compare what failed with
+what the PR changes: $diff. Run each command on its own, with no pipe or `&&`, since Bash allows only the listed commands.
 
 - Caused by the PR, in a round before round $max_rounds: fix the cause in the code. Do not weaken, skip, or delete
   tests, and do not change the CI setup.
-  Arete runs the full check gate after you finish: $checks.
-  Do not duplicate the full suite here; use a focused reproduction when helpful and report its real result.
+  Arete runs the full check gate after you finish: $checks. Report what you actually ran and its result.
 - Caused by the PR, in round $max_rounds: change nothing. This is the last round, so arete will not push again. It
   fails the run and turns the PRs to drafts for a person to pick up.
 - Not caused by the PR: change nothing for that check.
