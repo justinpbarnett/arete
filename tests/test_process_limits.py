@@ -1576,6 +1576,8 @@ class PolicyRestartLineageTests(Isolated):
             evidence[gate] = {"tree": tree, "policy": policy, "result": {"summary": f"old {gate}"},
                               "acceptance": controller.data["acceptance"], "producer": "d0000-0",
                               "observed": "2026-11-20T00:00:00Z"}
+            if gate == "checks":
+                evidence[gate]["result"]["full"] = True
             details = {"verdict": "pass"} if gate == "verify" else {}
             action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate],
                                  **details)
@@ -1642,6 +1644,71 @@ class PolicyRestartLineageTests(Isolated):
         self.assertEqual(repeated.data["evidence"]["review"]["producer"], fresh["id"])
         self.assertEqual(repeated.job.review.verdict, "pending")
         self.assertTrue(repeated.current("review"))
+
+    def test_batched_review_waits_for_full_checks_on_the_integrated_candidate(self):
+        prior, _ = self.saved()
+        ctl = self.controller(prior.run.id)
+        self.assertIsNone(ctl.prepare())
+        fingerprint = self.enterContext(patch.object(ctl, "fingerprint", return_value="candidate"))
+        self.enterContext(patch.object(orchestration.code_review, "bases", return_value={"": "base"}))
+        pending = {"method": "code-review", "verdict": "pending", "summary": "Missing edge", "problems": [],
+                   "findings": [{"id": "spec-1", "finding": "Missing edge"}], "bases": {"": "base"}}
+        reviewer = Mock(return_value=factory.Outcome("pass", data={"review": pending, "attempt": 1}))
+        check = Mock()
+
+        def step(name, args, kwargs):
+            if name == "review":
+                self.assertTrue(kwargs["code_review"])
+                return reviewer()
+            self.assertEqual(name, "checks")
+            return check()
+
+        self.enterContext(patch.object(ctl.flow, "run", side_effect=step))
+        review = {"op": "review.run", "args": OPERATIONS["review.run"].arguments(
+            {"route_id": "model:review:0", "effort": "low"})}
+
+        def batch(*calls):
+            turn = ledger.begin(ctl.lease, {}, 100)
+            actions = ledger.accept(ctl.lease, turn, ledger.snapshot(ctl.lease)["version"], {"calls": list(calls)}, 100)
+            for action in actions:
+                ctl.dispatch(action)
+            return ledger.actions(ctl.lease)[-1]
+
+        def checks(scope, status):
+            check.return_value = factory.Outcome(status, data={
+                "scope": scope, "full": scope == "full" and status == "pass", "report": "configured check result"})
+            return {"op": "checks.run", "args": OPERATIONS["checks.run"].arguments(
+                {"scope": "quick" if scope == "quick" else "full"})}
+
+        for scope, status in (("full", "fail"), ("quick", "pass"), ("failed", "fail"), ("failed", "pass")):
+            with self.subTest(scope=scope, status=status):
+                deferred = batch(checks(scope, status), review)
+                self.assertEqual(deferred["state"], "failed")
+                self.assertTrue(deferred["result"]["review_deferred"])
+                reviewer.assert_not_called()
+        batch(checks("full", "pass"))
+        fingerprint.return_value = "later integration"
+        self.assertTrue(batch(review)["result"]["review_deferred"])
+        reviewer.assert_not_called()
+
+        first = batch(checks("full", "pass"), review)
+        self.assertEqual(first["state"], "succeeded")
+        reviewer.assert_called_once()
+        fingerprint.return_value = "repair"
+        self.assertEqual(batch(review)["result"]["reused_review"], first["id"])
+        fingerprint.return_value = "later integration"
+        ctl.data["acceptance"] = "new owner requirements"
+        self.assertTrue(batch(review)["result"]["review_deferred"])
+        ctl.recover()
+        self.assertEqual(ctl.data["evidence"]["review"]["producer"], first["id"])
+        ctl.executing = ""
+        self.assertEqual(ctl.latest_code_review()["id"], first["id"])
+        self.assertFalse(ctl.current("review"))
+        reviewer.assert_called_once()
+        with (patch.object(ctl.run, "environment_release", "live"),
+              patch.object(ctl.flow, "run", return_value=reviewer.return_value) as legacy):
+            self.assertEqual(batch(review)["state"], "succeeded")
+            self.assertNotIn("code_review", legacy.call_args.args[2])
 
     def test_changed_policy_at_a_decision_boundary_reruns_every_gate_before_the_merge_gate(self):
         prior, produced = self.saved()

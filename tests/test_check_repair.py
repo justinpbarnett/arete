@@ -21,6 +21,42 @@ class FailedCheckDiagnosticsTests(unittest.TestCase):
                                   "capability": check_repair.MACOS_PROFILE})
         self.assertNotIn("capability", self.failure("AssertionError: incorrect value"))
 
+    def test_split_sandbox_stderr_in_the_child_traceback(self):
+        assertion = "AssertionError: sandbox subprocess exited with return code 71; stderr:"
+        stderr = "sandbox-exec: sandbox_apply: Operation not permitted"
+        child = ("Traceback (most recent call last):\n  File \"child.py\", line 9, in <module>\n"
+                 "    case.fail(message)\n")
+        nested = "AssertionError: 1 != 0 : child output\n" + child + assertion + "\n" + stderr
+        self.assertEqual(self.failure(nested)["capability"], check_repair.MACOS_PROFILE)
+        for diagnostic in (assertion, assertion + "\nother failure\n" + stderr,
+                           assertion.replace("71", "1") + "\n" + stderr,
+                           assertion + "\n" + stderr + "\nadditional stderr",
+                           nested + "\n\n" + child + "ValueError: application failed",
+                           child + "    " + assertion + "\n    " + stderr + "\nAssertionError: wrong output"):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertNotIn("capability", self.failure(diagnostic))
+
+    def test_truncated_check_report_cannot_confirm_the_runner_was_the_only_failure(self):
+        output = (f"...\ntest_launch ({self.first})\n{self.denied}\n"
+                  "Failed classes: test_profile.ProfileTests\nRan 2 tests in 0.20s: FAILED")
+        failure = check_repair.failed_check(self.layer, "behavior", output, 1)
+        self.assertEqual(failure, {"name": "behavior", "selectors": [self.first]})
+
+    def test_sandbox_stderr_immediately_precedes_the_failing_subprocess_traceback(self):
+        stderr = "sandbox-exec: sandbox_apply: Operation not permitted"
+        traceback = "Traceback (most recent call last):\n    subprocess.run(command, check=True)\n"
+        error = ("subprocess.CalledProcessError: Command '['/usr/bin/sandbox-exec', '-p', 'profile', 'node']' "
+                 "returned non-zero exit status 71.")
+        result = self.failure(stderr + "\n" + traceback + error)
+        self.assertEqual(result["capability"], check_repair.MACOS_PROFILE)
+        for diagnostic in (stderr + "\n" + traceback + error.replace("/usr/bin/sandbox-exec", "/usr/bin/node"),
+                           stderr + "\n" + traceback + error.replace("status 71", "status 1"),
+                           "    " + stderr + "\n" + traceback + error,
+                           stderr + "\nunrelated stderr\n" + traceback + error,
+                           stderr + "\n" + traceback + error + "\n" + traceback + "AssertionError: wrong value"):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertNotIn("capability", self.failure(diagnostic))
+
     def test_reuse_the_configured_runner_flags_without_deriving_a_command_from_shell_syntax(self):
         layer = config.RepoLayer(Path("."), checks={"tests": "uv run --locked python -m tests.parallel --timeout 30"})
         self.assertEqual(check_repair.classes_command(layer, "tests"),

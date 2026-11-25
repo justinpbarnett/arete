@@ -83,7 +83,8 @@ OPERATIONS = {
                                     "requirements": (list, [])}),
     "verification.decide": Operation("Record why an independently identified advisory verification gap can ship.",
                                       {"verification_id": required(str), "reason": required(str)}),
-    "review.run": Operation("One independent review of the current tree.",
+    "review.run": Operation("Review the current tree. Starting a Standards and Spec review requires passing full checks "
+                            "on that tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "review.decide": Operation("Settle the latest code review after full checks. Give each finding ID a decision "
                                "with status fixed or nonblocking and a reason. Delegate fixes before settling.",

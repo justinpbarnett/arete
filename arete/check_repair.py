@@ -14,6 +14,7 @@ FAILED = re.compile(r"^Failed classes: ([^\n]+)\nRan \d+ tests in [\d.]+s: FAILE
 PARALLEL = "uv run python -m tests.parallel"
 ARETE_SUITE = f"if [ -f tests/parallel.py ]; then {PARALLEL}; else uv run python -m unittest discover -s tests -v; fi"
 MACOS_PROFILE = "macos-sandbox-profile"
+SANDBOX_DENIAL = "sandbox-exec: sandbox_apply: Operation not permitted"
 
 
 def classes_command(layer, name):
@@ -34,8 +35,20 @@ def classes_command(layer, name):
     return []
 
 
-def profile_denied(exception):
-    if exception == "AssertionError: 71 != 0 : sandbox-exec: sandbox_apply: Operation not permitted":
+def profile_denied(detail):
+    # A parent assertion can include its child's traceback. Read the exception
+    # from the innermost traceback, skipping indented source that quotes it.
+    context, _, trace = detail.rpartition("\nTraceback (most recent call last):\n")
+    match = re.search(r"^[\w.]+:.*$", trace, re.MULTILINE)
+    if not match:
+        return False
+    exception = match[0]
+    if exception.startswith("subprocess.CalledProcessError: Command '['/usr/bin/sandbox-exec', "):
+        return context.endswith("\n" + SANDBOX_DENIAL) and exception.endswith("]' returned non-zero exit status 71.")
+    if exception == "AssertionError: sandbox subprocess exited with return code 71; stderr:":
+        stderr = trace[match.end():].partition("\n\n")[0].strip("\n")
+        return stderr == SANDBOX_DENIAL
+    if exception == f"AssertionError: 71 != 0 : {SANDBOX_DENIAL}":
         return True
     return (exception.startswith("AssertionError: The test runner is already sandboxed and sandbox-exec "
                                  "could not install the Pi worker profile.")
@@ -46,7 +59,7 @@ def failed_check(layer, name, output, exit_code):
     failure = {"name": name, "selectors": []}
     summaries = list(FAILED.finditer(output))
     if not summaries:
-        if exit_code == 71 and output.strip() == "sandbox-exec: sandbox_apply: Operation not permitted":
+        if exit_code == 71 and output.strip() == SANDBOX_DENIAL:
             failure["capability"] = MACOS_PROFILE
         return failure
     summary = summaries[-1]
@@ -62,16 +75,13 @@ def failed_check(layer, name, output, exit_code):
         targets.extend(dict.fromkeys(case[1] for case in matches) if matches else [key])
     for index, case in enumerate(cases):
         end = cases[index + 1].start() if index + 1 < len(cases) else len(diagnostics)
-        # Traceback source may quote the same message even when the test failed for another reason.
-        detail = diagnostics[case.end():end]
-        exceptions = [line for line in detail.splitlines() if line.startswith("AssertionError:")]
-        if exceptions and profile_denied(exceptions[-1]):
+        if profile_denied(diagnostics[case.end():end]):
             blocked.add(case.start())
     if classes_command(layer, name):
         failure["selectors"] = targets
     if (cases and all(case.start() in blocked for case in cases)
             and all(any(key in case.groups() for case in cases) for key in identifiers)
-            and not re.search(r"^.*(?:timed out|TIMEOUT|: unexpected)\b", diagnostics, re.MULTILINE)):
+            and not re.search(r"^\.\.\.$|^.*(?:timed out|TIMEOUT|: unexpected)\b", diagnostics, re.MULTILINE)):
         failure["capability"] = MACOS_PROFILE
     return failure
 

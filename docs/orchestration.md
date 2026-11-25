@@ -8,7 +8,8 @@ An explicitly invoked fixed or custom script keeps its strategy.
 ## Code review
 
 New and resumed orchestrated tickets finish with the repository’s full checks and a two-part code review.
-Two fresh read-only reviewers inspect the same staged candidate against its pinned base.
+After the full configured checks pass on the current candidate, two fresh read-only reviewers inspect it against its pinned base.
+The controller can request checks and review in one decision. After a failed or partial check, it requests review again once the full suite passes.
 Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
 This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
 
@@ -249,6 +250,7 @@ A dry run retains its local diff/report/workspace and performs no publication or
 SQLite orchestration tables are authoritative; run lines and viewer state are projections.
 A successor fences the old generation, checks producer identities and restores durable workspace authority and matching results.
 Completed evidence remains usable only for its matching tree, policy and owner acceptance inputs.
+When automatic PR recovery resolves a conflict locally, the orchestrator can see the PR head, target revision and resolved tree. Once the workspace is settled, Arete sends that candidate through full checks. A failed check returns to the usual repair process.
 Interrupted inference may have unknown usage, which is not an unlaunched free call.
 
 A changed admitted controller/catalog/policy, missing durable preparation, live prior producer or uncertain publication effect refuses automatic continuation.
