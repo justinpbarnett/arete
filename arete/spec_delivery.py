@@ -25,6 +25,23 @@ def definition(values: dict) -> dict:
     return found
 
 
+def protected_environment(repo, ticket, requested):
+    policy = release_proof.goal(repo, ticket)
+    if not policy:
+        return requested
+    default = policy["destination"]
+    options = {default: default}
+    if default == "staging":
+        options["production"] = "production"
+    aliases = {str(policy[point]).rstrip("/").casefold(): point for point in options if point in policy}
+    value = requested.strip().rstrip("/").casefold()
+    if not value:
+        return default
+    if (target := (options | aliases).get(value)):
+        return target
+    raise ValueError("Use the enrolled final delivery point: " + " or ".join(options))
+
+
 def describe(done: dict) -> str:
     return (f"## Definition of done\n\n{done['criterion']}\n\nObserve it by: {done['procedure']}"
             + (f"\n\nRequired runtime: {done['environment']}" if done.get("environment") else ""))

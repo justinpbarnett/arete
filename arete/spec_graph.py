@@ -274,6 +274,8 @@ def capture(job, remote, parent, accepted_direct):
     if accepted_direct == input_sha and not candidates:
         return {"mode": "direct", "input": input_sha}
     plan = proposal(infer(run, job.ws, "to-tickets", "plan", TO_TICKETS, inputs, PROPOSAL), candidates)
+    if plan["mode"] == "split":
+        plan["environment"] = spec_delivery.protected_environment(run.repo.name, parent.ref, plan["environment"])
     review = reviewed(infer(run, job.ws, "review-to-tickets", "review", REVIEW_BREAKDOWN,
                             {**inputs, "proposal": plan}, REVIEW), plan, candidates)
     latest = run.tracker.get(parent.ref)

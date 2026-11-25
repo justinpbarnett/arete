@@ -584,6 +584,7 @@ class Controller(worker_turns.WorkerTurns):
 
     def define_spec(self, args):
         found = spec_delivery.definition(args)
+        found["environment"] = spec_delivery.protected_environment(self.run.repo.name, str(self.run.tid), found["environment"])
         if prior := self.data.get("definition"):
             if found != prior:
                 raise ValueError("the spec already has a durable definition of done; do not silently replace it")
