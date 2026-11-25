@@ -760,8 +760,10 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
                    copies: list[str], *, preview_of: str = "",
                    excluded: Collection[Path] = ()) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
-    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
+    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
+                          repo.target_branch or base or gh.default_branch(p.github))
                  for p in repo.parts if ws / p.dir not in excluded]
+    require_target_branch(repo, checkouts, work_branch=branch)
     if any(wt.resolve().is_relative_to(c.wt.resolve()) or c.wt.resolve().is_relative_to(wt.resolve())
            for c in checkouts for wt in excluded):
         raise worktree_failure("an active worktree overlaps a closed PR worktree", ws, branch)
@@ -771,11 +773,22 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
         if preview_of:
             return bool(remote_head(c.src, preview_of))
         c.pr = gh.open_pr_url(c.github, branch)
+        require_target_branch(repo, [c])
         c.lease = remote_head(c.src, branch)
         return bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
 
     place_checkouts(run_id, checkouts, kept, branch, resumes_for, starting_branch=preview_of or branch)
     return ws, checkouts
+
+
+def require_target_branch(repo: config.Repo, checkouts: list[Checkout], *, work_branch: str = "") -> None:
+    target = repo.target_branch
+    if not target:
+        return
+    if work_branch == target:
+        raise RunFailed(f"the work branch is the saved target {target}; choose a separate work branch")
+    if any(c.base != target or c.pr and gh.pr_view(c.pr).get("baseRefName") != target for c in checkouts):
+        raise RunFailed(f"the existing checkout or PR does not target {target}; publication refused")
 
 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False, owner: str = "") -> Path:

@@ -194,7 +194,7 @@ def release_repo(cfg: config.Config) -> config.Repo | None:
 
 
 def release_base(repo: config.Repo) -> str:
-    return config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
+    return repo.target_branch or config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
 
 
 def release_contains_fixes(repo: config.Repo, numbers: list[int], sha: str) -> bool:

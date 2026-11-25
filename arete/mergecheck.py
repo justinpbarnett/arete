@@ -241,7 +241,7 @@ def plan(cfg: config.Config, repo: config.Repo, rows: list[dict], batch: list[di
     layer = config.load_layer(repo.layer_dir)
     if not layer.verify:
         raise Blocked(f"{repo.name}: no [verify] configuration")
-    base = layer.base_branch
+    base = repo.target_branch or layer.base_branch
     if not base:
         ref = util.git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], repo.path, check=False).strip()
         base = ref.removeprefix("refs/remotes/origin/") if ref else ""
