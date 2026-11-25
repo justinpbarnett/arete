@@ -689,7 +689,7 @@ class Server:
             if checks and not release_proof.known_good(repo.name, previous, checks):
                 self.deploy_refused(src, tip, "previous release did not pass its protected recovery check")
                 return
-            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time(), release_checks=tuple(checks))
+            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time(), release_checks=checks)
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(receipt))
             try:
                 util.deploy_fast_forward(src, tip)

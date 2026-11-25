@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from support import isolate_live_state
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 from arete import cli, codebase, config, paths, release_proof as proof, serve, serve_guard
 
@@ -21,7 +22,7 @@ class RunningRelease(unittest.TestCase):
         self.state = self.root / "state"
         self.checkout = self.root / "repo"
         self.checkout.mkdir()
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.checkout)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.checkout)], check=True, timeout=CHILD_HANG_TIMEOUT)
         self.git("config", "user.name", "Release Test")
         self.git("config", "user.email", "test@example.test")
         self.previous = self.commit("good")
@@ -75,7 +76,7 @@ class RunningRelease(unittest.TestCase):
         self.engine.say = self.engine.note_once = lambda text: None
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.checkout), *args], text=True).strip()
+        return subprocess.check_output(["git", "-C", str(self.checkout), *args], text=True, timeout=CHILD_HANG_TIMEOUT).strip()
 
     def commit(self, value):
         (self.checkout / "feature").write_text(value)

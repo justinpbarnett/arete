@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from contextlib import closing
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -40,7 +40,7 @@ class Receipt:
     settled: str = ""
     rollback: str = ""
     started_at: float | None = None
-    release_checks: tuple = ()
+    release_checks: list = field(default_factory=list)
     restore_status: str = ""
 
     def expired(self) -> bool:
