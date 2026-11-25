@@ -5126,7 +5126,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
             if enrollment and (not probes or probes.verdict == "pass"):
-                candidate = candidate_observer.observe(b, step, enrollment, url, v.url, lifetime.get("process"))
+                candidate = candidate_observer.observe(b, step, enrollment, url, v.url, lifetime.get("process"), attempt)
                 if candidate.verdict == "pass":
                     v = replace(v, notes=v.notes + "\n\nArete ran the enrolled browser observer on this candidate. "
                                 "Its checks below cover only the listed assertions. Verify all remaining requirements, "
