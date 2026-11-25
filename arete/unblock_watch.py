@@ -195,6 +195,11 @@ def land(repo, tid, case, attempt, candidate):
         if hold:
             ledger.mark(case, "waiting", unblock.safe(hold), unblock.RECHECK)
         else:
+            from . import release_proof
+
+            if release_proof.required(repo.name, tid):
+                ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
+                return
             issue_goal.lifecycle(repo.name, tid, "finish")
             ledger.mark(case, "resolved", "The issue orchestrator merged the verified PR")
 
@@ -212,6 +217,14 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "Run stopped by request")
         return
+    from . import release_proof
+
+    if not t.open and release_proof.required(repo.name, tid):
+        release = release_proof.progress(repo, str(tid))
+        if not release or not release["evidence"]:
+            if existing:
+                ledger.mark(existing, "waiting", "Tracker closed while protected delivery evidence is pending", unblock.RECHECK)
+            return
     if not t.open:
         if existing:
             issue_goal.lifecycle(repo.name, tid, "finish")
@@ -225,6 +238,12 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
     prior = existing or ledger.get(repo.name, tid)
     prs = unblock.prs_of(row)
     if all_merged(prs):
+        if release_proof.required(repo.name, tid):
+            release = release_proof.progress(repo, str(tid))
+            if not release or not release["evidence"]:
+                case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
+                ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
+                return
         if prior.get("phase") != "resolved":
             case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
             issue_goal.lifecycle(repo.name, tid, "finish")

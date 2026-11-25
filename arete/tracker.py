@@ -345,7 +345,10 @@ class GitHubTracker:
             return f"Part of #{t.id}"
         for tid in ids[1:]:
             self.require_ordinary(tid)
-        return "\n".join(f"Closes #{tid}" for tid in ids)
+        from . import release_proof
+
+        return "\n".join(f"Refs #{tid}" if release_proof.required(self.repo.name, tid) else f"Closes #{tid}"
+                         for tid in ids)
 
 
 class JiraTracker:

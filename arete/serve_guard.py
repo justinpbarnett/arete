@@ -40,6 +40,8 @@ class Receipt:
     settled: str = ""
     rollback: str = ""
     started_at: float | None = None
+    release_checks: tuple = ()
+    restore_status: str = ""
 
     def expired(self) -> bool:
         return bool(self.starts and time.time() - (
@@ -120,7 +122,8 @@ def log_tail(logs: Path) -> str:
 def report_reason(held: dict) -> str:
     reason = held.get("reason", "")
     if isinstance(reason, str) and (
-            reason in ("the candidate failed the import check", "the candidate failed the migration check", AGE_FAILURE)
+            reason in ("the candidate failed the import check", "the candidate failed the migration check", AGE_FAILURE,
+                        "the protected release check failed")
             or re.fullmatch(r"[0-9]{1,6} unhealthy starts", reason)):
         return reason
     return "startup health was not confirmed"

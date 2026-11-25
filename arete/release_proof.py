@@ -1,0 +1,382 @@
+"""Owner-controlled, read-only acceptance checks against an identified running release."""
+from __future__ import annotations
+
+import hashlib
+import http.client
+import json
+import re
+import time
+from dataclasses import asdict, replace
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from . import client, codebase, config, gh, paths, serve_guard, util, zte
+from .store import runs as run_store
+
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
+LIMIT = 1024 * 1024
+
+
+class Held(ValueError):
+    pass
+
+
+def need(ok, why):
+    if not ok:
+        raise Held(why)
+
+
+def digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def key(repo, ticket):
+    need(all(isinstance(i, str) and NAME.fullmatch(i) for i in (repo, ticket)), "invalid release goal identity")
+    return digest([repo, ticket])
+
+
+def policy_file(repo, ticket):
+    key(repo, ticket)
+    return paths.CONFIG_DIR / "release-checks" / repo / (ticket + ".json")
+
+
+def state_dir(repo, ticket):
+    return paths.STATE_DIR / "release-checks" / key(repo, ticket)
+
+
+def goal(repo, ticket):
+    file = policy_file(repo, ticket)
+    try:
+        data = json.loads(zte.private_bytes(file, 32768))
+    except FileNotFoundError:
+        return None
+    validate(data)
+    return data
+
+
+def server_url(value):
+    need(isinstance(value, str), "a destination URL is required")
+    url = urlsplit(value)
+    need(bool(url.hostname) and url.path in ("", "/") and not (url.query or url.fragment or url.username or url.password)
+         and (url.scheme == "https" or url.scheme == "http" and url.hostname in ("127.0.0.1", "::1")),
+         "use an HTTPS origin, or HTTP on numeric loopback for a disposable service")
+    return url
+
+
+def steps(rows):
+    need(isinstance(rows, list) and 1 <= len(rows) <= 16, "each scenario needs 1 to 16 assertions")
+    for row in rows:
+        need(isinstance(row, dict) and set(row) in ({"field", "equals"}, {"field", "count", "where"}),
+             "an assertion needs a field and expected value or a filtered count")
+        pointer(row["field"])
+        if "count" in row:
+            pointer(row["count"])
+            need(isinstance(row["where"], dict) and 1 <= len(row["where"]) <= 8, "count needs criteria")
+            for field in row["where"]:
+                pointer(field)
+
+
+def pointer(value):
+    need(isinstance(value, str) and re.fullmatch(r"(?:/[A-Za-z0-9_.-]+){1,8}", value), "invalid field path")
+    return value[1:].split("/")
+
+
+def validate(data):
+    need(isinstance(data, dict) and set(data) <= {"destination", "path", "assertions", "recovery", "revision",
+         "staging", "production", "qa", "instructions"} and data.get("destination") in ("arete-serve", "staging", "production"),
+         "invalid release policy or unattended destination")
+    path = data.get("path")
+    need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]+", path) and "//" not in path
+         and "%" not in path and not any(part in (".", "..") for part in path.split("/")), "invalid read-only path")
+    steps(data.get("assertions"))
+    steps(data.get("recovery"))
+    if "revision" in data:
+        need(isinstance(data["revision"], str) and serve_guard.SHA.fullmatch(data["revision"]), "invalid exact revision")
+    if data["destination"] == "arete-serve":
+        need(path.startswith("/api/") and not ({"staging", "production", "qa"} & set(data)), "invalid Arete client route")
+    else:
+        for env in {data["destination"], "production"}:
+            server_url(data.get(env))
+        need(isinstance(data.get("instructions"), str) and 0 < len(data["instructions"]) <= 500,
+             "record the user action QA should perform")
+        if data["destination"] == "staging":
+            need(isinstance(data.get("qa"), list) and bool(data["qa"])
+                 and all(isinstance(s, str) and NAME.fullmatch(s) for s in data["qa"]),
+                 "configure the authorized QA tracker accounts")
+            need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
+
+
+def install(repo, ticket, source):
+    value = json.loads(Path(source).read_bytes())
+    validate(value)
+    file = policy_file(repo.name, ticket)
+    if value["destination"] == "arete-serve":
+        need(config.load_required().arete_repo == repo.name, "use arete-serve only on the Arete repository")
+    else:
+        need(repo.target_branch and repo.landing and repo.unattended_environment == value["destination"],
+             "goal destination must match the repository's saved unattended environment")
+    with util.lock("release-" + key(repo.name, ticket), wait=True):
+        serve_guard.write(file, value)
+    return {"repo": repo.name, "ticket": ticket, "policy": digest(value), "destination": value["destination"]}
+
+
+def lookup(document, field):
+    value = document
+    for part in pointer(field):
+        if isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        elif isinstance(value, dict) and part in value:
+            value = value[part]
+        else:
+            raise AssertionError(f"field {field} is absent")
+    return value
+
+
+def compare(document, rows):
+    observed = []
+    for row in rows:
+        field = row["field"]
+        actual = lookup(document, field)
+        if "count" in row:
+            members = lookup(document, row["count"])
+            if not isinstance(members, list):
+                raise AssertionError(f"{row['count']} is not an array")
+            expected = sum(all(type(v := lookup(item, f)) is type(w) and v == w for f, w in row["where"].items())
+                           for item in members)
+        else:
+            expected = row["equals"]
+        if type(actual) is not type(expected) or actual != expected:
+            raise AssertionError(f"wrong value at {field}")
+        # Persist only expected-value fingerprints, never arbitrary response contents.
+        observed.append({"field": field, "value_sha256": digest(expected)})
+    return observed
+
+
+def fetch(data, revision, destination):
+    path = data["path"]
+    if destination == "arete-serve":
+        deadline = time.monotonic() + 8
+        # The local installation must agree with the engine stamp on this response.
+        need(codebase.RELEASE == revision, "the running Arete engine has a different release")
+        where = client.server(deadline, where=client.local_server()[0])
+        response = client.request("GET", path, where=where, deadline=deadline)
+        try:
+            need(response.status == 200 and response.getheader("X-Arete-Engine") == revision[:12],
+                 "the normal client did not observe the selected running engine")
+            raw = response.read(LIMIT + 1)
+        finally:
+            client.close_response(response)
+    else:
+        origin = server_url(data[destination])
+        transport = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
+        conn = transport(origin.hostname, origin.port, timeout=6)
+        try:
+            conn.request("GET", path, headers={"Accept": "application/json"})
+            response = conn.getresponse()
+            need(response.status == 200 and response.getheader("X-Release-Revision") == revision,
+                 "the deployed endpoint did not answer with the exact release revision")
+            raw = response.read(LIMIT + 1)
+        finally:
+            conn.close()
+    need(len(raw) <= LIMIT, "release response exceeded the size limit")
+    return json.loads(raw)
+
+
+def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=""):
+    need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision), "a full release revision is required")
+    data = goal(repo, ticket)
+    need(data, "no protected release check is enrolled for this goal")
+    policy = digest(data)
+    need(not pinned or pinned == policy, "the protected release policy changed")
+    destination = destination or data["destination"]
+    need(destination == data["destination"] or data["destination"] == "staging" and destination == "production",
+         "destination is outside this policy")
+    proof = {"repo": repo, "ticket": ticket, "revision": revision, "destination": destination,
+             "policy": policy, "path": data["path"], "recovery": recovery}
+    try:
+        body = fetch(data, revision, destination)
+        proof["observed"] = compare(body, data["recovery" if recovery else "assertions"])
+        proof["status"] = "verified"
+    except AssertionError as error:
+        proof.update(status="failed", reason=str(error))
+    except (OSError, ValueError, TypeError, http.client.HTTPException, client.Broken, client.Down, client.Failed):
+        proof.update(status="blocked", reason="could not identify or observe the requested release")
+    rid = digest(proof)
+    proof["receipt_id"], proof["at"] = rid, util.iso()
+    label = "recovery" if recovery else "behavior"
+    location = state_dir(repo, ticket) / revision / destination / label
+    with util.lock("release-" + key(repo, ticket), wait=True):
+        need(digest(goal(repo, ticket)) == policy, "policy changed during observation")
+        if not (record := serve_guard.read(location / (rid + ".json"))):
+            serve_guard.write(location / (rid + ".json"), proof)
+            record = proof
+        previous = serve_guard.read(location / "latest.json")
+        serve_guard.write(location / "latest.json", record)
+    if not recovery and destination == data["destination"]:
+        try:
+            from . import cohorts
+        except ImportError:
+            pass
+        else:
+            if proof["status"] == "verified" or (proof["status"] == "failed" and previous and previous["status"] == "verified"):
+                cohorts.record_release(repo, ticket, revision, rid, destination, regression=proof["status"] == "failed")
+    return record
+
+
+def evidence(repo: str, ticket: str, revision: str) -> dict | None:
+    data = goal(repo, ticket)
+    if not data or not serve_guard.SHA.fullmatch(revision or ""):
+        return None
+    location = state_dir(repo, ticket) / revision
+    landed = serve_guard.read(location / "landed.json")
+    if landed and landed["policy"] == digest(data):
+        revision = landed["revision"]
+        location = state_dir(repo, ticket) / revision
+    proof = serve_guard.read(location / data["destination"] / "behavior" / "latest.json")
+    if proof and (proof.get("status"), proof.get("policy"), proof.get("revision")) == ("verified", digest(data), revision):
+        return proof
+    return None
+
+
+def enrolled(repo):
+    folder = paths.CONFIG_DIR / "release-checks" / repo
+    return sorted(file.stem for file in folder.glob("*.json"))
+
+
+def merge_revision(repo, ticket, base):
+    row = run_store.newest_live_whole_run(repo.name, ticket) or {}
+    links = (row.get("pr_url") or "").split()
+    if len(links) == 1 and gh.pr_repo(links[0]).lower() == repo.github.lower():
+        pr = gh.pr_view(links[0])
+        if pr.get("state") == "MERGED" and pr.get("baseRefName") == base:
+            return (pr.get("mergeCommit") or {}).get("oid", "")
+    return ""
+
+
+def on_tip(repo, base, tip, previous=None):
+    selected = []
+    for ticket in enrolled(repo.name):
+        data = goal(repo.name, ticket)
+        if data["destination"] != "arete-serve":
+            continue
+        revision = data.get("revision") or merge_revision(repo, ticket, base)
+        interval = False
+        if previous and revision and revision != tip and serve_guard.SHA.fullmatch(revision):
+            def contains(ref):
+                return util.sh(["git", "--no-replace-objects", "merge-base", "--is-ancestor", revision, ref],
+                               cwd=repo.path, timeout=10).returncode == 0
+            interval = contains(tip) and not contains(previous)
+        if revision == tip or interval:
+            selected.append({"ticket": ticket, "policy": digest(data), "change": revision})
+    return selected
+
+
+def known_good(repo, previous, checks):
+    return all(observe(repo, row["ticket"], previous, recovery=True, pinned=row["policy"])["status"] == "verified"
+               for row in checks)
+
+
+def assess(repo, receipt):
+    statuses = []
+    for check in receipt.release_checks:
+        try:
+            result = observe(repo, check["ticket"], receipt.tip, pinned=check["policy"])
+        except (Held, PermissionError):
+            return "blocked"
+        if result["status"] == "verified" and check.get("change") != receipt.tip:
+            serve_guard.write(state_dir(repo, check["ticket"]) / check["change"] / "landed.json",
+                              {"revision": receipt.tip, "policy": check["policy"]})
+        statuses.append(result["status"])
+    return "failed" if "failed" in statuses else "blocked" if "blocked" in statuses else "verified"
+
+
+def restore_or_hold(checkout, receipt, say):
+    reason = "the protected release check failed"
+    try:
+        if serve_guard.rollback(paths.STATE_DIR, checkout, paths.LOG_DIR, receipt, reason):
+            return
+        why = serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous)
+    except (OSError, RuntimeError) as error:
+        why = str(error)
+    held = replace(receipt, settled="release_held", restore_status=why or "checkout identity changed")
+    serve_guard.write(serve_guard.hold_path(paths.STATE_DIR, receipt.tip), {**asdict(held), "reason": reason})
+    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(held))
+    say(f"deploy: held {receipt.tip}: {held.restore_status}")
+
+
+def confirm_restore(repo, checkout, started_head, completed):
+    if not completed:
+        return
+    raw = serve_guard.read(paths.STATE_DIR / serve_guard.RECEIPT) or {}
+    if (raw.get("settled") != "rolled_back" or raw.get("checkout") != str(checkout) or not raw.get("release_checks")
+            or raw.get("restore_status") == "verified" or raw["previous"][:12] != started_head):
+        return
+    outcome = "verified" if known_good(repo, raw["previous"], raw["release_checks"]) else "unverified"
+    if raw.get("restore_status") != outcome:
+        serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, {**raw, "restore_status": outcome})
+
+
+def required(repo, ticket):
+    # A malformed enrolled file still withholds automatic tracker closure.
+    try:
+        return policy_file(repo, str(ticket)).lstat() is not None
+    except FileNotFoundError:
+        return False
+
+
+def progress(repo, ticket):
+    data = goal(repo.name, ticket)
+    if not data:
+        return None
+    revision = data.get("revision") or merge_revision(repo, ticket, repo.target_branch or gh.default_branch(repo.github))
+    proof = evidence(repo.name, ticket, revision) if revision else None
+    last = (serve_guard.read(state_dir(repo.name, ticket) / revision / data["destination"] / "behavior" / "latest.json")
+            if revision else None)
+    return {"repo": repo.name, "ticket": ticket, "destination": data["destination"], "revision": revision,
+            "policy": digest(data), "evidence": proof, "last_observation": last}
+
+
+def finish_verified(cfg, repo, ticket, revision):
+    from . import tracker
+
+    proof = evidence(repo.name, ticket, revision)
+    if not proof:
+        return
+    tk = tracker.for_ticket(cfg, repo, ticket)
+    item = tk.get(ticket)
+    if not item.open or "spec" in item.labels:
+        return
+    reason = f"Verified {proof['path']} on {proof['destination']} at {revision}. Receipt {proof['receipt_id']}."
+    if isinstance(tk, tracker.GitHubTracker):
+        tk.require_ordinary(ticket)
+        gh.issue_close(repo.github, int(ticket), gh.marked(reason))
+    elif isinstance(tk, tracker.JiraTracker):
+        tk.move_to(ticket, cfg.jira.landed.get(repo.target_branch, ""))
+
+
+def advance(cfg):
+    for repo in cfg.repos:
+        for ticket in enrolled(repo.name):
+            try:
+                row = progress(repo, ticket)
+                if row and row["evidence"] and row["destination"] == "arete-serve":
+                    finish_verified(cfg, repo, ticket, row["revision"])
+            except (ValueError, OSError, RuntimeError) as error:
+                print(f"release {repo.name}/{ticket}: {type(error).__name__}", flush=True)
+
+
+def command(args):
+    cfg = config.load_required()
+    repo = cfg.repo(args.repo)
+    if args.action == "enroll":
+        answer = install(repo, args.ticket, args.policy_file)
+    elif args.action == "observe":
+        data = goal(repo.name, args.ticket)
+        need(data is not None, "release goal not enrolled")
+        current = data.get("revision") or merge_revision(repo, args.ticket, repo.target_branch or gh.default_branch(repo.github))
+        need(current == args.revision, "proposed release differs from the goal's revision")
+        answer = observe(repo.name, args.ticket, current)
+    else:
+        answer = progress(repo, args.ticket)
+    print(json.dumps(answer, sort_keys=True))
+    return 0 if answer is not None and answer.get("status", "verified") == "verified" else 1
