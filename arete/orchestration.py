@@ -530,7 +530,7 @@ class Controller(worker_turns.WorkerTurns):
         return False
 
     def publication_scope(self):
-        if not self.default_code_review or not self.data.get("prepared"):
+        if not self.data.get("prepared") or not self.default_code_review:
             return
         current, why = self.current_ticket()
         if why:

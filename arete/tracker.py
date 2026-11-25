@@ -84,6 +84,7 @@ class Ticket:
     github_blockers: list[int | str] = field(default_factory=list)
     spec_identity: str = ""
     owner_comments: str | None = None
+    saved_scope_matches: bool = False
 
     @property
     def is_spec(self) -> bool:
@@ -320,7 +321,7 @@ class GitHubTracker:
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
-    def get(self, tid: str, *, issue: dict | None = None) -> Ticket:
+    def get(self, tid: str, *, issue: dict | None = None, saved_comments: str | None = None) -> Ticket:
         i = gh.issue(self.repo.github, int(tid)) if issue is None else issue
         ticket = self.remember(tid, i)
         labels = ticket.labels
@@ -333,7 +334,8 @@ class GitHubTracker:
             "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
         ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
-                         owner_comments=scope_comments(comments), open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
+                         owner_comments=scope_comments(comments), saved_scope_matches=same_comment_scope(comments, comments, saved_comments),
+                         open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
                          updated=i.get("updatedAt") or "", blocker=blocker,
                          spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
@@ -472,7 +474,7 @@ class JiraTracker:
         return reply_text([(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(tid)
                            if _authored_by(c, me) and c.get("created")], since, strict=strict)
 
-    def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
+    def get(self, tid: str, *, include_environment: bool = True, saved_comments: str | None = None) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
         me = self.client.me().get("accountId", "")
         history = self.client.changelog(tid)
@@ -513,7 +515,7 @@ class JiraTracker:
                   for a in trusted(me, approved_at, f.get("attachment") or [])
                   if (a.get("mimeType") or "").startswith("image/")]
         return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=scope_comments(directed),
-                      open=((status.get("statusCategory") or {}).get("key") != "done"),
+                      saved_scope_matches=same_comment_scope(comments, directed, saved_comments), open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
                       labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
@@ -812,9 +814,32 @@ def answered(comments: list[tuple[datetime, str]]) -> bool:
     return bool(asked and replies) and max(replies) > max(asked)
 
 
+def spec_observation(body: str) -> tuple[str, str, str] | None:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if (len(lines) != 3 or not (token := re.fullmatch(r"Spec evidence ([0-9a-f]{24})", lines[0]))
+            or not lines[1].startswith("How:") or not lines[2].startswith("Saw:")):
+        return None
+    how, saw = [line.partition(":")[2].strip() for line in lines[1:]]
+    return (token[1], how, saw) if how and saw else None
+
+
 def scope_comments(comments: list[tuple[str, str, str]]) -> str:
     return comments_text([c for c in comments if c[0] != "Arete" and c[2].strip() and not from_arete(c[2])
-                          and not gh.has_arete_mark(c[2])])
+                          and not gh.has_arete_mark(c[2]) and not spec_observation(c[2])
+                          and not re.fullmatch(r"Promote [0-9a-f]{40} to production", c[2].strip())])
+
+
+def same_comment_scope(history, directed, saved: str | None) -> bool:
+    """Compare an old displayed snapshot to actual tracker records, including interleaved machine notices."""
+    if saved is None:
+        return False
+    current = scope_comments(directed)
+    approved = set(directed)
+    for end in range(len(history), -1, -1):
+        if comments_text(history[max(0, end - MAX_COMMENTS):end]) == saved:
+            if scope_comments([row for row in history[:end] if row in approved]) == current:
+                return True
+    return False
 
 
 def comments_text(comments: list[tuple[str, str, str]]) -> str:
