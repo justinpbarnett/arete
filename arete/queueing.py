@@ -11,6 +11,7 @@ def dependencies(ticket: tracker.Ticket) -> set[str]:
         return set(tracker.waits_on_tasks(ticket.body))
     if ticket.id.isdigit():
         numbers = set(tracker.waits_on(ticket.body))
+        numbers.update(ref for ref in ticket.github_blockers if isinstance(ref, int))
         if ticket.github_repo:
             own = ticket.github_repo.casefold()
             numbers.update(number for repo, number in tracker.github_waits(ticket.body, ticket.github_repo) if repo == own)

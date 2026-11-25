@@ -1001,7 +1001,7 @@ A permitted gap is reported as unverified, never as a pass.
 Sensitive ADW changes also remain held when behavioral verification is blocked.
 
 The poller orders new candidates by the longest remaining downstream dependency chain, then by the number of downstream tickets, then by age.
-It uses queued ticket bodies and existing `Waits on` declarations without extra per-ticket API fetches for ranking.
+It ranks queued tickets using their dependency declarations and GitHub's native blocking links to other tickets in the queue.
 Approval, dependency, running-ticket and capacity checks still decide whether a candidate can start, and the existing cross-repo scheduling remains in place.
 
 ## Layout
@@ -1108,9 +1108,10 @@ A dependency declaration is a body line starting with `Waits on` or `Blocked by`
 Leading spaces or tabs, one Markdown bullet (`-`, `*`, `+`) or heading (`#` through `######`), and `**` bold markers around the label are accepted, as in `- **Blocked by:** #7 and #9` or `### Waits on: #7`.
 The shared parser scans lines directly, including matching lines inside code fences or HTML comments; put examples in inline code to avoid declaring dependencies.
 GitHub issues use the bare `#N` references on these lines, such as `Waits on #7.` or `Blocked by #7 and #9`, and wait until every named issue or PR in the same repository is closed or merged.
+Arete also reads GitHub's native **Blocked by** links during polling and automatic recovery. An open blocker holds that ticket while other ready tickets can run. When the blocker closes or the link is removed, the next poll checks eligibility again. A parent issue can stay open while its independent children run.
 A number arete cannot read holds the issue too.
 Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
-References outside matching declaration lines hold nothing.
+Other references in the ticket body have no effect on scheduling.
 Each tracker reads only its own reference type on those lines: GitHub issue numbers, local task ids or Jira keys.
 
 A maintainer can consolidate a bounded group into one execution issue labelled `agent:batch`.
@@ -1741,6 +1742,20 @@ Checks passing is not the bar.
 After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw.
 Reading the code and running the test suite do not count as checks in use.
 Task prompts share the Behavior-first policy in `arete/prompt_loader.py`; individual roles do not define a separate test-writing policy.
+
+For a classic console draft check, `uv run python docs/console-drafts-fixture.py` starts a loopback dashboard with two saved chats. It prints the controls URL. File and Drop use the dashboard API with a disposable chat credential. The fixture records filed tickets locally and supplies an `example.invalid` issue link. Closing the fixture removes its state.
+
+To select this fixture for a verification attempt, use these values in its authorized `[verify]` layer. Keep the installed sandbox wrapper's absolute path in place of `sandbox` when the layer uses one.
+
+```toml
+[verify]
+start = "sandbox uv run python docs/console-drafts-fixture.py --port {port}"
+url = "http://127.0.0.1:{port}"
+ready = "/fixture"
+notes = "Open /fixture in a second tab for Hold and Release controls and the list of filed drafts."
+```
+
+Open the console and display draft A. From the controls tab, hold A and B reads. Start an A read, then select B. Release A first and inspect File and Drop while B is still waiting. Release B, file its draft and check the filed list. Start a fresh fixture to check Drop and confirm that A still has its draft.
 
 Eligible local Codex verification attempts get a fresh mode-700 `.arete-scratch-<16 hex>` folder in their worktree. Arete exclusively creates five empty fixture slots (`config/config.toml`, `state/arete.db`, `fixtures/config.toml`, `fixtures/fixture.db` and `out/output.txt`) for fake configuration, SQLite state and output. Files and folders the verifier or the service creates in scratch are verification output. This includes a fixture slot replaced by a file created there during the attempt, as in an atomic write. Arete archives verification output with the scratch root at finalization, without any ownership claim from the guard. Entries moved or hard-linked in from elsewhere, entries made before the attempt and folders holding them at any depth, entries on another device, entries that cannot be classified, and slots replaced after the snapshot keep the worktree retained. The diagnostic names each such entry and its reason under `unknown_entries` and `reasons`. Arete classifies entries by comparing the APFS file id with the largest id in the recorded layout and does not follow links.
 

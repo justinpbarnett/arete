@@ -250,6 +250,7 @@ A dry run retains its local diff/report/workspace and performs no publication or
 SQLite orchestration tables are authoritative; run lines and viewer state are projections.
 A successor fences the old generation, checks producer identities and restores durable workspace authority and matching results.
 Completed evidence remains usable only for its matching tree, policy and owner acceptance inputs.
+When automatic PR recovery resolves a conflict locally, the orchestrator can see the PR head, target revision and resolved tree. Once the workspace is settled, Arete sends that candidate through full checks. A failed check returns to the usual repair process.
 Interrupted inference may have unknown usage, which is not an unlaunched free call.
 
 A changed admitted controller/catalog/policy, missing durable preparation, live prior producer or uncertain publication effect refuses automatic continuation.
