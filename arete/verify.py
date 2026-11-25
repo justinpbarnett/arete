@@ -73,6 +73,33 @@ SCHEMA = {
 }
 
 
+def candidate_schema(token):
+    if not token:
+        return SCHEMA
+    candidate = {"type": "object", "additionalProperties": False,
+                 "properties": {"candidate_requirement": {"type": "string"}, "reason": {"type": "string"}},
+                 "required": ["candidate_requirement", "reason"]}
+    receipt = {"type": "object", "additionalProperties": False,
+               "properties": {"pending_delivery": {"type": "string", "enum": [token]}}, "required": ["pending_delivery"]}
+    return {**SCHEMA, "required": [*SCHEMA["required"], "pending_delivery", "unmeasured_requirements"],
+            "properties": {**SCHEMA["properties"], "pending_delivery": {"type": "string", "enum": [token]},
+                           "unmeasured_requirements": {"type": "array", "items": {"anyOf": [candidate, receipt]}}}}
+
+
+def candidate_gaps(rows, token):
+    if not isinstance(rows, list):
+        raise ValueError("The verifier must classify its outstanding candidate requirements.")
+    gaps = []
+    for row in rows:
+        if row == {"pending_delivery": token}:
+            continue
+        if (not isinstance(row, dict) or set(row) != {"candidate_requirement", "reason"}
+                or not all(isinstance(v, str) and v.strip() for v in row.values())):
+            raise ValueError("A verification gap needs a candidate requirement and reason, or the exact pending delivery identifier.")
+        gaps.append(row["candidate_requirement"].strip())
+    return gaps
+
+
 class ServerError(RuntimeError):
     pass
 
@@ -483,13 +510,24 @@ class Verified:
     nonblocking_trees: dict[str, str] = field(default_factory=dict)
     pending_delivery: str = ""
     delivery_obligation: dict = field(default_factory=dict)
+    invalid_candidate_report: bool = False
 
     @classmethod
-    def from_agent(cls, found: dict) -> Verified:
+    def from_agent(cls, found: dict, *, delivery_token="") -> Verified:
         said = found.get("verdict")
         checks = [{k: v for k, v in c.items() if k not in ("driver", "probe", "evidence_file")} for c in found.get("checks", []) if isinstance(c, dict)]
         names = found.get("unmeasured_requirements")
         unmeasured = [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
+        if delivery_token:
+            try:
+                unmeasured = candidate_gaps(names, delivery_token)
+            except ValueError as error:
+                if isinstance(names, list):
+                    unmeasured.extend(row["candidate_requirement"] for row in names if isinstance(row, dict)
+                                      and isinstance(row.get("candidate_requirement"), str) and row["candidate_requirement"].strip())
+                return cls("blocked", "The verifier returned an incomplete candidate report.", checks,
+                           blocked_by=str(error), finished=False, unmeasured_requirements=unmeasured,
+                           invalid_candidate_report=True)
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
                 checks, found.get("blocked_by", "").strip(), unmeasured_requirements=unmeasured)
         if isinstance(found.get("pending_delivery"), str):

@@ -54,6 +54,25 @@ ticket. Arete verifies the publisher and current comment, retains the historical
 observations of all the previous candidate checks. A separate open owner question still needs its own reply
 on the dashboard or through `arete answer`. Other missing requirements still need candidate evidence.
 
+A publisher can enumerate individual candidate checks in the native spec body as `AC-1`, `AC-2`, and so on.
+To bind those checks to an enrolled release, add the following line using the enrolled values.
+
+```text
+Delivery observation: Protected release receipt for DESTINATION PATH under policy SHA256
+```
+The destination, path and complete digest must match
+the protected policy. Each candidate check needs its identifier, how the verifier exercised it, and what it saw.
+For this format the independent verifier reports a missing local observation with its name and reason.
+Its pending release entry can contain only the controller-supplied identifier. Additional local gaps still block
+publication. A malformed report permits a fresh baseline and supplies no release evidence.
+
+When a publisher revises such a spec, Arete shows which unmeasured observations came from a completed
+baseline for the superseded scope. Choosing **Keep decisions and use revised checks** retains the earlier owner
+answers while requiring fresh observations on the amended spec. **Use the revised ticket** also replaces the listed
+owner decisions. **Keep the listed decisions** retains both. The linked historical action, report digest and owner
+answer remain available for audit. A requirement lacking this provenance or still named in the revised spec
+remains due. The protected receipt must still come from the running release.
+
 The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
 runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
 a comparable runner fingerprint appear as unclassified. When an existing run needs new behavioral evidence

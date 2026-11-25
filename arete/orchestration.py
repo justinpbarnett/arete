@@ -459,31 +459,51 @@ class Controller(worker_turns.WorkerTurns):
             self.atomic("orchestrate_ask", request=request, call=call)
         return "needs-info", reason, ""
 
-    def reconcile_answers(self, old, ticket):
+    def reconcile_answers(self, old, ticket, observations=None):
         notes = ask_store.individual_scope_notes(self.data.get("runs", []), self.data.get("owner_answers", []))
         retained, retired, uncertain = requirement_revision.prior_answers(old, ticket, notes)
-        if not uncertain:
+        if not (uncertain or observations):
             return retained, retired, None
-        key = ledger.digest([self.lease.root, requirement_revision.version(ticket), uncertain])
+        basis = [self.lease.root, requirement_revision.version(ticket), uncertain]
+        if observations:
+            basis.append(observations)
+        key = ledger.digest(basis)
         call = f"requirements.decisions.{key}"
         keep, revised = "Keep the listed decisions", "Use the revised ticket"
+        keep_answers = "Keep decisions and use revised checks"
         asked = ask_store.carry_scope_ask(self.run.repo.name, self.run.tid, call, self.run.id)
         if asked and asked["status"] in ("answered", "taken") and len(asked["answers"]) == 1:
             answer = asked["answers"][0]
             if not answer.get("by", "").startswith("rule:"):
                 if answer.get("picked") == [keep]:
                     return [*retained, *uncertain], retired, None
-                if answer.get("picked") == [revised]:
+                if answer.get("picked") == [revised] or (observations and uncertain and answer.get("picked") == [keep_answers]):
+                    if observations:
+                        self.data["required_verification_requirements"] = [
+                            n for n in self.data["required_verification_requirements"] if n not in observations]
+                        self.data.setdefault("superseded_verification_requirements", {})[key] = {
+                            "previous": requirement_revision.version(old), "current": requirement_revision.version(ticket),
+                            "asked": asked["id"], "observations": observations}
+                    if answer.get("picked") == [keep_answers]:
+                        return [*retained, *uncertain], retired, None
                     return retained, [*retired, *uncertain], None
         reason = "The revised ticket leaves the applicability of these earlier owner decisions unresolved."
+        if observations:
+            reason = ("Should the revised ticket replace the listed observations from the old verifier and any "
+                      "listed earlier decisions? Every AC-N candidate check in the revised ticket must be measured anew.")
+        previous = [*uncertain, *(observations or {})]
         if not asked and not (self.run.dry_run or self.run.alone or self.run.owner_questions_blocked):
             request = {"questions": [{"header": "Prior scope", "kind": "choice",
-                       "question": reason + "\n\n" + "\n\n".join(uncertain),
+                       "question": reason + "\n\n" + "\n\n".join(previous),
                        "options": [{"label": revised, "description": "Recommended. The current ticket replaces these "
                                     "decisions. Add any detail you want to retain to its requirements."},
                                    {"label": keep, "description": "I confirm all the listed decisions still apply to this revision."}]}],
                        "why": "Previously accepted decisions must be reconciled with the owner's current scope.",
                        "tried": "Kept decisions tied to unchanged checks and retired decisions the ticket explicitly supersedes."}
+            if observations and uncertain:
+                request["questions"][0]["options"].append({
+                    "label": keep_answers, "description": "Retain the earlier owner decisions and replace only "
+                    "the listed verifier observations with the revised candidate checks and protected receipt."})
             self.atomic("orchestrate_ask", request=request, call=call)
         return retained, retired, ("needs-info", reason, "")
 
@@ -516,7 +536,15 @@ class Controller(worker_turns.WorkerTurns):
                        for a in actions)
                 or any(w["phase"] in ("integrating", "reconciliation-required") for wid, w in workers.items() if wid not in keep)):
             return self.scope_question(ticket, "An earlier publication or worker integration has unsettled effects.")
-        retained_notes, retired_notes, waiting = self.reconcile_answers(old, ticket)
+        observations = {}
+        if (self.is_spec and self.data.get("definition") and self.data.get("required_verification_requirements")
+                and spec_delivery.delivery_declarations(ticket)):
+            previous_promise = spec_delivery.obligation(self.run.repo.name, old, self.data["definition"], self.run.spec_identity)
+            if previous_promise:
+                observations = spec_delivery.superseded_observations(
+                    actions, ticket, self.data["required_verification_requirements"],
+                    self.data.get("superseded_actions", ()), previous_promise)
+        retained_notes, retired_notes, waiting = self.reconcile_answers(old, ticket, observations)
         if waiting:
             return waiting
         reason = "the owner revised the ticket requirements"
@@ -1051,7 +1079,7 @@ class Controller(worker_turns.WorkerTurns):
                 routes.append(key)
         if report.nonblocking_reason:
             next_action = "publication.request"
-        elif routes or unattempted:
+        elif routes or unattempted or report.invalid_candidate_report:
             next_action = "verification.run"
         else:
             next_action = "owner.ask" if required else "verification.decide"
@@ -1074,10 +1102,12 @@ class Controller(worker_turns.WorkerTurns):
             self.data["protected_spec_source"] = promise["source"]
         elif done and self.data.get("protected_spec_source") == spec_delivery.source_version(self.job.ticket):
             raise factory.Refused("the protected delivery enrollment for this spec is missing")
+        declared, delivery_name = spec_delivery.declared_observations(self.job.ticket, promise) if done else ({}, "")
         carried = self.data.get("required_verification_requirements", [])
         directions = spec_delivery.legacy_directions(self.lease, done, carried, promise, self.data.get("superseded_actions", [])) if promise else {}
         confirmed = spec_delivery.confirmed_directions(self.run.tracker, self.run.tid, directions) if directions else {}
-        if promise and (source.get("delivery_obligation") != promise or confirmed and source.get("delivery_directions") != confirmed):
+        if promise and (source.get("delivery_obligation") != promise or source.get("invalid_candidate_report")
+                        or confirmed and source.get("delivery_directions") != confirmed):
             source = {}  # Historical stamps remain available for inspection. Only a fresh baseline can bind this promise.
         scope = verification_attempts.plan(source, requirements, host, tools)
         prior, pending = scope.prior, scope.requirements
@@ -1100,9 +1130,16 @@ class Controller(worker_turns.WorkerTurns):
             detail += ("\n\nThe publisher assigned these historical observations to the protected delivery receipt. "
                        "Repeat every previous candidate check independently on the current tree.\n" + "\n".join(confirmed))
         if done:
-            outstanding_required = list(dict.fromkeys([done["criterion"], *outstanding_required]))
+            outstanding_required = list(dict.fromkeys([done["criterion"], *declared, *outstanding_required]))
             if promise:
                 detail += spec_delivery.candidate_instructions(promise)
+            if delivery_name:
+                detail += ("\nThe exact named post-merge receipt is " + delivery_name + ". In the structured "
+                           "unmeasured_requirements array, this receipt uses only the pending_delivery identifier. "
+                           "A missing candidate observation uses candidate_requirement and reason; for a declared check "
+                           "use its AC-N identifier as candidate_requirement. Put additional explanations in summary. "
+                           "For each candidate check below, use only its stable AC-N identifier as 'what', and "
+                           "describe the interaction and observed result in 'how' and 'saw'.\n" + "\n".join(declared.values()))
         if not pending and (outstanding_required or scope.baseline_targets):
             detail += ("\n\nOn the full baseline, include these requirements and use their exact wording in 'what'.\n"
                        + "\n".join(f"- {name}" for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets])))
@@ -1116,7 +1153,8 @@ class Controller(worker_turns.WorkerTurns):
                 proven = verification_attempts.observed(prior) if pending else set()
                 covered = tuple(c["what"] for c in prior.checks if (c.get("driver") or c.get("probe"))
                                 and c.get("passed") and c["what"].casefold() in proven) if pending else ()
-                outcome = self.atomic("verify", tree=str(self.job.ws), single=True, covered_commands=covered)
+                outcome = self.atomic("verify", tree=str(self.job.ws), single=True, covered_commands=covered,
+                                      **({"delivery_token": ledger.digest(promise)} if delivery_name else {}))
         finally:
             self.job.goal = goal
         if not tree or tree != self.fingerprint() or host != verification_attempts.host():
@@ -1133,6 +1171,10 @@ class Controller(worker_turns.WorkerTurns):
         if pending:
             measured = verification_attempts.combine(prior, measured, pending)
         observed = verification_attempts.observed(measured)
+        if declared:
+            documented = {pipeline.verify.one_line(c.get("what")).casefold() for c in measured.checks
+                          if c.get("passed") is True and pipeline.verify.one_line(c.get("how")) and pipeline.verify.one_line(c.get("saw"))}
+            observed -= {n.casefold() for n in declared} - documented
         owed = [name for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets]) if name.casefold() not in observed]
         if owed:
             absent = [name for name in owed if name not in verification_attempts.outstanding(measured)]
