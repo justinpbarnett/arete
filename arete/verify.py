@@ -325,8 +325,12 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
             lifetime["stopped"] = False
         try:
             wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+            if lifetime is not None:
+                lifetime["process"] = proc
             yield reach
         finally:
+            if lifetime is not None:
+                lifetime.pop("process", None)
             util.stop_group(proc)
             pump.join(util.GROUP_STOP_SECONDS)
             if lifetime is not None:
