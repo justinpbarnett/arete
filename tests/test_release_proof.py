@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -104,6 +105,60 @@ class RunningRelease(unittest.TestCase):
         self.policy["assertions"] = [{"field": "/report/name", "equals": "new"}]
         self.file.write_text(json.dumps(self.policy))
         proof.install(self.cfg.repos[0], "12", self.file)
+        self.assertIsNone(proof.evidence("arete", "12", self.tip))
+
+    def stripped_healthy_release(self):
+        self.cfg.repos[0].github = self.receipt.github
+        self.git("checkout", "-q", "--detach", self.previous)
+        with mock.patch.object(codebase, "RELEASE", self.previous):
+            self.assertTrue(proof.known_good("arete", self.previous, self.checks))
+        self.git("checkout", "-q", "main")
+        file = self.state / serve_guard.RECEIPT
+        data = {**serve_guard.read(file), "healthy": True, "release_checks": [], "created_at": time.time()}
+        serve_guard.write(file, data)
+        return file
+
+    def deployment_poll(self):
+        with (mock.patch.object(self.engine, "deploy") as deploy, mock.patch.object(proof, "advance")):
+            self.engine.deploy_if_ready(self.cfg)
+        return deploy.call_count
+
+    def test_stripped_binding_reconciles_real_release_once_without_changing_deploy_receipt(self):
+        file = self.stripped_healthy_release()
+        original = file.read_bytes()
+        self.assertEqual(self.deployment_poll(), 0)  # The actual running behavior is wrong.
+        self.assertIsNone(proof.evidence("arete", "12", self.tip))
+        self.fixed = True
+        self.assertEqual(self.deployment_poll(), 1)
+        result = proof.for_delivery("arete", "12", self.tip, "production")
+        self.assertEqual(result["policy"], self.checks[0]["policy"])
+        self.assertEqual(result["observed"][0]["field"], "/report/pending_overdue")
+        self.assertFalse(result["recovery"])
+        self.assertIsNone(proof.evidence("arete", "12", self.previous))
+        with mock.patch.object(proof, "observe", side_effect=AssertionError("duplicate observation")):
+            self.assertEqual(self.deployment_poll(), 1)
+        self.assertEqual(file.read_bytes(), original)
+
+    def test_reconciliation_refuses_policy_rotation_unrelated_revision_and_late_recovery(self):
+        file = self.stripped_healthy_release()
+        repo = self.cfg.repos[0]
+        self.fixed = True
+        with mock.patch.object(proof, "observe", side_effect=AssertionError("unbound observation")):
+            with mock.patch.object(codebase, "RELEASE", self.previous):
+                self.assertEqual(self.deployment_poll(), 0)
+            self.policy["path"] = "/api/v1/different"
+            self.file.write_text(json.dumps(self.policy))
+            proof.install(repo, "12", self.file)
+            self.assertEqual(self.deployment_poll(), 0)
+            self.policy["revision"] = self.previous
+            self.file.write_text(json.dumps(self.policy))
+            proof.install(repo, "12", self.file)
+            self.assertEqual(self.deployment_poll(), 1)
+            self.policy.update(revision=self.tip, path="/api/v1/fixture")
+            self.file.write_text(json.dumps(self.policy))
+            proof.install(repo, "12", self.file)
+            serve_guard.write(file, {**serve_guard.read(file), "created_at": 1})
+            self.assertEqual(self.deployment_poll(), 0)
         self.assertIsNone(proof.evidence("arete", "12", self.tip))
 
     def test_dirty_checkout_holds_failed_release_and_keeps_operator_edit(self):

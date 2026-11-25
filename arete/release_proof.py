@@ -9,7 +9,7 @@ import sys
 import tempfile
 import re
 import time
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -437,9 +437,9 @@ def merge_revision(repo, ticket, base):
     return ""
 
 
-def on_tip(repo, base, tip, previous=None):
+def on_tip(repo, base, tip, previous=None, *, tickets=None):
     selected = []
-    for ticket in enrolled(repo.name):
+    for ticket in enrolled(repo.name) if tickets is None else tickets:
         data = goal(repo.name, ticket)
         if not data or data["destination"] != "arete-serve":
             continue
@@ -474,6 +474,59 @@ def assess(repo, receipt):
     return "failed" if "failed" in statuses else "blocked" if "blocked" in statuses else "verified"
 
 
+def preflight_recorded(folder, repo, receipt, check):
+    expected = {"repo": repo, "ticket": check["ticket"], "revision": receipt.previous, "destination": "arete-serve",
+                "status": "verified", "recovery": True, "policy": check["policy"]}
+    for file in folder.glob("*.json"):
+        if not re.fullmatch(r"[a-f0-9]{64}", file.stem):
+            continue
+        row = serve_guard.read(file) or {}
+        content = {key: value for key, value in row.items() if key not in ("at", "receipt_id")}
+        if row.get("receipt_id") != file.stem or digest(content) != file.stem or not all(
+                content.get(key) == value for key, value in expected.items()):
+            continue
+        try:
+            at = util.parse_iso(row["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if at.tzinfo and at.timestamp() <= receipt.created_at:
+            return True
+    return False
+
+
+def reconcile_running(repo):
+    """Re-observe a healthy transfer whose startup guard lost its admission bindings."""
+    checkout = repo.path.resolve()
+    receipt = serve_guard.current(paths.STATE_DIR, checkout)
+    if not receipt or not receipt.healthy or receipt.settled or not receipt.starts:
+        return ""
+    # Only a real preflight on the previous engine can establish historical enrollment.
+    # Most releases have no such record and need no tracker lookups.
+    recoveries = {ticket: state_dir(repo.name, ticket) / receipt.previous / "arete-serve" / "recovery"
+                  for ticket in enrolled(repo.name)}
+    recorded = {row["ticket"] for row in receipt.release_checks}
+    selected = [ticket for ticket, folder in recoveries.items() if ticket not in recorded and folder.is_dir()]
+    if not selected:
+        return ""
+    for check in on_tip(repo, receipt.branch, receipt.tip, receipt.previous, tickets=selected):
+        ticket = check["ticket"]
+        if evidence(repo.name, ticket, check["change"]):
+            continue
+        if (not repo.github or repo.github.casefold() != receipt.github.casefold()
+                or repo.target_branch and repo.target_branch != receipt.branch
+                or codebase.RELEASE != receipt.tip or not serve_guard.at_tip(checkout, receipt)
+                or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()):
+            return "release identity changed"
+        if not preflight_recorded(recoveries[ticket], repo.name, receipt, check):
+            return "cannot bind the pre-transfer recovery observation to the current policy"
+        # assess performs the pinned live GET and records its true observation time. The
+        # original deployment receipt remains intact, including on failure or unavailable access.
+        verdict = assess(repo.name, replace(receipt, release_checks=[check]))
+        if verdict != "verified":
+            return verdict
+    return ""
+
+
 def restore_or_hold(checkout, receipt, say):
     reason = "the protected release check failed"
     try:
@@ -482,10 +535,11 @@ def restore_or_hold(checkout, receipt, say):
         why = serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous)
     except (OSError, RuntimeError) as error:
         why = str(error)
-    held = replace(receipt, settled="release_held", restore_status=why or "checkout identity changed")
-    serve_guard.write(serve_guard.hold_path(paths.STATE_DIR, receipt.tip), {**asdict(held), "reason": reason})
-    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(held))
-    say(f"deploy: held {receipt.tip}: {held.restore_status}")
+    held = {**serve_guard.original(paths.STATE_DIR, receipt), "settled": "release_held",
+            "restore_status": why or "checkout identity changed"}
+    serve_guard.write(serve_guard.hold_path(paths.STATE_DIR, receipt.tip), {**held, "reason": reason})
+    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, held)
+    say(f"deploy: held {receipt.tip}: {held['restore_status']}")
 
 
 def confirm_restore(repo, checkout, started_head, completed):

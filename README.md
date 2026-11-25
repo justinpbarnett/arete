@@ -2837,6 +2837,8 @@ If a classic dashboard sidebar or questions request fails, the view can still re
 
 ### Verify the promised behavior on a running release
 
+For an installed self-deploy service, the current healthy release refreshes the standalone startup guard from its own committed source before fast-forwarding. The guard preserves additional fields when recording starts or rollback. If an older guard dropped a binding before the service recorded startup health, the deployment poll can recover it while that release is still serving. It matches the original transfer interval, policy and verified pre-transfer recovery receipt, then observes the running behavior. A failed or blocked check keeps the next deployment waiting. The original startup receipt retains its historical contents.
+
 Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-file FILE`. Arete copies this policy to its private configuration directory outside the worker checkout. A self-deploy policy might read as follows.
 
 ```json

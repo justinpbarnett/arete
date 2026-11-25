@@ -55,8 +55,19 @@ def serve_guard_file() -> Path:
     return paths.STATE_DIR / "serve-start.py"
 
 
-def write_serve_guard() -> None:
-    util.write_durably(serve_guard_file(), Path(serve_guard.__file__).read_bytes(), mode=0o600)
+def write_serve_guard(source: bytes | None = None) -> None:
+    if source is None:
+        source = Path(serve_guard.__file__).read_bytes()
+    util.write_durably(serve_guard_file(), source, mode=0o600)
+
+
+def refresh_serve_guard(checkout: Path, incumbent: str) -> None:
+    installed = serve_guard_file()
+    if installed.exists():
+        # The incoming checkout must not supply the guard deciding whether to roll it back.
+        trusted = serve_guard.git_bytes(checkout, "show", f"{incumbent}:arete/serve_guard.py")
+        if installed.read_bytes() != trusted:
+            write_serve_guard(trusted)
 
 
 def serve_command() -> list[str]:
