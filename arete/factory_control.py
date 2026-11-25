@@ -10,6 +10,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import wraps
 from uuid import uuid4
 
 from . import util
@@ -24,6 +25,10 @@ log = logging.getLogger(__name__)
 
 @contextmanager
 def activity(name, version=None):
+    if factory.generation.get() is not None:
+        factory.admit(version=version)
+        yield
+        return
     if not factory.available():
         yield
         return
@@ -37,6 +42,14 @@ def activity(name, version=None):
     finally:
         factory.generation.reset(token)
         factory.forget(key)
+
+
+def work(fn):
+    @wraps(fn)
+    def admitted(*args, **kwargs):
+        with activity(fn.__name__):
+            return fn(*args, **kwargs)
+    return admitted
 
 
 class WorkPool(ThreadPoolExecutor):

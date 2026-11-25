@@ -10,6 +10,7 @@ from . import (
     board,
     config,
     control,
+    factory_control,
     gh,
     paths,
     pipeline,
@@ -384,10 +385,8 @@ def reply_and_draft(result: Result) -> tuple[str, dict | None]:
     return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
 
 
+@factory_control.work
 def file_draft(chat_id: int, publication=None, *, draft=None) -> dict:
-    from .store import factory as factory_state
-
-    factory_state.admit()
     with filing:
         if publication and publication.pending and "result" in publication.pending:
             return view(chat_id)
