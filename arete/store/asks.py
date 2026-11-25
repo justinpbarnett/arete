@@ -52,14 +52,30 @@ def ask_get(ask_id: str, connect=reader) -> dict | None:
         return ask_row(r) if r else None
 
 
-def carry_scope_ask(repo: str, ticket: str, call: str, run: str) -> bool:
+def individual_scope_notes(runs, notes):
+    """Recover separately answered questions from historical notes using their actual stored questions and answers."""
+    if not any("\n2. " in note for note in notes):
+        return notes
+    groups = {}
+    expanded = {}
+    for run in runs:
+        for row in asks_of(run, "answered"):
+            expanded[owner_asks.fresh_note([row])] = owner_asks.decision_notes([row])
+            groups.setdefault(row["taken_by"], []).append(row)
+    for rows in groups.values():
+        rows.sort(key=lambda r: (r["asked"], r["id"]))
+        expanded[owner_asks.fresh_note(rows)] = owner_asks.decision_notes(rows)
+    return [part for note in notes for part in expanded.get(note, [note])]
+
+
+def carry_scope_ask(repo: str, ticket: str, call: str, run: str) -> dict | None:
     with db() as c:
-        row = c.execute("SELECT id,status FROM asks WHERE repo=? AND ticket=? AND call=? LIMIT 1",
+        row = c.execute("SELECT * FROM asks WHERE repo=? AND ticket=? AND call=? LIMIT 1",
                         (repo, str(ticket), call)).fetchone()
         if row and row["status"] == "open":
             # Keep the original ID, date, session and notification, with a live continuation for the answer.
             c.execute("UPDATE asks SET run=? WHERE id=?", (run, row["id"]))
-        return row is not None
+        return ask_row(row) if row else None
 
 
 def asks_of(run: str, status: str = "", connect=reader) -> list[dict]:

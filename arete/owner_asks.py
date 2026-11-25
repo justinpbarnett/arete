@@ -437,6 +437,11 @@ def fresh_note(rows: list[dict]) -> str:
             "\n\nThe owner has answered. Use the answers and finish the step without asking again.")
 
 
+def decision_notes(rows: list[dict]) -> list[str]:
+    return [fresh_note([{**row, "questions": [question], "answers": [answer]}])
+            for row in rows for question, answer in zip(row["questions"], row["answers"], strict=True)]
+
+
 def settles(ask: dict) -> bool:
     return all(q["kind"] == "choice" for q in ask["questions"])
 
