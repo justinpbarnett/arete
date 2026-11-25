@@ -4,6 +4,8 @@ from __future__ import annotations
 from . import factory, flows, gh, spec_delivery, spec_tracker, tracker, verify
 from .store import runs, specgraphs
 
+_READINESS_ONLY = object()
+
 
 def child_landing(repo, ticket, targets):
     run = runs.newest_live_whole_run(repo, ticket) or {}
@@ -66,16 +68,22 @@ def satisfied_native(source, child, blockers):
             usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []))}
 
 
-def active_child_blocker(run, ticket=None):
+def active_child_blocker(run, ticket=_READINESS_ONLY):
     source = getattr(run, "tracker", None)
     if (not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)) or tracker.is_task_id(run.tid)
             or not specgraphs.tracks_ticket(source.repo.name, str(run.tid))):
         return ""
     remote = spec_tracker.adapter(source)
     if not remote or not (key := specgraphs.membership(remote.scope, str(run.tid))):
-        return ""
+        return "the native graph child's tracker enrollment could not be confirmed"
     from . import spec_amendments
-    return ready(source, remote, key, str(run.tid)) or spec_amendments.before_acceptance(run, ticket)
+    if reason := ready(source, remote, key, str(run.tid)):
+        return reason
+    if ticket is _READINESS_ONLY:
+        return ""
+    if not isinstance(ticket, tracker.Ticket) or str(ticket.id) != str(run.tid):
+        return "the native graph child has no prepared assignment for its current ticket"
+    return spec_amendments.before_acceptance(run, ticket)
 
 
 def require_active_child(run, ticket=None):
