@@ -3556,7 +3556,7 @@ def unpinned_merge_hold(c: workspace.Checkout, base_sha: str) -> str:
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                track_moved_base: bool = False) -> str:
-    from . import merge_review
+    from . import merge_review, release_proof
 
     if len(b.checkouts) != 1:
         return merge_review.MULTIPLE
@@ -3575,7 +3575,8 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
         return merge_review.nominate(b, c, verified, review, base_sha, about)
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
-                                 track_moved_base=track_moved_base)
+                                 track_moved_base=track_moved_base,
+                                 **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
     if not hold and (c.github, head) in b.ci_rerun_requested_heads:
         hold = rerun_head_hold(b, c, head)
     if not hold:
@@ -3605,6 +3606,8 @@ def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
 
 def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, base_sha: str, about: str, *,
                      track_moved_base: bool) -> str:
+    from . import release_proof
+
     patch = checkout_patch(c, [], f"{base_sha}..{head}")
     if not patch:
         return "there is no diff to risk screen"
@@ -3614,7 +3617,8 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return "JEV could not judge the diff"
     if risk.hold:
         return risk.hold
-    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base)
+    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
+                            **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,

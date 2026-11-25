@@ -188,6 +188,7 @@ def register(sub) -> None:
         action.add_argument("ticket")
         if name == "enroll":
             action.add_argument("--policy-file", required=True)
+            action.add_argument("--observer-file", help="private Python browser observer matching the policy fingerprint")
         elif name == "observe":
             action.add_argument("--revision", required=True)
         action.set_defaults(fn=cmd_release)

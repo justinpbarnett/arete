@@ -172,7 +172,7 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     if release_proof.required(tk.repo.name, claim["issue"]):
         if len(landed) != 1 or landed[0]["repo"].casefold() != tk.repo.github.casefold():
             return {}
-        proof = release_proof.evidence(tk.repo.name, claim["issue"], landed[0]["commit"])
+        proof = release_proof.for_delivery(tk.repo.name, claim["issue"], landed[0]["commit"], done.get("environment"))
         if not proof:
             return {}
         return {"method": "protected release observation", "landed": landed, "how": f"Observed {proof['path']} "

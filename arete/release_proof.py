@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import subprocess
+import sys
+import tempfile
 import re
 import time
 from dataclasses import asdict, replace
@@ -83,7 +86,8 @@ def pointer(value):
 
 def validate(data):
     need(isinstance(data, dict) and set(data) <= {"destination", "path", "assertions", "recovery", "revision",
-         "staging", "production", "qa", "instructions"} and data.get("destination") in ("arete-serve", "staging", "production"),
+         "staging", "production", "qa", "instructions", "identity_path", "observer_sha256",
+         "production_branch", "immutable_host_suffix", "checks"} and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
     need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]+", path) and "//" not in path
@@ -92,29 +96,60 @@ def validate(data):
     steps(data.get("recovery"))
     if "revision" in data:
         need(isinstance(data["revision"], str) and serve_guard.SHA.fullmatch(data["revision"]), "invalid exact revision")
+    if "observer_sha256" in data:
+        need(re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None, "invalid observer fingerprint")
     if data["destination"] == "arete-serve":
-        need(path.startswith("/api/") and not ({"staging", "production", "qa"} & set(data)), "invalid Arete client route")
+        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks"} & set(data)), "invalid Arete client route")
     else:
+        identity = data.get("identity_path")
+        need(isinstance(identity, str) and re.fullmatch(r"/[A-Za-z0-9/_.-]+", identity)
+             and not ({".", "..", ""} & set(identity[1:].split("/"))), "provide a revision identity JSON path")
         for env in {data["destination"], "production"}:
             server_url(data.get(env))
         need(isinstance(data.get("instructions"), str) and 0 < len(data["instructions"]) <= 500,
              "record the user action QA should perform")
         if data["destination"] == "staging":
+            need(config.valid_target_branch(data.get("production_branch")), "invalid production branch")
+            if "checks" in data:
+                gates = data["checks"]
+                need(isinstance(gates, dict) and set(gates) == {"pr", "staging"}, "declare PR and staging checks")
+                for gate in gates.values():
+                    need(isinstance(gate, dict) and set(gate) == {"app_id", "required", "allow_skipped"} and
+                         type(gate["app_id"]) is int and gate["app_id"] > 0, "bind checks to a GitHub app ID")
+                    for names in (gate["required"], gate["allow_skipped"]):
+                        need(isinstance(names, list) and len(names) <= 30 and all(isinstance(n, str) and 0 < len(n) <= 100
+                             for n in names), "checks need explicit job names")
+                    need(gate["required"] and not set(gate["required"]).intersection(gate["allow_skipped"]),
+                         "require a passing job and use distinct optional job names")
+            if suffix := data.get("immutable_host_suffix"):
+                need(isinstance(suffix, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", suffix)
+                     and server_url(data["staging"]).hostname.endswith("." + suffix), "invalid preview hostname suffix")
             need(isinstance(data.get("qa"), list) and bool(data["qa"])
                  and all(isinstance(s, str) and NAME.fullmatch(s) for s in data["qa"]),
                  "configure the authorized QA tracker accounts")
             need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
 
 
-def install(repo, ticket, source):
+def install(repo, ticket, source, observer_file=None):
     value = json.loads(Path(source).read_bytes())
     validate(value)
     file = policy_file(repo.name, ticket)
     if value["destination"] == "arete-serve":
         need(config.load_required().arete_repo == repo.name, "use arete-serve only on the Arete repository")
     else:
-        need(repo.target_branch and repo.landing and repo.unattended_environment == value["destination"],
-             "goal destination must match the repository's saved unattended environment")
+        need(repo.pipeline and repo.target_branch and repo.landing and repo.unattended_environment == value["destination"],
+             "the goal must use an enabled pipeline consistent with the saved environment ceiling")
+        if value["destination"] == "staging":
+            need(repo.landing == "pr" and repo.target_branch != value["production_branch"], "use PR landing on a separate staging branch")
+    if observer_file:
+        program = Path(observer_file).read_bytes()
+        need(len(program) <= 65536 and hashlib.sha256(program).hexdigest() == value.get("observer_sha256"),
+             "protected observer does not match the policy fingerprint")
+        dest = observer_location(value["observer_sha256"])
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        util.write_bytes_atomic(dest, program)
+    if "observer_sha256" in value:
+        observer_bytes(value)
     with util.lock("release-" + key(repo.name, ticket), wait=True):
         serve_guard.write(file, value)
     return {"repo": repo.name, "ticket": ticket, "policy": digest(value), "destination": value["destination"]}
@@ -152,7 +187,52 @@ def compare(document, rows):
     return observed
 
 
-def fetch(data, revision, destination):
+def observer_location(sha):
+    return paths.CONFIG_DIR / "release-observers" / (sha + ".py")
+
+
+def observer_bytes(data):
+    sha = data["observer_sha256"]
+    program = zte.private_bytes(observer_location(sha), 65536)
+    need(hashlib.sha256(program).hexdigest() == sha, "protected observer fingerprint changed")
+    return program
+
+
+def http_json(origin, path):
+    url = server_url(origin)
+    transport = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    conn = transport(url.hostname, url.port, timeout=8)
+    try:
+        conn.request("GET", path, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+        response = conn.getresponse()
+        need(response.status == 200, "the deployed endpoint is not ready")
+        raw = response.read(LIMIT + 1)
+        need(len(raw) <= LIMIT, "release response exceeded the size limit")
+        return json.loads(raw)
+    finally:
+        conn.close()
+
+
+def deployed_revision(data, origin):
+    value = http_json(origin, data["identity_path"])
+    revision = value.get("revision") if isinstance(value, dict) else None
+    need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision), "the deployment did not identify its revision")
+    return revision
+
+
+def browser_observation(data, origin, revision, destination):
+    program = observer_bytes(data)
+    with tempfile.TemporaryDirectory(prefix="arete-release-observer-") as folder:
+        env = {"HOME": folder, "TMPDIR": folder, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+        result = util.run_whole_tree([sys.executable, "-I", "-c", program.decode()], 120,
+                                     json.dumps({"origin": origin, "path": data["path"], "revision": revision,
+                                                 "destination": destination}).encode(),
+                                     cwd=folder, env=env, graceful_timeout=True)
+    need(result.returncode == 0 and len(result.stdout) <= LIMIT, "protected browser observer could not complete")
+    return json.loads(result.stdout)
+
+
+def fetch(data, revision, destination, origin=None):
     path = data["path"]
     if destination == "arete-serve":
         deadline = time.monotonic() + 8
@@ -167,22 +247,17 @@ def fetch(data, revision, destination):
         finally:
             client.close_response(response)
     else:
-        origin = server_url(data[destination])
-        transport = http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
-        conn = transport(origin.hostname, origin.port, timeout=6)
-        try:
-            conn.request("GET", path, headers={"Accept": "application/json"})
-            response = conn.getresponse()
-            need(response.status == 200 and response.getheader("X-Release-Revision") == revision,
-                 "the deployed endpoint did not answer with the exact release revision")
-            raw = response.read(LIMIT + 1)
-        finally:
-            conn.close()
+        origin = origin or data[destination]
+        need(deployed_revision(data, origin) == revision, "the environment is serving a different release")
+        document = (browser_observation(data, origin, revision, destination) if "observer_sha256" in data
+                    else http_json(origin, path))
+        need(deployed_revision(data, origin) == revision, "the destination changed while observing behavior")
+        return document
     need(len(raw) <= LIMIT, "release response exceeded the size limit")
     return json.loads(raw)
 
 
-def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=""):
+def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned="", origin=None, check_destination=None):
     need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision), "a full release revision is required")
     data = goal(repo, ticket)
     need(data, "no protected release check is enrolled for this goal")
@@ -193,13 +268,23 @@ def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=
          "destination is outside this policy")
     proof = {"repo": repo, "ticket": ticket, "revision": revision, "destination": destination,
              "policy": policy, "path": data["path"], "recovery": recovery}
+    if origin:
+        url = server_url(origin)
+        suffix = data.get("immutable_host_suffix")
+        need(destination == "staging" and suffix and url.scheme == "https" and url.port is None
+             and url.hostname.endswith("." + suffix), "untrusted immutable preview URL")
+        proof["origin"] = origin
     try:
-        body = fetch(data, revision, destination)
+        if check_destination:
+            check_destination()
+        body = fetch(data, revision, destination, origin)
+        if check_destination:
+            check_destination()
         proof["observed"] = compare(body, data["recovery" if recovery else "assertions"])
         proof["status"] = "verified"
     except AssertionError as error:
         proof.update(status="failed", reason=str(error))
-    except (OSError, ValueError, TypeError, http.client.HTTPException, client.Broken, client.Down, client.Failed):
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, http.client.HTTPException, client.Broken, client.Down, client.Failed):
         proof.update(status="blocked", reason="could not identify or observe the requested release")
     rid = digest(proof)
     proof["receipt_id"], proof["at"] = rid, util.iso()
@@ -238,9 +323,47 @@ def evidence(repo: str, ticket: str, revision: str) -> dict | None:
     return None
 
 
+def completion(repo: str, ticket: str, revision: str) -> dict | None:
+    data = goal(repo, ticket)
+    if not data:
+        return None
+    if data["destination"] != "staging":
+        return evidence(repo, ticket, revision)
+    state = serve_guard.read(state_dir(repo, ticket) / "promotion.json") or {}
+    if (state.get("phase"), state.get("revision"), state.get("policy")) != ("production_verified", revision, digest(data)):
+        return None
+    receipt = serve_guard.read(state_dir(repo, ticket) / revision / "production" / "behavior" / "latest.json") or {}
+    return receipt if receipt.get("status") == "verified" and receipt.get("receipt_id") == state.get("production_receipt") else None
+
+
+def for_delivery(repo, ticket, revision, environment):
+    data = goal(repo, ticket)
+    if not data:
+        return None
+    where = (environment or "").strip().rstrip("/").casefold()
+    if data["destination"] == "staging":
+        if where in ("production", data["production"].rstrip("/").casefold()):
+            return completion(repo, ticket, revision)
+        if where not in ("", "staging", data["staging"].rstrip("/").casefold()):
+            return None
+    elif where and where not in {data["destination"], str(data.get(data["destination"], "")).rstrip("/").casefold()}:
+        return None
+    return evidence(repo, ticket, revision)
+
+
 def enrolled(repo):
     folder = paths.CONFIG_DIR / "release-checks" / repo
     return sorted(file.stem for file in folder.glob("*.json"))
+
+
+def pr_check_options(repo, ticket, github, base):
+    if not ticket or not isinstance(repo, config.Repo) or repo.github != github or not repo.pipeline or repo.target_branch != base:
+        return {}
+    if repo.unattended_environment == "staging" and required(repo.name, ticket):
+        data = goal(repo.name, str(ticket))
+        if data["destination"] == "staging" and data.get("checks") and data["production_branch"] != base:
+            return {"stage_checks": data["checks"]["pr"]}
+    return {}
 
 
 def merge_revision(repo, ticket, base):
@@ -333,18 +456,20 @@ def progress(repo, ticket):
     last = (serve_guard.read(state_dir(repo.name, ticket) / revision / data["destination"] / "behavior" / "latest.json")
             if revision else None)
     return {"repo": repo.name, "ticket": ticket, "destination": data["destination"], "revision": revision,
-            "policy": digest(data), "evidence": proof, "last_observation": last}
+            "policy": digest(data), "evidence": proof, "last_observation": last,
+            "promotion": serve_guard.read(state_dir(repo.name, ticket) / "promotion.json"),
+            "completion": completion(repo.name, ticket, revision) if revision else None}
 
 
-def finish_verified(cfg, repo, ticket, revision):
-    from . import tracker
+def finish_verified(cfg, repo, ticket, revision, delivered=None):
+    from . import tracker, unblock
 
-    proof = evidence(repo.name, ticket, revision)
+    proof = delivered or evidence(repo.name, ticket, revision)
     if not proof:
         return
     tk = tracker.for_ticket(cfg, repo, ticket)
     item = tk.get(ticket)
-    if not item.open or "spec" in item.labels:
+    if "spec" in item.labels or item.blocker or not unblock.approval(tk, item)[0]:
         return
     reason = f"Verified {proof['path']} on {proof['destination']} at {revision}. Receipt {proof['receipt_id']}."
     if isinstance(tk, tracker.GitHubTracker):
@@ -358,6 +483,16 @@ def advance(cfg):
     for repo in cfg.repos:
         for ticket in enrolled(repo.name):
             try:
+                data = goal(repo.name, ticket)
+                if data and data["destination"] == "staging":
+                    from . import release_promotion
+
+                    promotion = release_promotion.advance(cfg, repo, ticket)
+                    if promotion.get("phase") == "production_verified":
+                        revision = promotion["revision"]
+                        if receipt := completion(repo.name, ticket, revision):
+                            finish_verified(cfg, repo, ticket, revision, receipt)
+                    continue
                 row = progress(repo, ticket)
                 if row and row["evidence"] and row["destination"] == "arete-serve":
                     finish_verified(cfg, repo, ticket, row["revision"])
@@ -369,7 +504,7 @@ def command(args):
     cfg = config.load_required()
     repo = cfg.repo(args.repo)
     if args.action == "enroll":
-        answer = install(repo, args.ticket, args.policy_file)
+        answer = install(repo, args.ticket, args.policy_file, args.observer_file)
     elif args.action == "observe":
         data = goal(repo.name, args.ticket)
         need(data is not None, "release goal not enrolled")
