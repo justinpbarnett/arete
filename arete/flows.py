@@ -1317,7 +1317,7 @@ def retry_passed(verified: Verified) -> bool:
 
 
 @factory.step("verify")
-def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands: tuple[str, ...] = ()) -> Outcome:
+def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands: tuple[str, ...] = (), delivery_token="") -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
     check_only = single or bool(job.run.environment_release)
@@ -1328,7 +1328,8 @@ def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands
     else:
         check = pipeline.check_in_use if check_only else pipeline.verify_in_use
         verified = check(b, job.with_left(job.goal), job.build_summary,
-                         **({"covered_commands": covered_commands} if single and covered_commands else {}))
+                         **({"covered_commands": covered_commands} if single and covered_commands else {}),
+                         **({"delivery_token": delivery_token} if single and delivery_token else {}))
     if job.run.environment_release and not retry_passed(verified):
         return end_as("stop", "environment-held", verified=asdict(verified),
                       summary="Verification did not pass on the live release. The PR stays a draft.")
