@@ -53,6 +53,13 @@ def goal(repo, ticket):
         data = json.loads(zte.private_bytes(file, 32768))
     except FileNotFoundError:
         return None
+    from . import release_profile
+
+    profile = release_profile.read(repo)
+    if profile or "repository_profile" in data:
+        if not profile or data.get("repository_profile") != digest(profile):
+            return None
+        data = release_profile.apply(profile, data["promise"])
     validate(data)
     return data
 
@@ -132,7 +139,11 @@ def validate(data):
 
 
 def install(repo, ticket, source, observer_file=None):
-    value = json.loads(Path(source).read_bytes())
+    from . import release_profile
+
+    promise = json.loads(Path(source).read_bytes())
+    profile = release_profile.current(repo)
+    value = release_profile.apply(profile, promise) if profile else promise
     validate(value)
     file = policy_file(repo.name, ticket)
     if value["destination"] == "arete-serve":
@@ -152,7 +163,8 @@ def install(repo, ticket, source, observer_file=None):
     if "observer_sha256" in value:
         observer_bytes(value)
     with util.lock("release-" + key(repo.name, ticket), wait=True):
-        serve_guard.write(file, value)
+        need(release_profile.current(repo) == profile, "the release profile changed during enrollment")
+        serve_guard.write(file, {"repository_profile": digest(profile), "promise": promise} if profile else value)
     return {"repo": repo.name, "ticket": ticket, "policy": digest(value), "destination": value["destination"]}
 
 
@@ -348,8 +360,12 @@ def for_delivery(repo, ticket, revision, environment):
             return completion(repo, ticket, revision)
         if where not in ("", "staging", data["staging"].rstrip("/").casefold()):
             return None
-    elif where and where not in {data["destination"], str(data.get(data["destination"], "")).rstrip("/").casefold()}:
-        return None
+    elif where:
+        names = {data["destination"], str(data.get(data["destination"], "")).rstrip("/").casefold()}
+        if data["destination"] == "arete-serve":
+            names.add("production")
+        if where not in names:
+            return None
     return evidence(repo, ticket, revision)
 
 
@@ -358,12 +374,23 @@ def enrolled(repo):
     return sorted(file.stem for file in folder.glob("*.json"))
 
 
+def missing_staging_promise(repo, ticket):
+    from . import release_profile
+
+    if not isinstance(repo, config.Repo) or not release_profile.exists(repo.name):
+        return ""
+    release_profile.current(repo)
+    if not ticket or not goal(repo.name, str(ticket)):
+        return "Awaiting a protected ticket promise for the enrolled staging profile"
+    return ""
+
+
 def pr_check_options(repo, ticket, github, base):
     if not ticket or not isinstance(repo, config.Repo) or repo.github != github or not repo.pipeline or repo.target_branch != base:
         return {}
     if repo.unattended_environment == "staging" and required(repo.name, ticket):
         data = goal(repo.name, str(ticket))
-        if data["destination"] == "staging" and data.get("checks") and data["production_branch"] != base:
+        if data and data["destination"] == "staging" and data.get("checks") and data["production_branch"] != base:
             return {"stage_checks": data["checks"]["pr"]}
     return {}
 
@@ -382,7 +409,7 @@ def on_tip(repo, base, tip, previous=None):
     selected = []
     for ticket in enrolled(repo.name):
         data = goal(repo.name, ticket)
-        if data["destination"] != "arete-serve":
+        if not data or data["destination"] != "arete-serve":
             continue
         revision = data.get("revision") or merge_revision(repo, ticket, base)
         interval = False
@@ -442,7 +469,11 @@ def confirm_restore(repo, checkout, started_head, completed):
 
 
 def required(repo, ticket):
-    # A malformed enrolled file still withholds automatic tracker closure.
+    from . import release_profile
+
+    # A missing ticket promise or malformed enrolled file still withholds tracker closure.
+    if release_profile.exists(repo):
+        return True
     try:
         return policy_file(repo, str(ticket)).lstat() is not None
     except FileNotFoundError:
@@ -452,6 +483,9 @@ def required(repo, ticket):
 def progress(repo, ticket):
     data = goal(repo.name, ticket)
     if not data:
+        if missing_staging_promise(repo, ticket):
+            return {"repo": repo.name, "ticket": ticket, "destination": "staging", "status": "waiting_for_promise",
+                    "revision": "", "evidence": None, "completion": None}
         return None
     revision = data.get("revision") or merge_revision(repo, ticket, repo.target_branch or gh.default_branch(repo.github))
     proof = evidence(repo.name, ticket, revision) if revision else None
@@ -478,7 +512,9 @@ def finish_verified(cfg, repo, ticket, revision, delivered=None):
         tk.require_ordinary(ticket)
         gh.issue_close(repo.github, int(ticket), gh.marked(reason))
     elif isinstance(tk, tracker.JiraTracker):
-        tk.move_to(ticket, cfg.jira.landed.get(repo.target_branch, ""))
+        data = goal(repo.name, ticket)
+        branch = data.get("production_branch", repo.target_branch) if proof["destination"] == "production" else repo.target_branch
+        tk.move_to(ticket, cfg.jira.landed.get(branch, ""))
 
 
 def advance(cfg):

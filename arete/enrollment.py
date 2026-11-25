@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-from . import config, gh, jira, paths, refusals, settings, tracker, util
+from . import config, gh, jira, paths, refusals, release_profile, settings, tracker, util
 
 
 class Refused(refusals.Invalid, ValueError):
@@ -26,7 +26,7 @@ def config_snapshot() -> bytes | None:
 
 def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr",
            unattended_environment: str = "none", destination: str = "", jira_project: str = "",
-           jira_label: str = "", pipeline: bool = False, choose_project=None) -> config.Repo:
+           jira_label: str = "", pipeline: bool = False, choose_project=None, staging_profile: Path | None = None) -> config.Repo:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
         raise Refused("Use a repo name containing letters, numbers, hyphens or underscores.")
     checkout = paths.expand(checkout).resolve()
@@ -70,6 +70,7 @@ def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr"
             raise Refused("That Jira project and route label already belong to an enrolled repo.")
         row.update(jira_project=project, jira_site=client.base, jira_label=route)
     expected = config.repo_table(row)
+    profile = release_profile.prepare(expected, staging_profile) if staging_profile else None
 
     def verify(saved):
         return ("Enrollment did not read back as requested; config.toml is unchanged."
@@ -82,7 +83,17 @@ def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr"
         if text and not text.endswith("\n"):
             text += "\n"
         record = {key: json.dumps(value, ensure_ascii=False) for key, value in row.items()}
-        settings.write_checked(text + "\n[[repo]]\n" + "".join(f"{key} = {value}\n" for key, value in record.items()), verify)
+        if profile:
+            if release_profile.exists(name):
+                raise Refused("A saved staging profile already exists for this name; reconcile it before enrolling.")
+            # A poll must never see the new enabled repository before it can see the release boundary.
+            release_profile.store(expected, profile)
+        try:
+            settings.write_checked(text + "\n[[repo]]\n" + "".join(f"{key} = {value}\n" for key, value in record.items()), verify)
+        except (OSError, RuntimeError, ValueError):
+            if profile and config_snapshot() == original:
+                release_profile.location(name).unlink(missing_ok=True)
+            raise
     return expected
 
 
@@ -94,7 +105,8 @@ def show(cfg: config.Config, repo: config.Repo) -> dict:
     elif repo.tracker == "jira":
         destination.update(project=tracker.jira_project(repo, cfg.jira), route=tracker.route_label(repo),
                            site=repo.jira_site or None)
-    return {"name": repo.name, "destination": destination,
+    profile = release_profile.current(repo)
+    return {"name": repo.name, "destination": destination, **({"staging_profile": profile["settings"]} if profile else {}),
             "target_branch": {"value": repo.target_branch or layer.base_branch or None,
                               "source": "repo" if repo.target_branch else "legacy"},
             "landing": {"value": repo.landing or None, "source": "repo" if repo.landing else "legacy",
