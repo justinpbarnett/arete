@@ -258,9 +258,18 @@ def deployed_revision(data, origin):
 
 def browser_observation(data, origin, revision, destination):
     program = observer_bytes(data)
+    command = [sys.executable, "-I", "-c", program.decode()]
+    if destination == "candidate":
+        url = server_url(origin)
+        need(url.scheme == "http" and url.hostname in ("127.0.0.1", "::1") and url.port,
+             "candidate browser observation requires numeric loopback")
+        # Keep candidate page resources and redirects on the verifier's service port.
+        profile = (f'(version 1)(allow default)(deny network-outbound (remote ip "*:*"))'
+                   f'(allow network-outbound (remote tcp "localhost:{url.port}"))')
+        command = ["/usr/bin/sandbox-exec", "-p", profile, *command]
     with tempfile.TemporaryDirectory(prefix="arete-release-observer-") as folder:
         env = {"HOME": folder, "TMPDIR": folder, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
-        result = util.run_whole_tree([sys.executable, "-I", "-c", program.decode()], 120,
+        result = util.run_whole_tree(command, 120,
                                      json.dumps({"origin": origin, "path": data["path"], "revision": revision,
                                                  "destination": destination}).encode(),
                                      cwd=folder, env=env, graceful_timeout=True)

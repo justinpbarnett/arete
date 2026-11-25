@@ -222,6 +222,16 @@ def record_release(repo, ticket, revision, receipt_id, destination, *, regressio
             )
 
 
+def record_production_qa(repo, ticket, revision, comment):
+    """An accepted QA direction is a human intervention only on the path to production."""
+    with ledger(write=True) as conn:
+        if not conn.execute("SELECT 1 FROM cohorts WHERE repo=? AND destination='production'", (repo,)).fetchone():
+            return False
+        insert(conn, repo, str(ticket), "touch", comment["at"], comment["url"],
+               f"Production QA approved by {comment['actor']}", "production", revision)
+        return True
+
+
 def owner_intervention(result, observation):
     """Only record a newly advanced run under an authenticated human principal."""
     from . import principals

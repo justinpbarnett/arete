@@ -67,6 +67,7 @@ SCHEMA = {
         "missing_capability": {"type": "string"},
         "missing_tools": {"type": "array", "items": {"type": "string"}},
         "advisory_gaps": {"type": "array", "items": {"type": "string"}},
+        "pending_delivery": {"type": "string"},
     },
     "required": ["verdict", "summary", "checks"],
 }
@@ -325,8 +326,12 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
             lifetime["stopped"] = False
         try:
             wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+            if lifetime is not None:
+                lifetime["process"] = proc
             yield reach
         finally:
+            if lifetime is not None:
+                lifetime.pop("process", None)
             util.stop_group(proc)
             pump.join(util.GROUP_STOP_SECONDS)
             if lifetime is not None:
@@ -476,6 +481,8 @@ class Verified:
     advisory_gaps: list[str] = field(default_factory=list)
     nonblocking_reason: str = ""
     nonblocking_trees: dict[str, str] = field(default_factory=dict)
+    pending_delivery: str = ""
+    delivery_obligation: dict = field(default_factory=dict)
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
@@ -485,6 +492,8 @@ class Verified:
         unmeasured = [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
                 checks, found.get("blocked_by", "").strip(), unmeasured_requirements=unmeasured)
+        if isinstance(found.get("pending_delivery"), str):
+            v.pending_delivery = found["pending_delivery"]
         capability = found.get("missing_capability")
         v.missing_capability = capability.strip()[:2000] if isinstance(capability, str) else ""
         for key in ("missing_tools", "advisory_gaps"):
