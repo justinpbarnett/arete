@@ -61,7 +61,7 @@ def goal(repo, ticket):
             return None
         data = release_profile.apply(profile, data["promise"])
     validate(data)
-    return data
+    return {**data, "repository_profile": digest(profile)} if profile else data
 
 
 def server_url(value):
@@ -165,7 +165,8 @@ def install(repo, ticket, source, observer_file=None):
     with util.lock("release-" + key(repo.name, ticket), wait=True):
         need(release_profile.current(repo) == profile, "the release profile changed during enrollment")
         serve_guard.write(file, {"repository_profile": digest(profile), "promise": promise} if profile else value)
-    return {"repo": repo.name, "ticket": ticket, "policy": digest(value), "destination": value["destination"]}
+    return {"repo": repo.name, "ticket": ticket, "policy": digest({**value, "repository_profile": digest(profile)} if profile else value),
+            "destination": value["destination"]}
 
 
 def lookup(document, field):
