@@ -32,6 +32,7 @@ from . import (
 from .agent import EDIT_TOOLS, NO_SESSION, Session
 from .store import asks as asks_store
 from .store import chats as chats_store
+from .store import factory as factory_state
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -201,6 +202,9 @@ def published_baseline(repo: config.Repo) -> str:
 def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str = "", tools: list[str] | None = None,
            repo: str = "", budget_usd: float | None = None, task: bool = False, draft_pr: bool = False,
            chat: int = 0) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     prompt = prompt.strip()
     if not prompt:
         raise control.Refused("a session needs a first message")
@@ -251,6 +255,9 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
 
 
 def send(session_id: str, text: str) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     text = text.strip()
     if not text:
         raise control.Refused("write a message first")
@@ -637,21 +644,76 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     return "done", "reported: " + util.first_line(report["summary"], 200)
 
 
+def save_turn(c, spec, turn, prompt, session, phase):
+    c.execute("INSERT INTO session_checkpoints(run, turn, prompt, session, phase) VALUES(?,?,?,?,?) "
+              "ON CONFLICT(run) DO UPDATE SET turn=excluded.turn, prompt=excluded.prompt, "
+              "session=excluded.session, phase=excluded.phase",
+              (spec.id, turn, prompt, json.dumps(asdict(session)), phase))
+
+
+def continue_factory_session(session_id):
+    spec = load_spec(session_id)
+    with foundation.tx() as c:
+        factory_state.admit(c)
+        owner = factory_state.interrupted(session_id, c)
+        if not owner or owner["phase"] != "starting" or owner["cancelled"]:
+            return
+        point = c.execute("SELECT phase FROM session_checkpoints WHERE run=?", (session_id,)).fetchone()
+        if point and point["phase"] == "publishing":
+            raise control.Refused("Inspect the interrupted session publication before retrying")
+        if device_named(spec.device).kind in ("exe", "proxmox"):
+            source = device_named(spec.device)
+            retained = util.read_json(paths.RUNS_DIR / session_id / "factory-device.json", {})
+            if retained.get("source") != asdict(source):
+                raise control.Refused("The original device lease is unavailable or its configuration changed")
+        if not point and (SESSIONS_DIR / session_id / "session.log").exists():
+            transcript = [line for line in run_store.feed(session_id) if line["kind"] in ("you", "reply", "error")]
+            turns = sum(line["kind"] == "you" for line in transcript)
+            if not turns or transcript[-1]["kind"] == "you" or spec.task:
+                raise control.Refused("The older session log cannot confirm completion of the last turn or publication")
+            save_turn(c, spec, turns, "", NO_SESSION, "idle")
+        if not record.move(session_id, "running", ("interrupted", "stopped", "failed"),
+                           pid=None, finished=None, stop_asked=None, summary="Continuing factory-paused session"):
+            return
+        proc = control.detach(["session", "exec", session_id], SESSION_LOG)
+        record.note(session_id, pid=proc.pid)
+        factory_state.target(c, session_id, "continued", successor=session_id)
+
+
 def run_conversation(spec: Spec, cfg: config.Config, device: devices.Device) -> tuple[str, str]:
     status, summary = "done", ""
-    if spec.github:
+    with foundation.tx() as c:
+        factory_state.admit(c)
+        point = c.execute("SELECT * FROM session_checkpoints WHERE run=?", (spec.id,)).fetchone()
+        resume, turn, prompt = NO_SESSION, 0, spec.prompt
+        if point:
+            resume, turn, prompt = Session(**json.loads(point["session"])), point["turn"], point["prompt"]
+        else:
+            save_turn(c, spec, turn, prompt, resume, "turn")
+    if spec.github and not spec.cloned:
         clone_repo(spec, cfg, device)
-    resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
     idle_since = time.monotonic()
+    asked = None
     try:
         while True:
             if prompt:
                 turn += 1
                 resume = take_turn(spec, cfg, device, prompt, turn, resume)
+                with foundation.tx() as c:
+                    if spec.turn_error:
+                        factory_state.admit(c)
+                    save_turn(c, spec, turn, "", resume, "idle")
                 if spec.github:
+                    factory_state.admit()
                     return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
                 idle_since = time.monotonic()
-            prompt = "\n\n".join(asks_store.take_messages(spec.id))
+            with foundation.tx() as c:
+                factory_state.admit(c)
+                prompt = "\n\n".join(asks_store.take_messages(spec.id))
+                if prompt:
+                    save_turn(c, spec, turn, prompt, resume, "turn")
+                elif spec.task:
+                    save_turn(c, spec, turn, "", resume, "publishing")
             if prompt:
                 continue
             if spec.task:
@@ -662,9 +724,10 @@ def run_conversation(spec: Spec, cfg: config.Config, device: devices.Device) -> 
                 break
             time.sleep(INBOX_POLL_SECONDS)
     finally:
-        if spec.github and spec.cloned:
+        if spec.github and spec.cloned and not factory_state.interrupted(spec.id):
             return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
     if asked:
+        factory_state.admit()
         status, summary = conclude_task(spec, cfg, *asked)
     if spec.unreturned:
         status, summary = "failed", "the session's work did not come back from the device"
@@ -685,10 +748,13 @@ def execute(session_id: str) -> str:
                   devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
                                 lambda: unreturned_reason(spec)) as device):
                 status, summary = run_conversation(spec, cfg, device)
-                if summary:
+                if summary and not factory_state.interrupted(session_id):
                     close(spec, status, summary)
         except Exception as e:
             status, summary = devices.outcome_of(e, session_id)
+        if factory_state.interrupted(session_id) and status != "done":
+            record.settle(session_id, "interrupted", summary="Paused by the factory switch")
+            return "interrupted"
         close(spec, status, devices.with_left_up(summary, session_id))
         return status
 

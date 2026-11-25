@@ -181,6 +181,10 @@ def dead(row: dict):
 
 
 def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dict | None:
+    from .store import factory
+
+    if factory.interrupted(row["id"]):
+        return None
     status = dead_status(row)
     summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
     run_id = row["id"]

@@ -84,6 +84,10 @@ def insert(table, fields, identity=None, kind=None):
     if identity is not None:
         values[IDENTITY[table]] = identity
     with atomic() as c:
+        if table in ("tasks", "runs"):
+            from . import factory
+
+            factory.admit(c)
         cursor = c.execute(f"INSERT INTO {table} ({', '.join(values)}) VALUES ({','.join('?' for _ in values)})",
                            tuple(values.values()))
         identity = identity if identity is not None else cursor.lastrowid

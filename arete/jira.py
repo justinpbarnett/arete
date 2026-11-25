@@ -112,6 +112,8 @@ class Client:
             headers["Content-Type"] = "application/json"
         retries = 0 if single_attempt else RETRIES
         for attempt in range(retries + 1):
+            from .store import factory
+            factory.check_worker()
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:

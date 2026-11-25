@@ -102,6 +102,9 @@ def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> di
 
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False,
          publication=None) -> str:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     kind = delivery["type"]
     try:
         args = delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg

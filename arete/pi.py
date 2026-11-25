@@ -976,7 +976,10 @@ def mcp_servers(mcp_config: str) -> dict:
 def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budget_usd: float | None,
            cost_of: Callable[[str], float],
            on_line: Callable[[str], None], *, pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.CompletedProcess, str]:
-    proc = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    from . import factory_control
+    from .store import factory
+
+    key, proc = factory_control.spawn(scratch.spawn, cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, errors="replace", env=env, pass_fds=pass_fds,
                          actor_confined=bool(cmd and cmd[0] == "/usr/bin/sandbox-exec"))
     stderr: list[str] = []
@@ -1003,6 +1006,7 @@ def stream(cmd: list[str], cwd: str | None, env: dict, timeout: float, max_budge
             proc.kill()
             proc.wait()
         child.release(proc)
+        factory.forget(key)
     reader.join(5)
     done = subprocess.CompletedProcess(cmd, proc.returncode, "".join(lines), "".join(stderr))
     return done, over_budget or (f"timed out after {timeout:g}s" if out_of_time.is_set() else "")

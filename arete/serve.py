@@ -10,7 +10,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -19,6 +19,7 @@ from typing import NoReturn, TextIO
 
 from . import (
     alerts,
+    factory_control,
     backup,
     capture,
     chat,
@@ -59,6 +60,7 @@ from . import (
 from .loops import Loop
 from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import factory as factory_state
 from .store import incidents as incident_store
 from .store import loops as loop_store
 from .store import runs as run_store
@@ -343,12 +345,13 @@ class Server:
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
-        self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
+        self.pool = factory_control.WorkPool(POLL_THREADS, thread_name_prefix="poll")
         self.db_future: Future | None = None
         self.db_lock = threading.Lock()
         self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
                           "finished_at": None, "error": None}
         restarted = RESTARTED_FOR_NEW_CODE in os.environ
+        self.schedule_resumed = ""
         self.loaded = restarted
         self.workspace_contract_children = foundation.live_serve_children(foundation.inherited_serve_children())
         self.inherited = {pid for pid, _ in self.workspace_contract_children}
@@ -379,8 +382,9 @@ class Server:
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
+        self.factory_suspended = False
         self.contracts_waiting = False
-        self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
+        self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
 
     def say(self, text: str) -> None:
@@ -456,6 +460,23 @@ class Server:
             return False
         if self.contracts_waiting:
             return False
+        state = factory_state.view() if factory_state.available() else {"phase": "on", "version": 1}
+        self.factory_suspended = state["phase"] != "on"
+        if self.factory_suspended:
+            return True
+        with factory_control.activity("scheduler", state["version"]):
+            return self.run_scheduled_work(state)
+
+    def run_scheduled_work(self, state) -> bool:
+        if state["version"] > 1 and self.schedule_resumed != state["version"]:
+            resumed = util.parse_iso(state["changed"])
+            for loop in self.live:
+                if loop.trigger.cron or loop.trigger.every:
+                    old = loop_store.loop_state(loop.name)
+                    if not old.get("last_fire") or util.parse_iso(old["last_fire"]) < resumed:
+                        loop_store.set_loop_state(loop.name, last_fire=state["changed"], next_due=next_due(loop, resumed))
+            self.loaded = True
+            self.schedule_resumed = state["version"]
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
@@ -476,6 +497,7 @@ class Server:
             ("remind", self.remind, ()),
         )
         for name, action, args in stages:
+            factory_state.admit()
             self.guard(f"stage:{name}", action, *args)
         tick_stages = {"stage:reap", *(f"stage:{name}" for name, _, _ in stages)}
         return states is not None and not any(key in tick_stages or key.startswith("loop:") for key in self.failing)
@@ -563,6 +585,9 @@ class Server:
         completed = self.guard("tick", self.tick)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
+        if self.contracts_waiting or self.factory_suspended:
+            self.beat()
+            return
         self.guard("stage:alerts", self.watch_alerts)
         if self.checkout_update.acquire(blocking=False):
             try:
@@ -886,8 +911,10 @@ class Server:
             loop_store.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
-        queued = sources.fire(loop, trigger)
-        loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+        with foundation.tx() as c:
+            factory_state.admit(c)
+            queued = sources.fire(loop, trigger)
+            loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
     def poll(self, loop: Loop) -> None:
@@ -973,8 +1000,12 @@ class Server:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-            if (c := source_store.cursor(sid)) is not None:
-                source_store.set_cursor(sid, c["value"], False, text)
+            if isinstance(e, factory_state.Off):
+                return
+            with foundation.tx() as connection:
+                factory_state.admit(connection)
+                if (c := source_store.cursor(sid)) is not None:
+                    source_store.set_cursor(sid, c["value"], False, text)
             if self.errors.get(sid) != text:
                 self.say(f"{sid}: poll failed: {text}")
             self.errors[sid] = text
@@ -990,6 +1021,7 @@ class Server:
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
         self.settle("queue:", {str(i) for i in ids})
         for item in pending:
+            factory_state.admit()
             self.guard(f"queue:{item['id']}", self.dispatch_queued, item, by_name, slots)
 
     def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
@@ -999,7 +1031,9 @@ class Server:
     def dispatch_queued_as_rule(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
-            loop_store.drop_queue_item(item["id"])
+            with foundation.tx() as c:
+                factory_state.admit(c)
+                loop_store.drop_queue_item(item["id"])
             self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
             return
         why = self.dispatch_item(item, loop, slots)
@@ -1313,6 +1347,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
         server.report_config()
         for note in start_notes(server.cfg):
             server.say(note)
+        factory_control.notify()
         if with_dashboard:
             threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
         while True:

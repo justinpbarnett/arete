@@ -398,6 +398,9 @@ class NeverBegan(control.Refused):
 
 def launch(name: str, *, item: int | None = None, events: list[dict] | None = None, trial: bool = False,
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
     try:
@@ -482,6 +485,10 @@ def carry(run: LoopRun) -> str:
         if status == "stopped":
             how = "dead" if summary == record.STOPPED else "retry"
     summary = devices.with_left_up(summary, run.id)
+    from .store import factory
+    if factory.interrupted(run.id):
+        if status != "done":
+            return settle(run, "interrupted", "Paused by the factory switch")
     loop_store.end_claim(run.id, "dead" if status == "failed" else how, summary)
     return settle(run, status, summary)
 

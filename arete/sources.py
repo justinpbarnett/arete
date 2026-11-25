@@ -82,7 +82,10 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
 
 
 def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
-    with foundation.tx():
+    from .store import factory
+
+    with foundation.tx() as c:
+        factory.admit(c)
         if events is None:
             return [item] if (item := loop_store.enqueue(loop.name, loop.queue_name, "", how)) else []
         batches: dict[str, list[dict]] = {}
@@ -137,10 +140,15 @@ def shown(keys: list[str]) -> str:
 
 
 def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tuple[list[dict], list[int]]:
+    from .store import factory
+
+    version = factory.admit()
     source = loop.sources[index]
     sid = source_id(loop, index)
     kind = SOURCES[source["type"]]
-    adopt_history(loop, index, source, sid)
+    with foundation.tx() as c:
+        factory.admit(c, version=version)
+        adopt_history(loop, index, source, sid)
     started = util.iso()
     owner = fingerprint(source)
     known = source_store.cursor(sid)
@@ -151,7 +159,8 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
-    with foundation.tx():
+    with foundation.tx() as c:
+        factory.admit(c, version=version)
         claimed = set(source_store.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:

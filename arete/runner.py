@@ -248,6 +248,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
         max_steps: int | None = None, claude_tools: tuple[str, ...] = (), **kw) -> Result:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     cfg = cfg or config.load()
     if settings and settings.requires.delegation_only:
         kw.update(tools=[], allowed_tools=[], disallowed_tools=[], instructions=[], mcp_config="", add_dirs=[],

@@ -100,12 +100,21 @@ def receive(name: str, headers, body: bytes) -> dict:
     if not loop or not loop.trigger.webhook:
         raise Stated(404, f"No webhook for {name}.")
     check(name, headers, body)
+    from .store import factory
+    try:
+        version = factory.admit()
+    except factory.Off as error:
+        raise Stated(503, str(error)) from error
     if not loop.enabled or loop.error:
         raise Stated(409, f"The loop {name} is turned off.")
     e = event_of(name, headers, body)
     if why := loop.trigger.refusal(e):
         raise Stated(403, f"The loop {name} {why}.")
-    with foundation.tx():
+    with foundation.tx() as c:
+        try:
+            factory.admit(c, version=version)
+        except factory.Off as error:
+            raise Stated(503, str(error)) from error
         if not delivery_id(headers):
             source_store.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
         if not source_store.claim_seen(e["source"], [e["key"]]):
