@@ -257,7 +257,7 @@ def fetch(data, revision, destination, origin=None):
     return json.loads(raw)
 
 
-def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned="", origin=None):
+def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned="", origin=None, check_destination=None):
     need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision), "a full release revision is required")
     data = goal(repo, ticket)
     need(data, "no protected release check is enrolled for this goal")
@@ -275,7 +275,11 @@ def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=
              and url.hostname.endswith("." + suffix), "untrusted immutable preview URL")
         proof["origin"] = origin
     try:
+        if check_destination:
+            check_destination()
         body = fetch(data, revision, destination, origin)
+        if check_destination:
+            check_destination()
         proof["observed"] = compare(body, data["recovery" if recovery else "assertions"])
         proof["status"] = "verified"
     except AssertionError as error:
@@ -330,6 +334,21 @@ def completion(repo: str, ticket: str, revision: str) -> dict | None:
         return None
     receipt = serve_guard.read(state_dir(repo, ticket) / revision / "production" / "behavior" / "latest.json") or {}
     return receipt if receipt.get("status") == "verified" and receipt.get("receipt_id") == state.get("production_receipt") else None
+
+
+def for_delivery(repo, ticket, revision, environment):
+    data = goal(repo, ticket)
+    if not data:
+        return None
+    where = (environment or "").strip().rstrip("/").casefold()
+    if data["destination"] == "staging":
+        if where in ("production", data["production"].rstrip("/").casefold()):
+            return completion(repo, ticket, revision)
+        if where not in ("", "staging", data["staging"].rstrip("/").casefold()):
+            return None
+    elif where and where not in {data["destination"], str(data.get(data["destination"], "")).rstrip("/").casefold()}:
+        return None
+    return evidence(repo, ticket, revision)
 
 
 def enrolled(repo):

@@ -37,6 +37,30 @@ def preview(repo, policy, revision):
     return ""
 
 
+def selected_revision(repo, ticket):
+    return proof.merge_revision(repo, ticket, repo.target_branch)
+
+
+def observe_staging(repo, ticket, revision, *, pinned=""):
+    policy = proof.goal(repo.name, ticket)
+    proof.need(policy and policy["destination"] == repo.unattended_environment == "staging"
+               and repo.pipeline and repo.landing == "pr" and repo.target_branch != policy["production_branch"],
+               "no eligible staging enrollment")
+    proof.need(serve_guard.SHA.fullmatch(revision or "") and (not policy.get("revision") or policy["revision"] == revision),
+               "the release revision differs from the protected policy")
+    origin = preview(repo, policy, revision)
+    proof.need(origin, "waiting for the matching successful staging deployment")
+    if checks := policy.get("checks", {}).get("staging"):
+        proof.need(gh.merge_ci_passed(repo.github, revision, stage_checks=checks), "staging checks have not passed")
+
+    def check_destination():
+        proof.need(proof.deployed_revision(policy, policy["staging"]) == revision and preview(repo, policy, revision) == origin,
+                   "staging or its immutable deployment changed during observation")
+
+    return proof.observe(repo.name, ticket, revision, pinned=pinned or proof.digest(policy),
+                         origin=origin if policy.get("immutable_host_suffix") else None, check_destination=check_destination)
+
+
 def branch(repo, name):
     row = gh.gh_json(["api", f"repos/{repo.github}/git/ref/heads/{quote(name, safe='/')}"], timeout=15, retry=False)
     value = row.get("object") or {}
@@ -133,7 +157,7 @@ def ready(cfg, repo, ticket, policy, state):
     proof.need(choices, "waiting for a new QA instruction for the tested revision")
     proof.need(repo.unattended_environment == "staging" and repo.target_branch != target
                and proof.digest(proof.goal(repo.name, ticket)) == state["policy"], "release policy changed")
-    proof.need(branch(repo, repo.target_branch) == revision and proof.merge_revision(repo, ticket, repo.target_branch) == revision,
+    proof.need(branch(repo, repo.target_branch) == revision and selected_revision(repo, ticket) == revision,
                "the staging branch or goal changed; fresh QA is required")
     proof.need(parent(repo, revision) == branch(repo, target) == proof.deployed_revision(policy, policy["production"]),
                "promotion would include other unapproved changes or production identity is unconfirmed")
@@ -183,7 +207,7 @@ def _advance(cfg, repo, ticket, file):
         else:
             state["waiting"] = found["reason"]
         return state
-    revision = proof.merge_revision(repo, ticket, repo.target_branch)
+    revision = selected_revision(repo, ticket)
     proof.need(revision and serve_guard.SHA.fullmatch(revision), "waiting for the enrolled ticket's merged staging PR")
     proof.need(not policy.get("revision") or policy["revision"] == revision, "goal release differs from the pinned revision")
     tk, _, scope, _ = authority(cfg, repo, ticket, policy, revision)
@@ -194,21 +218,15 @@ def _advance(cfg, repo, ticket, file):
     proof.need(state["policy"] == proof.digest(policy) and state["scope"] == scope,
                "the tested behavior changed; a corrected staging revision and fresh QA are required")
     if state["phase"] == "observing_staging":
-        origin = preview(repo, policy, revision)
-        proof.need(origin, "waiting for the matching successful staging deployment")
-        proof.need(proof.deployed_revision(policy, policy["staging"]) == revision,
-                   "the stable staging address has not activated the tested revision")
-        found = proof.observe(repo.name, ticket, revision, pinned=state["policy"],
-                              origin=origin if policy.get("immutable_host_suffix") else None)
+        found = observe_staging(repo, ticket, revision, pinned=state["policy"])
         if found["status"] != "verified":
             state["waiting"] = found["reason"]
             return state
-        state.update(origin=origin, staging_receipt=found["receipt_id"])
+        state.update(origin=found.get("origin") or policy["staging"].rstrip("/"), staging_receipt=found["receipt_id"])
         note(tk, repo, ticket, state, file, policy, found)
         return state
     approval = ready(cfg, repo, ticket, policy, state)
-    result = proof.observe(repo.name, ticket, revision, pinned=state["policy"],
-                           origin=state["origin"] if policy.get("immutable_host_suffix") else None)
+    result = observe_staging(repo, ticket, revision, pinned=state["policy"])
     proof.need(result["status"] == "verified", "the staged behavior no longer passes its protected check")
     proof.need(ready(cfg, repo, ticket, policy, state) == approval, "QA authorization changed during verification")
     state.update(phase="promotion_intent", approval=approval, parent=parent(repo, revision),

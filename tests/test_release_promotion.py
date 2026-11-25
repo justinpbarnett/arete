@@ -97,6 +97,9 @@ class StagingRelease(unittest.TestCase):
         self.assertEqual(self.advance()["phase"], "awaiting_qa")
         self.assertEqual(len(self.notes), 1)
         self.assertEqual(proof.evidence("product", "12", self.new)["destination"], "staging")
+        self.assertIsNotNone(proof.for_delivery("product", "12", self.new, "staging"))
+        self.assertIsNone(proof.for_delivery("product", "12", self.new, "production"))
+        self.assertIsNone(proof.for_delivery("product", "12", self.new, "other"))
         self.comment("untrusted", "Promote " + self.new + " to production", 24)
         self.comment("tester", "looks good", 25)
         self.assertEqual(self.advance()["phase"], "awaiting_qa")
@@ -109,6 +112,12 @@ class StagingRelease(unittest.TestCase):
         self.assertEqual(self.advance()["phase"], "production_verified")
         self.assertEqual(self.advance()["phase"], "production_verified")
         self.assertEqual(self.posts, [self.new])
+        self.assertEqual(proof.for_delivery("product", "12", self.new, self.prod_url)["destination"], "production")
+
+    def test_stable_address_moving_during_graph_observation_invalidates_the_receipt(self):
+        with mock.patch.object(proof, "deployed_revision", side_effect=[self.new, self.new, self.new, self.other]):
+            self.assertEqual(promotion.observe_staging(self.repo, "12", self.new)["status"], "blocked")
+        self.assertIsNone(proof.for_delivery("product", "12", self.new, "staging"))
 
     def test_changed_scope_or_unapproved_parent_holds_production(self):
         self.assertEqual(self.advance()["phase"], "awaiting_qa")
