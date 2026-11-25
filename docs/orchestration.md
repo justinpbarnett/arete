@@ -347,3 +347,11 @@ workflow blob and directory digest, protected witness base and tests digest, Git
 and stale results keep the gate closed. The other check commands still run locally. A hosted pass lets the ordinary
 independent review and behavioral-verification gates proceed. An already-held ticket uses the existing runner
 readiness confirmation to resume once the enrolled route is available.
+
+## Delivery points for graph prerequisites
+
+A published spec can schedule independent children together up to the configured worker capacity. An unqualified prerequisite or `api@merge` waits for verified behavior on the child and its reviewed PR head to be merged into the enrolled target branch. Use `service@release` when the consumer needs the deployed behavior. That edge requires a protected release receipt for the merged change.
+
+Use `publisher@artifact=@team/library:1.2.3` when the consumer needs a specific published version. Enroll a protected read-only observation of the package registry or artifact endpoint on the publisher ticket. Its receipt must identify the merged change and match the exact string values in `/name` and `/version`. Publishing a different version leaves the consumer waiting. Include the package name and version in the approved spec so the plan reviewer can check them.
+
+The parent stays open after its children merge. Arete checks its enrolled scenario against the release containing those changes and records the observed revision on the parent. A production promise in a staging-only repository also waits for the tested revision’s QA and production receipt.

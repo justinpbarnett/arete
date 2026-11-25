@@ -13,6 +13,7 @@ from .store.specgraphs import GraphKey, Receipt
 
 MAX_CHILDREN = 20
 KEY = re.compile(r"[a-z][a-z0-9-]{0,39}")
+ARTIFACT = re.compile(r"artifact=(@?[A-Za-z0-9][A-Za-z0-9._/-]{0,127}):([0-9]+(?:\.[0-9]+)+(?:[-+][0-9A-Za-z.-]+)?)")
 DECLARED = re.compile(r"Child issues:[ \t]*(.*)", re.IGNORECASE)
 TASK = re.compile(r"^ {0,3}(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)?\[[ xX]\][ \t]+(.*)")
 TASK_TARGET = re.compile(r"^(?:\[[^\]\n]+\]\(([^\s)]+)\)|<([^\s>]+)>|(\S+))")
@@ -77,15 +78,19 @@ def proposal(raw, candidates):
             raise Held("to-tickets needs unique prerequisite keys for each child")
         if not isinstance(checks, list) or not 1 <= len(checks) <= 10:
             raise Held(f"{key} must have one to ten verifiable acceptance checks")
-        merged, released = [], []
+        merged, released, artifacts = [], [], {}
         for prerequisite in requires:
             name, separator, point = prerequisite.partition("@")
-            if not KEY.fullmatch(name) or separator and point not in ("merge", "release") or name in merged:
-                raise Held("use a unique prerequisite key with an optional @merge or @release delivery point")
+            artifact = ARTIFACT.fullmatch(point)
+            if (not KEY.fullmatch(name) or name in merged or
+                    (separator and point not in ("merge", "release") and not artifact)):
+                raise Held("use a unique prerequisite key with @merge, @release or @artifact=package:version")
             merged.append(name)
             if point == "release":
                 released.append(name)
-        nodes.append({"release_requires": released, "key": key, "existing": existing, "requires": merged, "title": clean(row["title"], 160),
+            if artifact:
+                artifacts[name] = {"name": artifact[1], "version": artifact[2]}
+        nodes.append({"artifacts": artifacts, "release_requires": released, "key": key, "existing": existing, "requires": merged, "title": clean(row["title"], 160),
                       "outcome": clean(row["outcome"], 1000), "checks": [clean(check, 750) for check in checks]})
     if candidates.keys() - adopted:
         raise Held("to-tickets did not account for existing children: " + ", ".join(sorted(candidates.keys() - adopted)))
@@ -113,7 +118,8 @@ TO_TICKETS = """Run to-tickets: inspect the prepared target checkout and break t
 of separately testable behavior changes. Return direct with no children if it should ship on the spec itself.
 Use the explicit owner-required final environment. Leave it blank for the enrolled default.
 For a split, give each child a stable lowercase key, title, observable outcome and one to ten concrete acceptance
-checks. Append @release to prerequisite keys whose behavior must already be observed on the running release. A prerequisite key means its outcome must exist before this child can be verified; do not add ordering
+checks. Use key@artifact=package:1.2.3 for a consumer that needs a specific published package, with its owner-stated exact version.
+Append @release to prerequisite keys whose behavior must already be observed on the running release. A prerequisite key means its outcome must exist before this child can be verified; do not add ordering
 for convenience. Existing is an exact ticket ID from the supplied evidence or an empty string for missing work.
 Use every supplied existing ID once, without guessing by title or copying work already published. Include closed
 children where they already delivered a slice. Do not alter files, contact trackers or propose unrelated work.

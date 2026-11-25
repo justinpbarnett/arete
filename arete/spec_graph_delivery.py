@@ -33,13 +33,20 @@ def child_landing(repo, ticket, targets):
     return result
 
 
-def usable(repo, node, mapped, graph, *, released=False):
+def usable(repo, node, mapped, graph, *, released=False, artifact=None):
     from . import release_proof
 
     ticket = mapped[node][0]
     landed = child_landing(repo, ticket, graph["targets"])
-    if released and (not landed or not all(release_proof.evidence(repo, ticket, t["commit"]) for t in landed)):
-        return []
+    if artifact or released:
+        for target in landed:
+            receipt = release_proof.evidence(repo, ticket, target["commit"])
+            if not receipt:
+                return []
+            if artifact:
+                fields = {f["field"]: f["value_sha256"] for f in receipt.get("observed", [])}
+                if any(fields.get("/" + k) != release_proof.digest(v) for k, v in artifact.items()):
+                    return []
     return landed
 
 
@@ -58,7 +65,8 @@ def satisfied_native(source, child, blockers):
     by_ref = {ref: name for name, (ref, _) in mapped.items()}
     dependent = next((n for n in graph["plan"]["children"] if n["key"] == by_ref.get(str(child))), {})
     return {ref for ref in blockers if (name := by_ref.get(str(ref))) and
-            usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []))}
+            usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []),
+                   artifact=dependent.get("artifacts", {}).get(name))}
 
 
 def active_child_blocker(run):
@@ -114,8 +122,10 @@ def ready(source, remote, key, ref):
                 return f"external prerequisite {block} is still open"
         for dep in sorted(prerequisites):
             released = dep in node.get("release_requires", [])
-            if not usable(source.repo.name, dep, mapped, data, released=released):
-                return f"waiting for {mapped[dep][0]} to reach its required {'release' if released else 'merge'}"
+            artifact = node.get("artifacts", {}).get(dep)
+            if not usable(source.repo.name, dep, mapped, data, released=released, artifact=artifact):
+                point = f"{artifact['name']} {artifact['version']}" if artifact else "release" if released else "merge"
+                return f"waiting for {mapped[dep][0]} to reach its required {point}"
     except (OSError, *spec_tracker.READ_ERRORS) as error:
         return f"the reviewed spec graph could not be confirmed: {error}"
     return ""
