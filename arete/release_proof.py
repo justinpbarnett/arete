@@ -97,7 +97,7 @@ def validate(data):
          "production_branch", "immutable_host_suffix", "checks", "qa_require_revision"} and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
-    need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]+", path) and "//" not in path
+    need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]*", path) and "//" not in path
          and "%" not in path and not any(part in (".", "..") for part in path.split("/")), "invalid read-only path")
     steps(data.get("assertions"))
     steps(data.get("recovery"))
