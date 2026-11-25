@@ -328,7 +328,7 @@ A suppressed nested macOS sandbox profile can block the behavior suite before th
 The local owner can enroll Arete’s own GitHub repository by creating `hosted-macos.toml` in the private Arete config
 directory. Set `repo = "justinpbarnett/arete"` and set `workflow_blob` to the quoted Git blob ID printed by
 `git rev-parse origin/main:.github/workflows/ci.yml` after the candidate-check workflow reaches protected main.
-Removing the file disables new requests. Changing the workflow requires a new owner pin.
+Removing the file disables new requests and invalidates cached hosted passes. Changing the workflow requires a new owner pin.
 
 An authorized orchestrated ticket on this repo can then request the existing read-only `arete-checks` macOS job
 when its only failing check is the recognized behavior-suite profile denial. Arete applies its full outbound diff

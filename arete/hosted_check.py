@@ -36,6 +36,17 @@ def pin():
     return value
 
 
+def current(result):
+    receipt = result.get("hosted_check")
+    if not receipt:
+        return True
+    try:
+        return (receipt.get("status") == "success" and receipt.get("exit") == 0
+                and receipt.get("workflow_blob") == pin() and bool(receipt.get("workflow_blob")))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def git(wt, *args, **kw):
     return util.git(list(args), wt, timeout=30, retry=False, **kw).strip()
 

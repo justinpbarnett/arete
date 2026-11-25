@@ -635,6 +635,8 @@ class Job:
         if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
             self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
             return False
+        if name == "checks" and not hosted_check.current(outcome.data):
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
