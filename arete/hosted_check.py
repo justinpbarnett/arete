@@ -144,7 +144,7 @@ def result(receipt):
                 receipt["exit"] = exits[0]
             if row["conclusion"] == "success":
                 required = {"Select check candidate", "Existing behavior checks", "Observe the protected worker isolation check",
-                            "Python lint, compilation and imports", "JavaScript syntax"}
+                            "Replay protected factory regressions", "Python lint, compilation and imports", "JavaScript syntax"}
                 pilot.require(receipt.get("exit") == 0 and required <= passed, "the full hosted macOS check did not run")
 
 

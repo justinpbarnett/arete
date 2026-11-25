@@ -126,7 +126,7 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
             seq = events.emit("task.start_requested", f"task:{tid}", cls="derived", task=tid,
                               data={"repo": repo.name, "ticket": tid})
             claims.claim(claim, seq)
-    return begin(cfg, repo, tid, force=force, poller_picks=False)
+    return begin(cfg, repo, tid, force=force, poller_picks=False, owner_forcing=force)
 
 
 def recover_start(claim, force=True):
@@ -160,7 +160,7 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")
 
 
-def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
+def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if pending := pending_start(repo.name, tid):
             return pending
@@ -175,7 +175,12 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         if state == SLOT_QUEUE_FAILED:
             return queued(repo, tid, NO_SLOT_AT_START, poller_picks)
         if state != "exited":
-            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
+            result = answer(tid, repo.name, new, state, "started" if new else "child is starting")
+            if owner_forcing:
+                from . import cohorts
+
+                cohorts.owner_intervention(result, "owner-forced start")
+            return result
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
     raise did_not_show(repo, tid)

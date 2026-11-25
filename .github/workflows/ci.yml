@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 0
       - name: Select check candidate
         if: startsWith(github.ref, 'refs/heads/arete-check/')
         run: git checkout --detach "$GITHUB_SHA^2"
@@ -66,6 +66,20 @@ jobs:
       - name: Behavior suite exit ${{ steps.behavior.outputs.exit_code }}
         if: ${{ !cancelled() && steps.behavior.outputs.exit_code != '' }}
         run: 'true'
+      - name: Replay protected factory regressions
+        env:
+          POLICY_REV: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eu
+          policy=.github/workflows/cohort-regressions
+          source="$POLICY_REV"
+          case "$GITHUB_REF" in refs/heads/arete-check/*) source="$GITHUB_SHA^1";; esac
+          git cat-file -e "$source^{commit}"
+          # Only the installation predates the protected cases.
+          if ! git cat-file -e "$source:$policy/run.py"; then source=HEAD; fi
+          guard_dir=$(mktemp -d)
+          git archive "$source" "$policy" | tar -x -C "$guard_dir"
+          .venv/bin/python -I -B "$guard_dir/$policy/run.py" --candidate "$PWD" --calibrate
       - name: Python lint, compilation and imports
         run: |
           sh tools/lint-arete
