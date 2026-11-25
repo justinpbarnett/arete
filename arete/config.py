@@ -119,6 +119,10 @@ class Part:
     github: str
 
 
+LANDING_METHODS = ("pr", "direct-push")
+DEPLOYMENT_ENVIRONMENTS = ("none", "development", "staging", "production")
+
+
 @dataclass
 class Repo:
     name: str
@@ -133,6 +137,16 @@ class Repo:
     layer: Path | None = None
     parts: list[Part] = field(default_factory=list)
     jev: bool = True
+    jira_site: str = ""
+    target_branch: str = ""
+    landing: str = ""
+    unattended_environment: str = ""
+
+    def allows_unattended_deploy(self, environment: str) -> bool:
+        return (environment in DEPLOYMENT_ENVIRONMENTS[1:] and
+                (not self.unattended_environment or
+                 DEPLOYMENT_ENVIRONMENTS.index(environment) <=
+                 DEPLOYMENT_ENVIRONMENTS.index(self.unattended_environment)))
 
     @property
     def layer_dir(self) -> Path:
@@ -157,6 +171,7 @@ class JiraConfig:
     auto_per_refresh: int = 3
     sprint_only: bool = True
     skip_types: list[str] = field(default_factory=list)
+    github_owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -427,6 +442,14 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
+    if isinstance(value, Config):
+        if "jira" in data:
+            data["jira"] = {key: field for key, field in data["jira"].items() if key != "github_owner"}
+        if not sparse:
+            for repo in data["repos"]:
+                for key in ("jira_site", "target_branch", "landing", "unattended_environment"):
+                    if not repo[key]:
+                        del repo[key]
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
     if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
@@ -1143,9 +1166,13 @@ def load_required() -> Config:
 
 
 def jira_table(j: dict) -> JiraConfig:
+    owner = j.get("github_owner", "")
+    if not isinstance(owner, str) or owner and not re.fullmatch(r"[A-Za-z0-9-]+", owner):
+        raise ValueError("[jira] github_owner must be a GitHub organization name")
     return JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
         project=j.get("project", ""),
+        github_owner=owner,
         transitions=moves_table(j, "transitions", {"merged": "merges move tickets through [jira.landed]",
                                                             DELIVERED: "research tickets move through [jira.research]"}),
         research=moves_table(j, "research"),
@@ -1192,7 +1219,30 @@ def github_app_table(app: dict) -> GithubApp:
     return found
 
 
+def valid_target_branch(value: object) -> bool:
+    return (isinstance(value, str) and bool(value) and value != "HEAD"
+            and not value.startswith(("-", "refs/")) and not value.endswith(".")
+            and not re.search(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{", value)
+            and all(part and not part.startswith(".") and not part.endswith(".lock") for part in value.split("/"))
+            and value != "@")
+
+
 def repo_table(repo: dict) -> Repo:
+    for key, choices in (("landing", LANDING_METHODS), ("unattended_environment", DEPLOYMENT_ENVIRONMENTS)):
+        if key in repo and repo[key] not in choices:
+            raise ValueError(f"repo {repo['name']}: {key} must be one of {', '.join(choices)}")
+    if "target_branch" in repo and not valid_target_branch(repo["target_branch"]):
+        raise ValueError(f"repo {repo['name']}: target_branch must be a Git branch name")
+    site = repo.get("jira_site", "")
+    if "jira_site" in repo:
+        from . import jira
+
+        try:
+            valid_site = isinstance(site, str) and jira.checked_base(site) == site
+        except (ValueError, jira.JiraError):
+            valid_site = False
+        if not valid_site:
+            raise ValueError(f"repo {repo['name']}: jira_site must be a Jira base URL without a trailing slash")
     tracker = repo.get("tracker", "github")
     if tracker not in configschema.enum("config_toml", "properties", "repo", "items", "properties", "tracker"):
         raise ValueError(f"repo {repo['name']}: tracker must be github, jira or local, not '{tracker}'")
@@ -1214,6 +1264,10 @@ def repo_table(repo: dict) -> Repo:
         layer=paths.expand(repo["layer"]) if repo.get("layer") else None,
         parts=parts or ([Part("", github)] if github else []),
         jev=bool(repo.get("jev", True)),
+        jira_site=site,
+        target_branch=repo.get("target_branch", ""),
+        landing=repo.get("landing", ""),
+        unattended_environment=repo.get("unattended_environment", ""),
     )
 
 

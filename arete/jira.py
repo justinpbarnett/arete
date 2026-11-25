@@ -177,6 +177,21 @@ class Client:
     def issue(self, key: str, fields: list[str]) -> dict:
         return _read_description(self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {})
 
+    def project_key(self, key: str) -> str:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]+", key):
+            raise ValueError("enter a Jira project key, such as APP")
+        row = self.get(f"/rest/api/3/project/{_path_segment(key)}")
+        if not isinstance(row, dict) or row.get("key") != key or row.get("archived"):
+            raise JiraError(f"Jira did not confirm an active project with key {key}")
+        return key
+
+    def subtask_type(self, project: str) -> str:
+        types = self._paged(f"/rest/api/3/issue/createmeta/{_path_segment(project)}/issuetypes", key="issueTypes")
+        ids = {row.get("id") for row in types if row.get("subtask") is True and row.get("id")}
+        if len(ids) != 1:
+            raise JiraError(f"{project} needs exactly one available subtask type to publish a child")
+        return str(ids.pop())
+
     def statuses(self, project: str) -> set[str]:
         if project not in self._statuses:
             types = self.get(f"/rest/api/3/project/{_path_segment(project)}/statuses") or []
@@ -247,10 +262,13 @@ class Client:
                              marker in adf.to_text((issue.get("fields") or {}).get("description")).splitlines())
         return self.browse_url(issues[0]["key"]) if issues else ""
 
-    def create_task(self, project: str, account: str, title: str, body: str, labels: list[str]) -> str:
+    def create_task(self, project: str, account: str, title: str, body: str, labels: list[str], *,
+                    parent: str = "", subtask_type: str = "") -> str:
         fields = {"project": {"key": project}, "issuetype": {"name": "Task"}, "assignee": {"accountId": account},
                   "summary": outbound.screen(title), "description": adf.from_markdown(outbound.screen(body)),
                   "labels": labels}
+        if parent:
+            fields.update(parent={"key": parent}, issuetype={"id": subtask_type})
         try:
             result = self.request("POST", "/rest/api/3/issue", body={"fields": fields})
         except (ValueError, UnicodeError) as error:

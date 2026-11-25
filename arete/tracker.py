@@ -396,7 +396,7 @@ class JiraTracker:
     def __init__(self, repo: config.Repo, jcfg: config.JiraConfig):
         self.repo = repo
         self.cfg = jcfg
-        self.project = repo.jira_project or jcfg.project
+        self.project = jira_project(repo, jcfg)
         self.route = route_label(repo)
 
     @property
@@ -404,7 +404,10 @@ class JiraTracker:
         key = str(self.cfg.env_file or "")
         if key not in _clients:
             _clients[key] = jira.Client.from_env(self.cfg.env_file)
-        return _clients[key]
+        client = _clients[key]
+        if self.repo.jira_site and client.base != self.repo.jira_site:
+            raise jira.JiraError(f"{self.repo.name}: connected Jira site differs from the enrolled site")
+        return client
 
     @property
     def queue_hint(self) -> str:
@@ -690,6 +693,10 @@ def task_ticket(row: dict, comments: str = "", blocker: str = "") -> Ticket:
                   comments=comments, open=row["state"] not in config.TASK_FINISHED,
                   kind=row["kind"] if row["kind"] in config.KINDS else "feat", created=row["created"] or "",
                   updated=row["updated"] or "", blocker=blocker)
+
+
+def jira_project(repo: config.Repo, jcfg: config.JiraConfig) -> str:
+    return repo.jira_project or jcfg.project
 
 
 def route_label(repo: config.Repo) -> str:

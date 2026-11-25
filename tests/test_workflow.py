@@ -18,7 +18,7 @@ import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -6448,8 +6448,9 @@ class MovedBasePublicationFixture:
         checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
                                       pr="https://github.com/fixture/repo/pull/7", lease="head")
         controller = orchestration.Controller.__new__(orchestration.Controller)
+        repo = config.Repo("repo", root, github=checkout.github, parts=[config.Part(checkout.dir, checkout.github)])
         run = mock.Mock(id="fixture-run", path="orchestrate", dry_run=False, alone=False, tid="7",
-                        repo=SimpleNamespace(name="repo", parts=[checkout], public=False), catch_up_preserved=set(),
+                        repo=repo, catch_up_preserved=set(),
                         closed_checkouts=[], closed_checkout_paths=set(),
                         waiting=mock.Mock(return_value=nullcontext()), feedback=[], repairs="", facts={},
                         action="", environment_release="", owner_questions_blocked=False)
@@ -6653,9 +6654,10 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
 
     def test_orchestrated_catch_up_ci_leaves_a_replacement_head_ready(self):
         for result in ("fail", "unread"):
-            with self.subTest(ci=result):
+            with self.subTest(ci=result), ExitStack() as cleanup:
                 controller, checkout = self.ready_run("7")
-                self.addCleanup(controller.close)
+                cleanup.callback(controller.job.slot.free)
+                cleanup.callback(controller.close)
                 pr = {"head": checkout.lease, "draft": False}
 
                 def catch_up(*_, before_push):
@@ -6695,8 +6697,6 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                 state.assert_called_once_with(checkout.pr)
                 draft.assert_not_called()
                 merge.assert_called_once()
-                controller.close()
-                controller.job.slot.free()
 
     def waiter_catches_up(self, *, fixed, ci_after_base_move=""):
         first, a = self.ready_run("1")

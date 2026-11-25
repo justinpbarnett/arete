@@ -1286,6 +1286,12 @@ A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
+### Enroll the delivery target
+
+Use `arete repo enroll NAME CHECKOUT --target-branch staging --landing pr --unattended-environment staging --pipeline` to save the tracker, branch and furthest permitted unattended environment. `arete repo show NAME` displays the saved choices. Use `--tracker jira --jira-project KEY` to choose a team tracker explicitly.
+
+Publish an agreed spec with `arete repo publish NAME spec --title TITLE --body-file FILE --key STABLE_KEY`. An enrolled, enabled pipeline receives the spec and agent labels in the same publication. Jira also gets the enrolled project, route label and assignee. To file a draft for later approval, add `--draft`. Child tickets and follow-ups keep their normal admission process.
+
 ### Durable issue orchestration
 
 Enable issue goals for the repositories that Arete should follow through tracker closure or PR merge.
