@@ -8214,6 +8214,44 @@ class ServeDeploymentTests(ServeDeploymentFixture):
         super().setUp()
         self.tip = self.publish("merged code")
 
+    def test_upgrade_uses_incumbent_standalone_and_restart_retains_full_admission(self):
+        source = Path(serve_guard.__file__).read_bytes()
+        guard = self.writer / "arete" / "serve_guard.py"
+        guard.write_bytes(source)
+        incumbent = self.publish("stable guard")
+        self.assertEqual(self.deploy(), incumbent)
+        file = self.state / serve_guard.RECEIPT
+        serve_guard.write(file, {**serve_guard.read(file), "healthy": True})
+        installed = install.serve_guard_file()
+        installed.write_text("raise SystemExit('obsolete standalone')\n")
+        incoming_guard = source + b"\n# next independently accepted startup guard\n"
+        guard.write_bytes(incoming_guard)
+        incoming = self.publish("new release")
+        binding = [{"ticket": "goal", "policy": "f" * 64, "change": incoming}]
+        with (mock.patch.object(codebase, "RELEASE", incumbent), mock.patch.object(serve.release_proof, "on_tip", return_value=binding),
+              mock.patch.object(serve.release_proof, "known_good", return_value=True)):
+            self.assertEqual(self.deploy(), incoming)
+        self.assertEqual(installed.read_bytes(), source)
+        data = {**serve_guard.read(file), "future_obligation": {"requires": ["more-evidence"]}}
+        serve_guard.write(file, data)
+        argv = install.serve_command()
+        argv[-1] = "pass"
+        subprocess.run(argv, check=True, timeout=CHILD_HANG_TIMEOUT)
+        restarted = serve_guard.read(file)
+        self.assertEqual(restarted["starts"], 1)
+        self.assertEqual(restarted["release_checks"], binding)
+        self.assertEqual(restarted["future_obligation"], data["future_obligation"])
+        self.server.cfg, self.server.started_head, self.server.with_dashboard = self.cfg, incoming[:12], False
+        self.server.note_once = self.server.say
+        with (mock.patch.object(codebase, "RELEASE", incoming),
+              mock.patch.object(serve.release_proof, "assess", side_effect=["blocked", "verified"])):
+            self.server.acknowledge_deploy(True)
+            self.assertEqual(installed.read_bytes(), source)
+            self.server.acknowledge_deploy(True)
+        self.assertTrue(serve_guard.read(file)["healthy"])
+        self.assertEqual(serve_guard.read(file)["future_obligation"], data["future_obligation"])
+        self.assertEqual(installed.read_bytes(), incoming_guard)
+
     def test_ci_rerun_goes_pending_while_waiting_for_repo_lock(self):
         attempting = threading.Event()
         repo_lock = util.repo_lock

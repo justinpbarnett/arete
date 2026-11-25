@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from contextlib import closing
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -77,16 +77,27 @@ def flush_directory(folder: Path) -> None:
         os.close(fd)
 
 
-def pending(state: Path, checkout: Path) -> Receipt | None:
+def current(state: Path, checkout: Path) -> Receipt | None:
     data = read(state / RECEIPT)
     if data is None or data.get("checkout") != str(checkout):
         return None
     receipt = Receipt(**{field.name: data[field.name] for field in fields(Receipt) if field.name in data})
-    if receipt.healthy or receipt.settled:
-        return None
     if not all(SHA.fullmatch(sha) for sha in (receipt.previous, receipt.tip)):
         raise ValueError("deploy receipt needs full commit IDs")
     return receipt
+
+
+def pending(state: Path, checkout: Path) -> Receipt | None:
+    receipt = current(state, checkout)
+    return receipt if receipt and not receipt.healthy and not receipt.settled else None
+
+
+def original(state: Path, receipt: Receipt) -> dict:
+    data = read(state / RECEIPT) or {}
+    identity = ("checkout", "branch", "previous", "tip", "github", "created_at")
+    if not all(data.get(key) == getattr(receipt, key) for key in identity):
+        raise ValueError("the deployment changed before the receipt update")
+    return data
 
 
 def hold_path(state: Path, tip: str) -> Path:
@@ -177,12 +188,13 @@ def rollback(state: Path, checkout: Path, logs: Path, receipt: Receipt, reason: 
     if git(checkout, "merge-base", receipt.previous, receipt.tip) != receipt.previous:
         raise RuntimeError("deploy rollback refused because the previous commit is not an ancestor")
     hold = hold_path(state, receipt.tip)
+    data = original(state, receipt)
     if not hold.exists():
-        write(hold, {**asdict(receipt), "reason": reason, "log_tail": log_tail(logs)})
+        write(hold, {**data, "reason": reason, "log_tail": log_tail(logs)})
     git(checkout, "reset", "--keep", receipt.previous)
     print(f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
           f"deploy: rolled back to {receipt.previous} because {reason}", flush=True)
-    write(state / RECEIPT, asdict(replace(receipt, settled="rolled_back", rollback="code_only")))
+    write(state / RECEIPT, {**data, "settled": "rolled_back", "rollback": "code_only"})
     return True
 
 
@@ -202,8 +214,7 @@ def record_start(state: Path, receipt: Receipt, at: float) -> None:
     started_at = receipt.started_at
     if started_at is None:
         started_at = receipt.created_at if receipt.starts else at
-    receipt = replace(receipt, starts=receipt.starts + 1, started_at=started_at)
-    write(state / RECEIPT, asdict(receipt))
+    write(state / RECEIPT, {**original(state, receipt), "starts": receipt.starts + 1, "started_at": started_at})
 
 
 def count_start(state: Path, checkout: Path, logs: Path) -> bool:

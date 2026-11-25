@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn, TextIO
@@ -598,6 +598,11 @@ class Server:
                 or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
+            if (paths.STATE_DIR / "release-checks").is_dir():
+                repo = self.cfg.repo_for_path(checkout)
+                if repo and (held := release_proof.reconcile_running(repo, receipt)):
+                    self.note_once(f"deploy: {receipt.tip} waiting for its omitted protected check ({held})")
+                    return
             if receipt.release_checks:
                 verdict = release_proof.assess(self.cfg.arete_repo, receipt)
                 if verdict != "verified":
@@ -606,8 +611,10 @@ class Server:
                     else:
                         self.note_once(f"deploy: {receipt.tip} waiting for protected release evidence ({verdict})")
                     return
-            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
+            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, {**serve_guard.original(paths.STATE_DIR, receipt), "healthy": True})
             self.say(f"deploy: {receipt.tip} is healthy")
+            if codebase.RELEASE == receipt.tip:
+                install.refresh_serve_guard(checkout, receipt.tip)
         elif receipt.expired():
             if reason := serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous):
                 self.note_once(f"deploy: code-only rollback refused because {reason}")
@@ -616,6 +623,10 @@ class Server:
 
     def deploy_if_ready(self, cfg: config.Config) -> None:
         try:
+            repo = cfg.repo_for_path(paths.PACKAGE_DIR)
+            if repo and repo.allows_unattended_deploy("production") and (held := release_proof.reconcile_running(repo)):
+                self.note_once(f"deploy: keeping the current release for its protected observation ({held})")
+                return
             self.deploy(cfg)
         finally:
             report_rollbacks(paths.PACKAGE_DIR.parent, self.say)
@@ -685,6 +696,10 @@ class Server:
             if prior and prior.release_checks:
                 self.deploy_refused(src, tip, "an earlier protected release is still awaiting its decision")
                 return
+            # A still-pending build must not be allowed to replace its own rollback guard.
+            if not prior and codebase.RELEASE == recovery.head:
+                install.refresh_serve_guard(src, recovery.head)
+            previous_receipt = serve_guard.original(paths.STATE_DIR, prior) if prior else None
             checks = release_proof.on_tip(repo, base, tip, previous)
             if checks and not release_proof.known_good(repo.name, previous, checks):
                 self.deploy_refused(src, tip, "previous release did not pass its protected recovery check")
@@ -698,8 +713,8 @@ class Server:
                 return
             except (OSError, RuntimeError) as error:
                 self.restore_deploy(src, base, tip, recovery, error)
-                if prior and serve_guard.at_tip(src, prior):
-                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(prior))
+                if previous_receipt and serve_guard.at_tip(src, prior):
+                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, previous_receipt)
                 self.deploy_refused(src, tip, str(error))
                 return
         self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
