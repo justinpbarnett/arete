@@ -155,7 +155,7 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
         claimed = set(source_store.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:
-            forwarded, older = [], fresh
+            forwarded, older = kind.baseline(fresh)
         elif changed or unsure:
             forwarded, older = kind.catch_up(fresh, last_good_poll(known), untimed=unsure)
         else:
@@ -170,12 +170,12 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
         source_store.set_cursor(sid, value, True, detail, started=started)
         source_store.set_source_owner(sid, owner)
     if first:
-        say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
-            + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))
+        say(f"{sid}: first read, {len(older)} existing events taken as the baseline"
+            + (f": {shown([e['key'] for e in older])}" if older else ""))
     elif told:
         say(f"{sid}: source settings changed; {len(forwarded)} events since the last good poll go on, "
             f"{len(older)} older taken as seen" + (f": {shown([e['key'] for e in older])}" if older else ""))
-    return ([], []) if first else (forwarded, items)
+    return forwarded, items
 
 
 def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
@@ -205,6 +205,9 @@ class Source:
 
     def rescope(self, source: dict, cursor):
         return cursor
+
+    def baseline(self, fresh: list[dict]) -> tuple[list[dict], list[dict]]:
+        return [], fresh
 
     def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
         cutoff = since - CATCH_UP_SLACK if since else None
@@ -428,6 +431,10 @@ def signature(line: str) -> str:
 
 class ClosedSpecs(Source):
     scope = ("tracker",)
+
+    def baseline(self, fresh):
+        return ([e for e in fresh if e["data"].get("delivery_root")],
+                [e for e in fresh if not e["data"].get("delivery_root")])
 
     def problems(self, source, loop, cfg):
         problems = super().problems(source, loop, cfg)

@@ -2752,7 +2752,7 @@ with workspaces.ticket_lock("sample", "7") as held:
 
 assert runs.run_get(rid)["pid"] == os.getpid() and util.pid_alive(os.getpid())
 assert not util.lock_is_held(lock)
-assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
 """)
 
     def test_child_identity_survives_restart_but_does_not_protect_a_recycled_pid(self):
@@ -2794,7 +2794,7 @@ with (subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.read
         replacement = (identity[0], identity[1] + 1)
         with patch.object(db, "process_identity", return_value=replacement):
             assert util.pid_alive(child.pid)
-            assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+            assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
             assert not serve.startup_beat()
             restarted.beat()
             assert control.database_beat()["workspace_contract_children"] == []
@@ -2827,7 +2827,7 @@ with util.hold_lock("serve"):
         assert db.contract_blockers(conn, 28) == [f"serve {pid}"]
 
 assert util.pid_alive(pid) and not util.lock_is_held("serve")
-assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
 """)
 
 
@@ -2858,7 +2858,7 @@ with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, st
         child.communicate(timeout=3)
 assert child.returncode == 0
 assert (paths.LOCKS_DIR / f"{name}.lock").exists()
-assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
 """)
 
     def test_detached_rule_lock_blocks_contract_without_run_row(self):
@@ -2995,7 +2995,7 @@ assert_deferred(out.getvalue())
 explicit.mkdir()
 explicit.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "explicit"}))
 assert db.workspace_handoff_ready(explicit)
-assert not db.migrate() and schema_version() == 28
+assert not db.migrate() and schema_version() == db.LATEST
 row = workspaces.open_for("sample-7")
 assert workspaces.files(row["id"]) == {"notes.txt": "explicit"}
 """)
@@ -3013,7 +3013,7 @@ assert_deferred(out.getvalue())
 assert "valid config" in out.getvalue()
 explicit.mkdir()
 explicit.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "explicit"}))
-assert not db.migrate(workspace_snapshots=explicit) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=explicit) and schema_version() == db.LATEST
 assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "explicit"}
 """)
 
@@ -3043,7 +3043,7 @@ assert not db.workspace_handoff_ready(None)
 with redirect_stdout(StringIO()) as out:
     assert db.migrate()
 assert_deferred(out.getvalue())
-assert not db.migrate(workspace_snapshots=foreign_source) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=foreign_source) and schema_version() == db.LATEST
 assert wrong.read_text() == json.dumps({"notes.txt": "destination"})
 assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "source"}
 """)
@@ -3058,19 +3058,21 @@ seed_saved_fingerprint()
 legacy.mkdir()
 legacy.joinpath("sample-7.json").write_text(json.dumps({"notes.txt": "new"}))
 lock = runs.run_lock("pipeline", "sample", "7")
-contract = chain[-1]
+contract_index = db.WORKSPACE_CONTRACT_SCHEMA - 1
+contract = chain[contract_index]
 with ExitStack() as held:
     def import_then_start(conn, folder, **kwargs):
         contract.apply(conn, folder, **kwargs)
         assert held.enter_context(util.lock(lock))
-    with (patch.object(db.migrations, "load", return_value=[*chain[:-1], replace(contract, apply=import_then_start)]),
+    chain[contract_index] = replace(contract, apply=import_then_start)
+    with (patch.object(db.migrations, "load", return_value=chain),
           redirect_stdout(StringIO()) as out):
         assert db.migrate(workspace_snapshots=legacy)
     assert f"held lock {lock}" in out.getvalue()
     assert schema_version() == 27
     with db.reader() as conn:
         assert conn.execute("SELECT fingerprint FROM workspace_files").fetchone()[0] == "saved"
-assert not db.migrate(workspace_snapshots=legacy) and schema_version() == 28
+assert not db.migrate(workspace_snapshots=legacy) and schema_version() == db.LATEST
 assert workspaces.files(workspaces.open_for("sample-7")["id"]) == {"notes.txt": "new"}
 """)
 
@@ -3765,7 +3767,7 @@ proposal, = approvals.proposals(status=["approve"])
 assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
+    assert schema_version() == db.LATEST
     assert approvals.proposal(p["id"])["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.LATEST

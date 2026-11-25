@@ -6,12 +6,15 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from . import config, gh, jira, principals, util
 from .store import runs as run_store
+from .store import specs as spec_store
 from .store import tasks as tasks_store
 
 LABEL = "agent"
+SPEC_LABEL = "spec"
 ZTE_LABEL = "agent:zte"
 ZTE_QUEUE = f"its `{ZTE_LABEL}` label reserves it for zero-touch delivery"
 BATCH_LABEL = "agent:batch"
@@ -79,9 +82,27 @@ class Ticket:
     images: list[Image] = field(default_factory=list)
     github_repo: str = ""
     github_blockers: list[int | str] = field(default_factory=list)
+    spec_identity: str = ""
+
+    @property
+    def is_spec(self) -> bool:
+        return SPEC_LABEL in self.labels
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
+
+
+def github_issue_identity(repo: str, tid: str | int) -> str:
+    return f"github:{repo.casefold()}#{int(tid)}"
+
+
+def jira_issue_identity(site: str, issue_id) -> str:
+    if not isinstance(site, str) or not str(issue_id or "").isdigit():
+        return ""
+    url = urlsplit(site)
+    if not url.scheme or not url.netloc:
+        return ""
+    return f"jira:{url.scheme.casefold()}://{url.netloc.casefold()}{url.path.rstrip('/')}:{int(issue_id)}"
 
 
 def is_task_id(tid) -> bool:
@@ -120,6 +141,8 @@ def error_of(call: Callable[[], object]) -> str:
 def batch_ids(t: Ticket) -> list[str]:
     if BATCH_LABEL not in t.labels:
         return [t.id]
+    if t.is_spec:
+        raise TaskError("a spec cannot also be a batch")
     lines = [line for line in t.body.splitlines() if line.strip()]
     header = BATCH_LINE.fullmatch(lines[0]) if lines else None
     if (not header or not BATCH_REFS.fullmatch(header[1].strip())
@@ -205,7 +228,7 @@ class GitHubTracker:
             ticket.labels.sort()
             names = set(ticket.labels)
             self._open_agent_tickets.append(ticket)
-            if (names & skip or not self.by_owner(i)
+            if (names & skip or not self.by_publisher(i, ticket.is_spec)
                     or failed in names and not (parked and parked(tid))):
                 continue
             out.append(ticket)
@@ -218,11 +241,18 @@ class GitHubTracker:
 
     def failed_queue(self) -> list[str]:
         return [str(i["number"]) for i in gh.issues(self.repo.github, self.label_name("failed"), limit=MAX_AGENT_ISSUES)
-                if self.by_owner(i) and self.queued_failure([label["name"] for label in i.get("labels", [])])]
+                if self.by_owner(i) and self.queued_failure([label["name"] for label in i.get("labels", [])])
+                and not any(label["name"] == SPEC_LABEL for label in i.get("labels", []))]
 
     def by_owner(self, item: dict) -> bool:
         login = (item.get("author") or {}).get("login") or ""
         return bool(login) and login.lower() == self.owner.lower()
+
+    def by_publisher(self, item: dict, spec: bool) -> bool:
+        if not spec:
+            return self.by_owner(item)
+        login = (item.get("author") or {}).get("login") or ""
+        return bool(login) and login.casefold() == gh.me().casefold()
 
     def blocker(self, tid: str) -> str:
         ticket = self._tickets.get(tid) or self.remember(tid, gh.issue(self.repo.github, int(tid)) or {})
@@ -263,42 +293,48 @@ class GitHubTracker:
         out = []
         for i in gh.issues(self.repo.github, self.label_name("needs-info")):
             labels = {lb["name"] for lb in i.get("labels", [])}
-            if LABEL not in labels or ZTE_LABEL in labels or not self.by_owner(i):
+            if LABEL not in labels or ZTE_LABEL in labels or not self.by_publisher(i, SPEC_LABEL in labels):
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
             ticket = self.remember(str(i["number"]), full)
             if ZTE_LABEL in ticket.labels:
                 continue
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
-                    if self.by_owner(c) and c.get("createdAt")]
+                    if self.by_publisher(c, ticket.is_spec) and c.get("createdAt")]
             if answered(mine):
                 out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], url=i.get("url", ""),
-                                  created=i.get("createdAt", "")))
+                                  created=i.get("createdAt", ""), labels=ticket.labels.copy()))
         return sorted(out, key=lambda t: t.created)
 
     def reply_since(self, tid: str, since: str) -> str:
         full = gh.issue(self.repo.github, int(tid))
-        if any(label["name"] == ZTE_LABEL for label in full.get("labels", [])):
+        labels = {label["name"] for label in full.get("labels", [])}
+        if ZTE_LABEL in labels:
             return ""
         return reply_text([(datetime.fromisoformat(c["createdAt"]), c.get("body") or "")
-                           for c in full.get("comments", []) if self.by_owner(c) and c.get("createdAt")], since)
+                           for c in full.get("comments", [])
+                           if self.by_publisher(c, SPEC_LABEL in labels) and c.get("createdAt")], since,
+                          strict=SPEC_LABEL in labels)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
-    def get(self, tid: str) -> Ticket:
-        i = gh.issue(self.repo.github, int(tid))
+    def get(self, tid: str, *, issue: dict | None = None) -> Ticket:
+        i = gh.issue(self.repo.github, int(tid)) if issue is None else issue
         ticket = self.remember(tid, i)
         labels = ticket.labels
+        spec = SPEC_LABEL in labels
         author = (i.get("author") or {}).get("login", "")
-        comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
-                    if self.by_owner(c)]
+        comments = [(self.owner if not spec else c["author"]["login"], c.get("createdAt", ""), c.get("body", ""))
+                    for c in i.get("comments", []) if self.by_publisher(c, spec)]
+        publisher = "the configured GitHub user" if spec else self.owner
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
-            "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
+            "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
         ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
                          open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
-                         updated=i.get("updatedAt") or "", blocker=blocker)
+                         updated=i.get("updatedAt") or "", blocker=blocker,
+                         spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -341,10 +377,14 @@ class GitHubTracker:
         if ZTE_LABEL in t.labels:
             raise TaskError(ZTE_QUEUE)
         ids = batch_ids(t)
-        if not whole:
+        if t.is_spec or not whole:
             return f"Part of #{t.id}"
         for tid in ids[1:]:
-            self.require_ordinary(tid)
+            labels = {label["name"] for label in gh.issue(self.repo.github, int(tid)).get("labels", [])}
+            if ZTE_LABEL in labels:
+                raise TaskError(ZTE_QUEUE)
+            if SPEC_LABEL in labels or spec_store.find(self.repo.name, tid, identity=github_issue_identity(self.repo.github, tid)):
+                raise TaskError(f"#{tid} is a spec and cannot be closed by a batch")
         return "\n".join(f"Closes #{tid}" for tid in ids)
 
 
@@ -423,17 +463,33 @@ class JiraTracker:
                 out.append(search_ticket(self.client, i))
         return out
 
-    def reply_since(self, tid: str, since: str) -> str:
+    def reply_since(self, tid: str, since: str, *, strict: bool = False) -> str:
         me = self.client.me().get("accountId", "")
         return reply_text([(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(tid)
-                           if _authored_by(c, me) and c.get("created")], since)
+                           if _authored_by(c, me) and c.get("created")], since, strict=strict)
 
     def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
         me = self.client.me().get("accountId", "")
-        blocker, approved_at = check_approval(me, issue, self.client.changelog(tid), self.route)
+        history = self.client.changelog(tid)
+        blocker, approved_at = check_approval(me, issue, history, self.route)
         f = issue.get("fields") or {}
         labels = list(f.get("labels") or [])
+        spec_identity = jira_issue_identity(getattr(self.client, "base", ""), issue.get("id"))
+        if SPEC_LABEL in labels:
+            creator = (f.get("creator") or {}).get("accountId")
+            key = issue.get("key", "")
+            if not me or creator != me:
+                blocker = blocker or "the Jira spec was not created by the configured Jira user"
+            elif (not spec_identity or key != tid or not jira.KEY_RE.fullmatch(key)
+                  or key.rsplit("-", 1)[0] != self.project.upper()):
+                blocker = blocker or "the Jira spec has no stable identity in the configured project"
+            additions = [h for h in history for item in _label_items(h)
+                         if SPEC_LABEL in _tokens(item.get("toString")) - _tokens(item.get("fromString"))]
+            if additions and not _authored_by(max(additions, key=lambda h: jira.parse_time(h["created"])), me):
+                blocker = blocker or "the `spec` label was not added by the configured Jira user"
+            if (f.get("issuetype") or {}).get("subtask"):
+                blocker = blocker or "a Jira subtask cannot be a bootstrap spec"
         body = f.get("description") or "(no description)"
         blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
         if include_environment and not blocker:
@@ -452,7 +508,7 @@ class JiraTracker:
                       open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
-                      labels=labels, blocker=blocker, images=images)
+                      labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         out = SavedImages()
@@ -476,16 +532,17 @@ class JiraTracker:
     def comment(self, tid: str, body: str) -> str:
         return error_of(lambda: self.client.comment(tid, body))
 
-    def move(self, tid: str, state: str) -> str:
+    def move(self, tid: str, state: str, *, keep_open: bool = False) -> str:
         try:
-            return self.move_to(tid, self.cfg.transitions.get(state, ""))
+            target = self.cfg.transitions.get(state, "")
+            return self.shift(tid, target, keep_done=True, keep_open=True).error if keep_open else self.move_to(tid, target)
         except jira.JiraError as e:
             return str(e)
 
     def move_to(self, tid: str, target: str) -> str:
         return self.shift(tid, target).error
 
-    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False) -> Moved:
+    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False, *, keep_open: bool = False) -> Moved:
         if not target:
             return Moved()
         f = self.client.issue(tid, ["status", "updated"]).get("fields") or {}
@@ -493,8 +550,8 @@ class JiraTracker:
         done = ((f.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
         if status.lower() == target.lower() or keep_done and done:
             return Moved(before=f.get("updated") or "")
-        if not self.client.move(tid, target):
-            return Moved(f"{tid} has no transition to '{target}' from '{status}'")
+        if not (self.client.move(tid, target, category="open") if keep_open else self.client.move(tid, target)):
+            return Moved(f"{tid} has no {'non-closing ' if keep_open else ''}transition to '{target}' from '{status}'")
         after = ""
         if stamps:
             after = (self.client.issue(tid, ["updated"]).get("fields") or {}).get("updated") or ""
@@ -598,6 +655,29 @@ class LocalTracker:
 
 
 Tracker = GitHubTracker | JiraTracker | LocalTracker
+
+
+def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_open: bool = True) -> str:
+    if not ticket.is_spec or not isinstance(tk, (GitHubTracker, JiraTracker)):
+        return "the ticket no longer carries spec publication authority"
+    if {"no-agent", "agent:hold"} & set(ticket.labels):
+        return "the owner has placed this spec on hold"
+    if require_open and not ticket.open:
+        return "the spec is not open"
+    if ticket.blocker or not ticket.spec_identity:
+        return ticket.blocker or "the spec has no stable tracker identity"
+    if not tk.repo.pipeline or not tk.repo.parts:
+        return "the spec needs a configured pipeline checkout and PR target"
+    if isinstance(tk, JiraTracker):
+        routed = [r.name for r in cfg.repos if r.tracker == "jira" and r.pipeline
+                  and (r.jira_project or cfg.jira.project).upper() == tk.project.upper()
+                  and route_label(r) in ticket.labels]
+        if routed != [tk.repo.name]:
+            return "the Jira spec must route to exactly one configured pipeline checkout"
+        children = tk.client.search(f'parent = "{tk.normalize(ticket.id)}"', ["summary"], limit=1)
+    else:
+        children = gh.api_list(f"repos/{tk.repo.github}/issues/{int(ticket.id)}/sub_issues")
+    return "the bootstrap spec lane does not run specs with child tickets" if children else ""
 
 
 def item_state(tk: Tracker, t: Ticket) -> str:
@@ -711,10 +791,10 @@ def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
 
 
-def reply_text(comments: list[tuple[datetime, str]], since: str) -> str:
+def reply_text(comments: list[tuple[datetime, str]], since: str, *, strict: bool = False) -> str:
     cutoff = util.parse_iso(since)
     return "\n\n".join(body.strip() for when, body in sorted(comments, key=lambda c: c[0])
-                       if when >= cutoff and body.strip() and not from_arete(body))
+                       if (when > cutoff if strict else when >= cutoff) and body.strip() and not from_arete(body))
 
 
 def answered(comments: list[tuple[datetime, str]]) -> bool:
