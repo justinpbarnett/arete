@@ -198,7 +198,7 @@ def note(name, ticket, kind, evidence, detail, at=""):
             receipt = conn.execute(
                 """SELECT evidence FROM observations WHERE repo=? AND kind='verified'
                                   AND destination=? AND ticket IN (SELECT value FROM json_each(?)) AND at<=?
-                                  ORDER BY at,rowid LIMIT 1""",
+                                  ORDER BY at DESC,rowid DESC LIMIT 1""",
                 (repo, target, json.dumps(ids), at),
             ).fetchone()
             if not receipt:
@@ -301,15 +301,17 @@ def report(name):
             obs += [
                 dict(kind="touch", at=a["answered"], evidence="ask:" + a["id"], detail="owner answer consumed")
                 for a in answers
-                if a["answered"] and a["answered"] >= arrived
+                if a["answered"]
             ]
-            obs = sorted((r for r in obs if r["at"] >= arrived), key=lambda r: r["at"])
-            verified = next((r for r in obs if r["kind"] == "verified"), None)
+            obs = sorted((r for r in obs if r["at"] >= arrived or r["kind"] == "touch"), key=lambda r: r["at"])
+            deliveries = [r for r in obs if r["kind"] == "verified"]
+            verified = deliveries[-1] if deliveries else None
             terminal = next((r for r in reversed(obs) if r["kind"] in ("failed", "verified", "pending")), None)
             status = {"verified": "verified", "failed": "failed"}.get(terminal["kind"] if terminal else "", "pending")
-            first = next((r for r in obs if r["kind"] == "touch" and (not verified or r["at"] <= verified["at"])), None)
+            through = verified["at"] if status == "verified" else util.iso(now)
+            first = next((r for r in obs if r["kind"] == "touch" and r["at"] <= through), None)
             # An empty trace has no authority to establish absence of manual tracker/PR actions.
-            audited = verified and any(
+            audited = status == "verified" and any(
                 r["kind"] == "audit"
                 and r["at"] >= verified["at"]
                 and r["revision"] == audit_signature(name, ids, verified["evidence"])
@@ -343,7 +345,7 @@ def report(name):
                     first_touch=first,
                     release=verified,
                     regressions=[
-                        r for r in obs if verified and r["at"] >= verified["at"] and r["kind"] == "regression"
+                        r for r in obs if verified and r["at"] >= deliveries[0]["at"] and r["kind"] == "regression"
                     ],
                     pull_requests=sorted({url for run in runs for url in (run["pr_url"] or "").split()}),
                     attempts=len(runs),
