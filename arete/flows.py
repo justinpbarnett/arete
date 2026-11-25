@@ -1584,6 +1584,8 @@ def require_environment_owner_clear(job: Job) -> None:
 def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    from . import spec_graph_delivery
+    spec_graph_delivery.require_active_child(run)
     require_environment_owner_clear(job)
     run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     recovery = job.recovery_publication

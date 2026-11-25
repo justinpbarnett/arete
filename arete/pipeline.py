@@ -3304,6 +3304,9 @@ def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
 def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                   track_moved_base: bool = False, require_pinned_base: bool = False) -> str | None:
     run = b.run
+    from . import spec_graph_delivery
+    if reason := spec_graph_delivery.active_child_blocker(run):
+        return reason
     try:
         if require_pinned_base:
             return unpinned_merge_hold(c, fetch_merge_base(c))
