@@ -1868,13 +1868,7 @@ if sys.platform == 'darwin':
     '''
     sandboxed = [*argv[:argv.index('-p') + 2], node, '--input-type=module', '-e', js,
                  pi.GUARD_FILE.as_uri(), str(store / 'fixture')]
-    launch = subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']},
-                            stderr=subprocess.PIPE, timeout=10)
-    if launch.returncode != 0:
-        stderr = launch.stderr[:2000].decode('utf-8', errors='replace')
-        if len(launch.stderr) > 2000:
-            stderr += '\n[stderr truncated]'
-        case.fail(f'sandbox subprocess exited with return code {launch.returncode}; stderr:\n{stderr}')
+    subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']}, check=True, timeout=10)
 nested = store / db.schema_metadata()['instance_tag'] / 'global'
 floor = guard.floor('', checkout, [nested])
 protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])

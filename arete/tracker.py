@@ -657,6 +657,8 @@ Tracker = GitHubTracker | JiraTracker | LocalTracker
 def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_open: bool = True) -> str:
     if not ticket.is_spec or not isinstance(tk, (GitHubTracker, JiraTracker)):
         return "the ticket no longer carries spec publication authority"
+    if {"no-agent", "agent:hold"} & set(ticket.labels):
+        return "the owner has placed this spec on hold"
     if require_open and not ticket.open:
         return "the spec is not open"
     if ticket.blocker or not ticket.spec_identity:
