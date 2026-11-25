@@ -1868,7 +1868,15 @@ if sys.platform == 'darwin':
     '''
     sandboxed = [*argv[:argv.index('-p') + 2], node, '--input-type=module', '-e', js,
                  pi.GUARD_FILE.as_uri(), str(store / 'fixture')]
-    subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']}, check=True, timeout=10)
+    launched = subprocess.run(sandboxed, cwd=checkout, env={**env, 'PATH': os.environ['PATH']},
+                              stderr=subprocess.PIPE, timeout=10)
+    if launched.returncode:
+        stderr = launched.stderr.strip()
+        denied = 'sandbox-exec: sandbox_apply: Operation not permitted'
+        # Report the known launcher error verbatim, but never echo arbitrary stderr.
+        detail = denied if stderr == denied.encode() else (
+            'sandboxed Node probe stderr withheld' if stderr else 'sandboxed Node probe produced no stderr')
+        case.assertEqual(launched.returncode, 0, detail)
 nested = store / db.schema_metadata()['instance_tag'] / 'global'
 floor = guard.floor('', checkout, [nested])
 protection = json.loads(pi.guard_env(floor)['ARETE_PI_GUARD_PATHS'])
@@ -5391,7 +5399,9 @@ class _CliThroughServeCase(unittest.TestCase):
         "mcp": "mcp_stdio", "mcp-ask": "owner_asks", "mcp-config": "commands.api",
         "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
         "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
-        "release-journeys": "releasejourneys", "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
+        "release-journeys": "releasejourneys", "replay sample": "replay",
+        "repo enroll": "commands.setup", "repo publish": "commands.setup", "repo show": "commands.setup",
+        "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
         "upload-guard": "uploads", "webhook secret": "webhooks.secret",
         "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
@@ -5410,6 +5420,9 @@ class _CliThroughServeCase(unittest.TestCase):
         "hold claude --release": "store.devices", "costs --correct r1 1 --why correction": "record.correct",
         "costs --backfill": "store.runs", "backup": "backup.snapshot", "backup --restore backup.db": "backup.restore",
         "secrets rm replay-sample secret": "vault",
+        "repo enroll fixture checkout --target-branch main": "commands.setup",
+        "repo publish fixture spec --title Example --body-file - --key fixture-spec": "commands.setup",
+        "repo show fixture --json": "commands.setup",
     }
 
     @classmethod

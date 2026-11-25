@@ -161,7 +161,7 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
     if device.remote and repo:
         layer = config.load_layer(repo.layer_dir)
         spec.github = repo.github
-        spec.base = layer.base_branch or gh.default_branch(repo.github)
+        spec.base = repo.target_branch or layer.base_branch or gh.default_branch(repo.github)
         spec.deny = diffguard.denied_paths(layer)
         spec.branch = f"session/{spec.id}"
         spec.cwd = posixpath.join(device.dir, f"{repo.name}-{spec.id}")
@@ -188,7 +188,7 @@ def workspace(spec: Spec, device: devices.Device, repo: config.Repo | None) -> N
 
 
 def published_baseline(repo: config.Repo) -> str:
-    base = config.load_layer(repo.layer_dir).base_branch or util.git(
+    base = repo.target_branch or config.load_layer(repo.layer_dir).base_branch or util.git(
         ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], repo.path, check=False).strip().removeprefix(
         "origin/") or "main"
     found = util.sh(["git", "merge-base", "HEAD", f"refs/remotes/origin/{base}"], cwd=repo.path)
@@ -444,6 +444,8 @@ def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
 
 
 def push_fetched(spec: Spec, repo: config.Repo) -> None:
+    if repo.target_branch and spec.branch == repo.target_branch:
+        raise ValueError(f"a session cannot push its work branch to the saved target {repo.target_branch}")
     if denied := denied_work(spec, repo):
         held = ", ".join(denied)
         if held != spec.held:
@@ -576,10 +578,14 @@ def open_draft_pr(spec: Spec, cfg: config.Config, report: dict) -> str:
     try:
         repo = cfg.repo(spec.repo)
         github = repo.github
-        base = spec.base or config.load_layer(repo.layer_dir).base_branch or gh.default_branch(github)
-        url = gh.open_pr_url(github, spec.branch) or gh.pr_create(
-            github, spec.branch, base, util.first_line(spec.prompt, 72), draft_body(spec, report), draft=True,
-            cwd=repo.path)
+        if repo.target_branch and spec.base and spec.base != repo.target_branch:
+            return f"the session started on {spec.base}, not the saved target {repo.target_branch}"
+        base = repo.target_branch or spec.base or config.load_layer(repo.layer_dir).base_branch or gh.default_branch(github)
+        url = gh.open_pr_url(github, spec.branch)
+        if url and repo.target_branch and gh.pr_view(url).get("baseRefName") != base:
+            return f"the draft PR targets a different branch than {base}"
+        url = url or gh.pr_create(github, spec.branch, base, util.first_line(spec.prompt, 72), draft_body(spec, report),
+                                  draft=True, cwd=repo.path)
     except (gh.GhError, RuntimeError, OSError) as e:
         return f"the draft PR was not opened: {util.one_line(str(e), 300)}"
     spec.pr = url

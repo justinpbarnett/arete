@@ -812,13 +812,16 @@ def open_workspace(run: LoopRun) -> Workspace:
     src, github = repo.path, repo.github
     layer = config.load_layer(repo.layer_dir)
     if "origin" in util.git(["remote"], src, check=False).split():
-        base = layer.base_branch or (gh.default_branch(github) if github else util.origin_default_branch(src))
+        base = repo.target_branch or layer.base_branch or (
+            gh.default_branch(github) if github else util.origin_default_branch(src))
         util.git(["fetch", "origin", base], src)
         start = f"origin/{base}"
     else:
-        base = util.git(["rev-parse", "--abbrev-ref", "HEAD"], src).strip()
+        base = repo.target_branch or util.git(["rev-parse", "--abbrev-ref", "HEAD"], src).strip()
         start = base
     branch = f"loop/{run.id}"
+    if branch == repo.target_branch:
+        raise ValueError(f"the work branch is the saved target {branch}")
     wt = paths.WORKTREES_DIR / f"loop-{run.id}"
     try:
         util.add_worktree(src, wt, branch, start)
