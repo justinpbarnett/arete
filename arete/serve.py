@@ -598,6 +598,11 @@ class Server:
                 or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
+            if (paths.STATE_DIR / "release-checks").is_dir():
+                repo = self.cfg.repo_for_path(checkout)
+                if repo and (held := release_proof.reconcile_running(repo, receipt)):
+                    self.note_once(f"deploy: {receipt.tip} waiting for its omitted protected check ({held})")
+                    return
             if receipt.release_checks:
                 verdict = release_proof.assess(self.cfg.arete_repo, receipt)
                 if verdict != "verified":

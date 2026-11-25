@@ -139,6 +139,19 @@ class RunningRelease(unittest.TestCase):
             self.assertEqual(self.deployment_poll(), 1)
         self.assertEqual(file.read_bytes(), original)
 
+    def test_stripped_pending_transfer_waits_for_real_acceptance_before_startup_health(self):
+        file = self.stripped_healthy_release()
+        data = {**serve_guard.read(file), "healthy": False, "future_obligation": ["original"]}
+        serve_guard.write(file, data)
+        self.engine.acknowledge_deploy(True)
+        self.assertEqual(serve_guard.read(file), data)
+        self.assertEqual(self.deployment_poll(), 0)
+        self.assertIsNone(proof.evidence("arete", "12", self.tip))
+        self.fixed = True
+        self.engine.acknowledge_deploy(True)
+        self.assertIsNotNone(proof.for_delivery("arete", "12", self.tip, "production"))
+        self.assertEqual(serve_guard.read(file), {**data, "healthy": True})
+
     def test_reconciliation_refuses_policy_rotation_unrelated_revision_and_late_recovery(self):
         file = self.stripped_healthy_release()
         repo = self.cfg.repos[0]

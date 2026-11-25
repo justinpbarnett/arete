@@ -494,11 +494,11 @@ def preflight_recorded(folder, repo, receipt, check):
     return False
 
 
-def reconcile_running(repo):
-    """Re-observe a healthy transfer whose startup guard lost its admission bindings."""
+def reconcile_running(repo, receipt=None):
+    """Re-observe a transfer whose startup guard lost its admission bindings."""
     checkout = repo.path.resolve()
-    receipt = serve_guard.current(paths.STATE_DIR, checkout)
-    if not receipt or not receipt.healthy or receipt.settled or not receipt.starts:
+    receipt = receipt or serve_guard.current(paths.STATE_DIR, checkout)
+    if not receipt or receipt.settled or not receipt.starts:
         return ""
     # Only a real preflight on the previous engine can establish historical enrollment.
     # Most releases have no such record and need no tracker lookups.
@@ -510,7 +510,8 @@ def reconcile_running(repo):
         return ""
     for check in on_tip(repo, receipt.branch, receipt.tip, receipt.previous, tickets=selected):
         ticket = check["ticket"]
-        if evidence(repo.name, ticket, check["change"]):
+        accepted = evidence(repo.name, ticket, check["change"])
+        if accepted and accepted["revision"] == receipt.tip:
             continue
         if (not repo.github or repo.github.casefold() != receipt.github.casefold()
                 or repo.target_branch and repo.target_branch != receipt.branch
