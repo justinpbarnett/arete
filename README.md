@@ -24,6 +24,8 @@ arete cohort candidates november
 
 The scheduler catches up label events before picking work. A failed tracker read preserves the previous cursor. Reports show the cursor and whether intake covers the whole window. Repeated polls and re-added labels count one goal. The read-only CLI and authenticated `GET /api/v1/cohorts/{name}` report delivery, terminal failure, or a pending goal with age, reason and deadline. All successive attempts and their PRs share the goal. Link a replacement even when it already started independently. Capture any necessary hand merge or rescope using `note ... touch` and its source reference. A terminal abandonment uses `failed`. Use `pending` to record a subsequent readmission.
 
+The integer `pending_overdue` counts each pending goal whose `deadline` is strictly before the report's `observed` time, including a readmitted goal that previously delivered on time. An empty cohort reports zero. The member's `overdue` field continues to use the latest verified delivery time when one exists.
+
 A verified delivery requires a protected observation on a specific release at the declared destination. A consumed owner question, an authenticated manual intervention, or attested external work records a touch. On a delivery with a complete retrospective review of the ticket, PR and run history, `note ... audit` records positive evidence of absence of intervention through that delivery. Missing evidence stays unknown. A later `regression` observation on the goal or its successor preserves the prior delivery history. Keep the owner-state `cohorts.sqlite` alongside the instance state when backing it up or moving it.
 
 The `candidates` command selects failed goals, first interventions and escaped defects with their source references. Promote a corroborated case into the protected cases under `.github/workflows/cohort-regressions/`. The existing `arete-checks` job reads those cases from the base revision, reproduces their historical failures and corrections, and checks the candidate against the same observations. To repeat on a disposable worker, use `python .github/workflows/cohort-regressions/run.py --candidate . --calibrate`.
@@ -2841,14 +2843,21 @@ Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-fi
 {
   "destination": "arete-serve",
   "path": "/api/v1/cohorts/example",
-  "assertions": [{"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending"}, "before": {"member": "/deadline", "response": "/report/observed"}}],
+  "assertions": [
+    {
+      "field": "/report/pending_overdue",
+      "count": "/report/members",
+      "where": {"/status": "pending"},
+      "before": {"member": "/deadline", "response": "/report/observed"}
+    }
+  ],
   "recovery": [{"field": "/report/cohort/name", "equals": "example"}]
 }
 ```
 
 The default binding follows the enrolled ticket's single merged factory PR to its configured target. A private policy can instead pin a full `revision` for a known release. When several commits fast-forward together, each matching goal is checked against the running tip. The normal local client exercises the protected read on the revision that answered the request. Each receipt records the goal, policy fingerprint, requested path, verified fields, revision, timestamp and outcome.
 
-A filtered count can compare a member timestamp with another field from the very same response. Add `"before": {"member": "/deadline", "response": "/report/observed"}` to the count assertion and use `"where": {"/status": "pending"}` to measure pending deadlines strictly before the reported observation time. Both timestamps need UTC offsets. A readmitted member can be pending past its deadline even if a previous delivery was on time.
+The assertion counts pending member rows whose `deadline` is strictly before `observed` in the same response. Both timestamps need UTC offsets. A readmitted member can be pending past its deadline even if a previous delivery was on time.
 
 Before moving the checkout, the prior release must pass the recovery assertion. A wrong result on the new release keeps the ticket open and invokes the existing code-only rollback guard. A dirty checkout or incompatible database holds the release. After a successful rollback the running previous version rechecks its recovery assertion. The previous version must already contain this feature to perform that confirmation. `arete release status REPO TICKET` reports the receipt. `arete release observe REPO TICKET --revision SHA` reruns the enrolled check for the authorized revision.
 
