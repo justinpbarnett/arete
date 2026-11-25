@@ -76,7 +76,7 @@ def server_url(value):
 def steps(rows):
     need(isinstance(rows, list) and 1 <= len(rows) <= 16, "each scenario needs 1 to 16 assertions")
     for row in rows:
-        need(isinstance(row, dict) and set(row) in ({"field", "equals"}, {"field", "count", "where"}),
+        need(isinstance(row, dict) and set(row) in ({"field", "equals"}, {"field", "count", "where"}, {"field", "count", "where", "before"}),
              "an assertion needs a field and expected value or a filtered count")
         pointer(row["field"])
         if "count" in row:
@@ -84,6 +84,12 @@ def steps(rows):
             need(isinstance(row["where"], dict) and 1 <= len(row["where"]) <= 8, "count needs criteria")
             for field in row["where"]:
                 pointer(field)
+            if "before" in row:
+                bound = row["before"]
+                need(isinstance(bound, dict) and set(bound) == {"member", "response"},
+                     "before needs a member timestamp and a response timestamp")
+                pointer(bound["member"])
+                pointer(bound["response"])
 
 
 def pointer(value):
@@ -97,7 +103,7 @@ def validate(data):
          "production_branch", "immutable_host_suffix", "checks", "qa_require_revision"} and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
-    need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]+", path) and "//" not in path
+    need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]*", path) and "//" not in path
          and "%" not in path and not any(part in (".", "..") for part in path.split("/")), "invalid read-only path")
     steps(data.get("assertions"))
     steps(data.get("recovery"))
@@ -181,6 +187,17 @@ def lookup(document, field):
     return value
 
 
+def observed_time(document, field):
+    value = lookup(document, field)
+    try:
+        timestamp = util.parse_iso(value)
+    except (TypeError, ValueError):
+        raise AssertionError(f"invalid timestamp at {field}") from None
+    if timestamp.tzinfo is None:
+        raise AssertionError(f"timestamp needs an offset at {field}")
+    return timestamp
+
+
 def compare(document, rows):
     observed = []
     for row in rows:
@@ -190,8 +207,13 @@ def compare(document, rows):
             members = lookup(document, row["count"])
             if not isinstance(members, list):
                 raise AssertionError(f"{row['count']} is not an array")
-            expected = sum(all(type(v := lookup(item, f)) is type(w) and v == w for f, w in row["where"].items())
-                           for item in members)
+            matches = [item for item in members if all(type(v := lookup(item, f)) is type(w) and v == w
+                                                       for f, w in row["where"].items())]
+            if bound := row.get("before"):
+                at = observed_time(document, bound["response"])
+                expected = sum(observed_time(item, bound["member"]) < at for item in matches)
+            else:
+                expected = len(matches)
         else:
             expected = row["equals"]
         if type(actual) is not type(expected) or actual != expected:

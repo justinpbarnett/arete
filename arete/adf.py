@@ -49,6 +49,29 @@ def to_text(value: object) -> str:
     return _render_text(parts)
 
 
+def task_items(value: object) -> tuple[str, ...]:
+    if not isinstance(value, dict):
+        return ()
+    items = []
+    pending = [value]
+    while pending:
+        node = pending.pop()
+        kind = node["type"]
+        if kind == "taskItem":
+            parts = []
+            _read_node(node, kind, {kind}, parts)
+            items.append(_render_text(parts).split("\n", 1)[0])
+            continue
+        if kind == "listItem" and (first := node["content"][0])["type"] == "paragraph":
+            parts = []
+            _read_node(first, kind, {"paragraph"}, parts)
+            if checkbox := re.match(r"^\[[ xX]\][ \t]+([^\n]+)", _render_text(parts)):
+                items.append(checkbox[1])
+        if kind not in ("blockquote", "codeBlock"):
+            pending.extend(reversed(node.get("content", [])))
+    return tuple(items)
+
+
 def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, _LinkTargets | None]],
                inherited_links: _LinkTargets | None = None) -> None:
     def refuse(reason: str):

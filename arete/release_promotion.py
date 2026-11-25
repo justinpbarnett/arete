@@ -39,6 +39,9 @@ def preview(repo, policy, revision):
 
 
 def selected_revision(repo, ticket):
+    from . import spec_graph_delivery
+    if (graph := spec_graph_delivery.promotion_target(repo, ticket)) is not None:
+        return graph.get("commit", "")
     return proof.merge_revision(repo, ticket, repo.target_branch)
 
 
@@ -158,6 +161,20 @@ def note(tk, repo, ticket, state, state_file, policy, proof_row):
     serve_guard.write(state_file, state)
 
 
+def promotion_base(repo, ticket, revision, production):
+    from . import spec_graph_delivery
+    if (graph := spec_graph_delivery.promotion_target(repo, ticket)) is None:
+        return parent(repo, revision)
+    proof.need(graph.get("commit") == revision, "the verified graph release changed")
+    approved = set(graph["children"])
+    cursor = revision
+    while cursor != production:
+        proof.need(cursor in approved, "the staged range contains a change outside the verified spec graph")
+        approved.remove(cursor)
+        cursor = parent(repo, cursor)
+    return production
+
+
 def ready(cfg, repo, ticket, policy, state):
     revision, target = state["revision"], policy["production_branch"]
     try:
@@ -176,7 +193,8 @@ def ready(cfg, repo, ticket, policy, state):
                and proof.digest(proof.goal(repo.name, ticket)) == state["policy"], "release policy changed")
     proof.need(branch(repo, repo.target_branch) == revision and selected_revision(repo, ticket) == revision,
                "the staging branch or goal changed; fresh QA is required")
-    proof.need(parent(repo, revision) == branch(repo, target) == proof.deployed_revision(policy, policy["production"]),
+    production = branch(repo, target)
+    proof.need(promotion_base(repo, ticket, revision, production) == production == proof.deployed_revision(policy, policy["production"]),
                "promotion would include other unapproved changes or production identity is unconfirmed")
     proof.need(gh.merge_ci_passed(repo.github, revision, stage_checks=policy.get("checks", {}).get("staging")), "checks on the staged revision must pass before promotion")
     proof.need(proof.deployed_revision(policy, policy["staging"]) == revision
@@ -247,7 +265,7 @@ def _advance(cfg, repo, ticket, file):
     result = observe_staging(repo, ticket, revision, pinned=state["policy"])
     proof.need(result["status"] == "verified", "the staged behavior no longer passes its protected check")
     proof.need(ready(cfg, repo, ticket, policy, state) == approval, "QA authorization changed during verification")
-    state.update(phase="promotion_intent", approval=approval, parent=parent(repo, revision),
+    state.update(phase="promotion_intent", approval=approval, parent=promotion_base(repo, ticket, revision, branch(repo, policy["production_branch"])),
                  production_branch=policy["production_branch"])
     serve_guard.write(file, state)
     # A non-forced update of a direct child cannot land unrelated work if the branch races.

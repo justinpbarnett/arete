@@ -114,3 +114,23 @@ class RunningRelease(unittest.TestCase):
         held = serve_guard.read(self.state / serve_guard.RECEIPT)
         self.assertEqual(held["settled"], "release_held")
         self.assertIn("tracked changes", held["restore_status"])
+
+
+class RelativeDeadline(unittest.TestCase):
+    def test_recount_uses_strict_instants_from_the_same_response_even_for_readmitted_goals(self):
+        rule = {"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending"},
+                "before": {"member": "/deadline", "response": "/report/observed"}}
+        proof.steps([rule])
+        at = "2026-11-25T15:00:00Z"
+        past = "2026-11-25T08:59:59-06:00"
+        rows = [{"status": status, "deadline": deadline, "overdue": historical} for status, deadline, historical in
+                [("pending", past, False), ("pending", past, True), ("pending", past, True), ("pending", at, False),
+                 ("pending", "2026-11-26T00:00:00Z", False), ("verified", past, True), ("failed", past, True)]]
+        response = {"report": {"pending_overdue": 3, "members": rows, "observed": at}}
+        self.assertEqual(len(proof.compare(response,[rule])),1)
+        old = {"field": "/report/pending_overdue", "count": "/report/members", "where": {"/status": "pending","/overdue": True}}
+        with self.assertRaises(AssertionError):
+            proof.compare(response,[old])
+        for invalid in (None, "not a timestamp", "2026-11-25T15:00:00"):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                proof.compare({"report": {**response["report"], "observed": invalid}},[rule])

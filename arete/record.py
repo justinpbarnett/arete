@@ -27,6 +27,7 @@ from .store import db as foundation
 from .store import insights as insights_store
 from .store import loops as loop_store
 from .store import runs as run_store
+from .store import specgraphs
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -162,7 +163,9 @@ def dead_status(row: dict) -> str:
     if row["kind"] == "pipeline":
         earlier = [r for r in run_store.ticket_runs(row["repo"], row["issue"], limit=2, whole=True, live=True)
                    if r["id"] != row["id"]]
-        return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"
+        if earlier and earlier[0]["status"] == "interrupted" and not specgraphs.unfinished(row["repo"], row["issue"]):
+            return "failed"
+        return "interrupted"
     return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
 
 

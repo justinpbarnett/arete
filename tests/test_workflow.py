@@ -42,6 +42,7 @@ from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from arete.store import runs as run_store
+from arete.store import specgraphs
 from arete.store import tasks as task_store
 from arete.store import workspaces
 from tests import parallel, support
@@ -443,6 +444,7 @@ class QueueScoringTests(unittest.TestCase):
         self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
         self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
         self.enterContext(mock.patch.object(tracker.LocalTracker, "todo", return_value=[]))
+        self.enterContext(mock.patch.object(specgraphs, "launch_blocker", return_value=""))
         return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
 
     def test_waits_on_ignores_oversized_reference(self):
@@ -942,6 +944,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         repo = config.Repo("fixture", root / "source", parts=[config.Part(c.dir, c.github)])
         self.run = pipeline.Run(id="revision-run", repo=repo, tracker=mock.Mock(), tid="7",
                                 dir=root, path="orchestrate", alone=True)
+        self.run.tracker.get.return_value = ticket
         self.enterContext(mock.patch.object(self.run, "log"))
         self.job = job = flows.Job(config.Config(), self.run, self.ws, continues="prior-run")
         self.controller = ctl = orchestration.Controller.__new__(orchestration.Controller)
@@ -1879,7 +1882,9 @@ class RestoredPRRevisionTests(unittest.TestCase):
             labels.difference_update(remove)
             labels.update(add)
 
+        api = support.parentless_github_issue(repo.github, self.run.tid, issue)
         self.enterContext(mock.patch.multiple(gh, issue=issue, issue_labels=edit_labels, issue_comment=mock.DEFAULT,
+                                              gh_json=mock.Mock(side_effect=api),
                                               find_issue_comment_marker=mock.Mock(return_value=""),
                                               ensure_label=mock.Mock(return_value=""),
                                               issues=lambda r, label, **kw: [issue(r, 7)] if label in labels else []))
@@ -7928,6 +7933,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
             with self.subTest(pr_head=initial, tree=tree):
                 resumed, _ = self.controller()
                 resumed.flow.continues = first.run.id
+                resumed.run.tracker.get.return_value = ticket
                 resumed.data = json.loads(saved)
                 resumed.job = resumed.flow.ctx = flows.Job(config.Config(), resumed.run, root, built=resumed.job.b)
                 resumed.run.add_dirs, resumed.run.story, resumed.run.workspace = [], [], None

@@ -1234,7 +1234,7 @@ with db.tx() as c:
     before = snapshot(c)
 
 row = secretstore.put('global', 'DEMO_KEY', 'synthetic-upgrade-value', 'api_key', 'hand')
-assert_schema(db.LATEST)
+assert_schema(db.WORKSPACE_CONTRACT_SCHEMA)
 with db.reader() as c:
     assert snapshot(c) == before
 assert secretstore.get('global', 'DEMO_KEY') == row
@@ -3767,10 +3767,10 @@ proposal, = approvals.proposals(status=["approve"])
 assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == db.LATEST
+    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     assert approvals.proposal(p["id"])["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
-    assert schema_version() == db.LATEST
+    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     return "main"
 
 with (patch.dict(os.environ, {control.WORKER_ENV: "file-rule"}), patch.object(db, "MIGRATE_WAIT_SECONDS", 0),
@@ -3830,7 +3830,7 @@ def read_health(handlers, cfg, port, inside_serve, host):
 
 with patch.object(tailnet, "serve", side_effect=read_health):
     dashboard.serve()
-assert schema_version() == db.LATEST
+assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
 """)
 
 

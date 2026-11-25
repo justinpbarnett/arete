@@ -3046,8 +3046,10 @@ class UnansweredRepairBudgetTests(OwnerAnswerBudgetFixture):
             labels.difference_update(remove)
             labels.update(add)
 
+        api = support.parentless_github_issue(self.repo.github, self.ticket, issue_view)
         with (patch.object(gh, "issue", side_effect=issue_view), patch.object(gh, "issues", side_effect=issue_list),
-              patch.object(gh, "issue_labels", side_effect=edit_labels), patch.object(gh, "issue_comment")):
+              patch.object(gh, "gh_json", side_effect=api), patch.object(gh, "issue_labels", side_effect=edit_labels),
+              patch.object(gh, "issue_comment")):
             first, asked = self.spent_question(structured=True)
             self.assertIn(source.label_name("needs-info"), labels)
             self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched before label removal")), 0)
@@ -4595,6 +4597,8 @@ class EnvironmentRequeueTests(Isolated):
         self.time = datetime(2026, 11, 21, 8, tzinfo=UTC)
         self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}"
         self.authority = self.root / "authority"
+        api = support.parentless_github_issue(self.repo.github, self.issue, self.issue_view)
+        self.patches.enter_context(patch.object(gh, "gh_json", side_effect=api))
         for module, name, func in (
             (config, "load", lambda: self.cfg),
             (codebase, "STAMP", "old-engine"),
