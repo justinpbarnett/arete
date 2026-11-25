@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from textwrap import indent
 from typing import TYPE_CHECKING
 
 from . import (
@@ -1294,16 +1295,20 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
-            if results is not None:
-                detail = ({"name": name} if passed else check_repair.failed_check(
-                    layer, name, res.stdout + "\n" + res.stderr, res.returncode))
-                results.append({**detail, "passed": passed})
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
-            if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
-            else:
+            detail = {"name": name}
+            if passed:
                 report.append(f"### {name} passed: `{cmd}`")
+            else:
+                detail = check_repair.failed_check(layer, name, res.stdout + "\n" + res.stderr, res.returncode)
+                detail["exit"] = res.returncode
+                tail = tail_of_both_streams(res.stdout, res.stderr, 6000)
+                fence = "`" * max(3, 1 + max(map(len, re.findall(r"`+", tail)), default=0))
+                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n{fence}\n{tail}\n{fence}"
+                              f"\n\n{check_repair.diagnostics([detail])}")
+            if results is not None:
+                results.append({**detail, "passed": passed})
 
     try:
         with check_lane(layer, run) as hold_fds:
@@ -1320,6 +1325,19 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
+
+
+def check_failure_story(heading: str, failures: list[dict], report: str = "") -> str:
+    parts = [heading, check_repair.diagnostics(failures)]
+    if report:
+        parts.append("Check report excerpt (reference only):\n\n" + indent(util.tail(report, 2500), "    "))
+    return "\n\n".join(filter(None, parts))
+
+
+def check_fix_prompt(attempt: int, tries: int, report: str, checks: str, deny: list[str]) -> str:
+    text = prompt_loader.prompt(
+        "fix", attempt=attempt, max_attempts=tries, failures=report, checks=checks, denied=prompt_loader.code_list(deny))
+    return check_repair.builder_prompt(prompt_loader.task_prompt(text))
 
 
 def checkout_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
@@ -1600,11 +1618,11 @@ class Build(TicketWork):
         attempts, tries = 1, self.run.settings("check_repair").tries
         ok = self.check(after=after)
         while not ok and attempts < tries:
-            self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
+            failures = [item for item in self.check_results if not item["passed"]]
+            self.run.story.append(check_failure_story(f"Checks failed on attempt {attempts}:", failures, self.report))
             attempts += 1
-            self.resume(step_name(attempts),
-                        prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
-                               checks=self.check_commands, denied=prompt_loader.code_list(self.deny)), role="check_repair")
+            self.resume(step_name(attempts), check_fix_prompt(attempts, tries, self.report, self.check_commands, self.deny),
+                        role="check_repair")
             ok = self.check(after=after)
         return ok, attempts
 
