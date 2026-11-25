@@ -96,6 +96,8 @@ def assess(cfg, repo, ticket, row, prs):
             or not isinstance(candidate.get("rerun"), bool)
             or not {"tree", "review", "verification", "observed", "risk", "diff_excerpt", "diff_truncated"} <= candidate.keys()):
         return "merge-verification", {}
+    if release_proof.missing_staging_promise(repo, ticket.id):
+        return "", {}
     number = gh.pr_number(url)
     _, hold = gh.merge_readiness(binding["github"], number, binding["head"], binding["target"], binding["base"],
                                  required=pilot.required_check(cfg, repo, layer),

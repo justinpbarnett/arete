@@ -756,8 +756,10 @@ class Run(AgentRun):
         others = [s for s in self.tracker.states if s != status]
         labeled = self.tracker.label(self.tid, add=[status], remove=others)
         record.note(self.id, label_pending=status if labeled else "")
+        from . import release_proof
+
         guarded_jira = isinstance(self.tracker, tracker.JiraTracker) and (
-            self.spec_root or spec_store.find(self.repo.name, str(self.tid)))
+            self.spec_root or spec_store.find(self.repo.name, str(self.tid)) or release_proof.required(self.repo.name, self.tid))
         moved = (self.tracker.move(self.tid, status, keep_open=True) if guarded_jira
                  else self.tracker.move(self.tid, status))
         for err in (labeled, moved):
@@ -3531,6 +3533,8 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
 
     if len(b.checkouts) != 1:
         return merge_review.MULTIPLE
+    if hold := release_proof.missing_staging_promise(b.run.repo, getattr(b.ticket, "id", None)):
+        return hold
     head = c.lease
     if hold := merge_evidence_hold(b, c, verified, review, head):
         return hold

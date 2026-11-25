@@ -296,18 +296,21 @@ def choose_jira_project() -> str:
 
 
 def cmd_repo(args) -> int:
-    from .. import enrollment, gh, jira, outbound, ticket_publication
+    from .. import enrollment, gh, jira, outbound, release_profile, ticket_publication
 
     try:
         if args.repo_action == "enroll":
             repo = enrollment.enroll(args.name, args.path, target_branch=args.target_branch, landing=args.landing,
                                      unattended_environment=args.unattended_environment, destination=args.tracker,
                                      jira_project=args.jira_project, jira_label=args.jira_label, pipeline=args.pipeline,
-                                     choose_project=choose_jira_project if sys.stdin.isatty() else None)
+                                     choose_project=choose_jira_project if sys.stdin.isatty() else None,
+                                     staging_profile=args.staging_profile)
             cfg = config.load_required()
         else:
             cfg = config.load_required()
             repo = cfg.repo(args.name)
+        if args.repo_action == "staging-profile":
+            release_profile.install(repo, args.policy_file)
         if args.repo_action == "publish":
             body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
             url = ticket_publication.plan(cfg, repo, args.kind, args.title, body, args.key,
@@ -337,6 +340,13 @@ def repo_commands(sub) -> None:
     p.add_argument("--jira-project", default="", help="select Jira and use this existing project instead of [jira] project")
     p.add_argument("--jira-label", default="", help="override the repo's Jira routing label")
     p.add_argument("--pipeline", action="store_true", help="enable the repo's existing factory queue")
+    p.add_argument("--staging-profile", type=Path, help="owner-approved reusable staging destinations, checks and QA authority")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("staging-profile", help="set the protected staging defaults of an existing repository")
+    p.add_argument("name")
+    p.add_argument("--policy-file", type=Path, required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_repo)
 

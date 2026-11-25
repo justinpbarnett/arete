@@ -6,7 +6,7 @@ import re
 import secrets
 from urllib.parse import quote, urlencode
 
-from . import adf, config, gh, jira, release_proof as proof, serve_guard, tracker, util
+from . import adf, config, gh, jira, release_profile, release_proof as proof, serve_guard, tracker, util
 
 NEUTRAL = {"thanks", "thank you", "looks good", "lgtm", "ack"}
 EXPLICIT = {"promote this to production", "push this to production", "moving this to push to production on the sheet"}
@@ -43,6 +43,7 @@ def selected_revision(repo, ticket):
 
 
 def observe_staging(repo, ticket, revision, *, pinned=""):
+    release_profile.current(repo)
     policy = proof.goal(repo.name, ticket)
     proof.need(policy and policy["destination"] == repo.unattended_environment == "staging"
                and repo.pipeline and repo.landing == "pr" and repo.target_branch != policy["production_branch"],
@@ -200,6 +201,7 @@ def advance(cfg, repo, ticket):
 
 
 def _advance(cfg, repo, ticket, file):
+    release_profile.current(repo)
     policy = proof.goal(repo.name, ticket)
     proof.need(policy and policy["destination"] == repo.unattended_environment == "staging" and repo.target_branch
                and repo.target_branch != policy["production_branch"], "no eligible staging enrollment")
