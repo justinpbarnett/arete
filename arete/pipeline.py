@@ -5012,7 +5012,7 @@ def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[s
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, *, replay_drivers: set[str] | None = None,
                 covered_commands: tuple[str, ...] = (), **values) -> verify.Verified:
-    from . import pilot, readme_verify, zte
+    from . import candidate_observer, pilot, readme_verify, release_proof, zte
 
     run, configured = b.run, b.layer.verify
     replay_only = replay_drivers is not None
@@ -5087,7 +5087,15 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     lifetime = {"stopped": True}
     fixture_blocker = ""
     probes = None
+    candidate = enrollment = None
     try:
+        if delivery_verification and not replay_only:
+            try:
+                enrollment = candidate_observer.binding(b)
+            except (OSError, ValueError, RuntimeError) as error:
+                reason = str(error) if isinstance(error, release_proof.Held) else type(error).__name__
+                return save_verification(run, step, verify.Verified("blocked", "Candidate enrollment could not be confirmed.",
+                                                                    blocked_by=reason, finished=False))
         if attempt:
             run.log(f"{step}: scratch folder {attempt.root}")
             v = verify.with_scratch(v, attempt.root)
@@ -5117,6 +5125,15 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
+            if enrollment and (not probes or probes.verdict == "pass"):
+                candidate = candidate_observer.observe(b, step, enrollment, url, v.url, lifetime.get("process"))
+                if candidate.verdict == "pass":
+                    v = replace(v, notes=v.notes + "\n\nArete ran the enrolled browser observer on this candidate. "
+                                "Its checks below cover only the listed assertions. Verify all remaining requirements, "
+                                "including unrelated behavior, yourself. Report deployed staging separately.\n\n"
+                                + candidate.markdown())
+                else:
+                    probes = candidate
             probes_passed = not probes or probes.verdict == "pass"
             if replay and probes_passed:
                 driver_config = replace(v, probes={}, probe_seconds=run.time_for(v.probe_seconds))
@@ -5185,6 +5202,15 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         verified = verify.Verified.from_agent(res.structured)
     if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
+    if candidate and candidate.verdict == "pass":
+        try:
+            unchanged = enrollment == candidate_observer.binding(b)
+        except (OSError, ValueError, RuntimeError):
+            unchanged = False
+        if not unchanged:
+            return save_verification(run, step, verify.Verified("blocked", "The verified candidate changed.",
+                                     blocked_by="Candidate checkout or observer policy changed before acceptance.", finished=False), removed)
+        verified.checks = candidate.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     measured = verified.verdict == "pass" or (getattr(run, "code_review", False) is True and verified.verdict == "blocked"
