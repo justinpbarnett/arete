@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main, 'arete-check/**']
 
 permissions:
   contents: read
@@ -22,6 +22,10 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Select check candidate
+        if: startsWith(github.ref, 'refs/heads/arete-check/')
+        run: git checkout --detach "$GITHUB_SHA^2"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: '0.10.2'
@@ -30,9 +34,52 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
+      - name: Observe the protected worker isolation check
+        if: startsWith(github.ref, 'refs/heads/arete-check/')
+        run: |
+          witness="$RUNNER_TEMP/arete-protected-witness"
+          git worktree add --quiet --detach "$witness" "$GITHUB_SHA^2"
+          git -C "$witness" restore --source="$GITHUB_SHA^2^" --staged --worktree -- tests
+          cd "$RUNNER_TEMP"
+          uv --no-config run --isolated --no-project --python 3.13 python -IB - "$witness" <<'PYTHON'
+          import sys
+          import unittest
+          from pathlib import Path
+          from types import ModuleType
+          tests = ModuleType("tests")
+          tests.__path__ = [str(Path(sys.argv[1]) / "tests")]
+          sys.modules["tests"] = tests
+          sys.path.append(sys.argv[1])
+          name = "tests.test_behavior.AuthorityPrivatePiWorkerTests.test_private_worker_launch_denies_the_configured_file_store"
+          suite = unittest.defaultTestLoader.loadTestsFromName(name)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(not (result.wasSuccessful() and result.testsRun == 1 and not result.skipped and not result.expectedFailures))
+          PYTHON
       - run: uv sync --locked
       - name: Existing behavior checks
-        run: uv run --locked python -m tests.parallel --timeout 30
+        id: behavior
+        run: |
+          status=0
+          uv run --locked python -m tests.parallel --timeout 30 || status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Behavior suite exit ${{ steps.behavior.outputs.exit_code }}
+        if: ${{ !cancelled() && steps.behavior.outputs.exit_code != '' }}
+        run: 'true'
+      - name: Replay protected factory regressions
+        env:
+          POLICY_REV: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eu
+          policy=.github/workflows/cohort-regressions
+          source="$POLICY_REV"
+          case "$GITHUB_REF" in refs/heads/arete-check/*) source="$GITHUB_SHA^1";; esac
+          git cat-file -e "$source^{commit}"
+          # Only the installation predates the protected cases.
+          if ! git cat-file -e "$source:$policy/run.py"; then source=HEAD; fi
+          guard_dir=$(mktemp -d)
+          git archive "$source" "$policy" | tar -x -C "$guard_dir"
+          .venv/bin/python -I -B "$guard_dir/$policy/run.py" --candidate "$PWD" --calibrate
       - name: Python lint, compilation and imports
         run: |
           sh tools/lint-arete
