@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 
 from . import (
     alerts,
@@ -47,6 +48,7 @@ from . import (
     outbound,
     owner_asks,
     paths,
+    pr_recovery,
     principals,
     prompt_loader,
     record,
@@ -69,6 +71,7 @@ from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
 from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
+from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import specs as spec_store
@@ -76,6 +79,9 @@ from .store import triage as triage_store
 from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
+
+if TYPE_CHECKING:
+    from . import unblock
 
 ADW = "adw"
 ORCHESTRATED = "orchestrated"
@@ -500,11 +506,18 @@ class CatchUpPathCollision(workspace.RunFailed):
         self.name = name
 
 
+@dataclass(frozen=True)
+class RecoveryDiscussion:
+    decision: str = ""
+    replies: list[dict] | None = None
+
+
 @dataclass(kw_only=True)
 class Run(AgentRun):
     tracker: tracker.Tracker
     tid: str
     force: bool = False
+    from_poll: bool = False
     feedback: list[dict] = field(default_factory=list)
     claim_feedback_on_revise: bool = False
     closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
@@ -533,6 +546,37 @@ class Run(AgentRun):
     code_review: bool = False
     spec_root: str = ""
     spec_identity: str = ""
+    pr_recovery_cutoff: str = field(default="", init=False)
+    pr_recovery_discussion: dict[str, RecoveryDiscussion] = field(default_factory=dict, init=False)
+    pr_recovery_ticket_replies: list[unblock.TicketReply] | None = field(default=None, init=False)
+    pr_recovery_answers: list[dict] = field(default_factory=list, init=False)
+
+    def capture_pr_recovery_discussion(self, prs: list[str]) -> None:
+        from . import unblock
+
+        if not self.pr_recovery_cutoff:
+            self.pr_recovery_cutoff = util.iso()
+            self.pr_recovery_answers = pr_recovery.answered_asks(self.id)
+            try:
+                self.pr_recovery_ticket_replies = unblock.ticket_reply_rows(self.tracker, str(self.tid))
+            except (*tracker.ERRORS, OSError, KeyError, TypeError, ValueError) as error:
+                detail = util.first_line(vault.hidden(str(error)), 300)
+                self.log(f"could not record the initial ticket replies: {detail}")
+        prior = self.recovery.get("binding", {}).get("pr_recovery", {})
+        for pr in dict.fromkeys(prs):
+            if pr in self.pr_recovery_discussion:
+                continue
+            decision = prior.get("decision", "") if prior.get("refs", {}).get("url") == pr else ""
+            replies = None
+            try:
+                replies = pr_recovery.pr_replies(pr, self.repo.name, str(self.tid))
+                if self.pr_recovery_ticket_replies is not None:
+                    decision = unblock.recovery_decision_for(replies, self.pr_recovery_ticket_replies,
+                                                             self.pr_recovery_answers)
+            except (*tracker.ERRORS, OSError, ValueError) as error:
+                detail = util.first_line(vault.hidden(str(error)), 300)
+                self.log(f"could not record the initial owner discussion on {pr}: {detail}")
+            self.pr_recovery_discussion[pr] = RecoveryDiscussion(decision, replies)
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -777,8 +821,22 @@ def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
     run.workspace = ws, checkouts
 
 
+def retain_for_cleanup(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
+    try:
+        retained = sorted(c.prefix + name for c in checkouts for name in pr_recovery.cleanup_paths(c))
+        why = f"it contains retained files ({', '.join(map(repr, retained))})" if retained else ""
+    except (workspace.RunFailed, RuntimeError, OSError, ValueError) as error:
+        why = f"retained files could not be checked: {str(error)}"
+    if why:
+        workspaces.keep(ws, "operator")
+        run.log(vault.hidden(f"workspace kept at {ws}: {why}"))
+    return bool(why)
+
+
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
     try:
+        if retain_for_cleanup(run, ws, checkouts):
+            return False
         if run.closed_checkouts or run.catch_up_preserved:
             workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
                                 excluded=run.closed_checkout_paths)
@@ -810,16 +868,34 @@ def restore_paths(wt: Path, source: str, paths: list[str]) -> None:
         wt, env={"GIT_LITERAL_PATHSPECS": "1"})
 
 
-def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> None:
+def drop_new_bytecode(wt: Path, retained: pr_recovery.Retained) -> None:
+    if not retained.names:
+        workspace.drop_untracked_bytecode(wt)
+        return
+    names = {n for n in workspace.untracked_files(wt) if Path(n).parent.name == "__pycache__"}
+    for name in names.difference(pr_recovery.overlapping_paths(names, retained.names)):
+        workspace.remove_untracked(wt, name)
+
+
+def protect_retained_from_restore(c: workspace.Checkout, paths: list[str]) -> None:
+    saved = pr_recovery.read_retained(c.wt).names
+    if saved and (overlap := pr_recovery.overlapping_paths(saved, paths)):
+        raise pr_recovery.path_hold(c, "restoring paths could overwrite retained files", overlap,
+                                    "Save or reconcile the named files separately, then retry")
+
+
+def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> tuple[str, str] | None:
     head = git(["rev-parse", "HEAD"], c.wt).strip()
-    workspace.drop_untracked_bytecode(c.wt)
-    diffguard.add(c.wt)
+    retained = pr_recovery.check_retained(c)
+    drop_new_bytecode(c.wt, retained)
+    pr_recovery.add_retained_safe(c, retained)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
     holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
                              c.wt)) if vault.every() else {}
     changed = util.git_records(["diff", "--cached", "--no-renames", "--name-only"], c.wt)
     fatal = [n for n in changed if n in holding or workflow_denied(n, c.prefix)]
     if fatal:
+        protect_retained_from_restore(c, fatal)
         restore_paths(c.wt, head, fatal)
     if denied := [n for n in changed if n not in fatal
                   and (util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny))]:
@@ -828,22 +904,32 @@ def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | No
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
         util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         c.onto = c.onto or head
+        return head, git(["rev-parse", "HEAD"], c.wt).strip()
+    return None
 
 
-def keep_edits(run: Run) -> None:
+def keep_edits(run: Run) -> dict[str, tuple[str, str]]:
+    kept = {}
     if run.dry_run or not run.workspace:
-        return
+        return kept
+    try:
+        pr_recovery.check_staging(run.workspace[1])
+    except (workspace.RunFailed, RuntimeError, OSError, ValueError) as error:
+        run.log(f"left the retained files unstaged: {vault.hidden(str(error))}")
+        return kept
     for c in run.workspace[1]:
         if not (c.wt / ".git").exists():
             continue
         try:
-            commit_kept(run.id, c, run.layer)
-        except (RuntimeError, OSError) as e:
+            if heads := commit_kept(run.id, c, run.layer):
+                kept[c.github] = heads
+        except (workspace.RunFailed, RuntimeError, OSError, ValueError) as e:
             run.log(f"could not commit the edits in {c.github}, so they stay uncommitted in {c.wt}: {e}")
             try:
                 c.onto = c.onto or git(["rev-parse", "HEAD"], c.wt).strip()
             except (RuntimeError, OSError):
                 pass
+    return kept
 
 
 def kept_heads(run: Run) -> dict:
@@ -900,7 +986,7 @@ class Staged(diffguard.Diff):
 
 
 def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = True) -> str:
-    return git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
+    return c.recovery_base or git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
 
 
 def has_unpublished_base(c: workspace.Checkout) -> bool:
@@ -930,15 +1016,18 @@ def changed_tree_paths(wt: Path, before: str, after: str) -> set[str]:
 
 def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False, *,
           worker_trees: dict[str, str] | None = None, ignored_denied_paths: dict[str, list[str]] | None = None) -> Staged:
+    retained = pr_recovery.check_staging(checkouts, ignored_denied_paths)
     out = Staged()
     for c in checkouts:
-        workspace.drop_untracked_bytecode(c.wt)
+        saved = retained[c.github]
+        drop_new_bytecode(c.wt, saved)
         against = base_of_head(c) if from_base else (c.onto or "HEAD")
-        if retained := (ignored_denied_paths or {}).get(c.github):
-            if names := stageable_untracked(c.wt, ignored=True).intersection(retained):
+        if forced := (ignored_denied_paths or {}).get(c.github):
+            if names := stageable_untracked(c.wt, ignored=True).intersection(forced) - saved.names:
                 git(["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], c.wt,
                     input="\0".join(sorted(names)) + "\0", env={"GIT_LITERAL_PATHSPECS": "1"})
-        diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
+        pr_recovery.add_retained_safe(c, saved)
+        diff = diffguard.between(c.wt, "--cached", against, deny=deny, prefix=c.prefix, moves=True)
         merged = pending_merge(c)
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
@@ -1118,7 +1207,12 @@ def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
 
 
 def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]]:
-    return [(d, name) for d, names in before.items() for name in sorted(workspace.untracked_files(d) - names)]
+    added = []
+    for d, names in before.items():
+        current = workspace.untracked_files(d) - names
+        protected = pr_recovery.overlapping_paths(current, pr_recovery.read_retained(d).names)
+        added.extend((d, name) for name in sorted(current.difference(protected)))
+    return added
 
 
 def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
@@ -1223,6 +1317,23 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
+
+
+def checkout_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
+    trees = {c.github: factory.fingerprint(c.wt) for c in checkouts}
+    return trees if len(trees) == len(checkouts) and all(trees.values()) else {}
+
+
+def check_tree(trees: dict[str, str]) -> str:
+    if not trees:
+        return ""
+    return next(iter(trees.values())) if len(trees) == 1 else orchestration_store.digest(trees)
+
+
+def check_git_state(checkouts: list[workspace.Checkout]) -> dict[str, tuple[str, str, str]]:
+    return {c.github: (pr_recovery.current_head(c), pr_recovery.current_ref(c),
+                       hashlib.sha256(util.git_bytes(["ls-files", "--stage", "-v", "-z"], c.wt)).hexdigest())
+            for c in checkouts}
 
 
 class RetryNextPoll(Exception):
@@ -1367,17 +1478,28 @@ class Build(TicketWork):
                                defer_failed_cleanup: bool = False, focused: dict[str, list[str]] | None = None) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = not focused and (selected is None or selected == set(self.layer.checks))
-        before = factory.fingerprint(self.ws)
+        before = checkout_trees(self.checkouts)
+        if not before:
+            self.report = "Checks did not run: could not fingerprint every participating checkout."
+            return False
+        git_before = check_git_state(self.checkouts)
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
                                      defer_failed_cleanup=defer_failed_cleanup, focused=focused, results=self.check_results)
+        pr_recovery.check_staging(self.checkouts)
+        after = checkout_trees(self.checkouts)
+        if not after:
+            self.report += "\n\nCould not fingerprint every participating checkout after checks."
+            return False
+        git_after = check_git_state(self.checkouts)
+        if changed := [repo for repo in before if before[repo] != after[repo] or git_before[repo] != git_after[repo]]:
+            self.report += (f"\n\nChecks modified the source tree, index or HEAD in {', '.join(changed)}; "
+                            "rerun the full suite on the intended candidate.")
+            return False
         if ok:
-            after = factory.fingerprint(self.ws)
-            if before and after and before != after:
-                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
-                return False
+            tree = check_tree(before)
             if full:
-                self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
-            elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
+                self.checked = {"tree": tree, "trees": before, "commands": dict(self.layer.checks), "report": self.report}
+            elif tree == previous.get("tree") and previous.get("commands") == self.layer.checks:
                 self.checked = previous
         return ok
 
@@ -1400,6 +1522,10 @@ class Build(TicketWork):
         return f"{failure} {details} {instruction}"
 
     def restore_staged_paths(self, staged: Staged) -> None:
+        for c in self.checkouts:
+            paths = staged.restores.get(c.github, ("", []))[1] + staged.fatal_restores.get(c.github, [])
+            if paths:
+                protect_retained_from_restore(c, paths)
         for c in self.checkouts:
             if restore := staged.restores.get(c.github):
                 restore_paths(c.wt, *restore)
@@ -1459,10 +1585,10 @@ class Build(TicketWork):
                             f"### Lines changed by file\n\n{lines_by_file(counts)}{pushed}")
 
     def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None,
-             check_targets: Callable[[], None] | None = None) -> None:
+             check_targets: Callable[[], None] | None = None, recovery: pr_recovery.Publication | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
         commit_and_push(self.checkouts, self.staged.changed, branch, message, before_push=before_push,
-                        check_targets=check_targets)
+                        check_targets=check_targets, recovery=recovery)
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None, *,
@@ -1775,7 +1901,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         if (status == "noop" and run.closed_feedback_prs) or (
                 status == "failed" and failure.get("reason") == "policy-changed"):
             insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
-        elif run.step_started or (flow and flow.work_started):
+        elif failure.get("reason") == pr_recovery.REASON or run.step_started or (flow and flow.work_started):
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         else:
             insights_store.release_feedback(run.id)
@@ -1914,6 +2040,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 return 2
             retry_of = {"environment_retry_of": source["id"], "pr_url": source["pr_url"], "branch": source["branch"]}
         only = (script.only or (script.action if script.action_only else "")) if script else ""
+        continuation = flows.adaptive_state(script.continues) if script and script.path == "orchestrate" else {}
+        reconciling_recovery = bool(pr_recovery.pending_receipt(continuation))
         reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
                                 and bool(flows.pending_catch_up(script.continues)))
         try:
@@ -2005,9 +2133,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
-            poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
-                            and latest["status"] == "failed" and not latest["dry_run"]
-                            and launch_lease.from_poll(repo.name, str(tid)) else "")
+            from_poll = launch_lease.from_poll(repo.name, str(tid))
+            poll_failure = (latest["id"] if from_poll and not (dry_run or force or retry_of or readmission) and latest
+                            and latest["status"] == "failed" and not latest["dry_run"] else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -2155,7 +2283,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=from_poll,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
@@ -2223,6 +2351,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 raise
             return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
         status, pr_url, passed, drive_entered, retaining_catch_up = "failed", "", None, False, False
+        open_pr_hold, kept = None, {}
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -2235,6 +2364,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         def keep_edits_blocker() -> str:
             if run.catch_up_preserved:
                 return "catch-up left files in place"
+            if run.path == "orchestrate" and pr_recovery.pending_receipt(flows.adaptive_state(run.id)):
+                return "publication still needs reconciliation"
             if retaining_catch_up:
                 return "the catch-up checkout is retained for reconciliation"
             if run.environment_release and not ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
@@ -2326,7 +2457,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
                 with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
-                    if not (only or zte_grant or (flow and flow.refusal)):
+                    if not (only or zte_grant or reconciling_recovery or (flow and flow.refusal)):
                         run.retry_gate_evidence()
                     drive_entered = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
@@ -2378,6 +2509,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if status == "interrupted":
                 summary += " The next poll can reconcile the recorded push."
             run.log(summary)
+        except pr_recovery.Hold as error:
+            if _termination is not None:
+                raise
+            open_pr_hold = error
+            status, summary = "failed", error.why
         except workspace.RunFailed as e:
             if _termination is not None:
                 raise
@@ -2408,6 +2544,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, summary)
+            elif run.path == "orchestrate" and pr_recovery.pending_receipt(flows.adaptive_state(run.id)):
+                status, summary, pr_url = _fail(run, "publication was interrupted; reconcile before resuming",
+                                               recovery=run.failure)
             else:
                 run.give_up("crashed before finishing")
         finally:
@@ -2422,6 +2561,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
                                             preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths,
                                             during_termination=True)
+                        retain_for_cleanup(run, *run.workspace)
                 except Exception as error:
                     run.log(f"SIGTERM: could not keep work: {error}")
                 finally:
@@ -2429,10 +2569,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             try:
                 if run.workspace and not zte_grant:
                     if not keep_edits_blocker():
-                        keep_edits(run)
+                        kept = keep_edits(run)
                     workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
                                         preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
-                    workspaces.keep(run.workspace[0], status)
+                    if not retain_for_cleanup(run, *run.workspace):
+                        workspaces.keep(run.workspace[0], status)
             except (OSError, sqlite3.Error) as e:
                 run.log(f"could not finalize workspace {run.workspace[0]}: {util.first_line(str(e), 300)}")
             finally:
@@ -2445,6 +2586,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.log(f"could not record retained heads for the catch-up park: {e}")
         try:
             with handoff_io():
+                if open_pr_hold:
+                    status, summary, pr_url = hold_open_pr(run, open_pr_hold, kept)
                 settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
             if not zte_grant:
@@ -2466,8 +2609,46 @@ def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str
     return "pr", why, pr_url
 
 
+def hold_open_pr(run: Run, error: pr_recovery.Hold, kept: dict[str, tuple[str, str]]) -> tuple[str, str, str]:
+    from . import flows, unblock
+
+    failure = dict(error.recovery)
+    why = error.why
+    if pr_recovery.pending_receipt(saved := flows.adaptive_state(run.id)):
+        why += ". " + (pr_recovery.manual_publication_hold(saved["publication_intent"])
+                       or f"Inspect the recorded effects, then resume `{run.id}` to verify the retained publication")
+    before, after = kept.get(failure["github"], ("", ""))
+    if before == failure["local"] and after:
+        failure["local"] = after
+        why += f" Arete kept the remaining edits at {after}."
+    if "attempted_refs" in failure:
+        retry = run.recovery.get("binding", {}).get("pr_recovery", {})
+        refs = retry.get("refs", {})
+        if refs.get("url") == failure["pr"] and retry.get("local") == failure["local"]:
+            failure["retried_refs"] = refs
+    discussion = run.pr_recovery_discussion.get(failure["pr"], RecoveryDiscussion())
+    failure["held_at"] = run.pr_recovery_cutoff or util.iso()
+    failure["seen_replies_by_pr"] = {pr: pr_recovery.reply_keys(snapshot.replies)
+                                     for pr, snapshot in run.pr_recovery_discussion.items()}
+    failure["seen_replies"] = failure["seen_replies_by_pr"].get(failure["pr"])
+    ticket_replies = run.pr_recovery_ticket_replies
+    failure["seen_ticket_replies"] = None if ticket_replies is None else unblock.ticket_reply_keys(ticket_replies)
+    run.failure = {"class": "environment", **failure, "decision": discussion.decision}
+    run.log(f"held: {why}")
+    run.enter(run.failed_state)
+    if not run.dry_run and pr_recovery.notice(run.repo.name, str(run.tid), run.failure):
+        run.say(why, on_ticket=True)
+    return "failed", why, ""
+
+
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
           *, recovery: dict | None = None) -> tuple[str, str, str]:
+    from . import flows
+
+    saved = flows.adaptive_state(run.id) if run.path == "orchestrate" else {}
+    reconciling = pr_recovery.pending_receipt(saved)
+    if reconciling:
+        why = pr_recovery.manual_publication_hold(saved["publication_intent"]) or why
     run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
     run.log(f"failed: {why}")
     run.enter(run.failed_state)
@@ -2476,8 +2657,9 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
     task = ("apply your feedback" if run.feedback else "repair the review findings" if run.repairs
             else "finish this one")
+    retry = "Reconcile the recorded publication effects before resuming" if reconciling else run.retry_hint
     run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
-            f"Mac. {run.retry_hint}.")
+            f"Mac. {retry}.", **({"on_ticket": True} if reconciling else {}))
     return "failed", why, ""
 
 
@@ -3087,9 +3269,11 @@ def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
 
 
 def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
-                  track_moved_base: bool = False) -> str | None:
+                  track_moved_base: bool = False, require_pinned_base: bool = False) -> str | None:
     run = b.run
     try:
+        if require_pinned_base:
+            return unpinned_merge_hold(c, fetch_merge_base(c))
         return merge_hold(b, c, verified, review, about, track_moved_base=track_moved_base)
     except gh.GhUnsure:
         run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
@@ -3100,7 +3284,8 @@ def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, re
         return "the merge gate could not be completed"
 
 
-def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
+def report_automerge(run: Run, c: workspace.Checkout, hold: str, *,
+                     recovery: pr_recovery.Publication | None = None) -> None:
     from . import merge_review
 
     if not hold:
@@ -3111,8 +3296,12 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
         run.log(f"{c.pr}: {hold}")
         return
     run.log(f"automerge left {c.pr} for a person: {hold}")
+    body = public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it.")
     try:
-        gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
+        if recovery:
+            recovery.comment(c, body, kind="Recovered automerge decision", during="before reporting the automerge hold")
+        else:
+            gh.pr_comment(c.pr, body)
     except gh.GhError as e:
         run.log(f"automerge could not report the hold on {c.pr}: {e}")
 
@@ -3331,6 +3520,11 @@ def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Ver
     return None
 
 
+def unpinned_merge_hold(c: workspace.Checkout, base_sha: str) -> str:
+    return (f"GitHub cannot require the checked base `{c.base}` at `{base_sha}` when merging this recovered PR; "
+            "the merge API only pins the head")
+
+
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
                track_moved_base: bool = False) -> str:
     from . import merge_review
@@ -3475,6 +3669,47 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
     return ci_stopped
 
 
+def report_recovered_measurement(run: Run, recovery: pr_recovery.Publication, c: workspace.Checkout,
+                                 report: str, section: str, observed: list[str], verified: verify.Verified) -> None:
+    try:
+        basis = report if with_unverified_measurement(report, "") != report else gh.pr_body(c.pr)
+    except ci.READ_ERRORS as error:
+        run.log(f"ci: could not read the unverified requirement in {c.pr}: {util.first_line(str(error), 300)}")
+        return
+    section = gh.outgoing(public_text(run, section))
+    if with_unverified_measurement(basis, section, observed_requirements=observed, existing_only=True) != basis:
+        recovery.comment(c, public_text(run, section or verified.markdown()), kind="Recovered measurement evidence",
+                         during="before refreshing measurement evidence")
+
+
+def link_recovered_prs(run: Run, t: tracker.Ticket, recovery: pr_recovery.Publication,
+                       with_prs: list[workspace.Checkout]) -> None:
+    ticket_links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    for c in with_prs:
+        body = gh.pr_body(c.pr)
+        link, text = gh.split_link(body, ticket_links)
+        updated = with_siblings(text, sibling_section(t.ref, c, with_prs))
+        if updated == text or (payload := gh.outgoing(updated, link)) == body:
+            continue
+        with recovery.pr_write(c, "PR sibling links", "before linking sibling PRs", "after linking sibling PRs"):
+            gh.gh(["pr", "edit", c.pr, "--body-file", "-"], input=payload, write=True, retry=False)
+
+
+def refresh_recovered_prs(run: Run, t: tracker.Ticket, recovery: pr_recovery.Publication,
+                          with_prs: list[workspace.Checkout], changed: list[workspace.Checkout],
+                          report: str, link: str) -> list[workspace.Checkout]:
+    ci_stopped = []
+    ticket = f"{link}\n\n" if link else ""
+    for c in (c for c in with_prs if c in changed):
+        if stopped_by_ci(run, c):
+            ci_stopped.append(c)
+        compared = f"Compared with `{c.base}` at `{recovery.checked_base(c)}`."
+        related = sibling_section(t.ref, c, with_prs)
+        recovery.comment(c, f"{compared}\n\n{ticket}{report}{related}", kind=pr_recovery.GATE_EVIDENCE,
+                         during="before refreshing PR evidence")
+    return ci_stopped
+
+
 def left_section(run: Run, text: str) -> str:
     if len(text) <= MAX_LEFT_FOR_A_PERSON_CHARS:
         return gh.outgoing(text)
@@ -3526,7 +3761,10 @@ def note_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> None:
 
 def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str,
                     *, before_push: Callable[[workspace.Checkout], str] | None = None,
-                    check_targets: Callable[[], None] | None = None) -> None:
+                    check_targets: Callable[[], None] | None = None,
+                    recovery: pr_recovery.Publication | None = None) -> None:
+    if not recovery and any(c.recovery_head for c in changed):
+        raise workspace.RunFailed("a reconciled PR requires fresh controller gates and an exact-head publication lease")
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
@@ -3534,8 +3772,14 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
         try:
             util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
+            if recovery:
+                raise recovery.failure(f"the commit in {c.github} failed", vault.hidden(str(e))) from e
             raise workspace.RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
         c.onto = c.onto or before
+    if recovery:
+        for c in changed:
+            recovery.push(c)
+        return
     moved = [c.github for c in checkouts if workspace.remote_head(c.src, branch) != c.lease]
     if moved:
         raise workspace.RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
@@ -3610,10 +3854,14 @@ def drafted_note(drafted: list[workspace.Checkout], with_prs: list[workspace.Che
     return "The PR is now a draft." if len(with_prs) == 1 else "The PRs are now drafts."
 
 
-def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci") -> bool:
+def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci", *,
+              recovery: pr_recovery.Publication | None = None) -> bool:
     now = "a draft" if draft else "ready for review"
+    write = (recovery.pr_write(c, "draft state", "before changing the PR draft state",
+                               f"after attempting to mark the PR {now}", draft=draft) if recovery else nullcontext())
     try:
-        gh.pr_set_draft(c.pr, draft)
+        with write:
+            gh.pr_set_draft(c.pr, draft, **({"single_attempt": True} if recovery else {}))
     except gh.GhError as e:
         run.log(f"{by}: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
         return False
@@ -3638,33 +3886,36 @@ def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
 
 
 def hold_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
-                draft_why: str) -> list[workspace.Checkout]:
+                draft_why: str, *, recovery: pr_recovery.Publication | None = None) -> list[workspace.Checkout]:
     if not draft_why or run.repairs or run.feedback:
         return []
     held = []
+    options = {"recovery": recovery} if recovery else {}
     for c in pushed:
         if c in ci_stopped:
             continue
         draft = own_draft_state(run, c)
         if draft is None:
             continue
-        if draft or set_draft(run, c, True, "pr"):
+        if draft or set_draft(run, c, True, "pr", **options):
             held.append(c)
     return held
 
 
 def ready_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
-                 draft_why: str) -> list[workspace.Checkout]:
+                 draft_why: str, *, recovery: pr_recovery.Publication | None = None,
+                 ready_drafts: bool = True) -> list[workspace.Checkout]:
     if draft_why or run.repairs or run.feedback:
         return []
     ready = []
+    options = {"recovery": recovery} if recovery else {}
     for c in pushed:
         if c in ci_stopped:
             continue
         draft = own_draft_state(run, c)
         if draft is None:
             continue
-        if not draft or set_draft(run, c, False, "pr"):
+        if not draft or (ready_drafts and set_draft(run, c, False, "pr", **options)):
             ready.append(c)
     return ready
 
@@ -3738,9 +3989,11 @@ def classic_ci_reruns(b: Build) -> AutomaticCIReruns:
 
 
 class AutomaticCIReruns:
-    def __init__(self, requested_heads: set[tuple[str, str]], remember: Callable[[str, str], None] | None = None):
+    def __init__(self, requested_heads: set[tuple[str, str]], remember: Callable[[str, str], bool | None] | None = None,
+                 request: Callable[[str, int], bool] | None = None):
         self.requested_heads = requested_heads
         self.remember = remember
+        self.request = request
         self.reruns: dict[tuple[str, str, str], list[gh.WorkflowRerun]] = {}
         self.before: dict[tuple[str, str, str], ci.Watched] = {}
 
@@ -3789,13 +4042,17 @@ class AutomaticCIReruns:
         except ci.READ_ERRORS as e:
             run.log(f"ci: could not identify the workflow for {names}: {util.first_line(str(e), 300)}")
             return False
-        if self.remember:
-            self.remember(repo, head)
+        if self.remember and self.remember(repo, head) is False:
+            return False
         self.requested_heads.add((repo, head))
         unsure = None
         failed = False
         try:
-            gh.rerun_failed_jobs(repo, workflow)
+            if self.request:
+                if not self.request(repo, workflow):
+                    return False
+            else:
+                gh.rerun_failed_jobs(repo, workflow)
             current.story = f"Arete reran failed jobs for {names}. GitHub accepted the rerun request."
         except gh.GhUnsure as e:
             unsure = util.first_line(str(e), 300)
@@ -3839,7 +4096,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
 
 
 def ci_target(c: workspace.Checkout) -> ci.Target:
-    return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
+    return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.recovery_base or c.base)
 
 
 def watch_checkout_ci(run: Run, checkout: workspace.Checkout, reruns=()) -> ci.Watched:
@@ -3909,7 +4166,8 @@ def commit_edits_before_merge(run: AgentRun, checkouts: list[workspace.Checkout]
                               committed: Callable[[workspace.Checkout], None] = lambda c: None) -> None:
     try:
         for c in checkouts:
-            workspace.drop_untracked_bytecode(c.wt)
+            retained = pr_recovery.check_retained(c)
+            drop_new_bytecode(c.wt, retained)
             if workspace.uncommitted(c.wt):
                 commit_kept(run.id, c, layer)
                 committed(c)
@@ -4245,6 +4503,8 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
 def merge_moved_bases_for_ci_fix(b: Build, watched: list[workspace.Checkout]) -> str:
     fetched = []
     for c in watched:
+        if c.recovery_base:
+            continue
         try:
             workspace.fetch(c.src, c.base)
         except RuntimeError as e:
@@ -4298,7 +4558,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
 def judge_publication_ci(b: Build, pushed: list[workspace.Checkout], reds: list[ci.Red], n: int) -> None:
     run = b.run
     try:
-        patch = "\n".join(checkout_patch(c, [], f"{c.origin_base}...{c.lease}") for c in pushed)
+        patch = "\n".join(checkout_patch(c, [], f"{c.recovery_base or c.origin_base}...{c.lease}") for c in pushed)
         failures = ci_failure_notes(run, reds, f"publish-judge{n}")
         diff = util.both_ends(vault.hidden(patch), MAX_FIX_DIFF_IN_PROMPT)
         text = ("Judge whether the published PR caused each CI failure. Compare the failure evidence with the "
@@ -4368,7 +4628,10 @@ def name_key(name: str) -> str:
 
 
 def discard_edits(b: Build) -> None:
-    for c in b.restage().changed:
+    changed = b.restage().changed
+    for c in changed:
+        protect_retained_from_restore(c, workspace.uncommitted(c.wt, tracked_only=True))
+    for c in changed:
         git(["reset", "-q", "--hard"], c.wt)
         b.run.log(f"ci: threw away the fix step's edits in {c.github}, since the PR caused no failure")
 
@@ -4537,7 +4800,8 @@ def feedback_markdown(rows: list[dict]) -> str:
     return "\n\n".join(out)
 
 
-def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
+def answer_feedback(run: Run, replies: list[dict], fallback: str, *,
+                    recovery: pr_recovery.Publication | None = None) -> None:
     by_comment = {r["comment_id"]: r["reply"].strip() for r in replies if r.get("reply", "").strip()}
     threads: dict[tuple[str, int], str] = {}
     for f in run.feedback:
@@ -4545,8 +4809,15 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
             key = (f["pr_url"], f["thread"])
             threads[key] = by_comment.get(f["gh_id"]) or by_comment.get(f["thread"]) or threads.get(key) or fallback
     for (url, thread), text in threads.items():
+        write = nullcontext()
+        if recovery:
+            if not (checkout := next((c for c in recovery.checkouts if c.pr == url), None)):
+                continue
+            write = recovery.pr_write(checkout, "feedback reply", "before replying to PR feedback",
+                                      "after replying to PR feedback", thread=thread)
         try:
-            gh.pr_reply(url, thread, public_text(run, text))
+            with write:
+                gh.pr_reply(url, thread, public_text(run, text))
         except gh.GhError as e:
             run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
 
@@ -4938,22 +5209,31 @@ def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) ->
             workspace.remove_untracked(d, name)
             removed += existed
     for d in untracked_before:
-        if not workspace.record_holds(view, d):
+        if workspace.record_holds(view, d):
+            continue
+        if protected := pr_recovery.read_retained(d).names:
+            pr_recovery.apply_pathspec(d, ["checkout", "-q"], protected)
+        else:
             git(["checkout", "-q", "--", "."], d)
     return removed
 
 
-def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) -> dict[str, str]:
+def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified, *,
+                    recovery: pr_recovery.Publication | None = None) -> dict[str, str]:
     if run.layer and run.layer.verify and not run.layer.verify.publish_evidence:
         run.log("evidence: publication disabled by the layer; screenshots stay in the run folder")
         return {}
     shots = verified.screenshots(run.dir / "evidence")
     if not shots:
         return {}
+    write = (recovery.pr_write(c, "screenshot upload", "before uploading screenshot evidence",
+                               "after uploading screenshot evidence") if recovery else nullcontext())
     try:
-        with util.repo_lock(c.src):
+        with write, util.repo_lock(c.src):
             images = verify.push_evidence(c.src, c.github, run.id, shots)
     except RuntimeError as e:
+        if recovery:
+            raise
         run.log(f"evidence: the push failed, so the PR shows no screenshots: {util.first_line(str(e), 300)}")
         return {}
     run.log(f"evidence: pushed {util.count(len(shots), 'screenshot')} to {verify.EVIDENCE_BRANCH} on {c.github}")
