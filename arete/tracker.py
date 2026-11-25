@@ -83,6 +83,7 @@ class Ticket:
     github_repo: str = ""
     github_blockers: list[int | str] = field(default_factory=list)
     spec_identity: str = ""
+    owner_comments: str | None = None
 
     @property
     def is_spec(self) -> bool:
@@ -332,7 +333,7 @@ class GitHubTracker:
             "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
         ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
-                         open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
+                         owner_comments=scope_comments(comments), open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
                          updated=i.get("updatedAt") or "", blocker=blocker,
                          spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
@@ -502,12 +503,16 @@ class JiraTracker:
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
         itype = (f.get("issuetype") or {}).get("name", "").lower()
         status = f.get("status") or {}
+        approved_comments = trusted(me, approved_at, self.client.comments(tid))
         comments = [((c.get("author") or {}).get("displayName", "someone"), c.get("created", ""), c.get("body") or "")
-                    for c in trusted(me, approved_at, self.client.comments(tid))]
+                    for c in approved_comments]
+        directed = [text for c, text in zip(approved_comments, comments)
+                    if not c.get("updateAuthor") or (c["updateAuthor"].get("accountId") == me)
+                    or approved_at and jira.parse_time(c.get("updated") or c["created"]) <= approved_at]
         images = [Image(str(a["id"]), a.get("filename") or "image", int(a.get("size") or 0))
                   for a in trusted(me, approved_at, f.get("attachment") or [])
                   if (a.get("mimeType") or "").startswith("image/")]
-        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments),
+        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=scope_comments(directed),
                       open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
@@ -618,13 +623,14 @@ class LocalTracker:
     def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
-        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
-                    for c in tasks_store.task_comments(tid)]
+        history = tasks_store.task_comments(tid)
+        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "") for c in history]
+        directed = [text for c, text in zip(history, comments) if c["author"] != "arete" and principals.is_person(c["author"])]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
                    else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
         if include_environment and not blocker:
             blocker = environment_blocker(self.repo.name, tid)
-        return task_ticket(row, comments_text(comments), blocker)
+        return replace(task_ticket(row, comments_text(comments), blocker), owner_comments=scope_comments(directed))
 
     def prepare(self) -> list[str]:
         return []
@@ -804,6 +810,11 @@ def answered(comments: list[tuple[datetime, str]]) -> bool:
     asked = [when for when, body in comments if from_arete(body)]
     replies = [when for when, body in comments if not from_arete(body)]
     return bool(asked and replies) and max(replies) > max(asked)
+
+
+def scope_comments(comments: list[tuple[str, str, str]]) -> str:
+    return comments_text([c for c in comments if c[0] != "Arete" and c[2].strip() and not from_arete(c[2])
+                          and not gh.has_arete_mark(c[2])])
 
 
 def comments_text(comments: list[tuple[str, str, str]]) -> str:

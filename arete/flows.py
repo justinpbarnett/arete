@@ -47,7 +47,7 @@ from .store import triage as triage_store
 from .store import workspaces
 from .verify import Verified
 
-TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels")
+TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels", "owner_comments")
 BUILD = "build"
 REVIEW_FIX = "review_fix"
 CHECK_REPAIR = "check_repair"
