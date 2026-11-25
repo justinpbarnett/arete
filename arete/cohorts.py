@@ -359,6 +359,7 @@ def report(name):
         observed=util.iso(now),
         arrivals=sum(m["source"] != "replacement" for group in groups.values() for m in group),
         goals=len(goals),
+        pending_overdue=sum(g["status"] == "pending" and g["overdue"] for g in goals),
         outcomes=counts,
         members=goals,
         intake_complete=not cohort["label"] or cohort["scanned"] >= cohort["closes"],

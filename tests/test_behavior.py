@@ -1472,6 +1472,68 @@ def browser_session():
 """
 
 
+class CohortReportTests(_SecretChildCase):
+    def test_counts_pending_overdue_on_the_authenticated_report(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
+from arete import cohorts, util
+
+opens = "2030-01-01T00:00:00Z"
+observed = "2030-01-01T02:00:00Z"
+window = dict(slug="fixture/repo", label="agent", opens=opens, closes="2030-01-02T00:00:00Z", hours=1)
+with mock.patch.object(util, "now", return_value=util.parse_iso(opens)):
+    for name in ("pilot", "empty"):
+        cohorts.declare(name, "fixture", "arete-serve", "cohort report", **window)
+
+with cohorts.ledger(write=True) as conn:
+    arrivals = {
+        "1": opens, "2": "2030-01-01T01:30:00Z", "3": opens, "4": opens,
+        "5": "2030-01-01T01:00:00Z", "6": opens, "7": opens,
+    }
+    conn.executemany(
+        "INSERT INTO members VALUES(?,?,?,?,?)",
+        [("pilot", ticket, ticket, at, f"github-event:{ticket}") for ticket, at in arrivals.items()],
+    )
+    for ticket, kind, hour in (
+        ("3", "verified", "01:30"), ("4", "failed", "00:30"),
+        ("6", "verified", "00:30"), ("6", "pending", "01:45"),
+        ("7", "verified", "01:30"), ("7", "pending", "01:45"),
+    ):
+        target = "arete-serve" if kind == "verified" else ""
+        cohorts.insert(conn, "fixture", ticket, kind, f"2030-01-01T{hour}:00Z", f"fixture:{kind}:{ticket}",
+                       "fixture observation", target)
+
+_, reader = tokens.issue(actor, "Cohort reader", ["read"])
+_, writer = tokens.issue(actor, "Task writer", ["task:write"])
+path = "/api/v1/cohorts/pilot"
+with mock.patch.object(util, "now", return_value=util.parse_iso(observed)):
+    cohorts.replacement("pilot", "1", "8")
+    request("GET", path, status=401, code="unauthenticated")
+    request("GET", path, token=writer, status=403, code="scope_missing")
+    _, response = request("GET", path, token=reader)
+    _, empty = request("GET", "/api/v1/cohorts/empty", token=reader)
+
+assert_shape("cohort.get", response)
+report = response["report"]
+members = {member["root"]: member for member in report["members"]}
+assert {root: (member["status"], member["overdue"]) for root, member in members.items()} == {
+    "1": ("pending", True), "2": ("pending", False), "3": ("verified", True),
+    "4": ("failed", True), "5": ("pending", False), "6": ("pending", False), "7": ("pending", True),
+}
+assert members["1"]["tickets"] == ["1", "8"]
+assert members["5"]["deadline"] == observed
+assert members["6"]["deadline"] == "2030-01-01T01:00:00Z"
+assert (report["cohort"]["name"], report["observed"]) == ("pilot", observed)
+assert (report["arrivals"], report["goals"]) == (7, 7)
+assert report["outcomes"]["pending"]["unknown"] == 5
+assert report["intake_complete"] is False
+for result, expected in ((report, 2), (empty["report"], 0)):
+    matching = [row for row in result["members"] if row["status"] == "pending" and row["overdue"] is True]
+    assert type(result["pending_overdue"]) is int
+    assert result["pending_overdue"] == expected == len(matching)
+assert empty["report"]["members"] == []
+""")
+
+
 class SecretApiTests(_SecretChildCase):
     def test_every_secret_route_requires_a_store_and_principal_is_reserved(self):
         self.run_secret_child(SECRET_HTTP_FIXTURE + r"""
