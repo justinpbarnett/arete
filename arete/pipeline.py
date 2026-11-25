@@ -2966,6 +2966,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     revised = "Revised for the review feedback on the PR.\n\n" if run.feedback else ""
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
+    workspace.require_target_branch(repo, checkouts, work_branch=branch)
     b.push(branch, message)
     opened: list[workspace.Checkout] = []
     for c in staged.changed:

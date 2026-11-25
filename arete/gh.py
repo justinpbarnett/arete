@@ -194,6 +194,22 @@ def open_issue_blockers(repo: str, number: int, issue: dict) -> list[int | str]:
     return blockers
 
 
+def issue_node(repo: str, number: int) -> dict:
+    row = gh_json(["api", f"repos/{repo}/issues/{number}"])
+    if not isinstance(row, dict) or row.get("number") != number or "pull_request" in row or type(row.get("id")) is not int:
+        raise GhError(f"could not confirm issue {repo}#{number}")
+    return row
+
+
+def ensure_sub_issue(repo: str, parent: int, child: int) -> None:
+    path = f"repos/{repo}/issues/{parent}/sub_issues"
+    child_id = issue_node(repo, child)["id"]
+    if any(row.get("id") == child_id for row in api_list(path)):
+        return
+    gh(["api", path, "--method", "POST", "--input", "-"],
+       input=Outgoing(json.dumps({"sub_issue_id": child_id, "replace_parent": False})), write=True, retry=False)
+
+
 def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:
     text = outbound.inert(outbound.screen(text))
     if link:
@@ -576,7 +592,8 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName"]
+    args = ["pr", "view", str(url_or_number), "--json",
+            "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName,baseRefName"]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}

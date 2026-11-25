@@ -965,8 +965,9 @@ def end_as(result: str, kind: str, **fields) -> Outcome:
 def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies: list[str]) -> list[workspace.Checkout]:
     repo = run.repo
     checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
-                                   base or util.origin_default_branch(repo.path / p.dir))
+                                   repo.target_branch or base or util.origin_default_branch(repo.path / p.dir))
                  for p in repo.parts or [config.Part("", repo.name)]]
+    workspace.require_target_branch(repo, checkouts, work_branch=branch)
     kept = workspace.kept_or_cleared(ws, checkouts, repo.path, copies, branch)
 
     def resumes_for(c: workspace.Checkout) -> bool:
@@ -1556,6 +1557,7 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "") -> Outco
     run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     recovery = job.recovery_publication
     found = [] if recovery else adopt_open_prs(job)
+    workspace.require_target_branch(run.repo, job.checkouts, work_branch=job.branch)
     refuse_changed_prs(job)
     before_push = None
     if pilot.is_pilot_task(str(run.tid)):
@@ -1619,6 +1621,7 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
     job: Job = flow.ctx
     run = job.run
     require_environment_owner_clear(job)
+    workspace.require_target_branch(run.repo, job.checkouts, work_branch=job.branch)
     if not run.repo.parts:
         run.enter("done")
         what = (f"pushed {job.branch} to origin" if job.committed

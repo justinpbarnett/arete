@@ -608,7 +608,7 @@ class Server:
             report_rollbacks(paths.PACKAGE_DIR.parent, self.say)
 
     def deploy(self, cfg: config.Config) -> None:
-        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
+        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)) or not repo.allows_unattended_deploy("production"):
             return
         src = repo.path.resolve()
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
@@ -624,6 +624,8 @@ class Server:
                 return
             if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
                 raise RuntimeError(f"could not determine the default branch of {github}")
+            if repo.target_branch and repo.target_branch != base:
+                return
             ref = f"refs/remotes/origin/{base}"
             util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                       "origin", f"+refs/heads/{base}:{ref}"], src,

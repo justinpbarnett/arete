@@ -97,6 +97,10 @@
           "github": {"type": "string"},
           "jira_project": {"type": "string"},
           "jira_label": {"type": "string"},
+          "jira_site": {"type": "string"},
+          "target_branch": {"type": "string"},
+          "landing": {"type": "string", "enum": ["pr", "direct-push"]},
+          "unattended_environment": {"type": "string", "enum": ["none", "development", "staging", "production"]},
           "pipeline": {"type": "boolean"},
           "mine": {"type": "boolean"},
           "public": {"type": "boolean"},
@@ -164,6 +168,7 @@
       "type": "object",
       "properties": {
         "env_file": {"type": "string"},
+        "github_owner": {"type": "string"},
         "project": {"type": "string"},
         "auto": {"type": "boolean"},
         "sprint_only": {"type": "boolean"},
