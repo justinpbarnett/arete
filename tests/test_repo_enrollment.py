@@ -153,14 +153,17 @@ class EnrollAndPublish(unittest.TestCase):
             with self.assertRaises(release_proof.Held):
                 release_proof.install(repo, "1", goal)
         goal.write_text(json.dumps({**promise, "qa": ["publisher"]}))
-        release_proof.install(repo, "1", goal)
+        original = release_proof.install(repo, "1", goal)["policy"]
+        self.assertEqual(original, release_proof.digest(release_proof.goal("profiled", "1")))
         self.assertEqual(release_proof.missing_staging_promise(repo, "1"), "")
         self.assertEqual(release_proof.goal("profiled","1")["qa"], ["publisher"])
         self.assertIn("promise", release_proof.missing_staging_promise(repo, "2"))
-        source.write_text(json.dumps({**profile, "qa": ["new-publisher"]}))
+        source.write_text(json.dumps({**profile, "qa": ["publisher"]}))
         self.call("staging-profile", "profiled", "--policy-file", str(source))
         self.assertIn("promise", release_proof.missing_staging_promise(repo, "1"))
         self.assertIsNone(release_proof.goal("profiled", "1"))
+        # Even when the ticket's effective QA subset is identical, receipts bind to its updated repository authority.
+        self.assertNotEqual(original, release_proof.install(repo, "1", goal)["policy"])
 
     def test_defaults_overrides_and_policy_round_trip(self):
         personal = self.enroll("personal", "me/blog", "--landing", "direct-push", "--unattended-environment", "staging")
