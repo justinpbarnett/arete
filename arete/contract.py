@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 6
+MINOR = 7
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -211,9 +211,14 @@ TOKEN_ISSUE = obj({"label": STRING, "scopes": array(STRING), "profile": {**STRIN
                    "expires": STRING, "commands": array(STRING), "spend_cap_usd": {**NUMBER, "minimum": 0}},
                   ["label", "scopes"])
 TOKEN_ISSUED = envelope({"token": TOKEN, "text": STRING})
+COHORT_REPORT = obj({"cohort": mapping(JSON), "observed": STRING, "arrivals": INTEGER, "goals": INTEGER,
+                     "outcomes": mapping(mapping(INTEGER)), "members": array(mapping(JSON)),
+                     "intake_complete": BOOLEAN}, additional=JSON)
 OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
+              operation("cohort.get", "cohorts/{name}", envelope({"report": COHORT_REPORT}),
+                        obj({"name": STRING}), {"name": "example"}),
               operation("error.list", "errors", envelope({"errors": array(ERROR)})),
               operation("screen.get", "screen", envelope({"sidebar": SIDEBAR, "asks": obj({"asks": array(ASK)}),
                         "view": mapping(JSON)}), obj({"view": STRING, "id": STRING}, []))]

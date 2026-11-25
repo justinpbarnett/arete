@@ -5392,6 +5392,7 @@ class _CliThroughServeCase(unittest.TestCase):
     LOCAL = {
         "api check": "api_check", "api diff": "contract_evolution", "ask": "jev_ask", "audit": "audit", "background": "background",
         "benchmark fixture": "lab.benchmark", "benchmark run": "lab.benchmark", "benchmark sample": "lab.benchmark",
+        **{f"cohort {part}": "cohorts" for part in ("declare", "sync", "candidates", "report", "replacement", "note")},
         "codex-guard": "codex", "dashboard": "dashboard", "devices probe": "devices",
         "document": "document", "eval": "evals", "experiment optimize": "lab.optimize",
         "experiment promote": "lab.optimize", "experiment run": "lab.experiment", "experiment sample": "lab.experiment",
@@ -7562,8 +7563,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 66)
-        self.assertEqual(len({op["name"] for op in operations}), 66)
+        self.assertEqual(len(operations), 67)
+        self.assertEqual(len({op["name"] for op in operations}), 67)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

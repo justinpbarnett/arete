@@ -14,6 +14,7 @@ from . import (
     document,
     factory,
     gh,
+    hosted_check,
     intake,
     journeys,
     outbound,
@@ -650,6 +651,8 @@ class Job:
         if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
             self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
             return False
+        if name == "checks" and not hosted_check.current(outcome.data):
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
@@ -1263,14 +1266,31 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
     job: Job = flow.ctx
     run, b = job.run, job.b
     phase = after or "the build and its fixes"
+    before = factory.fingerprint(job.ws) if (paths.CONFIG_DIR / "hosted-macos.toml").exists() else ""
     ok = b.check(quick=quick, after=phase, **({"focused": focused} if focused else {}))
     failures = [{k: v for k, v in item.items() if k != "passed"} for item in b.check_results if not item["passed"]]
     executed = [item["name"] for item in b.check_results]
     scope = "failed" if focused else "quick" if quick and set(executed) != set(job.layer.checks) else "full"
+    hosted = hosted_check.check(job, before, failures) if not ok and before else None
+    if hosted:
+        result = hosted["status"]
+        description = hosted.get("error") or hosted.get("url") or "waiting for GitHub"
+        b.report += f"\n\n### GitHub-hosted macOS check: {result}\n{description}"
+        run.save("checks.md", b.report)
+        if (result == "success" and hosted.get("exit") == 0
+                and (scope != "full" or set(executed) == set(job.layer.checks))):
+            failures = []
+            ok = True
+            if scope == "full":
+                b.checked = {"tree": before, "commands": dict(job.layer.checks), "report": b.report}
+        elif result == "failure":
+            failures = [{"name": "behavior", "selectors": []}]
     details = {"scope": scope, "checks_executed": executed, "failed_checks": failures,
                "policy": job.policy("checks", {"quick": quick, "focused": focused}),
                "runner_blocked": bool(failures) and all(f.get("capability") == "macos-sandbox-profile"
                                                         for f in failures)}
+    if hosted:
+        details["hosted_check"] = hosted
     if not after:
         record.note(run.id, attempts=attempt)
     if not ok:
