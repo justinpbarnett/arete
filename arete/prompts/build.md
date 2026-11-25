@@ -26,10 +26,11 @@ Denied paths: $denied.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Arete owns the full check gate and runs it after you finish: $checks.
   Do not duplicate the full suite in this builder step; leave it to the checks step.
-  Run the test classes for the files you changed by name, for example `$test_classes`;
-  a full suite run here waits for a free check lane and gives you nothing the checks step does not.
-  Use short, focused checks or a user-level reproduction when helpful, and report exactly what you ran.
-  If a check cannot start in your sandbox, report that and finish; never work around the refusal.
+  When investigating a failed check, rerun its configured command first if it is available.
+  Do not build a replacement verifier environment or work around a refusal. If the command is unavailable
+  or cannot run, report the blocker and name the configured command if known.
+  For routine edits, run focused test classes by name, for example `$test_classes`, or use a short
+  user-level reproduction when helpful. Report exactly what you ran.
 - Shell commands you may run: $commands. Others are refused. If a command is refused, do not get the same result
   another way (another interpreter, sed, perl, cp, or a heredoc that writes the file). Stop without editing for that
   part and say exactly what a human must run.

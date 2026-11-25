@@ -21,6 +21,10 @@ VERIFICATION_POLICY = (
     "Add or extend them only when an explicit task or repository instruction requires coverage of a specific "
     "essential business rule; keep that coverage focused, deterministic and fast.\n"
     "Follow the workflow’s configured check, review and in-use verification requirements.\n"
+    "When investigating a failed check, rerun its configured command first if it is available. "
+    "Do not build a replacement verifier environment or work around a refusal. "
+    "If the command is unavailable or cannot run, report the blocker and name the configured command if known.\n"
+    "Use focused checks for routine edits; Arete owns the final gates.\n"
     "Use disposable scratch helpers and run reports for behavioral evidence, not new ADRs or specification files, "
     "unless those documents are explicitly requested."
 )
