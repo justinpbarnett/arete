@@ -422,7 +422,6 @@ class Publication:
             raise Held("the original graph was reconciled, but the approved spec changed; review it before continuing")
         for node in self.nodes:
             self.enable(node["key"], items[node["key"]])
-        specgraphs.finish(self.key)
         return items
 
 
@@ -435,8 +434,6 @@ def intake(job, accepted_direct=None):
         return None
     key = GraphKey(remote.scope, str(run.tid))
     saved = specgraphs.get(key, run.repo.name)
-    if not saved and SPEC not in job.ticket.labels:
-        return None
     try:
         remote = spec_tracker.adapter(run.tracker, fresh=not run.dry_run)
         if remote.scope != key.scope:
@@ -466,16 +463,23 @@ def intake_graph(job, remote, key, saved, accepted_direct):
         db.require_spec_graph_schema()
         if remote.account() != data["account"]:
             raise Held("the tracker account changed since the spec graph was reviewed")
-        ticket = run.tracker.get(ref)
-        same_approval = (authorized(ticket, parent) and source_identity(ticket, job.goal, job.triage) == data["source"])
-
         def can_write():
             current = remote.read(ref)
-            return (same_approval and current.open and {SPEC, tracker.LABEL} <= set(current.labels)
-                    and not {tracker.ZTE_LABEL, "no-agent", "agent:hold"}.intersection(current.labels)
+            fresh = run.tracker.get(ref)
+            return (authorized(fresh, current) and fresh.spec_identity == run.spec_identity
+                    and source_identity(fresh, job.goal, job.triage) == data["source"]
                     and body_identity(current) == data["parent"])
 
         Publication(remote, parent, saved, can_write).publish()
+        if not can_write():
+            raise Held("the approved parent changed before graph dispatch")
+        ticket = run.tracker.get(ref)
+        delivery = {"graph": True, "source": data["ticket_version"],
+                    "definition": {"criterion": ticket.title, "procedure": "Exercise the enrolled parent scenario "
+                                   "on the release containing all reviewed children.",
+                                   "environment": data["plan"].get("environment", "")},
+                    "landing": spec_delivery.landing_policy(run.tracker)}
+        specgraphs.finish(key, run.spec_identity, run.id, delivery)
     mapped = specgraphs.children(key)
     children = [mapped[node["key"]][0] for node in data["plan"]["children"] if node["key"] in mapped]
     return {"mode": "split", "children": children, "environment": data["plan"].get("environment", ""), "preview": run.dry_run}

@@ -4,7 +4,7 @@ import sqlite3
 from enum import Enum, auto
 from typing import NamedTuple
 
-from . import db, orchestration
+from . import db, orchestration, specs
 
 TABLES = {"spec_graphs": "kept", "spec_graph_children": "kept", "spec_graph_writes": "kept"}
 
@@ -170,8 +170,10 @@ def unconfirmed(key):
                                                "AND received = 0", key).fetchone())
 
 
-def finish(key):
+def finish(key, identity, run, delivery):
     with db.tx() as c:
         if unconfirmed(key):
             raise Conflict("the spec graph still has an unconfirmed tracker write")
+        if not specs.advance(identity, run, "building", "published", delivery):
+            raise Conflict("the spec graph no longer owns the parent delivery claim")
         c.execute("UPDATE spec_graphs SET complete = 1 WHERE scope = ? AND parent = ?", key)
