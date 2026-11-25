@@ -39,6 +39,7 @@ class StagingRelease(unittest.TestCase):
         self.enterContext(mock.patch.object(gh, "find_issue_comment_marker", return_value=""))
         self.enterContext(mock.patch.object(gh, "issue_comment", side_effect=self.handoff))
         self.enterContext(mock.patch.object(gh, "gh", side_effect=self.push))
+        self.scored = self.enterContext(mock.patch("arete.cohorts.record_release"))
         self.good = True
         self.stage_url = self.serve("staging")
         self.prod_url = self.serve("production")
@@ -114,6 +115,7 @@ class StagingRelease(unittest.TestCase):
         self.assertEqual(self.advance()["phase"], "production_verified")
         self.assertEqual(self.posts, [self.new])
         self.assertEqual(proof.for_delivery("product", "12", self.new, self.prod_url)["destination"], "production")
+        self.assertEqual({call.args[4] for call in self.scored.call_args_list}, {"staging", "production"})
 
     def test_stable_address_moving_during_graph_observation_invalidates_the_receipt(self):
         with mock.patch.object(proof, "deployed_revision", side_effect=[self.new, self.new, self.new, self.other]):

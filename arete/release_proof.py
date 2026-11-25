@@ -299,7 +299,7 @@ def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=
             record = proof
         previous = serve_guard.read(location / "latest.json")
         serve_guard.write(location / "latest.json", record)
-    if not recovery and destination == data["destination"]:
+    if not recovery:
         try:
             from . import cohorts
         except ImportError:
