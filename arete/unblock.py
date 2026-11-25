@@ -27,7 +27,7 @@ RECHECK = 120
 ACTOR = "rule:unblock"
 OWNER_DIRECTIVE = "Arete owner action: "
 DEPENDENCY_DIRECTIVE = "Arete dependency correction: remove "
-EXCLUDED_LABELS = {"no-agent", "agent:hold", tracker.ZTE_LABEL}
+EXCLUDED_LABELS = {"no-agent", "agent:hold", tracker.ZTE_LABEL, tracker.SPEC_LABEL}
 HELD_REPLY_RETRY = ("If a reply could not be confirmed as new, post the guidance as a new ticket comment "
                     "or use Resume on the held run.")
 ACTIONS = {"retry": {"direction", "limit"}, "clarify": {"direction", "limit"}, "answer": {"answers"}, "merge": {"head", "base"},

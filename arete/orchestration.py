@@ -33,6 +33,7 @@ from . import (
     run_lines,
     runlimits,
     slots,
+    spec_delivery,
     tracker,
     util,
     vault,
@@ -46,6 +47,7 @@ from .orchestration_api import BUNDLES, PROTOCOL, WORKER_PROTOCOL, Catalog, desc
 from .store import asks as ask_store
 from .store import insights as insights_store
 from .store import orchestration as ledger
+from .store import specs as spec_store
 from .store import triage as triage_store
 from .store import worker_exchange as exchange
 from .verify import Verified
@@ -119,11 +121,12 @@ class Controller(worker_turns.WorkerTurns):
         configured = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
         if max_builders is not None:
             configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
-        private = configured.max_builders and self.default_code_review
+        private = configured.max_builders and self.default_code_review and not self.is_spec
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
                                     {"protocol": protocol, "mode": self.run.path, "evidence": {},
-                                     "review_method": code_review.METHOD if self.default_code_review else "legacy"})
+                                     "review_method": code_review.METHOD if self.default_code_review else "legacy"},
+                                    **({"spec_root": self.run.spec_root} if self.is_spec else {}))
         self.data = ledger.snapshot(self.lease)["data"]
         self.run.code_review = self.uses_code_review
         self.protocol = self.data.get("protocol")
@@ -145,6 +148,10 @@ class Controller(worker_turns.WorkerTurns):
         self.issue_goal = getattr(self.run.budget, "issue_goal", False) is True
         self.catalog = None
         self.last_progress, self.ending = -inf, None
+
+    @property
+    def is_spec(self):
+        return bool(spec_store.run_root(self.run))
 
     @property
     def decision_limit(self):
@@ -220,6 +227,11 @@ class Controller(worker_turns.WorkerTurns):
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
         merge_verification = self.run.recovery.get("merge_verification") is True
+        if self.is_spec and self.data.get("preparing") and not self.data.get("prepared"):
+            if recovered := flows.prepared_data(self.flow.continues):
+                self.data["prepared"] = recovered
+            elif not factory.started(self.flow.continues, "prepare"):
+                self.data.pop("preparing")
         prepared = self.data.get("prepared")
         restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
         if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
@@ -234,6 +246,13 @@ class Controller(worker_turns.WorkerTurns):
                 for c in prepared["checkouts"]:
                     if not c.get("pr") and c["github"] in published:
                         c["pr"] = published[c["github"]]
+            if self.is_spec:
+                fresh = self.spec_ticket()
+                if not self.data.get("definition"):
+                    prepared["ticket"] = {key: getattr(fresh, key) for key in flows.TICKET_FIELDS}
+                    self.data["goal_base"] = f"Check the spec and owner's answers in use:\n{fresh.title}\n{fresh.body}"
+                elif spec_delivery.source_version(fresh) != self.data["spec_source"]:
+                    raise factory.Refused("the spec changed after its definition of done was recorded; reconcile before resuming")
             if merge_verification and not pending_push:
                 ticket = self.run.tracker.get(self.run.tid)
                 prepared["ticket"] = asdict(ticket)
@@ -362,24 +381,10 @@ class Controller(worker_turns.WorkerTurns):
         if self.run.answers_due:
             answer = owner_asks.fresh_note(self.run.answers_due)
             self.run.story.append(answer)
-            self.data.setdefault("owner_answers", []).append(answer)
-        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
-        if self.job.pr_plans:
-            if discussion := pr_recovery.owner_discussion(self.job.ticket.comments):
-                goal += f"\n\n## Current ticket discussion\n\n{discussion}"
-            known_replies = {(pipeline.feedback_key(f), f["body"]) for f in self.data.get("feedback", [])}
-            for plan in self.job.pr_plans:
-                pr = plan.inputs.checkout.pr
-                replies = self.run.pr_recovery_discussion[pr].replies
-                if replies is None:
-                    replies = pr_recovery.pr_replies(pr, self.run.repo.name, str(self.run.tid))
-                unseen = [row for row in replies if (pipeline.feedback_key(row), row["body"]) not in known_replies]
-                if unseen:
-                    latest = sorted(unseen, key=lambda row: row["created"] or "")[-tracker.MAX_COMMENTS:]
-                    discussion = f"## Owner discussion on the reconciled PR\n\n{pipeline.feedback_markdown(latest)}"
-                    self.run.story.append(discussion)
-                    goal += f"\n\n{discussion}"
-        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+            notes = self.data.setdefault("owner_answers", [])
+            if not self.is_spec or answer not in notes:
+                notes.append(answer)
+        self.acceptance_goal()
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         if self.exchanged and not prepared and (reason := self.serial_reason()):
@@ -394,8 +399,7 @@ class Controller(worker_turns.WorkerTurns):
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["limits"] = self.configured_limits()
-        self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
-                                                 self.job.left_for_a_person])
+        self.acceptance_stamp()
         if (self.flow.continues and self.default_code_review and not self.run.environment_release
                 and not self.uses_code_review):
             self.adopt_code_review()
@@ -424,6 +428,59 @@ class Controller(worker_turns.WorkerTurns):
         self.write_lineage_event()
         self.job.recheck_pr_plans("before resuming work", installed=True)
         return None
+
+    def acceptance_goal(self):
+        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        if self.is_spec and (done := self.data.get("definition")):
+            goal += (f"\n\n{spec_delivery.describe(done)}\n\n"
+                     f"Required in-use evidence: check the criterion and return its exact wording in 'what':\n"
+                     f"{done['criterion']}")
+            if done.get("environment"):
+                goal += ("\nMeasure the behavior on this candidate now. The engine separately requires evidence "
+                         "in the named runtime before closure; do not claim to have checked that runtime here.")
+        if self.job.pr_plans:
+            if discussion := pr_recovery.owner_discussion(self.job.ticket.comments):
+                goal += f"\n\n## Current ticket discussion\n\n{discussion}"
+            known_replies = {(pipeline.feedback_key(f), f["body"]) for f in self.data.get("feedback", [])}
+            for plan in self.job.pr_plans:
+                pr = plan.inputs.checkout.pr
+                replies = self.run.pr_recovery_discussion[pr].replies
+                if replies is None:
+                    replies = pr_recovery.pr_replies(pr, self.run.repo.name, str(self.run.tid))
+                unseen = [row for row in replies if (pipeline.feedback_key(row), row["body"]) not in known_replies]
+                if unseen:
+                    latest = sorted(unseen, key=lambda row: row["created"] or "")[-tracker.MAX_COMMENTS:]
+                    discussion = f"## Owner discussion on the reconciled PR\n\n{pipeline.feedback_markdown(latest)}"
+                    self.run.story.append(discussion)
+                    goal += f"\n\n{discussion}"
+        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+
+    def acceptance_stamp(self):
+        self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal, self.job.left_for_a_person])
+        if self.is_spec and (done := self.data.get("definition")):
+            self.catalog.add_context("definition of done", spec_delivery.describe(done))
+
+    def spec_ticket(self):
+        source = self.run.tracker.get(self.run.tid)
+        if (why := tracker.spec_blocker(self.job.cfg, self.run.tracker, source)) or source.spec_identity != self.run.spec_identity:
+            raise factory.Refused(why or "the spec tracker identity changed")
+        return source
+
+    def define_spec(self, args):
+        found = spec_delivery.definition(args)
+        if prior := self.data.get("definition"):
+            if found != prior:
+                raise ValueError("the spec already has a durable definition of done; do not silently replace it")
+            return prior
+        source = spec_delivery.source_version(self.spec_ticket())
+        if source != spec_delivery.source_version(self.job.ticket):
+            raise factory.Refused("the spec changed during preparation; resume to read the updated scope")
+        self.data.update(definition=found, spec_source=source)
+        self.acceptance_goal()
+        self.acceptance_stamp()
+        self.persist()
+        self.run.say(spec_delivery.describe(found), on_ticket=True)
+        return found
 
     def restore_pr_targets(self, prepared):
         targets = {c["pr"]: c for c in prepared["checkouts"] if c.get("pr")}
@@ -641,7 +698,8 @@ class Controller(worker_turns.WorkerTurns):
         saved_policy = self.data.get("policy_sha")
         if saved_policy is not None and self.matches_policy(saved_policy, policy):
             policy = saved_policy
-        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations(self.protocol)),
+        found = {"catalog_sha": self.catalog.fingerprint,
+                 "operations_sha": ledger.digest(describe_operations(self.protocol, spec=self.is_spec)),
                  "policy_sha": policy,
                  "controller_prompt": ledger.digest(prompt_loader.template(self.controller_prompt).template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
@@ -699,6 +757,8 @@ class Controller(worker_turns.WorkerTurns):
         return self.data.get("review_method") == code_review.METHOD and not self.run.environment_release
 
     def required_gates(self):
+        if self.is_spec:
+            return ("checks", "review", "verify")
         owner_required = any(verification_attempts.REQUIRED_IN_USE.search(note) for note in self.data.get("owner_answers", []))
         if (self.uses_code_review and not code_review.requires_behavior(self.job.b) and not owner_required
                 and not any(c.recovery_head for c in self.job.checkouts)
@@ -850,6 +910,8 @@ class Controller(worker_turns.WorkerTurns):
             self.catalog.read(ref, 0, 8000)["text"] for ref in refs) if refs else ""
         goal = self.job.goal
         outstanding_required = self.data.get("required_verification_requirements", [])
+        if self.is_spec and (done := self.data.get("definition")):
+            outstanding_required = list(dict.fromkeys([done["criterion"], *outstanding_required]))
         if not pending and (outstanding_required or scope.baseline_targets):
             detail += ("\n\nOn the full baseline, include these requirements and use their exact wording in 'what'.\n"
                        + "\n".join(f"- {name}" for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets])))
@@ -1078,6 +1140,8 @@ class Controller(worker_turns.WorkerTurns):
                 "required_gates": self.required_gates(),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
                 **({"resolved_pr_conflicts": receipt} if (receipt := self.resolved_pr_conflicts(all_actions)) else {}),
+                **({"spec": {"guide": spec_delivery.GUIDANCE, "definition": self.data.get("definition")}}
+                   if self.is_spec else {}),
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
@@ -1152,7 +1216,8 @@ class Controller(worker_turns.WorkerTurns):
             return ledger.accept(self.lease, turn, observation["state_version"], response, self.action_limit)
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
-        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol), observation=json.dumps(observation))
+        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol, spec=self.is_spec),
+                                      observation=json.dumps(observation))
         result = {}
         for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
             request = delegation.request(self.job, turn, prompt, setting, (), [])
@@ -1202,6 +1267,8 @@ class Controller(worker_turns.WorkerTurns):
             raise ValueError("a dependency has not succeeded")
         setting, name, writing = self.catalog.worker(args)
         writing = writing and args["tool_bundle"] == "write"
+        if self.is_spec and writing and not self.data.get("definition"):
+            raise ValueError("record the spec's definition of done or ask the owner before implementation")
         if len(self.workers) >= self.policy.max_workers or (not self.exchanged and self.workers and (
                 writing or any(worker.writing for worker in self.workers.values()))):
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
@@ -1261,6 +1328,9 @@ class Controller(worker_turns.WorkerTurns):
             inputs.update(workspace=str(private), class_check="")
         if not writing:
             inputs["class_check"] = ""
+        if self.is_spec and (done := self.data.get("definition")):
+            inputs["goal"] += "\n\n" + spec_delivery.describe(done)
+            inputs["verify"] = self.job.goal
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         if assignment:
             messages = exchange.inbox(self.lease, logical_id)
@@ -1466,6 +1536,13 @@ class Controller(worker_turns.WorkerTurns):
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
+        if self.is_spec:
+            if not (done := self.data.get("definition")) or self.job.left_for_a_person or unverified_measurement:
+                raise ValueError("a spec needs one complete definition of done and cannot ship a partial or unverified outcome")
+            if spec_delivery.source_version(self.spec_ticket()) != self.data["spec_source"]:
+                raise factory.Refused("the published spec changed after the definition of done was recorded")
+            if not spec_delivery.behavior(self.job.verified, done):
+                raise ValueError("verify the exact spec criterion in use and record how it was checked and what was observed")
         recovering = any(c.recovery_head for c in self.job.checkouts)
         tree = self.fingerprint() if recovering else None
         gates = self.required_gates()
@@ -2086,6 +2163,13 @@ class Controller(worker_turns.WorkerTurns):
         self.persist()
         if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
             return self.settle_publication_failure(outcome.data)
+        if self.is_spec and outcome.passed:
+            if not all(self.current(gate) for gate in self.required_gates()):
+                raise factory.Refused("the published tree no longer has current spec gates")
+            receipt = spec_delivery.candidate(self.job, self.data["definition"], self.policy_sha(), self.data["acceptance"],
+                                              code_review.candidate_trees(self.job.checkouts))
+            if not spec_store.advance(self.run.spec_identity, self.run.id, "building", "published", receipt):
+                raise factory.Refused("the spec delivery claim changed during publication")
         self.ending = flows.ended(self.flow, outcome)
         self.release_merge_lease()
         return outcome.data
@@ -2217,6 +2301,8 @@ class Controller(worker_turns.WorkerTurns):
         self.barrier()
         if self.exchanged and op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed"):
             self.worker_barrier()
+        if op == "spec.define" and self.is_spec:
+            return self.define_spec(args)
         if op == "checks.run":
             remaining = self.data.get("remaining_checks", [])
             focused = check_repair.focus(self.job.layer, remaining) if remaining and self.uses_code_review else {}
@@ -2312,6 +2398,8 @@ class Controller(worker_turns.WorkerTurns):
             elif self.data.get("catch_up_hold"):
                 self.ending = self.park_catch_up("the orchestrator stopped without delivery")
             elif args["reason"] == "noop":
+                if self.is_spec:
+                    raise ValueError("a spec cannot finish without delivery-point evidence")
                 if feedback := self.data.get("denied_feedback"):
                     raise ValueError(feedback)
                 if not self.job.b.restage().empty:

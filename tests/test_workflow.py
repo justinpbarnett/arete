@@ -418,6 +418,13 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
 
 
 class QueueScoringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        cls.enterClassContext(support.workspace_state(root))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+
     def setUp(self):
         remote = "fixture/repo"
         self.repo = config.Repo("fixture", Path("."), github=remote, parts=[config.Part("", remote)])
@@ -2067,7 +2074,7 @@ class PublicationFixture(unittest.TestCase):
         flow.run = lambda name, args, kw: getattr(flows, name)(flow, *args, **kw)
         flow.step = lambda name, **kw: flow.run(name, (), kw)
         controller.job, controller.flow = job, flow
-        controller.catalog = mock.Mock(context={})
+        controller.catalog = mock.Mock(context={}, protocol=orchestration.PROTOCOL, operations=OPERATIONS)
         del controller.atomic, controller.current
         controller.executing = "prior-action"
         if stamp:

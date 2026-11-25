@@ -102,7 +102,7 @@ def route_ticket(cfg: config.Config, repo: config.Repo, source: tracker.Tracker,
                  dry_run: bool = False, log=print) -> tracker.Ticket:
     if not cfg.triage.route_fixes or dry_run or not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)):
         return ticket
-    if ticket.blocker or not ticket.open:
+    if ticket.is_spec or ticket.blocker or not ticket.open:
         return ticket
     if ticket.kind == "fix" or FIX in ticket.labels or FEATURE in ticket.labels:
         return ticket
