@@ -54,6 +54,15 @@ def owner(c, scope, ticket):
                       f"{scope.removeprefix('github:')}#{ticket}")).fetchone()
 
 
+def tracks_ticket(repo, ticket):
+    with db.reader() as c:
+        if not installed(c):
+            return False
+        return bool(c.execute("SELECT 1 FROM spec_graphs g WHERE g.repo = ? AND (g.parent = ? OR EXISTS "
+                              "(SELECT 1 FROM spec_graph_children n WHERE n.scope = g.scope AND "
+                              "n.parent = g.parent AND n.ticket = ?)) LIMIT 1", (repo, ticket, ticket)).fetchone())
+
+
 def membership(scope, ticket):
     with db.reader() as c:
         row = owner(c, scope, ticket) if installed(c) else None

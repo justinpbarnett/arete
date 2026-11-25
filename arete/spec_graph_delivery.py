@@ -43,6 +43,24 @@ def usable(repo, node, mapped, graph, *, released=False):
     return landed
 
 
+def satisfied_native(source, child, blockers):
+    """An owned dependency may already be usable while its tracker ticket is still open."""
+    if not blockers:
+        return set()
+    remote = spec_tracker.adapter(source)
+    key = specgraphs.membership(remote.scope, str(child)) if remote else None
+    if not key or key.scope != remote.scope:
+        return set()
+    saved = specgraphs.get(key, source.repo.name)
+    if not saved or not saved["complete"]:
+        return set()
+    graph, mapped = saved["data"], specgraphs.children(key)
+    by_ref = {ref: name for name, (ref, _) in mapped.items()}
+    dependent = next((n for n in graph["plan"]["children"] if n["key"] == by_ref.get(str(child))), {})
+    return {ref for ref in blockers if (name := by_ref.get(str(ref))) and
+            usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []))}
+
+
 def current_parent(source, remote, key, saved):
     from . import spec_graph
 
@@ -51,7 +69,7 @@ def current_parent(source, remote, key, saved):
     ticket = source.get(key.parent)
     if (not saved["complete"] or remote.scope != data["destination"] or remote.account() != data["account"]
             or parent.native_id != data["native_id"] or spec_graph.body_identity(parent) != data["parent"]
-            or not spec_graph.authorized(ticket, parent)):
+            or spec_delivery.source_version(ticket) != data["ticket_version"] or not spec_graph.authorized(ticket, parent)):
         raise spec_tracker.Held("the published parent identity, scope or pickup authority changed")
     return parent
 

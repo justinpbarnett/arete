@@ -2536,7 +2536,7 @@ class Controller(worker_turns.WorkerTurns):
         ticket = self.spec_ticket()
         graph = {"graph": True, "source": spec_delivery.source_version(ticket),
                  "definition": {"criterion": ticket.title, "procedure": "Exercise the enrolled parent scenario "
-                                "on the release containing all reviewed children.", "environment": ""},
+                                "on the release containing all reviewed children.", "environment": found["environment"]},
                  "landing": spec_delivery.landing_policy(self.run.tracker)}
         if not spec_store.advance(self.run.spec_identity, self.run.id, "building", "published", graph):
             existing = spec_store.find(self.run.repo.name, str(self.run.tid))

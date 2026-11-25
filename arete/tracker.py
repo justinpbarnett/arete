@@ -270,7 +270,12 @@ class GitHubTracker:
             waits.extend(run_store.environment_waits(self.repo.name, ticket.id))
         refs = [n if repo == own else f"{repo}#{n}" for repo, n in waits]
         native = set(ticket.github_blockers)
-        return wait_blocker([*refs, *ticket.github_blockers], lambda ref: ref in native or self.wait_is_open(ref))
+        if native:
+            from . import spec_graph_delivery
+            satisfied = spec_graph_delivery.satisfied_native(self, ticket.id, native)
+            native -= satisfied
+            refs = [ref for ref in refs if ref not in satisfied]
+        return wait_blocker([*refs, *sorted(native, key=str)], lambda ref: ref in native or self.wait_is_open(ref))
 
     def wait_is_open(self, ref: int | str) -> bool | None:
         if isinstance(ref, int):

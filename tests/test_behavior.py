@@ -3767,7 +3767,7 @@ proposal, = approvals.proposals(status=["approve"])
 assert schema_version() == 24
 
 def push(cfg, repo, p):
-    assert schema_version() == db.LATEST
+    assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     assert approvals.proposal(p["id"])["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA

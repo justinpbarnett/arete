@@ -5,7 +5,7 @@ import re
 from dataclasses import asdict
 from graphlib import CycleError, TopologicalSorter
 
-from . import gh, jira, outbound, prompt_loader, spec_tracker, tracker, util
+from . import gh, jira, outbound, prompt_loader, spec_delivery, spec_tracker, tracker, util
 from .spec_tracker import READ_ERRORS, SPEC, Held
 from .store import db, runs, specgraphs
 from .store.orchestration import digest
@@ -30,6 +30,7 @@ def object_schema(**fields):
 
 NODE = object_schema(key=STRING, title=STRING, outcome=STRING, checks=STRINGS, requires=STRINGS, existing=STRING)
 PROPOSAL = object_schema(mode={"type": "string", "enum": ["direct", "split"]}, reason=STRING,
+                         environment={"type": "string", "enum": ["", "arete-serve", "staging", "production"]},
                          children={"type": "array", "items": NODE})
 REVIEW = object_schema(approved={"type": "boolean"}, reason=STRING, add_contract=STRINGS)
 
@@ -48,11 +49,14 @@ def ordered(deps):
 
 
 def proposal(raw, candidates):
-    if not isinstance(raw, dict) or set(raw) != set(PROPOSAL["required"]) or not isinstance(raw["children"], list):
+    if not isinstance(raw, dict) or set(raw) | {"environment"} != set(PROPOSAL["required"]) or not isinstance(raw["children"], list):
         raise Held("to-tickets returned no valid breakdown")
     mode, reason, rows = raw["mode"], clean(raw["reason"], 1000), raw["children"]
     if mode == "direct" and not rows and not candidates:
         return {"mode": mode, "reason": reason, "children": []}
+    environment = raw.get("environment", "")
+    if environment not in ("", "arete-serve", "staging", "production"):
+        raise Held("the spec delivery point must be an enrolled release environment")
     minimum = 1 if candidates else 2
     if mode != "split" or not minimum <= len(rows) <= MAX_CHILDREN:
         raise Held(f"to-tickets must reuse the existing child tickets or propose {minimum}–{MAX_CHILDREN} testable pieces")
@@ -88,7 +92,7 @@ def proposal(raw, candidates):
     if any(set(node["requires"]) - (keys - {node["key"]}) for node in nodes):
         raise Held("to-tickets named an unknown prerequisite or a child that depends on itself")
     ordered({node["key"]: node["requires"] for node in nodes})
-    return {"mode": mode, "reason": reason, "children": nodes}
+    return {"mode": mode, "reason": reason, "environment": environment, "children": nodes}
 
 
 def reviewed(raw, plan, candidates):
@@ -107,6 +111,7 @@ def reviewed(raw, plan, candidates):
 
 TO_TICKETS = """Run to-tickets: inspect the prepared target checkout and break the approved spec into the smallest set
 of separately testable behavior changes. Return direct with no children if it should ship on the spec itself.
+Use the explicit owner-required final environment. Leave it blank for the enrolled default.
 For a split, give each child a stable lowercase key, title, observable outcome and one to ten concrete acceptance
 checks. Append @release to prerequisite keys whose behavior must already be observed on the running release. A prerequisite key means its outcome must exist before this child can be verified; do not add ordering
 for convenience. Existing is an exact ticket ID from the supplied evidence or an empty string for missing work.
@@ -114,7 +119,7 @@ Use every supplied existing ID once, without guessing by title or copying work a
 children where they already delivered a slice. Do not alter files, contact trackers or propose unrelated work.
 Acceptance checks describe behavior; don't demand new automated tests by default."""
 REVIEW_BREAKDOWN = """Review the supplied to-tickets proposal against the approved spec and the prepared target checkout.
-Approve only if it covers the approved scope without overlap, has independently observable outcomes and runnable
+Check the final environment against the owner-approved scope. Approve only if it covers the approved scope without overlap, has independently observable outcomes and runnable
 acceptance checks, reuses the supplied IDs correctly, and adds only necessary blocking links. For direct, confirm
 splitting buys no independently useful verification and there are no existing children. For each adopted issue,
 compare its existing description with the proposed outcome and checks. In add_contract list just the adopted
@@ -217,7 +222,10 @@ def reserve(run, remote, parent, data, candidates):
 
 
 def queue_blocker(source, tid, *, native=False):
-    if tracker.is_task_id(tid) or not (remote := spec_tracker.adapter(source)):
+    if (tracker.is_task_id(tid) or not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker))
+            or not native and not specgraphs.tracks_ticket(source.repo.name, str(tid))):
+        return ""
+    if not (remote := spec_tracker.adapter(source)):
         return ""
     ref = str(tid)
     if key := specgraphs.membership(remote.scope, ref):
@@ -288,7 +296,7 @@ def capture(job, remote, parent, accepted_direct):
     data = {"version": 1, "account": account, "destination": remote.scope, "project": getattr(remote, "project", ""),
             "route": getattr(remote, "route", ""), "targets": [{"repo": c.github, "branch": c.base} for c in job.checkouts],
             "parent": body_identity(parent), "native_id": parent.native_id,
-            "source": source, "input": input_sha, "plan": plan, "review": review, "policy": policy,
+            "source": source, "ticket_version": spec_delivery.source_version(ticket), "input": input_sha, "plan": plan, "review": review, "policy": policy,
             "adopted": {ref: body_identity(item) for ref, item in candidates.items()}}
     return reserve(run, remote, parent, data, candidates)
 
@@ -462,9 +470,10 @@ def intake_graph(job, remote, key, saved, accepted_direct):
         def can_write():
             current = remote.read(ref)
             return (same_approval and current.open and {SPEC, tracker.LABEL} <= set(current.labels)
-                    and tracker.ZTE_LABEL not in current.labels and body_identity(current) == data["parent"])
+                    and not {tracker.ZTE_LABEL, "no-agent", "agent:hold"}.intersection(current.labels)
+                    and body_identity(current) == data["parent"])
 
         Publication(remote, parent, saved, can_write).publish()
     mapped = specgraphs.children(key)
     children = [mapped[node["key"]][0] for node in data["plan"]["children"] if node["key"] in mapped]
-    return {"mode": "split", "children": children, "preview": run.dry_run}
+    return {"mode": "split", "children": children, "environment": data["plan"].get("environment", ""), "preview": run.dry_run}
