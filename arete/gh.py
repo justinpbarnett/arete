@@ -696,7 +696,7 @@ def merge_ref_hold(row: dict, head: str, base: str) -> str:
     return ""
 
 
-def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
+def merge_ci_passed(repo: str, head: str, *, required: dict | None = None, stage_checks: dict | None = None) -> bool:
     path = f"repos/{repo}/commits/{head}"
     checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
     statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
@@ -706,16 +706,30 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
         return False
     runs = [row for page in checks for row in page["check_runs"]]
     if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
-                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+                            and (row.get("app") or {}).get("id") == required["app_id"]
+                            and row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs):
         return False
+    skippable = set()
+    if stage_checks:
+        issuer = stage_checks["app_id"]
+        seen = {row.get("name") for row in runs if row.get("head_sha") == head and (row.get("app") or {}).get("id") == issuer
+                and row.get("status") == "completed" and row.get("conclusion") == "success"}
+        if not seen.issuperset(stage_checks["required"]):
+            return False
+        skippable = {(name, issuer, head) for name in stage_checks["allow_skipped"]}
     contexts = {}
     for page in statuses:
         if not isinstance(page, list):
             return False
         for row in page:
             contexts.setdefault(row["context"], row["state"])
-    return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
-                                           for row in runs) and all(state == "success" for state in contexts.values()))
+    def passing(row):
+        if row.get("status") != "completed":
+            return False
+        identity = (row.get("name"), (row.get("app") or {}).get("id"), row.get("head_sha"))
+        return row.get("conclusion") == "success" or (row.get("conclusion") == "skipped" and identity in skippable)
+
+    return bool(runs or contexts) and all(map(passing, runs)) and all(state == "success" for state in contexts.values())
 
 
 def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
@@ -742,7 +756,7 @@ def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None, track_moved_base: bool = False) -> tuple[str, str]:
+                    required: dict | None = None, track_moved_base: bool = False, stage_checks: dict | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
@@ -764,7 +778,7 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
         time.sleep(min(MERGE_POLL_SECONDS, remaining))
     if state != "CLEAN" or mergeable != "MERGEABLE":
         return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
-    if not merge_ci_passed(repo, head, required=required):
+    if not merge_ci_passed(repo, head, required=required, **({"stage_checks": stage_checks} if stage_checks else {})):
         return "", "GitHub has no fully passing CI result for the verified head"
     return str(row.get("title") or "").strip(), ""
 
@@ -779,8 +793,10 @@ def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha:
 
 
 def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False,
-                  required: dict | None = None) -> str:
+                  required: dict | None = None, stage_checks: dict | None = None) -> str:
     options = {"required": required} if required else {}
+    if stage_checks:
+        options["stage_checks"] = stage_checks
     subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base, **options)
     if hold:
         return hold

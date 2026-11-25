@@ -2849,3 +2849,30 @@ Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-fi
 The default binding follows the enrolled ticket's single merged factory PR to its configured target. A private policy can instead pin a full `revision` for a known release. When several commits fast-forward together, each matching goal is checked against the running tip. The normal local client exercises the protected read on the revision that answered the request. Each receipt records the goal, policy fingerprint, requested path, verified fields, revision, timestamp and outcome.
 
 Before moving the checkout, the prior release must pass the recovery assertion. A wrong result on the new release keeps the ticket open and invokes the existing code-only rollback guard. A dirty checkout or incompatible database holds the release. After a successful rollback the running previous version rechecks its recovery assertion. The previous version must already contain this feature to perform that confirmation. `arete release status REPO TICKET` reports the receipt. `arete release observe REPO TICKET --revision SHA` reruns the enrolled check for the authorized revision.
+
+For a staging-gated repository, first enroll its tracker, staging branch, PR landing policy and staging ceiling with `arete repo enroll`. Production may use its existing push-triggered deployment workflow. Set an owner-controlled revision identity document in both environments. The response from each deployed origin must identify its complete Git revision, for example `{"revision":"<40-character commit SHA>"}`.
+
+```json
+{
+  "destination": "staging",
+  "staging": "https://staging.example.com",
+  "production": "https://www.example.com",
+  "production_branch": "main",
+  "identity_path": "/.well-known/arete-release.json",
+  "path": "/api/settings",
+  "assertions": [{"field": "/selection", "equals": "Sources"}],
+  "recovery": [{"field": "/available", "equals": true}],
+  "instructions": "Open Settings and confirm that the saved selection is Sources.",
+  "qa": ["release-owner"]
+}
+```
+
+If the release workflow reports an immutable preview as the GitHub `staging` deployment's environment URL, configure `immutable_host_suffix` (e.g. `project.pages.dev`). Arete checks the exact SHA at the stable staging address and the immutable preview, then posts the preview, expected user action and evidence on the ticket.
+
+A workflow can conditionally skip deployment-only jobs on pull requests. Declare each GitHub Actions check by its exact name and publisher ID in the protected policy. For example, `"checks": {"pr": {"app_id": 15368, "required": ["Verify"], "allow_skipped": ["Deploy"]}, "staging": {"app_id": 15368, "required": ["Verify", "Deploy"], "allow_skipped": []}}`. Arete requires the named jobs to succeed on the candidate SHA and accepts a skipped result only for a listed job from the same publisher on that SHA. Failed, cancelled and pending jobs always hold.
+
+For browser checks, pin the SHA-256 of an owner-installed Python observer in `observer_sha256` and supply `--observer-file FILE` on enrollment. The observer receives a JSON object on stdin with `origin`, `path`, `revision` and `destination`. It emits one JSON object with the observations that the protected assertions evaluate. It runs outside the checkout, with a temporary home, a clean environment, and a 120-second limit. A nonzero exit leaves verification blocked. Installing an observer authorizes that program to execute as the service user. Keep its browser and other executable dependencies in a trusted installation outside candidate worktrees.
+
+A spec that requests `staging` (or the enrolled staging origin) may finish on the staging receipt. A spec that requests `production` (or its enrolled origin) needs its QA-approved production receipt. Unrecognized runtime names hold for clarification.
+
+Set `"qa_require_revision": true` to require the full revision on the explicit QA instruction. An authorized GitHub login or Jira account ID can reply to the QA handoff with `Promote FULL_SHA to production`. Arete rechecks staging and its behavior, current scope, QA authority, CI, and the running production revision. A non-forced production branch update advances the one staged commit only when it directly follows the verified production tip. Existing branch protections continue to apply. Use this adapter where the enrolled repository already deploys pushes on that production branch. A change that needs bundling, an unrelated branch advance, or a changed requirement holds for reconciliation or fresh QA. Arete records the intent before sending, reconciles the actual branch after restart, and keeps the ticket open until the production endpoint proves the expected behavior. `arete release status REPO TICKET` shows the staging handoff and production completion independently.
