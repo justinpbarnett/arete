@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import replace
 
 from . import emits, gh, jira, loops, miner, outbound, paths, record, runlimits, sources, tracker, util
-from .store import insights, runs as run_store
+from .store import insights, runs as run_store, specs as spec_store
 
 
 GITHUB_SPECS = """
@@ -27,11 +27,19 @@ query($owner: String!, $name: String!, $endCursor: String) {
 """
 
 
-def closed_event(sid, repo, ref, title, body, url, closed_at):
+def closed_event(sid, repo, ref, title, body, url, closed_at, *, delivery_root=""):
     key = f"{repo.github.lower()}#{ref}" if repo.tracker == "github" else ref
     return sources.event("spec.closed", sid, key, title, repo=repo.name, url=url, trust="internal",
                          data={"tracker": repo.tracker, "ref": ref, "at": closed_at,
-                               "description": (body or "")[:12000]})
+                               "description": (body or "")[:12000],
+                               **({"delivery_root": delivery_root} if delivery_root else {})})
+
+
+def delivery_root(repo, ref, identity):
+    claim = spec_store.find(repo.name, ref, identity=identity)
+    if not claim:
+        return ""
+    return claim["root"] if claim["state"] in ("evidenced", "complete") else None
 
 
 def github_specs(repos, sid):
@@ -47,8 +55,11 @@ def github_specs(repos, sid):
             for issue in page["data"]["repository"]["issues"]["nodes"]:
                 if issue["parent"] or (issue["author"] or {}).get("login", "").casefold() != login:
                     continue
-                yield closed_event(sid, repo, str(issue["number"]), issue["title"], issue["body"], issue["url"],
-                                   issue["closedAt"])
+                ref = str(issue["number"])
+                root = delivery_root(repo, ref, tracker.github_issue_identity(repo.github, ref))
+                if root is not None:
+                    yield closed_event(sid, repo, ref, issue["title"], issue["body"], issue["url"], issue["closedAt"],
+                                       delivery_root=root)
 
 
 def jira_specs(repos, sid, cfg):
@@ -80,8 +91,11 @@ def jira_specs(repos, sid, cfg):
             if len(routed) != 1:
                 continue
             key = row["key"]
-            yield closed_event(sid, routed[0], key, fields["summary"], fields["description"], client.browse_url(key),
-                               fields.get("statuscategorychangedate") or "")
+            identity = tracker.jira_issue_identity(getattr(client, "base", ""), row.get("id"))
+            root = delivery_root(routed[0], key, identity)
+            if root is not None:
+                yield closed_event(sid, routed[0], key, fields["summary"], fields["description"], client.browse_url(key),
+                                   fields.get("statuscategorychangedate") or "", delivery_root=root)
 
 
 def closed_specs(cfg, kind, sid):

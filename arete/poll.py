@@ -25,6 +25,7 @@ from . import (
     requeue,
     routing,
     runlimits,
+    spec_delivery,
     steps,
     tracker,
     util,
@@ -49,6 +50,7 @@ from .store import db
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import specs as spec_store
 
 MAX_STARTS_PER_POLL = 64
 FEEDBACK_PICK = "revising the PR for your review comments"
@@ -100,6 +102,10 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                     or not pilot.pickable(tid, repo.name)
                     or (zte.reserved(tid) and not (zte.scheduled_poll() and zte.pickable(tid, repo.name)))):
                 continue
+            if not isinstance(source, tracker.LocalTracker):
+                claim = spec_store.find(repo.name, tid)
+                if claim and (not t.is_spec or claim["state"] != "building"):
+                    continue
             if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
@@ -143,6 +149,9 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                     excluded = excluded | {tid}
                     continue
             return Pick(tid, "restarting after an interruption")
+    for tid in spec_store.answering(repo.name):
+        if eligible_again(tid) and pipeline.answered_run(repo.name, tid):
+            return Pick(tid, "the spec owner answered the question")
     for tid in ask_store.ready_runner_tickets(repo.name):
         if ordinary_history(tid):
             source = tracker.LocalTracker(repo) if tracker.is_task_id(tid) else tk
@@ -191,7 +200,7 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
         source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
         if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
             first = ("build",)
-    for role in (*first, *(("verify",) if layer.verify else ()), "review"):
+    for role in (*first, *(("verify",) if layer.verify or ticket.is_spec else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
         if setting.runner == REPLAY:
             continue
@@ -203,7 +212,7 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
 
 
 def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool, *,
-                  from_queue: bool, from_feedback: bool) -> str:
+                  from_queue: bool, from_feedback: bool, spec: bool = False) -> str:
     newest = run_store.newest_live_whole_run(repo.name, tid)
     if not newest or newest["status"] != "needs-info":
         return ""
@@ -224,7 +233,8 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
         return ""
     if not waiting and pipeline.answer_text(run_id):
         return ""
-    text = tk.reply_since(tid, since) if since else ""
+    text = (tk.reply_since(tid, since, strict=True) if spec and isinstance(tk, tracker.JiraTracker)
+            else tk.reply_since(tid, since)) if since else ""
     if not waiting and not text:
         return ""
     with util.lock(owner_asks.STEER_LOCK, wait=True), db.tx():
@@ -259,7 +269,8 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     return ""
 
 
-def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None) -> bool | None:
+def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None, *,
+                   spec: bool = False) -> bool | None:
     """Return True for a spawn, None for existing work, False for an oncall refusal."""
     from . import tasks
 
@@ -277,7 +288,7 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                 if readmission:
                     lease.readmission = json.dumps(asdict(readmission))
                     readmission.attempted(record=True)
-                return spawn_run(repo_name, tid)
+                return spawn_run(repo_name, tid, **({"spec": True} if spec else {}))
 
             tasks.spawn_pending(repo_name, str(tid), spawn)
             return True
@@ -365,7 +376,26 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
-    reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
+    ticket = source.get(tid)
+    claim = (spec_store.find(repo.name, str(tid), identity=ticket.spec_identity)
+             if not isinstance(source, tracker.LocalTracker) else {})
+    if claim or ticket.is_spec:
+        why = tracker.spec_blocker(cfg, source, ticket)
+        if claim and (claim["repo"], claim["issue"], claim["identity"]) != (repo.name, str(tid), ticket.spec_identity):
+            why = "the spec's original checkout or tracker identity changed"
+        if not why and not claim and run_store.newest_live_whole_run(repo.name, tid):
+            why = "a spec cannot adopt the ordinary builder's history"
+        if why:
+            skips.note(name, ticket, why, repo.name)
+            return "blocked"
+        if claim and (claim["state"] in ("evidenced", "complete")
+                      or claim["state"] == "published" and not pick.from_feedback):
+            return "skipped"
+    reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue,
+                          from_feedback=pick.from_feedback and not ticket.is_spec,
+                          **({"spec": True} if ticket.is_spec else {}))
+    if not reply and claim and ask_store.asks_of(claim["run"], "open"):
+        reply = "its asks are still waiting for an owner answer"
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
     answering = answered is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
@@ -373,20 +403,21 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
-    ticket = source.get(tid)
     fresh_feedback = False
     if pick.from_feedback and not dry_run and insights_store.has_fresh_feedback(pending_feedback(repo.name, tid)):
-        mode = pipeline.recorded_path(answered["id"]) if answered else pipeline.dispatch_path(repo, str(tid))
+        mode = ("orchestrate" if ticket.is_spec else pipeline.recorded_path(answered["id"]) if answered
+                else pipeline.dispatch_path(repo, str(tid)))
         fresh_feedback = mode in (pipeline.ORCHESTRATED, "orchestrate")
     blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
         repo, str(tid), ticket, runlimits.Policy.of(layer))
-    blocked = blocked or source.blocker(tid) or reply
+    blocked = blocked or (ticket.blocker if ticket.is_spec else source.blocker(tid)) or reply
     if not blocked:
         newest = run_store.newest_whole_run(repo.name, tid)
         if not (newest and newest["status"] == "interrupted" and flows.pending_catch_up(newest["id"])):
             if not zte.reserved(str(tid)):
                 ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
-            blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
+            blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer,
+                                         **({"mode": "orchestrate"} if ticket.is_spec else {}))
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")
@@ -394,7 +425,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     print(f"{util.iso()} {name}: {pick.why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        spawned = spawn_unparked(repo.name, tid, readmission)
+        spawned = spawn_unparked(repo.name, tid, readmission, **({"spec": True} if ticket.is_spec else {}))
         if spawned is None:
             return "skipped"
         if not spawned:
@@ -499,6 +530,7 @@ def poll(dry_run: bool = False) -> int:
         if not dry_run:
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
+            guard(errors, "syncing spec deliveries", lambda: spec_delivery.sync(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)

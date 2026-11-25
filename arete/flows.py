@@ -15,6 +15,7 @@ from . import (
     gh,
     intake,
     journeys,
+    outbound,
     owner_asks,
     patching,
     paths,
@@ -37,6 +38,7 @@ from .review import Review
 from .store import asks as asks_store
 from .store import insights as insights_store
 from .store import runs as run_store
+from .store import specs as spec_store
 from .store import triage as triage_store
 from .verify import Verified
 
@@ -74,8 +76,9 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     from . import requeue
 
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.workspace_key}"
-    continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
-                              else "")
+    if not spec_store.run_root(run):
+        continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
+                                  else "")
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
     if run.path == "orchestrate" and not (continues or only or run.dry_run or run.repairs) and requeue.policy_retry(earlier):
         job.policy_retry = requeue.recorded_failure(earlier)
@@ -895,6 +898,12 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
+    spec_root = spec_store.run_root(run)
+    if spec_root or t.is_spec:
+        why = (tracker.spec_blocker(cfg, tk, t) if spec_root and t.spec_identity == run.spec_identity
+               else "a spec must run through its own delivery lineage")
+        if why:
+            return end_as("stop", "quiet", status="skipped", summary=why)
     opened(run, t)
     mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
     feedback_prs = run.feedback_prs
@@ -1198,7 +1207,7 @@ def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands
     job: Job = flow.ctx
     b = job.staged()
     check_only = single or bool(job.run.environment_release)
-    if single and "refactor" in job.ticket.labels:
+    if single and "refactor" in job.ticket.labels and not spec_store.run_root(job.run):
         verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
     elif check_only and not job.layer.verify:
         verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
@@ -1343,6 +1352,8 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
         b.committed_lines = max(b.committed_lines, staged.lines)
     committed = not fresh.empty or bool(unpushed)
     subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    if spec_store.run_root(run):
+        subject = outbound.inert(subject)
     draft_why = job.held_reason
     revised = ("Revised for the review feedback on the PR.\n\n" if run.feedback else
                f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")

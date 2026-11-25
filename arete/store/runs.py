@@ -8,7 +8,7 @@ from datetime import timedelta
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
-from .db import WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
+from .db import SPEC_DELIVERY_SCHEMA, WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -525,11 +525,15 @@ def _prune(c, days, lines_days):
         "WHERE w.phase NOT IN ('completed','integrated','cancelled') "
         "AND EXISTS (SELECT 1 FROM json_each(o.data,'$.runs') WHERE value=runs.id)) "
     ) if migration_applied(WORKER_EXCHANGE_SCHEMA, c) else ""
+    keep_specs = (
+        "AND NOT EXISTS (SELECT 1 FROM spec_deliveries s WHERE s.repo = runs.repo AND s.issue = runs.issue "
+        "AND s.state != 'complete') "
+    ) if migration_applied(SPEC_DELIVERY_SCHEMA, c) else ""
     eligible = c.execute(
         "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
         "AND status NOT IN ('running', 'pr', 'needs-info') "
         "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-        + keep_workers
+        + keep_workers + keep_specs
         + "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
         "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
         "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "

@@ -124,6 +124,7 @@ WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
 SECRET_REGISTRY_SCHEMA = 27
 WORKSPACE_CONTRACT_SCHEMA = 28
+SPEC_DELIVERY_SCHEMA = 29
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -134,7 +135,7 @@ WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] wo
                      "or from arete migrate --workspace-snapshots DIR")
 # Each capability migrates at its own entry point. Unrelated writers can use older databases.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
-             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA))
+             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()

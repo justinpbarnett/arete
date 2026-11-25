@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 
 from . import config, owner_asks, prompt_loader, routing, steps, verification_attempts
 from .agent import BUILD_TOOLS, READ_TOOLS, traits_of
+from .store import specs as spec_store
 from .store.orchestration import digest
 
 PROTOCOL = 1
@@ -32,7 +33,7 @@ class Operation:
             item = value.get(name, default)
             if type(item) is not kind:
                 raise ValueError(f"{name} must be {kind.__name__}")
-            if kind is str and (not item.strip() or len(item) > 16000):
+            if kind is str and ((not item.strip() and default != "") or len(item) > 16000):
                 raise ValueError(f"{name} must be nonempty and at most 16000 characters")
             constraints = self.constraints.get(name, {})
             if "enum" in constraints and item not in constraints["enum"]:
@@ -121,8 +122,15 @@ WORKER_OPERATIONS = {
 }
 
 
-def operations(protocol):
-    return WORKER_OPERATIONS if protocol == WORKER_PROTOCOL else OPERATIONS
+SPEC_DEFINE = Operation("Persist one observable completion criterion and a reproducible procedure grounded in the "
+                        "published spec and its owner answers. Ask about missing product decisions instead of assuming. "
+                        "Omit environment unless the spec requires an observation in that named runtime.",
+                        {"criterion": required(str), "procedure": required(str), "environment": (str, "")})
+
+
+def operations(protocol, *, spec=False):
+    found = WORKER_OPERATIONS if protocol == WORKER_PROTOCOL else OPERATIONS
+    return {**found, "spec.define": SPEC_DEFINE} if spec else found
 
 
 class Catalog:
@@ -176,6 +184,11 @@ class Catalog:
         self.refresh_context()
         self.fingerprint = digest(self.entries)
 
+    @property
+    def operations(self):
+        run = getattr(getattr(self, "job", None), "run", None)
+        return operations(self.protocol, spec=bool(spec_store.run_root(run)))
+
     def refresh_context(self) -> None:
         job = self.job
         self.context.update(task=f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
@@ -196,8 +209,8 @@ class Catalog:
             raise ValueError("describe takes between 1 and 10 IDs")
         found = []
         for key in ids:
-            if key in operations(self.protocol):
-                found.append({"id": key, **operations(self.protocol)[key].describe()})
+            if key in self.operations:
+                found.append({"id": key, **self.operations[key].describe()})
             elif key in self.entries:
                 entry = dict(self.entries[key])
                 if entry["kind"] == "models":
@@ -265,10 +278,10 @@ class Catalog:
         calls = []
         for call in response["calls"]:
             if (not isinstance(call, dict) or set(call) != {"op", "args"} or type(call["op"]) is not str
-                    or call["op"] not in operations(self.protocol)):
+                    or call["op"] not in self.operations):
                 raise ValueError("unknown operation or malformed call")
             op = call["op"]
-            args = operations(self.protocol)[op].arguments(call["args"])
+            args = self.operations[op].arguments(call["args"])
             if op == "worker.start":
                 args["tool_bundle"] = args["tool_bundle"].removeprefix("tools:")
                 self.worker(args)
@@ -297,7 +310,7 @@ class Catalog:
             if op == "catalog.describe":
                 ids = args["ids"]
                 if (not 1 <= len(ids) <= 10 or any(type(key) is not str or key not in self.entries
-                                                and key not in operations(self.protocol) for key in ids)):
+                                                and key not in self.operations for key in ids)):
                     raise ValueError("describe needs between 1 and 10 known catalog or operation IDs")
             if op == "context.read":
                 self.read(**args)
@@ -317,9 +330,9 @@ class Catalog:
         return {**response, "calls": calls}
 
 
-def describe_operations(protocol=PROTOCOL) -> dict:
-    return {name: operation.describe() for name, operation in operations(protocol).items()}
+def describe_operations(protocol=PROTOCOL, *, spec=False) -> dict:
+    return {name: operation.describe() for name, operation in operations(protocol, spec=spec).items()}
 
 
-def help_text(protocol=PROTOCOL) -> str:
-    return json.dumps(describe_operations(protocol), separators=(",", ":"))
+def help_text(protocol=PROTOCOL, *, spec=False) -> str:
+    return json.dumps(describe_operations(protocol, spec=spec), separators=(",", ":"))
