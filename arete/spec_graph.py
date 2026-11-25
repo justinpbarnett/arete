@@ -220,6 +220,9 @@ def queue_blocker(source, tid, *, native=False):
     if tracker.is_task_id(tid) or not (remote := spec_tracker.adapter(source)):
         return ""
     ref = str(tid)
+    if key := specgraphs.membership(remote.scope, ref):
+        from . import spec_graph_delivery
+        return spec_graph_delivery.ready(source, remote, key, ref)
     if reason := specgraphs.launch_blocker(remote.scope, ref):
         return reason
     return remote.launch_blocker(ref) if native else ""
@@ -415,6 +418,8 @@ class Publication:
 
 def intake(job, accepted_direct=None):
     run = job.run
+    if SPEC not in job.ticket.labels:
+        return None
     remote = spec_tracker.adapter(run.tracker)
     if remote is None:
         return None

@@ -162,6 +162,9 @@ def public_text(tk: tracker.Tracker, text: str) -> str:
 
 def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     data = claim["data"]
+    if data.get("graph"):
+        from . import spec_graph_delivery
+        return spec_graph_delivery.integrated(tk, claim)
     landed = reached(data)
     if not landed:
         return {}
@@ -235,6 +238,6 @@ def sync(cfg) -> None:
             try:
                 repo = cfg.repo(repo_name)
                 settle(cfg, repo, claim)
-            except (KeyError, gh.GhError, jira.JiraError, tracker.TaskError) as error:
+            except (KeyError, ValueError, OSError, gh.GhError, jira.JiraError, tracker.TaskError) as error:
                 print(f"{util.iso()} {tracker.issue_name(repo_name, tid)}: spec delivery held: "
                       f"{outbound.sanitize(str(error), 300)}")

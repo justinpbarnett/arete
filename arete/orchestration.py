@@ -2222,6 +2222,8 @@ class Controller(worker_turns.WorkerTurns):
         return refusal
 
     def spec_intake(self):
+        if not self.is_spec:
+            return None
         try:
             found = spec_graph.intake(self.job, self.data.get("spec_direct"))
         except spec_graph.Pending as error:
@@ -2240,6 +2242,15 @@ class Controller(worker_turns.WorkerTurns):
             return "dry-run", "Reviewed the spec breakdown without publishing it", ""
         refs = ", ".join(tid if "#" in tid else self.run.tracker.ref(tid) for tid in found["children"])
         summary = f"Published or adopted the native spec graph: {refs}"
+        ticket = self.spec_ticket()
+        graph = {"graph": True, "source": spec_delivery.source_version(ticket),
+                 "definition": {"criterion": ticket.title, "procedure": "Exercise the enrolled parent scenario "
+                                "on the release containing all reviewed children.", "environment": ""},
+                 "landing": spec_delivery.landing_policy(self.run.tracker)}
+        if not spec_store.advance(self.run.spec_identity, self.run.id, "building", "published", graph):
+            existing = spec_store.find(self.run.repo.name, str(self.run.tid))
+            if existing.get("run") != self.run.id or not existing.get("data", {}).get("graph"):
+                raise factory.Refused("the spec graph no longer owns this delivery")
         self.run.leave("running")
         return "done", summary, ""
 
