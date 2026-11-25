@@ -8,7 +8,8 @@ An explicitly invoked fixed or custom script keeps its strategy.
 ## Code review
 
 New and resumed orchestrated tickets finish with the repository’s full checks and a two-part code review.
-Two fresh read-only reviewers inspect the same staged candidate against its pinned base.
+After the full configured checks pass on the current candidate, two fresh read-only reviewers inspect it against its pinned base.
+The controller can request checks and review in one decision. After a failed or partial check, it requests review again once the full suite passes.
 Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
 This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
 
