@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import subprocess
 
-from . import config, factory, paths, release_profile, release_proof as proof, serve_guard, util, verify
+from . import config, factory, paths, release_profile, release_proof as proof
+from . import scratch, scratch_process, serve_guard, util, verify
 
 
 def binding(work):
@@ -36,7 +37,7 @@ def binding(work):
                     "policy": proof.digest(policy), "observer": policy["observer_sha256"], "path": policy["path"]}
 
 
-def listener(proc, origin, configured):
+def listener(proc, origin, configured, attempt=None):
     proof.need(isinstance(origin, str) and origin and isinstance(configured, str) and configured,
                "the protected candidate observer requires a configured, running local service")
     url = proof.server_url(origin)
@@ -48,22 +49,29 @@ def listener(proc, origin, configured):
                             capture_output=True, text=True, timeout=10)
     lines = result.stdout.splitlines()
     owners = {int(line[1:]) for line in lines if line.startswith("p") and line[1:].isdigit()}
-    expected = dict(util.process_tree(proc.pid))
+    root = proc.pid
+    if attempt is not None:
+        monitor = scratch.producer_monitor(attempt, root)
+        proof.need(monitor, "the started candidate service has no current scratch producer")
+        root, responsibility = monitor
+        proof.need(all(scratch_process.responsible_identity(pid) == responsibility for pid in owners),
+                   "the loopback listener does not belong exclusively to the started candidate process")
+    expected = dict(util.process_tree(root))
     proof.need(result.returncode == 0 and owners and owners <= expected.keys()
                and {line[1:] for line in lines if line.startswith("n")} == {endpoint},
                "the loopback listener does not belong exclusively to the started candidate process")
     return sorted(owners)
 
 
-def observe(work, step, enrolled, origin, configured, proc):
+def observe(work, step, enrolled, origin, configured, proc, attempt=None):
     policy, scope = enrolled
     receipt = {**scope, "run": work.run.id, "step": step, "origin": origin, "destination": "candidate"}
     checks = []
     try:
         proof.need(enrolled == binding(work), "candidate tree or enrolled policy changed during server startup")
-        owners = listener(proc, origin, configured)
+        owners = listener(proc, origin, configured, attempt)
         document = proof.browser_observation(policy, origin, scope["revision"], "candidate")
-        proof.need(owners == listener(proc, origin, configured) and enrolled == binding(work),
+        proof.need(owners == listener(proc, origin, configured, attempt) and enrolled == binding(work),
                    "the candidate listener, tree or enrolled policy changed during observation")
         observed = []
         for assertion in policy["assertions"]:

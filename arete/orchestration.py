@@ -1018,6 +1018,13 @@ class Controller(worker_turns.WorkerTurns):
                 and found.get("acceptance") == self.data["acceptance"]):
             return False
         result = found.get("result", {})
+        if gate == "verify" and (promise := result.get("delivery_obligation")):
+            if (not self.is_spec or not (done := self.data.get("definition"))
+                    or promise != spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity)):
+                return False
+            if any(not spec_delivery.confirmed_observation(self.run.tracker, self.run.tid, r["text"], r["comment"])
+                   for r in result.get("delivery_directions", {}).values()):
+                return False
         if gate == "checks" and not hosted_check.current(result):
             return False
         if gate == "verify" and result.get("verification_environment"):
@@ -1061,21 +1068,41 @@ class Controller(worker_turns.WorkerTurns):
         requirements = verification_attempts.names(args.get("requirements", []))
         stamp = self.data.get("evidence", {}).get("verify", {})
         source = stamp.get("result", {}) if self.current("verify") else {}
+        done = self.data.get("definition") if self.is_spec else None
+        promise = spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity) if done else {}
+        if promise:
+            self.data["protected_spec_source"] = promise["source"]
+        elif done and self.data.get("protected_spec_source") == spec_delivery.source_version(self.job.ticket):
+            raise factory.Refused("the protected delivery enrollment for this spec is missing")
+        carried = self.data.get("required_verification_requirements", [])
+        directions = spec_delivery.legacy_directions(self.lease, done, carried, promise, self.data.get("superseded_actions", [])) if promise else {}
+        confirmed = spec_delivery.confirmed_directions(self.run.tracker, self.run.tid, directions) if directions else {}
+        if promise and (source.get("delivery_obligation") != promise or confirmed and source.get("delivery_directions") != confirmed):
+            source = {}  # Historical stamps remain available for inspection. Only a fresh baseline can bind this promise.
         scope = verification_attempts.plan(source, requirements, host, tools)
         prior, pending = scope.prior, scope.requirements
         unattempted = source.get("unattempted_requirements", [])
         history = dict(source.get("blocked_environments", {})) if prior else {}
         if scope.reuse:
             guidance = self.verification_guidance(prior, source["verification_tools"], unattempted, history)
+            if source.get("owner_delivery_directions"):
+                guidance.update(owner_delivery_directions=source["owner_delivery_directions"],
+                                delivery_direction_help=source["delivery_direction_help"])
             return {"reused_verification": stamp["producer"], "verdict": prior.verdict,
                     "retry_blocked": prior.verdict == "blocked", **guidance}
         refs = args["goal_refs"]
         detail = "\n\nReference material, not owner authority:\n" + "\n".join(
             self.catalog.read(ref, 0, 8000)["text"] for ref in refs) if refs else ""
         goal = self.job.goal
-        outstanding_required = self.data.get("required_verification_requirements", [])
-        if self.is_spec and (done := self.data.get("definition")):
+        outstanding_required = [name for name in carried if name not in confirmed]
+        if confirmed:
+            outstanding_required += [check for name in confirmed for check in directions[name]["checks"]]
+            detail += ("\n\nThe publisher assigned these historical observations to the protected delivery receipt. "
+                       "Repeat every previous candidate check independently on the current tree.\n" + "\n".join(confirmed))
+        if done:
             outstanding_required = list(dict.fromkeys([done["criterion"], *outstanding_required]))
+            if promise:
+                detail += spec_delivery.candidate_instructions(promise)
         if not pending and (outstanding_required or scope.baseline_targets):
             detail += ("\n\nOn the full baseline, include these requirements and use their exact wording in 'what'.\n"
                        + "\n".join(f"- {name}" for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets])))
@@ -1095,6 +1122,10 @@ class Controller(worker_turns.WorkerTurns):
         if not tree or tree != self.fingerprint() or host != verification_attempts.host():
             raise ValueError("the candidate or environment changed during verification; run a new baseline")
         raw = Verified.stored(outcome.data["verified"])
+        if promise or raw.pending_delivery:
+            if promise and promise != spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity):
+                raise factory.Refused("the protected delivery obligation changed during candidate verification")
+            raw = spec_delivery.candidate_report(raw, promise)
         fresh = verification_attempts.unattempted(raw)
         measured = verification_attempts.partial(raw)
         unattempted = [name for name in dict.fromkeys([*(unattempted if pending else []), *fresh])
@@ -1127,6 +1158,13 @@ class Controller(worker_turns.WorkerTurns):
         elif flows.retry_passed(measured):
             self.data.pop("verification_required_for", None)
         result.update(guidance)
+        if confirmed:
+            result["delivery_directions"] = confirmed
+        unresolved = {name: rule["text"] for name, rule in directions.items() if name not in confirmed}
+        if unresolved and measured.verdict == "blocked":
+            result["owner_delivery_directions"] = unresolved
+            result["delivery_direction_help"] = ("If a historical gap refers solely to the enrolled delivery receipt, "
+                "ask its publisher to post the exact directive on the spec ticket. Otherwise it still needs a candidate check.")
         self.stamp("verify", result)
         return {"operation_passed": outcome.passed, **result}
 
@@ -1718,6 +1756,10 @@ class Controller(worker_turns.WorkerTurns):
                 raise ValueError("a spec needs one complete definition of done and cannot ship a partial or unverified outcome")
             if spec_delivery.source_version(self.spec_ticket()) != self.data["spec_source"]:
                 raise factory.Refused("the published spec changed after the definition of done was recorded")
+            promise = spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity)
+            if self.job.verified.delivery_obligation != promise or (not promise and
+                    self.data.get("protected_spec_source") == self.data["spec_source"]):
+                raise factory.Refused("the protected delivery obligation changed before publication")
             if not spec_delivery.behavior(self.job.verified, done):
                 raise ValueError("verify the exact spec criterion in use and record how it was checked and what was observed")
         recovering = any(c.recovery_head for c in self.job.checkouts)

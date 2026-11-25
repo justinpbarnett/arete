@@ -961,6 +961,26 @@ def producer_group(a: Attempt, producer: str, group: int | None, monitor: int | 
         store(fd, key, data)
 
 
+def producer_monitor(a: Attempt, relay: int) -> tuple[int, int] | None:
+    """Identify the detached monitor registered for this live producer relay."""
+    with registry() as (fd, key):
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        data = load(fd, key, a.selector)
+        if a.selector not in LEASES or data["attempt"] != asdict(a) or data["state"] not in LIVE:
+            return None
+        identity = identity_of(relay)
+        if not identity:
+            return None
+        matches = [entry["monitor"] for entry in data["producers"].values()
+                   if isinstance(entry, dict) and entry.get("group") == relay
+                   and entry.get("identity") == identity and entry.get("monitor")]
+        if len(matches) == 1:
+            pid, owner = matches[0]["pid"], matches[0]["identity"]
+            if identity_of(pid) == owner == scratch_process.responsible_identity(pid):
+                return pid, owner
+    return None
+
+
 def home_dir() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 

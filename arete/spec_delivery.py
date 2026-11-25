@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from urllib.parse import quote
 
 from . import gh, jira, outbound, release_proof, requirement_revision, tracker, util, vault, verify
@@ -47,6 +48,73 @@ def describe(done: dict) -> str:
             + (f"\n\nRequired runtime: {done['environment']}" if done.get("environment") else ""))
 
 
+def obligation(repo, ticket, done, identity=""):
+    """Reserve the protected observation that will run after this spec lands."""
+    target = done.get("environment", "")
+    if not target:
+        return {}
+    policy = release_proof.goal(repo, ticket.id)
+    if not policy:
+        release_proof.need(target != "arete-serve" and not release_proof.required(repo, ticket.id),
+                           "the native spec's protected delivery enrollment is missing")
+        return {}
+    release_proof.need(protected_environment(repo, ticket.id, target) == target,
+                       "the spec destination does not match its protected enrollment")
+    release_proof.need(bool(identity or ticket.spec_identity) and not (identity and ticket.spec_identity and identity != ticket.spec_identity),
+                       "the protected delivery obligation needs the same authorized spec identity")
+    return {"repo": repo, "ticket": ticket.id, "identity": identity or ticket.spec_identity, "source": source_version(ticket),
+            "definition": orchestration.digest(done),
+            "destination": target, "path": policy["path"], "policy": release_proof.digest(policy)}
+
+
+def candidate_instructions(promise):
+    token = orchestration.digest(promise)
+    return (f"\n\nArete has reserved the post-merge release observation for this spec at {promise['destination']} "
+            f"on {promise['path']}, under protected policy {promise['policy']}. Use the candidate to independently "
+            "exercise every observable requirement, including access rules and error cases. Return the exact spec "
+            "criterion in a check describing what you actually observed on the candidate. The service will exercise "
+            "the promised behavior on the running release and retain that receipt before closing the spec. "
+            f"Report this later step using pending_delivery = {token}. Keep every unknown or failed candidate "
+            "requirement in your evidence and unmeasured_requirements. Never claim a release observation here.")
+
+
+def candidate_report(report, promise):
+    expected = orchestration.digest(promise) if promise else ""
+    if report.verdict == "pass" and report.pending_delivery != expected:
+        return replace(report, verdict="blocked", blocked_by="The candidate verifier did not identify the enrolled delivery obligation.",
+                       delivery_obligation=promise)
+    return replace(report, delivery_obligation=promise)
+
+
+def legacy_directions(lease, done, carried, promise, superseded):
+    directions = {}
+    for action in orchestration.actions(lease) if carried and promise else ():
+        row = action["result"]
+        acceptance = row.get("evidence", {}).get("acceptance")
+        if (action["op"] != "verification.run" or action["state"] != "succeeded" or row.get("delivery_obligation")
+                or not acceptance or action["id"] in superseded or row.get("verdict") != "blocked"
+                or not row.get("operation_passed") or not row.get("finished") or not row.get("behavior_reached")):
+            continue
+        gaps, checks = row.get("unmeasured_requirements", []), row.get("checks", [])
+        if (len(gaps) != 1 or gaps[0] not in carried or gaps[0] in directions or row.get("unattempted_requirements") != gaps
+                or row.get("verification_requirements") or done["criterion"].casefold() not in {c["what"].casefold() for c in checks}
+                or not all(c.get("passed") is True and c.get("how") and c.get("saw") for c in checks)):
+            continue
+        token = orchestration.digest([lease.root, action["id"], acceptance, promise, gaps[0]])[:24]
+        directions[gaps[0]] = {"text": f"Assign release observation {token} to delivery",
+                               "checks": [c["what"] for c in checks]}
+    return directions
+
+
+def confirmed_directions(tk, ticket, directions):
+    found = {}
+    for body, url, _ in comments(tk, ticket) if directions else ():
+        for name, direction in directions.items():
+            if body.strip() == direction["text"] and url and confirmed_observation(tk, ticket, body, url):
+                found[name] = {"comment": url, "text": body}
+    return found
+
+
 def behavior(report: verify.Verified, done: dict) -> dict:
     criterion = done["criterion"].casefold()
     if (report.verdict != "pass" or not report.finished or not report.behavior_reached or report.failed_checks
@@ -80,8 +148,13 @@ def candidate(job, done: dict, policy: str, acceptance: str, trees: dict) -> dic
                 or c.pr and gh.pr_repo(c.pr).casefold() != c.github.casefold()):
             raise ValueError("a release checkout does not match the verified spec tree")
         targets.append({"pr": c.pr, "repo": c.github, "base": c.base, "tree": tree, "head": head})
-    return {"definition": done, "source_format": 2, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
-            "landing": landing_policy(job.run.tracker), "targets": targets, "behavior": observed}
+    receipt = {"definition": done, "source_format": 2, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
+               "landing": landing_policy(job.run.tracker), "targets": targets, "behavior": observed}
+    if promise := job.verified.delivery_obligation:
+        release_proof.need(promise == obligation(job.run.repo.name, job.ticket, done, job.run.spec_identity),
+                           "the spec's protected delivery obligation changed before publication")
+        receipt["delivery_obligation"] = promise
+    return receipt
 
 
 def revision(repo: str, ref: str) -> tuple[str, str]:
@@ -207,11 +280,15 @@ def at_delivery(claim: dict, tk: tracker.Tracker) -> dict:
     if not landed:
         return {}
     done = data["definition"]
-    if release_proof.required(tk.repo.name, claim["issue"]):
+    promise = data.get("delivery_obligation")
+    if promise or release_proof.required(tk.repo.name, claim["issue"]):
         if len(landed) != 1 or landed[0]["repo"].casefold() != tk.repo.github.casefold():
             return {}
         proof = release_proof.for_delivery(tk.repo.name, claim["issue"], landed[0]["commit"], done.get("environment"))
         if not proof:
+            return {}
+        if promise and (proof.get("status") != "verified" or not proof.get("receipt_id") or any(
+                proof.get(k) != promise[k] for k in ("repo", "ticket", "destination", "path", "policy"))):
             return {}
         return {"method": "protected release observation", "landed": landed, "how": f"Observed {proof['path']} "
                 f"on {proof['destination']} at {proof['revision']}", "saw": f"All protected assertions matched. "
@@ -260,8 +337,14 @@ def settle(cfg, repo, claim: dict) -> None:
     if (t.spec_identity != claim["identity"] or tracker.spec_blocker(cfg, tk, t, require_open=False)
             or not same_source or landing_policy(tk) != data["landing"]):
         return
+    protected = None
+    if promise := data.get("delivery_obligation"):
+        if promise != obligation(repo.name, t, data["definition"]) or not (protected := at_delivery(claim, tk)):
+            return
+        if claim["state"] == "evidenced" and data.get("delivery") != protected:
+            return
     if claim["state"] == "published":
-        observed = data.get("delivery") or at_delivery(claim, tk)
+        observed = protected or data.get("delivery") or at_delivery(claim, tk)
         if not observed:
             return
         data["delivery"] = observed
