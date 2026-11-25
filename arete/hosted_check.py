@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import tomllib
 from urllib.parse import urlencode
@@ -133,15 +134,18 @@ def result(receipt):
     receipt.update(run=run, attempt=attempt, url=f"https://github.com/{REPO}/actions/runs/{run}/attempts/{attempt}")
     if row["status"] == "completed":
         receipt["status"] = row["conclusion"]
-        if row["conclusion"] == "success":
+        if row["conclusion"] in ("success", "failure"):
             jobs = gh.workflow_attempt_jobs(REPO, receipt["head"], run, attempt, retry=False, timeout=20)
-            required = {"Select check candidate", "Existing behavior checks", "Observe the protected worker isolation check",
-                        "Python lint, compilation and imports", "JavaScript syntax"}
-            pilot.require(len(jobs) == 1 and jobs[0]["name"] == "arete-checks" and jobs[0]["conclusion"] == "success"
-                          and "macos-15" in jobs[0]["labels"]
-                          and required <= {s["name"] for s in jobs[0]["steps"] if s["conclusion"] == "success"},
-                          "the full hosted macOS check did not run")
-            receipt["exit"] = 0
+            pilot.require(len(jobs) == 1 and jobs[0]["name"] == "arete-checks" and "macos-15" in jobs[0]["labels"]
+                          and jobs[0]["conclusion"] == row["conclusion"], "the hosted macOS job is unidentified")
+            passed = {s["name"] for s in jobs[0]["steps"] if s["conclusion"] == "success"}
+            exits = [int(m[1]) for name in passed if (m := re.fullmatch(r"Behavior suite exit (\d{1,3})", name))]
+            if len(exits) == 1 and exits[0] <= 255:
+                receipt["exit"] = exits[0]
+            if row["conclusion"] == "success":
+                required = {"Select check candidate", "Existing behavior checks", "Observe the protected worker isolation check",
+                            "Python lint, compilation and imports", "JavaScript syntax"}
+                pilot.require(receipt.get("exit") == 0 and required <= passed, "the full hosted macOS check did not run")
 
 
 def check(job, tree, failures):

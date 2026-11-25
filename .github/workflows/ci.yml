@@ -44,6 +44,11 @@ jobs:
           uv --no-config run --isolated --no-project --python 3.13 python -IB - "$witness" <<'PYTHON'
           import sys
           import unittest
+          from pathlib import Path
+          from types import ModuleType
+          tests = ModuleType("tests")
+          tests.__path__ = [str(Path(sys.argv[1]) / "tests")]
+          sys.modules["tests"] = tests
           sys.path.append(sys.argv[1])
           name = "tests.test_behavior.AuthorityPrivatePiWorkerTests.test_private_worker_launch_denies_the_configured_file_store"
           suite = unittest.defaultTestLoader.loadTestsFromName(name)
@@ -52,7 +57,15 @@ jobs:
           PYTHON
       - run: uv sync --locked
       - name: Existing behavior checks
-        run: uv run --locked python -m tests.parallel --timeout 30
+        id: behavior
+        run: |
+          status=0
+          uv run --locked python -m tests.parallel --timeout 30 || status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Behavior suite exit ${{ steps.behavior.outputs.exit_code }}
+        if: ${{ !cancelled() && steps.behavior.outputs.exit_code != '' }}
+        run: 'true'
       - name: Python lint, compilation and imports
         run: |
           sh tools/lint-arete

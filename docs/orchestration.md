@@ -343,7 +343,7 @@ worker-isolation witness from that protected copy. Candidate changes to the witn
 supply this result. A missing, skipped or expected-failure witness holds the gate.
 
 The check action and its run folder (`hosted-check.json`) record the candidate tree and commit, policy digest,
-workflow blob and directory digest, protected witness base and tests digest, GitHub run and attempt, conclusion and a zero exit on success. Cancelled, missing, failed, incomplete
+workflow blob and directory digest, protected witness base and tests digest, GitHub run and attempt, conclusion and the behavior process’s exit code when it ran. Cancelled, missing, failed, incomplete
 and stale results keep the gate closed. The other check commands still run locally. A hosted pass lets the ordinary
 independent review and behavioral-verification gates proceed. An already-held ticket uses the existing runner
 readiness confirmation to resume once the enrolled route is available.
