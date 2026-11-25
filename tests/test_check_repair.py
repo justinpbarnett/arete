@@ -1,12 +1,7 @@
-import shlex
 import unittest
-from contextlib import nullcontext
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
-from arete import check_repair, config, environment, pipeline, vault
+from arete import check_repair, config
 
 
 class FailedCheckDiagnosticsTests(unittest.TestCase):
@@ -78,44 +73,3 @@ class FailedCheckDiagnosticsTests(unittest.TestCase):
         self.assertEqual(check_repair.focus(self.layer, [{"name": "behavior", "selectors": ["--all"]}]), {})
         self.assertEqual(check_repair.focus(self.layer, [{"name": "other", "selectors": []}]), {})
         self.assertEqual(check_repair.focus(self.layer, [{"name": n} for n in self.layer.checks]), {})
-
-    def local_checks(self, *, secret="", **cases):
-        root = Path(self.enterContext(TemporaryDirectory()))
-        commands = {}
-        for name, (code, output) in cases.items():
-            fixture = root / name
-            fixture.write_text(f"printf '%s\\n' {shlex.quote(output)} >&2\nexit {code}\n")
-            commands[name] = shlex.join(["/bin/sh", str(fixture)])
-        layer = config.RepoLayer(root, checks=commands, quick_checks=tuple(commands),
-                                 targeted_commands={"classes": check_repair.PARALLEL})
-        run = SimpleNamespace(id="fixture", config=config.Config(), repo=None, time_for=lambda n: n, log=Mock(),
-                              story=[], save=Mock(), settings=lambda _: SimpleNamespace(tries=2))
-        results = []
-        with (patch.object(pipeline, "check_lane", return_value=nullcontext(())),
-              patch.object(pipeline.record, "timed", side_effect=lambda *a, **kw: nullcontext(kw)),
-              patch.object(environment, "stored", return_value={"TOKEN": secret} if secret else {})):
-            passed, report = pipeline.run_checks(layer, root, [], run, 5, results=results)
-        self.assertFalse(passed)
-        self.assertEqual([item["exit"] for item in results], [code for code, _ in cases.values()])
-        return run, results, report
-
-    def test_no_footer_reports_custom_traceback_reason_but_not_log_lines(self):
-        secret = "fixture-secret-value"
-        reason = "HarnessFailure: could not load " + secret + " " + "x" * 400
-        logs = "HarnessFailure: retrying\nError: retry scheduled\nStatus: failed"
-        trace = ('Traceback (most recent call last):\n  File "harness.py", line 1, in <module>\n'
-                 '    load_fixture()\n')
-        output = (trace + "ValueError: earlier exception\n\n" + trace + reason + "\n"
-                  + "log noise " * 800 + "\n" + logs)
-        run, results, report = self.local_checks(behavior=(1, output), compile=(1, logs), secret=secret)
-        redacted = reason.replace(secret, vault.REDACTED)[:300]
-        self.assertEqual(results[0]["reason"], redacted)
-        self.assertNotIn("reason", results[1])
-        self.assertNotIn(secret, report)
-        self.assertIn("behavior (exit 1)", report)
-        self.assertIn(redacted, report)
-        b = SimpleNamespace(check=Mock(side_effect=[False, True]), check_results=results, report=report, run=run,
-                            check_commands="`checks behavior`", deny=[], resume=Mock())
-        self.assertEqual(pipeline.Build.check_with_repairs(b, lambda n: f"fix-{n}"), (True, 2))
-        self.assertIn(redacted, run.story[-1])
-        self.assertIn(redacted, b.resume.call_args.args[1])

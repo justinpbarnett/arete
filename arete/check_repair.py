@@ -16,10 +16,14 @@ PARALLEL = "uv run python -m tests.parallel"
 ARETE_SUITE = f"if [ -f tests/parallel.py ]; then {PARALLEL}; else uv run python -m unittest discover -s tests -v; fi"
 MACOS_PROFILE = "macos-sandbox-profile"
 SANDBOX_DENIAL = "sandbox-exec: sandbox_apply: Operation not permitted"
+TRACEBACK_MARGIN = r"(?(margin)(?P=margin)\| )"
+EXCEPTION_NAME = r"(?:[A-Za-z_]\w*\.(?:<locals>\.)?)*[A-Za-z_]\w*"
 TRACEBACK_EXCEPTION = re.compile(
-    r'^Traceback \(most recent call last\):\r?\n  File "[^\r\n]+", line \d+\b[^\r\n]*\r?\n'
-    r'(?:[ \t][^\r\n]*\r?\n)*'
-    r'((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?::[ \t][^\r\n]*|:)?)[ \t]*\r?$',
+    r"^(?:(?P<margin> +)(?:\+ Exception Group |\| (?:Exception Group )?))?"
+    r"Traceback \(most recent call last\):\r?\n"
+    rf'{TRACEBACK_MARGIN}  File "[^\r\n]+", line \d+\b[^\r\n]*\r?\n'
+    rf"(?:{TRACEBACK_MARGIN}[ \t][^\r\n]*\r?\n)*"
+    rf"{TRACEBACK_MARGIN}(?P<exception>{EXCEPTION_NAME}(?::[ \t][^\r\n]*|:)?)[ \t]*\r?$",
     re.ASCII | re.MULTILINE,
 )
 
@@ -69,8 +73,8 @@ def failed_check(layer, name, output, exit_code):
         if exit_code == 71 and output.strip() == SANDBOX_DENIAL:
             failure["capability"] = MACOS_PROFILE
         else:
-            for exception in TRACEBACK_EXCEPTION.finditer(output):
-                failure["reason"] = exception[1].rstrip()[:300]
+            for match in TRACEBACK_EXCEPTION.finditer(output):
+                failure["reason"] = match["exception"].rstrip()[:300]
         return failure
     summary = summaries[-1]
     identifiers = summary[1].split(", ")

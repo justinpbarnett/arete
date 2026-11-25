@@ -1337,7 +1337,7 @@ def check_failure_story(heading: str, failures: list[dict], report: str = "") ->
 def check_fix_prompt(attempt: int, tries: int, report: str, checks: str, deny: list[str]) -> str:
     text = prompt_loader.prompt(
         "fix", attempt=attempt, max_attempts=tries, failures=report, checks=checks, denied=prompt_loader.code_list(deny))
-    return check_repair.builder_prompt(prompt_loader.task_prompt(text))
+    return check_repair.builder_prompt(text)
 
 
 def checkout_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
