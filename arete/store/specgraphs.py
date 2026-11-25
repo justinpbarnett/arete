@@ -177,3 +177,21 @@ def finish(key, identity, run, delivery):
         if not specs.advance(identity, run, "building", "published", delivery):
             raise Conflict("the spec graph no longer owns the parent delivery claim")
         c.execute("UPDATE spec_graphs SET complete = 1 WHERE scope = ? AND parent = ?", key)
+
+
+def amend(key, previous, updated, *, claim=None):
+    with db.tx() as c:
+        changed = c.execute("UPDATE spec_graphs SET data=? WHERE scope=? AND parent=? AND complete=1 AND data=?",
+                            (orchestration.encoded(updated), *key, orchestration.encoded(previous))).rowcount
+        if changed != 1:
+            raise Conflict("the native graph changed during amendment")
+        if claim:
+            revision = updated["ticket_version"]
+            payload = {**claim["data"], "source_format": 2, "source": revision, "amended": revision}
+            for field in ("notes", "delivery", "observation_request"):
+                payload.pop(field, None)
+            changed = c.execute("UPDATE spec_deliveries SET data=? WHERE identity=? AND run=? AND state='published' AND data=?",
+                                (orchestration.encoded(payload), claim["identity"], claim["run"],
+                                 orchestration.encoded(claim["data"]))).rowcount
+            if changed != 1:
+                raise Conflict("the parent delivery claim changed during amendment")

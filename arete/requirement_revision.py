@@ -104,7 +104,7 @@ def github_conflict(tk: tracker.GitHubTracker, ticket: tracker.Ticket) -> str:
     comments = []
     for item in github_issue_pages(tk, ticket.id):
         if (not authorized(item.get("author")) or item["title"].strip() != ticket.title
-                or (item["body"] or "(no description)") != ticket.body):
+                or (item["body"] or "(no description)") != (ticket.body if ticket.graph_body is None else ticket.graph_body)):
             return "the issue changed while the new requirements were being read"
         renamed = item["timelineItems"]["nodes"]
         if renamed and (renamed[0]["currentTitle"] != item["title"] or not authorized(renamed[0]["actor"])):

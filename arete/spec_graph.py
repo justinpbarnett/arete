@@ -301,7 +301,8 @@ def capture(job, remote, parent, accepted_direct):
     for child in unattached:
         remote.check_attachment(child, policy)
     dependencies(remote, nodes, existing, policy)
-    data = {"version": 1, "account": account, "destination": remote.scope, "project": getattr(remote, "project", ""),
+    from . import spec_amendments
+    data = {"version": 1, "accepted_parent": spec_amendments.snapshot(ticket), "account": account, "destination": remote.scope, "project": getattr(remote, "project", ""),
             "route": getattr(remote, "route", ""), "targets": [{"repo": c.github, "branch": c.base} for c in job.checkouts],
             "parent": body_identity(parent), "native_id": parent.native_id,
             "source": source, "ticket_version": spec_delivery.source_version(ticket), "input": input_sha, "plan": plan, "review": review, "policy": policy,
