@@ -357,7 +357,7 @@ def enrolled(repo):
 
 
 def pr_check_options(repo, ticket, github, base):
-    if not isinstance(repo, config.Repo) or repo.github != github or not repo.pipeline or repo.target_branch != base:
+    if not ticket or not isinstance(repo, config.Repo) or repo.github != github or not repo.pipeline or repo.target_branch != base:
         return {}
     if repo.unattended_environment == "staging" and required(repo.name, ticket):
         data = goal(repo.name, str(ticket))

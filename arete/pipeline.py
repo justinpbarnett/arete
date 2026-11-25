@@ -3547,7 +3547,7 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base,
-                                 **release_proof.pr_check_options(b.run.repo, b.ticket.id, c.github, c.base))
+                                 **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
     if not hold and (c.github, head) in b.ci_rerun_requested_heads:
         hold = rerun_head_hold(b, c, head)
     if not hold:
@@ -3589,7 +3589,7 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
     if risk.hold:
         return risk.hold
     return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
-                            **release_proof.pr_check_options(b.run.repo, b.ticket.id, c.github, c.base))
+                            **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
