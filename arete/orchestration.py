@@ -653,7 +653,7 @@ class Controller(worker_turns.WorkerTurns):
         return next((a for a in reversed(ledger.actions(self.lease))
                      if a["op"] == "review.run" and a["id"] not in stale
                      and a["state"] != "accepted" and a["id"] != self.executing
-                     and not a["result"].get("reused_review")), {})
+                     and not (a["result"].get("reused_review") or a["result"].get("review_deferred"))), {})
 
     def applicable_report(self, source):
         stamp = source.get("result", {}).get("evidence", {})
@@ -672,13 +672,16 @@ class Controller(worker_turns.WorkerTurns):
         report = self.applicable_report(source)
         if source.get("id") != request["review_id"] or report.get("verdict") != "pending":
             raise ValueError("decisions require the latest completed review for this issue, base and policy")
-        if not self.current("checks") or not self.data["evidence"]["checks"]["result"].get("full"):
+        if not self.full_checks_passed():
             raise ValueError("run the full configured checks on the candidate before deciding findings")
         judged = code_review.disposition(report, request["decisions"], code_review.candidate_trees(self.job.checkouts))
         self.stamp("review", judged.asdict())
         self.job.review = judged
         pipeline.note_review(self.run, judged, self.job.verified)
         return judged.asdict()
+
+    def full_checks_passed(self):
+        return self.current("checks") and self.data["evidence"]["checks"].get("result", {}).get("full") is True
 
     def current(self, gate):
         if gate == "checks" and self.data.get("denied_feedback"):
@@ -876,7 +879,7 @@ class Controller(worker_turns.WorkerTurns):
                 self.catalog.add_context(action["id"], result["text"])
             if gate and not old_gate and action["state"] != "accepted" and not (
                     result.get("reused_checks") or result.get("reused_review") or result.get("reused_verification")
-                    or result.get("preserved_verification")
+                    or result.get("review_deferred") or result.get("preserved_verification")
                     or action["op"] in ("review.decide", "verification.decide") and action["state"] != "succeeded"):
                 self.data.setdefault("evidence", {}).pop(gate, None)
             if action["state"] == "succeeded":
@@ -1950,6 +1953,10 @@ class Controller(worker_turns.WorkerTurns):
                            (report["verdict"] == "pending" and self.job.review.verdict == "pending")):
                 return {"reused_review": source["id"], "findings": report["findings"],
                         "next": "Use the source review ID to settle pending findings, or publish a settled review."}
+            if not self.full_checks_passed():
+                return {"review_deferred": True,
+                        "error": "Standards and Spec review requires passing full checks on the current candidate. "
+                                 "Resolve the failing checks or runner issue. After a focused pass, request full checks."}
         if op in ("verification.run", "review.run"):
             role = "verify" if op == "verification.run" else "review"
             self.data.setdefault("evidence", {}).pop(role, None)
