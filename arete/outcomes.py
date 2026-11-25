@@ -195,7 +195,10 @@ def sync_moves(cfg: config.Config) -> None:
             claim = spec_store.find(*key)
             if claim.get("state") in ("evidenced", "complete"):
                 continue
-            m = tk.shift(key[1], target, keep_done=True, **({"keep_open": True} if claim else {}))
+            from . import release_proof
+
+            keep_open = claim or release_proof.required(*key)
+            m = tk.shift(key[1], target, keep_done=True, **({"keep_open": True} if keep_open else {}))
         except jira.JiraError as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not move it to {target}, trying next poll: "
                   f"{util.first_line(str(e), 300)}")
@@ -241,7 +244,10 @@ def sync_landings(cfg: config.Config) -> None:
             claim = spec_store.find(repo.name, str(r["issue"]))
             if claim and (reached == branches[-1] or claim["state"] in ("evidenced", "complete")):
                 continue
-            err = (tk.shift(str(r["issue"]), target, keep_done=True, keep_open=True).error if claim
+            from . import release_proof
+
+            keep_open = claim or release_proof.required(repo.name, str(r["issue"]))
+            err = (tk.shift(str(r["issue"]), target, keep_done=True, keep_open=True).error if keep_open
                    else tk.move_to(str(r["issue"]), target))
             if reached != branches[-1]:
                 run = pipeline.Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]), writes_lines=False)
