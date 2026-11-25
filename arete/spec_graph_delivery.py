@@ -1,7 +1,7 @@
 """Dispatch a reviewed graph from its recorded identities and verify the integrated parent."""
 from __future__ import annotations
 
-from . import flows, gh, spec_delivery, spec_tracker, verify
+from . import factory, flows, gh, spec_delivery, spec_tracker, tracker, verify
 from .store import runs, specgraphs
 
 
@@ -59,6 +59,21 @@ def satisfied_native(source, child, blockers):
     dependent = next((n for n in graph["plan"]["children"] if n["key"] == by_ref.get(str(child))), {})
     return {ref for ref in blockers if (name := by_ref.get(str(ref))) and
             usable(source.repo.name, name, mapped, graph, released=name in dependent.get("release_requires", []))}
+
+
+def active_child_blocker(run):
+    source = getattr(run, "tracker", None)
+    if not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)) or tracker.is_task_id(run.tid):
+        return ""
+    remote = spec_tracker.adapter(source)
+    if not remote or not (key := specgraphs.membership(remote.scope, str(run.tid))):
+        return ""
+    return ready(source, remote, key, str(run.tid))
+
+
+def require_active_child(run):
+    if reason := active_child_blocker(run):
+        raise factory.Refused(reason)
 
 
 def current_parent(source, remote, key, saved):

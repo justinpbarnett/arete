@@ -37,6 +37,7 @@ from . import (
     slots,
     spec_delivery,
     spec_graph,
+    spec_graph_delivery,
     tracker,
     util,
     vault,
@@ -431,6 +432,8 @@ class Controller(worker_turns.WorkerTurns):
             why = tracker.spec_blocker(self.job.cfg, self.run.tracker, ticket)
             if not why and ticket.spec_identity != self.run.spec_identity:
                 why = "the spec tracker identity changed"
+        elif graph_hold := spec_graph_delivery.active_child_blocker(self.run):
+            why = graph_hold
         elif not ticket.open:
             why = "the source ticket is closed"
         elif {"no-agent", "agent:hold"} & set(ticket.labels):
@@ -894,6 +897,7 @@ class Controller(worker_turns.WorkerTurns):
         return ledger.digest(trees) if trees else ""
 
     def stamp(self, gate, result):
+        spec_graph_delivery.require_active_child(self.run)
         checked_trees = result.get("checked", {}).get("trees") if gate == "checks" else None
         tree = ledger.digest(checked_trees) if checked_trees else self.fingerprint()
         if not tree:
@@ -1575,6 +1579,12 @@ class Controller(worker_turns.WorkerTurns):
                         self.run.launch_done(worker.step, bool(message.get("ok")))
                     self.run.cost += message.get("cost_usd", 0)
                     self.run.paid += message.get("paid_usd", 0)
+                    if reason := spec_graph_delivery.active_child_blocker(self.run):
+                        if self.exchanged:
+                            exchange.cancel(self.lease, worker.logical_id, key, reason)
+                        else:
+                            ledger.transition(self.lease, key, "cancelled", {"reason": reason, "usage_unknown": False})
+                        raise workspace.RunFailed(reason)
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if self.exchanged:
                         phase = self.settle_turn(worker, message)
