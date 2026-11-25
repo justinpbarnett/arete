@@ -33,11 +33,8 @@ Denied paths: $denied.
 - For each finding, fix the named path and every other path in the change where the same problem occurs. These fixes
   are part of what the finding asks. Name each extra path you fixed in the summary.
 - Keep all other changes within what the findings ask. No scope growth, no drive by refactors, no formatting churn.
-- Arete runs the full check gate after you finish: $checks.
-  Do not duplicate the full suite here; leave it to the checks step.
-  Run the test classes for the files you changed by name, for example `$test_classes`;
-  a full suite run here waits for a free check lane.
-  Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.
+- Configured checks: $checks.
+  For a focused test class, for example, use `$test_classes`. Report exactly what you ran.
 - Shell commands you may run: $commands. Others are refused. If a finding needs one, change nothing for it and say
   in your reply exactly what a human must run.
 - Never run git commands that write (commit, push, checkout, reset). Arete commits and pushes, and deletes the
