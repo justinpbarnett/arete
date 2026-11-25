@@ -106,8 +106,7 @@ def ready(source, remote, key, ref):
     return ""
 
 
-def integrated(source, claim):
-    from . import release_proof
+def integrated_targets(source, claim):
 
     remote = spec_tracker.adapter(source)
     key = specgraphs.GraphKey(remote.scope, claim["issue"])
@@ -117,17 +116,40 @@ def integrated(source, claim):
     if {x.native_id for x in remote.children(parent.ref)} != {v[1] for v in mapped.values()}:
         return {}
     targets = data["targets"]
-    if not targets or not release_proof.required(source.repo.name, claim["issue"]):
-        return {}
+    if not targets:
+        return []
     observed = []
     for entry in targets:
         commit, _ = spec_delivery.revision(entry["repo"], entry["branch"])
-        observed.append({**entry, "commit": commit, "pr": ""})
+        observed.append({**entry, "commit": commit, "pr": "", "children": []})
     for node in data["plan"]["children"]:
         landed = usable(source.repo.name, node["key"], mapped, data)
-        if not landed or any(not any(x["repo"] == t["repo"] and gh.branch_contains(x["repo"], x["commit"], t["commit"])
-                                     for x in observed) for t in landed):
-            return {}
+        if not landed:
+            return []
+        for child in landed:
+            target = next((x for x in observed if x["repo"] == child["repo"] and x["branch"] == child["branch"]), None)
+            if not target or not gh.branch_contains(target["repo"], target["commit"], child["commit"]):
+                return []
+            target["children"].append(child["commit"])
+    return observed
+
+
+def promotion_target(repo, ticket):
+    from . import config, tracker
+    from .store import specs
+    claim = specs.find(repo.name, ticket)
+    if claim.get("state") not in ("published", "evidenced") or not claim["data"].get("graph"):
+        return None
+    source = tracker.for_ticket(config.load_required(), repo, ticket)
+    targets = integrated_targets(source, claim)
+    return next((x for x in targets if x["repo"].casefold() == repo.github.casefold()), {})
+
+
+def integrated(source, claim):
+    from . import release_promotion, release_proof
+    observed = integrated_targets(source, claim)
+    if not release_proof.required(source.repo.name, claim["issue"]):
+        return {}
     primary = next((x for x in observed if x["repo"].casefold() == source.repo.github.casefold()), None)
     if not primary:
         return {}
@@ -135,12 +157,16 @@ def integrated(source, claim):
     policy = release_proof.goal(owner, ticket)
     if policy["destination"] == "arete-serve":
         receipt = release_proof.observe(owner, ticket, sha)
+    elif policy["destination"] == "staging":
+        receipt = release_promotion.observe_staging(source.repo, ticket, sha)
+        if claim["data"]["definition"].get("environment") == "production":
+            receipt = release_proof.completion(owner, ticket, sha)
     else:
-        receipt = release_proof.evidence(owner, ticket, sha)
+        receipt = release_proof.observe(owner, ticket, sha)
     if not receipt or receipt["status"] != "verified" or receipt["revision"] != sha:
         return {}
     if any(spec_delivery.revision(x["repo"], x["branch"])[0] != x["commit"] for x in observed):
         return {}
     return {"method": "protected integrated release observation", "landed": observed,
             "how": f"Exercised {receipt['path']} on {receipt['destination']} at {sha}",
-            "saw": f"Integrated assertions matched for {len(mapped)} landed children. Receipt {receipt['receipt_id']}."}
+            "saw": f"Integrated assertions matched. Receipt {receipt['receipt_id']}."}
