@@ -842,10 +842,14 @@ def graph_resolution(body: str):
     return header[1], mapped
 
 
+DELIVERY_DIRECTION = re.compile(r"Assign release observation [0-9a-f]{24} to delivery")
+
+
 def scope_comments(comments: list[tuple[str, str, str]]) -> str:
     return comments_text([c for c in comments if c[0] != "Arete" and c[2].strip() and not from_arete(c[2])
                           and not gh.has_arete_mark(c[2]) and not spec_observation(c[2]) and not graph_resolution(c[2])
-                          and not re.fullmatch(r"Promote [0-9a-f]{40} to production", c[2].strip())])
+                          and not re.fullmatch(r"Promote [0-9a-f]{40} to production", c[2].strip())
+                          and not DELIVERY_DIRECTION.fullmatch(c[2].strip())])
 
 
 def same_comment_scope(history, directed, saved: str | None) -> bool:

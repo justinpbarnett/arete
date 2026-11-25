@@ -40,6 +40,19 @@ controller can select an approved runner with the missing capability or request 
 For a supplemental scenario the verifier identified as advisory, the controller can record its reason to proceed
 with `verification.decide`. The PR retains the gap and decision. Each required behavior still needs evidence.
 
+For a native spec enrolled in protected release verification, the candidate verifier exercises the full
+definition of done against the candidate and returns the controller’s `pending_delivery` identifier.
+The controller binds that identifier to the native ticket, its approved scope, definition, destination and
+protected observation policy. After merge, the release check must record the matching deployed behavior
+before Arete posts the delivery evidence and closes the ticket.
+
+An older baseline can have a single named release observation recorded as an unmeasured candidate requirement.
+If the existing evidence includes a successful observation of each local check, the next verification result
+can offer the spec publisher an `owner_delivery_directions` entry for that exact remaining requirement.
+The publisher can assign it to the enrolled release check by posting the supplied line alone on the native
+ticket. Arete verifies the publisher and current comment, retains the historical evidence, and requires fresh
+observations of all the previous candidate checks. Other missing requirements still need candidate evidence.
+
 The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
 runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
 a comparable runner fingerprint appear as unclassified. When an existing run needs new behavioral evidence
