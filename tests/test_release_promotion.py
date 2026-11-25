@@ -50,7 +50,7 @@ class StagingRelease(unittest.TestCase):
         self.policy = {"destination": "staging", "staging": self.stage_url, "production": self.prod_url,
                        "path": "/feature", "identity_path": "/.well-known/arete-release.json",
                        "observer_sha256": hashlib.sha256(script.read_bytes()).hexdigest(), "production_branch": "main",
-                       "qa": ["tester"], "instructions": "Open Settings. Check the selection survives reload.",
+                       "qa": ["tester"], "qa_require_revision": True, "instructions": "Open Settings. Check the selection survives reload.",
                        "assertions": [{"field": "/selection", "equals": "Sources"}],
                        "recovery": [{"field": "/service", "equals": "ready"}]}
         policy_file = root / "policy.json"
@@ -101,7 +101,8 @@ class StagingRelease(unittest.TestCase):
         self.assertIsNone(proof.for_delivery("product", "12", self.new, "production"))
         self.assertIsNone(proof.for_delivery("product", "12", self.new, "other"))
         self.comment("untrusted", "Promote " + self.new + " to production", 24)
-        self.comment("tester", "looks good", 25)
+        self.comment("tester", "looks good", 24)
+        self.comment("tester", "Promote this to production", 25)
         self.assertEqual(self.advance()["phase"], "awaiting_qa")
         self.comment("tester", "Promote " + self.new + " to production", 26)
         self.comment("tester", "Promote " + self.new + " to production", 27)

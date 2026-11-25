@@ -87,7 +87,7 @@ def pointer(value):
 def validate(data):
     need(isinstance(data, dict) and set(data) <= {"destination", "path", "assertions", "recovery", "revision",
          "staging", "production", "qa", "instructions", "identity_path", "observer_sha256",
-         "production_branch", "immutable_host_suffix", "checks"} and data.get("destination") in ("arete-serve", "staging", "production"),
+         "production_branch", "immutable_host_suffix", "checks", "qa_require_revision"} and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
     need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]+", path) and "//" not in path
@@ -99,7 +99,7 @@ def validate(data):
     if "observer_sha256" in data:
         need(re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None, "invalid observer fingerprint")
     if data["destination"] == "arete-serve":
-        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks"} & set(data)), "invalid Arete client route")
+        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks", "qa_require_revision"} & set(data)), "invalid Arete client route")
     else:
         identity = data.get("identity_path")
         need(isinstance(identity, str) and re.fullmatch(r"/[A-Za-z0-9/_.-]+", identity)
@@ -110,6 +110,7 @@ def validate(data):
              "record the user action QA should perform")
         if data["destination"] == "staging":
             need(config.valid_target_branch(data.get("production_branch")), "invalid production branch")
+            need(type(data.get("qa_require_revision", False)) is bool, "qa_require_revision must be a boolean")
             if "checks" in data:
                 gates = data["checks"]
                 need(isinstance(gates, dict) and set(gates) == {"pr", "staging"}, "declare PR and staging checks")
@@ -266,6 +267,7 @@ def observe(repo, ticket, revision, *, destination=None, recovery=False, pinned=
     destination = destination or data["destination"]
     need(destination == data["destination"] or data["destination"] == "staging" and destination == "production",
          "destination is outside this policy")
+    need(destination != "staging" or check_destination, "use the verified staging deployment for an observation")
     proof = {"repo": repo, "ticket": ticket, "revision": revision, "destination": destination,
              "policy": policy, "path": data["path"], "recovery": recovery}
     if origin:
@@ -510,7 +512,12 @@ def command(args):
         need(data is not None, "release goal not enrolled")
         current = data.get("revision") or merge_revision(repo, args.ticket, repo.target_branch or gh.default_branch(repo.github))
         need(current == args.revision, "proposed release differs from the goal's revision")
-        answer = observe(repo.name, args.ticket, current)
+        if data["destination"] == "staging":
+            from . import release_promotion
+
+            answer = release_promotion.observe_staging(repo, args.ticket, current)
+        else:
+            answer = observe(repo.name, args.ticket, current)
     else:
         answer = progress(repo, args.ticket)
     print(json.dumps(answer, sort_keys=True))

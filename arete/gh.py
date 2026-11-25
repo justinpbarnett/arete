@@ -706,7 +706,8 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None, stage
         return False
     runs = [row for page in checks for row in page["check_runs"]]
     if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
-                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+                            and (row.get("app") or {}).get("id") == required["app_id"]
+                            and row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs):
         return False
     skippable = set()
     if stage_checks:
