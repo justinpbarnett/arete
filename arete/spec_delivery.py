@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from . import gh, jira, outbound, release_proof, tracker, util, vault, verify
+from . import gh, jira, outbound, release_proof, requirement_revision, tracker, util, vault, verify
 from .store import orchestration, runs, specs, workspaces
 
 GUIDANCE = (
@@ -44,7 +44,7 @@ def behavior(report: verify.Verified, done: dict) -> dict:
 
 
 def source_version(ticket: tracker.Ticket) -> str:
-    return orchestration.digest([ticket.title, ticket.body])
+    return requirement_revision.version(ticket)
 
 
 def landing_policy(tk: tracker.Tracker) -> list[list[str]]:

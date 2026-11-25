@@ -544,6 +544,7 @@ class Run(AgentRun):
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
     code_review: bool = False
+    scope_revoked: bool = False
     spec_root: str = ""
     spec_identity: str = ""
     pr_recovery_cutoff: str = field(default="", init=False)
@@ -1893,7 +1894,7 @@ def parked_review_lines(folder: Path) -> list[str]:
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
                *, echo_end: bool = True) -> None:
     failure = run.failure if run.failure is not None else {"class": "work"}
-    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs):
+    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs or run.scope_revoked):
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")

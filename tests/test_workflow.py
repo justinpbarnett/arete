@@ -944,6 +944,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         repo = config.Repo("fixture", root / "source", parts=[config.Part(c.dir, c.github)])
         self.run = pipeline.Run(id="revision-run", repo=repo, tracker=mock.Mock(), tid="7",
                                 dir=root, path="orchestrate", alone=True)
+        self.run.tracker.get.return_value = ticket
         self.enterContext(mock.patch.object(self.run, "log"))
         self.job = job = flows.Job(config.Config(), self.run, self.ws, continues="prior-run")
         self.controller = ctl = orchestration.Controller.__new__(orchestration.Controller)
@@ -7932,6 +7933,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
             with self.subTest(pr_head=initial, tree=tree):
                 resumed, _ = self.controller()
                 resumed.flow.continues = first.run.id
+                resumed.run.tracker.get.return_value = ticket
                 resumed.data = json.loads(saved)
                 resumed.job = resumed.flow.ctx = flows.Job(config.Config(), resumed.run, root, built=resumed.job.b)
                 resumed.run.add_dirs, resumed.run.story, resumed.run.workspace = [], [], None

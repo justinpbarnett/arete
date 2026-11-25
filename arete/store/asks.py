@@ -52,6 +52,16 @@ def ask_get(ask_id: str, connect=reader) -> dict | None:
         return ask_row(r) if r else None
 
 
+def carry_scope_ask(repo: str, ticket: str, call: str, run: str) -> bool:
+    with db() as c:
+        row = c.execute("SELECT id,status FROM asks WHERE repo=? AND ticket=? AND call=? LIMIT 1",
+                        (repo, str(ticket), call)).fetchone()
+        if row and row["status"] == "open":
+            # Keep the original ID, date, session and notification, with a live continuation for the answer.
+            c.execute("UPDATE asks SET run=? WHERE id=?", (run, row["id"]))
+        return row is not None
+
+
 def asks_of(run: str, status: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         return [ask_row(r) for r in c.execute(
