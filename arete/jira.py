@@ -96,30 +96,31 @@ class Client:
     def browse_url(self, key: str) -> str:
         return f"{self.base}/browse/{key}"
 
-    def request(self, method: str, path: str, params: dict | None = None, body=None):
-        raw = self._send(method, path, params, body)
+    def request(self, method: str, path: str, params: dict | None = None, body=None, *, single_attempt=False):
+        raw = self._send(method, path, params, body, **({"single_attempt": True} if single_attempt else {}))
         return json.loads(raw) if raw.strip() else None
 
     def attachment(self, attachment_id: str) -> bytes:
         return self._send("GET", f"/rest/api/2/attachment/content/{_path_segment(attachment_id)}", accept="*/*")
 
     def _send(self, method: str, path: str, params: dict | None = None, body=None,
-              accept: str = "application/json") -> bytes:
+              accept: str = "application/json", *, single_attempt=False) -> bytes:
         url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Authorization": self._auth, "Accept": accept}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        for attempt in range(RETRIES + 1):
+        retries = 0 if single_attempt else RETRIES
+        for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
-                if method == "POST" and e.code >= 500:
+                if (single_attempt or method == "POST") and e.code >= 500:
                     raise JiraUnsure(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}", e.code) from None
-                if (e.code == 429 or e.code >= 500) and attempt < RETRIES and wait <= MAX_RETRY_WAIT:
+                if (e.code == 429 or e.code >= 500) and attempt < retries and wait <= MAX_RETRY_WAIT:
                     time.sleep(wait)
                     continue
                 later = f" (retry after {wait:.0f} s)" if wait > MAX_RETRY_WAIT else ""
@@ -127,9 +128,9 @@ class Client:
             except (urllib.error.URLError, TimeoutError, OSError, RemoteDisconnected) as e:
                 never_sent = isinstance(e, urllib.error.URLError) and isinstance(
                     e.reason, (socket.gaierror, ConnectionRefusedError))
-                if method == "POST" and not never_sent:
+                if (single_attempt or method == "POST") and not never_sent:
                     raise JiraUnsure(f"jira {method} {path}: {e}") from None
-                if attempt < RETRIES:
+                if attempt < retries:
                     if not util.online():
                         util.wait_for_network()
                     time.sleep(2**attempt)

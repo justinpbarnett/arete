@@ -1855,7 +1855,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, launch_lease, pilot, unblock, zte
+    from . import flows, launch_lease, pilot, spec_graph, unblock, zte
     from .store import db, orchestration
     from .store import zte as zte_store
 
@@ -1888,6 +1888,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        try:
+            poll_launch = launch_lease.from_poll(repo.name, str(tid))
+            ordinary_launch = poll_launch or bool(script and script.environment_release)
+            if ordinary_launch and (owned := spec_graph.queue_blocker(tk, tid)):
+                print(f"{name}: {owned}")
+                return 2
+        except (PermissionError, *spec_graph.READ_ERRORS) as error:
+            print(f"{name}: could not confirm ticket ownership: {error}")
+            return 2
         retry_of = {}
         fixed_gaps = ()
         spec_ticket = None
@@ -2007,7 +2016,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                                                        readmission=readmission)
             poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
                             and latest["status"] == "failed" and not latest["dry_run"]
-                            and launch_lease.from_poll(repo.name, str(tid)) else "")
+                            and poll_launch else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -2150,6 +2159,26 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     print(f"{name}: {error}")
                     return 2
+            elif ordinary_launch and not tracker.is_task_id(tid):
+                try:
+                    owned = spec_graph.queue_blocker(tk, tid, native=True)
+                except spec_graph.READ_ERRORS as error:
+                    slot.free()
+                    print(f"{name}: could not confirm ticket ownership: {error}")
+                    return 2
+                if owned:
+                    slot.free()
+                    print(f"{name}: {owned}")
+                    return 2
+                with db.tx():
+                    owned = spec_graph.queue_blocker(tk, tid)
+                    if not owned:
+                        run_id = start()
+                if owned:
+                    slot.free()
+                    print(f"{name}: {owned}")
+                    return 2
+                launch_lease.registered(repo.name, str(tid))
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline

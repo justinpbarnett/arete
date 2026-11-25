@@ -42,6 +42,7 @@ from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from arete.store import runs as run_store
+from arete.store import specgraphs
 from arete.store import tasks as task_store
 from arete.store import workspaces
 from tests import parallel, support
@@ -443,6 +444,7 @@ class QueueScoringTests(unittest.TestCase):
         self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
         self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
         self.enterContext(mock.patch.object(tracker.LocalTracker, "todo", return_value=[]))
+        self.enterContext(mock.patch.object(specgraphs, "launch_blocker", return_value=""))
         return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
 
     def test_waits_on_ignores_oversized_reference(self):
@@ -1868,7 +1870,9 @@ class RestoredPRRevisionTests(unittest.TestCase):
             labels.difference_update(remove)
             labels.update(add)
 
+        api = support.parentless_github_issue(repo.github, self.run.tid, issue)
         self.enterContext(mock.patch.multiple(gh, issue=issue, issue_labels=edit_labels, issue_comment=mock.DEFAULT,
+                                              gh_json=mock.Mock(side_effect=api),
                                               find_issue_comment_marker=mock.Mock(return_value=""),
                                               ensure_label=mock.Mock(return_value=""),
                                               issues=lambda r, label, **kw: [issue(r, 7)] if label in labels else []))

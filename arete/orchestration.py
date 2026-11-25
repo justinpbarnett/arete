@@ -33,6 +33,7 @@ from . import (
     runlimits,
     slots,
     spec_delivery,
+    spec_graph,
     tracker,
     util,
     verification_attempts,
@@ -43,6 +44,7 @@ from . import (
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, WORKER_PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
+from .store import db
 from .store import insights as insights_store
 from .store import orchestration as ledger
 from .store import specs as spec_store
@@ -2219,6 +2221,28 @@ class Controller(worker_turns.WorkerTurns):
             raise refusal
         return refusal
 
+    def spec_intake(self):
+        try:
+            found = spec_graph.intake(self.job, self.data.get("spec_direct"))
+        except spec_graph.Pending as error:
+            summary = f"Spec intake awaiting tracker reconciliation: {error}"
+            self.run.log(summary)
+            return "interrupted", summary, ""
+        except (db.IncompatibleSchema, *spec_graph.READ_ERRORS) as error:
+            raise workspace.RunFailed(f"Spec intake held: {error}") from error
+        if not found:
+            return None
+        if found["mode"] == "direct":
+            self.data["spec_direct"] = found["input"]
+            self.persist()
+            return None
+        if found["preview"]:
+            return "dry-run", "Reviewed the spec breakdown without publishing it", ""
+        refs = ", ".join(tid if "#" in tid else self.run.tracker.ref(tid) for tid in found["children"])
+        summary = f"Published or adopted the native spec graph: {refs}"
+        self.run.leave("running")
+        return "done", summary, ""
+
     def drive(self):
         verification_passed = False
         park_reason = None
@@ -2267,6 +2291,10 @@ class Controller(worker_turns.WorkerTurns):
                             return "failed", f"{wid} ended its standalone attempt {phase}; resume the controller", ""
                     return ("step" if result["state"] == "succeeded" else "failed",
                             f"{rerun['id']} {result['state']}; dependent evidence must be refreshed", "")
+            if not (self.run.alone or self.run.action or self.run.repairs or self.run.environment_release
+                    or self.run.feedback or self.run.recovery or ledger.actions(self.lease)):
+                if ended := self.spec_intake():
+                    return ended
             while not self.ending:
                 self.collect()
                 pending = [a for a in ledger.actions(self.lease) if a["state"] == "accepted"]

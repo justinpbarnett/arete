@@ -84,6 +84,8 @@ class Ticket:
     github_blockers: list[int | str] = field(default_factory=list)
     spec_identity: str = ""
 
+    owner_comments: str | None = None
+
     @property
     def is_spec(self) -> bool:
         return SPEC_LABEL in self.labels
@@ -334,7 +336,7 @@ class GitHubTracker:
         ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
                          open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
                          updated=i.get("updatedAt") or "", blocker=blocker,
-                         spec_identity=github_issue_identity(self.repo.github, i["number"]))
+                         owner_comments=human_comments(comments), spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -505,7 +507,7 @@ class JiraTracker:
                       open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
-                      labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
+                      labels=labels, blocker=blocker, images=images, owner_comments=human_comments(comments), spec_identity=spec_identity)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         out = SavedImages()
@@ -671,10 +673,7 @@ def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_ope
                   and route_label(r) in ticket.labels]
         if routed != [tk.repo.name]:
             return "the Jira spec must route to exactly one configured pipeline checkout"
-        children = tk.client.search(f'parent = "{tk.normalize(ticket.id)}"', ["summary"], limit=1)
-    else:
-        children = gh.api_list(f"repos/{tk.repo.github}/issues/{int(ticket.id)}/sub_issues")
-    return "the bootstrap spec lane does not run specs with child tickets" if children else ""
+    return ""
 
 
 def item_state(tk: Tracker, t: Ticket) -> str:
@@ -794,6 +793,10 @@ def answered(comments: list[tuple[datetime, str]]) -> bool:
     asked = [when for when, body in comments if from_arete(body)]
     replies = [when for when, body in comments if not from_arete(body)]
     return bool(asked and replies) and max(replies) > max(asked)
+
+
+def human_comments(comments: list[tuple[str, str, str]]) -> str:
+    return comments_text([row for row in comments if not from_arete(row[2])])
 
 
 def comments_text(comments: list[tuple[str, str, str]]) -> str:
