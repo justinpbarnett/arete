@@ -71,6 +71,7 @@ from .store import asks as asks_store
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import specs as spec_store
 from .store import triage as triage_store
 from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
@@ -530,6 +531,8 @@ class Run(AgentRun):
     preview_of: str = ""
     recovery: dict = field(default_factory=dict)
     code_review: bool = False
+    spec_root: str = ""
+    spec_identity: str = ""
 
     @property
     def closed_checkout_paths(self) -> set[Path]:
@@ -709,7 +712,10 @@ class Run(AgentRun):
         others = [s for s in self.tracker.states if s != status]
         labeled = self.tracker.label(self.tid, add=[status], remove=others)
         record.note(self.id, label_pending=status if labeled else "")
-        moved = self.tracker.move(self.tid, status)
+        guarded_jira = isinstance(self.tracker, tracker.JiraTracker) and (
+            self.spec_root or spec_store.find(self.repo.name, str(self.tid)))
+        moved = (self.tracker.move(self.tid, status, keep_open=True) if guarded_jira
+                 else self.tracker.move(self.tid, status))
         for err in (labeled, moved):
             if err:
                 self.log(f"tracker: {util.first_line(err, 300)}")
@@ -1580,10 +1586,14 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
     return wanted(repo)
 
 
-def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
+def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False, *,
+                spec: bool = False) -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    mode = dispatch_path(cfg.repo(repo_name), str(tid))
+    repo = cfg.repo(repo_name)
+    if not tracker.is_task_id(tid) and (spec or spec_store.find(repo.name, str(tid))):
+        return script_command(cfg, "orchestrate", repo.name, str(tid), *flags)
+    mode = dispatch_path(repo, str(tid))
     if (asked := answered_run(repo_name, str(tid))) and not dry_run:
         mode = recorded_path(asked["id"])
         if mode != "classic":
@@ -1846,7 +1856,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     cfg = config.load()
     repo = cfg.repo(repo_name)
     from . import flows, launch_lease, pilot, unblock, zte
-    from .store import db
+    from .store import db, orchestration
     from .store import zte as zte_store
 
     adw, refusal = run_refusal(repo, script is not None)
@@ -1880,6 +1890,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 0
         retry_of = {}
         fixed_gaps = ()
+        spec_ticket = None
+        spec_claim, spec_previous, spec_identity = {}, "", ""
+        jira_at_capacity, jira_slots = False, None
         preview_of = run_store.held_environment_branch(repo.name, str(tid)) if dry_run else ""
         if preview_of and script and script.continues:
             print(f"{name}: run the dry run without --continue to preview the held draft in its own workspace")
@@ -1926,22 +1939,66 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 wall_deadline = permit["deadline"]
             issue_state = None
             if isinstance(tk, tracker.GitHubTracker):
+                spec_identity = tracker.github_issue_identity(repo.github, tid)
                 issue = gh.issue(repo.github, int(tid)) or {}
                 labels = issue.get("labels")
                 if any(label["name"] == tracker.ZTE_LABEL for label in labels or ()):
                     raise tracker.TaskError(tracker.ZTE_QUEUE)
                 if labels is not None:
                     issue_state = issue.get("state")
+                if any(label["name"] == tracker.SPEC_LABEL for label in labels or ()):
+                    spec_ticket = tk.get(tid, issue=issue)
+            elif isinstance(tk, tracker.JiraTracker):
+                if not dry_run and (jira_slots := slots.slots_free_to_start(cfg.max_parallel)) <= 0:
+                    known = spec_store.find(repo.name, tid)
+                    previous = orchestration.find(known["root"]).get("current_run", "") if known else ""
+                    due_from = previous or (script.continues if script else "")
+                    due = asks_store.asks_due([due_from]) if due_from and not only else []
+                    jira_at_capacity = not due or zte_store.activation_pending()
+                if not jira_at_capacity:
+                    client = tk.client
+                    issue = client.issue(tid, ["labels"])
+                    spec_identity = tracker.jira_issue_identity(getattr(client, "base", ""), issue.get("id"))
+                    if tracker.SPEC_LABEL in ((issue.get("fields") or {}).get("labels") or []):
+                        spec_ticket = tk.get(tid)
+            if not jira_at_capacity and not isinstance(tk, tracker.LocalTracker):
+                spec_claim = spec_store.find(repo.name, tid, identity=spec_identity)
+            if spec_ticket or spec_claim:
+                if not spec_ticket:
+                    raise tracker.TaskError("the spec's publication label was removed")
+                if why := tracker.spec_blocker(cfg, tk, spec_ticket):
+                    raise tracker.TaskError(why)
+                if spec_ticket.spec_identity != spec_identity:
+                    raise tracker.TaskError("the spec tracker identity changed during admission")
+                if not script or script.path != "orchestrate" or any(
+                        (dry_run, only, script.again, script.repairs, script.environment_release, closed_context)):
+                    raise tracker.TaskError("a spec must run through its whole-ticket orchestrator")
+                if spec_claim:
+                    if (spec_claim["repo"], spec_claim["issue"], spec_claim["identity"]) != (
+                            repo.name, tid, spec_ticket.spec_identity):
+                        raise tracker.TaskError("this spec's delivery lineage is already bound to another checkout or key")
+                    spec_previous = orchestration.find(spec_claim["root"]).get("current_run", "")
+                    if spec_claim["state"] in ("evidenced", "complete"):
+                        raise tracker.TaskError("this spec already has delivery evidence")
+                    if script.continues and script.continues not in (spec_claim["run"], spec_previous):
+                        raise tracker.TaskError("continue must name this spec's current delivery lineage")
+                elif script.continues or run_store.newest_live_whole_run(repo.name, tid):
+                    raise tracker.TaskError("a spec cannot adopt the ordinary builder's history")
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             latest = budget_history[0] if budget_history else None
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
             feedback = pending_feedback(repo.name, tid) if may_revise else []
+            if spec_claim.get("state") == "published" and not insights_store.has_new_feedback(feedback):
+                raise tracker.TaskError("this spec is already awaiting delivery evidence")
+            if spec_claim and (previous_run := run_store.run_get(spec_claim["run"])):
+                if previous_run["status"] == "needs-info" and asks_store.asks_of(previous_run["id"], "open"):
+                    raise tracker.TaskError("the spec is still waiting for an owner answer")
             feedback_readmits = (not dry_run and script and script.path == "orchestrate"
                                  and insights_store.has_fresh_feedback(feedback))
-            recovery, recovery_case = unblock.child_grant(cfg, repo, tk, str(tid), force=force, script=script,
-                                                           dry_run=dry_run)
+            recovery, recovery_case = ({}, {}) if spec_ticket else unblock.child_grant(
+                cfg, repo, tk, str(tid), force=force, script=script, dry_run=dry_run)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
             if recovery or (feedback_readmits and not (force or readmission)):
                 budget_admission = runlimits.Admission()
@@ -1972,12 +2029,20 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
+        if jira_at_capacity:
+            if recovery and jira_slots == 0:
+                print(f"{name}: recovery is waiting for a run slot")
+                return SLOT_QUEUE_FAILED_EXIT
+            print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. "
+                  f"Wait for a run to finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+            return 1
         with ExitStack() as slot_admission:
             if not slot_admission.enter_context(slots.admitting(wait=zte_grant is None)):
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
-            due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
+            due_from = spec_previous or (script.continues if script else "")
+            due = asks_store.asks_due([due_from]) if due_from and not only else []
             if recovery and slots.slots_free_to_start(cfg.max_parallel) == 0:
                 print(f"{name}: recovery is waiting for a run slot")
                 return SLOT_QUEUE_FAILED_EXIT
@@ -2077,6 +2142,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     print(f"{name}: {error}")
                     return 2
+            elif spec_ticket:
+                try:
+                    run_id = spec_store.bind(spec_ticket.spec_identity, repo.name, tid, spec_claim.get("run", ""), start)
+                    launch_lease.registered(repo.name, str(tid))
+                except (orchestration.Conflict, db.IncompatibleSchema) as error:
+                    slot.free()
+                    print(f"{name}: {error}")
+                    return 2
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -2089,6 +2162,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
                       recovery=recovery.get("grant", {}),
+                      spec_root=(spec_claim.get("root") or run_id) if spec_ticket else "",
+                      spec_identity=spec_ticket.spec_identity if spec_ticket else "",
                 **(script.run_fields if script else {}))
             if run.recovery:
                 run_lines.write(run.id, "recovery", grant=recovery["id"], source=recovery_case["source"],
@@ -2141,7 +2216,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if zte_grant:
                     check_handoff()
                 flow = (flows.start(cfg, run, (earlier or {}) if not revising_over_repair else {},
-                                    slot, script.continues, script.only, script.again) if script else None)
+                                    slot, spec_previous if spec_ticket else script.continues,
+                                    script.only, script.again) if script else None)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             if not zte_grant:
                 raise
@@ -2201,7 +2277,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = recovery_case["source"] if recovery else parent_run(script, earlier, budget_history)
-            if restarting and not (dry_run or only or run.recovery or zte_grant):
+            if restarting and not (dry_run or only or run.recovery or zte_grant or spec_ticket):
                 run.recovery = unblock.inherited(earlier, lambda: runlimits.specification(tk.get(tid)))
             allow_reset = not (dry_run or retry_of or run.recovery)
             previous = "" if allow_reset and budget_admission.reset_time else parent
@@ -2215,7 +2291,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 answered_runs = tuple(a["run"] for a in run.answers_due if not owner_asks.supervisor_answered([a]))
                 if run.answering and not run.recovery and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
-            issue_goal = (not dry_run and not run.alone and not run.closed_context
+            issue_goal = (not dry_run and not run.alone and not run.closed_context and not spec_ticket
                           and unblock.active(cfg, repo.name, str(tid)) and not unblock.exclude(repo.name, str(tid)))
             if issue_goal:
                 from . import issue_goal as goal_store
@@ -2483,7 +2559,7 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     from . import unblock
 
     shared_runner = bool(asked) and all(a.get("call") == owner_asks.CHECK_RUNNER_CALL for a in asked)
-    recover = (not shared_runner and not run.dry_run and not run.alone
+    recover = (not shared_runner and not run.dry_run and not run.alone and not run.spec_root
                and unblock.active(run.config, run.repo.name, str(run.tid))
                and not unblock.exclude(run.repo.name, str(run.tid)))
     if recover and not asked:
@@ -2599,6 +2675,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
+    if t.is_spec:
+        return "skipped", "a spec must run through its whole-ticket orchestrator", ""
     run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
     if run.answering:
         run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
@@ -3340,7 +3418,10 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[work
 
 def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> tuple[str, str]:
     wanted = run.tracker.pr_link(t, whole=not left)
-    had, text = gh.split_link(body, (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)))
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    if t.is_spec and isinstance(run.tracker, tracker.GitHubTracker):
+        links += (f"Closes #{t.id}",)
+    had, text = gh.split_link(body, links)
     if had and had != wanted:
         run.log(f"{pr} now links the ticket with: {wanted}")
     left_synced = with_left_section(text, left)
@@ -5150,7 +5231,8 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
-              alone=bool(row.get("only_step")), dry_run=bool(row.get("dry_run")))
+              alone=bool(row.get("only_step")), dry_run=bool(row.get("dry_run")),
+              spec_root=spec_store.find(repo.name, str(row["issue"])).get("root", ""))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] != "stopped":
         run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")
@@ -5184,8 +5266,8 @@ def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: in
     return slots.no_free_slot(cfg.max_parallel) if free_slots <= 0 else ""
 
 
-def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
-    return control.launch(run_command(repo_name, tid, force), RUNS_LOG)
+def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False) -> subprocess.Popen:
+    return control.launch(run_command(repo_name, tid, force, **({"spec": True} if spec else {})), RUNS_LOG)
 
 
 def run_skipped(name: str) -> dict:

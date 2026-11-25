@@ -265,7 +265,7 @@ class Client:
         if ops:
             self.request("PUT", f"/rest/api/2/issue/{_path_segment(key)}", body={"update": {"labels": ops}})
 
-    def move(self, key: str, target: str) -> bool:
+    def move(self, key: str, target: str, *, category: str = "") -> bool:
         try:
             status_exists = target.lower() in {s.lower() for s in self.statuses(key.rsplit("-", 1)[0])}
         except JiraError:
@@ -277,6 +277,10 @@ class Client:
             pick = next((t for t in found if t.get("name", "").lower() == want), None)
         if pick is None:
             return False
+        if category:
+            destination = ((pick.get("to") or {}).get("statusCategory") or {}).get("key")
+            if not destination or (destination == "done") != (category == "done"):
+                return False
         try:
             self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": pick["id"]}})
         except JiraUnsure as e:

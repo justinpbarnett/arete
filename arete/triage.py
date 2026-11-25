@@ -37,7 +37,7 @@ from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
-SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
+SKIP_LABELS = {tracker.LABEL, tracker.SPEC_LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
 HOLD_LABELS = {"no-agent", "agent:hold"}
 AUTO_SKIP_LABELS = {*HOLD_LABELS, "duplicate", "invalid", "wontfix",
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
@@ -185,7 +185,7 @@ class JiraSource(Source):
         out = []
         for i in client.search(f"{mine} ORDER BY updated DESC", SEARCH_FIELDS, limit=PER_SOURCE):
             f = i.get("fields") or {}
-            if tracker.LABEL not in (f.get("labels") or []):
+            if not {tracker.LABEL, tracker.SPEC_LABEL}.intersection(f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
                                      f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or "",
                                      on_hold=not HOLD_LABELS.isdisjoint(f.get("labels") or [])))
@@ -199,6 +199,8 @@ class JiraSource(Source):
     def ticket(self, c: Candidate) -> TicketText:
         client = self.client
         f = client.issue(c.id, JIRA_FIELDS).get("fields") or {}
+        if tracker.SPEC_LABEL in (f.get("labels") or []):
+            raise tracker.TaskError("specs require explicit tracker approval")
         facts = [f"Type: {(f.get('issuetype') or {}).get('name', '')}",
                  f"Status: {(f.get('status') or {}).get('name', '')}",
                  f"Labels: {', '.join(f.get('labels') or []) or 'none'}"]
@@ -280,6 +282,8 @@ class GitHubSource(Source):
         labels = tuple(lb["name"] for lb in issue.get("labels", []))
         if tracker.ZTE_LABEL in labels:
             raise tracker.TaskError(tracker.ZTE_QUEUE)
+        if tracker.SPEC_LABEL in labels:
+            raise tracker.TaskError("specs require explicit tracker approval")
         comments = [(tk.owner, cm.get("createdAt", ""), cm.get("body", ""))
                     for cm in issue.get("comments", []) if tk.by_owner(cm)]
         return TicketText(f"Labels: {', '.join(labels) or 'none'}", (issue.get("body") or "").strip(),

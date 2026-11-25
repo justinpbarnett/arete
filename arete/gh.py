@@ -576,7 +576,8 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName"]
+    args = ["pr", "view", str(url_or_number), "--json",
+            "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName,headRefOid,baseRefName"]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}

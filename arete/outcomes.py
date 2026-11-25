@@ -23,6 +23,7 @@ from . import (
 )
 from .store import insights as insights_store
 from .store import runs as run_store
+from .store import specs as spec_store
 from .util import git
 
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
@@ -179,7 +180,10 @@ def sync_moves(cfg: config.Config) -> None:
         if not isinstance(tk, tracker.JiraTracker):
             continue
         try:
-            m = tk.shift(str(r["issue"]), target, keep_done=True)
+            claim = spec_store.find(*key)
+            if claim.get("state") in ("evidenced", "complete"):
+                continue
+            m = tk.shift(key[1], target, keep_done=True, **({"keep_open": True} if claim else {}))
         except jira.JiraError as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not move it to {target}, trying next poll: "
                   f"{util.first_line(str(e), 300)}")
@@ -222,7 +226,11 @@ def sync_landings(cfg: config.Config) -> None:
                 continue
             target = cfg.jira.landed[reached]
             tk = tracker.for_repo(cfg, repo)
-            err = tk.move_to(str(r["issue"]), target)
+            claim = spec_store.find(repo.name, str(r["issue"]))
+            if claim and (reached == branches[-1] or claim["state"] in ("evidenced", "complete")):
+                continue
+            err = (tk.shift(str(r["issue"]), target, keep_done=True, keep_open=True).error if claim
+                   else tk.move_to(str(r["issue"]), target))
             if reached != branches[-1]:
                 run = pipeline.Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]), writes_lines=False)
                 moved = "" if err else f" and moved to {target}"
