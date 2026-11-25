@@ -898,7 +898,9 @@ class Controller(worker_turns.WorkerTurns):
         return ledger.digest(trees) if trees else ""
 
     def stamp(self, gate, result):
-        spec_graph_delivery.require_active_child(self.run, self.job.ticket)
+        run = getattr(self, "run", None)
+        ticket = getattr(getattr(self, "job", None), "ticket", None)
+        spec_graph_delivery.require_active_child(run, ticket)
         checked_trees = result.get("checked", {}).get("trees") if gate == "checks" else None
         tree = ledger.digest(checked_trees) if checked_trees else self.fingerprint()
         if not tree:
@@ -1580,7 +1582,8 @@ class Controller(worker_turns.WorkerTurns):
                         self.run.launch_done(worker.step, bool(message.get("ok")))
                     self.run.cost += message.get("cost_usd", 0)
                     self.run.paid += message.get("paid_usd", 0)
-                    if reason := spec_graph_delivery.active_child_blocker(self.run, self.job.ticket):
+                    ticket = getattr(getattr(self, "job", None), "ticket", None)
+                    if reason := spec_graph_delivery.active_child_blocker(self.run, ticket):
                         if self.exchanged:
                             exchange.cancel(self.lease, worker.logical_id, key, reason)
                         else:
