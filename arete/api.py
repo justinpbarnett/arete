@@ -215,6 +215,9 @@ def execute(name, values, handler=None):
 
 
 def read(name, values, handler):
+    if name == "factory.get":
+        from .store import factory
+        return {"factory": factory.view()}
     if name == "cohort.get":
         from . import cohorts
 
@@ -344,6 +347,8 @@ def dispatch(handler, op, path_values, query):
     except secretstore.StoreMissing:
         raise credential_http.problem("secret_store_missing") from None
     except refusals.Refusal as error:
+        if getattr(error, "code", None) == "factory_off":
+            raise contract.Problem("conflict", str(error)) from error
         if not getattr(error, "code", None) and error.status in (400, 404):
             raise contract.Problem("not_found" if error.status == 404 else "invalid_input", str(error)) from error
         raise
@@ -363,7 +368,10 @@ def command(handler, op, values, path_values, *, claim=None):
 def mutation(name, values, handler):
     from . import dashboard
 
-    if name in ("secret.remove", "secret.check"):
+    if name == "factory.set":
+        from . import factory_control
+        result = {"factory": factory_control.request(values["enabled"], values["base_version"])}
+    elif name in ("secret.remove", "secret.check"):
         scope, secret = values["scope"], values["name"]
         change = secretstore.remove if name == "secret.remove" else secretstore.check
         result = secret_result(scope, secret, change(scope, secret, principals.current()))

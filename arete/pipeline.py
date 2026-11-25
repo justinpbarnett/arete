@@ -609,6 +609,31 @@ class Run(AgentRun):
         return owner_asks.GUIDE if self.asks_owner else owner_asks.NOBODY
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        if self.path == "classic" or not self.path:
+            if step in ("plan", "build", "revise") and self.workspace:
+                return self.classic_factory_step(step, text, cwd, role, kw)
+        return self.agent_with_answers(step, text, cwd, role, **kw)
+
+    def classic_factory_step(self, step, text, cwd, role, kw):
+        from .store import factory as factory_state
+
+        request = hashlib.sha256(text.replace(str(self.dir), "{run}").encode()).hexdigest()
+        parent = factory_state.previous_run(self.id) if os.getenv(factory_state.CONTINUATION) else None
+        if parent:
+            trees = [factory.fingerprint(checkout.wt) for checkout in self.workspace[1]]
+            point = util.read_json(paths.RUNS_DIR / parent / f"factory-{step}.json", {})
+            if point.get("request") == request and (step == "plan" or trees and all(trees) and point.get("trees") == trees):
+                self.save(f"factory-{step}.json", point)
+                self.log(f"{step}: continued from {parent}")
+                return Result(ok=True, text=point["text"], structured=point["structured"])
+        result = self.agent_with_answers(step, text, cwd, role, **kw)
+        if result.ok:
+            self.save(f"factory-{step}.json", {"request": request, "trees": [
+                factory.fingerprint(checkout.wt) for checkout in self.workspace[1]], "text": result.text,
+                "structured": result.structured})
+        return result
+
+    def agent_with_answers(self, step, text, cwd, role, **kw):
         if kw.get("read_only"):
             return super().agent(step, text, cwd, role, **kw)
         if self.recovery.get("direction") and role in ("plan", "build", "check_repair", "review_repair", "ci_repair"):
@@ -1656,6 +1681,7 @@ class Script:
     action: str = ""
     action_only: bool = False
     environment_release: str = ""
+    settings_args: tuple[str, ...] = ()
 
     @property
     def run_fields(self) -> dict:
@@ -1994,6 +2020,9 @@ def crash_failure(error: Exception) -> dict:
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None, admission: Callable | None = None,
               launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     try:
         producer_baseline = scratch.process_ids()
     except OSError:
@@ -2023,7 +2052,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 1
     if not script:
         recovery_child = launch_lease.recovery(repo.name, str(tid))
-        adw = not recovery_child and dispatch_path(repo, str(tid)) != "classic"
+        parent = os.getenv(factory_state.CONTINUATION)
+        continuing_classic = parent and recorded_path(parent) == "classic"
+        adw = not (recovery_child or continuing_classic) and dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -2352,7 +2383,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             try:
                 with handoff_io():
                     run.dir.mkdir(parents=True, exist_ok=True)
-                    run_lines.write(run.id, "execution", path=run.path or "classic",
+                    run_lines.write(run.id, "execution", path=run.path or "classic", from_poll=poll_launch,
+                                    **({"continues": script.continues, "settings": script.settings_args} if script and only else {}),
                                     **({} if run.path == "orchestrate" else {"protocol": 0}),
                                     **({"environment_release": run.environment_release} if run.environment_release else {}))
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
@@ -3099,6 +3131,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
     workspace.require_target_branch(repo, checkouts, work_branch=branch)
+    run.save("factory-publishing.json", {"branch": branch, "run": run.id})
     b.push(branch, message)
     opened: list[workspace.Checkout] = []
     for c in staged.changed:

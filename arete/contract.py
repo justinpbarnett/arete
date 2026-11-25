@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 8
+MINOR = 9
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -44,6 +44,9 @@ RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
 RUN["properties"]["version"] = INTEGER
+FACTORY_STATE = obj({"enabled": BOOLEAN, "phase": STRING, "version": INTEGER, "actor": STRING, "changed": STRING,
+                     "unconfirmed": INTEGER, "paused": INTEGER, "targets": array(obj(dict.fromkeys(
+                         ("id", "phase", "reason", "successor"), STRING)))})
 NULL_TEXT = {"type": ["string", "null"]}
 LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
             "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
@@ -106,6 +109,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("method_not_allowed", 405, "The route does not accept this method."),
     ("conflict", 409, "The request conflicts with current state."),
     ("invalid_state", 409, "The task cannot be closed from its current state."),
+    ("factory_off", 409, "The factory has stopped admitting work."),
+    ("factory_version_conflict", 409, "Read the current factory setting before retrying."),
     ("task_version_conflict", 409, "The task was updated since the requested base version."),
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
@@ -140,7 +145,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
-    optional_errors = {"invalid_state", "task_version_conflict", "secret_store_missing", "secret_internal"}
+    optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict", "secret_store_missing", "secret_internal"}
     if noun not in ("token", "pairing", "principal", "secret") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
@@ -165,7 +170,7 @@ def sample(schema):
 for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
-                "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
+                "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
@@ -219,6 +224,10 @@ COHORT_REPORT = obj({"cohort": mapping(JSON), "observed": STRING, "arrivals": IN
                     ["cohort", "observed", "arrivals", "goals", "outcomes", "members", "intake_complete"],
                     additional=JSON)
 OPERATIONS = [operation("meta.get", "meta", META),
+              operation("factory.get", "factory/state", envelope({"factory": FACTORY_STATE})),
+              operation("factory.set", "factory/state", envelope({"factory": FACTORY_STATE}),
+                        obj({"enabled": BOOLEAN, "base_version": {**INTEGER, "minimum": 1}}),
+                        {"enabled": True, "base_version": 1}, "POST", errors=("factory_version_conflict",)),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
               operation("cohort.get", "cohorts/{name}", envelope({"report": COHORT_REPORT}),

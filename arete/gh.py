@@ -71,6 +71,9 @@ def unscreened_text(args: list[str], input: str | None) -> bool:
 
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False,
        *, retry: bool = True) -> str:
+    from .store import factory
+
+    factory.check_worker()
     if unscreened_text(args, input):
         raise TypeError("text sent to GitHub must come from gh.outgoing")
     if retry:

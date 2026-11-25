@@ -1424,14 +1424,22 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
             if not inside_serve:
                 raise
             time.sleep(RESTART_RETRY_SECONDS)
-    chat.recover()
-    if inside_serve:
+    from . import factory_control
+    from .store import factory
+
+    installed = factory.available()
+    if installed:
+        factory_control.notify()
+    accepting = not installed or factory.view()["phase"] == "on"
+    if accepting:
+        chat.recover()
+    if accepting and inside_serve:
         capture.recover()
-    else:
+    elif accepting:
         from . import serve
 
         with util.lock(serve.SERVE_LOCK) as free:
-            if free:
+            if free and (not installed or factory.view()["phase"] == "on"):
                 capture.recover()
     with util.repeating(60, maintain_credentials, "credential-maintenance"):
         tailnet.serve(handlers(), cfg, port, inside_serve, host)

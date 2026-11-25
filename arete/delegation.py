@@ -66,8 +66,10 @@ class Worker:
         try:
             with log.open("ab") as output:
                 # The trusted SDK broker applies the runner's sandbox; nesting it prevents native startup on macOS.
-                self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=output,
-                                             pass_fds=(peer.fileno(),), start_new_session=True)
+                from . import factory_control
+                self.factory_key, self.proc = factory_control.spawn(
+                    subprocess.Popen, command, stdin=subprocess.PIPE, stdout=output, stderr=output,
+                    pass_fds=(peer.fileno(),), start_new_session=True)
             self.proc.stdin.write(json.dumps(request).encode())
             self.proc.stdin.close()
             self.pid = self.proc.pid
@@ -126,6 +128,8 @@ class Worker:
         util.stop_group(self.proc)
         if util.group_alive(self.proc):
             raise RuntimeError("worker producer group did not become quiescent")
+        from .store import factory
+        factory.forget(self.factory_key)
 
 
 def reports_progress(event: dict) -> bool:

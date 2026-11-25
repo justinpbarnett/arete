@@ -41,6 +41,8 @@
 <script src="/loaders.js" defer></script>
 <script src="/start.js" defer></script>
 <script type="module" src="/browser-auth.js"></script>
+<link rel="stylesheet" href="/factory-switch.css">
+<script type="module" src="/factory-switch.js"></script>
 </head>
 <body>
 <button type="button" class="skip" id="skip">Skip to the content</button>
@@ -49,6 +51,7 @@
 <p id="waiting-result" class="said" aria-live="polite" tabindex="-1" hidden></p>
 
 <nav class="side" aria-label="Views">
+  <factory-switch></factory-switch>
   <div class="group tools">
     <button type="button" id="find-open" aria-haspopup="dialog">Find</button>
     <button type="button" id="console-open" aria-expanded="false" aria-controls="console"><span>Console</span><span class="count" id="count-console"></span></button>

@@ -85,6 +85,9 @@ def repo_named(cfg: config.Config, name: str) -> config.Repo:
 
 def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "",
           force: bool = True, claim=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     prompt, ticket = prompt.strip(), ticket.strip()
     if not prompt and not ticket:
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
@@ -110,6 +113,9 @@ def begin_prompt(cfg, repo, tid):
 
 
 def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True, claim=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     try:
         tid = tracker.for_ticket(cfg, repo, ticket).normalize(ticket)
     except ValueError as e:
@@ -161,6 +167,9 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
 
 
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if pending := pending_start(repo.name, tid):
             return pending
@@ -236,6 +245,9 @@ def reap_pending() -> None:
 
 
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     global PENDING_REAPER
 
     try:
@@ -483,6 +495,9 @@ def stage_recovery_answers(group: list[dict], decision: dict, *, scrub) -> None:
 
 
 def answer_ask(ask_id: str, body) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         ask = ask_store.ask_get(ask_id)
         if not ask:
@@ -704,7 +719,45 @@ def release_closed(cfg: config.Config) -> list[str]:
     return notes
 
 
+def resume_factory_run(row):
+    """Respect single-step scope and the original workflow's continuation contract."""
+    key = row["id"]
+    if row.get("only_step"):
+        lines = run_lines.read(key)
+        execution = factory.first(lines, "execution")
+        source = execution.get("continues") or factory.first(lines, "route").get("continues")
+        if not source:
+            raise control.Refused("Cannot identify the source of this single-step run")
+        cfg, repo, _ = command_run(key, row["version"])
+        path = pipeline.recorded_path(source)
+        step = row["only_step"]
+        select = ["--action", step, "--only-action"] if path == "orchestrate" else ["--only", step]
+        settings = [f"--set={setting}" for setting in execution.get("settings", [])]
+        return launch(cfg, repo, str(row["issue"]), command_of(
+            cfg, path, repo.name, str(row["issue"]), "--continue", source, *select, *settings,
+            *(["--dry-run"] if row.get("dry_run") else [])), admission=(key, row["version"]))
+    path = pipeline.recorded_path(key)
+    if row.get("dry_run") and path != "classic":
+        cfg, repo, _ = command_run(key, row["version"])
+        return launch(cfg, repo, str(row["issue"]), command_of(
+            cfg, path, repo.name, str(row["issue"]), "--dry-run", "--continue", key), admission=(key, row["version"]))
+    if path == "classic":
+        with util.lock(STEER_LOCK, wait=True):
+            cfg, repo, row = command_run(key, row["version"])
+            no_later_run(row)
+            if row["status"] != "interrupted" or row.get("files_purged"):
+                raise control.Refused("The interrupted classic workspace is no longer available")
+            if (paths.RUNS_DIR / key / "factory-publishing.json").exists():
+                raise control.Refused("Inspect the interrupted classic publication before retrying")
+            return launch(cfg, repo, str(row["issue"]), control.command(
+                ["run", repo.name, str(row["issue"]), "--local", "--force", *(["--dry-run"] if row.get("dry_run") else [])]), admission=(key, row["version"]))
+    return resume(key, base_version=row["version"])
+
+
 def resume(run_id: str, step: str = "", base_version=None, *, environment_release: str = "") -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
@@ -772,6 +825,9 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
 
 
 def repair(run_id: str, base_version=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         tid = str(row["issue"])
@@ -815,6 +871,9 @@ def adaptive_action(row: dict, action: str) -> dict:
 
 
 def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row["status"] == "running":

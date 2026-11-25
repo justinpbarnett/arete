@@ -14,6 +14,7 @@ from typing import ClassVar
 from . import (
     alerts,
     config,
+    factory_control,
     gh,
     intake,
     jev,
@@ -556,6 +557,7 @@ def preview_refresh(cfg, srcs, read, old, todo):
           "fresh labels, issue versions and required screens still decide admission")
 
 
+@factory_control.work
 def refresh(cfg: config.Config, dry_run: bool) -> int:
     old = {r["ref"]: r for r in triage_store.triage_rows()}
     meta = util.read_json(META_FILE, {})
@@ -709,6 +711,7 @@ def answers_comment(pairs: list[tuple[str, str]]) -> str:
     return f"{prompt_loader.TRIAGE_ANSWERS}:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
 
 
+@factory_control.work
 def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str,
          *, publication=None) -> str:
     with util.lock(BOARD_LOCK, wait=True):
@@ -1206,6 +1209,7 @@ class BoardRefused(Exception):
     pass
 
 
+@factory_control.work
 def publish(cfg: config.Config, v: dict, meta: dict) -> str:
     repo = cfg.alert_repo
     if not repo:

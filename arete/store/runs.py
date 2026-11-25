@@ -557,7 +557,11 @@ def running_runs(conn):
 
 
 def insert_run(run_id: str, row: dict) -> None:
-    writes.insert("runs", row, run_id, "run.started")
+    from . import factory
+
+    with writes.atomic() as c:
+        writes.insert("runs", row, run_id, "run.started")
+        factory.registered_run(c, run_id, row)
 
 
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
@@ -593,7 +597,14 @@ def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
 def note(run_id: str, *, base_version=None, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run's status")
-    writes.update("runs", run_id, fields, base_version=base_version)
+    if fields.get("pid"):
+        from . import factory
+
+        with writes.atomic() as c:
+            writes.update("runs", run_id, fields, base_version=base_version)
+            factory.register(c, run_id, fields["pid"], "run")
+    else:
+        writes.update("runs", run_id, fields, base_version=base_version)
 
 
 def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
@@ -626,10 +637,13 @@ def ask_stop(run_id: str, base_version=None) -> dict | None:
 
 
 def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> dict | None:
-    with writes.atomic():
+    from . import factory
+
+    with writes.atomic() as c:
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        factory.finish_run(c, run_id)
         if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
             from . import insights
 

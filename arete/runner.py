@@ -21,6 +21,7 @@ from . import (
     context,
     devices,
     environment,
+    factory_control,
     guard,
     jev,
     jev_ask,
@@ -237,6 +238,7 @@ def admitted(kw: dict, limits: dict | None) -> dict:
                     for key, value in limits.items()}}
 
 
+@factory_control.work
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",

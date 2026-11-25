@@ -2625,6 +2625,23 @@ Read `/api/v1/meta` for the API version, contract hash, server revision, and old
 Read `/api/v1/contract` for the live registry or see the generated [OpenAPI document](docs/openapi.json) for this checkout.
 Legacy URLs keep their existing shapes and are tracked as deprecated aliases.
 
+#### Factory emergency stop
+
+The **Stop factory** button on the Floor and classic dashboard closes work admission for this Arete instance. Issue pickup, webhooks, launches and scheduled jobs pause. The dashboard and control API stay reachable. **Stopping** shows workers whose exit is still pending, including offline remote devices. **Affected work** lists their IDs and any reason a continuation needs attention.
+
+**Resume factory** reopens admission after outstanding stops are confirmed. An interrupted interactive session keeps its ID, conversation checkpoint, remaining budget and queued messages. Eligible ticket runs use their recorded workflow and retained workspace. A command or publication with uncertain external effects is held for inspection. Missed timer firings are skipped. Each loop and repository continues to honor its own saved settings, including edits made during the pause.
+
+Agents can read `GET /api/v1/factory/state` with the `read` scope. To request a change, use a credential with `factory:write`, the version from the read and a fresh idempotency key. Reuse that key and the same body when retrying a lost response.
+
+```sh
+curl -H "Authorization: Bearer $ARETE_TOKEN" "$ARETE_URL/api/v1/factory/state"
+curl -X POST -H "Authorization: Bearer $ARETE_TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $REQUEST_ID" -d '{"enabled":false,"base_version":1}' \
+  "$ARETE_URL/api/v1/factory/state"
+```
+
+Set `enabled` to `true` with the current version to resume. A stale version returns HTTP 409. A successful write records the requested state. Read `factory.phase` and `factory.unconfirmed` to follow actual stop progress.
+
 #### Checking API changes
 
 Run these steps from the checkout after `uv sync` and `git fetch origin main`:

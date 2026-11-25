@@ -134,7 +134,9 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
               recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> Pick | None:
-    excluded = excluded | oncall.parked(repo.name)
+    from .store import factory
+
+    excluded = excluded | oncall.parked(repo.name) | factory.held_tickets(repo.name)
 
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
@@ -564,6 +566,18 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 
 def poll(dry_run: bool = False) -> int:
+    from . import factory_control
+    from .store import factory
+
+    try:
+        with factory_control.activity("poll"):
+            return poll_admitted(dry_run)
+    except factory.Off as error:
+        print(str(error))
+        return 0
+
+
+def poll_admitted(dry_run: bool) -> int:
     if not dry_run:
         paths.ensure_dirs()
     cfg = config.load()
