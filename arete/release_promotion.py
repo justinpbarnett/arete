@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from urllib.parse import quote, urlencode
 
 from . import adf, config, gh, jira, release_proof as proof, serve_guard, tracker, util
@@ -117,12 +118,19 @@ def authority(cfg, repo, ticket, policy, revision):
 
 
 def note(tk, repo, ticket, state, state_file, policy, proof_row):
-    marker = "arete-qa-" + proof.digest([repo.name, ticket, state["revision"], state["scope"], state["policy"]])
-    found = (gh.find_issue_comment_marker(repo.github, int(ticket), marker) if isinstance(tk, tracker.GitHubTracker)
-             else tk.client.find_comment_marker(ticket, marker))
+    # Only a handoff actually sent by this service can anchor a tester's subsequent direction.
+    marker = state.setdefault("note_marker", "arete-qa-" + secrets.token_hex(16))
+    found = ""
+    if state.get("note_intent"):
+        actor = gh.me() if isinstance(tk, tracker.GitHubTracker) else tk.client.me().get("accountId", "")
+        proof.need(actor, "cannot confirm the staging handoff publisher")
+        for who, body, _, _, cid in comments(repo, ticket, tk):
+            if who == actor and marker in body.splitlines() and cid.isdigit():
+                found = (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
+                         else tk.client.comment_url(ticket, cid))
+                break
+        proof.need(found, "staging handoff awaiting tracker reconciliation")
     if not found:
-        if state.get("note_intent"):
-            raise proof.Held("staging handoff awaiting tracker reconciliation")
         state["note_intent"] = True
         serve_guard.write(state_file, state)
         body = gh.marked(f"Staging verified at {state['origin']} for {state['revision']}.\n\n"
@@ -141,7 +149,10 @@ def note(tk, repo, ticket, state, state_file, policy, proof_row):
             state.pop("note_intent")
             serve_guard.write(state_file, state)
             raise
-    proof.need(found, "the tracker did not identify its QA handoff")
+    prefix = (gh.issue_url(repo.github, ticket) + "#issuecomment-" if isinstance(tk, tracker.GitHubTracker)
+              else tk.client.browse_url(ticket) + "?focusedCommentId=")
+    proof.need(isinstance(found, str) and found.startswith(prefix) and found[len(prefix):].isdigit(),
+               "the tracker did not identify its QA handoff")
     state.update(phase="awaiting_qa", handoff=found, qa_since=util.iso())
     serve_guard.write(state_file, state)
 

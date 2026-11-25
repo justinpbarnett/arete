@@ -120,6 +120,20 @@ class StagingRelease(unittest.TestCase):
             self.assertEqual(promotion.observe_staging(self.repo, "12", self.new)["status"], "blocked")
         self.assertIsNone(proof.for_delivery("product", "12", self.new, "staging"))
 
+    def test_lost_handoff_confirmation_reconciles_only_the_service_publishers_comment(self):
+        def uncertain(*args, **kwargs):
+            self.handoff(*args, **kwargs)
+            raise gh.GhUnsure("unconfirmed comment")
+
+        with mock.patch.object(gh, "issue_comment", side_effect=uncertain), mock.patch.object(gh, "me", return_value="tester"):
+            self.assertEqual(self.advance()["phase"], "observing_staging")
+            original = self.notes.pop()
+            self.notes.append(("other", *original[1:]))
+            self.assertIn("reconciliation", self.advance()["waiting"])
+            self.notes.append(original)
+            self.assertEqual(self.advance()["phase"], "awaiting_qa")
+            self.assertEqual(len(self.notes), 2)
+
     def test_changed_scope_or_unapproved_parent_holds_production(self):
         self.assertEqual(self.advance()["phase"], "awaiting_qa")
         self.comment("tester", "Promote " + self.new + " to production", 26)

@@ -126,7 +126,7 @@ def validate(data):
                 need(isinstance(suffix, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", suffix)
                      and server_url(data["staging"]).hostname.endswith("." + suffix), "invalid preview hostname suffix")
             need(isinstance(data.get("qa"), list) and bool(data["qa"])
-                 and all(isinstance(s, str) and NAME.fullmatch(s) for s in data["qa"]),
+                 and all(isinstance(s, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", s) for s in data["qa"]),
                  "configure the authorized QA tracker accounts")
             need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
 
