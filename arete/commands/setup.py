@@ -290,7 +290,75 @@ def cmd_dashboard(args) -> int:
     return dashboard.serve(args.port)
 
 
+def choose_jira_project() -> str:
+    print("Jira project key for this repo (blank to cancel): ", end="", flush=True, file=sys.stderr)
+    return sys.stdin.readline().strip()
+
+
+def cmd_repo(args) -> int:
+    from .. import enrollment, gh, jira, outbound, ticket_publication
+
+    try:
+        if args.repo_action == "enroll":
+            repo = enrollment.enroll(args.name, args.path, target_branch=args.target_branch, landing=args.landing,
+                                     unattended_environment=args.unattended_environment, destination=args.tracker,
+                                     jira_project=args.jira_project, jira_label=args.jira_label, pipeline=args.pipeline,
+                                     choose_project=choose_jira_project if sys.stdin.isatty() else None)
+            cfg = config.load_required()
+        else:
+            cfg = config.load_required()
+            repo = cfg.repo(args.name)
+        if args.repo_action == "publish":
+            body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+            url = ticket_publication.plan(cfg, repo, args.kind, args.title, body, args.key,
+                                          parent=args.parent, source=args.source, draft=args.draft)
+            print(url)
+        else:
+            print(json.dumps(enrollment.show(cfg, repo), indent=None if args.json else 2))
+    except (OSError, ValueError, gh.GhError, jira.JiraError) as error:
+        print(f"arete repo {args.repo_action}: {outbound.sanitize(str(error), 300)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def repo_commands(sub) -> None:
+    group = sub.add_parser("repo", help="enroll a checkout and publish to its saved tracker")
+    actions = group.add_subparsers(dest="repo_action", required=True)
+    p = actions.add_parser("enroll", help="save tracker and delivery policy together in config.toml")
+    p.add_argument("name")
+    p.add_argument("path", type=Path, help="root of the Git checkout")
+    p.add_argument("--target-branch", required=True)
+    p.add_argument("--landing", choices=config.LANDING_METHODS, default="pr",
+                   help="pr forbids direct pushes; direct-push allows existing guarded push deliveries")
+    p.add_argument("--unattended-environment", choices=config.DEPLOYMENT_ENVIRONMENTS, default="none",
+                   help="deployment ceiling, not permission to deploy (default: none)")
+    p.add_argument("--tracker", choices=("github", "jira"), default="",
+                   help="override GitHub for personal repos or Jira for [jira] github_owner")
+    p.add_argument("--jira-project", default="", help="select Jira and use this existing project instead of [jira] project")
+    p.add_argument("--jira-label", default="", help="override the repo's Jira routing label")
+    p.add_argument("--pipeline", action="store_true", help="enable the repo's existing factory queue")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("show", help="read back tracker, branch, landing and deployment settings")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("publish", help="publish to the enrolled tracker; a published spec enters its enabled pipeline")
+    p.add_argument("name", help="enrolled destination repo name")
+    p.add_argument("kind", choices=("spec", "child", "follow-up"))
+    p.add_argument("--title", required=True)
+    p.add_argument("--body-file", required=True, help="Markdown file, or - for stdin")
+    p.add_argument("--key", required=True, help="stable request key; use the same key to reconcile a retry")
+    p.add_argument("--draft", action="store_true", help="file a spec without authorizing pickup")
+    p.add_argument("--parent", default="", help="child's parent in the same destination: GitHub number or Jira key")
+    p.add_argument("--source", default="", help="follow-up's source issue URL")
+    p.set_defaults(fn=cmd_repo)
+
+
 def register(sub) -> None:
+    repo_commands(sub)
     p = sub.add_parser("init", help="write the default global config")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)

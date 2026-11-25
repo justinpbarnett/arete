@@ -346,7 +346,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
         closed_at = gh.pr_view(branch, repo.github).get("closedAt") or ""
         if streak(repo.name, since=closed_at) < layer.automerge_after:
             return
-    base = layer.base_branch or gh.default_branch(repo.github)
+    base = repo.target_branch or layer.base_branch or gh.default_branch(repo.github)
     labels = ["arete-trust"] if repo.tracker == "github" else []
     wt = workspace.make_worktree(repo, base, branch, "trust")
     try:

@@ -79,7 +79,7 @@ class Home:
 
     @property
     def base(self) -> str:
-        return self.layer.base_branch or gh.default_branch(self.repo.github)
+        return self.repo.target_branch or self.layer.base_branch or gh.default_branch(self.repo.github)
 
 
 def home_of(src: triage.TriageSource, r: dict) -> Home | None:
