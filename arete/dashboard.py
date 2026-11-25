@@ -1263,6 +1263,10 @@ def post_run(handler, rest, query):
         result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
     else:
         raise NoRoute
+    if result.get("run") and result["run"] != run_id and action in ("answer", "repair", "resume"):
+        from . import cohorts
+
+        cohorts.owner_intervention(result, f"owner {action}")
     handler.write_receipt = event_store.committed_receipt(f"run:{run_id}")
     if result.get("run") and result["run"] != run_id:
         handler.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started")

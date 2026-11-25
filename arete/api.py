@@ -215,6 +215,15 @@ def execute(name, values, handler=None):
 
 
 def read(name, values, handler):
+    if name == "cohort.get":
+        from . import cohorts
+
+        if not cohorts.location().is_file():
+            raise contract.Problem("not_found", "No cohort has been declared")
+        try:
+            return {"report": cohorts.report(values["name"])}
+        except cohorts.UnknownCohort as error:
+            raise contract.Problem("not_found", str(error)) from error
     if name.startswith("secret."):
         return secret_read(name, values)
     if name == "account.list":

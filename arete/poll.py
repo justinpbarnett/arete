@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 
 from . import (
+    cohorts,
     config,
     environment_gaps,
     flows,
@@ -566,6 +567,7 @@ def poll(dry_run: bool = False) -> int:
             return 0
         errors: list[str] = []
         if not dry_run:
+            guard(errors, "capturing cohort arrivals", cohorts.sync)
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
             guard(errors, "syncing spec deliveries", lambda: spec_delivery.sync(cfg))

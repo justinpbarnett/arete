@@ -8,6 +8,26 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 A dark software factory repeatedly turns authorized goals for a defined class of work into working software at its agreed point of delivery, without requiring a person to implement, review, approve, or advance ordinary changes. It verifies the delivered behavior using acceptance checks the builder cannot waive or weaken. It recovers from routine failures on its own and, when it cannot safely proceed, stops the affected work and makes the reason visible.
 
+### Measure a delivery cohort
+
+Declare eligible work, its unattended destination, its arrival window and hours allowed for delivery before the first pickup. A scheduled batch accepts repeated `--ticket` flags and admits the whole batch at the opening time. For a continuous GitHub cohort, use `--label agent`. Each matching label application to a repository-owner-authored issue in the window qualifies, including issues that close before the next poll. An active hold remains visible as waiting work. The declaration is immutable. These commands run on the Arete host.
+
+```sh
+arete cohort declare november --repo arete --label agent --destination arete-serve \
+  --work-class 'Owner-authored issues receiving the agent label this week' --closes 2026-12-02T00:00:00Z --deadline-hours 48
+arete cohort sync
+arete cohort replacement november 71 83
+arete cohort note november 83 touch --evidence 'tracker-comment:142' --detail 'Owner resolved the ambiguous acceptance condition'
+arete cohort report november
+arete cohort candidates november
+```
+
+The scheduler catches up label events before picking work. A failed tracker read preserves the previous cursor. Reports show the cursor and whether intake covers the whole window. Repeated polls and re-added labels count one goal. The read-only CLI and authenticated `GET /api/v1/cohorts/{name}` report delivery, terminal failure, or a pending goal with age, reason and deadline. All successive attempts and their PRs share the goal. Link a replacement even when it already started independently. Capture any necessary hand merge or rescope using `note ... touch` and its source reference. A terminal abandonment uses `failed`. Use `pending` to record a subsequent readmission.
+
+A verified delivery requires a protected observation on a specific release at the declared destination. A consumed owner question, an authenticated manual intervention, or attested external work records a touch. On a delivery with a complete retrospective review of the ticket, PR and run history, `note ... audit` records positive evidence of absence of intervention through that delivery. Missing evidence stays unknown. A later `regression` observation on the goal or its successor preserves the prior delivery history. Keep the owner-state `cohorts.sqlite` alongside the instance state when backing it up or moving it.
+
+The `candidates` command selects failed goals, first interventions and escaped defects with their source references. Promote a corroborated case into the protected cases under `.github/workflows/cohort-regressions/`. The existing `arete-checks` job reads those cases from the base revision, reproduces their historical failures and corrections, and checks the candidate against the same observations. To repeat on a disposable worker, use `python .github/workflows/cohort-regressions/run.py --candidate . --calibrate`.
+
 ## Database transactions and the timing rollout
 
 Retain at least one full day of rollback-mode measurements before deploying this WAL release.
