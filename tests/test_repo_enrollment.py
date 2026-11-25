@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import adf, cli, config, emits, enrollment, gh, jira, loop_run, loops, paths, push, release_proof, serve, tracker, workspace
+from arete import adf, cli, config, emits, enrollment, gh, jira, loop_run, loops, paths, push, release_profile, release_proof, serve, serve_guard, spec_delivery, tracker, workspace
 from arete.commands import setup
 from arete.store import loops as loop_store
 from support import isolate_live_state
@@ -132,6 +132,120 @@ class EnrollAndPublish(unittest.TestCase):
         key = key or f"{self.id().split('.')[-1]}/{repo}/{kind}"
         return self.call("publish", repo, kind, "--title", f"A {kind}", "--body-file", self.body,
                          "--key", key, *options, status=status)
+
+    def test_future_github_release_grant_freezes_promises_and_preserves_historical_evidence(self):
+        profile_file, promise_file = self.root / "destinations.json", self.root / "smoke.json"
+        checks = {"app_id": 19, "required": ["Verify", "Deploy"], "allow_skipped": ["Worker"]}
+        profile = {"destination": "staging", "staging": "https://stage.example.com", "production": "https://example.com",
+                   "production_branch": "main", "identity_path": "/sha.json", "qa": ["publisher"],
+                   "immutable_host_suffix": "example.com", "checks": {"pr": checks, "staging": checks}}
+        profile_file.write_text(json.dumps(profile))
+        self.enroll("automatic", "me/automatic", "--unattended-environment", "staging", "--staging-profile", profile_file)
+        repo = config.load_required().repo("automatic")
+        assertions = [{"field": "/ready", "equals": True}]
+        promise = {"path": "/api/health", "instructions": "Read the live status.", "assertions": assertions, "recovery": assertions}
+        promise_file.write_text(json.dumps(promise))
+        release_proof.install(repo, "6", promise_file)
+        old_policy = release_proof.goal(repo.name, "6")
+        self.assertEqual(json.loads(self.call("standing-production", repo.name)[0]), {"active": False})
+        args = ("standing-production", repo.name, "--after-issue", "6", "--promise-file", promise_file)
+        active = json.loads(self.call(*args)[0])
+        self.assertTrue(active["active"])
+        self.assertEqual(json.loads(self.call(*args)[0]), active)
+        self.assertEqual(json.loads(self.call("show", repo.name)[0])["standing_production"], active)
+        for historical in ("6", "5", "07", "0", "TEAM-8"):
+            self.assertIsNone(release_profile.standing(repo, historical))
+        self.assertEqual(release_proof.goal(repo.name, "6"), old_policy)
+        self.assertEqual(release_proof.enrolled(repo.name), ["6"])
+        self.assertIsNone(release_proof.goal(repo.name, "7"))
+        release_profile.admit(repo, "7")
+        self.assertEqual(release_proof.enrolled(repo.name), ["6", "7"])
+        self.assertEqual(release_profile.standing(repo, "7")["id"], active["id"])
+        self.assertEqual(spec_delivery.protected_environment(repo.name, "7", ""), "production")
+        self.assertEqual(spec_delivery.protected_environment(repo.name, "7", "staging"), "staging")
+        explicit = {**promise, "path": "/specific"}
+        special = self.root / "explicit.json"
+        special.write_text(json.dumps(explicit))
+        release_proof.install(repo, "8", special)
+        release_profile.admit(repo, "8")
+        self.assertEqual(release_proof.goal(repo.name, "8")["path"], "/specific")
+        # Rotating the grant never changes old proof content or reauthorizes its frozen promise.
+        overridden = self.root / "checks.json"
+        overridden.write_text(json.dumps({**checks, "required": ["another check"]}))
+        frozen = release_proof.goal(repo.name, "7")
+        child_sha, integrated_sha = "1" * 40, "2" * 40
+        child_state = release_proof.state_dir(repo.name, "7")
+        observed = {"status": "verified", "revision": integrated_sha, "policy": release_proof.digest(frozen),
+                    "receipt_id": "test-child-production", "destination": "production"}
+        serve_guard.write(child_state / "promotion.json",
+                          {"phase": "production_verified", "policy": release_proof.digest(frozen), "graph_parent": "9",
+                           "staged_revision": child_sha, "revision": integrated_sha, "production_receipt": observed["receipt_id"]})
+        serve_guard.write(child_state / integrated_sha / "production" / "behavior" / "latest.json", observed)
+        self.assertEqual(release_proof.completion(repo.name, "7", child_sha), observed)
+        self.assertIsNone(release_proof.completion(repo.name, "7", "3" * 40))
+        rotated = json.loads(self.call(*args, "--production-checks", overridden)[0])
+        self.assertNotEqual(rotated["id"], active["id"])
+        release_profile.admit(repo, "7")
+        self.assertEqual(release_proof.goal(repo.name, "7"), frozen)
+        self.assertIsNone(release_profile.standing(repo, "7"))
+        self.assertEqual(release_profile.standing(repo, "8")["id"], rotated["id"])
+        self.assertEqual(json.loads(self.call("standing-production", repo.name, "--revoke")[0]), {"active": False})
+        self.assertEqual(release_proof.goal(repo.name, "7"), frozen)
+        self.assertIsNone(release_profile.standing(repo, "9"))
+        reactivated = json.loads(self.call(*args)[0])
+        self.assertNotEqual(reactivated["id"], active["id"])
+        self.assertIsNone(release_profile.standing(repo, "7"))
+        release_profile.admit(repo, "9")
+        self.assertEqual(release_profile.standing(repo, "9")["id"], reactivated["id"])
+        # Removing or changing repository authority cannot turn a stale explicit promise into the default.
+        changed = {**profile, "production": "https://alternate.example.com"}
+        profile_file.write_text(json.dumps(changed))
+        self.call("staging-profile", repo.name, "--policy-file", profile_file)
+        self.assertFalse(json.loads(self.call("standing-production", repo.name)[0])["active"])
+        self.assertIsNone(release_profile.standing(repo, "8"))
+        release_profile.admit(repo, "8")
+        self.assertIsNone(release_proof.goal(repo.name, "8"))
+
+    def test_confirmed_standing_closure_is_cached_and_a_reopened_admission_keeps_the_previous_proof(self):
+        repo = config.Repo("reopened", self.root, github="me/reopened", tracker="github")
+        tk = mock.MagicMock(spec=tracker.GitHubTracker)
+        item = tracker.Ticket("21", "#21", "reopened", labels=["agent"])
+        tk.get.return_value = item
+        sha = "9" * 40
+        data = {"destination": "staging"}
+        receipt = {"revision": sha, "receipt_id": "verified-release", "path": "/", "destination": "production",
+                   "at": "2026-11-25T11:00:00Z", "status": "verified"}
+        folder = release_proof.state_dir(repo.name, "21")
+        state = {"phase": "production_verified", "standing_authority": "grant", "production_receipt": receipt["receipt_id"],
+                 "policy": release_proof.digest(data), "revision": sha}
+        serve_guard.write(folder / "promotion.json", state)
+        serve_guard.write(folder / sha / "production" / "behavior" / "latest.json", receipt)
+        latest = {"id": "first-run", "started": "2026-11-25T10:00:00Z"}
+        self.enterContext(mock.patch.object(release_proof.run_store, "newest_live_whole_run", return_value=latest))
+        close = self.enterContext(mock.patch.object(gh, "issue_close", side_effect=gh.GhError("unavailable")))
+        with self.assertRaises(gh.GhError):
+            release_proof.finish_standing(repo, "21", tk, receipt)
+        marker = folder / "tracker-completion.json"
+        self.assertFalse(marker.exists())
+        close.side_effect = None
+        probe = self.enterContext(mock.patch.object(gh, "issue_state", return_value="OPEN"))
+        release_proof.finish_standing(repo, "21", tk, receipt)
+        self.assertFalse(marker.exists())
+        probe.return_value = "CLOSED"
+        release_proof.finish_standing(repo, "21", tk, receipt)
+        self.assertEqual(serve_guard.read(marker), {"run": "first-run", "receipt": "verified-release"})
+        tk.get.reset_mock()
+        release_proof.finish_standing(repo, "21", tk, receipt)
+        tk.get.assert_not_called()
+        self.enterContext(mock.patch.object(release_proof, "goal", return_value=data))
+        release_proof.new_release_run(repo, "21", "first-run")
+        self.assertEqual(serve_guard.read(folder / "promotion.json"), state)
+        latest.update(id="second-run", started="2026-11-25T12:00:00Z")
+        release_proof.new_release_run(repo, "21", "second-run")
+        self.assertEqual(serve_guard.read(folder / "promotion.json"), {"phase": "waiting", "run": "second-run"})
+        self.assertEqual(release_proof.completion(repo.name, "21", sha), receipt)
+        release_proof.finish_standing(repo, "21", tk, receipt)
+        tk.get.assert_not_called()
 
     def test_profile_enrollment_persists_repository_authority_and_holds_unverified_tracker_delivery(self):
         source = self.root / "profile.json"

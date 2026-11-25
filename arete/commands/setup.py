@@ -311,7 +311,17 @@ def cmd_repo(args) -> int:
             repo = cfg.repo(args.name)
         if args.repo_action == "staging-profile":
             release_profile.install(repo, args.policy_file)
-        if args.repo_action == "publish":
+        if args.repo_action == "standing-production":
+            if args.promise_file:
+                release_profile.set_standing(repo, args.after_issue, args.promise_file, args.observer_file, args.production_checks)
+            else:
+                if args.after_issue is not None or args.observer_file or args.production_checks:
+                    raise ValueError("use --promise-file to install a standing production grant")
+                if args.revoke:
+                    release_profile.revoke_standing(repo)
+            status = release_profile.standing_status(repo, release_profile.current(repo)) or {"active": False}
+            print(json.dumps(status, indent=None if args.json else 2))
+        elif args.repo_action == "publish":
             body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
             url = ticket_publication.plan(cfg, repo, args.kind, args.title, body, args.key,
                                           parent=args.parent, source=args.source, draft=args.draft)
@@ -347,6 +357,17 @@ def repo_commands(sub) -> None:
     p = actions.add_parser("staging-profile", help="set the protected staging defaults of an existing repository")
     p.add_argument("name")
     p.add_argument("--policy-file", type=Path, required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("standing-production", help="inspect, grant or revoke automatic promotion for future GitHub issues")
+    p.add_argument("name")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--promise-file", type=Path, help="install the default protected ticket promise")
+    mode.add_argument("--revoke", action="store_true", help="withdraw the repository's standing production approval")
+    p.add_argument("--after-issue", type=int, help="apply only to issue numbers greater than this number")
+    p.add_argument("--observer-file", type=Path, help="observer program matching the promise's SHA-256")
+    p.add_argument("--production-checks", type=Path, help="production job policy JSON, defaults to the profile's staging checks")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_repo)
 

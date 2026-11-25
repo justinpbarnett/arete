@@ -106,7 +106,9 @@ def show(cfg: config.Config, repo: config.Repo) -> dict:
         destination.update(project=tracker.jira_project(repo, cfg.jira), route=tracker.route_label(repo),
                            site=repo.jira_site or None)
     profile = release_profile.current(repo)
+    grant = release_profile.standing_status(repo, profile)
     return {"name": repo.name, "destination": destination, **({"staging_profile": profile["settings"]} if profile else {}),
+            **({"standing_production": grant} if grant else {}),
             "target_branch": {"value": repo.target_branch or layer.base_branch or None,
                               "source": "repo" if repo.target_branch else "legacy"},
             "landing": {"value": repo.landing or None, "source": "repo" if repo.landing else "legacy",

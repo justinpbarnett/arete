@@ -2889,3 +2889,15 @@ For browser checks, pin the SHA-256 of an owner-installed Python observer in `ob
 A spec that requests `staging` (or the enrolled staging origin) may finish on the staging receipt. A spec that requests `production` (or its enrolled origin) needs its QA-approved production receipt. Unrecognized runtime names hold for clarification.
 
 Set `"qa_require_revision": true` to require the full revision on the explicit QA instruction. An authorized GitHub login or Jira account ID can reply to the QA handoff with `Promote FULL_SHA to production`. Arete rechecks staging and its behavior, current scope, QA authority, CI, and the running production revision. A non-forced production branch update advances the one staged commit only when it directly follows the verified production tip. Existing branch protections continue to apply. Use this adapter where the enrolled repository already deploys pushes on that production branch. A change that needs bundling, an unrelated branch advance, or a changed requirement holds for reconciliation or fresh QA. Arete records the intent before sending, reconciles the actual branch after restart, and keeps the ticket open until the production endpoint proves the expected behavior. `arete release status REPO TICKET` shows the staging handoff and production completion independently.
+
+### Standing authorization for future production releases
+
+A GitHub repository with an enrolled staging profile can authorize automatic promotion after verification. Enable automatic triage, include the repository in `[unblock].repos`, and use its `automerge` trust level to let the issue orchestrator review automatically admitted PRs. The owner grants production authority with:
+
+```sh
+arete repo standing-production REPO --after-issue NUMBER --promise-file smoke.json --observer-file smoke.py --production-checks checks.json
+```
+
+Use the last existing GitHub issue or PR number as the boundary. At admission, new issues receive the protected smoke check. An individually enrolled promise takes precedence. The promise uses the same path, assertions, recovery and observer fingerprint as a ticket release check. The production checks file names the GitHub app ID, required successful jobs and jobs allowed to skip, using the staging checks format.
+
+Arete verifies the immutable staging revision, rechecks the current grant and production parent, then promotes the same revision. Closure requires the production push checks and the live production observation. The tracker records the release under the standing grant. `arete repo show REPO` reports the active policy. `arete repo standing-production REPO --revoke` withdraws it for future promotions.

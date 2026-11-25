@@ -117,6 +117,111 @@ class StagingRelease(unittest.TestCase):
         self.assertEqual(proof.for_delivery("product", "12", self.new, self.prod_url)["destination"], "production")
         self.assertEqual({call.args[4] for call in self.scored.call_args_list}, {"staging", "production"})
 
+    def standing(self):
+        grant = {"id": "approved-policy-digest", "production_checks": {"app_id": 15368, "required": ["Verify"], "allow_skipped": []}}
+        return self.enterContext(mock.patch.object(promotion.release_profile, "standing", return_value=grant))
+
+    def test_standing_authority_promotes_after_proof_and_waits_for_the_production_build(self):
+        standing = self.standing()
+        checks = self.enterContext(mock.patch.object(promotion, "production_checks_passed", return_value=False))
+        self.good = False
+        self.assertEqual(self.advance()["phase"], "observing_staging")
+        self.assertEqual(self.posts, [])
+        self.good = True
+        state = self.advance()
+        self.assertEqual(state["phase"], "promotion_intent")
+        self.assertEqual(state["standing_authority"], standing.return_value["id"])
+        self.assertNotIn("approval", state)
+        self.assertEqual(self.notes, [])
+        self.running["production"] = self.new
+        self.assertEqual(self.advance()["phase"], "observing_production")
+        self.assertIsNone(proof.completion("product", "12", self.new))
+        checks.return_value = True
+        self.assertEqual(self.advance()["phase"], "production_verified")
+        self.assertEqual(self.advance()["phase"], "production_verified")
+        self.assertEqual(self.posts, [self.new])
+        self.assertEqual(proof.completion("product", "12", self.new)["destination"], "production")
+
+    def test_revocation_during_recheck_stops_standing_push_even_after_recording_intent(self):
+        standing = self.standing()
+        grant = standing.return_value
+        standing.side_effect = (grant, grant, grant, None)
+        state = self.advance()
+        self.assertEqual(state["phase"], "promotion_intent")
+        self.assertIn("authorization changed", state["waiting"])
+        standing.side_effect = None
+        self.assertEqual(self.posts, [])
+        grant = {"id": "replacement", "production_checks": {}}
+        standing.return_value = grant
+        self.assertIn("authorization changed", self.advance()["waiting"])
+        self.assertEqual(self.posts, [])
+
+    def test_staging_only_spec_stops_at_its_verified_destination(self):
+        self.standing()
+        with mock.patch.object(promotion.specs, "find", return_value={"state": "published", "data": {
+                "definition": {"environment": "staging"}}}):
+            self.assertEqual(self.advance()["phase"], "staging_only")
+            self.assertEqual(self.advance()["phase"], "staging_only")
+        self.assertIsNotNone(proof.evidence("product", "12", self.new))
+        self.assertEqual(self.posts, [])
+
+    def test_standing_parent_waits_for_the_last_childs_own_staging_result(self):
+        self.standing()
+        children = {"first": ("21", "101"), "last": ("22", "102")}
+        graph = {"commit": self.new, "children": [self.other, self.new]}
+        self.enterContext(mock.patch("arete.spec_graph_delivery.promotion_target", return_value=graph))
+        self.enterContext(mock.patch.object(promotion.specgraphs, "children", return_value=children))
+        parents = {self.new: self.other, self.other: self.old}
+        self.enterContext(mock.patch.object(promotion, "parent", side_effect=lambda repo, revision: parents[revision]))
+
+        def stage_child(ticket, revision, good):
+            proof.install(self.repo, ticket, proof.policy_file("product", "12"))
+            self.running["staging"] = revision
+            self.good = good
+            receipt = promotion.observe_staging(self.repo, ticket, revision)
+            self.assertEqual(receipt["status"], "verified" if good else "failed")
+            if good:
+                promotion.serve_guard.write(proof.state_dir("product", ticket) / "promotion.json", {
+                    "phase": "staged_for_parent", "graph_parent": "12", "revision": revision,
+                    "staging_receipt": receipt["receipt_id"]})
+
+        stage_child("21", self.other, True)
+        self.running["staging"] = self.new
+        self.assertIn("each graph child", self.advance()["waiting"])
+        stage_child("22", self.new, False)
+        self.good = True  # The parent's integrated scenario passes independently of child 22's own check.
+        self.assertIn("each graph child", self.advance()["waiting"])
+        self.assertEqual(self.posts, [])
+        stage_child("22", self.new, True)
+        state = self.advance()
+        self.assertEqual(state["phase"], "promotion_intent")
+        self.assertCountEqual(state["graph_revisions"], [self.other, self.new])
+        self.assertEqual(self.posts, [self.new])
+
+    def test_graph_child_keeps_staging_receipt_and_only_verifies_the_parent_in_production(self):
+        self.standing()
+        self.enterContext(mock.patch.object(promotion, "graph_parent", return_value="10"))
+        self.assertEqual(self.advance()["phase"], "staged_for_parent")
+        self.assertIsNotNone(proof.evidence("product", "12", self.new))
+        self.assertIn("waiting for the parent", self.advance()["waiting"])
+        parent_file = proof.state_dir("product", "10") / "promotion.json"
+        promotion.serve_guard.write(parent_file, {"revision": self.other, "graph_revisions": [self.new]})
+        real_completion = proof.completion
+        def parent_completion(repo, ticket, revision):
+            if ticket == "10" and revision == self.other:
+                return {"status": "verified"}
+            return real_completion(repo, ticket, revision)
+
+        self.refs["main"] = self.running["production"] = self.other
+        with (mock.patch.object(proof, "completion", side_effect=parent_completion),
+              mock.patch.object(promotion, "production_checks_passed", return_value=True)):
+            state = self.advance()
+        self.assertEqual((state["phase"], state["staged_revision"], state["revision"]),
+                         ("production_verified", self.new, self.other))
+        self.assertEqual(self.posts, [])
+        self.assertEqual(real_completion("product", "12", self.other)["ticket"], "12")
+        self.assertEqual(real_completion("product", "12", self.new)["revision"], self.other)
+
     def test_stable_address_moving_during_graph_observation_invalidates_the_receipt(self):
         with mock.patch.object(proof, "deployed_revision", side_effect=[self.new, self.new, self.new, self.other]):
             self.assertEqual(promotion.observe_staging(self.repo, "12", self.new)["status"], "blocked")
@@ -170,6 +275,31 @@ class GitHubDeployment(unittest.TestCase):
             with mock.patch.object(promotion, "pages", side_effect=[rows, [{"state": status, "environment_url": origin}]]) as read:
                 self.assertEqual(promotion.preview(repo, policy, head), expected)
                 self.assertIn("/deployments/3/statuses?", read.call_args.args[0])
+
+
+    def test_production_checks_require_the_matching_push_and_complete_pinned_jobs(self):
+        repo = config.Repo("product", Path("/dev/null"), github="owner/product")
+        revision, suite = "a" * 40, 1234
+        state = {"revision": revision, "production_branch": "main",
+                 "production_checks": {"app_id": 15368, "required": ["Verify", "Pages"], "allow_skipped": ["Worker"]}}
+        run = {"head_sha": revision, "head_branch": "main", "event": "push", "status": "completed",
+               "conclusion": "success", "check_suite_id": suite}
+        check = {"head_sha": revision, "check_suite": {"id": suite}, "name": "Verify", "status": "completed",
+                 "conclusion": "success", "app": {"id": 15368}}
+        pages = {**check, "name": "Pages"}
+        worker = {**check, "name": "Worker", "conclusion": "skipped"}
+        def passes(runs, jobs):
+            with mock.patch.object(gh, "actions_rows", side_effect=[runs, jobs]):
+                return promotion.production_checks_passed(repo, state)
+        self.assertTrue(passes([run], [check, pages, worker]))
+        self.assertTrue(passes([run], [check, pages, {**worker, "conclusion": "success"}]))
+        for delta in ({"head_branch": "staging"}, {"event": "pull_request"}, {"head_sha": "b" * 40},
+                      {"status": "in_progress"}, {"conclusion": "failure"}):
+            self.assertFalse(passes([{**run, **delta}], [check, pages, worker]))
+        for jobs in ([check, worker], [check, {**pages, "app": {"id": 1}}, worker],
+                     [check, pages, {**worker, "conclusion": "failure"}],
+                     [check, pages, {**worker, "check_suite": {"id": 5678}}]):
+            self.assertFalse(passes([run], jobs))
 
 
 class PinnedCI(unittest.TestCase):
