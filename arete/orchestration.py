@@ -20,6 +20,7 @@ from . import (
     factory,
     flows,
     gh,
+    hosted_check,
     journeys,
     merge_review,
     outbound,
@@ -752,6 +753,8 @@ class Controller(worker_turns.WorkerTurns):
                 and found.get("acceptance") == self.data["acceptance"]):
             return False
         result = found.get("result", {})
+        if gate == "checks" and not hosted_check.current(result):
+            return False
         if gate == "verify" and result.get("verification_environment"):
             setting = self.catalog.settings.get(result["verification_route"])
             return bool(setting and result["verification_environment"] == verification_attempts.environment(

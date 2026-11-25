@@ -419,7 +419,7 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, contract, dashboard, paths, principals, record, replay, secretstore, triage
+        from . import agent, cohorts, contract, dashboard, paths, principals, record, replay, secretstore, triage
         from .sighting import Sighting
         from .store import chats, incidents, insights, runs, tokens
         from .store import triage as triage_store
@@ -436,6 +436,8 @@ class Check:
         fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
         secretstore.put("global", "DEMO_KEY", "fixture-contract-key", "api_key", "hand")
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
+        cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
+                        closes="2099-01-01T00:00:00Z", hours=24)
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
