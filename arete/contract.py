@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 7
+MINOR = 8
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -213,7 +213,11 @@ TOKEN_ISSUE = obj({"label": STRING, "scopes": array(STRING), "profile": {**STRIN
 TOKEN_ISSUED = envelope({"token": TOKEN, "text": STRING})
 COHORT_REPORT = obj({"cohort": mapping(JSON), "observed": STRING, "arrivals": INTEGER, "goals": INTEGER,
                      "outcomes": mapping(mapping(INTEGER)), "members": array(mapping(JSON)),
-                     "intake_complete": BOOLEAN}, additional=JSON)
+                     "intake_complete": BOOLEAN,
+                     "pending_overdue": {**INTEGER, "minimum": 0,
+                                         "description": "Number of pending members with a deadline before the report observation time."}},
+                    ["cohort", "observed", "arrivals", "goals", "outcomes", "members", "intake_complete"],
+                    additional=JSON)
 OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
