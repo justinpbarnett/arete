@@ -307,7 +307,7 @@ def cmd_repo(args) -> int:
                                      unattended_environment=args.unattended_environment, destination=args.tracker,
                                      jira_project=args.jira_project, jira_label=args.jira_label, pipeline=args.pipeline,
                                      choose_project=choose_jira_project if sys.stdin.isatty() else None,
-                                     staging_profile=args.staging_profile)
+                                     staging_profile=args.staging_profile, commenters=args.commenter)
             cfg = config.load_required()
         else:
             cfg = config.load_required()
@@ -354,6 +354,7 @@ def repo_commands(sub) -> None:
     p.add_argument("--jira-label", default="", help="override the repo's Jira routing label")
     p.add_argument("--pipeline", action="store_true", help="enable the repo's existing factory queue")
     p.add_argument("--staging-profile", type=Path, help="owner-approved reusable staging destinations, checks and QA authority")
+    p.add_argument("--commenter", action="append", default=[], help="GitHub username allowed to direct work in ticket comments")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_repo)
 

@@ -258,6 +258,13 @@ class GitHubTracker:
         login = (item.get("author") or {}).get("login") or ""
         return bool(login) and login.lower() == self.owner.lower()
 
+    def commenter_allowlist(self) -> tuple[str, ...]:
+        return self.repo.github_commenters()
+
+    def by_commenter(self, item: dict) -> bool:
+        login = (item.get("author") or item.get("user") or {}).get("login") or ""
+        return bool(login) and login.casefold() in {u.casefold() for u in self.commenter_allowlist()}
+
     def by_publisher(self, item: dict, spec: bool) -> bool:
         if not spec:
             return self.by_owner(item)

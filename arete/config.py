@@ -141,12 +141,28 @@ class Repo:
     target_branch: str = ""
     landing: str = ""
     unattended_environment: str = ""
+    commenters: list[str] = field(default_factory=list)
 
     def allows_unattended_deploy(self, environment: str) -> bool:
         return (environment in DEPLOYMENT_ENVIRONMENTS[1:] and
                 (not self.unattended_environment or
                  DEPLOYMENT_ENVIRONMENTS.index(environment) <=
                  DEPLOYMENT_ENVIRONMENTS.index(self.unattended_environment)))
+
+    def github_commenters(self) -> tuple[str, ...]:
+        if self.commenters:
+            seen, out = set(), []
+            for login in self.commenters:
+                cleaned = login.strip()
+                if cleaned and cleaned.casefold() not in seen:
+                    seen.add(cleaned.casefold())
+                    out.append(cleaned)
+            return tuple(out)
+        if self.github and "/" in self.github:
+            owner = self.github.split("/", 1)[0].strip()
+            if owner:
+                return (owner,)
+        return ()
 
     @property
     def layer_dir(self) -> Path:
@@ -467,7 +483,7 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
                         del data["jira"][name]
         if not sparse:
             for repo in data["repos"]:
-                for key in ("jira_site", "target_branch", "landing", "unattended_environment"):
+                for key in ("jira_site", "target_branch", "landing", "unattended_environment", "commenters"):
                     if not repo[key]:
                         del repo[key]
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
@@ -1277,6 +1293,18 @@ def repo_table(repo: dict) -> Repo:
     if parts and (github or tracker != "jira"):
         raise ValueError(f"repo {repo['name']}: a repo with parts takes its github from each part and needs "
                          'tracker = "jira"')
+    raw_commenters = repo.get("commenters", [])
+    if not isinstance(raw_commenters, list):
+        raise ValueError(f"repo {repo['name']}: commenters must be a list of GitHub usernames")
+    commenters: list[str] = []
+    seen_commenters: set[str] = set()
+    for login in raw_commenters:
+        if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}", login.strip()):
+            raise ValueError(f"repo {repo['name']}: invalid commenter login {login!r}")
+        cleaned = login.strip()
+        if cleaned.casefold() not in seen_commenters:
+            seen_commenters.add(cleaned.casefold())
+            commenters.append(cleaned)
     return Repo(
         name=repo["name"],
         path=paths.expand(repo["path"]),
@@ -1294,6 +1322,7 @@ def repo_table(repo: dict) -> Repo:
         target_branch=repo.get("target_branch", ""),
         landing=repo.get("landing", ""),
         unattended_environment=repo.get("unattended_environment", ""),
+        commenters=commenters,
     )
 
 
