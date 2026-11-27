@@ -26,6 +26,7 @@ from . import (
     util,
     workspace,
 )
+from .store import db as foundation
 from .store import devices as devices_store
 from .store import loops as loop_store
 from .store import runs as run_store
@@ -54,6 +55,40 @@ def check_costs() -> list[Check]:
     detail = (f"{len(drift)} runs differ from steps by ${sum(abs(r['difference']) for r in drift):.6f}: "
               + ", ".join(r["id"] for r in drift[:5])) if drift else "run costs equal their steps"
     return [Check("costs:drift", not drift, detail)]
+
+
+def unfinished_resumes(statuses: tuple[str, ...], account_prefix: str) -> list[tuple[str, bool]]:
+    pattern = account_prefix + "%"
+    with foundation.reader() as c:
+        return [(row["id"], bool(row["legacy"])) for row in c.execute(f"""
+            SELECT r.id, (
+                EXISTS (SELECT 1 FROM asks a WHERE a.run = r.id
+                        AND (a.status = 'open' OR (a.status = 'answered' AND a.taken_by = ''))
+                        AND json_extract(NULLIF(a.session, ''), '$.id') != ''
+                        AND json_extract(NULLIF(a.session, ''), '$.account') != ''
+                        AND json_extract(NULLIF(a.session, ''), '$.account') NOT LIKE ?)
+                OR EXISTS (SELECT 1 FROM orchestration_actions a WHERE a.root = r.id
+                           AND json_extract(NULLIF(a.result, ''), '$.session.id') != ''
+                           AND json_extract(NULLIF(a.result, ''), '$.session.account') != ''
+                           AND json_extract(NULLIF(a.result, ''), '$.session.account') NOT LIKE ?)
+            ) AS legacy FROM runs r
+            WHERE r.kind = 'pipeline' AND {run_store.WHOLE_RUN} AND r.status IN ({','.join('?' * len(statuses))})
+            AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline'
+                            AND later.repo = r.repo AND later.issue = r.issue AND later.rowid > r.rowid
+                            AND COALESCE(later.only_step, '') = '')
+            """, (pattern, pattern, *statuses))]
+
+
+def check_legacy_accounts() -> list[Check]:
+    from . import factory
+    from .tasks import RESUMABLE
+
+    holds = sum(row["scope"].startswith(("credit-v1:", "subscription-v1:")) for row in devices_store.holds())
+    unfinished = unfinished_resumes(("running", "needs-info", *RESUMABLE), runner.ACCOUNT_PREFIX)
+    resumes = sum(stored or any((session := factory.outcome_of(line).session).id and session.account
+                                and not session.account.startswith(runner.ACCOUNT_PREFIX)
+                                for line in factory.history(factory.chain(run))) for run, stored in unfinished)
+    return [Check("accounts:legacy", True, f"{holds} active v1 holds, {resumes} unfinished runs with v1 sessions")]
 
 
 def check_jobs(cfg: config.Config) -> list[Check]:
@@ -452,6 +487,7 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_runs_size, cfg),
         (check_backups, cfg),
         (check_costs,),
+        (check_legacy_accounts,),
         (check_loops, cfg),
         (check_oncall, cfg),
         (check_workspaces,),

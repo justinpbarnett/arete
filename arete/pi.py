@@ -48,6 +48,7 @@ from .agent import (
     unreachable_limit,
     usage_totals,
 )
+from .store import db
 from .store import devices as devices_store
 
 if TYPE_CHECKING:
@@ -229,7 +230,7 @@ def managed_material(credential: ManagedCredential, provider: str) -> list:
                         selected["sso-session " + session] = dict(parser.items("sso-session " + session))
                     profile = fields.get("source_profile", "")
                 data = selected
-            values.append((str(path), accounts.fingerprint(data)))
+            values.append((str(path), accounts.legacy_fingerprint(data)))
         except (OSError, ValueError, configparser.Error):
             values.append((str(path), ""))
     return [credential.kind, env, values]
@@ -439,20 +440,21 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
             (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local))):
         error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
     chosen_auth = auth if chosen_login else accounts.Auth(
-        "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key")
-    if not chosen_login:
+        "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key",
+        provider=provider)
+    if not chosen_login and has_key:
         source_kind = ("managed" if managed else "configured" if key_name == "ARETE_PI_SELECTED_KEY" else
                        "keys" if keys.get(key_name) else "environment")
         credential_context = {n: available[n] for n in TRANSPORT_NAMES.get(provider, ()) if available.get(n)
                               and re.search(r"REGION|PROJECT|ACCOUNT|RESOURCE|GATEWAY|BASE_URL|ENDPOINT", n)}
         credential_context["baseUrl"] = configured.get("baseUrl", "")
         material = managed_material(managed, provider) if managed else [key_name, key]
-        chosen_auth = replace(chosen_auth, provider=provider,
-                              generation=accounts.fingerprint("pi-managed" if managed else "pi-key", material),
-                              credential=accounts.fingerprint("credential-v1", "pi", provider, source_kind,
-                                                              str(owner) if source_kind == "configured" else
-                                                              str(KEYS_FILE) if source_kind == "keys" else "",
-                                                              material, credential_context))
+        chosen_auth = accounts.keyed(provider, ("pi-managed" if managed else "pi-key", material),
+                                     ("pi", provider, source_kind,
+                                      str(owner) if source_kind == "configured" else
+                                      str(KEYS_FILE) if source_kind == "keys" else "",
+                                      material, credential_context),
+                                     mode=chosen_auth.mode)
     raw_credentials = credential_config(models)
     env, never = child_env(provider, available, passing, providers, raw_credentials, chosen_login, managed, key,
                            key_name)
@@ -686,26 +688,32 @@ def login_unchanged(route: Route) -> bool:
 
 def observed_refresh(route: Route, event: dict) -> accounts.Auth | None:
     if event.get("provider") != route.provider:
-        return
+        return None
     before, after = accounts.mapping(event.get("before")), accounts.mapping(event.get("after"))
     route.refreshed_secrets.update(v for v in credential_values([before, after]) if len(v) >= vault.SHORTEST)
     if before.get("type") != "oauth" or after.get("type") != "oauth":
-        return
-    previous = accounts.fingerprint("pi", str(route.owner), route.provider, before)
-    if (previous not in {route.auth.generation, *route.refreshed}
-            and not devices_store.refresh_continues(route.auth.generation, previous)):
-        return
-    latest = accounts.pi(route.provider, after, str(route.owner))
-    markers = ("accountId", "accountUuid", "account_id", "account_uuid", "userId", "user_id")
-    if route.auth.identity:
-        if latest.identity != route.auth.identity:
-            return
-    elif any(before.get(name) != after.get(name) for name in markers):
-        return
-    earlier = accounts.pi(route.provider, before, str(route.owner))
-    prefixes = [accounts.scope(a, "")[:-2] if a.mode == "subscription" else accounts.scope(a, "credit")
-                for a in (earlier, latest)]
-    devices_store.record_refresh(previous, latest.generation, *prefixes)
+        return None
+    db.migrate_on_demand(db.SECRET_REGISTRY_SCHEMA)
+    with nullcontext() if db.in_write() else db.one_read():
+        earlier = accounts.pi(route.provider, before, str(route.owner))
+        previous = earlier.generation
+        if (previous not in {route.auth.generation, *route.refreshed}
+                and not devices_store.refresh_continues(route.auth.generation, previous)):
+            return None
+        latest = accounts.pi(route.provider, after, str(route.owner))
+        markers = ("accountId", "accountUuid", "account_id", "account_uuid", "userId", "user_id")
+        if route.auth.identity:
+            if latest.identity != route.auth.identity:
+                return None
+        elif any(before.get(name) != after.get(name) for name in markers):
+            return None
+        prefixes = [accounts.scope(a, "")[:-2] if a.mode == "subscription" else accounts.scope(a, "credit")
+                    for a in (earlier, latest)]
+        legacy = [accounts.legacy_scope(a, "")[:-2] if a.mode == "subscription" else accounts.legacy_scope(a, "credit")
+                  for a in (earlier, latest)]
+    with db.tx():
+        devices_store.record_refresh(previous, latest.generation, *prefixes)
+        devices_store.record_refresh(earlier.legacy_generation, latest.legacy_generation, *legacy)
     route.refreshed.add(latest.generation)
     route.refreshed_auths.add(latest)
     if previous != latest.generation and not (earlier.identity or latest.identity):

@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from . import local_paths
 
-MARKER = b"arete-verification-scratch-v1"
+MARKER = local_paths.VERIFY_SCRATCH_CONTENT
 SPEC = "verify-faults.json"
 REFUSAL = ("verify-fault requires ARETE_STATE_DIR under a user-owned verification scratch directory "
            "with a valid .arete-owned marker. Run it through the verification sandbox wrapper.")
@@ -47,7 +47,7 @@ def scratch_state(state: Path | None):
     try:
         if os.fstat(root).st_uid != os.getuid():
             raise PermissionError(REFUSAL)
-        with plain_file(root, ".arete-owned") as marker:
+        with plain_file(root, local_paths.VERIFY_SCRATCH_MARKER) as marker:
             if marker.read(len(MARKER) + 2) not in (MARKER, MARKER + b"\n"):
                 raise PermissionError(REFUSAL)
         with local_paths.directory_fd(Path(state.name), root) as directory:
