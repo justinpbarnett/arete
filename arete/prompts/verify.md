@@ -32,7 +32,7 @@ $diff
 
 ## How to check
 
-Arete already ran the repo's checks, and they pass: $checks. Do not run them again.
+The latest repository check report is $checks. Use its results as context and spend this step exercising the product.
 Before starting a check, identify whether it fits the remaining step budget. Do not start or repeat a check that cannot finish in that budget; report it as blocked if essential. Do not wait with chained sleeps; poll a background run with a single short command at a time.
 
 $surface
@@ -43,8 +43,9 @@ $scratch
 
 $journeys## Rules
 
-- Check every behavior the issue asks for, each edge and error case it names, and one thing near the change that
-  worked before and must still work.
+- For a full baseline, check each behavior the issue asks for, its named edge and error cases, and one nearby
+  behavior that must still work. For a focused follow-up, check only the named requirements in the goal. Keep
+  their exact wording in `what` so the engine can combine the new observations with the baseline.
 - Do what the user does: the commands they type, the requests their clients send, the clicks they make. Read
   the real output, not the code that makes it.
 - Shell commands you may run: $commands. Others are refused.$env_example
@@ -87,6 +88,10 @@ $journeys## Rules
 - `unmeasured_requirements`: list the exact wording of each requirement whose measurement your environment cannot
   establish, and explain the limitation in `summary`. For example, timing that includes sandbox setup does not
   establish standalone runtime. Keep observed failures in `checks` and follow the same verdict rules.
+- `advisory_gaps`: exact names of outstanding supplemental checks you added on your own. Treat issue and owner
+  requirements, configured probes and named journeys as required. Leave uncertain classifications out of this list.
+- For an environment block, describe the fixture, permission or runner feature needed in `missing_capability`.
+  In `missing_tools`, list the exact unavailable tool IDs when known. Record completed observations alongside the gap.
 - `verdict`: `pass` when every check passed. `fail` when the product does not do what the issue asks or something
   near it broke. `blocked` when you could not check something essential for a reason outside the change (no
   login, missing data, a command you may not run); say what in `blocked_by`.

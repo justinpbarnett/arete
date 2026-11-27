@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
-from .. import dbstats, paths, util
+from .. import check_process, dbstats, paths, util
 from . import migrations
 from .migrations import m0002_foundation_time_shape as time_shape
+from .migrations import m0028_workspaces_contract as workspace_contract
 
 TABLES = {"schema_meta": "kept", "schema_migrations": "kept"}
 DB_LOCK = threading.Lock()
@@ -117,8 +122,23 @@ _CHAIN = migrations.load()
 LATEST = _CHAIN[-1].n
 WORKSPACE_SNAPSHOT_SCHEMA = 25
 WORKER_EXCHANGE_SCHEMA = 26
-# Each capability migrates at its own entry point. Unrelated writers can use older databases.
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract" and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA))
+SECRET_REGISTRY_SCHEMA = 27
+WORKSPACE_CONTRACT_SCHEMA = 28
+SPEC_DELIVERY_SCHEMA = 29
+SPEC_GRAPH_SCHEMA = 30
+FACTORY_SCHEMA = 31
+INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
+WORKSPACE_CHILD_PIDS = "workspace_contract_children"
+WORKSPACE_CHILD_IDENTITIES = "workspace_contract_child_identities"
+type ProcessIdentity = tuple[str, int]
+type ServeChildren = set[tuple[int, ProcessIdentity | None]]
+WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] workspace_snapshots "
+                     "or from arete migrate --workspace-snapshots DIR")
+# Unrelated writers can use older databases. Spec graph migrations are serve-owned.
+NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
+             and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
+                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -129,6 +149,10 @@ class NoDatabase(RuntimeError):
 
 
 class IncompatibleSchema(RuntimeError):
+    pass
+
+
+class WorkspaceHandoffPending(RuntimeError):
     pass
 
 
@@ -148,19 +172,218 @@ def missing_database():
 
 
 def contract_blockers(conn, n):
-    from .. import control, record
+    from .. import control, launch_lease, record
 
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
+    workspace_contract = n == WORKSPACE_CONTRACT_SCHEMA
+    blockers = [f"launch lease {name}" for name in launch_lease.held_launches()] if workspace_contract else []
+    statuses = "(status = 'running' OR pid IS NOT NULL)" if workspace_contract else "status = 'running'"
+    for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "
                             "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
         row = dict(row)
-        with record.dead(row) as gone:
-            if not gone:
-                blockers.append(row["id"])
-    beat = control.database_beat()
-    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
+        if row["status"] == "running":
+            with record.dead(row) as gone:
+                if not gone:
+                    blockers.append(row["id"])
+        elif workspace_contract and settled_run_process_alive(row):
+            blockers.append(row["id"])
+    if workspace_contract:
+        beat, seen = util.read_json_snapshot(paths.DB_FILE.with_name(control.BEAT_FILE.name), {})
+        if not isinstance(beat, dict):
+            beat = {}
+        children = live_serve_children(heartbeat_serve_children(beat, seen) | inherited_serve_children())
+        blockers.extend(f"inherited child {pid}" for pid in sorted({pid for pid, _ in children}))
+        blockers.extend(workspace_admission_blockers())
+        if problem := workspace_serve_blocker(beat, n):
+            blockers.append(problem)
+    else:
+        beat = control.database_beat()
+        if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
+            blockers.append(f"serve {beat.get('pid')}")
     return blockers
+
+
+def workspace_admission_blockers():
+    for file in sorted(paths.LOCKS_DIR.iterdir()):
+        name = file.stem
+        if (file.suffix == ".lock" and (name == "file-rule" or name.startswith(("run-", "loop-")))
+                and util.lock_is_held(name)):
+            yield f"held lock {name}"
+
+
+def process_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        if paths.ON_MAC:
+            from .. import scratch
+
+            boot, serial = scratch.boot_session(), scratch.identity_of(pid)
+        else:
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            serial = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        if boot and serial is not None:
+            return UUID(boot).hex, serial
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def child_identity(value) -> ProcessIdentity | None:
+    if (isinstance(value, list) and len(value) == 2 and isinstance(value[0], str)
+            and type(value[1]) is int and value[1] >= 0):
+        with suppress(ValueError):
+            return UUID(value[0]).hex, value[1]
+    return None
+
+
+def heartbeat_serve_children(beat, seen=None) -> ServeChildren:
+    pids = beat.get(WORKSPACE_CHILD_PIDS)
+    identities = beat.get(WORKSPACE_CHILD_IDENTITIES)
+    if not isinstance(identities, dict):
+        identities = {}
+    children = set()
+    for pid in pids if isinstance(pids, list) else ():
+        if type(pid) is int and 0 < pid <= 2**31 - 1:
+            identity = child_identity(identities.get(str(pid)))
+            if identity is not None or seen is None or process_existed_by(pid, seen.st_mtime):
+                children.add((pid, identity))
+    return children
+
+
+def inherited_serve_children() -> ServeChildren:
+    pids = [int(pid) for pid in os.environ.get(INHERITED_SERVE_CHILDREN, "").split(",") if pid]
+    try:
+        identities = json.loads(os.environ.get(INHERITED_SERVE_IDENTITIES, "{}"))
+    except ValueError:
+        identities = {}
+    inherited = heartbeat_serve_children({WORKSPACE_CHILD_PIDS: pids, WORKSPACE_CHILD_IDENTITIES: identities})
+    children = set()
+    for pid, identity in inherited:
+        if identity is not None and process_identity(pid) not in (None, identity) and has_live_child(pid):
+            identity = None
+        children.add((pid, identity))
+    return children
+
+
+def has_live_child(pid: int) -> bool:
+    try:
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None
+    except ChildProcessError:
+        return False
+    except OSError:
+        return True
+
+
+def live_serve_children(children: ServeChildren) -> ServeChildren:
+    return {(pid, identity) for pid, identity in children if util.pid_alive(pid)
+            and (identity is None or process_identity(pid) in (None, identity))}
+
+
+def workspace_child_fields(children: ServeChildren) -> dict:
+    grouped = {}
+    for pid, identity in children:
+        grouped.setdefault(pid, set()).add(identity)
+    identities = {str(pid): next(iter(found)) for pid, found in grouped.items() if len(found) == 1 and None not in found}
+    return {WORKSPACE_CHILD_PIDS: sorted(grouped), WORKSPACE_CHILD_IDENTITIES: identities}
+
+
+def process_existed_by(pid, at):
+    if not util.pid_alive(pid):
+        return False
+    try:
+        if paths.ON_MAC:
+            existed = check_process.DarwinProcesses().existed_by(pid, at)
+            return util.pid_alive(pid) if existed is None else existed
+        found = util.sh(["/bin/ps", "-p", str(pid), "-o", "stat=,lstart="], timeout=2, env={"LC_ALL": "C", "TZ": "UTC"})
+        if not found.stdout.strip():
+            return util.pid_alive(pid)
+        state, started = found.stdout.strip().split(maxsplit=1)
+        when = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y").replace(tzinfo=UTC)
+        return not state.startswith("Z") and when.timestamp() <= at
+    except (OSError, ValueError):
+        return util.pid_alive(pid)
+
+
+def settled_run_process_alive(row):
+    if row["pid"] == os.getpid():
+        return False
+    try:
+        at = util.parse_iso(row["finished"] or row["started"]).timestamp()
+    except (ValueError, TypeError):
+        return util.pid_alive(row["pid"])
+    return process_existed_by(row["pid"], at)
+
+
+def workspace_serve_blocker(beat, n):
+    from .. import control
+
+    if not util.lock_is_held("serve"):
+        if (paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve() and util.pid_alive(beat.get("pid"))
+                and (type(beat.get("schema")) is not int or beat["schema"] < n)):
+            return f"serve {beat.get('pid')}"
+        return ""
+    try:
+        with (paths.LOCKS_DIR / "serve.lock").open() as lock:
+            lock_pid = int(lock.read())
+            lock_written = os.fstat(lock.fileno()).st_mtime_ns
+    except (OSError, ValueError):
+        return "serve lock holder has not reported its schema"
+    unreported = f"serve {lock_pid} has not reported its schema"
+    try:
+        beat_written = paths.DB_FILE.with_name(control.BEAT_FILE.name).stat().st_mtime_ns
+    except FileNotFoundError:
+        return unreported
+    status = control.database_beat()
+    if (lock_pid <= 0 or not util.pid_alive(lock_pid) or not isinstance(status, dict)
+            or status.get("pid") != lock_pid or type(status.get("schema")) is not int):
+        return unreported
+    if status["schema"] < n:
+        return f"serve {lock_pid}"
+    return unreported if beat_written < lock_written else ""
+
+
+def workspace_handoff_blockers(conn, source, *, explicit=False):
+    from .. import serve_guard
+
+    blockers = contract_blockers(conn, WORKSPACE_CONTRACT_SCHEMA)
+    try:
+        receipt = serve_guard.pending(paths.DB_FILE.parent, paths.PACKAGE_DIR.parent)
+        if receipt is not None and serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
+            contract = next(m for m in _CHAIN if m.n == WORKSPACE_CONTRACT_SCHEMA)
+            if reason := serve_guard.unsupported_contract(paths.PACKAGE_DIR.parent, receipt.previous,
+                                                          [(contract.name, contract.sha256)]):
+                blockers.append(f"deploy a compatible workspace rollback release first: {reason}")
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        blockers.append(f"cannot verify the pending workspace deployment: {error}")
+    if problem := workspace_source_blocker(conn, source, explicit=explicit):
+        blockers.append(problem)
+    return blockers
+
+
+def workspace_source_blocker(conn, source, *, explicit):
+    if source is None:
+        return "" if new_workspace_store(conn) else f"supply {WORKSPACE_HANDOFF}"
+    try:
+        allow_missing = workspace_contract.may_be_missing(conn, explicit)
+        with workspace_contract.snapshot_directory(source, allow_missing=allow_missing):
+            return ""
+    except (OSError, ValueError) as e:
+        return workspace_source_problem(source, e)
+
+
+def workspace_source_problem(source, error):
+    return f"snapshot directory {source}: {util.first_line(str(error), 300)}; supply {WORKSPACE_HANDOFF}"
+
+
+def new_workspace_store(conn):
+    return (conn.execute("SELECT 1 FROM schema_meta WHERE key = 'new_workspace_store' AND value = '1'").fetchone() is not None
+            and workspace_contract.unrestored(conn) and workspace_store_is_new())
+
+
+def workspace_handoff_ready(snapshots: Path | None) -> bool:
+    with reader() as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SECRET_REGISTRY_SCHEMA:
+            return False
+        source = workspace_contract.snapshot_source(conn, snapshots)
+        return not workspace_source_blocker(conn, source, explicit=snapshots is not None)
 
 
 def execute_statements(conn, sql):
@@ -174,10 +397,24 @@ def execute_statements(conn, sql):
         conn.execute(pending)
 
 
-def migrate(contracts=True):
-    from .. import backup
+def workspace_store_is_new():
+    from .. import install, serve_guard
+
+    scaffolding = {paths.DB_FILE, paths.RUNS_DIR, paths.WORKTREES_DIR, paths.LOCKS_DIR, paths.LOG_DIR,
+                   paths.DB_FILE.with_name(paths.SERVE_BEAT_FILE.name), paths.SERVER_FILE, paths.backups_dir(),
+                   paths.DB_FILE.parent / serve_guard.RECEIPT, install.serve_guard_file(),
+                   *(paths.DB_FILE.with_name(paths.DB_FILE.name + suffix) for suffix in ("-wal", "-shm", "-journal"))}
+    expected = {path.absolute() for path in scaffolding}
+    return (all(entry.absolute() in expected for entry in paths.STATE_DIR.iterdir())
+            and not any(paths.RUNS_DIR.iterdir()) and not any(paths.WORKTREES_DIR.iterdir()))
+
+
+def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through: int | None = None):
+    from .. import backup, config
 
     chain = migrations.load()
+    if through is not None:
+        chain = [migration for migration in chain if migration.n <= through]
     paths.ensure_dirs()
     with util.lock("migrate", wait=True):
         refuse_empty_file()
@@ -188,6 +425,8 @@ def migrate(contracts=True):
             migrations.validate(conn, chain, version)
             conn.close()
             conn = None
+            fresh_workspaces = (version == 0 and chain[-1].n >= WORKSPACE_CONTRACT_SCHEMA
+                                and workspace_store_is_new())
             snapshot = None
             started_chain = False
             for migration in chain:
@@ -196,10 +435,21 @@ def migrate(contracts=True):
                 if migration.phase == "contract":
                     if not contracts:
                         return True
+                    if migration.n == WORKSPACE_CONTRACT_SCHEMA and workspace_snapshots is None:
+                        cfg, problem = config.load_or_problem()
+                        if problem:
+                            print(f"migration {migration.name} waits for valid config "
+                                  f"({util.first_line(problem, 300)}); supply {WORKSPACE_HANDOFF}", flush=True)
+                            return True
+                        workspace_snapshots = cfg.workspace_snapshots
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
                     try:
-                        blockers = contract_blockers(conn, migration.n)
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA:
+                            source = workspace_contract.snapshot_source(conn, workspace_snapshots)
+                            blockers = workspace_handoff_blockers(conn, source, explicit=workspace_snapshots is not None)
+                        else:
+                            blockers = contract_blockers(conn, migration.n)
                     finally:
                         conn.close()
                         conn = None
@@ -214,10 +464,28 @@ def migrate(contracts=True):
                 try:
                     timing = dbstats.Timing(paths.DB_FILE, "write")
                     with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
-                        if migration.sql is not None:
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA:
+                            source = workspace_contract.snapshot_source(writer, workspace_snapshots)
+                            explicit = workspace_snapshots is not None
+                            if blockers := workspace_handoff_blockers(writer, source, explicit=explicit):
+                                print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
+                                return True
+                            from .. import install
+
+                            if paths.DB_FILE.parent == paths.STATE_DIR and install.serve_guard_file().exists():
+                                install.write_serve_guard()
+                            allow_missing = workspace_contract.may_be_missing(writer, explicit)
+                            try:
+                                migration.apply(writer, source, allow_missing=allow_missing)
+                            except OSError as e:
+                                raise WorkspaceHandoffPending(workspace_source_problem(source, e)) from e
+                        elif migration.sql is not None:
                             execute_statements(writer, migration.sql)
                         else:
                             migration.apply(writer)
+                        if migration.n == 1 and chain[-1].n >= WORKSPACE_CONTRACT_SCHEMA:
+                            writer.execute("INSERT INTO schema_meta (key, value) VALUES ('new_workspace_store', ?)",
+                                           ("1" if fresh_workspaces else "0",))
                         writer.execute("INSERT INTO schema_migrations "
                                        "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
                                        (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
@@ -225,6 +493,11 @@ def migrate(contracts=True):
                         writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                                        (str(migration.n),))
                         writer.execute(f"PRAGMA user_version = {migration.n}")
+                        if migration.n == WORKSPACE_CONTRACT_SCHEMA and (blockers := contract_blockers(writer, migration.n)):
+                            raise WorkspaceHandoffPending(", ".join(blockers))
+                except WorkspaceHandoffPending as e:
+                    print(f"migration {migration.name} waits for {e}", flush=True)
+                    return True
                 except BaseException as e:
                     raise migrations.Refused(f"{migration.name}: {e}") from e
                 version = migration.n
@@ -241,7 +514,8 @@ def _schema_key(identity, needed):
             getattr(identity, "st_birthtime", None), LATEST, needed)
 
 
-def checked_connection(*, timeout: float | None = None, on_demand: bool = False, needed: int | None = None):
+def checked_connection(*, timeout: float | None = None, on_demand: bool = False, needed: int | None = None,
+                       initialize_isolated: bool = True):
     from .. import backup
 
     needed = NEEDED if needed is None else needed
@@ -250,9 +524,9 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
-        if not on_demand and (not paths.ISOLATED or timeout is not None):
+        if not on_demand and (not initialize_isolated or not paths.ISOLATED or timeout is not None):
             raise missing_database() from None
-        migrate()
+        migrate(through=max(needed, WORKSPACE_CONTRACT_SCHEMA) if on_demand else None)
         identity = paths.DB_FILE.stat()
     if identity.st_size == 0:
         refuse_empty_file()
@@ -268,18 +542,21 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if on_demand and version < needed:
                 conn.close()
-                migrate()
-                return checked_connection(timeout=timeout, needed=needed)
-            if paths.ISOLATED and version == 0 and timeout is None:
+                migrate(through=max(needed, WORKSPACE_CONTRACT_SCHEMA))
+                return checked_connection(timeout=timeout, needed=needed, initialize_isolated=initialize_isolated)
+            if initialize_isolated and paths.ISOLATED and version == 0 and timeout is None:
                 conn.close()
                 migrate()
                 return checked_connection(needed=needed)
-            deadline = time.monotonic() + (MIGRATE_WAIT_SECONDS if timeout is None else 0)
+            deadline = time.monotonic() + (
+                MIGRATE_WAIT_SECONDS if timeout is None and needed != WORKSPACE_CONTRACT_SCHEMA else 0)
             if version < needed:
                 print(f"schema {version} waits for schema {needed}; run arete serve or arete migrate", flush=True)
             while version < needed:
                 if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {needed}; run arete serve or arete migrate")
+                    action = (f"supply {WORKSPACE_HANDOFF}" if needed == WORKSPACE_CONTRACT_SCHEMA
+                              else "run arete serve or arete migrate")
+                    raise IncompatibleSchema(f"schema {version} needs {needed}; {action}")
                 time.sleep(0.5)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
             oldest = conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0]
@@ -368,10 +645,12 @@ def owned(mode, timeout, before_commit=None):
             before_commit()
         check()
 
+    callbacks = []
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
+            _OWNER.after_commit = callbacks
             if bounded:
                 check()
                 conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
@@ -388,6 +667,9 @@ def owned(mode, timeout, before_commit=None):
                     conn.set_progress_handler(None, 0)
     finally:
         _OWNER.active = None
+        _OWNER.after_commit = None
+    for callback in callbacks:
+        callback()
 
 
 @contextmanager
@@ -445,9 +727,20 @@ def write_connection():
     return active[2]
 
 
-def in_write():
+def after_commit(callback: Callable[[], None]) -> None:
+    write_connection()
+    _OWNER.after_commit.append(callback)
+
+
+def transaction_mode():
     active = getattr(_OWNER, "active", None)
-    return bool(active and active[:2] == (os.getpid(), "write") and active[2].in_transaction)
+    if active and active[0] == os.getpid() and active[2].in_transaction:
+        return active[1]
+    return None
+
+
+def in_write():
+    return transaction_mode() == "write"
 
 
 def ensure_schema() -> None:
@@ -465,7 +758,20 @@ def migrate_on_demand(needed: int = WORKSPACE_SNAPSHOT_SCHEMA) -> None:
             return
     except FileNotFoundError:
         pass
-    checked_connection(on_demand=True, needed=needed).close()
+    checked_connection(on_demand=needed <= SPEC_DELIVERY_SCHEMA, needed=needed).close()
+
+
+def require_spec_graph_schema() -> None:
+    checked_connection(needed=SPEC_GRAPH_SCHEMA, initialize_isolated=False).close()
+
+
+def require_workspace_contract() -> None:
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        if active[2].execute("PRAGMA user_version").fetchone()[0] < WORKSPACE_CONTRACT_SCHEMA:
+            raise IncompatibleSchema(f"workspace access waits for schema {WORKSPACE_CONTRACT_SCHEMA}")
+    else:
+        migrate_on_demand(WORKSPACE_CONTRACT_SCHEMA)
 
 
 def quoted(name: str) -> str:

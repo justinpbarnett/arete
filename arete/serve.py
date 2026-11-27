@@ -10,15 +10,16 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn, TextIO
 
 from . import (
     alerts,
+    factory_control,
     backup,
     capture,
     chat,
@@ -41,6 +42,7 @@ from . import (
     pilot,
     principals,
     record,
+    release_proof,
     routing,
     runner,
     serve_guard,
@@ -58,6 +60,7 @@ from . import (
 from .loops import Loop
 from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import factory as factory_state
 from .store import incidents as incident_store
 from .store import loops as loop_store
 from .store import runs as run_store
@@ -87,7 +90,7 @@ def mergecheck_reset(loop: Loop, item: dict) -> str:
 
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; from arete import codebase; codebase.load()"
 CONFIG_CHECK = "from arete import config; config.load()"
-RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
+RESTARTED_FOR_NEW_CODE = foundation.INHERITED_SERVE_CHILDREN
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = serve_guard.LOCK_FD
 ALERT_TICKS = 9
@@ -274,6 +277,20 @@ def child_pids() -> set[int]:
     return {int(p) for p in found.stdout.split()} if found.returncode == 0 else set()
 
 
+def restart_children() -> foundation.ServeChildren:
+    reap_children()
+    children = set()
+    for pid in child_pids():
+        identity = foundation.process_identity(pid)
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                confirmed = foundation.process_identity(pid)
+                children.add((pid, identity if identity == confirmed else None))
+        except ChildProcessError:
+            continue
+    return children
+
+
 def is_due(loop: Loop, last_fire: str, now: datetime) -> bool:
     last = util.parse_iso(last_fire)
     if loop.trigger.every:
@@ -328,18 +345,22 @@ class Server:
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
-        self.pool = ThreadPoolExecutor(POLL_THREADS, thread_name_prefix="poll")
+        self.pool = factory_control.WorkPool(POLL_THREADS, thread_name_prefix="poll")
         self.db_future: Future | None = None
         self.db_lock = threading.Lock()
         self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
                           "finished_at": None, "error": None}
-        restarted_with = os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
-        self.loaded = restarted_with is not None
-        self.inherited = {int(p) for p in (restarted_with or "").split(",") if p}
+        restarted = RESTARTED_FOR_NEW_CODE in os.environ
+        self.schedule_resumed = ""
+        self.loaded = restarted
+        self.workspace_contract_children = foundation.live_serve_children(foundation.inherited_serve_children())
+        self.inherited = {pid for pid, _ in self.workspace_contract_children}
+        os.environ.pop(RESTARTED_FOR_NEW_CODE, None)
+        os.environ.pop(foundation.INHERITED_SERVE_IDENTITIES, None)
         self.pruned = self.swept = self.workspaces_swept = self.rotated = 0.0
         self.checked_closed = 0.0
         self.ticks = 0
-        self.reloaded = restarted_with is not None
+        self.reloaded = restarted
         self.failing: dict[str, dict] = {}
         self.logged: dict[str, str] = {}
         self.every_loop: list[Loop] = []
@@ -361,8 +382,9 @@ class Server:
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
+        self.factory_suspended = False
         self.contracts_waiting = False
-        self.job_pools = {job.note: ThreadPoolExecutor(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
+        self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
 
     def say(self, text: str) -> None:
@@ -436,6 +458,25 @@ class Server:
         foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return False
+        if self.contracts_waiting:
+            return False
+        state = factory_state.view() if factory_state.available() else {"phase": "on", "version": 1}
+        self.factory_suspended = state["phase"] != "on"
+        if self.factory_suspended:
+            return True
+        with factory_control.activity("scheduler", state["version"]):
+            return self.run_scheduled_work(state)
+
+    def run_scheduled_work(self, state) -> bool:
+        if state["version"] > 1 and self.schedule_resumed != state["version"]:
+            resumed = util.parse_iso(state["changed"])
+            for loop in self.live:
+                if loop.trigger.cron or loop.trigger.every:
+                    old = loop_store.loop_state(loop.name)
+                    if not old.get("last_fire") or util.parse_iso(old["last_fire"]) < resumed:
+                        loop_store.set_loop_state(loop.name, last_fire=state["changed"], next_due=next_due(loop, resumed))
+            self.loaded = True
+            self.schedule_resumed = state["version"]
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
@@ -456,6 +497,7 @@ class Server:
             ("remind", self.remind, ()),
         )
         for name, action, args in stages:
+            factory_state.admit()
             self.guard(f"stage:{name}", action, *args)
         tick_stages = {"stage:reap", *(f"stage:{name}" for name, _, _ in stages)}
         return states is not None and not any(key in tick_stages or key.startswith("loop:") for key in self.failing)
@@ -543,6 +585,9 @@ class Server:
         completed = self.guard("tick", self.tick)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
+        if self.contracts_waiting or self.factory_suspended:
+            self.beat()
+            return
         self.guard("stage:alerts", self.watch_alerts)
         if self.checkout_update.acquire(blocking=False):
             try:
@@ -562,31 +607,58 @@ class Server:
             finished, self.deployment = self.deployment, None
             finished.result()
         now = time.monotonic()
-        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
+        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem and not self.contracts_waiting:
             self.deploy_at = now
             self.deployment = self.pool.submit(self.deploy_if_ready, self.cfg)
 
     def acknowledge_deploy(self, completed: bool | None) -> None:
         checkout = paths.PACKAGE_DIR.parent
         receipt = serve_guard.pending(paths.STATE_DIR, checkout)
-        if (receipt is None or not receipt.starts or self.started_head != receipt.tip[:12]
+        if receipt is None:
+            if completed:
+                release_proof.confirm_restore(self.cfg.arete_repo, checkout, self.started_head, completed)
+            return
+        if (not receipt.starts or self.started_head != receipt.tip[:12]
                 or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()
                 or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
-            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
+            if (paths.STATE_DIR / "release-checks").is_dir():
+                repo = self.cfg.repo_for_path(checkout)
+                if repo and (held := release_proof.reconcile_running(repo, receipt)):
+                    self.note_once(f"deploy: {receipt.tip} waiting for its omitted protected check ({held})")
+                    return
+            if receipt.release_checks:
+                verdict = release_proof.assess(self.cfg.arete_repo, receipt)
+                if verdict != "verified":
+                    if verdict == "failed" and not self.busy_with():
+                        release_proof.restore_or_hold(checkout, receipt, self.say)
+                    else:
+                        self.note_once(f"deploy: {receipt.tip} waiting for protected release evidence ({verdict})")
+                    return
+            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, {**serve_guard.original(paths.STATE_DIR, receipt), "healthy": True})
             self.say(f"deploy: {receipt.tip} is healthy")
+            if codebase.RELEASE == receipt.tip:
+                install.refresh_serve_guard(checkout, receipt.tip)
         elif receipt.expired():
-            self.restart_for_new_code()
+            if reason := serve_guard.rollback_schema_refusal(paths.STATE_DIR, checkout, receipt.previous):
+                self.note_once(f"deploy: code-only rollback refused because {reason}")
+            else:
+                self.restart_for_new_code()
 
     def deploy_if_ready(self, cfg: config.Config) -> None:
         try:
+            repo = cfg.repo_for_path(paths.PACKAGE_DIR)
+            if repo and repo.allows_unattended_deploy("production") and (held := release_proof.reconcile_running(repo)):
+                self.note_once(f"deploy: keeping the current release for its protected observation ({held})")
+                return
             self.deploy(cfg)
         finally:
             report_rollbacks(paths.PACKAGE_DIR.parent, self.say)
+            release_proof.advance(cfg)
 
     def deploy(self, cfg: config.Config) -> None:
-        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
+        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)) or not repo.allows_unattended_deploy("production"):
             return
         src = repo.path.resolve()
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
@@ -602,6 +674,8 @@ class Server:
                 return
             if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
                 raise RuntimeError(f"could not determine the default branch of {github}")
+            if repo.target_branch and repo.target_branch != base:
+                return
             ref = f"refs/remotes/origin/{base}"
             util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                       "origin", f"+refs/heads/{base}:{ref}"], src,
@@ -615,9 +689,9 @@ class Server:
                 ):
                     self.deploy_refused(src, tip, reason)
                     return
-                self.deploy_tip(src, base, ref, tip, github)
+                self.deploy_tip(src, base, ref, tip, github, repo)
 
-    def deploy_tip(self, src: Path, base: str, ref: str, tip: str, github: str) -> None:
+    def deploy_tip(self, src: Path, base: str, ref: str, tip: str, github: str, repo: config.Repo) -> None:
         if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
             return
         if not self.deploy_ready(src, base, tip):
@@ -644,7 +718,18 @@ class Server:
                 self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
             prior = serve_guard.pending(paths.STATE_DIR, src)
             previous = prior.previous if prior and prior.branch == base and prior.tip == recovery.head else recovery.head
-            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time())
+            if prior and prior.release_checks:
+                self.deploy_refused(src, tip, "an earlier protected release is still awaiting its decision")
+                return
+            # A still-pending build must not be allowed to replace its own rollback guard.
+            if not prior and codebase.RELEASE == recovery.head:
+                install.refresh_serve_guard(src, recovery.head)
+            previous_receipt = serve_guard.original(paths.STATE_DIR, prior) if prior else None
+            checks = release_proof.on_tip(repo, base, tip, previous)
+            if checks and not release_proof.known_good(repo.name, previous, checks):
+                self.deploy_refused(src, tip, "previous release did not pass its protected recovery check")
+                return
+            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time(), release_checks=checks)
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(receipt))
             try:
                 util.deploy_fast_forward(src, tip)
@@ -653,8 +738,8 @@ class Server:
                 return
             except (OSError, RuntimeError) as error:
                 self.restore_deploy(src, base, tip, recovery, error)
-                if prior and serve_guard.at_tip(src, prior):
-                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(prior))
+                if previous_receipt and serve_guard.at_tip(src, prior):
+                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, previous_receipt)
                 self.deploy_refused(src, tip, str(error))
                 return
         self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
@@ -826,8 +911,10 @@ class Server:
             loop_store.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
-        queued = sources.fire(loop, trigger)
-        loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+        with foundation.tx() as c:
+            factory_state.admit(c)
+            queued = sources.fire(loop, trigger)
+            loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
     def poll(self, loop: Loop) -> None:
@@ -913,8 +1000,12 @@ class Server:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-            if (c := source_store.cursor(sid)) is not None:
-                source_store.set_cursor(sid, c["value"], False, text)
+            if isinstance(e, factory_state.Off):
+                return
+            with foundation.tx() as connection:
+                factory_state.admit(connection)
+                if (c := source_store.cursor(sid)) is not None:
+                    source_store.set_cursor(sid, c["value"], False, text)
             if self.errors.get(sid) != text:
                 self.say(f"{sid}: poll failed: {text}")
             self.errors[sid] = text
@@ -930,6 +1021,7 @@ class Server:
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
         self.settle("queue:", {str(i) for i in ids})
         for item in pending:
+            factory_state.admit()
             self.guard(f"queue:{item['id']}", self.dispatch_queued, item, by_name, slots)
 
     def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
@@ -939,7 +1031,9 @@ class Server:
     def dispatch_queued_as_rule(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
-            loop_store.drop_queue_item(item["id"])
+            with foundation.tx() as c:
+                factory_state.admit(c)
+                loop_store.drop_queue_item(item["id"])
             self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
             return
         why = self.dispatch_item(item, loop, slots)
@@ -1109,19 +1203,27 @@ class Server:
             if busy := self.busy_with():
                 self.note_once(f"new code waits to load: {busy}")
                 return
-            reap_children()
-            still_running = child_pids()
+            still_running = restart_children()
+            children = foundation.live_serve_children(self.workspace_contract_children | still_running)
+            self.workspace_contract_children = children
+            beat = util.read_json(control.BEAT_FILE, {})
+            if not isinstance(beat, dict):
+                beat = {}
+            util.write_json(control.BEAT_FILE, {**beat, **foundation.workspace_child_fields(children)})
             self.say(f"new code: serve {os.getpid()} restarts itself" + (
                 f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
-            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, sorted(still_running)))
+            fields = foundation.workspace_child_fields(still_running)
             fd = self.lock.fileno()
             os.set_inheritable(fd, True)
             os.environ[SERVE_LOCK_FD] = str(fd)
+            os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, fields[foundation.WORKSPACE_CHILD_PIDS]))
+            os.environ[foundation.INHERITED_SERVE_IDENTITIES] = json.dumps(fields[foundation.WORKSPACE_CHILD_IDENTITIES])
             try:
                 os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
             except BaseException:
                 os.set_inheritable(fd, False)
-                os.environ.pop(SERVE_LOCK_FD, None)
+                for name in (SERVE_LOCK_FD, RESTARTED_FOR_NEW_CODE, foundation.INHERITED_SERVE_IDENTITIES):
+                    os.environ.pop(name, None)
                 raise
         finally:
             dashboard.POSTS_IN_FLIGHT.reopen()
@@ -1138,7 +1240,7 @@ class Server:
         every_loop, live = self.every_loop, self.live
         failing = {key: dict(found) for key, found in self.failing.items()}
         at = util.iso()
-        if not failing:
+        if not failing and not self.contracts_waiting:
             self.last_ok = at
         try:
             pending = len(loop_store.pending())
@@ -1151,6 +1253,7 @@ class Server:
             tickets = len(slots.holding(rows, "pipeline"))
         except Exception:
             tickets = None
+        self.workspace_contract_children = foundation.live_serve_children(self.workspace_contract_children)
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1160,7 +1263,10 @@ class Server:
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
             "running": running, "tickets": tickets, "poll_errors": dict(self.errors),
-            "tick_ok": not failing, "last_ok": self.last_ok, "failing": failing, "reloaded": self.reloaded,
+            "tick_ok": not failing and not self.contracts_waiting, "last_ok": self.last_ok,
+            "failing": failing, "reloaded": self.reloaded,
+            "workspace_contract_waiting": self.contracts_waiting,
+            **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
@@ -1191,18 +1297,29 @@ def cleanup_legacy() -> None:
             pass
 
 
+def startup_beat() -> foundation.ServeChildren:
+    beat, seen = util.read_json_snapshot(control.BEAT_FILE, {})
+    if not isinstance(beat, dict):
+        beat = {}
+    inherited = foundation.heartbeat_serve_children(beat, seen) | foundation.inherited_serve_children()
+    children = foundation.live_serve_children(inherited)
+    if beat.get("pid") != os.getpid():
+        beat = {}
+    util.write_json(control.BEAT_FILE, {**beat, "pid": os.getpid(), "schema": foundation.LATEST,
+                                       **foundation.workspace_child_fields(children),
+                                       "db": beat.get("db") or {
+                                           **dbstats.empty_collection(), "status": "initial",
+                                           "requested_at": None, "finished_at": None, "error": None}})
+    return children
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     codebase.load()
     rotation_notes = install.rotate_own_log()
     with principals.acting("hand"):
         held = take_serve_lock()
         try:
-            beat = util.read_json(control.BEAT_FILE, {})
-            if beat.get("pid") == os.getpid():
-                util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
-                                                  "db": beat.get("db") or {
-                                                      **dbstats.empty_collection(), "status": "initial",
-                                                      "requested_at": None, "finished_at": None, "error": None}})
+            inherited = startup_beat()
             try:
                 with util.lock("migrate", wait=True):
                     backup.recover_restore()
@@ -1217,6 +1334,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
                 report_rollbacks(paths.PACKAGE_DIR.parent, lambda line: print(line, file=sys.stderr))
                 raise SystemExit(1) from e
             server = Server()
+            server.workspace_contract_children = inherited
             server.contracts_waiting = contracts_waiting
             server.lock = held
             server.with_dashboard = with_dashboard
@@ -1229,6 +1347,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
         server.report_config()
         for note in start_notes(server.cfg):
             server.say(note)
+        factory_control.notify()
         if with_dashboard:
             threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
         while True:

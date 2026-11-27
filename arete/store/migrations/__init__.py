@@ -44,7 +44,7 @@ def owners():
 def area_owner(area, name, registered):
     if area == "work" and name == "m0004_work_event_routing.py":
         area = "loops"
-    owner = "db" if area == "foundation" else area
+    owner = {"foundation": "db", "spec": "specs"}.get(area, area)
     return owner if owner in registered else None
 
 

@@ -71,6 +71,9 @@ def unscreened_text(args: list[str], input: str | None) -> bool:
 
 def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False,
        *, retry: bool = True) -> str:
+    from .store import factory
+
+    factory.check_worker()
     if unscreened_text(args, input):
         raise TypeError("text sent to GitHub must come from gh.outgoing")
     if retry:
@@ -109,6 +112,44 @@ def ensure_label(repo: str, name: str, color: str = "5319e7", description: str =
         return f"{name}: {e}"
 
 
+def read_blocking_links(issues: list[dict]) -> None:
+    by_id = {row["id"]: row for row in issues if isinstance(row.get("id"), str) and row["id"]}
+    query = ("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Issue { id blockedBy(first: 100) "
+             "{ totalCount nodes { number state url } } } } }")
+    for ids in itertools.batched(by_id, 100):
+        payload = Outgoing(json.dumps({"query": query, "variables": {"ids": ids}}))
+        try:
+            reply = json.loads(gh(["api", "graphql", "--input", "-"], input=payload, timeout=15, retry=False))
+        except (GhError, ValueError):
+            continue
+        data = reply.get("data") if isinstance(reply, dict) else None
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        if isinstance(nodes, list):
+            for node in nodes:
+                if isinstance(node, dict) and node.get("id") in ids:
+                    by_id[node["id"]]["blockedBy"] = node.get("blockedBy")
+
+
+def with_blocking_links(args: list[str]):
+    fields = args.index("--json") + 1
+    projected = args.copy()
+    projected[fields] += ",blockedBy"
+    try:
+        data = gh_json(projected)
+    except GhError as error:
+        if 'Unknown JSON field: "blockedBy"' not in str(error):
+            raise
+        projected[fields] = args[fields] + ",id"
+        data = gh_json(projected)
+        read_blocking_links([row for row in (data if isinstance(data, list) else [data]) if isinstance(row, dict)])
+    # An unavailable projection must hold admission even when the ticket itself is readable.
+    for issue in data if isinstance(data, list) else [data]:
+        if not isinstance(issue, dict):
+            raise GhError("GitHub issue lookup returned no issue metadata")
+        issue.setdefault("blockedBy", None)
+    return data
+
+
 def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, author: str = "", *,
            search: str = "") -> list[dict]:
     args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit),
@@ -119,13 +160,57 @@ def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, aut
         args += ["--author", author]
     if search:
         args += ["--search", search]
-    return gh_json(args) or []
+    return (with_blocking_links(args) if label == "agent" else gh_json(args)) or []
 
 
 def issue(repo: str, number: int) -> dict:
-    return gh_json(
-        ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author,updatedAt"]
+    return with_blocking_links(
+        ["issue", "view", str(number), "--repo", repo, "--json",
+         "number,title,body,labels,url,comments,state,author,updatedAt"]
     )
+
+
+def open_issue_blockers(repo: str, number: int, issue: dict) -> list[int | str]:
+    connection = issue.get("blockedBy", {"nodes": [], "totalCount": 0})
+    missing = f"could not read all GitHub blocking links for {repo}#{number}"
+    if not isinstance(connection, dict):
+        raise GhError(missing)
+    nodes, count = connection.get("nodes"), connection.get("totalCount")
+    if not isinstance(nodes, list) or type(count) is not int or count < 0:
+        raise GhError(missing)
+    if len(nodes) != count:
+        nodes = api_list(f"repos/{repo}/issues/{number}/dependencies/blocked_by")
+        if len(nodes) != count:
+            raise GhError(missing)
+    blockers = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise GhError(missing)
+        state = str(node.get("state", "")).upper()
+        link = re.fullmatch(r"https://[^/]+/([\w.-]+/[\w.-]+)/issues/([1-9][0-9]*)",
+                            node.get("html_url") or node.get("url") or "")
+        if not link or state not in {"OPEN", "CLOSED"} or int(link[2]) != node.get("number"):
+            raise GhError(missing)
+        if state == "OPEN":
+            other, dependency = link[1].casefold(), int(link[2])
+            blockers.append(dependency if other == repo.casefold() else f"{other}#{dependency}")
+    return blockers
+
+
+def issue_node(repo: str, number: int) -> dict:
+    row = gh_json(["api", f"repos/{repo}/issues/{number}"])
+    if not isinstance(row, dict) or row.get("number") != number or "pull_request" in row or type(row.get("id")) is not int:
+        raise GhError(f"could not confirm issue {repo}#{number}")
+    return row
+
+
+def ensure_sub_issue(repo: str, parent: int, child: int) -> None:
+    path = f"repos/{repo}/issues/{parent}/sub_issues"
+    child_id = issue_node(repo, child)["id"]
+    if any(row.get("id") == child_id for row in api_list(path)):
+        return
+    gh(["api", path, "--method", "POST", "--input", "-"],
+       input=Outgoing(json.dumps({"sub_issue_id": child_id, "replace_parent": False})), write=True, retry=False)
 
 
 def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:
@@ -510,7 +595,8 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName"]
+    args = ["pr", "view", str(url_or_number), "--json",
+            "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName,headRefOid,baseRefName"]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}
@@ -537,8 +623,8 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
-def pr_set_draft(url: str, draft: bool) -> None:
-    gh(["pr", "ready", url, *(["--undo"] if draft else [])])
+def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = False) -> None:
+    gh(["pr", "ready", url, *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
 
 
 def pr_close(url: str) -> None:
@@ -591,8 +677,10 @@ class BaseTipChanged(str):
 
 
 def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True,
-                     watch_checks: bool = False) -> dict:
+                     watch_checks: bool = False, identity: bool = False) -> dict:
     fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title,reviewDecision"
+    if identity:
+        fields += ",url,headRefName,isCrossRepository"
     if watch_checks:
         fields += ",statusCheckRollup"
     args = ["pr", "view", pr, "--json", fields]
@@ -611,7 +699,7 @@ def merge_ref_hold(row: dict, head: str, base: str) -> str:
     return ""
 
 
-def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
+def merge_ci_passed(repo: str, head: str, *, required: dict | None = None, stage_checks: dict | None = None) -> bool:
     path = f"repos/{repo}/commits/{head}"
     checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
     statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
@@ -621,16 +709,30 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
         return False
     runs = [row for page in checks for row in page["check_runs"]]
     if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
-                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+                            and (row.get("app") or {}).get("id") == required["app_id"]
+                            and row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs):
         return False
+    skippable = set()
+    if stage_checks:
+        issuer = stage_checks["app_id"]
+        seen = {row.get("name") for row in runs if row.get("head_sha") == head and (row.get("app") or {}).get("id") == issuer
+                and row.get("status") == "completed" and row.get("conclusion") == "success"}
+        if not seen.issuperset(stage_checks["required"]):
+            return False
+        skippable = {(name, issuer, head) for name in stage_checks["allow_skipped"]}
     contexts = {}
     for page in statuses:
         if not isinstance(page, list):
             return False
         for row in page:
             contexts.setdefault(row["context"], row["state"])
-    return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
-                                           for row in runs) and all(state == "success" for state in contexts.values()))
+    def passing(row):
+        if row.get("status") != "completed":
+            return False
+        identity = (row.get("name"), (row.get("app") or {}).get("id"), row.get("head_sha"))
+        return row.get("conclusion") == "success" or (row.get("conclusion") == "skipped" and identity in skippable)
+
+    return bool(runs or contexts) and all(map(passing, runs)) and all(state == "success" for state in contexts.values())
 
 
 def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
@@ -657,7 +759,7 @@ def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None, track_moved_base: bool = False) -> tuple[str, str]:
+                    required: dict | None = None, track_moved_base: bool = False, stage_checks: dict | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
@@ -679,7 +781,7 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
         time.sleep(min(MERGE_POLL_SECONDS, remaining))
     if state != "CLEAN" or mergeable != "MERGEABLE":
         return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
-    if not merge_ci_passed(repo, head, required=required):
+    if not merge_ci_passed(repo, head, required=required, **({"stage_checks": stage_checks} if stage_checks else {})):
         return "", "GitHub has no fully passing CI result for the verified head"
     return str(row.get("title") or "").strip(), ""
 
@@ -694,8 +796,10 @@ def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha:
 
 
 def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False,
-                  required: dict | None = None) -> str:
+                  required: dict | None = None, stage_checks: dict | None = None) -> str:
     options = {"required": required} if required else {}
+    if stage_checks:
+        options["stage_checks"] = stage_checks
     subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base, **options)
     if hold:
         return hold

@@ -24,6 +24,7 @@ queue = "merge-check"
 [[emit]]
 type = "ticket"
 repo = "$finding.repo"
-labels = ["agent"]
+tracker = "configured"
+github_labels = ["agent"]
 prefix = "[merge-check] "
 approve = false

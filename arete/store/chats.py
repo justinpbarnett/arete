@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from .. import util
+from . import factory
 from .db import db, reader
 
 TABLES = {
@@ -94,7 +95,8 @@ def chat_sessions_untold() -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
             f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "
-            "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' ORDER BY l.rowid")]
+            "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' "
+            f"{factory.exclude_retained(c, 'l.run_id')} ORDER BY l.rowid")]
 
 
 def chat_tell_session(run_id: str, text: str) -> bool:

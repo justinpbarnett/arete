@@ -152,12 +152,14 @@ def sample(where: Path, adw: bool = False, orchestrated: bool = False) -> list[s
     if orchestrated:
         (answers / "worker.patch").write_text(patch)
         (answers / "worker.json").write_text(json.dumps({**SAMPLE_ANSWERS["build"], **SAMPLE_USAGE}))
+        for axis in ("standards", "spec"):
+            (answers / f"review-{axis}.json").write_text(json.dumps({**SAMPLE_USAGE,
+                "structured": {"summary": f"The {axis} review found no issues.", "findings": []}}))
         decisions = [
             [{"op": "worker.start", "args": {"goal": f"Add {SAMPLE_WORD} to {SAMPLE_FILE}.",
                "route_id": "model:build:0", "effort": "low"}}],
             [{"op": "run.wait", "args": {"timeout_seconds": 60}}],
             [{"op": "checks.run", "args": {}},
-             {"op": "verification.run", "args": {"route_id": "model:verify:0", "effort": "low"}},
              {"op": "review.run", "args": {"route_id": "model:review:0", "effort": "low"}}],
             [{"op": "publication.request", "args": {}}],
         ]

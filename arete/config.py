@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
+import pwd
 import re
 import shlex
 import tomllib
@@ -117,6 +119,10 @@ class Part:
     github: str
 
 
+LANDING_METHODS = ("pr", "direct-push")
+DEPLOYMENT_ENVIRONMENTS = ("none", "development", "staging", "production")
+
+
 @dataclass
 class Repo:
     name: str
@@ -131,6 +137,16 @@ class Repo:
     layer: Path | None = None
     parts: list[Part] = field(default_factory=list)
     jev: bool = True
+    jira_site: str = ""
+    target_branch: str = ""
+    landing: str = ""
+    unattended_environment: str = ""
+
+    def allows_unattended_deploy(self, environment: str) -> bool:
+        return (environment in DEPLOYMENT_ENVIRONMENTS[1:] and
+                (not self.unattended_environment or
+                 DEPLOYMENT_ENVIRONMENTS.index(environment) <=
+                 DEPLOYMENT_ENVIRONMENTS.index(self.unattended_environment)))
 
     @property
     def layer_dir(self) -> Path:
@@ -155,6 +171,7 @@ class JiraConfig:
     auto_per_refresh: int = 3
     sprint_only: bool = True
     skip_types: list[str] = field(default_factory=list)
+    github_owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -223,6 +240,12 @@ class Retention:
 @dataclass(frozen=True)
 class BackupConfig:
     copy_to: str = ""
+
+
+@dataclass(frozen=True)
+class SecretsConfig:
+    store: str | None = None
+    store_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -350,6 +373,7 @@ class Config:
     dashboard_owner: str = ""
     dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
+    workspace_snapshots: InitVar[Path | None] = field(default=None, kw_only=True)
     queues: dict[str, int] = field(default_factory=dict)
     pricing: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     local_providers: list[str] = field(default_factory=lambda: ["ollama"])
@@ -375,8 +399,9 @@ class Config:
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
-    def __post_init__(self, zte_repo: str | None) -> None:
+    def __post_init__(self, zte_repo: str | None, workspace_snapshots: Path | None) -> None:
         self.zte_repo = self.arete_repo if zte_repo is None else zte_repo
+        self.workspace_snapshots = workspace_snapshots
 
     def repo(self, name: str) -> Repo:
         for r in self.repos:
@@ -417,6 +442,14 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
     sparse = data is not None
     if data is None:
         data = asdict(value)
+    if isinstance(value, Config):
+        if "jira" in data:
+            data["jira"] = {key: field for key, field in data["jira"].items() if key != "github_owner"}
+        if not sparse:
+            for repo in data["repos"]:
+                for key in ("jira_site", "target_branch", "landing", "unattended_environment"):
+                    if not repo[key]:
+                        del repo[key]
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
     if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
@@ -765,6 +798,110 @@ def backup_table(data) -> BackupConfig:
     return BackupConfig(copy_to=copy_to)
 
 
+def store_path_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.parts) if paths.ON_MAC else path.parts
+
+
+def store_path_lineage(path: Path) -> list[tuple[int, int, tuple[str, ...]]]:
+    top, *descendants = (*reversed(path.parents), path)
+    info = top.stat()
+    device, inode = info.st_dev, info.st_ino
+    missing_tail: tuple[str, ...] = ()
+    lineage = [(device, inode, missing_tail)]
+    for descendant in descendants:
+        try:
+            info = descendant.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            name = descendant.name
+            missing_tail += (name.casefold() if paths.ON_MAC else name,)
+        else:
+            device, inode, missing_tail = info.st_dev, info.st_ino, ()
+        lineage.append((device, inode, missing_tail))
+    return lineage
+
+
+def store_locations_overlap(directory: Path, protected: tuple[Path, ...]) -> bool:
+    parts = store_path_parts(directory)
+    for root in map(store_path_parts, protected):
+        if parts[:len(root)] == root or root[:len(parts)] == parts:
+            return True
+    lineage = store_path_lineage(directory)
+    for root in protected:
+        protected_lineage = store_path_lineage(root)
+        if protected_lineage[-1] in lineage or lineage[-1] in protected_lineage:
+            return True
+    return False
+
+
+def validate_store_location(directory: Path, config_file: Path, repo_paths=()) -> None:
+    directory = directory.resolve()
+    protected = (config_file.parent, config_file.resolve().parent, paths.CONFIG_DIR,
+                 paths.STATE_DIR, paths.LOG_DIR, paths.WORKTREES_DIR, *repo_paths)
+    if store_locations_overlap(directory, tuple(path.resolve() for path in protected)):
+        raise ValueError("[secrets] store_dir must be separate from config, state, logs, worktrees and repositories")
+    for parent in (directory, *directory.parents):
+        try:
+            (parent / ".git").lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            if not ((parent / "HEAD").is_file() and (parent / "objects").is_dir() and (parent / "refs").is_dir()):
+                continue
+        raise ValueError("[secrets] store_dir must be outside git repositories and work trees")
+
+
+def keychain_program() -> str | None:
+    if not paths.ON_MAC or paths.ISOLATED:
+        return None
+    from . import sandbox
+
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        config_dir, state_dir = paths.CONFIG_DIR.resolve(), paths.STATE_DIR.resolve()
+        if paths.HOME.resolve() != home or sandbox.sandboxed():
+            return None
+        if (config_dir, state_dir) != (home / ".config/arete", home / ".local/share/arete"):
+            return None
+        if paths.CONFIG_FILE.is_symlink() or paths.CONFIG_FILE.resolve() != config_dir / "config.toml":
+            return None
+    except (AttributeError, KeyError, OSError, RuntimeError):
+        return None
+    return "/usr/bin/security"
+
+
+def secrets_table(data, config_file: Path, *, repo_paths=()) -> SecretsConfig:
+    if not isinstance(data, dict):
+        raise ValueError("[secrets] must be a table")
+    table = only(data, root_schema("secrets"), "[secrets]")
+    store = table.get("store", "keychain")
+    if store not in ("", "keychain", "pve_store"):
+        raise ValueError("[secrets] store must be keychain, pve_store or empty")
+    if store == "keychain" and not keychain_program():
+        store = ""
+    if "store_dir" not in table:
+        if store == "pve_store":
+            raise ValueError("[secrets] pve_store requires store_dir")
+        return SecretsConfig(store or None)
+    raw = table["store_dir"]
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        raise ValueError("[secrets] store_dir must be a directory path")
+    directory = config_file.parent / paths.expand(raw)
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("[secrets] store_dir must be a plain directory")
+    if paths.ISOLATED and (paths.confined(directory) is None or
+                           paths.scratch_root(directory) != paths.scratch_root(paths.STATE_DIR)):
+        raise ValueError("[secrets] store_dir must be inside the instance's scratch folder")
+    validate_store_location(directory, config_file, repo_paths)
+    return SecretsConfig(store or None, directory.resolve())
+
+
+def secret_settings() -> SecretsConfig:
+    try:
+        data = read_data()
+    except FileNotFoundError:
+        data = {}
+    return secrets_table(data.get("secrets", {}), paths.CONFIG_FILE,
+                         repo_paths=(paths.expand(repo["path"]) for repo in data.get("repo", ())))
+
+
 def chat_table(data, ignored: list[str] | None = None) -> ChatConfig:
     table = only(table_of(data, "chat"), root_schema("chat"), "[chat]", ignored=ignored)
     tokens = table.get("context_tokens", ChatConfig.context_tokens)
@@ -1029,9 +1166,13 @@ def load_required() -> Config:
 
 
 def jira_table(j: dict) -> JiraConfig:
+    owner = j.get("github_owner", "")
+    if not isinstance(owner, str) or owner and not re.fullmatch(r"[A-Za-z0-9-]+", owner):
+        raise ValueError("[jira] github_owner must be a GitHub organization name")
     return JiraConfig(
         env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
         project=j.get("project", ""),
+        github_owner=owner,
         transitions=moves_table(j, "transitions", {"merged": "merges move tickets through [jira.landed]",
                                                             DELIVERED: "research tickets move through [jira.research]"}),
         research=moves_table(j, "research"),
@@ -1078,7 +1219,30 @@ def github_app_table(app: dict) -> GithubApp:
     return found
 
 
+def valid_target_branch(value: object) -> bool:
+    return (isinstance(value, str) and bool(value) and value != "HEAD"
+            and not value.startswith(("-", "refs/")) and not value.endswith(".")
+            and not re.search(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{", value)
+            and all(part and not part.startswith(".") and not part.endswith(".lock") for part in value.split("/"))
+            and value != "@")
+
+
 def repo_table(repo: dict) -> Repo:
+    for key, choices in (("landing", LANDING_METHODS), ("unattended_environment", DEPLOYMENT_ENVIRONMENTS)):
+        if key in repo and repo[key] not in choices:
+            raise ValueError(f"repo {repo['name']}: {key} must be one of {', '.join(choices)}")
+    if "target_branch" in repo and not valid_target_branch(repo["target_branch"]):
+        raise ValueError(f"repo {repo['name']}: target_branch must be a Git branch name")
+    site = repo.get("jira_site", "")
+    if "jira_site" in repo:
+        from . import jira
+
+        try:
+            valid_site = isinstance(site, str) and jira.checked_base(site) == site
+        except (ValueError, jira.JiraError):
+            valid_site = False
+        if not valid_site:
+            raise ValueError(f"repo {repo['name']}: jira_site must be a Jira base URL without a trailing slash")
     tracker = repo.get("tracker", "github")
     if tracker not in configschema.enum("config_toml", "properties", "repo", "items", "properties", "tracker"):
         raise ValueError(f"repo {repo['name']}: tracker must be github, jira or local, not '{tracker}'")
@@ -1100,6 +1264,10 @@ def repo_table(repo: dict) -> Repo:
         layer=paths.expand(repo["layer"]) if repo.get("layer") else None,
         parts=parts or ([Part("", github)] if github else []),
         jev=bool(repo.get("jev", True)),
+        jira_site=site,
+        target_branch=repo.get("target_branch", ""),
+        landing=repo.get("landing", ""),
+        unattended_environment=repo.get("unattended_environment", ""),
     )
 
 
@@ -1158,6 +1326,12 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     serve = data.get("serve", {})
     if "loop_dirs" in serve:
         cfg.loop_dirs = [paths.expand(d) for d in serve["loop_dirs"]]
+    if "workspace_snapshots" in serve:
+        value = serve["workspace_snapshots"]
+        snapshots = paths.expand(value) if isinstance(value, str) else None
+        if snapshots is None or not snapshots.is_absolute():
+            raise ValueError("[serve] workspace_snapshots must be an absolute directory path")
+        cfg.workspace_snapshots = snapshots
     cfg.queues = {str(k): max(1, int(v)) for k, v in (serve.get("queues") or {}).items()}
     cfg.daily_budget_usd = float(serve["daily_budget_usd"]) if serve.get("daily_budget_usd") else None
     cfg.session_idle_hours = float(serve.get("session_idle_hours", cfg.session_idle_hours))
@@ -1199,6 +1373,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
+    secrets_table(data.get("secrets", {}), path, repo_paths=(repo.path for repo in cfg.repos))
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent, ignored)

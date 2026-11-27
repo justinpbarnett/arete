@@ -398,8 +398,15 @@ class NeverBegan(control.Refused):
 
 def launch(name: str, *, item: int | None = None, events: list[dict] | None = None, trial: bool = False,
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
     with util.lock_file(loop_store.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
@@ -478,6 +485,10 @@ def carry(run: LoopRun) -> str:
         if status == "stopped":
             how = "dead" if summary == record.STOPPED else "retry"
     summary = devices.with_left_up(summary, run.id)
+    from .store import factory
+    if factory.interrupted(run.id):
+        if status != "done":
+            return settle(run, "interrupted", "Paused by the factory switch")
     loop_store.end_claim(run.id, "dead" if status == "failed" else how, summary)
     return settle(run, status, summary)
 
@@ -607,7 +618,8 @@ def finding_text(f: dict) -> str:
 def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
     from . import mergecheck, releasejourneys
 
-    if mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop):
+    if (mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop)
+            or run.loop.origin == "arete" and run.loop.name == "mine"):
         return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}
@@ -763,6 +775,8 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     events = classify(run, events)
     if arrived and not events:
         return "skipped", f"the classifier passed none of {util.count(arrived, 'event')}"
+    if loop.origin == "arete" and loop.name == "mine":
+        return spec_retro_loop(run, events)
     memory = loop_store.loop_state(loop.name)["data"]
     res = run.agent("watch", watch_prompt(run, events, memory), agent_dir(run), tools=loop.tools,
                     json_schema=WATCH_SCHEMA)
@@ -777,6 +791,22 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     if not run.trial and isinstance(answer.get("state"), dict):
         loop_store.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
+    return finish_watch(run, events, found, fresh, summary)
+
+
+def spec_retro_loop(run: LoopRun, events: list[dict]) -> tuple[str, str]:
+    from . import spec_retro
+
+    found = []
+    for e in events:
+        if e.get("source") not in ("mine#github-specs", "mine#jira-specs") or e["type"] != "spec.closed":
+            raise ValueError("A spec retrospective requires a closed parent from its configured tracker")
+        found.extend(spec_retro.review(run, e, agent_dir(run), WATCH_SCHEMA))
+    return finish_watch(run, events, found, new_findings(run, found), f"Reviewed {util.count(len(events), 'closed spec')}")
+
+
+def finish_watch(run: LoopRun, events: list[dict], found: list[dict], fresh: list[dict], summary: str) -> tuple[str, str]:
+    loop = run.loop
     outcome = {"summary": summary, "trust": weakest_trust(events)}
     if fresh:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
@@ -789,13 +819,16 @@ def open_workspace(run: LoopRun) -> Workspace:
     src, github = repo.path, repo.github
     layer = config.load_layer(repo.layer_dir)
     if "origin" in util.git(["remote"], src, check=False).split():
-        base = layer.base_branch or (gh.default_branch(github) if github else util.origin_default_branch(src))
+        base = repo.target_branch or layer.base_branch or (
+            gh.default_branch(github) if github else util.origin_default_branch(src))
         util.git(["fetch", "origin", base], src)
         start = f"origin/{base}"
     else:
-        base = util.git(["rev-parse", "--abbrev-ref", "HEAD"], src).strip()
+        base = repo.target_branch or util.git(["rev-parse", "--abbrev-ref", "HEAD"], src).strip()
         start = base
     branch = f"loop/{run.id}"
+    if branch == repo.target_branch:
+        raise ValueError(f"the work branch is the saved target {branch}")
     wt = paths.WORKTREES_DIR / f"loop-{run.id}"
     try:
         util.add_worktree(src, wt, branch, start)

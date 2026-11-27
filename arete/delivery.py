@@ -6,7 +6,7 @@ import traceback
 from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import config, gh, jira, util
+from . import config, factory_control, gh, jira, util
 from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
@@ -100,6 +100,7 @@ def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> di
     return {}
 
 
+@factory_control.work
 def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False,
          publication=None) -> str:
     kind = delivery["type"]

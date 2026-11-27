@@ -62,6 +62,7 @@ DASHBOARD_PORT = 8796
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
 TLS_KEY_FILE = STATE_DIR / "dashboard.key"
 PUSH_KEY_FILE = STATE_DIR / "webpush.key"
+FINGERPRINT_KEY_FILE = STATE_DIR / "fingerprint.key"
 LOCKS_DIR = STATE_DIR / "locks"
 CHECK_LOCKS_DIR = Path("/tmp").resolve() / f"arete-check-slots-{os.getuid()}"
 ZTE_AUTHORITY = CONFIG_DIR / "zte-authority"

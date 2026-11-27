@@ -85,6 +85,9 @@ def repo_named(cfg: config.Config, name: str) -> config.Repo:
 
 def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "",
           force: bool = True, claim=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     prompt, ticket = prompt.strip(), ticket.strip()
     if not prompt and not ticket:
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
@@ -110,6 +113,9 @@ def begin_prompt(cfg, repo, tid):
 
 
 def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True, claim=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     try:
         tid = tracker.for_ticket(cfg, repo, ticket).normalize(ticket)
     except ValueError as e:
@@ -126,7 +132,7 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
             seq = events.emit("task.start_requested", f"task:{tid}", cls="derived", task=tid,
                               data={"repo": repo.name, "ticket": tid})
             claims.claim(claim, seq)
-    return begin(cfg, repo, tid, force=force, poller_picks=False)
+    return begin(cfg, repo, tid, force=force, poller_picks=False, owner_forcing=force)
 
 
 def recover_start(claim, force=True):
@@ -160,7 +166,10 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")
 
 
-def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
+def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if pending := pending_start(repo.name, tid):
             return pending
@@ -175,7 +184,12 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         if state == SLOT_QUEUE_FAILED:
             return queued(repo, tid, NO_SLOT_AT_START, poller_picks)
         if state != "exited":
-            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
+            result = answer(tid, repo.name, new, state, "started" if new else "child is starting")
+            if owner_forcing:
+                from . import cohorts
+
+                cohorts.owner_intervention(result, "owner-forced start")
+            return result
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
     raise did_not_show(repo, tid)
@@ -231,8 +245,15 @@ def reap_pending() -> None:
 
 
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     global PENDING_REAPER
 
+    try:
+        foundation.require_workspace_contract()
+    except foundation.IncompatibleSchema as e:
+        raise control.Refused(str(e)) from e
     with PENDING_LOCK, launch_lease.acquiring(repo_name, tid) as lease:
         before = set(run_ids(repo_name, tid))
         proc = spawn()
@@ -441,8 +462,9 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 def asks_view(*, owner_only=True) -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for row in ask_store.open_asks(connect=foundation.reader, owner_only=owner_only)
-                     if (a := owner_asks.unstaged(row))["questions"]]}
+    rows = ask_store.open_asks(connect=foundation.reader, owner_only=owner_only, group_runners=True)
+    return {"asks": [{k: ask[k] for k in keys} for row in rows
+                     if (ask := owner_asks.unstaged(row))["questions"]]}
 
 
 def stage_recovery_answers(group: list[dict], decision: dict, *, scrub) -> None:
@@ -473,6 +495,9 @@ def stage_recovery_answers(group: list[dict], decision: dict, *, scrub) -> None:
 
 
 def answer_ask(ask_id: str, body) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         ask = ask_store.ask_get(ask_id)
         if not ask:
@@ -560,21 +585,39 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
-    try:
-        checkouts = [workspace.Checkout.from_row(c)
-                     for c in flows.prepared_data(run_id).get("checkouts") or []]
-    except (TypeError, KeyError):
-        checkouts = None
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
-        row, imported = workspaces.import_legacy(ws)
-        if row and row["state"] == "removed":
+        row = workspaces.open_for(ws.name)
+        if not row:
             return None if os.path.lexists(ws) else workspace.Release("removed")
-        if imported:
-            checkouts = checkouts or workspaces.owner_of(row).checkouts or workspace.registered_root_checkout(ws)
-        if checkouts is None:
+        if row["owner_run"] != run_id or row["kept_reason"] in (workspaces.LEGACY_RESUME, "operator"):
             return None
+        if row["kept_reason"] == workspaces.LEGACY_WAITING:
+            latest = run_store.newest_whole_run(repo.name, tid)
+            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, tid):
+                return workspaces.remove_imported_waiting(ws, row)
+            return None
+        try:
+            checkouts = [workspace.Checkout.from_row(c)
+                         for c in flows.prepared_data(run_id).get("checkouts") or []]
+        except (TypeError, KeyError):
+            checkouts = None
+        if not checkouts:
+            checkouts = workspaces.owner_of(row).checkouts
+            if not checkouts and os.path.lexists(ws):
+                return None
+            made = workspace.made_before(ws)
+            for c in checkouts:
+                attached, unsafe = workspace.checkout_attachment(ws, c.wt)
+                if unsafe is not None or (attached and not saved_checkout_head(made, c)):
+                    return None
         return workspace.remove_workspace(ws, checkouts, edits=True)
+
+
+def saved_checkout_head(made: dict, checkout: workspace.Checkout) -> bool:
+    head = workspace.head_recorded(made, checkout)
+    return bool(head and util.git(["symbolic-ref", "-q", "HEAD"], checkout.wt, check=False).strip()
+                and util.git(["rev-parse", "HEAD"], checkout.wt, check=False).strip() == head)
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
@@ -593,7 +636,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         folder = "its work folder was left in place"
         try:
             release = kept_folder_removed(repo, tid, run_id) if latest else None
-        except (OSError, sqlite3.Error, migrations.Refused, workspaces.SnapshotUnavailable) as e:
+        except (OSError, sqlite3.Error, foundation.IncompatibleSchema, migrations.Refused) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
             if release and release.state == "removed":
@@ -676,7 +719,45 @@ def release_closed(cfg: config.Config) -> list[str]:
     return notes
 
 
+def resume_factory_run(row):
+    """Respect single-step scope and the original workflow's continuation contract."""
+    key = row["id"]
+    if row.get("only_step"):
+        lines = run_lines.read(key)
+        execution = factory.first(lines, "execution")
+        source = execution.get("continues") or factory.first(lines, "route").get("continues")
+        if not source:
+            raise control.Refused("Cannot identify the source of this single-step run")
+        cfg, repo, _ = command_run(key, row["version"])
+        path = pipeline.recorded_path(source)
+        step = row["only_step"]
+        select = ["--action", step, "--only-action"] if path == "orchestrate" else ["--only", step]
+        settings = [f"--set={setting}" for setting in execution.get("settings", [])]
+        return launch(cfg, repo, str(row["issue"]), command_of(
+            cfg, path, repo.name, str(row["issue"]), "--continue", source, *select, *settings,
+            *(["--dry-run"] if row.get("dry_run") else [])), admission=(key, row["version"]))
+    path = pipeline.recorded_path(key)
+    if row.get("dry_run") and path != "classic":
+        cfg, repo, _ = command_run(key, row["version"])
+        return launch(cfg, repo, str(row["issue"]), command_of(
+            cfg, path, repo.name, str(row["issue"]), "--dry-run", "--continue", key), admission=(key, row["version"]))
+    if path == "classic":
+        with util.lock(STEER_LOCK, wait=True):
+            cfg, repo, row = command_run(key, row["version"])
+            no_later_run(row)
+            if row["status"] != "interrupted" or row.get("files_purged"):
+                raise control.Refused("The interrupted classic workspace is no longer available")
+            if (paths.RUNS_DIR / key / "factory-publishing.json").exists():
+                raise control.Refused("Inspect the interrupted classic publication before retrying")
+            return launch(cfg, repo, str(row["issue"]), control.command(
+                ["run", repo.name, str(row["issue"]), "--local", "--force", *(["--dry-run"] if row.get("dry_run") else [])]), admission=(key, row["version"]))
+    return resume(key, base_version=row["version"])
+
+
 def resume(run_id: str, step: str = "", base_version=None, *, environment_release: str = "") -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
@@ -744,6 +825,9 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
 
 
 def repair(run_id: str, base_version=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         tid = str(row["issue"])
@@ -787,6 +871,9 @@ def adaptive_action(row: dict, action: str) -> dict:
 
 
 def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row["status"] == "running":
