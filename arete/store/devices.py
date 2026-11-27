@@ -13,6 +13,16 @@ TABLES = {
 
 
 REFRESH_SCOPE = "credential-refresh-v1:"
+LEGACY_SCOPES: dict[str, str] = {}
+LEGACY_SCOPE_LIMIT = 256
+
+
+def remember_legacy_scope(current: str, legacy: str) -> None:
+    if not current or not legacy or current == legacy:
+        return
+    if len(LEGACY_SCOPES) >= LEGACY_SCOPE_LIMIT:
+        LEGACY_SCOPES.clear()
+    LEGACY_SCOPES[current] = legacy
 
 
 def hold(scope: str, until: str, why: str) -> None:
@@ -38,10 +48,28 @@ def holds(connect=reader) -> list[dict]:
                                            (REFRESH_SCOPE + "%", util.iso()))]
 
 
-def clear_holds(scopes: list[str], set_before: str) -> None:
+def migrate_holds(aliases: dict[str, str]) -> list[dict]:
     with tx() as c:
         links = refresh_links(c)
-        linked = {s for scope in scopes for s in linked_scopes(scope, links)}
+        now = util.iso()
+        for before, after in aliases.items():
+            row = c.execute("SELECT * FROM holds WHERE scope = ? AND (until = '' OR until > ?)",
+                            (before, now)).fetchone()
+            if row:
+                for linked in linked_scopes(after, links):
+                    save_hold(c, linked, row["until"], row["why"], row["ts"])
+                c.execute("DELETE FROM holds WHERE scope = ?", (before,))
+        return holds()
+
+
+def clear_holds(scopes: list[str], set_before: str) -> None:
+    expanded = list(scopes)
+    for scope in scopes:
+        if legacy := LEGACY_SCOPES.get(scope):
+            expanded.append(legacy)
+    with tx() as c:
+        links = refresh_links(c)
+        linked = {s for scope in expanded for s in linked_scopes(scope, links)}
         c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in linked])
 
 

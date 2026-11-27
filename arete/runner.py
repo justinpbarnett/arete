@@ -202,7 +202,7 @@ def login_restored(cfg: config.Config, repo: config.Repo, layer: config.RepoLaye
         if not generation:
             return True
         auth = authentication(route.model, route.runner, cfg=cfg, repo=repo)
-        if auth.generation and auth.generation != generation:
+        if auth.generation and generation not in {auth.generation, getattr(auth, "legacy_generation", "")}:
             return True
     return False
 
@@ -362,9 +362,9 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         launch_kw = admitted(launch_kw, on_launch(route))
-        account = account_of(picked.auth)
+        has_account = bool(picked.auth.identity or picked.auth.credential)
         with ExitStack() as after_attempt:
-            if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
+            if has_account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
                 local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
                 if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
                     after_attempt.callback(enroll_after_attempt, picked)
@@ -376,21 +376,25 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
-            res.session = replace(res.session, credential=chosen_route.credential, account=account,
+            res.session = replace(res.session, credential=chosen_route.credential, account=account_of(picked.auth),
                                   generation=picked.auth.generation)
             if openrouter:
                 res.session = replace(res.session, openrouter_model=picked.name, openrouter_run=config_run)
         if not res.usage_limit:
-            if res.ok:
-                devices_store.clear_holds([accounts.scope(a, s, picked.unknown) for a in picked.auths
-                                   for s in routing.limit_scopes(a, picked.name)], set_before=started)
+            if res.ok and paths.DB_FILE.exists() and devices_store.holds():
+                scopes = [found for a in picked.auths for s in routing.limit_scopes(a, picked.name)
+                          for found in (accounts.scope(a, s, picked.unknown),
+                                        accounts.legacy_scope(a, s, picked.unknown))
+                          if found]
+                devices_store.clear_holds(scopes, set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
         why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
                else f"{chosen_route.runner} provider could not be reached" if limit.kind == "unreachable"
                else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
         for a in picked.auths:
-            devices_store.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
+            if hold_scope := accounts.scope(a, limit.scope, picked.unknown):
+                devices_store.hold(hold_scope, limit.until, why)
         limited.append(res)
         previous = Stopped(res, picked)
         key = routing.route_key(chosen_route)
@@ -632,7 +636,9 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
         if why := discovery.policy_refusal(candidate.credential, auth.mode):
             skipped.append(passed_over(candidate, "policy", why))
             continue
-        unknown = "local-" + accounts.fingerprint(trip.invocation, auth.generation)
+        unknown = ("" if (candidate.credential == "local" and not (auth.identity or auth.credential))
+                   or accounts.instance_key() is None
+                   else "local-" + accounts.fingerprint(trip.invocation, auth.generation))
         auths = {auth, *(selected.refreshed_auths if selected else ())}
         active = [h for a in auths if (h := routing.auth_hold(a, name, unknown=unknown))]
         held = max(active, key=lambda h: (not h["until"], h["until"]), default=None)
@@ -684,9 +690,26 @@ def out_of_headroom(res: Result) -> bool:
             and any(s["state"] == HEADROOM_STATE for s in res.skipped))
 
 
+ACCOUNT_PREFIX = "account-v2:"
+
+
 def account_of(auth: accounts.Auth) -> str:
     who = auth.identity or auth.credential
-    return accounts.fingerprint(auth.mode, auth.family, auth.provider, who) if who else ""
+    return ACCOUNT_PREFIX + accounts.fingerprint(auth.mode, auth.family, auth.provider, who) if who else ""
+
+
+def legacy_account_of(auth: accounts.Auth) -> str:
+    who = auth.legacy_identity or auth.legacy_credential
+    return accounts.legacy_fingerprint(auth.mode, auth.family, auth.provider, who) if who else ""
+
+
+def matches_account(saved: str, auth: accounts.Auth) -> bool:
+    return bool(saved) and saved == (account_of(auth) if saved.startswith(ACCOUNT_PREFIX) else legacy_account_of(auth))
+
+
+def refreshed(generation: str, auth: accounts.Auth) -> bool:
+    return (devices_store.refresh_continues(generation, auth.generation)
+            or devices_store.refresh_continues(generation, auth.legacy_generation))
 
 
 def session_route(session: Session, candidate: routing.Candidate) -> bool:
@@ -699,8 +722,9 @@ def continues(stopped: Stopped, picked: Picked, persist: bool) -> bool:
     before, now = stopped.picked.auth, picked.auth
     res = stopped.res
     return (session_route(res.session, picked.candidate) and bool(res.session.id) and res.turns > 1
-            and persist and (before == now or (bool(account_of(before)) and account_of(before) == account_of(now))
-                             or devices_store.refresh_continues(before.generation, now.generation)))
+            and persist and (before == now or matches_account(res.session.account, now)
+                             or matches_account(account_of(before), now)
+                             or refreshed(before.generation, now) or refreshed(res.session.generation, now)))
 
 
 def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[[str], str] | None,
@@ -708,8 +732,7 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
     which = picked.candidate.runner
     saved = trip.resume
     usable = saved.id and session_route(saved, picked.candidate) and (
-        not saved.account or saved.account == account_of(picked.auth)
-        or devices_store.refresh_continues(saved.generation, picked.auth.generation))
+        not saved.account or matches_account(saved.account, picked.auth) or refreshed(saved.generation, picked.auth))
     if previous is None and usable:
         return prompt, saved
     if previous is not None and continues(previous, picked, kw.get("persist", True)):
