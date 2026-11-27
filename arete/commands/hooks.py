@@ -178,7 +178,7 @@ class HookFloor:
 
 
 def cmd_guard(args) -> int:
-    from .. import codex, guard, sandbox, scratch
+    from .. import codex, guard, sandbox, scratch, tool_events
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     try:
@@ -197,9 +197,34 @@ def cmd_guard(args) -> int:
             target = cwd / paths.expand(values.get("path") or ".") / search_path(values.get("pattern") or "")
             if boundary.denies(target):
                 return codex.write_guard_decision(guard.reach(str(target)))
-        return codex.write_guard_decision(guard.decide(payload, args.judge, boundary))
+        confined = tool_events.in_worker()
+        reason = guard.decide(payload, args.judge and not confined, boundary)
+        if not reason and confined and args.judge and command.strip():
+            reason = worker_guard(command.strip(), cwd)
+        return codex.write_guard_decision(reason)
     except Exception:
         return codex.write_guard_decision("Arete could not verify the agent's file or command permissions.")
+
+
+def worker_guard(command: str, cwd: Path) -> str:
+    from .. import guard, jev, scratch, tool_events
+
+    if not tool_events.has_worker_judge():
+        return ""
+    shown = guard.PLACEHOLDER.sub("", command).strip() or command
+    state = f"{scratch.context(command, str(cwd))}Working directory: {cwd}\n\nCommand:\n{shown}"
+    reply = tool_events.worker_judge_request("guard", cwd.resolve(), jev.clip(state))
+    probability = reply.get("probability")
+    if not jev.worker_probability(probability):
+        return ""
+    if reply.get("blocked") == "irreversible":
+        reason, way = f"a step git cannot undo (p {probability:.2f})", "Find a way git can undo"
+    elif reply.get("blocked") == "secrets":
+        reason, way = f"touching credentials (p {probability:.2f})", "Work without the credentials"
+    else:
+        return ""
+    return (f"Arete's guard blocked this command: JEV reads it as {reason}. "
+            f"{way}, or leave the step for a person and say so in your summary.")
 
 
 def cmd_upload_guard(args) -> int:

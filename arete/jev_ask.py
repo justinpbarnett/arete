@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import config, jev, paths, sandbox
+from . import config, jev, sandbox, tool_events
 
 NOTE = ("You can run `{ask}`, which puts a question to JEV, a fast classifier that costs next to nothing, over text you "
         "pipe in or over files you name, and gives an answer and a confidence for each. Use it to sort or check many "
@@ -69,14 +69,23 @@ def main(args) -> int:
     files = [f for f in files if f not in refused]
     if not cfg.jev_allowed([cfg.repo_for_work_dir(here), *map(cfg.repo_for_work_dir, files)]):
         return fail("JEV is off for this repo in the arete config")
-    if not jev.key():
-        return fail(f"no {jev.KEY_NAME}; put it in {paths.short_path(jev.KEY_FILE)}")
+    confined = tool_events.in_worker()
+    if confined:
+        if not tool_events.has_worker_judge():
+            return fail(jev.WORKER_UNAVAILABLE)
+        if not jev.valid_worker_question(q):
+            return fail("question or choices exceed the confined JEV limits")
+    elif not jev.key():
+        return fail(f"no {jev.KEY_NAME}; set {jev.KEY_ADDRESS}")
     if args.paths:
-        rows = asked_files(files, q, cfg) + [{"path": str(f), "skipped": why} for f, why in refused.items()]
+        rows = asked_files(files, q, cfg, confined=confined)
+        rows.extend({"path": str(f), "skipped": why} for f, why in refused.items())
     elif sys.stdin.isatty():
         return fail("give paths, or pipe the text in")
     else:
-        rows = [row("", jev.ask(sys.stdin.read(), {"q": q}, cfg, trace=("", "ask")), q)]
+        reply = (worker_ask(sys.stdin.read(jev.STATE_CHARS + 1), q) if confined else
+                 jev.ask(sys.stdin.read(), {"q": q}, cfg, trace=("", "ask")))
+        rows = [row("", reply, q)]
     if args.only:
         rows = [r for r in rows if r.get("answer") == args.only or "error" in r]
     if args.json:
@@ -87,7 +96,24 @@ def main(args) -> int:
     return 1 if any("error" in r for r in rows) else 0
 
 
-def asked_files(files: list[Path], q: dict, cfg: config.Config) -> list[dict]:
+def worker_ask(text: str, q: dict) -> jev.Reply:
+    reply = tool_events.worker_judge_request("ask", Path.cwd().resolve(), jev.clip(text), question=q)
+    probabilities = reply.get("probabilities")
+    if isinstance(probabilities, dict):
+        answer = jev.Answer(reply.get("value"), reply.get("confidence"), probabilities)
+        if clean := jev.worker_answer(answer, q):
+            return jev.Reply(answers={"q": jev.Answer(**clean)})
+    return jev.Reply(error=jev.WORKER_UNAVAILABLE)
+
+
+def asked_files(files: list[Path], q: dict, cfg: config.Config, *, confined=False) -> list[dict]:
+    if confined:
+        rows = []
+        for f in files:
+            text = jev.readable(f, limit=4 * jev.STATE_CHARS + 1)
+            rows.append(row(str(f), worker_ask(f"File: {f}\n\n{text}", q), q) if text is not None else
+                        {"path": str(f), "skipped": "binary or unreadable"})
+        return rows
     texts = [(f, jev.readable(f)) for f in files]
     readable = [(f, t) for f, t in texts if t is not None]
     replies = jev.ask_many([(f"File: {f}\n\n{t}", {"q": q}) for f, t in readable], cfg, trace=("", "ask"))

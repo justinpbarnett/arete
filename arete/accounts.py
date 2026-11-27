@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 import urllib.request
 import uuid
@@ -264,7 +265,7 @@ def legacy_scope(auth: Auth, limit: str, unknown: str = "") -> str:
 
 
 def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False,
-           defer_unconfigured: bool = False) -> dict | None:
+           defer_unconfigured: bool = False, usage: str = "personal") -> dict | None:
     who = auth.identity or auth.credential
     if not (auth.provider and auth.mode and who) or not paths.DB_FILE.exists():
         return None
@@ -299,8 +300,18 @@ def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = Fal
         else:
             identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
                                           auth.identity or (secret_id if secret_id is not None else who))
-        return credentials.save_account(c, label, auth.provider, auth.mode, holder, "personal", identity, digest,
+        return credentials.save_account(c, label, auth.provider, auth.mode, holder, usage, identity, digest,
                                         secret_id)
+
+
+def record_workspace(row, provider, mode):
+    if row is None:
+        return
+    try:
+        return record(Auth(mode, provider=provider, credential=row["fingerprint"]),
+                      secret_id=row["id"], usage="workspace")
+    except (OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, secretstore.StoreMissing) as error:
+        LOG.warning("Could not record a workspace account (%s)", type(error).__name__)
 
 
 def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigured: bool = False,

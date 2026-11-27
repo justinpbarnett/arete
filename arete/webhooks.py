@@ -3,17 +3,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import secrets
 from datetime import timedelta
 from urllib.parse import parse_qs
 
-from . import loops, paths, sources, util
+from . import loops, paths, secret_move, secretstore, sources, util
 from .refusals import Stated
 from .store import db as foundation
 from .store import sources as source_store
 
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
+KEY_NAME = "WEBHOOK_SECRET"
 HOOK_PATH = "/hook/"
 BODY_KEY_WINDOW = timedelta(minutes=10)
 MAX_HOOK_BODY = 1024 * 1024
@@ -25,21 +25,56 @@ def hook_path(name: str) -> str:
     return HOOK_PATH + name
 
 
-def secret_file(name: str):
-    return HOOKS_DIR / f"{name.replace('/', '.')}.secret"
+def scope(name):
+    return "connector:loop." + name.replace("/", ".")
 
 
-def secret(name: str, create: bool = True) -> str:
-    p = secret_file(name)
-    if p.is_file():
-        return p.read_text().strip()
-    if not create:
+def legacy_file(name):
+    stem = scope(name).removeprefix("connector:loop.")
+    return secret_move.fallback(HOOKS_DIR / (stem + secret_move.HOOK_SUFFIX))
+
+
+def present(name):
+    target = scope(name)
+    row = secretstore.registered(target, KEY_NAME) if secretstore.SCOPE.fullmatch(target) else None
+    if row is not None:
+        return row["status"] == "set"
+    old = legacy_file(name)
+    return bool(old and old.is_file() and old.stat().st_size)
+
+
+def secret(name: str) -> str:
+    target = scope(name)
+    if secretstore.SCOPE.fullmatch(target):
+        row, value = secretstore.lookup(target, KEY_NAME)
+        if row is not None:
+            return value
+    old = legacy_file(name)
+    try:
+        return paths.read_confined(old).decode().strip() if old else ""
+    except FileNotFoundError:
         return ""
-    HOOKS_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(secrets.token_urlsafe(32) + "\n")
-    return p.read_text().strip()
+
+
+def unique_scope(name, found):
+    if any(other.name != name and other.trigger.webhook and scope(other.name) == scope(name) for other in found):
+        raise Stated(409, "More than one webhook uses that secret address.")
+
+
+def rotate(name, actor):
+    found = loops.load_all()
+    loop = next((loop for loop in found if loop.name == name), None)
+    if not loop or not loop.trigger.webhook:
+        raise Stated(404, f"No webhook for {name}.")
+    if loop.error:
+        raise Stated(409, f"The loop {name} is broken.")
+    unique_scope(name, found)
+    target = scope(name)
+    if not secretstore.SCOPE.fullmatch(target):
+        raise Stated(400, "This loop name cannot be used as a secret address.")
+    value = secrets.token_urlsafe(32)
+    secretstore.put(target, KEY_NAME, value, "webhook_secret", actor, provider="webhook", managed_by="arete")
+    return value
 
 
 def bearer_token(authorization: str) -> str:
@@ -48,7 +83,7 @@ def bearer_token(authorization: str) -> str:
 
 
 def check(name: str, headers, body: bytes) -> None:
-    key = secret(name, create=False)
+    key = secret(name)
     if not key:
         raise Stated(404, f"No webhook for {name}.")
     signature = headers.get("X-Hub-Signature-256", "")
@@ -96,9 +131,11 @@ def event_of(name: str, headers, body: bytes) -> dict:
 
 
 def receive(name: str, headers, body: bytes) -> dict:
-    loop = next((x for x in loops.load_all() if x.name == name), None)
+    found = loops.load_all()
+    loop = next((x for x in found if x.name == name), None)
     if not loop or not loop.trigger.webhook:
         raise Stated(404, f"No webhook for {name}.")
+    unique_scope(name, found)
     check(name, headers, body)
     from .store import factory
     try:

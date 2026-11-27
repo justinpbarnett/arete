@@ -302,7 +302,7 @@ class Jira(Source):
     scope = ("jql", "on_update")
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
-        client = jira.Client.from_env(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira)
         fields = ["summary", "status", "reporter", "updated", "description", "labels"]
         out = []
         for issue in client.search(source["jql"], fields, limit=int(source.get("limit", 50))):

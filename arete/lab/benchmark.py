@@ -4,7 +4,6 @@ import contextlib
 import http.client
 import json
 import math
-import os
 import re
 import socket
 import statistics
@@ -21,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import accounts, config, devices, outbound, pi, util
+from .. import accounts, config, devices, outbound, pi, secretstore, util
 
 SCENARIOS = ("ok", "oom", "overflow", "malformed", "offline")
 SERVED = ("ok", "oom", "overflow", "malformed")
@@ -141,8 +140,7 @@ def read_manifest(path: Path) -> Spec:
         spec.max_seconds = ranged(data["max_seconds"], 1, 7200, "max_seconds")
     if "escalation" in data:
         spec.escalation = read_rates(data["escalation"])
-    env = {**os.environ, **util.read_env_file(pi.KEYS_FILE)}
-    spec.candidates = [read_candidate(name, accounts.mapping(raw), env) for name, raw in table.items()]
+    spec.candidates = [read_candidate(name, accounts.mapping(raw)) for name, raw in table.items()]
     return spec
 
 
@@ -154,7 +152,7 @@ def read_rates(raw) -> dict:
     return {k: ranged(raw[k], 0, float("inf"), f"escalation {k}") for k in keys}
 
 
-def read_candidate(name: str, raw: dict, env: dict) -> Candidate:
+def read_candidate(name: str, raw: dict) -> Candidate:
     if not NAME.fullmatch(name):
         raise Refused(f"candidate {name}: the name may use letters, digits, - and _ only")
     if unknown := sorted(set(raw) - CANDIDATE_KEYS):
@@ -177,7 +175,7 @@ def read_candidate(name: str, raw: dict, env: dict) -> Candidate:
     if base is None:
         key = ""
     else:
-        key = pi.configured_key(key, env)
+        key = pi.configured_key(key, secretstore.env(pi.key_references(key) - pi.SERVICE_KEYS))
     return Candidate(name, raw["route"], provider, model, base or "", key, raw["quantization"], raw["runtime"],
                      raw["runtime_version"], raw["hardware"], raw["memory_gb"], window, device)
 

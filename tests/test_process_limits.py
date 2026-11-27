@@ -5564,13 +5564,15 @@ class TrackerReadmissionTests(ReadmissionFixture):
         client = jira.Client("https://example.invalid", "unused", "unused")
         ordinary = [{"key": f"FIXTURE-{i}"} for i in range(1, 21)]
         parked = {"key": "FIXTURE-21", "fields": {"summary": "Parked ticket"}}
-        with patch.dict(tracker._clients, {"": client}), patch.object(client, "get", side_effect=[
-            {"issues": [], "isLast": True},
-            {"issues": ordinary, "isLast": False, "nextPageToken": "next"},
-            {"issues": [parked], "isLast": True},
-        ]) as read:
+        with (patch.object(jira.Client, "from_env", return_value=client) as from_env,
+              patch.object(client, "get", side_effect=[
+                  {"issues": [], "isLast": True},
+                  {"issues": ordinary, "isLast": False, "nextPageToken": "next"},
+                  {"issues": [parked], "isLast": True},
+              ]) as read):
             self.assertEqual([ticket.id for ticket in source.todo(parked=lambda key: key == parked["key"])],
                              [parked["key"]])
+        from_env.assert_called_once_with(self.cfg.jira)
         self.assertEqual(read.call_args.kwargs["nextPageToken"], "next")
 
 
