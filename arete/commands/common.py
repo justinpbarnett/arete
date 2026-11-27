@@ -110,6 +110,36 @@ def print_waiting(w: dict) -> None:
               + ("review submitted" if t["at_once"] else f"last comment {t['last']}"))
 
 
+def print_ticket_progress(rows: list[dict]) -> None:
+    if not rows:
+        return
+    print("ticket progress:")
+    for row in rows:
+        since = f" since {when(row['since'])}" if row.get("since") else ""
+        print(f"  {row['ticket']}: {row['activity']}{since}")
+        if row["blocker"]:
+            print(f"    Blocker: {row['blocker']}")
+        if row["next_event"]:
+            print(f"    Next: {row['next_event']}")
+        if timing := row.get("timing"):
+            for line in timing["lines"]:
+                print(f"    {line}")
+        for pr in row["prerequisites"]:
+            label = ("Deployed prerequisite" if pr["deployed_release"] else
+                     "Merged prerequisite (deployment not confirmed)" if pr["state"] == "merged" else
+                     f"Prerequisite ({pr['state']})")
+            print(f"    {label}: {pr['url']}")
+        unread = [ref for ref, read in row["prerequisite_issues"].items() if not read]
+        if unread:
+            print(f"    Prerequisite lookup not confirmed: {', '.join(unread)}")
+        if follow_up := row["follow_up"]:
+            label = "Draft follow-up" if follow_up["draft"] else "Follow-up PR"
+            for url in follow_up["prs"]:
+                print(f"    {label}: {url}")
+        for update in row["updates"]:
+            print(f"    {when(update['at'])}: {update['message']}")
+
+
 def print_triage(t: dict) -> None:
     from .. import triage
 

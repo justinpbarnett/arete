@@ -11,21 +11,28 @@ async function loadRunDetail(id) {
   const request = ++feedRequest;
   if (feedOf.id !== id) feedOf = { id, epoch: null, after: 0, lines: [] };
   if (messagePage.run !== id) messagePage = { run: id, after: 0 };
-  const messages = messagePage.after ? `?messages_after=${messagePage.after}` : "";
-  const board = await call(`/api/runs/${encodeURIComponent(id)}${messages}`);
+  const path = `/api/runs/${encodeURIComponent(id)}`;
+  const [board, page] = await Promise.all([
+    loadScreen("run", path, id),
+    messagePage.after ? call(`${path}?messages_after=${messagePage.after}`) : null,
+  ]);
   if (board.lines_from === "feed") {
     let after = feedOf.id === id ? feedOf.after : 0;
     let data = await call(`/api/feed/${encodeURIComponent(id)}?after=${after}`);
-    if (request !== feedRequest || feedOf.id !== id) return { board, feed: { data, asked: after, request } };
-    if (feedOf.epoch !== null && data.restore_epoch < feedOf.epoch) return { board, feed: { data, asked: after, request } };
+    if (request !== feedRequest || feedOf.id !== id) return { board, page, feed: { data, asked: after, request } };
+    if (feedOf.epoch !== null && data.restore_epoch < feedOf.epoch) return { board, page, feed: { data, asked: after, request } };
     if (feedOf.epoch !== null && data.restore_epoch !== feedOf.epoch) {
       feedOf = { id, epoch: data.restore_epoch, after: 0, lines: [] };
       after = 0;
       data = await call(`/api/feed/${encodeURIComponent(id)}?after=0`);
     }
-    return { board, feed: { data, asked: after, request } };
+    return { board, page, feed: { data, asked: after, request } };
   }
-  return { board, log: await call(`/api/log/${encodeURIComponent(id)}`) };
+  const [log, renderProgress] = await Promise.all([
+    call(`/api/log/${encodeURIComponent(id)}`),
+    board.ticket_progress && ticketProgressRenderer(),
+  ]);
+  return { board, page, log, renderProgress };
 }
 
 function mergeFeed(id, { data, asked, request }) {
@@ -95,7 +102,7 @@ function drawRunDetail(pane, result, kind) {
     fill(`${pane}-talk`);
     return SLOW_MS;
   }
-  const { board, feed, log } = result.value;
+  const { board, page, feed, log, renderProgress } = result.value;
   const r = board.run;
   const running = r.status === "running";
   const lines = feed ? mergeFeed(id, feed) : log.lines;
@@ -114,13 +121,14 @@ function drawRunDetail(pane, result, kind) {
       fact("Paid", paidWords(r, board.models)),
       fact("Pull request", r.pr_url ? pullLinks(r.pr_url) : ""),
       fact("Summary", r.summary ? withLinks(r.summary) : "")),
+    renderProgress ? [el("h3", { text: "Ticket progress" }), renderProgress(board.ticket_progress)] : null,
     board.approvals.length ? [el("h3", { text: "Waiting for you" }),
       table("", NEEDS_HEADS, board.approvals.map((a) => approvalRow(a, place)), { stack: true })] : null,
     s ? [el("h3", { text: "Session" }), el("dl", { class: "w" },
       fact("Folder", s.cwd ? pathCode(s.cwd) : ""), fact("Repo", s.repo), fact("Tools", s.tools.join(", ") || "none")),
     s.prompt ? foldText(`prompt:${id}`, "Show the first message", s.prompt) : null] : null,
     board.models.length ? [el("h3", { text: "Models" }), modelTable(board.models)] : null,
-    orchestrationDetail(board, place),
+    orchestrationDetail(page || board, place),
     el("h3", { text: feed ? "Feed" : "Log" }),
     el("pre", { class: `lines ${feed ? "feed" : "log"}`, tabindex: "0", "data-focus": "lines", "aria-label": feed ? "The feed" : "The log" },
       lines.length ? lines.map((text) => el("span", { text })) : feed ? "Nothing in the feed yet." : "This run has no log yet."));
