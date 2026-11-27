@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
@@ -12,6 +12,7 @@ from . import (
     config,
     environment_gaps,
     flows,
+    gh,
     intake,
     jira,
     launch_lease,
@@ -26,6 +27,8 @@ from . import (
     queueing,
     requeue,
     routing,
+    run_lines,
+    run_timing,
     runlimits,
     spec_delivery,
     spec_graph,
@@ -75,9 +78,9 @@ def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracke
     return [*([tk] if repo.parts or isinstance(tk, tracker.JiraTracker) else []), tracker.LocalTracker(repo)]
 
 
-def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
-                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
-                recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> tracker.Ticket | None:
+def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
+                     other_routes: set[str], excluded: set[str],
+                     recovered: tuple[tracker.Ticket, ...], observe) -> Iterator[tracker.Ticket]:
     for source in ticket_queues(repo, tk):
         def retry_failed(tid: str) -> bool:
             if runlimits.latest_park(repo.name, tid)[1]:
@@ -119,8 +122,13 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
-            return t
-    return None
+            yield t
+
+
+def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
+                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
+                recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> tracker.Ticket | None:
+    return next(fresh_candidates(repo, tk, skips, other_routes, excluded, recovered, observe), None)
 
 
 def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
@@ -131,13 +139,8 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
     return out
 
 
-def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
-              other_routes: set[str], excluded: set[str] = frozenset(),
-              recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> Pick | None:
-    from .store import factory
-
-    excluded = excluded | oncall.parked(repo.name) | factory.held_tickets(repo.name)
-
+def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
+                  other_routes: set[str], excluded: set[str]) -> Pick | None:
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
                 and not run_store.issue_running(repo.name, tid) and not spec_graph.queue_blocker(tk, tid))
@@ -155,7 +158,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 if tid in feedback_due:
                     return Pick(tid, FEEDBACK_PICK, from_feedback=True)
                 if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
-                    excluded = excluded | {tid}
+                    excluded.add(tid)
                     continue
             return Pick(tid, "restarting after an interruption")
     for tid in spec_store.answering(repo.name):
@@ -181,8 +184,25 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
             return Pick(t.id, f"{t.title} (you replied to the question)")
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered, observe=observe)
-    return Pick(fresh.id, fresh.title, from_queue=True) if fresh else None
+    return None
+
+
+def pick_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
+                    other_routes: set[str], excluded: set[str],
+                    recovered: tuple[tracker.Ticket, ...], observe) -> Iterator[Pick]:
+    from .store import factory
+
+    excluded = set(excluded).union(oncall.parked(repo.name), factory.held_tickets(repo.name))
+    if pick := priority_pick(repo, tk, skips, other_routes, excluded):
+        yield pick
+    for ticket in fresh_candidates(repo, tk, skips, other_routes, excluded, recovered, observe):
+        yield Pick(ticket.id, ticket.title, from_queue=True)
+
+
+def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
+              other_routes: set[str], excluded: set[str] = frozenset(),
+              recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> Pick | None:
+    return next(pick_candidates(repo, tk, skips, other_routes, excluded, recovered, observe), None)
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
@@ -441,8 +461,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     if not reply and claim and ask_store.asks_of(claim["run"], "open"):
         reply = "its asks are still waiting for an owner answer"
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
-    answering = answered is not None
-    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
+    if answered is None and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
@@ -456,17 +475,25 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
         repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or (ticket.blocker if ticket.is_spec else source.blocker(tid)) or reply
+    route_blocked = ""
     if not blocked and continues:
-        blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer, mode="orchestrate")
+        blocked = route_blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer, mode="orchestrate")
     elif not blocked:
         newest = run_store.newest_whole_run(repo.name, tid)
         if not (newest and newest["status"] == "interrupted" and flows.pending_catch_up(newest["id"])):
             if not zte.reserved(str(tid)):
                 ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
-            blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer,
-                                         **({"mode": "orchestrate"} if ticket.is_spec else {}))
+            blocked = route_blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer,
+                                                         **({"mode": "orchestrate"} if ticket.is_spec else {}))
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
+        if route_blocked and not dry_run:
+            waiting = answered or run_store.newest_live_whole_run(repo.name, tid) or {}
+            if waiting.get("status") == "needs-info" and (answered or pipeline.answer_text(waiting["id"])):
+                rid = waiting["id"]
+                skips.current[name]["answer_run"] = rid
+                if skips.before.get(name, {}).get("answer_run") != rid:
+                    skips.current[name]["since"] = util.iso()
         print(f"{util.iso()} {name}: {blocked}")
         return "blocked"
     why = "continuing the held PR after an explicit requeue" if continues else pick.why
@@ -493,16 +520,20 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
             if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
                 continue
             try:
-                if not dry_run and repo.name in cfg.unblock_repos:
-                    from . import unblock
-
+                observe = None
+                if not dry_run and (repo.name in cfg.unblock_repos or isinstance(queue.tracker, tracker.GitHubTracker)):
                     def observe(source, tickets):
-                        unblock.publish_queue(repo, source, tickets)
+                        if repo.name in cfg.unblock_repos:
+                            from . import unblock
 
-                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected,
-                                     queue.recovered, observe=observe)
-                else:
-                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected, queue.recovered)
+                            unblock.publish_queue(repo, source, tickets)
+                        if isinstance(source, tracker.GitHubTracker):
+                            guard(errors, f"{repo.name} dependency discovery",
+                                  lambda: environment_gaps.observe_dependencies(cfg, source))
+
+                candidates = pick_candidates(repo, queue.tracker, skips, queue.other_routes, queue.selected,
+                                             queue.recovered, observe)
+                pick = next(candidates, None)
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:
@@ -514,6 +545,9 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 result = start_pick(cfg, queue, pick, skips, dry_run, going, slots)
                 if result in ("held", "refused"):
                     exhausted.add(repo.name)
+                    if result == "held" and not dry_run:
+                        for _ in candidates:
+                            pass
                 elif result == "started":
                     selected_work = True
                     slots -= 1
@@ -536,8 +570,9 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
             try:
                 if spec_graph.queue_blocker(queue.tracker, row["issue"], native=True):
                     continue
-                can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
-                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
+                slot_blocker = held_back(cfg, repo.name, going, slots - started)
+                can_start = started < MAX_STARTS_PER_POLL and not slot_blocker
+                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start, slot_blocker=slot_blocker):
                     queue.selected.add(str(row["issue"]))
                     going[repo.name] += 1
                     started += 1
@@ -559,10 +594,37 @@ def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira
         skips.keep_project(project)
 
 
-def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
-                           sync_landings: Callable[[config.Config], None]) -> None:
+def pr_ready(url: str) -> bool | None:
+    try:
+        pr = gh.pr_merge_details(url, timeout=15, retry=False)
+    except (gh.GhError, ValueError):
+        return None
+    if not isinstance(pr, dict):
+        return None
+    state, draft = pr.get("state"), pr.get("isDraft")
+    if state in ("MERGED", "CLOSED"):
+        return True
+    return not draft if state == "OPEN" and type(draft) is bool else None
+
+def observe_drafts(cfg: config.Config) -> None:
+    repos, states = {repo.name for repo in cfg.repos}, {}
+    for row in run_store.ticket_attention_runs():
+        if (row["repo"] in repos and not zte.reserved(str(row["issue"]))
+                and run_timing.draft_report(row, run_timing.read_log(rid := row["id"]))):
+            urls = set(row["pr_url"].split())
+            states.update((url, pr_ready(url)) for url in sorted(urls - states.keys()))
+            observed = {states[url] for url in urls}
+            if observed == {True} or False in observed:
+                run_store.note_draft_review(rid, row["pr_url"], ready=observed == {True})
+
+def save_skips(skips: pipeline.SkipLog) -> None:
+    now = util.iso()
+    for name, old in skips.before.items():
+        current = skips.current.get(name, {})
+        if ((rid := old.get("answer_run")) and isinstance(since := old.get("since"), str) and since < now
+                and (rid, since) != (current.get("answer_run"), current.get("since"))):
+            run_lines.write(rid, "wait", event_id=f"provider-wait:{since}", cause="provider", phase="end", since=since, at=now)
     util.write_json(pipeline.SKIPPED_FILE, skips.current)
-    sync_landings(cfg)
 
 
 def poll(dry_run: bool = False) -> int:
@@ -594,6 +656,7 @@ def poll_admitted(dry_run: bool) -> int:
             guard(errors, "capturing cohort arrivals", cohorts.sync)
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
+            guard(errors, "observing draft status", lambda: observe_drafts(cfg))
             guard(errors, "syncing spec deliveries", lambda: spec_delivery.sync(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
         going = Counter(r["repo"] for r in live_pipeline_runs())
@@ -612,8 +675,12 @@ def poll_admitted(dry_run: bool) -> int:
         selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots - resumed) or resumed > 0
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
+            def finish_poll():
+                save_skips(skips)
+                outcomes.sync_landings(cfg)
+
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
-            guard(errors, "poll", lambda: save_skips_and_landings(cfg, skips, outcomes.sync_landings))
+            guard(errors, "poll", finish_poll)
             mark_loop("poll", not errors, "; ".join(errors))
         elif not errors and not selected_work:
             print(f"{util.iso()} poll dry run: no new run would start")

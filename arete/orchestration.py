@@ -1087,7 +1087,7 @@ class Controller(worker_turns.WorkerTurns):
                 "verification_required": required, "capable_routes": routes,
                 "next_action": next_action}
 
-    def verification_attempt(self, args):
+    def verification_attempt(self, args, *, progress_attempt: str = ""):
         setting = self.catalog.route(args["route_id"], args["effort"], ("verify",))
         tools = verification_attempts.capabilities(self.job.b, setting)
         host = verification_attempts.host()
@@ -1154,7 +1154,8 @@ class Controller(worker_turns.WorkerTurns):
                 covered = tuple(c["what"] for c in prior.checks if (c.get("driver") or c.get("probe"))
                                 and c.get("passed") and c["what"].casefold() in proven) if pending else ()
                 outcome = self.atomic("verify", tree=str(self.job.ws), single=True, covered_commands=covered,
-                                      **({"delivery_token": ledger.digest(promise)} if delivery_name else {}))
+                                      **({"delivery_token": ledger.digest(promise)} if delivery_name else {}),
+                                      **({"progress_attempt": progress_attempt} if progress_attempt else {}))
         finally:
             self.job.goal = goal
         if not tree or tree != self.fingerprint() or host != verification_attempts.host():
@@ -2633,7 +2634,8 @@ class Controller(worker_turns.WorkerTurns):
         if op == "verification.decide":
             return self.decide_verification(args)
         if op == "verification.run" and self.uses_code_review:
-            return self.verification_attempt(args)
+            admitted_run = action.get("run") or self.run.id
+            return self.verification_attempt(args, progress_attempt=f"{admitted_run}/{action['id']}")
         if op == "review.decide":
             return self.decide_findings(args)
         if op == "review.run" and self.uses_code_review:
@@ -2659,8 +2661,13 @@ class Controller(worker_turns.WorkerTurns):
             self.job.goal, self.job.fix_reply = goal + references, reply + references
             try:
                 with self.selected(setting):
-                    outcome = self.atomic(role, **({"tree": str(self.job.ws), "single": True} if role == "verify"
-                                                   else {"attempt": self.job.reviews + 1, **({"code_review": True} if self.uses_code_review else {})}))
+                    if role == "verify":
+                        admitted_run = action.get("run") or self.run.id
+                        outcome = self.atomic(role, tree=str(self.job.ws), single=True,
+                                              progress_attempt=f"{admitted_run}/{action['id']}")
+                    else:
+                        outcome = self.atomic(role, attempt=self.job.reviews + 1,
+                                              **({"code_review": True} if self.uses_code_review else {}))
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
@@ -2677,7 +2684,12 @@ class Controller(worker_turns.WorkerTurns):
                 raise ValueError("; ".join(errors))
             return self.atomic("orchestrate_ask", request=ask).data
         if op == "publication.request":
-            return self.publish(args.get("unverified_measurement"))
+            previous = getattr(self.run, "publication_check_attempt", "")
+            self.run.publication_check_attempt = f"{action.get('run') or self.run.id}/{action['id']}"
+            try:
+                return self.publish(args.get("unverified_measurement"))
+            finally:
+                self.run.publication_check_attempt = previous
         if op == "run.finish":
             if args["reason"] == "noop" and self.data.get("ci_failed"):
                 raise ValueError("CI is still failed; retry CI through publication.request, repair, or finish failed")

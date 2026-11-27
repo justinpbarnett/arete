@@ -185,6 +185,7 @@ class GitHubTracker:
         self._tickets: dict[str, Ticket] = {}
         self._open: dict[int, bool | None] = {}
         self._open_agent_tickets: list[Ticket] = []
+        self._dependency_tickets: list[Ticket] = []
 
     @property
     def queue_hint(self) -> str:
@@ -206,6 +207,10 @@ class GitHubTracker:
     def open_agent_tickets(self) -> tuple[Ticket, ...]:
         return tuple(self._open_agent_tickets)
 
+    @property
+    def dependency_tickets(self) -> tuple[Ticket, ...]:
+        return tuple(self._dependency_tickets)
+
     def remember(self, tid: str, issue: dict) -> Ticket:
         tid = str(tid)
         ticket = Ticket(tid, self.ref(tid), issue.get("title") or "", body=issue.get("body") or "",
@@ -223,7 +228,7 @@ class GitHubTracker:
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
         self._tickets, self._open = {}, {}
-        self._open_agent_tickets = []
+        self._open_agent_tickets, self._dependency_tickets = [], []
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             tid = str(i["number"])
             ticket = self.remember(tid, i)
@@ -231,6 +236,9 @@ class GitHubTracker:
             ticket.labels.sort()
             names = set(ticket.labels)
             self._open_agent_tickets.append(ticket)
+            owned = self.by_owner(i)
+            if owned and not names & {ZTE_LABEL, BATCH_LABEL}:
+                self._dependency_tickets.append(ticket)
             if (names & skip or not self.by_publisher(i, ticket.is_spec)
                     or failed in names and not (parked and parked(tid))):
                 continue
