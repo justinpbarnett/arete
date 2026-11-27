@@ -9723,6 +9723,7 @@ class ServeTicketCountsTests(unittest.TestCase):
         server.reloaded = False
         server.cfg = SimpleNamespace(ignored=())
         server.config_problem = server.code_problem = ""
+        server.authority_problem = ""
         rows = [
             {"kind": "pipeline", "repo": "fixture", "issue": 1},
             {"kind": "pipeline", "repo": "fixture", "issue": 2},

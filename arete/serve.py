@@ -45,6 +45,7 @@ from . import (
     release_proof,
     routing,
     runner,
+    scratch,
     serve_guard,
     sessions,
     slots,
@@ -382,6 +383,7 @@ class Server:
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
+        self.authority_problem = ""
         self.factory_suspended = False
         self.contracts_waiting = False
         self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
@@ -1254,6 +1256,8 @@ class Server:
         except Exception:
             tickets = None
         self.workspace_contract_children = foundation.live_serve_children(self.workspace_contract_children)
+        authority_problem = "; ".join(dict.fromkeys(filter(None, (
+            self.authority_problem, scratch.ignored_legacy_authority()))))
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1268,6 +1272,7 @@ class Server:
             "workspace_contract_waiting": self.contracts_waiting,
             **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
+            **({"authority_problem": authority_problem} if authority_problem else {}),
             **({"config_problem": self.config_problem} if self.config_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
         })
@@ -1333,7 +1338,9 @@ def run(with_dashboard: bool = True) -> NoReturn:
                 print(str(e), file=sys.stderr)
                 report_rollbacks(paths.PACKAGE_DIR.parent, lambda line: print(line, file=sys.stderr))
                 raise SystemExit(1) from e
+            authority_problem = scratch.start_authority()
             server = Server()
+            server.authority_problem = authority_problem
             server.workspace_contract_children = inherited
             server.contracts_waiting = contracts_waiting
             server.lock = held
@@ -1342,6 +1349,8 @@ def run(with_dashboard: bool = True) -> NoReturn:
             held.close()
             raise
         server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+        if authority_problem:
+            server.say(authority_problem)
         for note in rotation_notes:
             server.say(note)
         server.report_config()

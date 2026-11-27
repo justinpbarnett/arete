@@ -60,25 +60,49 @@ def fixture_bearer(person):
     return "Bearer " + text
 
 
+def isolated_behavior_environment(case, *, scratch_root=False):
+    folder = tempfile.TemporaryDirectory(suffix=".noindex", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
+    root = Path(case.enterContext(folder))
+    if scratch_root:
+        root = root / f"{paths.SCRATCH_PREFIX}1234567890abcdef{paths.SCRATCH_SUFFIX}"
+        root.mkdir(mode=0o700)
+    env = api_check.isolated_env(root)
+    if scratch_root:
+        env[paths.SCRATCH_ENV] = str(root)
+    return root, env
+
+
+def run_isolated_behavior_child(case, root, env, script, *argv):
+    command = api_check.child_command(api_check.SOURCE, script, *argv)
+    done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+    case.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
 class _SecretChildCase(unittest.TestCase):
     adapter_only = False
+    fixture_pwd = False
+    owner_state = False
 
-    def run_secret_child(self, entry, *, keychain=False, schema=None):
-        folder = tempfile.TemporaryDirectory(suffix=".noindex", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
-        root = Path(self.enterContext(folder))
-        if self.adapter_only:
-            root = root / f"{paths.SCRATCH_PREFIX}1234567890abcdef{paths.SCRATCH_SUFFIX}"
-            root.mkdir(mode=0o700)
-        env = api_check.isolated_env(root)
-        if self.adapter_only:
-            env[paths.SCRATCH_ENV] = str(root)
+    def run_secret_child(self, entry, *, keychain=False, schema=None, argv=()):
+        root, env = isolated_behavior_environment(self, scratch_root=self.adapter_only)
         env["ARETE_DRIVE_FLUSH"] = "0"
         store = "keychain" if keychain else "pve_store"
-        (root / "config/config.toml").write_text(f'[secrets]\nstore = "{store}"\nstore_dir = "../store"\n')
+        store_dir = "../store"
+        if self.owner_state:
+            home = root / "pwd-home"
+            state = home / ".local/share/arete"
+            settings = home / ".config/arete"
+            for path in (state, settings):
+                path.mkdir(parents=True)
+            env.update(ARETE_STATE_DIR=str(state), ARETE_CONFIG_DIR=str(settings), HOME=str(home))
+            store_dir = str(root / "store")
+        (Path(env["ARETE_CONFIG_DIR"]) / "config.toml").write_text(
+            f'[secrets]\nstore = "{store}"\nstore_dir = {json.dumps(store_dir)}\n')
         if keychain:
             bin_dir = root / "bin"
             bin_dir.mkdir()
-            security = bin_dir / "fixture-security"
+            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", os.defpath)
+            security = bin_dir / "security"
             security.write_text(f"#!{sys.executable}\n" + r"""
 import json
 import shlex
@@ -117,11 +141,30 @@ from arete.store import db
 
 case = unittest.TestCase()
 """
-        if self.adapter_only:
+        if self.fixture_pwd:
+            init = """
+import pwd
+from pathlib import Path
+from unittest import mock
+
+pwd_home = Path.cwd() / 'pwd-home'
+pwd_home.mkdir(exist_ok=True)
+getpwuid = pwd.getpwuid
+
+def fixture_pwd(uid):
+    entry = getpwuid(uid)
+    return pwd.struct_passwd((*entry[:5], str(pwd_home), entry[6]))
+
+mock.patch.object(pwd, 'getpwuid', side_effect=fixture_pwd).start()
+""" + init
+        if self.adapter_only and not argv:
             init += "assert paths.ISOLATED\n"
         if keychain:
             init += """
-fixture_security = str(Path.cwd() / 'bin/fixture-security')
+import shutil
+
+fixture_security = str(Path.cwd() / 'bin/security')
+assert shutil.which('security') == fixture_security
 run = secretstore.subprocess.run
 subprocess_error = secretstore.subprocess.SubprocessError
 
@@ -156,9 +199,675 @@ assert_schema({schema!r})
         script = init + entry
         if schema is not None:
             script = "from arete import api_check\nwith api_check.offline():\n" + indent(script, "    ")
-        command = api_check.child_command(api_check.SOURCE, script)
-        done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        run_isolated_behavior_child(self, root, env, script, *argv)
+
+
+class _AuthorityChildCase(_SecretChildCase):
+    fixture_pwd = True
+
+
+AUTHORITY_FIXTURE = r"""
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import time
+from dataclasses import asdict
+
+from arete import browser, sandbox, scratch
+
+authority = paths.STATE_DIR / 'verification-authority'
+legacy = pwd_home / '.config/arete/verification-authority'
+pin = {'fixture-browser': {'version': '1.0.0', 'integrity': 'sha512-fixture'}}
+name = 'VERIFICATION_SIGNING_KEY'
+
+
+def envelope(key, data):
+    # The pre-refactor representation, independent of the implementation's encoder.
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+    signature = hmac.new(key, encoded(data), hashlib.sha256).hexdigest()
+    return encoded({'data': data, 'signature': signature})
+
+
+def new_attempt(letter, root=None):
+    workspace = paths.WORKTREES_DIR / ('workspace-' + letter)
+    run_dir = paths.RUNS_DIR / ('run-' + letter)
+    workspace.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    root = root or workspace / (paths.SCRATCH_PREFIX + letter * 16 + paths.SCRATCH_SUFFIX)
+    return scratch.Attempt(letter * 64, letter * 16, run_dir.name, 'verify', str(workspace), str(root),
+                           str(run_dir), {}, {})
+
+
+def record(attempt, **fields):
+    return {'attempt': asdict(attempt), 'version': 2, 'state': 'done', 'source_mutations': False, **fields}
+
+
+def record_name(attempt):
+    return attempt.selector + '.json'
+
+
+def load(attempt):
+    with scratch.registry() as (fd, key):
+        return scratch.load(fd, key, attempt.selector)
+
+
+def lease(path, attempt):
+    return os.open(path / (attempt.selector + '.lease'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+
+def tree_bytes(path):
+    return {p.relative_to(path): p.read_bytes() if p.is_file() else None for p in path.rglob('*')}
+
+
+@contextmanager
+def engine():
+    assert sandbox.AUTHORITY == authority, sandbox.AUTHORITY
+    with (mock.patch.object(sandbox, 'can_confine', return_value=True),
+          mock.patch.object(scratch, 'process_ids', return_value={}),
+          mock.patch.object(scratch, 'service_labels', return_value={}),
+          mock.patch.object(scratch, 'identity_of', return_value=1),
+          mock.patch.object(scratch, 'holders', return_value=[])):
+        yield
+
+
+def make(letter):
+    a = new_attempt(letter)
+    return scratch.make(a.run_id, a.step, Path(a.workspace), Path(a.run_dir))
+"""
+
+
+class AuthoritySignedFileTests(_AuthorityChildCase):
+    def test_legacy_record_and_pin_bytes_are_unchanged_by_the_shared_writer(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+a = new_attempt('a')
+data = record(a, fixture='non-ASCII \u2603')
+large_pin = {'fixture-browser': {'version': '1.0.0', 'integrity': 'x' * scratch.MAX_RECORD_BYTES}}
+with engine(), scratch.registry(True) as (fd, key):
+    expected = {record_name(a): envelope(key, data), browser.PIN: envelope(key, large_pin)}
+    for filename, payload in expected.items():
+        (authority / filename).write_bytes(payload)
+    assert scratch.load(fd, key, a.selector) == data and browser.read_pin() == large_pin
+    scratch.store(fd, key, data)
+    browser.store_pin(fd, key, large_pin)
+    assert {filename: (authority / filename).read_bytes() for filename in expected} == expected
+    with case.assertRaisesRegex(ValueError, 'byte limit'):
+        scratch.store(fd, key, {**data, 'fixture': 'x' * scratch.MAX_RECORD_BYTES})
+    assert (authority / record_name(a)).read_bytes() == expected[record_name(a)]
+""")
+
+    def test_bad_signatures_keep_distinct_record_and_pin_errors(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+a = new_attempt('a')
+with engine():
+    with scratch.registry(True) as (fd, key):
+        wrong_key = bytes([key[0] ^ 1]) + key[1:]
+        scratch.store(fd, wrong_key, record(a))
+        browser.store_pin(fd, wrong_key, pin)
+        with case.assertRaises(ValueError):
+            scratch.load(fd, key, a.selector)
+        assert not scratch.verifies(fd, key, browser.PIN)
+        scratch.store(fd, key, record(a))
+    with case.assertRaisesRegex(sandbox.ConfinementUnavailable, 'the pin is not signed by this engine'):
+        browser.read_pin()
+    with case.assertRaisesRegex(scratch.RotationRefused, browser.PIN):
+        scratch.rotate()
+    assert not (authority / scratch.NEXT_SECRET).exists()
+""")
+
+    def test_rotation_helpers_do_not_import_browser(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+import ast
+import inspect
+
+assert browser.PIN == scratch.PIN == 'browser-server.pin'
+for fn in (scratch.verifies, scratch.resign, scratch.rotation_counts, scratch.rotate):
+    imports = (n for n in ast.walk(ast.parse(inspect.getsource(fn))) if isinstance(n, ast.ImportFrom))
+    assert not any(n.level == 1 and n.module is None and any(a.name == 'browser' for a in n.names)
+                   for n in imports), fn.__name__
+""")
+
+
+class SecretVerificationKeyMintTests(_AuthorityChildCase):
+    def test_missing_signing_secret_cannot_be_reminted_over_records_or_change_the_fingerprint(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+a = new_attempt('a')
+with engine(), scratch.registry(True) as (fd, key):
+    scratch.store(fd, key, record(a))
+expected = secretstore.item_digest(secretstore.fingerprint_key(), key)
+row = secretstore.get('global', name)
+assert row['kind'] == 'signing_key' and row['store'] == 'owner_file' and row['fingerprint'] == expected
+ref = secretstore.parse_reference(row['reference'], db.schema_metadata()['instance_tag'])
+assert ref.item == 'verification-authority/signing.secret'
+key_path = authority / scratch.SECRET
+key_path.unlink()
+with engine(), case.assertRaises(PermissionError) as refused:
+    with scratch.registry(True):
+        case.fail('missing key was replaced')
+assert str(authority) in str(refused.exception) and record_name(a) in str(refused.exception)
+assert not key_path.exists()
+assert (authority / record_name(a)).read_bytes() == envelope(key, record(a))
+assert secretstore.get('global', name)['fingerprint'] == expected
+""")
+
+    def test_pin_and_rotation_artifacts_prevent_minting_in_hot_and_settled_folders(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+authority.mkdir(mode=0o700)
+settled = authority / scratch.SETTLED
+settled.mkdir(mode=0o700)
+a = new_attempt('a')
+artifacts = {filename: b'fixture artifact from a previous signing key'
+             for filename in (browser.PIN, scratch.NEXT_SECRET, scratch.ROTATION_MARKER)}
+artifacts[record_name(a)] = envelope(b'previous fixture key', record(a))
+for folder in (authority, settled):
+    for filename, contents in artifacts.items():
+        artifact = folder / filename
+        with case.subTest(artifact=artifact):
+            artifact.write_bytes(contents)
+            try:
+                with engine(), case.assertRaises(PermissionError) as refused:
+                    with scratch.registry(True):
+                        case.fail('key minted despite a signed-file or rotation artifact')
+                assert str(authority) in str(refused.exception) and filename in str(refused.exception)
+                assert not (authority / scratch.SECRET).exists()
+            finally:
+                artifact.unlink()
+assert secretstore.get('global', name) is None
+""")
+
+
+class SecretVerificationKeyRotationTests(_AuthorityChildCase):
+    def test_rotation_resigns_record_and_pin_and_records_the_new_owner_file_fingerprint(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+a = new_attempt('a')
+data = record(a)
+with engine():
+    with scratch.registry(True) as (fd, old):
+        scratch.store(fd, old, data)
+        browser.store_pin(fd, old, pin)
+    old_row = secretstore.get('global', name)
+    assert scratch.rotate() == (1, 1)
+    with scratch.registry() as (fd, new):
+        assert new != old and scratch.load(fd, new, a.selector) == data
+        with case.assertRaises(ValueError):
+            scratch.load(fd, old, a.selector)
+        with case.assertRaises(sandbox.ConfinementUnavailable):
+            browser.load_pin(fd, old)
+    assert browser.read_pin() == pin
+row = secretstore.get('global', name)
+expected = secretstore.item_digest(secretstore.fingerprint_key(), new)
+assert row['fingerprint'] == expected != old_row['fingerprint']
+assert row['reference'] == old_row['reference'] and row['rotated_at']
+rotated, = [e for e in secretstore.history('global', name) if e['event'] == 'rotated']
+assert rotated['fingerprint_after'] == expected and rotated['at'] == row['rotated_at']
+with db.reader() as c:
+    changes = [json.loads(r['data']) for r in c.execute(
+        "SELECT data FROM events_log WHERE kind = 'credential.changed' AND subject = ? ORDER BY seq",
+        ('secret:global/' + name,))]
+assert [c['fingerprint'] for c in changes].count(expected) == 1
+assert changes[-1] == {'scope': 'global', 'name': name, 'fingerprint': expected}
+""")
+
+    def test_check_repairs_the_row_when_rotation_dies_after_the_swap(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+from arete.store import credentials
+
+class StopAfterSwap(BaseException):
+    pass
+
+key_path = authority / scratch.SECRET
+a = new_attempt('a')
+with engine(), scratch.registry(True) as (fd, old):
+    scratch.store(fd, old, record(a))
+previous = secretstore.get('global', name)
+history = secretstore.history('global', name)
+fingerprint_key = secretstore.fingerprint_key()
+emit = credentials.secret_changed
+
+
+def changes(c):
+    return [json.loads(r['data']) for r in c.execute(
+        "SELECT data FROM events_log WHERE kind = 'credential.changed' AND subject = ? ORDER BY seq",
+        ('secret:global/' + name,))]
+
+
+with db.reader() as c:
+    previous_changes = changes(c)
+
+
+def stop_after_swap(c, row, actor):
+    new = key_path.read_bytes()
+    if (row['scope'], row['name']) != ('global', name) or new == old:
+        return emit(c, row, actor)
+    fingerprint = secretstore.item_digest(fingerprint_key, new)
+    assert row == credentials.secret(c, 'global', name)
+    assert row['fingerprint'] == fingerprint != previous['fingerprint']
+    rotated, = credentials.history(c, row['id'])[len(history):]
+    assert rotated['event'] == 'rotated' and rotated['fingerprint_after'] == fingerprint
+    emit(c, row, actor)
+    assert changes(c) == [*previous_changes, {'scope': 'global', 'name': name, 'fingerprint': fingerprint}]
+    raise StopAfterSwap()
+
+
+with engine():
+    with (mock.patch.object(credentials, 'secret_changed', side_effect=stop_after_swap),
+          case.assertRaises(StopAfterSwap)):
+        scratch.rotate()
+    new = key_path.read_bytes()
+    assert new != old
+    with scratch.authority_fd() as fd:
+        assert scratch.load(fd, new, a.selector) == record(a)
+assert secretstore.get('global', name) == previous
+assert secretstore.history('global', name) == history
+with db.reader() as c:
+    assert changes(c) == previous_changes
+repaired = secretstore.check('global', name)
+assert repaired['status'] == 'set' and repaired['check_ok']
+assert repaired['fingerprint'] == secretstore.item_digest(fingerprint_key, new)
+assert secretstore.get('global', name)['fingerprint'] == repaired['fingerprint']
+assert key_path.read_bytes() == new
+""")
+
+    def test_rotation_refuses_a_held_lease_then_resumes_partly_signed_files(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+class Interrupted(BaseException):
+    pass
+
+a = new_attempt('a')
+with engine():
+    with scratch.registry(True) as (fd, key):
+        scratch.store(fd, key, record(a))
+        browser.store_pin(fd, key, pin)
+    before = tree_bytes(authority)
+    held = lease(authority, a)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with case.assertRaisesRegex(scratch.RotationRefused, a.selector + r'\.lease'):
+            scratch.rotate()
+        assert {p: data for p, data in tree_bytes(authority).items() if p.suffix != '.lease'} == before
+    finally:
+        os.close(held)
+
+    resign = scratch.resign
+    signed = []
+    def interrupt(fd, old, new, filename):
+        if signed:
+            raise Interrupted()
+        resign(fd, old, new, filename)
+        signed.append(filename)
+
+    with mock.patch.object(scratch, 'resign', side_effect=interrupt), case.assertRaises(Interrupted):
+        scratch.rotate()
+    assert (authority / scratch.SECRET).read_bytes() == key
+    next_key = (authority / scratch.NEXT_SECRET).read_bytes()
+    assert signed and (authority / scratch.ROTATION_MARKER).is_file()
+    assert scratch.rotate() == (1, 1)
+    assert (authority / scratch.SECRET).read_bytes() == next_key != key
+    assert not (authority / scratch.ROTATION_MARKER).exists()
+    assert not (authority / scratch.NEXT_SECRET).exists()
+    assert load(a) == record(a) and browser.read_pin() == pin
+""")
+
+
+class AuthorityReplayTests(_AuthorityChildCase):
+    def test_replay_attempt_finishes_in_custom_state_without_touching_the_pwd_home_store(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+with paths.CONFIG_FILE.open('a') as out:
+    out.write('\n[replay]\nall = true\n')
+assert config.load().replay.all
+assert paths.STATE_DIR == Path(os.environ['ARETE_STATE_DIR']) and paths.HOME != pwd_home
+assert sandbox.AUTHORITY == authority
+legacy.mkdir(mode=0o700, parents=True)
+(legacy / scratch.SECRET).write_bytes(b'fixture representing the old key')
+(legacy / scratch.SECRET).chmod(0o600)
+(legacy / browser.PIN).write_bytes(envelope(b'fixture representing the old key', pin))
+before = tree_bytes(legacy)
+with engine():
+    a = make('a')
+    (Path(a.root) / 'out/output.txt').write_text('replayed verification')
+    assert (authority / record_name(a)).is_file()
+    archive, saved, held = scratch.end(a, Path(a.run_dir))
+    assert not held and not Path(a.root).exists()
+    assert load(a)['state'] == 'done'
+    assert Path(archive).is_relative_to(authority / a.selector) and 'out/output.txt' in saved
+assert tree_bytes(legacy) == before
+""")
+
+
+class AuthorityScratchIsolationTests(_AuthorityChildCase):
+    adapter_only = True
+
+    def test_state_in_a_scratch_root_has_no_verification_authority(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+assert paths.ISOLATED and not paths.GUARD_HOOK
+assert paths.STATE_DIR.is_relative_to(Path(os.environ[paths.SCRATCH_ENV]))
+assert sandbox.AUTHORITY == paths.NOWHERE
+assert not authority.exists()
+""")
+
+    def test_guard_hook_cannot_authorize_a_record_from_producer_owned_state(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+from dataclasses import replace
+
+assert paths.GUARD_HOOK and not paths.ISOLATED
+root = Path(os.environ[paths.SCRATCH_ENV])
+assert paths.STATE_DIR.is_relative_to(root)
+a = replace(new_attempt('a', root=root), directories={'': scratch.identity(root.stat())})
+authority.mkdir(mode=0o700)
+with paths.directory_fd(authority) as fd:
+    scratch.create_secret(fd, scratch.SECRET)
+    key = scratch.read_secret(fd)
+    data = record(a, state='active')
+    scratch.store(fd, key, data)
+    assert scratch.load(fd, key, a.selector) == data
+held = lease(authority, a)
+try:
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    scratch.HOOK.update(root=a.root, id=a.selector, saves=str(authority / a.selector))
+    with mock.patch.object(sandbox, 'can_confine', return_value=True):
+        assert scratch.authorized() is None
+    assert sandbox.AUTHORITY == paths.NOWHERE
+finally:
+    os.close(held)
+""", argv=('guard',))
+
+
+AUTHORITY_MIGRATION = AUTHORITY_FIXTURE + r"""
+from arete import heartbeat, serve
+
+mock.patch.object(scratch, 'legacy_authority', return_value=legacy).start()
+legacy_key = b'legacy fixture key'.ljust(32, b'!')
+
+
+@contextmanager
+def old_store():
+    legacy.mkdir(mode=0o700, parents=True)
+    secret = legacy / scratch.SECRET
+    secret.write_bytes(legacy_key)
+    secret.chmod(0o600)
+
+    @contextmanager
+    def old_registry(create=False):
+        with paths.directory_fd(legacy) as fd:
+            yield fd, legacy_key
+
+    with mock.patch.object(sandbox, 'AUTHORITY', legacy), mock.patch.object(scratch, 'registry', old_registry):
+        yield
+
+
+def boot(observe=lambda _: None):
+    class FirstBeat(BaseException):
+        pass
+
+    def first_pass(server):
+        try:
+            server.beat()
+            observe(server)
+        finally:
+            server.pool.shutdown()
+            server.lock.close()
+        raise FirstBeat()
+
+    with (mock.patch.object(serve.codebase, 'load'),
+          mock.patch.object(serve.codebase, 'checkout_head', return_value='fixture'),
+          mock.patch.object(sandbox, 'sandboxed', return_value=False),
+          mock.patch.object(serve.install, 'rotate_own_log', return_value=[]),
+          mock.patch.object(serve, 'start_notes', return_value=[]),
+          mock.patch.object(serve.Server, 'run_pass', first_pass),
+          case.assertRaises(FirstBeat)):
+        serve.run(with_dashboard=False)
+
+
+def heartbeat_problems():
+    return '\n'.join(check.detail for check in heartbeat.check_serve() + heartbeat.check_scratch() if not check.ok)
+"""
+
+
+class AuthorityMigrationTests(_AuthorityChildCase):
+    owner_state = True
+
+    def test_serve_moves_the_folder_and_recovery_finishes_in_the_new_location(self):
+        self.run_secret_child(AUTHORITY_MIGRATION + r"""
+class StopInCleanup(BaseException):
+    pass
+
+with engine():
+    with old_store():
+        done = make('a')
+        assert not scratch.end(done, Path(done.run_dir))[2]
+        pending = make('b')
+        (Path(pending.root) / 'out/output.txt').write_text('pending data')
+        with (mock.patch.object(scratch, 'seal', side_effect=StopInCleanup), case.assertRaises(StopInCleanup)):
+            scratch.end(pending, Path(pending.run_dir))
+        os.close(scratch.LEASES.pop(pending.selector))
+        pending_data = load(pending)
+        assert pending_data['state'] == 'pending' and not Path(pending.root).exists()
+        transaction = Path(pending.selector) / pending_data['capture']['name'] / 'tree'
+        assert (legacy / transaction / 'out/output.txt').read_text() == 'pending data'
+        browser.write_pin(pin)
+        expected = {a.selector: load(a) for a in (done, pending)}
+    before = tree_bytes(legacy)
+    old_identity = scratch.identity(legacy.stat())
+    captured_identity = scratch.identity((legacy / transaction).stat())
+    assert not authority.exists()
+
+    def after_start(server):
+        assert authority.is_dir() and not legacy.exists()
+        assert scratch.identity(authority.stat()) == old_identity
+        assert scratch.identity((authority / transaction).stat()) == captured_identity
+        assert tree_bytes(authority) == before
+        assert {d['attempt']['selector']: d for d in scratch.records(strict=True)} == expected
+        assert browser.read_pin() == pin
+        assert scratch.recover_pending() == [pending.root]
+        recovered = load(pending)
+        assert recovered['state'] == 'done' and Path(recovered['final_tree']) == transaction.relative_to(pending.selector)
+        assert (authority / transaction / 'out/output.txt').read_text() == 'pending data'
+        assert not legacy.exists()
+
+        legacy.mkdir(mode=0o700)
+        (legacy / browser.PIN).write_bytes(envelope(legacy_key, {'unexpected': 'old folder pin'}))
+        assert browser.read_pin() == pin
+        assert load(done) == expected[done.selector]
+        server.beat()
+        assert str(legacy) in heartbeat_problems(), heartbeat_problems()
+
+    boot(after_start)
+    boot(lambda _: case.assertIn(str(legacy), heartbeat_problems()))
+""")
+
+    def test_serve_leaves_a_store_with_a_locked_lease_and_reports_it_in_the_heartbeat(self):
+        self.run_secret_child(AUTHORITY_MIGRATION + r"""
+a = new_attempt('a')
+with old_store():
+    browser.write_pin(pin)
+held = lease(legacy, a)
+try:
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    before = tree_bytes(legacy)
+    with engine():
+        boot()
+    assert tree_bytes(legacy) == before and not authority.exists()
+    assert a.selector + '.lease' in heartbeat_problems(), heartbeat_problems()
+finally:
+    os.close(held)
+""")
+
+    def test_same_device_rename_failure_leaves_the_old_folder_without_a_copy(self):
+        self.run_secret_child(AUTHORITY_MIGRATION + r"""
+import errno
+
+with old_store():
+    browser.write_pin(pin)
+a, b = new_attempt('a'), new_attempt('b')
+for attempt in (a, b):
+    os.close(lease(legacy, attempt))
+before = tree_bytes(legacy)
+
+
+def reject_move(source, source_fd, target, target_fd):
+    assert source == legacy.name and target == authority.name
+    assert scratch.identity(os.fstat(source_fd)) == scratch.identity(legacy.parent.stat())
+    assert scratch.identity(os.fstat(target_fd)) == scratch.identity(authority.parent.stat())
+    with (paths.directory_fd(legacy) as folder,
+          open(legacy / (a.selector + '.lease'), 'rb') as first,
+          open(legacy / (b.selector + '.lease'), 'rb') as second):
+        for fd in (folder, first.fileno(), second.fileno()):
+            with case.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+
+with engine(), mock.patch.object(scratch, 'restore_entry', side_effect=reject_move) as move:
+    boot()
+move.assert_called_once()
+assert tree_bytes(legacy) == before and not authority.exists()
+text = heartbeat_problems().lower()
+assert any(reason in text for reason in ('cross-device', 'cross device', 'exdev', 'different device')), text
+""")
+
+
+class AuthorityScopedRecordTests(_AuthorityChildCase):
+    def test_valid_signature_with_an_unknown_version_holds_only_the_named_workspace(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+from arete import workspace
+
+a, b = new_attempt('a'), new_attempt('b')
+ws_a, ws_b = Path(a.workspace), Path(b.workspace)
+with engine():
+    with scratch.registry(True) as (_, key):
+        (authority / record_name(a)).write_bytes(envelope(key, record(a, version=999, state='pending')))
+    view = scratch.survey()
+    unreadable, = view.unreadable
+    assert unreadable.authenticated and unreadable.version == 999 and not view.good
+    assert scratch.holds(view, ws_a) == [unreadable] and not scratch.holds(view, ws_b)
+    with case.assertRaises(workspace.RunFailed) as blocked:
+        workspace.clear_workspace(ws_a, [], Path.cwd(), [])
+    assert record_name(a) in str(blocked.exception) and ws_a.is_dir()
+    workspace.clear_workspace(ws_b, [], Path.cwd(), [])
+    assert not ws_b.exists()
+""")
+
+    def test_retained_record_holds_only_its_workspace_without_local_confinement(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+from arete import pi, workspace
+
+a, b = new_attempt('a'), new_attempt('b')
+ws_a, ws_b = Path(a.workspace), Path(b.workspace)
+data = record(a, state='retained')
+with engine():
+    with scratch.registry(True) as (fd, key):
+        scratch.store(fd, key, data)
+    with case.assertRaises(OSError) as refused:
+        scratch.make(a.run_id, a.step, ws_a, Path(a.run_dir))
+    assert record_name(a) in str(refused.exception)
+with mock.patch.object(pi.sandbox, 'can_confine', return_value=False):
+    view = scratch.survey()
+    assert view.good == [data] and not view.unreadable
+    assert scratch.holds(view, ws_a) == [data] and not scratch.holds(view, ws_b)
+    with case.assertRaises(workspace.RunFailed) as blocked:
+        workspace.clear_workspace(ws_a, [], Path.cwd(), [])
+    assert record_name(a) in str(blocked.exception) and ws_a.is_dir()
+    workspace.clear_workspace(ws_b, [], Path.cwd(), [])
+    assert not ws_b.exists()
+""")
+
+    def test_settlement_moves_an_hour_old_done_record_and_prunes_its_sealed_evidence(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+with paths.CONFIG_FILE.open('a') as out:
+    out.write('\n[retention]\ndays = 2\n')
+days = config.load().retention.days
+with engine():
+    a = make('a')
+    (Path(a.root) / 'out/output.txt').write_text('fixture evidence')
+    assert not scratch.end(a, Path(a.run_dir))[2]
+    data = load(a)
+    hot = authority / record_name(a)
+    settled = authority / scratch.SETTLED / hot.name
+    evidence = authority / a.selector
+    tree = evidence / data['final_tree']
+    assert (tree.stat().st_mode & 0o777) == 0o500
+    assert (tree / 'out/output.txt').read_text() == 'fixture evidence'
+    assert scratch.settle(days) == [] and hot.is_file() and not settled.exists()
+    two_hours_ago = time.time() - 7200
+    os.utime(hot, (two_hours_ago, two_hours_ago))
+    assert scratch.settle(days) == []
+    assert not hot.exists() and settled.is_file() and evidence.is_dir()
+    assert scratch.settled_record(a.selector, Path(a.workspace))
+    old = time.time() - (days + 1) * 86400
+    os.utime(settled, (old, old))
+    assert scratch.settle(days) == []
+    assert not settled.exists() and not evidence.exists()
+    assert not (authority / (a.selector + '.lease')).exists()
+    assert scratch.settled_record(a.selector, Path(a.workspace))
+""")
+
+
+class AuthorityProducerConfinementTests(_AuthorityChildCase):
+    def test_service_hides_pwd_home_config_and_authority(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+import shlex
+import subprocess
+
+assert sandbox.AUTHORITY == authority
+private = legacy.parent / 'fixture.txt'
+private.parent.mkdir(parents=True, exist_ok=True)
+private.write_text('private config fixture')
+assert paths.HOME != pwd_home
+a = new_attempt('a')
+workspace = Path(a.workspace)
+control = workspace / 'fixture.txt'
+control.write_text('public fixture')
+Path(a.root).mkdir(mode=0o700)
+for name in scratch.FOLDERS:
+    (Path(a.root) / name).mkdir(mode=0o700)
+command = shlex.join(['/bin/cat', str(control), str(private)])
+native = sandbox.can_confine(False) and not sandbox.sandboxed()
+with mock.patch.object(sandbox, 'can_confine', return_value=True):
+    argv = scratch.service_command(a, command)
+profile = argv[argv.index('-p') + 1]
+for folder in (private.parent, authority):
+    param, = [p.split('=', 1)[0] for p in argv if p.startswith('H') and p.endswith('=' + str(folder))]
+    assert f'(deny file-read* file-write* file-link (subpath (param "{param}")))' in profile
+if native:
+    result = subprocess.run(argv, cwd=workspace, env={**os.environ, **scratch.attempt_env(a)},
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode != 0 and result.stdout == 'public fixture', result
+    assert str(private) in result.stderr, result
+""")
+
+
+class AuthorityBrowserConfinementTests(_AuthorityChildCase):
+    owner_state = True
+
+    def test_browser_profile_opens_only_its_state_exceptions_without_hiding_all_state(self):
+        self.run_secret_child(AUTHORITY_FIXTURE + r"""
+import subprocess
+
+assert sandbox.AUTHORITY == authority
+assert paths.STATE_DIR == pwd_home / '.local/share/arete'
+a = new_attempt('a')
+folder = browser.browser_folder(a)
+assert paths.STATE_DIR not in scratch.hidden_folders(with_state=False)
+assert legacy.parent in scratch.hidden_folders(with_state=False) and authority in scratch.hidden_folders(with_state=False)
+argv = browser.browser_profile(a, 4123, folder)
+assert 'STATE=' + str(paths.STATE_DIR) in argv
+hidden = {arg.split('=', 1)[1] for arg in argv if arg.startswith('H') and '=' in arg}
+assert str(paths.STATE_DIR) not in hidden and {str(legacy.parent), str(authority)} <= hidden
+opened = {arg.split('=', 1)[1] for arg in argv if arg.startswith('SO') and '=' in arg}
+assert opened == {str(p) for p in (folder, scratch.evidence_path(a.run_dir), browser.server_folder(), browser.browser_log(a))}
+if sandbox.can_confine(False) and not sandbox.sandboxed():
+    allowed = browser.server_folder() / 'fixture.txt'
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text('server fixture')
+    denied = paths.STATE_DIR / 'fixture.txt'
+    denied.write_text('ordinary private state')
+    result = subprocess.run([*argv, '/bin/cat', str(allowed), str(denied)], cwd=folder,
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode != 0 and result.stdout == 'server fixture', result
+    assert str(denied) in result.stderr, result
+""")
 
 
 SECRET_RECOVERY_FIXTURE = r"""
