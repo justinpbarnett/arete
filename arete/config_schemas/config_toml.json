@@ -101,6 +101,10 @@
           "target_branch": {"type": "string"},
           "landing": {"type": "string", "enum": ["pr", "direct-push"]},
           "unattended_environment": {"type": "string", "enum": ["none", "development", "staging", "production"]},
+          "commenters": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
           "pipeline": {"type": "boolean"},
           "mine": {"type": "boolean"},
           "public": {"type": "boolean"},
