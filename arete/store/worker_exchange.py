@@ -41,6 +41,54 @@ def assign(lease, action, data):
                   (lease.root, action, action, lease.generation, "assigned", ledger.encoded(data)))
 
 
+def admission_result(action, phase, reason):
+    return {"phase": phase, "depends_on": action["request"]["depends_on"],
+            "reason": outbound.redact(reason)[:2000]}
+
+
+def declare_start(lease, action, reason, data=None):
+    result = admission_result(action, "queued", reason)
+    with tx() as c:
+        if data is not None:
+            ledger.fenced(c, lease)
+            result["worker_id"] = action["id"]
+            c.execute("INSERT INTO orchestration_workers VALUES (?,?,?,?,?,?)",
+                      (lease.root, action["id"], action["id"], lease.generation, "queued",
+                       ledger.encoded({**data, "reason": result["reason"]})))
+        ledger.transition_in(c, lease, action["id"], "accepted", result, expected=("accepted",))
+
+
+def update_admission(lease, action, reason, *, private, cancelled=False):
+    if not cancelled and action["result"].get("reason") == reason:
+        return
+    if cancelled and private:
+        cancel(lease, action["id"], action["id"], reason)
+        return
+    state = "cancelled" if cancelled else "accepted"
+    result = admission_result(action, "cancelled" if cancelled else "queued", reason)
+    with tx() as c:
+        if private:
+            w = get(c, lease, action["id"])
+            w["data"]["reason"] = result["reason"]
+            save(c, lease, w, w["phase"])
+        ledger.transition_in(c, lease, action["id"], state, result, expected=("accepted",))
+
+
+def admit(lease, worker, candidate, role, *, batch_snapshot=False):
+    with tx() as c:
+        w = get(c, lease, worker)
+        if w["phase"] != "queued":
+            raise ledger.Conflict("worker is no longer queued")
+        w["data"].pop("reason", None)
+        w["data"].update(candidate=candidate, role=role, batch_snapshot=batch_snapshot)
+        save(c, lease, w, "assigned")
+        return w["data"]
+
+
+def holds_claim(w):
+    return w["data"]["writing"] and w["phase"] not in CLOSED | {"queued"}
+
+
 def message_id(lease, action, kind):
     return f"{kind}-{ledger.digest([lease.root, action, kind])[:20]}"
 
@@ -104,6 +152,8 @@ def queue(lease, action, validate_scope=None):
             if len(page(c, lease.root, worker=w["id"], pending=True)) >= MAX_INBOX:
                 raise ValueError("worker inbox is full")
             if scope := args.get("write_paths"):
+                if w["phase"] == "queued":
+                    raise ValueError("a queued worker does not yet hold a write claim")
                 validate_scope(w, scope, workers(lease, c))
                 w["data"]["effective"]["write_paths"] = w["data"]["write_paths"] = scope
             mid = add(c, lease, w, action["id"], kind, args["message"], question)
@@ -195,9 +245,18 @@ def schedule(lease, worker, maximum):
             raise ledger.Limit(f"run used its {maximum} action allowance")
         attempt = f"{worker}.t{rows + 1}"
         args = {"worker_id": worker, "message": w["data"]["effective"]["goal"], "settings": {}}
+        result = {"scheduled": True}
+        if retry_of := w["data"].pop("retry_of", None):
+            previous = ledger.decoded(c.execute("SELECT * FROM orchestration_actions WHERE root=? AND id=?",
+                                               (lease.root, retry_of)).fetchone())
+            if previous["id"] != w["attempt"] or previous["state"] != "interrupted":
+                raise ledger.Conflict("interrupted worker attempt superseded")
+            if previous["op"] == "worker.continue":
+                args = previous["request"]
+            result["retry_of"] = retry_of
         c.execute("INSERT INTO orchestration_actions VALUES (?,?,?,?,?,'accepted',?,?,?)",
                   (lease.root, attempt, worker.split("-")[0], lease.run, "worker.continue", ledger.encoded(args),
-                   ledger.encoded({"scheduled": True}), util.iso()))
+                   ledger.encoded(result), util.iso()))
         w["attempt"] = attempt
         save(c, lease, w, "assigned")
         return ledger.decoded(c.execute("SELECT * FROM orchestration_actions WHERE root=? AND id=?",
@@ -216,12 +275,13 @@ def cancel(lease, worker, action, reason, *, receipt=False):
         w = get(c, lease, worker)
         if w["phase"] in CLOSED | {"integrating", "reconciliation-required"}:
             raise ValueError(f"worker is {w['phase']} at {w['attempt']}")
-        producer = c.execute("SELECT state FROM orchestration_actions WHERE root=? AND id=?",
-                             (lease.root, w["attempt"])).fetchone()
+        producer = ledger.decoded(c.execute("SELECT * FROM orchestration_actions WHERE root=? AND id=?",
+                                            (lease.root, w["attempt"])).fetchone())
         if producer and producer["state"] in ("accepted", "running"):
-            ledger.transition_in(c, lease, w["attempt"], "cancelled",
-                                 {"effective": w["data"]["effective"], "worker_id": worker,
-                                  "reason": reason, "usage_unknown": producer["state"] == "running"})
+            result = (admission_result(producer, "cancelled", reason) if ledger.queued_start(producer) else
+                      {"effective": w["data"]["effective"], "reason": reason,
+                       "usage_unknown": producer["state"] == "running"})
+            ledger.transition_in(c, lease, w["attempt"], "cancelled", {**result, "worker_id": worker})
         for row in c.execute("SELECT id FROM orchestration_messages WHERE root=? AND worker=? "
                              "AND state IN ('open','queued','dispatched')", (lease.root, worker)).fetchall():
             mark(c, lease, row["id"], "cancelled", action, reason)
@@ -245,7 +305,8 @@ def public_text(value, key=""):
 def projection(c, lease, limits, *, after=0, limit=20, outstanding=False):
     ws = workers(lease, c)
     visible = [{k: w[k] for k in ("id", "attempt", "generation", "phase")} |
-               {k: w["data"][k] for k in ("writing", "question", "role", "reason", "write_paths", "conflicts") if k in w["data"]}
+               {k: w["data"][k] for k in ("writing", "question", "role", "reason", "write_paths", "conflicts", "depends_on")
+                if k in w["data"]}
                for w in ws.values()]
     messages = page(c, lease.root, after, limit + 1, outstanding=outstanding)
     more = len(messages) > limit

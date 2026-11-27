@@ -237,9 +237,8 @@ function Orchestration({ view, retry }) {
   const run = view.detail.run;
   const rerun = (id) => dispatch(retryStep(), { ...runContext(run, "steps", {}, id), stale: retry,
     commit: (_, result) => { retry(); if (result.run) location.hash = hashOf(result.run); return { label: `Started ${id} alone; dependent evidence must be refreshed` }; } });
-  const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
-    && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
-    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
+  const eligible = (a) => data.action_rerun_available && run.status !== "running"
+    && !a.result.depends_on && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return html`<section class="run-orchestration" aria-label="Orchestration"><h3>Orchestration</h3>
