@@ -49,6 +49,9 @@ $journeys## Rules
 - Do what the user does: the commands they type, the requests their clients send, the clicks they make. Read
   the real output, not the code that makes it.
 - Shell commands you may run: $commands. Others are refused.$env_example
+- Write each command with its paths and values spelled out. Arete's guard cannot check a shell variable, a
+  `$$(...)` substitution, or a `#` inside a quoted argument, and it refuses such a command. Put the scratch path
+  in the command as written.
 - To set a variable for a program, use `<allowed command> env NAME=value <program> …` with an allowed command that
   runs the program you pass it. The verification harness runs its arguments with `exec "$$@"`.
 - If the permission mode refuses a command solely because it starts with `NAME=value`, retry once with the same
