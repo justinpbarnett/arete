@@ -1134,13 +1134,9 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     elif t.blocker and not run.force:
         return end_as("stop", "quiet", status="skipped", summary=t.blocker)
     try:
-        images = tk.save_images(t, run.dir / "images")
+        attachments, attachment_dirs, _manifest = pipeline.collect_ticket_attachments(tk, t, run.dir, log=run.log)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not download the images on {run.ref}: {e}")
-    if images.paths:
-        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
-    if images.left_out:
-        run.log(f"images: left out {', '.join(images.left_out)}")
     main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
@@ -1184,8 +1180,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                         excluded=run.closed_checkout_paths)
     approval = triage_store.triage_approval(run.triage_key)
     data = prepared_fields(t, branch, [*checkouts, *run.closed_checkouts], layer,
-                           [run.dir / "images"] if images.paths else [],
-                           pipeline.images_note(images), approval)
+                           attachment_dirs, attachments, approval)
     if job.closed_prs:
         data["closed_prs"] = sorted(job.closed_prs)
     if feedback_prs:
