@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, factory, gh, paths, run_lines, util, workspace
-from .review import Review
+from .review import Review, repair_fields
 
 PLAN_STEPS = ("plan", "revise", "repair")
 MAX_LOG = 200
@@ -26,22 +26,39 @@ class Source:
     goal: str
     left_for_a_person: str
     runs: set[str] = field(default_factory=set)
+    repair_state: dict = field(default_factory=dict)
 
 
-def saved_review(run_id: str) -> tuple[Review, int]:
-    report = next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
+def report_review(report: dict) -> Review:
     saved = report.get("review")
-    if not isinstance(saved, dict) or not saved.get("verdict"):
+    if not isinstance(saved, dict):
+        return Review()
+    problems = [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category"),
+                 **repair_fields(p)} for p in saved.get("problems") or []
+                if isinstance(p, dict) and str(p.get("text") or "").strip()]
+    return Review(verdict=saved.get("verdict"), trees=saved.get("trees") or {}, problems=problems).identify(
+        f"{report.get('run')}:report-{run_lines.seq_of(report)}")
+
+
+def saved_review(run_id: str) -> tuple[Review, str, dict]:
+    from . import flows
+
+    related = flows.lineage_runs(run_id)
+    report = next((line for line in reversed(related.get(run_id, [])) if line.get("event") == run_lines.END), {})
+    restored = flows.continued_review(related, report=report)
+    if not (review := restored.get("review")):
         raise Refused(f"run {run_id} saved no review")
-    if saved.get("verdict") == "approve":
+    if review.approved():
         raise Refused(f"run {run_id}: its last review approved the change, so nothing is left to repair")
-    listed = [p for p in saved.get("problems") or [] if isinstance(p, dict) and str(p.get("text") or "").strip()]
-    if saved.get("verdict") != "request_changes" or not listed:
+    if review.verdict != "request_changes" or not review.blocking():
         raise Refused(f"run {run_id} requested changes but saved no findings to repair")
-    found = Review.stored({"verdict": "request_changes", "problems":
-        [{"file": p.get("file"), "problem": p["text"], "severity": "blocker", "category": p.get("category")}
-         for p in listed]})
-    return found, int(report.get("seq") or 0)
+    state = restored["repair_state"]
+    keys = {p["finding"] for p in review.blocking()} | {
+        key for key, finding in state.get("findings", {}).items() if finding.get("verification") == "check"}
+    state = {name: {key: value for key, value in rows.items() if key in keys}
+             for name, rows in state.items() if name in ("findings", "receipts", "baselines", "in_use_waivers")}
+    line = restored["line"]
+    return review, f"the {line['event']} line of run {line['run']} (seq {run_lines.seq_of(line)})", state
 
 
 def saved_plan(run_id: str) -> tuple[str, str, str]:
@@ -73,11 +90,10 @@ def source(row: dict) -> Source:
         raise Refused(f"run {run_id} ran {row['only_step']} alone; repair the run it continued")
     if row.get("status") not in ("pr", "failed") or not row.get("pr_url") or not row.get("branch"):
         raise Refused(f"run {run_id} ended {row.get('status')} with no open PR; only a run that left a PR is repaired")
-    review, seq = saved_review(run_id)
+    review, evidence, state = saved_review(run_id)
     plan, goal, left = saved_plan(run_id)
     runs = {run_id} | factory.chain_runs(run_id)
-    return Source(run_id, str(row["branch"]), str(row["pr_url"]).split(), review,
-                  f"the review in the report line of run {run_id} (seq {seq})", plan, goal, left, runs)
+    return Source(run_id, str(row["branch"]), str(row["pr_url"]).split(), review, evidence, plan, goal, left, runs, state)
 
 
 def run_commits(cwd: Path, log_args: list[str]) -> list[tuple[str, set[str]]]:

@@ -77,8 +77,9 @@ OPERATIONS = {
                               {"worker_id": required(str), "message": required(str)}),
     "worker.cancel": Operation("Stop a worker and confirm producer cleanup before releasing its lease.",
                                {"worker_id": required(str), "reason": required(str)}),
-    "checks.run": Operation("Run owner-configured checks. After a failure, rerun the failing tests first, then request full checks on the repaired candidate.",
-                            {"scope": (str, "full")}, {"scope": {"enum": ["quick", "full"]}}),
+    "checks.run": Operation("Run owner-configured checks. After a failure, rerun the failing tests first, then request full checks on the repaired candidate. "
+                            "Scope focused resolves blank selectors through an independent selector step, then runs named regressions on the integrated tree; it is not full check evidence.",
+                            {"scope": (str, "full")}, {"scope": {"enum": ["quick", "full", "focused"]}}),
     "verification.run": Operation("Verify behavior; target exact outstanding requirements after a current baseline.",
                                    {"goal_refs": (list, []), "route_id": required(str), "effort": required(str),
                                     "requirements": (list, [])}),
@@ -100,6 +101,7 @@ OPERATIONS = {
                           {"after": (int, 0), "timeout_seconds": (int, 60)},
                           {"after": {"minimum": 0}, "timeout_seconds": {"minimum": 0}}),
     "publication.request": Operation("Request existing engine publication; current evidence and authority are required. "
+                                     "At repair exhaustion, current unresolved review can only publish a held draft. "
                                      "For an unmeasurable requirement, supply requirement and measurement strings "
                                      "in unverified_measurement.", {"unverified_measurement": (dict, {})}),
     "run.finish": Operation("Finish failed, noop or delivered; delivered requires engine publication.",

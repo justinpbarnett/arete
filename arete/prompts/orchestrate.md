@@ -33,6 +33,17 @@ check added by the verifier, call verification.decide with its verification_id a
 continue. A required probe, journey, acceptance requirement or observed product failure needs resolution.
 For legacy runs, obtain checks, review and configured behavioral verification on the final tree.
 Any mutation invalidates applicable evidence, including changes after a passing review.
+When `repair_findings` appears in the observation, read its reference. Run `checks.run` with `scope: focused` on
+an unchanged reviewed candidate before the first repair when the regression is already runnable. If it did not
+reproduce or could not run, report that honestly. The engine appends findings, observable acceptance and any
+focused failures to writing assignments. Delegate a repair for a failure before requesting another full review;
+rerun focused checks after integration or other edits. Reuse a focused regression or, if none fits, delegate a
+disposable, non-sensitive scratch regression outside the patch. Use the approved checked-command path or report
+why it cannot run; never invent commands or count unrelated results. Check approval does not authorize permanent
+coverage. Delegate it only when an explicit task or repository instruction requires coverage of a specific
+essential business rule; keep it focused, deterministic and fast.
+An alternate independent review or in-use requirement is not a focused pass. Focused passes never replace the
+full checks, independent review or applicable in-use verification on the final integrated tree.
 Use the existing held-draft dispositions for genuine blockers, never turn blocked into pass.
 For workflows using the legacy measurement-disclosure policy, apply the following rules.
 Ask the owner only for information or permission you cannot obtain safely through workers.
