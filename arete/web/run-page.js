@@ -71,9 +71,8 @@ function orchestrationDetail(board, place) {
     `/api/runs/${encodeURIComponent(run.id)}/steps/${encodeURIComponent(action.id)}`, {},
     (result) => { if (result.run) go(detailHash("run", result.run), "action");
       return `Started ${action.id} alone. Dependent evidence must be refreshed before publication.`; }, { object: run });
-  const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
-    && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
-    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
+  const eligible = (a) => data.action_rerun_available
+    && !a.result.depends_on && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return [el("h3", { text: "Orchestration" }),

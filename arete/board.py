@@ -684,6 +684,20 @@ def run_rows(rows: list[dict]) -> list[dict]:
              "loop": r.get("loop") or "", "repo": r["repo"] or ""} for r in rows]
 
 
+def action_rerun_available(run: dict, adaptive: dict) -> bool:
+    if (run["status"] == "running" or adaptive["mode"] != "orchestrate"
+            or adaptive["current_run"] != run["id"] or not adaptive["workspace_retained"]):
+        return False
+    if "workers" not in adaptive:
+        return True
+    from . import worker_turns
+    from .store import worker_exchange
+
+    lease = orchestration_store.Lease(adaptive["root"], adaptive["current_run"], adaptive["generation"])
+    known = {a["id"]: a for a in orchestration_store.actions(lease)}
+    return not worker_turns.private_rerun_blocked(known, worker_exchange.workers(lease))
+
+
 def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = False) -> dict:
     with foundation.one_read():
         if not re.fullmatch(r"\w[\w.-]*", run_id):
@@ -712,6 +726,7 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
         adaptive = orchestration_store.view(run_id, connect=foundation.reader, messages_after=messages_after)
         if adaptive:
             adaptive["workspace_retained"] = not flows.action_workspace_refusal(run_id)
+            adaptive["action_rerun_available"] = action_rerun_available(r, adaptive)
         recovery = unblock_store.get(r["repo"], str(r["issue"]), connect=foundation.reader) if r["issue"] else {}
         routes = asks_store.routes_of([run_id], connect=foundation.reader) if r["status"] == "needs-info" else {}
         result = {"now": util.iso(), "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4),
