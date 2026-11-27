@@ -128,24 +128,28 @@ def comments(repo, ticket, tk):
 
 
 def review_comments(tk, repo, ticket, policy, revision):
+    from . import ticket_feedback
+
     allowed = set(policy["qa"])
     notes = comments(repo, ticket, tk)
     approvals, changes = [], []
     for who, body, at, edited, cid in notes:
         # GitHub's visible bot types and Arete's own marked handoffs cannot grant release authority.
-        if who not in allowed or tracker.from_arete(body) or gh.has_arete_mark(body) or not cid or not at:
+        if who not in allowed or ticket_feedback.is_arete_comment(body) or not cid or not at:
             continue
         line = body.strip()
         directive = APPROVE.fullmatch(line)
-        if directive or line.rstrip(".!").casefold() in EXPLICIT:
-            if not directive and policy.get("qa_require_revision"):
+        matched_prod, prod_rev = ticket_feedback.match_production_instruction(line)
+        explicit_sha = directive[1] if directive else prod_rev
+        if directive or matched_prod or line.rstrip(".!").casefold() in EXPLICIT:
+            if not explicit_sha and policy.get("qa_require_revision"):
                 continue
-            if (cid.isdigit() and (not directive or directive[1] == revision)
+            if (cid.isdigit() and (not explicit_sha or explicit_sha.lower() == revision.lower())
                     and (not edited or util.parse_iso(edited) == util.parse_iso(at))):
                 url = (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
                        else tk.client.comment_url(ticket, cid))
                 approvals.append({"id": cid, "at": cohorts.timestamp(at), "url": url, "actor": who})
-        elif line.rstrip(".!").casefold() not in NEUTRAL:
+        elif line.rstrip(".!").casefold() not in NEUTRAL and not ticket_feedback.is_neutral_acknowledgment(line):
             changes.append((who, cid, line))
     return changes, approvals
 
@@ -268,6 +272,10 @@ def ready(cfg, repo, ticket, policy, state):
         raise proof.Held("repository enrollment is unavailable") from error
     proof.need(current == repo and current.pipeline and current.landing == "pr", "repository enrollment changed")
     _, _, scope, approvals = authority(cfg, repo, ticket, policy, revision)
+    from . import ticket_feedback
+
+    proof.need(not ticket_feedback.pending_corrections(repo.name, ticket),
+               "pending authorized feedback requires a corrected staging revision and fresh QA")
     proof.need(scope == state["scope"], "scope changed after staging; deploy the corrected revision for fresh QA")
     approval = None
     if state.get("standing_authority"):
@@ -388,6 +396,10 @@ def _advance(cfg, repo, ticket, file):
         serve_guard.write(file, state)
     proof.need(state["policy"] == proof.digest(policy) and state["scope"] == scope,
                "the tested behavior changed; a corrected staging revision and fresh QA are required")
+    from . import ticket_feedback
+
+    proof.need(not ticket_feedback.pending_corrections(repo.name, ticket),
+               "pending authorized feedback requires a corrected staging revision and fresh QA")
     if state["phase"] == "observing_staging":
         found = observe_staging(repo, ticket, revision, pinned=state["policy"])
         if found["status"] != "verified":

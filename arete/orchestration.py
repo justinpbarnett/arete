@@ -403,6 +403,17 @@ class Controller(worker_turns.WorkerTurns):
             self.run.story.append(feedback)
             self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
+        ticket_fb = getattr(self.run, "ticket_feedback", None)
+        known_ticket_fb = {(f["tracker"], f["comment_id"]) for f in self.data.get("ticket_feedback", [])}
+        fresh_ticket_fb = ([f for f in ticket_fb if (f["tracker"], f["comment_id"]) not in known_ticket_fb]
+                           if isinstance(ticket_fb, list) else [])
+        if fresh_ticket_fb:
+            from . import ticket_feedback as tf
+
+            self.data.setdefault("ticket_feedback", []).extend(fresh_ticket_fb)
+            ticket_md = tf.worker_instructions_markdown(fresh_ticket_fb)
+            self.run.story.append(ticket_md)
+            self.data["goal_base"] += f"\n\nAddress each authorized ticket-thread correction:\n{ticket_md}"
         answers = [a for a in self.run.answers_due or [] if not a.get("call", "").startswith("requirements.")]
         if answers:
             answer = owner_asks.fresh_note(answers)
