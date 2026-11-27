@@ -503,6 +503,8 @@ class Verified:
     native_trees: dict[str, str] = field(default_factory=dict)
     behavior_reached: bool = True
     unmeasured_requirements: list[str] = field(default_factory=list)
+    observed_trees: dict[str, str] = field(default_factory=dict)
+    repair_observations: dict[str, str] = field(default_factory=dict)
     missing_capability: str = ""
     missing_tools: list[str] = field(default_factory=list)
     advisory_gaps: list[str] = field(default_factory=list)
@@ -569,6 +571,13 @@ class Verified:
             return {name for name in passed if name and name.casefold() not in unmeasured}
         return {one_line(c.get("what")) for c in failed
                 if c.get("passed") is False and str(c.get("cause") or "").strip().lower() != "environment"} - {""}
+
+    def observed_repairs(self, requirements: dict[str, str]) -> dict[str, str]:
+        observed = self.observed_requirements()
+        return {c["what"]: requirements[c["what"]] for c in self.checks
+                if isinstance(c.get("what"), str) and c["what"] in requirements and c["what"] in observed
+                and c.get("passed") is True
+                and all(isinstance(c.get(key), str) and c[key].strip() for key in ("how", "saw"))}
 
     def screenshots(self, evidence: Path) -> list[Path]:
         names = [Path(c["screenshot"]).name for c in self.checks if (c.get("screenshot") or "").strip()]

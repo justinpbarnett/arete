@@ -19,10 +19,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from string import Template
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from adws import feature
 from arete import (
+    ci,
     codebase,
     config,
     control,
@@ -987,9 +988,21 @@ class CatchUpWorkspaceRecordTests(Isolated):
         self.assertEqual(collision.read_text(), "Keep this file\n")
 
 
+def passed_fixture_checks(flow, **kw):
+    job = flow.ctx
+    report = "Fixture checks passed."
+    return factory.Outcome("pass", data={
+        "report": report, "policy": job.policy("checks", kw),
+        "checked": {"tree": factory.fingerprint(job.ws), "trees": pipeline.verification_trees(job.b),
+                    "commands": dict(job.layer.checks), "report": report},
+    })
+
+
 class ReviewRetryTests(Isolated):
     PR = "https://github.com/example/fixture/pull/1"
-    BLOCKER = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
+    BLOCKER = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue",
+               "acceptance": "Inspect notes.txt and confirm the fixture blocker is addressed.",
+               "verification": "review", "verification_reason": "This finding is about the wording of the notes."}
 
     def review_build(self, *replies):
         run = self.made_run()
@@ -1008,14 +1021,16 @@ class ReviewRetryTests(Isolated):
 
         with (patch.object(pipeline.runner, "run", side_effect=replies) as agent,
               patch.object(factory, "fingerprint", return_value="fixture-tree"),
+              patch.object(pipeline, "verification_trees", return_value={"": "fixture-tree"}),
               patch.object(flows, "documents", return_value=False),
               patch.dict(factory.STEPS, {
-                  "checks": lambda *a, **kw: factory.Outcome("pass"),
+                  "checks": passed_fixture_checks,
                   "verify": lambda *a, **kw: factory.Outcome("pass", data={"verified": {"verdict": "pass"}, "names": []}),
                   "learn": lambda *a, **kw: factory.Outcome("pass"),
                   "pr": open_pr,
                   "publish": lambda *a: factory.Outcome("pass", data={"ending": "pr", "pr_url": self.PR}),
-                  "respond": lambda _, ending, **kw: factory.Outcome("pass", data={"status": ending, "summary": "", **kw}),
+                  "respond": lambda _, ending, **kw: factory.Outcome("pass", data={
+                      "status": ending, "summary": kw.get("why", ""), "pr_url": "", **kw}),
               })):
             ending = feature.built(flow, [], prepared=True)
         self.assertEqual(ending, ("pr", "", self.PR))
@@ -4339,7 +4354,7 @@ class AdwPrFixture(PrAnswerFixture):
     def adw_pr_steps(self, prepared):
         return {
             "prepare": lambda *a, **kw: prepared,
-            "checks": lambda flow, **kw: factory.Outcome("pass", data={"policy": flow.ctx.policy("checks", kw)}),
+            "checks": passed_fixture_checks,
             "verify": lambda flow, **kw: factory.Outcome("pass", data={
                 "verified": {"verdict": "pass"}, "names": [], "policy": flow.ctx.policy("verify", kw)}),
             "learn": lambda *a, **kw: factory.Outcome("pass"),
@@ -4376,6 +4391,7 @@ class AdwRevisionFeedbackTests(AdwPrFixture):
             return outcome
 
         with (patch.object(factory, "fingerprint", return_value="fixture-tree"),
+              patch.object(pipeline, "verification_trees", return_value={"": "fixture-tree"}),
               patch.object(pipeline, "workspace_note", return_value="Fixture workspace"),
               patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"notes.txt": 1})),
               patch.object(gh, "pr_body", return_value=""),
@@ -4447,7 +4463,9 @@ class AdwRepairContinuationTests(AdwPrFixture):
         pr = "https://github.com/owner/project/pull/1"
         published = self.made_run()
         run_lines.write(published.id, run_lines.END, review={"verdict": "request_changes", "problems": [
-            {"file": "notes.txt", "text": "Fix the saved finding.", "category": "issue"}]})
+            {"file": "notes.txt", "text": "Fix the saved finding.", "category": "issue",
+             "acceptance": "Inspect notes.txt and confirm the requested wording was corrected.",
+             "verification": "review", "verification_reason": "This finding is about the wording of the notes."}]})
         (published.dir / "plan.md").write_text("Implement the issue.")
         record.settle(published.id, "pr", pr_url=pr, branch="fixture")
         asked = self.made_run(published.id)
@@ -4574,7 +4592,10 @@ class ParkedRetryBudgetTests(Isolated):
         self.assert_fresh_retry()
 
 
-class DeniedWorkerEditsTests(unittest.TestCase):
+class RepairWorkflowFixture(unittest.TestCase):
+    pr_url = "https://github.com/fixture/repo/pull/1"
+    branch = "fixture-branch"
+
     @classmethod
     def setUpClass(cls):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
@@ -4590,7 +4611,7 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         util.git(["add", "."], cls.base)
         util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
 
-    def prepare_controller(self, *, real_ledger=False):
+    def prepare_controller(self, max_repair_cycles=1, *, real_ledger=False):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         self.enterContext(support.workspace_state(root))
@@ -4599,7 +4620,7 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.wt = root / "repo"
         shutil.copytree(self.base, self.wt)
         repo = config.Repo("fixture/repo", self.wt, tracker="local")
-        self.layer = config.RepoLayer(repo.layer_dir, max_repair_cycles=1,
+        self.layer = config.RepoLayer(repo.layer_dir, max_repair_cycles=max_repair_cycles,
                                       deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
                                       checks={"goal": 'test "$(cat goal.txt)" = reached'})
         cfg = config.Config(replay=config.ReplayConfig(all=True))
@@ -4629,21 +4650,10 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                                                  "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
         job.use_layer(self.layer)
         self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
-        flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
+        flow = SimpleNamespace(ctx=job, continues="", run=lambda name, _args, kw: factory.STEPS[name](flow, **kw))
         self.controller = orchestration.Controller(flow)
         self.controller.catalog = Catalog(job)
 
-    def test_each_pipeline_writing_prompt_renders_denied_paths(self):
-        writing = {name for name, (_, writes) in PROMPTS.items() if writes}
-        writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
-                    "apply", "oncall_repair"}
-        denied = "`guarded.txt`, `restricted/**`"
-        for name in sorted(writing):
-            with self.subTest(prompt=name):
-                identifiers = prompt_loader.template(name).get_identifiers()
-                inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
-                rendered = prompt_loader.prompt(name, **inputs)
-                self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
     def git(self, *args):
         return util.git(list(args), self.wt).strip()
 
@@ -4651,6 +4661,12 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         target = self.wt / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+
+    def commit(self, message, *files, cwd=None):
+        folder = cwd or self.wt
+        util.git(["add", "--", *files], folder)
+        util.git([*util.ARETE_IDENTITY, "commit", "-qm", message], folder)
+        return util.git(["rev-parse", "HEAD"], folder).strip()
 
     def perform(self, op, **args):
         self.controller.executing = op
@@ -4680,6 +4696,19 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                          route_id="model:build:0", effort=model.effort or "low")
             self.assertTrue(controller.collect())
             return worker.call_args.args[2]["role"]
+
+class DeniedWorkerEditsTests(RepairWorkflowFixture):
+    def test_each_pipeline_writing_prompt_renders_denied_paths(self):
+        writing = {name for name, (_, writes) in PROMPTS.items() if writes}
+        writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
+                    "apply", "oncall_repair"}
+        denied = "`guarded.txt`, `restricted/**`"
+        for name in sorted(writing):
+            with self.subTest(prompt=name):
+                identifiers = prompt_loader.template(name).get_identifiers()
+                inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
+                rendered = prompt_loader.prompt(name, **inputs)
+                self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
 
     def test_failed_test_runs_before_full_suite_on_the_final_candidate(self):
         self.prepare_controller(real_ledger=True)
@@ -4835,6 +4864,522 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.assertEqual(failed.exception.why, f"the build and its fixes touched denied paths: {paths_in_message}")
         self.assertEqual(self.run_fixture.budget.repair_calls, 0)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "goal.txt")
+
+
+class FocusedRollbackTests(RepairWorkflowFixture):
+    def test_settings_rollback_regression_returns_to_repair_until_current_pass(self):
+        self.prepare_controller(max_repair_cycles=2)
+        self.layer.verify = config.Verify(url="")
+        self.layer.targeted_commands.update(classes=f"{shlex.quote(sys.executable)} -B -m unittest", unrelated=":")
+        test_class = "rollback_probe.SettingsRollbackTests.test_immediate_read"
+        settings = """import unittest
+
+class Settings:
+    def __init__(self):
+        self.value, self.history = 'blue', [(1, 'blue')]
+    def rotate(self):
+        self.value = 'green'
+        self.history.append((2, self.value))
+    def rollback(self):
+        self.history.pop()
+
+class SettingsRollbackTests(unittest.TestCase):
+    def test_immediate_read(self):
+        settings = Settings()
+        settings.rotate()
+        self.assertEqual((settings.value, settings.history[-1]), ('green', (2, 'green')))
+        settings.rollback()
+        self.assertEqual((settings.value, settings.history), ('blue', [(1, 'blue')]),
+                         f'expected blue and only revision 1, got {settings.value}, {settings.history}')
+"""
+        self.write("goal.txt", "reached\n")
+        self.write("rollback_probe.py", settings)
+        self.assertTrue(self.perform("checks.run")["full"])
+        acceptance = "Rotate blue to green, roll back and immediately read blue with only revision 1."
+
+        def operate(op, role="review"):
+            route = f"model:{role}:0"
+            return self.perform(op, route_id=route, effort=self.controller.catalog.settings[route].effort or "low")
+
+        def focused():
+            return self.perform("checks.run", scope="focused")["receipts"][key]
+
+        def receipts():
+            return [c.kwargs for c in record.mark.call_args_list if c.args[1] == "focused_check"]
+
+        review = Mock(return_value=Result(True, structured={"problems": [{
+            "file": "rollback_probe.py", "problem": "Rollback leaves the cached settings value green.",
+            "severity": "blocker", "category": "regression", "acceptance": acceptance, "verification": "check",
+            "check": "obsolete"}]}))
+        selectors = iter([{"check": "unrelated"}, {"check": "classes", "test_class": "obsolete.Test"},
+                          {"check": "classes", "test_class": test_class}])
+
+        def agent(step, text, cwd, **kwargs):
+            if not step.startswith("review_selectors"):
+                return review(step, text, cwd, **kwargs)
+            self.assertTrue(kwargs["read_only"])
+            self.assertIn(acceptance, text)
+            return Result(True, structured={"selectors": [dict(id=key, verification="check", **next(selectors))]})
+
+        with patch.object(self.run_fixture, "agent", side_effect=agent):
+            self.assertEqual((first := operate("review.run"))["verdict"], "request_changes")
+            key = first["problems"][0]["finding"]
+            b = self.controller.job.b
+            green = focused()
+            self.assertEqual((green["outcome"], green["exit"], green["on_reviewed_tree"]), ("not reproduced", 0, True))
+            self.assertNotIn(key, b.repair_baselines)
+            with self.assertRaisesRegex(ValueError, "current focused repair evidence"):
+                operate("review.run")
+            self.assertEqual(b.capture_repair_baselines("before-worker"), f"{key} (fail)")
+            _, obsolete, red = receipts()
+            self.assertEqual((obsolete["outcome"], obsolete["exit"], obsolete["on_reviewed_tree"]),
+                             ("selector unavailable", 1, True))
+            self.assertEqual((red["exit"], red["outcome"], red["on_reviewed_tree"]), (1, "fail", True))
+            self.assertIn("expected blue and only revision 1, got green, [(1, 'blue')]", red["report"])
+            self.assertEqual((red["check"], red["test_class"]), ("classes", test_class))
+            fixed = settings.replace("self.history.pop()", "self.history.pop()\n        self.value = self.history[-1][1]")
+            for change, expected in ((settings + "\n# Incomplete repair.\n", "fail"), (fixed, "pass")):
+                self.assertEqual(self.worker(lambda: self.write("rollback_probe.py", change)), "review_repair")
+                self.assertEqual(focused()["outcome"], expected)
+                if expected == "fail":
+                    with self.assertRaisesRegex(ValueError, "current focused repair evidence"):
+                        operate("review.run")
+            self.write("rollback_probe.py", fixed + "\n# Integrated candidate changed.\n")
+            with self.assertRaisesRegex(ValueError, "stale"):
+                operate("review.run")
+            review.assert_called_once()
+            fresh = focused()
+            self.assertEqual((fresh["exit"], fresh["outcome"]), (0, "pass"))
+            self.assertEqual(len({r["tree"][""] for r in receipts()}), 4)
+            self.assertTrue(all(r["finding"] == key and r["command_sha"] == red["command_sha"]
+                                and r["after_tree"] == r["tree"] for r in receipts()[2:]))
+            self.assertEqual(b.repair_baselines[key], red)
+            with self.assertRaisesRegex(ValueError, "checks, review, verify"):
+                self.perform("publication.request")
+            self.assertTrue(self.perform("checks.run")["full"])
+            review.return_value = Result(True, structured={"problems": [], "earlier": [{"id": "B1", "status": "fixed"}]})
+            self.assertEqual(operate("review.run")["verdict"], "approve")
+            with self.assertRaisesRegex(ValueError, "publication needs current evidence: verify"):
+                self.perform("publication.request")
+            with patch.object(pipeline, "check_in_use", return_value=pipeline.verify.Verified("pass")) as verifier:
+                operate("verification.run", "verify")
+            self.assertEqual(pipeline.verification_trees(verifier.call_args.args[0]), fresh["tree"])
+            self.assertTrue(all(self.controller.current(gate) for gate in ("checks", "review", "verify")))
+
+        self.assertEqual(receipts()[-1], flows.saved_repair_state(self.run_fixture.id)["receipts"][key])
+
+
+class RepairVerificationSelectionTests(RepairWorkflowFixture):
+    def test_focused_repair_only_runs_approved_names_and_exposes_alternate_evidence(self):
+        self.prepare_controller()
+        self.layer.targeted_commands["classes"] = f"{shlex.quote(sys.executable)} -B -m unittest"
+        acceptance = "Reload the view and observe the saved value."
+        unapproved_name = "echo unapproved"
+        invalid_class = "fixture.Test; echo unapproved"
+        findings = [
+            dict(problem="Immediate read shows an old value.", verification="check", check=unapproved_name,
+                 acceptance="Read the saved value after rollback."),
+            dict(problem="After a second rollback the revision is wrong.", verification="check", check="classes",
+                 test_class=invalid_class),
+            dict(problem="Live view keeps an obsolete value.", verification="in_use",
+                 verification_reason="Needs the deployed view.", acceptance=acceptance),
+        ]
+        review = pipeline.Review.judged({"problems": [dict(p, severity="blocker") for p in findings]}, [], [], {})
+        b = self.controller.job.b
+        b.carry_review(review, "review-receipt")
+
+        def select_regressions(step, _prompt, where, *, role, read_only, **_kw):
+            self.assertEqual((step, where, role, read_only), ("review_selectors", self.wt, "review", True))
+            return Result(True, structured={"selectors": [
+                dict(id="review-receipt:B1", verification="check", check=unapproved_name),
+                dict(id="review-receipt:B2", verification="check", check="classes", test_class=invalid_class),
+            ]})
+
+        with (patch.object(self.run_fixture, "agent", side_effect=select_regressions) as selector,
+              patch.object(pipeline, "run_checks", side_effect=AssertionError("An unapproved check ran"))):
+            focused = self.perform("checks.run", scope="focused")
+        selector.assert_called_once()
+        self.assertFalse(focused["passed"])
+        self.assertEqual({key: receipt["outcome"] for key, receipt in focused["receipts"].items()},
+                         {"review-receipt:B1": "blocked", "review-receipt:B2": "blocked"})
+        self.assertFalse(b.repair_baselines)
+        key = "review-receipt:B3"
+        for expected in ("Requires independent in use: Needs the deployed view.", acceptance):
+            self.assertIn(expected, b.repair_feedback())
+        self.assertEqual(b.in_use_repair_hold(pipeline.verify.Verified("unverified")), key)
+        self.layer.verify = config.Verify(url="")
+        self.write("revision.txt", "1 blue\n")
+
+        def observe(_step, prompt, where, *, role, **_kw):
+            self.assertEqual(role, "verify")
+            self.assertIn(f"{key}: {acceptance}", prompt)
+            if (path := where / "revision.txt").read_text() == "2 green\n":
+                path.write_text("1 blue\n")
+            saw = path.read_text().strip()
+            return Result(True, runner="pi", structured={"verdict": "pass", "checks": [
+                {"what": key, "how": "Read revision.txt", "saw": saw, "passed": saw == "1 blue"}]})
+
+        with (patch.object(self.run_fixture.budget, "verifying", side_effect=contextlib.nullcontext),
+              patch.object(scratch, "make", return_value=None), patch.object(paths, "dashboard_ports", return_value=set()),
+              patch.object(self.run_fixture, "agent", side_effect=observe)):
+            verified = pipeline.check_in_use(b, "Verify the revision", "Repaired the read")
+            self.assertEqual((verified.native_trees, verified.repair_observations), ({}, {key: acceptance}))
+            self.assertEqual(b.in_use_repair_hold(pipeline.verify.Verified.stored(asdict(verified))), "")
+            self.write("revision.txt", "2 green\n")
+            self.assertEqual(b.in_use_repair_hold(verified), key)
+            edited = pipeline.check_in_use(b, "Verify the revision", "Edited during verification")
+            self.assertEqual((edited.verdict, edited.repair_observations, b.in_use_repair_hold(edited)), ("pass", {}, key))
+
+
+class HeldRepairDraftFixture(RepairWorkflowFixture):
+    rollback = ('saw=$(cat revision.txt) || exit 2; echo "saw $saw"; '
+                'test "$saw" = "1 blue" || { echo ARETE_REGRESSION_FAILED; exit 1; }')
+    acceptance = "Read revision 1 with value blue."
+    blocking_problem = {"file": "revision.txt", "problem": "Rollback leaves the wrong revision.", "severity": "blocker",
+                        "category": "regression", "verification": "check", "check": "rollback", "acceptance": acceptance}
+
+    def prepare_settings(self, *, max_repair_cycles=1, revision="1 blue"):
+        self.prepare_controller(max_repair_cycles)
+        self.layer.targeted_commands["rollback"] = self.rollback
+        self.write("goal.txt", "reached\n")
+        self.write("revision.txt", revision + "\n")
+        return self.controller.job
+
+    def prepare_draft_publication(self, *, existing_pr=False, focused=False, sibling=False):
+        job = self.prepare_settings(revision="2 green" if focused or existing_pr else "1 blue")
+        if sibling:
+            path = self.wt.with_name("sibling")
+            shutil.copytree(self.base, path)
+            shutil.copyfile(self.wt / "revision.txt", path / "revision.txt")
+            job.checkouts.append(workspace.Checkout("sibling", "fixture/sibling", path, path, "main"))
+        job.run.repo.parts = [config.Part(c.dir, c.github) for c in job.checkouts]
+        job.branch = self.branch
+        self.enterContext(patch.object(record, "metered_spent", return_value=0.0))
+        create = Mock(return_value=self.pr_url, side_effect=AssertionError("Unexpected new PR") if existing_pr else None)
+        self.enterContext(patch.multiple(gh, gh=Mock(side_effect=AssertionError("Unexpected GitHub call")),
+                                         pr_view=Mock(return_value={"state": "OPEN", "headRefName": job.branch}),
+                                         open_pr_url=Mock(return_value=""), pr_create=create,
+                                         pr_body=Mock(return_value=""), pr_edit_body=Mock()))
+        self.enterContext(patch.object(pipeline, "sync_pr_bodies", return_value=[]))
+        for c in job.checkouts:
+            self.prepare_branch(c, f"https://github.com/{c.github}/pull/1" if existing_pr else "")
+        self.enterContext(patch.object(workspace, "remote_head", side_effect=lambda src, _: next(
+            c.lease for c in job.checkouts if c.src == src)))
+        if sibling:
+            job.b.from_base = True
+        if focused:
+            self.exhaust_focused_review(job)
+        return job
+
+    def observe_file(self, b, file, what, expected):
+        trees, saw = pipeline.verification_trees(b), (self.wt / file).read_text().strip()
+        check = {"what": what, "how": f"Read {file}", "saw": saw, "passed": saw == expected}
+        return pipeline.verify.Verified("pass", native_trees=trees, observed_trees=trees, checks=[check])
+
+    def prepare_branch(self, c, pr="", *, published=("revision.txt",)):
+        util.git(["update-ref", f"refs/remotes/{c.origin_base}", "HEAD"], c.wt)
+        util.git(["switch", "-qc", self.branch], c.wt)
+        if pr:
+            c.pr = pr
+            c.note_pushed_head(self.commit(f"Published fixture\n\nArete-Run: {self.run_fixture.id}", *published, cwd=c.wt))
+            util.git(["update-ref", f"refs/remotes/origin/{self.branch}", c.lease], c.wt)
+
+    def exhaust_focused_review(self, job):
+        self.assertTrue(self.perform("checks.run")["full"])
+        self.controller.stamp("verify", asdict(job.verified))
+        with patch.object(job.run, "agent", return_value=Result(True, structured={"problems": [self.blocking_problem]})):
+            self.assertFalse(self.controller.atomic("review", attempt=1, tries=1).passed)
+        self.assertTrue(job.review_exhausted)
+        self.controller.stamp("review", job.review.asdict())
+
+    def publish_fixture(self, controller=False):
+        ctl = self.controller
+        if controller:
+            with patch.multiple(ctl, publication_ci=Mock(return_value=None), finish_publication=lambda: ctl.data["publication"]):
+                return self.perform("publication.request")
+        self.assertTrue((outcome := flows.pr(ctl.flow, tree=str(self.wt))).passed)
+        return outcome.data
+
+    @contextlib.contextmanager
+    def draft_actions(self, states, *, mock_build_push=True):
+        actions = Mock()
+        actions.read.side_effect = states
+        actions.commit.side_effect = lambda *_, check_targets, **_kw: check_targets()
+        push = patch.object(pipeline.Build, "push", actions.push) if mock_build_push else contextlib.nullcontext()
+        with (push, patch.multiple(gh, pr_draft_and_head=actions.read, pr_set_draft=actions.draft),
+              patch.object(pipeline, "commit_and_push", actions.commit)):
+            yield actions
+
+
+class HeldRepairDraftTests(HeldRepairDraftFixture):
+    def test_scripted_verification_repair_reaches_review_and_discloses_the_block_in_draft(self):
+        job = self.prepare_draft_publication()
+        self.layer.verify, job.run.step_overrides["verify"] = config.Verify(), {"tries": 2}
+        before = pipeline.verification_trees(job.b)
+        job.review, job.reviews = pipeline.Review("approve", trees=before), 1
+        gap = pipeline.verify.Verified("blocked", blocked_by="The settings viewer is unavailable.")
+
+        def agent(name, prompt, *_, role, **_kw):
+            if (name, role) == ("verify_fix", "check_repair"):
+                self.write("settings-config.txt", "revision = 1\n")
+                return Result(True)
+            self.assertEqual((name, role), ("review2", "review"))
+            self.assertTrue(job.b.full_checks_current(pipeline.verification_trees(job.b)))
+            self.assertIn(gap.blocked_by, prompt)
+            return Result(True, structured={"problems": []})
+
+        flow = factory.Flow(job.run.id, job)
+        with (patch.object(job.run, "agent", side_effect=agent),
+              patch.object(job.run.budget, "verifying", side_effect=contextlib.nullcontext),
+              patch.object(pipeline, "check_in_use", side_effect=[pipeline.verify.Verified("fail"), gap]),
+              patch.object(pipeline.Build, "push")):
+            self.assertIsNone(feature.final_blocker(flow, str(job.ws), patch=False, fixed=True, skipped=False, review_needed=False))
+            self.assertNotEqual(job.review.trees, before)
+            self.assertEqual(job.review.trees, pipeline.verification_trees(job.b))
+            published = self.publish_fixture()
+            self.assertTrue(gh.pr_create.call_args.kwargs["draft"])
+        self.assertEqual(published["verified"]["verdict"], "blocked")
+        self.assertIn(gap.blocked_by, published["report_body"])
+
+    def test_scripted_and_controller_exhaustion_require_a_held_draft(self):
+        for controller, error in ((False, workspace.RunFailed), (True, ValueError)):
+            with self.subTest(controller=controller):
+                job = self.prepare_draft_publication(focused=True)
+                job.review_exhausted = False
+                with self.assertRaisesRegex(error, "needs current focused repair evidence"):
+                    self.publish_fixture(controller)
+                if controller:
+                    job.run.budget.repair_calls = self.layer.max_repair_cycles
+                    evidence = self.controller.data["evidence"]
+                    saved = evidence.pop("verify")
+                    with self.assertRaisesRegex(ValueError, "needs current evidence: verify"):
+                        self.publish_fixture(controller)
+                    evidence["verify"] = saved
+                job.review_exhausted = not controller
+                with patch.object(pipeline.Build, "push") as push, patch.object(pipeline, "set_draft") as draft:
+                    self.assertIn("Focused repair evidence is still required", self.publish_fixture(controller)["draft_why"])
+                    self.assertIs(gh.pr_create.call_args.kwargs["draft"], True)
+                    gh.pr_create.assert_called_once()
+                push.assert_called_once()
+                draft.assert_not_called()
+
+    def test_held_update_cannot_push_without_a_confirmed_draft_at_its_head(self):
+        job = self.prepare_draft_publication(existing_pr=True, focused=True)
+        c, = job.checkouts
+        ready, replaced = (False, c.lease), (True, self.git("rev-parse", c.origin_base))
+        for controller, states in ((False, [ready, ready]), (False, [ready, replaced]), (True, [replaced])):
+            if controller:
+                job.review_exhausted = False
+                job.run.budget.repair_calls = self.layer.max_repair_cycles
+            with (self.subTest(states=states), self.draft_actions(states) as actions,
+                  self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft")):
+                self.publish_fixture(controller)
+            expected = [call.read(c.pr)] if controller else [call.read(c.pr), call.draft(c.pr, True), call.read(c.pr)]
+            self.assertEqual(actions.mock_calls, expected)
+
+    def test_classic_feedback_with_pending_focused_evidence_does_not_update_a_ready_pr(self):
+        job = self.prepare_draft_publication(existing_pr=True, focused=True)
+        c, = job.checkouts
+        job.run.feedback = [{"pr_url": c.pr}]
+        self.assertTrue(job.b.focused_hold())
+        job.b.restage()
+        with (self.draft_actions([(False, c.lease)]) as actions,
+              self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft")):
+            pipeline.push_classic_candidate(job.b, job.branch, "Fixture update", require_draft=True)
+        self.assertEqual(actions.mock_calls, [call.read(c.pr)])
+
+
+class HeldSiblingDraftTests(HeldRepairDraftFixture):
+    def test_no_push_continuation_holds_rechecked_heads_without_converting_feedback_or_repair_siblings(self):
+        job = self.prepare_draft_publication(existing_pr=True, sibling=True)
+        c, sibling = job.checkouts
+        prior = c.lease
+        c.note_pushed_head(self.commit("Published fixture goal", "goal.txt"))
+        sibling.revision = sibling.lease
+        job.continues = "continued-run"
+        self.assertTrue(self.perform("checks.run")["full"])
+        job.review = pipeline.Review("request_changes", failed=True, trees=pipeline.verification_trees(job.b))
+        for mode, targets in (("ordinary", job.checkouts), ("repair", [c]), ("feedback", []), ("pending", []),
+                              ("moved", job.checkouts)):
+            c.revision = prior if mode == "repair" else c.lease
+            job.run.repairs = "repair-source" if mode == "repair" else ""
+            job.run.feedback = [{"pr_url": c.pr}] if mode == "feedback" else []
+            job.prepared_feedback_prs = [c.pr] if mode == "pending" else []
+            states = [(draft, target.lease) for target in targets for draft in (False, True)]
+            if mode == "moved":
+                states[-1] = True, self.git("rev-parse", sibling.origin_base)
+            with self.subTest(mode=mode), self.draft_actions(states) as actions:
+                if mode == "moved":
+                    with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft at this run's head"):
+                        self.publish_fixture()
+                else:
+                    published = self.publish_fixture()
+                    self.assertEqual((published["committed"], published["drafted"]),
+                                     (False, [target.github for target in targets]))
+                self.assertEqual(actions.mock_calls, [action for target in targets for action in
+                                 (call.read(target.pr), call.draft(target.pr, True), call.read(target.pr))])
+
+    def test_held_updates_leave_an_unchanged_sibling_ready(self):
+        for mode in ("scripted", "controller", "adopt"):
+            with self.subTest(mode=mode):
+                job = self.prepare_draft_publication(existing_pr=True, sibling=True)
+                c, sibling = job.checkouts
+                adopt = mode == "adopt"
+                if mode != "scripted":
+                    head = self.commit(f"Update\n\nArete-Run: {job.run.id}", "goal.txt")
+                if adopt:
+                    c.note_pushed_head(head)
+                    c.revision, c.pr, sibling.revision = head, "", sibling.lease
+                    gh.open_pr_url.return_value = self.pr_url
+                self.exhaust_focused_review(job)
+                if not adopt:
+                    job.run.budget.repair_calls = self.layer.max_repair_cycles
+                states = [(False, c.lease)] + [(True, c.lease)] * (1 if adopt else 3)
+                with self.draft_actions(states, mock_build_push=mode != "scripted") as actions:
+                    published = self.publish_fixture(mode == "controller")
+                    gh.pr_create.assert_not_called()
+                at_head = call.read(self.pr_url)
+                expected = [at_head, call.draft(self.pr_url, True), at_head]
+                if adopt:
+                    pipeline.sync_pr_bodies.assert_called_once()
+                    self.assertIn("Focused repair evidence is still required", published["draft_why"])
+                else:
+                    self.assertIn(sibling.github, published["changed"])
+                    pushed, = actions.commit.call_args_list
+                    self.assertEqual(pushed.args[:2], ([c, sibling], [c]))
+                    expected += [call.commit(*pushed.args, **pushed.kwargs), at_head, at_head]
+                self.assertEqual(actions.mock_calls, expected)
+                self.assertEqual((published["found"], published["drafted"], published["pushed"]),
+                                 ([c.github] if adopt else [], [c.github], [] if adopt else [c.github]))
+
+
+class FeedbackInUseDraftTests(HeldRepairDraftFixture):
+    def test_feedback_missing_in_use_evidence_requires_the_same_draft_through_push(self):
+        job = self.prepare_draft_publication(existing_pr=True)
+        c, = job.checkouts
+        job.run.feedback = [{"pr_url": c.pr}]
+        b = job.b
+        finding = {"problem": "The settings page shows the wrong revision.", "severity": "blocker",
+                   "verification": "in_use", "acceptance": "Reload settings and read revision 1 with value blue."}
+        b.carry_review(pipeline.Review("request_changes", problems=[finding]), "repair")
+        self.assertTrue(self.perform("checks.run")["full"])
+        job.verified = self.observe_file(b, "goal.txt", "General smoke check", "reached")
+        job.review = pipeline.Review("approve", trees=job.verified.observed_trees)
+        self.controller.stamp("review", job.review.asdict())
+        self.controller.stamp("verify", asdict(job.verified))
+        self.assertEqual((b.focused_hold(), b.in_use_repair_hold(job.verified)), ("", "repair:B1"))
+        held, ready, moved = (True, c.lease), (False, c.lease), (True, self.git("rev-parse", c.origin_base))
+        for states in ([held, ready], [held, moved], [held, held], [ready]):
+            job.check_publication_targets = Mock()
+            with self.subTest(states=states), self.draft_actions(states) as actions:
+                def push(*_, check_targets, **_kw):
+                    check_targets()
+                    actions.delivered()
+
+                actions.draft.side_effect = AssertionError("Converted a feedback PR")
+                actions.push.side_effect = push
+                if states == [held, held]:
+                    self.assertIn("Independent in-use evidence is still required for repair:B1",
+                                  self.publish_fixture()["draft_why"])
+                else:
+                    with self.assertRaisesRegex(workspace.RunFailed, "not a confirmed draft") as refused:
+                        self.publish_fixture(states == [ready])
+                    if states == [ready]:
+                        self.assertIn("Requires independent in use", refused.exception.detail)
+                        actions.push.assert_not_called()
+                actions.commit.assert_not_called()
+                self.assertEqual(actions.delivered.call_count, int(states == [held, held]))
+                self.assertEqual(actions.read.call_args_list, [call(c.pr)] * len(states))
+                self.assertEqual(job.check_publication_targets.call_count, len(states))
+
+
+class FocusedRepairContinuationTests(HeldRepairDraftFixture):
+    producer = "repair:B1"
+
+    def carry_rollback(self, b):
+        self.write("revision.txt", "2 green\n")
+        b.carry_review(pipeline.Review("request_changes", trees=pipeline.verification_trees(b),
+                                      problems=[self.blocking_problem]), "repair")
+        self.assertEqual(b.check_repair_findings(producer="before-repair"), f"{self.producer} (fail)")
+        self.write("revision.txt", "1 blue\n")
+        self.assertEqual(b.check_repair_findings(producer="after-repair"), "")
+
+    def test_explicit_repair_reruns_closed_regression_on_changed_candidate(self):
+        b = self.prepare_settings().b
+        self.write("history.txt", "1 blue\n")
+        self.carry_rollback(b)
+        previous = {**self.blocking_problem, "finding": self.producer, "status": "fixed"}
+        history = {**self.blocking_problem, "file": "history.txt", "problem": "Rollback lost the history.",
+                   "check": "history", "acceptance": "Read both revisions after rollback."}
+        self.layer.targeted_commands["history"] = self.rollback.replace("revision.txt", "history.txt").replace(
+            '"1 blue"', '"1 blue, 2 green"')
+        latest = pipeline.Review("request_changes", trees=pipeline.verification_trees(b),
+                                 problems=[history], earlier=[previous])
+        b.carry_review(latest, "latest")
+        self.assertEqual(b.check_repair_findings(producer="latest:before", baseline=True), "latest:B1 (fail)")
+        evidence = pipeline.note_publication_review(b.run, "catch_up", latest, pipeline.verify.Verified("unverified"))
+        line = {"event": "publication_review", "run": b.run.id, "seq": 1, "evidence": evidence}
+        with patch.object(flows, "lineage_runs", return_value={b.run.id: [line]}):
+            review, origin, state = repairs.saved_review(b.run.id)
+        self.assertIn("publication_review", origin)
+        restored = replace(b, repair_findings={}, repair_receipts={}, repair_baselines={})
+        self.controller.job.built = restored
+        b.run.step_overrides["check_repair"] = {"tries": 1}
+        source = repairs.Source(b.run.id, self.branch, [], review, origin, "Repair rollback", "", "", repair_state=state)
+
+        def repair(_step, prompt, _cwd, *, role, **_):
+            self.assertEqual(role, "review_repair")
+            for text in (self.acceptance, history["acceptance"], "Focused check `history`: fail."):
+                self.assertIn(text, prompt)
+            self.write("history.txt", "1 blue, 2 green\n")
+            self.write("revision.txt", "2 green\n")
+            self.assertEqual(restored.focused_status(), {self.producer: "stale", "latest:B1": "stale"})
+            return Result(True)
+
+        with (patch.object(b.run, "repairs", source.run_id), patch.object(repairs, "source", return_value=source),
+              patch.object(b.run, "agent", side_effect=repair)):
+            outcome = flows.repair(self.controller.flow, str(self.wt))
+        self.assertEqual(outcome.feedback, "focused review regressions did not pass")
+        self.assertEqual(restored.focused_status(), {self.producer: "fail", "latest:B1": "pass"})
+
+    def test_saved_review_restores_legacy_findings_and_preserves_current_receipts(self):
+        job = self.prepare_settings()
+        b = job.b
+        implicit = {k: v for k, v in self.blocking_problem.items() if k != "verification"}
+        data = {"review": pipeline.Review("request_changes", problems=[implicit]).asdict()}
+        job.take("review", factory.Outcome("fail", data=data), stored=True)
+        check, = b.repair_findings
+        self.assertEqual(b.repair_findings[check]["acceptance"], self.acceptance)
+        self.assertEqual(b.check_repair_findings(producer="before", baseline=True), f"{check} (not run)")
+        self.assertEqual(b.check_repair_findings(producer="repair"), f"{check} (baseline unavailable)")
+        self.assertEqual(b.repair_receipts[check]["exit"], 0)
+        state = b.repair_state()
+        state["findings"][check] = {**state["findings"][check], "verification": "review"}
+        job.take("review", factory.Outcome("fail", data={**data, "repair_state": state}), stored=True)
+        self.assertEqual(b.focused_status(), {check: "baseline unavailable"})
+        self.assertEqual(b.repair_receipts, state["receipts"])
+
+    def test_full_and_focused_ci_repairs_share_the_configured_attempts(self):
+        b = self.prepare_settings(max_repair_cycles=2).b
+        b.checkouts[0].pr = self.pr_url
+        b.run.step_overrides["check_repair"] = {"tries": 2}
+        self.carry_rollback(b)
+        self.layer.checks["ready"] = "test -f ready.txt"
+
+        def repair(step, prompt, *, role):
+            self.assertEqual((step, role), ("check_repair", "check_repair"))
+            self.assertIn("ready.txt", prompt)
+            b.run.budget.charge(step, role)
+            self.write("ready.txt", "ready\n")
+            self.write("revision.txt", "2 green\n")
+            return Result(True)
+
+        with (patch.object(b, "resume", side_effect=repair) as worker, patch.object(b, "push") as push,
+              patch.object(b, "check", wraps=b.check) as full, patch.object(pipeline, "_review") as review,
+              self.assertRaisesRegex(workspace.RunFailed, "focused review regressions did not pass") as held):
+            pipeline.push_ci_fix(b, self.branch, [], "CI fixture", 1)
+        self.assertIn("saw 2 green", held.exception.detail)
+        self.assertEqual((worker.call_count, full.call_count, review.call_count, push.call_count), (1, 1, 0, 0))
 
 
 class OrchestratedFinishBudgetTests(PollFixture):

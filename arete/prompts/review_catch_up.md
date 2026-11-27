@@ -81,6 +81,13 @@ Set `part` to the diff that contains the cited location.
 - `approved` for a changed line in the approved diff that depends on a base change. Cite that change in
   `base_change` and explain the dependency in `dependency`.
 
+Give each blocker an `acceptance` condition with concrete steps and the expected repaired result. If repeatable,
+set `verification` to `check` and name the approved focused `check` from the supplied list. For an approved
+`classes` check also name the dotted class or test method in `test_class`. If no suitable check is approved,
+omit `check` and explain the gap in `verification_reason`; do not invent a command. If a checked
+regression is unsuitable, set `verification` to `in_use` for a live observation or `review` for inspection, and
+explain why in `verification_reason`.
+
 List other findings as `major` or `minor` follow-ups. Findings without valid attribution go in the PR body as notes
 found on catch-up. A missing check in use is a note. If the checks show a failure, identify the change that caused
 it. The pipeline approves when there are no attributed blockers. Keep `summary` to three sentences.

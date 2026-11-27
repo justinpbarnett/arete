@@ -11,6 +11,18 @@ BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
 UNWAIVABLE = ("security", "data_loss")
 EARLIER_STATUSES = ("fixed", "open", "waived")
 NOTE_SEVERITIES = ("major", "minor")
+REPAIR_METHODS = ("check", "review", "in_use")
+REPAIR_FIELDS = ("acceptance", "verification", "check", "test_class", "verification_reason")
+REPAIR_SELECTOR_SCHEMA = {
+    "type": "object",
+    "properties": {"selectors": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, "verification": {"type": "string", "enum": list(REPAIR_METHODS)},
+                       "check": {"type": "string"}, "test_class": {"type": "string"}, "reason": {"type": "string"}},
+        "required": ["id", "verification"],
+    }}},
+    "required": ["selectors"],
+}
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -26,6 +38,16 @@ REVIEW_SCHEMA = {
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
+                    "acceptance": {"type": "string"},
+                    "verification": {
+                        "type": "string",
+                        "enum": list(REPAIR_METHODS),
+                        "description": "Defaults to check for blockers. Use review for inspection or in_use for a "
+                                       "live observation.",
+                    },
+                    "check": {"type": "string"},
+                    "test_class": {"type": "string"},
+                    "verification_reason": {"type": "string"},
                 },
                 "required": ["problem", "severity"],
             },
@@ -139,7 +161,11 @@ class Review:
     @classmethod
     def judged(cls, said: dict, earlier: list[dict], waived: list[dict], trees: dict) -> Review:
         answered = settled(earlier, said.get("earlier"))
-        found = cls.stored({**said, "problems": said.get("problems"), "earlier": answered, "trees": trees,
+        problems = [{k: v for k, v in p.items() if k != "finding"} for p in review_problems(said.get("problems"))]
+        for problem in problems:
+            if problem["severity"] not in NOTE_SEVERITIES:
+                problem.setdefault("verification", "check")
+        found = cls.stored({**said, "problems": problems, "earlier": answered, "trees": trees,
                             "waived": waived + [e for e in answered if e["status"] == "waived"]})
         found.verdict = "request_changes" if found.blocking() else "approve"
         if "verdict" not in found._keys:
@@ -194,7 +220,26 @@ class Review:
         return {"verdict": str(self.verdict or ""), "summary": str(self.summary or ""),
                 "unresolved": self.verdict in ("pending", "request_changes"),
                 **{k: self._extra[k] for k in ("method", "findings", "decisions") if k in self._extra},
-                "problems": reported(self.blocking()), "notes": reported(self.notes())}
+                "problems": reported(self.blocking()), "notes": reported(self.notes()),
+                **({"trees": self.trees} if self.trees and self.blocking() else {})}
+
+    def identify(self, receipt: str) -> Review:
+        for n, p in enumerate(self._blocking, 1):
+            p.setdefault("finding", f"{receipt}:{blocker_id(n)}")
+        return self
+
+    def repair_requirements(self) -> dict[str, dict]:
+        requirements = {}
+        for p in self._blocking:
+            method = p.get("verification") or "check"
+            acceptance = p.get("acceptance") or f"Exercise the reported path and observe it no longer fails: {p['problem']}"
+            reason = p.get("verification_reason", "")
+            if not reason and method in ("review", "in_use"):
+                reason = "No alternate verification reason was recorded."
+            requirements[p["finding"]] = {"file": p.get("file", ""), "problem": p["problem"], "acceptance": acceptance,
+                                           "verification": method, "check": p.get("check", ""),
+                                           "test_class": p.get("test_class", ""), "reason": reason}
+        return requirements
 
 
 def settled(earlier: list[dict], answers) -> list[dict]:
@@ -234,8 +279,13 @@ def review_problems(listed) -> list[dict]:
              "severity": str(p.get("severity") or "unrated").strip().lower(),
              "category": str(p.get("category") or "").strip().lower()
              if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else "",
-             **{key: p[key] for key in ("cause", "catch_up_note") if p.get(key)}}
+             **repair_fields(p), **{key: p[key] for key in ("cause", "catch_up_note") if p.get(key)}}
             for p in listed if isinstance(p, dict)]
+
+
+def repair_fields(problem: dict, *, identified: bool = True) -> dict:
+    keys = (*REPAIR_FIELDS, "finding") if identified else REPAIR_FIELDS
+    return {key: problem[key].strip() for key in keys if isinstance(problem.get(key), str) and problem[key].strip()}
 
 
 def problem_text(problem: dict) -> str:
@@ -357,6 +407,7 @@ def catch_up_problems(problems: list, patches: dict[str, str]) -> list[dict]:
         if not isinstance(raw, dict):
             continue
         problem = {key: raw[key] for key in ("file", "problem", "severity", "category") if key in raw}
+        problem.update(repair_fields(raw, identified=False))
         if str(problem.get("severity") or "").strip().lower() not in NOTE_SEVERITIES:
             if cause := catch_up_cause(raw.get("attribution"), changes):
                 problem["cause"] = cause
@@ -367,5 +418,5 @@ def catch_up_problems(problems: list, patches: dict[str, str]) -> list[dict]:
 
 
 def reported(listed: list[dict]) -> list[dict]:
-    return [{"file": p["file"], "text": problem_text(p), "severity": p["severity"], "category": p.get("category") or ""}
-            for p in listed]
+    return [{"file": p["file"], "text": problem_text(p), "severity": p["severity"], "category": p.get("category") or "",
+             **repair_fields(p)} for p in listed]
