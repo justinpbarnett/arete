@@ -1,5 +1,8 @@
 import io
 import json
+import shlex
+import subprocess
+import tempfile
 import unittest
 import urllib.error
 from contextlib import nullcontext
@@ -7,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import config, gh, jev, outbound, pipeline, slots, tracker, verify, workspace
+from arete import config, diffguard, gh, jev, outbound, pipeline, sessions, slots, tracker, util, verify, workspace
 from arete.review import Review
 
 READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
@@ -243,6 +246,143 @@ class PushedPrDraftTests(unittest.TestCase):
                 self.assertEqual(pipeline.hold_pushed(self.run, [self.c], stopped, "held"), [])
                 self.assertEqual(self.names("pr", "ready"), [])
                 self.assertEqual(self.names("api", "-X", "PUT"), [])
+
+
+class StagingPathspecTests(unittest.TestCase):
+    DENY = [".env", "secrets/**", "path with spaces/*.key"]
+
+    def test_helpers_preserve_never_staged_order_and_glob_syntax(self):
+        self.assertEqual(diffguard.staged_pathspec(()), list(diffguard.NEVER_STAGED))
+        self.assertEqual(
+            diffguard.staged_pathspec(self.DENY),
+            [*diffguard.NEVER_STAGED, ":(exclude,glob).env", ":(exclude,glob)secrets/**",
+             ":(exclude,glob)path with spaces/*.key"],
+        )
+        self.assertEqual(diffguard.denied_pathspec(()), [])
+        self.assertEqual(
+            diffguard.denied_pathspec(self.DENY),
+            [":(glob).env", ":(glob)secrets/**", ":(glob)path with spaces/*.key"],
+        )
+
+    def test_diffguard_add_and_session_commits_generate_matching_args_and_scripts(self):
+        wt = Path("/fixture/wt")
+        with mock.patch.object(diffguard.util, "git") as git_mock:
+            diffguard.add(wt)
+        git_mock.assert_called_once_with(["add", "-A", "--", ".", *diffguard.NEVER_STAGED], wt)
+
+        for deny in ([], self.DENY):
+            with self.subTest(deny=bool(deny)):
+                expected_add = ["add", "-A", "--", ".", *diffguard.NEVER_STAGED,
+                                *(f":(exclude,glob){p}" for p in deny)]
+                expected_status = ["status", "--porcelain", "--untracked-files=all", "--",
+                                   *(f":(glob){p}" for p in deny)]
+
+                seen_git: list[list[str]] = []
+                logs: list[tuple[str, str]] = []
+
+                def fake_git(args, cwd):
+                    self.assertEqual(cwd, wt)
+                    seen_git.append(list(args))
+                    if args[:3] == ["diff", "--cached", "--name-only"]:
+                        return "ok.txt\n"
+                    if args[0] == "status":
+                        return "?? .env\n"
+                    if args == ["rev-parse", "HEAD"]:
+                        return "1" * 40 + "\n"
+                    return ""
+
+                spec = sessions.Spec("ses-1", "prompt", cwd=str(wt), deny=list(deny))
+                with mock.patch.object(sessions.util, "git", side_effect=fake_git), \
+                        mock.patch.object(sessions.util, "git_as_owner") as commit_mock, \
+                        mock.patch.object(sessions, "log_line", side_effect=lambda _s, k, t: logs.append((k, t))):
+                    sessions.commit_local(spec, "msg")
+
+                self.assertEqual(seen_git[0], ["reset", "-q"])
+                self.assertEqual(seen_git[1], expected_add)
+                self.assertEqual(seen_git[2], ["diff", "--cached", "--name-only"])
+                commit_mock.assert_called_once_with(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "msg"], wt)
+                if deny:
+                    self.assertEqual(seen_git[3], expected_status)
+                    self.assertEqual(seen_git[4], ["rev-parse", "HEAD"])
+                    self.assertEqual(logs, [("device", "left .env out of the commit: a denied path")])
+                else:
+                    self.assertEqual(seen_git[3], ["rev-parse", "HEAD"])
+                    self.assertEqual(logs, [])
+
+                excluded = shlex.join([*diffguard.NEVER_STAGED, *(f":(exclude,glob){p}" for p in deny)])
+                listed = shlex.join(f":(glob){p}" for p in deny)
+                expected_steps = [
+                    "cd ~/repo",
+                    "git reset -q",
+                    f"git add -A -- . {excluded}",
+                    f"{{ git diff --cached --quiet || {sessions.GIT_NO_HOOKS} commit -q -m msg; }}",
+                ]
+                if deny:
+                    expected_steps.append(f"git status --porcelain --untracked-files=all -- {listed}")
+                expected_steps.append("git rev-parse HEAD")
+                expected_script = " && ".join(expected_steps)
+                remote_out = ("?? .env\n" if deny else "") + "2" * 40 + "\n"
+
+                with mock.patch.object(sessions, "run_script", return_value=remote_out) as script_mock:
+                    head, left_out = sessions.commit_all("box", "~/repo", "msg", list(deny))
+
+                script_mock.assert_called_once_with("box", expected_script, "committing the session's work")
+                self.assertEqual(head, "2" * 40)
+                self.assertEqual(left_out, [".env"] if deny else [])
+
+    def test_local_and_remote_staging_exclude_never_staged_and_denied_paths_in_git(self):
+        for mode in ("local", "remote"):
+            for deny in ([], [".env", "secrets/**"]):
+                with self.subTest(mode=mode, deny=bool(deny)), tempfile.TemporaryDirectory() as tmp:
+                    wt = Path(tmp) / "repo"
+                    wt.mkdir()
+                    util.git(["init", "-q", "-b", "main"], wt)
+                    util.git(["config", "user.name", "Arete Test"], wt)
+                    util.git(["config", "user.email", "test@localhost"], wt)
+                    (wt / "base.txt").write_text("base\n")
+                    util.git(["add", "base.txt"], wt)
+                    util.git(["commit", "-q", "-m", "init"], wt)
+
+                    (wt / "keep.txt").write_text("keep\n")
+                    (wt / ".env").write_text("SECRET=1\n")
+                    (wt / "secrets").mkdir()
+                    (wt / "secrets" / "key.txt").write_text("k\n")
+                    (wt / "__pycache__").mkdir()
+                    (wt / "__pycache__" / "mod.pyc").write_bytes(b"pyc")
+
+                    if mode == "local":
+                        logs: list[str] = []
+                        spec = sessions.Spec("ses-2", "prompt", cwd=str(wt), deny=list(deny))
+                        with mock.patch.object(sessions, "log_line", side_effect=lambda _s, _k, t: logs.append(t)):
+                            sessions.commit_local(spec, "session commit")
+                        head = spec.fetched
+                        left_out = logs
+                    else:
+                        def run_locally(_device, script, _what):
+                            res = subprocess.run(["sh", "-c", script], check=True, capture_output=True, text=True)
+                            return res.stdout
+
+                        with mock.patch.object(sessions, "run_script", side_effect=run_locally):
+                            head, left_out = sessions.commit_all("box", str(wt), "session commit", list(deny))
+
+                    committed = set(util.git(["diff-tree", "--no-commit-id", "--name-only", "-r", head], wt).splitlines())
+                    self.assertIn("keep.txt", committed)
+                    self.assertNotIn("__pycache__/mod.pyc", committed)
+                    if deny:
+                        self.assertNotIn(".env", committed)
+                        self.assertNotIn("secrets/key.txt", committed)
+                        if mode == "local":
+                            self.assertEqual(
+                                sorted(left_out),
+                                ["left .env out of the commit: a denied path",
+                                 "left secrets/key.txt out of the commit: a denied path"],
+                            )
+                        else:
+                            self.assertEqual(sorted(left_out), [".env", "secrets/key.txt"])
+                    else:
+                        self.assertIn(".env", committed)
+                        self.assertIn("secrets/key.txt", committed)
+                        self.assertEqual(left_out, [])
 
 
 if __name__ == "__main__":
