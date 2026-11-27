@@ -297,10 +297,18 @@ def limit_applies(scope: str, model: str) -> bool:
 
 
 def auth_hold(auth: accounts.Auth, model: str, connect=foundation.reader, unknown: str = "") -> dict | None:
-    if not (auth.identity or auth.credential or unknown):
+    if not (auth.identity or auth.credential or auth.legacy_identity or auth.legacy_credential or unknown):
         return None
-    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
-    found = [h for h in devices_store.holds(connect) if h["scope"] in scopes]
+    pairs = [(accounts.legacy_scope(auth, s, unknown), accounts.scope(auth, s, unknown))
+             for s in limit_scopes(auth, model)]
+    aliases = {before: after for before, after in pairs if before and after}
+    scopes = {after for _, after in pairs if after}
+    rows = devices_store.holds(connect)
+    if foundation.transaction_mode() == "read" or connect is not foundation.reader:
+        scopes.update(before for before, _ in pairs if before)
+    elif any(h["scope"] in aliases for h in rows):
+        rows = devices_store.migrate_holds(aliases)
+    found = [h for h in rows if h["scope"] in scopes]
     return next((h for h in found if not h["until"]), found[-1] if found else None)
 
 
@@ -601,9 +609,8 @@ class Discovery:
 
     def cli_key_auth(self, way: Way | Candidate) -> accounts.Auth:
         selected = self.cli_key_route(way)
-        return accounts.Auth("api_key", generation=accounts.fingerprint("cli-key", selected.provider, selected.key),
-                             credential=accounts.fingerprint("credential-v1", way.runner, selected.provider, selected.key),
-                             provider=selected.provider)
+        return accounts.keyed(selected.provider, ("cli-key", selected.provider, selected.key),
+                              (way.runner, selected.provider, selected.key))
 
     def openrouter(self) -> dict:
         if self.listed is None:

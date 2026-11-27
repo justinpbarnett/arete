@@ -8,7 +8,7 @@ import re
 import time
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, paths, secretstore
@@ -32,13 +32,43 @@ class Auth:
     generation: str = ""
     credential: str = ""
     provider: str = ""
+    legacy_identity: str = field(default="", repr=False, compare=False)
+    legacy_generation: str = field(default="", repr=False, compare=False)
+    legacy_credential: str = field(default="", repr=False, compare=False)
 
 
 cache: dict[str, tuple[float, Auth]] = {}
 
 
 def fingerprint(*values) -> str:
+    return secretstore.fingerprint(*values)
+
+
+def legacy_fingerprint(*values) -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def instance_key() -> bytes | None:
+    if not paths.DB_FILE.exists() and not paths.LOCKS_DIR.is_relative_to(paths.STATE_DIR):
+        return None
+    if db.transaction_mode() == "read":
+        try:
+            with db.reader() as c:
+                meta = db.metadata(c)
+                if not (meta.get(secretstore.KEY_REF) or meta.get(secretstore.KEY_LOCAL)):
+                    return None
+        except db.NoDatabase:
+            return None
+    return secretstore.fingerprint_key()
+
+
+def keyed(provider: str, generation: tuple, credential: tuple, *, mode: str = "api_key") -> Auth:
+    key = instance_key()
+    return Auth(mode, provider=provider,
+                generation=secretstore.digest(key, *generation) if key else "",
+                credential=secretstore.digest(key, "credential-v2", *credential) if key else "",
+                legacy_generation=legacy_fingerprint(*generation),
+                legacy_credential=legacy_fingerprint("credential-v1", *credential))
 
 
 def mapping(value) -> dict:
@@ -62,12 +92,17 @@ def stable(value, family: str) -> str:
         return value if family == "codex" and re.fullmatch(r"[A-Za-z0-9_-]+", value) else ""
 
 
-def identity(family: str, values: list) -> str:
+def identities(key: bytes | None, family: str, values: list) -> tuple[str, str]:
     supplied = [v for v in values if v is not None and v != ""]
     normalized = [stable(v, family) for v in supplied]
     if not normalized or not all(normalized) or len(set(normalized)) != 1:
-        return ""
-    return fingerprint("account-v1", family, normalized[0])
+        return "", ""
+    return (secretstore.digest(key, "account-v2", family, normalized[0]) if key else "",
+            legacy_fingerprint("account-v1", family, normalized[0]))
+
+
+def identity(family: str, values: list) -> str:
+    return identities(secretstore.fingerprint_key(), family, values)[0]
 
 
 def jwt(token) -> dict:
@@ -121,7 +156,10 @@ def chatgpt_account_ids(claims: dict) -> list:
 
 def claude(status=None, account=None, token: str = "", source: str = "") -> Auth:
     status, account = mapping(status), mapping(account)
-    generation = fingerprint("claude", source, status, account, token)
+    key = instance_key()
+    inputs = ("claude", source, status, account, token)
+    generation = secretstore.digest(key, *inputs) if key else ""
+    legacy_generation = legacy_fingerprint(*inputs)
 
     def discover():
         method = status.get("authMethod") or status.get("auth_mode")
@@ -140,24 +178,28 @@ def claude(status=None, account=None, token: str = "", source: str = "") -> Auth
             if not stable(account_uuid, "claude"):
                 return Auth(mode, "claude", generation=generation)
             values += [account_uuid]
-        return Auth(mode, "claude", identity("claude", values), generation)
+        ident, legacy = identities(key, "claude", values)
+        return Auth(mode, "claude", ident, generation, legacy_identity=legacy)
 
-    found = cached(generation, discover)
+    found = cached(generation or legacy_generation, discover)
+    credential = ("claude", source, token or [status, account])
     return Auth(found.mode, found.family, found.identity, generation,
-                fingerprint("credential-v1", "claude", source, token or [status, account]), "anthropic")
+                secretstore.digest(key, "credential-v2", *credential) if key else "", "anthropic",
+                found.legacy_identity, legacy_generation, legacy_fingerprint("credential-v1", *credential))
 
 
 def codex(data=None, source: str = "", provider: str = "") -> Auth:
     data = mapping(data)
-    generation = fingerprint("codex", source, data, provider)
+    inputs = ("codex", source, data, provider)
     selected = data.get("auth_mode")
     if (selected in ("apikey", "api_key") or provider == "openai" or
             (not selected and data.get("OPENAI_API_KEY"))):
-        return Auth("api_key", generation=generation,
-                    credential=fingerprint("credential-v1", "codex", source, data.get("OPENAI_API_KEY") or data),
-                    provider="openai")
+        return keyed("openai", inputs, ("codex", source, data.get("OPENAI_API_KEY") or data))
+    key = instance_key()
+    generation = secretstore.digest(key, *inputs) if key else ""
+    legacy_generation = legacy_fingerprint(*inputs)
     if selected and selected not in ("chatgpt", "subscription"):
-        return Auth(generation=generation)
+        return Auth(generation=generation, legacy_generation=legacy_generation)
     tokens = mapping(data.get("tokens"))
     values = [tokens.get("account_id"), data.get("account_id"), data.get("accountId")]
     malformed = False
@@ -169,31 +211,56 @@ def codex(data=None, source: str = "", provider: str = "") -> Auth:
         malformed |= not bool(claims)
         values += chatgpt_account_ids(claims)
     mode = "subscription" if tokens or provider == "chatgpt" or data.get("auth_mode") in ("chatgpt", "subscription") else ""
-    return Auth(mode, "codex", "" if malformed else identity("codex", values), generation,
-                fingerprint("credential-v1", "codex", source, data), "openai-codex")
+    ident, legacy = ("", "") if malformed else identities(key, "codex", values)
+    credential = ("codex", source, data)
+    return Auth(mode, "codex", ident, generation,
+                secretstore.digest(key, "credential-v2", *credential) if key else "",
+                "openai-codex", legacy, legacy_generation, legacy_fingerprint("credential-v1", *credential))
 
 
 def pi(provider: str, credential=None, source: str = "") -> Auth:
     credential = mapping(credential)
-    generation = fingerprint("pi", source, provider, credential)
-    local = fingerprint("credential-v1", "pi", source, provider, credential)
+    if not credential:
+        return Auth("api_key", provider=provider)
+    inputs = ("pi", source, provider, credential)
     if credential.get("type") != "oauth" or provider not in PI_SUBSCRIPTIONS:
-        return Auth("api_key", generation=generation, credential=local, provider=provider)
+        return keyed(provider, inputs, inputs)
+    key = instance_key()
+    ident = legacy = ""
     family = "codex" if provider == "openai-codex" else ""
     if family == "codex":
         token = credential.get("access")
         claims = jwt(token) if token else {}
         values = [credential.get("accountId"), *chatgpt_account_ids(claims)]
-        return Auth("subscription", family, "" if token and not claims else identity(family, values), generation,
-                    local, provider)
-    return Auth("subscription", generation=generation, credential=local, provider=provider)
+        if not token or claims:
+            ident, legacy = identities(key, family, values)
+    return Auth("subscription", family, ident,
+                secretstore.digest(key, *inputs) if key else "",
+                secretstore.digest(key, "credential-v2", *inputs) if key else "", provider,
+                legacy, legacy_fingerprint(*inputs), legacy_fingerprint("credential-v1", *inputs))
+
+
+def subscription_scope(version: str, family: str, account: str, limit: str) -> str:
+    return f"subscription-{version}:" + json.dumps([family, account, limit], separators=(",", ":")) if account else ""
 
 
 def scope(auth: Auth, limit: str, unknown: str = "") -> str:
     if auth.mode == "api_key":
-        return "credit-v1:" + fingerprint(auth.provider, auth.credential or unknown) if auth.credential or unknown else ""
-    account = auth.identity or auth.credential or unknown
-    return "subscription-v1:" + json.dumps([auth.family, account, limit], separators=(",", ":")) if account else ""
+        current = "credit-v2:" + fingerprint(auth.provider, auth.credential or unknown) if auth.credential or unknown else ""
+    else:
+        account = auth.identity or auth.credential or unknown
+        current = subscription_scope("v2", auth.family, account, limit)
+    if current and (auth.legacy_identity or auth.legacy_credential):
+        if legacy := legacy_scope(auth, limit):
+            devices.remember_legacy_scope(current, legacy)
+    return current
+
+
+def legacy_scope(auth: Auth, limit: str, unknown: str = "") -> str:
+    if auth.mode == "api_key":
+        account = auth.legacy_credential or unknown
+        return "credit-v1:" + legacy_fingerprint(auth.provider, account) if account else ""
+    return subscription_scope("v1", auth.family, auth.legacy_identity or auth.legacy_credential or unknown, limit)
 
 
 def record(auth: Auth, *, secret_id: int | None = None, refresh_only: bool = False,
