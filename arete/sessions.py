@@ -387,8 +387,8 @@ def clone(device: ssh.Device | str, github: str, base: str, branch: str, folder:
 
 
 def commit_all(device: ssh.Device | str, folder: str, message: str, deny: list[str]) -> tuple[str, list[str]]:
-    excluded = shlex.join([*diffguard.NEVER_STAGED, *(f":(exclude,glob){p}" for p in deny)])
-    listed = shlex.join(f":(glob){p}" for p in deny)
+    excluded = shlex.join(diffguard.staged_pathspec(deny))
+    listed = shlex.join(diffguard.denied_pathspec(deny))
     steps = [f"cd {ssh.remote_dir(folder)}", "git reset -q", f"git add -A -- . {excluded}",
              f"{{ git diff --cached --quiet || {GIT_NO_HOOKS} commit -q -m {shlex.quote(message)}; }}"]
     if deny:
@@ -500,11 +500,12 @@ def unreturned_reason(spec: Spec) -> str:
 def commit_local(spec: Spec, message: str) -> None:
     wt = Path(spec.cwd)
     util.git(["reset", "-q"], wt)
-    util.git(["add", "-A", "--", ".", *diffguard.NEVER_STAGED, *(f":(exclude,glob){p}" for p in spec.deny)], wt)
+    util.git(["add", "-A", "--", ".", *diffguard.staged_pathspec(spec.deny)], wt)
     if util.git(["diff", "--cached", "--name-only"], wt).strip():
         util.git_as_owner(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", message], wt)
     if spec.deny:
-        left_out = util.git(["status", "--porcelain", "--untracked-files=all", "--", *(f":(glob){p}" for p in spec.deny)], wt)
+        left_out = util.git(["status", "--porcelain", "--untracked-files=all", "--",
+                             *diffguard.denied_pathspec(spec.deny)], wt)
         for line in left_out.splitlines():
             log_line(spec, "device", f"left {line[3:]} out of the commit: a denied path")
     spec.fetched = util.git(["rev-parse", "HEAD"], wt).strip()
