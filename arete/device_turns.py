@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import json
+from dataclasses import asdict, replace
 import os
 import re
 import selectors
@@ -12,7 +14,7 @@ import uuid
 from collections.abc import Callable
 
 from . import child, scratch, ssh
-from .store import db
+from .store import db, factory
 
 HEARTBEAT_SECONDS = 30
 BACKOFF = (1, 2, 4, 10)
@@ -60,7 +62,8 @@ def control(device, script, stdin="", timeout=CONTROL_SECONDS):
             pipe.close()
 
 
-def launch_script(path, argv, cwd, env, timeout, merge_stderr, input_size, retain=True):
+def launch_script(path, argv, cwd, env, timeout, merge_stderr, input_size, retain=True, fence=""):
+    admitted = f"test ! -f {fence} || exit 1" if fence else ":"
     if any(not ENV_NAME.fullmatch(k) for k in env):
         raise ValueError("invalid remote environment name")
     command = shlex.join(["env", *(f"{k}={v}" for k, v in env.items()), *argv])
@@ -88,6 +91,7 @@ echo "$$" > "$turn/pgid.tmp" && mv "$turn/pgid.tmp" "$turn/pgid" || exit 1
     sleep .1
   done
   test ! -f "$turn/stop" || exit 1
+  {admitted}
   cd "$working" && {command} < "$turn/in" >> "$turn/out" {'2>&1' if merge_stderr else '2>> "$turn/err.log"'}
   code=$?; echo "$code" > "$turn/exit.tmp" && mv "$turn/exit.tmp" "$turn/exit"
 ) &
@@ -123,6 +127,7 @@ kill -KILL -"$$"
     bash_job = ('set -m; ( exec bash -c "$1" bash "$2" "$3" ) & '
                 'worker=$!; echo "$worker" > "$2/owner"; wait "$worker"')
     return f"""umask 077
+{admitted}
 working=$(cd {ssh.remote_dir(cwd)} && pwd -P) || exit 1
 mkdir -p -m 0700 "$(dirname {path})" || exit 1
 mkdir -m 0700 {path} || exit 2
@@ -240,13 +245,42 @@ def finish(device, path, timeout=CONTROL_SECONDS):
                    "test -f stopped && test -f exit || exit 4; cat exit; tail -c 6000 err.log", timeout=timeout)
 
 
+def saved_device(data):
+    return ssh.Device(**{**data, "via": saved_device(data["via"]) if data.get("via") else None})
+
+
+def stop_fence(device, key):
+    return ssh.remote_dir(f"{device.dir.rstrip('/')}/.arete/factory-stops/{component(key)}")
+
+
+def confirm_factory_stop(process):
+    entry = json.loads(process["detail"])
+    device = saved_device(entry["device"])
+    path = folder(device, entry["leaf"])
+    fence = stop_fence(device, process["id"])
+    script = (f'umask 077; mkdir -p "$(dirname {fence})" && touch {fence} || exit 1; '
+              f"mkdir -p {path} && touch {path}/stop || exit 1; "
+              f"test ! -s {path}/pgid || test -f {path}/stopped")
+    return control(device, script).returncode == 0
+
+
 def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: str, *, timeout: float,
         on_line: Callable[[str], None], on_mark: Callable[[str, int], None], leaf: str,
         merge_stderr: bool = False, settle_answer: bool = False) -> subprocess.CompletedProcess:
     if not db.migration_applied(CONTRACT):
         raise ssh.DeviceError("remote turns wait for the remote-turn contract; stop older runs, loops, sessions "
                               "and serve processes, then run arete migrate")
-    path = folder(device, leaf if device.turns else f"{leaf}-{uuid.uuid4().hex}")
+    retain = bool(device.turns)
+    leaf = leaf if retain else f"{leaf}-{uuid.uuid4().hex}"
+    device = replace(device, turns=base(device))
+    path = folder(device, leaf)
+    key = f"remote-{uuid.uuid4().hex}"
+    with db.tx() as c:
+        version = factory.admit(c)
+        factory.register(c, key, os.getpid(), "remote", version=version,
+                         detail=json.dumps({"device": asdict(device), "leaf": leaf}))
+        fence = stop_fence(device, key) if factory.installed(c) else ""
+    settled = False
     deadline = time.monotonic() + timeout
     started = False
     attempted = False
@@ -309,7 +343,8 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             time.sleep(min(.1, left(), max(0, end - time.monotonic())))
 
     try:
-        script = launch_script(path, argv, cwd, env, timeout, merge_stderr, len(stdin.encode()), retain=bool(device.turns))
+        script = launch_script(path, argv, cwd, env, timeout, merge_stderr, len(stdin.encode()), retain=retain,
+                               fence=fence)
         attempted = True
         try:
             launched = control(device, script, stdin, timeout=left())
@@ -419,6 +454,7 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             lost("remote turn cleanup was not acknowledged")
         if status == "killed: deadline":
             raise subprocess.TimeoutExpired(argv, timeout, output="".join(output), stderr=err)
+        settled = True
         completed = subprocess.CompletedProcess(argv, 0 if settling else int(status) if status.isdigit() else 137,
                                                 "".join(output), err)
         completed.started = started
@@ -433,10 +469,18 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             error.output = "".join(output)
         if attempted:
             try:
-                remove = not device.turns and not awaiting_status
+                remove = not retain and not awaiting_status
                 cleanup(device, path, stop=True, discard=remove, remove=remove, retry=False, deadline=deadline)
             except (OSError, subprocess.SubprocessError, RuntimeError) as cleanup_error:
                 error.add_note(str(cleanup_error))
+            else:
+                settled = True
+        else:
+            settled = True
         raise
     finally:
         finished.set()
+        if settled:
+            with db.tx() as c:
+                if not factory.interrupted(key, c):
+                    factory.forget(key)

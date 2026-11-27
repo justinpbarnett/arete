@@ -203,6 +203,12 @@ def settle_feedback(run_id: str, status: str, *, prs: tuple[str, ...] = ()) -> N
                   f"{pr_filter}", (status, run_id, *prs))
 
 
+def ticket_feedback(repo: str, ref: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE repo = ? AND issue = ? "
+                                           "ORDER BY pr_url, created", (repo, ref))]
+
+
 def feedback_between(since: str, until: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute("SELECT * FROM feedback WHERE COALESCE(recorded, created) >= ? "

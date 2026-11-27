@@ -82,7 +82,10 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
 
 
 def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
-    with foundation.tx():
+    from .store import factory
+
+    with foundation.tx() as c:
+        factory.admit(c)
         if events is None:
             return [item] if (item := loop_store.enqueue(loop.name, loop.queue_name, "", how)) else []
         batches: dict[str, list[dict]] = {}
@@ -137,10 +140,15 @@ def shown(keys: list[str]) -> str:
 
 
 def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tuple[list[dict], list[int]]:
+    from .store import factory
+
+    version = factory.admit()
     source = loop.sources[index]
     sid = source_id(loop, index)
     kind = SOURCES[source["type"]]
-    adopt_history(loop, index, source, sid)
+    with foundation.tx() as c:
+        factory.admit(c, version=version)
+        adopt_history(loop, index, source, sid)
     started = util.iso()
     owner = fingerprint(source)
     known = source_store.cursor(sid)
@@ -151,11 +159,12 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
-    with foundation.tx():
+    with foundation.tx() as c:
+        factory.admit(c, version=version)
         claimed = set(source_store.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:
-            forwarded, older = [], fresh
+            forwarded, older = kind.baseline(fresh)
         elif changed or unsure:
             forwarded, older = kind.catch_up(fresh, last_good_poll(known), untimed=unsure)
         else:
@@ -170,12 +179,12 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
         source_store.set_cursor(sid, value, True, detail, started=started)
         source_store.set_source_owner(sid, owner)
     if first:
-        say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
-            + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))
+        say(f"{sid}: first read, {len(older)} existing events taken as the baseline"
+            + (f": {shown([e['key'] for e in older])}" if older else ""))
     elif told:
         say(f"{sid}: source settings changed; {len(forwarded)} events since the last good poll go on, "
             f"{len(older)} older taken as seen" + (f": {shown([e['key'] for e in older])}" if older else ""))
-    return ([], []) if first else (forwarded, items)
+    return forwarded, items
 
 
 def peek(loop: Loop, index: int, cfg: config.Config) -> list[dict]:
@@ -205,6 +214,9 @@ class Source:
 
     def rescope(self, source: dict, cursor):
         return cursor
+
+    def baseline(self, fresh: list[dict]) -> tuple[list[dict], list[dict]]:
+        return [], fresh
 
     def catch_up(self, fresh: list[dict], since: datetime | None, untimed: bool = False) -> tuple[list[dict], list[dict]]:
         cutoff = since - CATCH_UP_SLACK if since else None
@@ -426,4 +438,25 @@ def signature(line: str) -> str:
     return text[:300]
 
 
-SOURCES: dict[str, Source] = {"github": GitHub(), "jira": Jira(), "log": Log(), "command": Command()}
+class ClosedSpecs(Source):
+    scope = ("tracker",)
+
+    def baseline(self, fresh):
+        return ([e for e in fresh if e["data"].get("delivery_root")],
+                [e for e in fresh if not e["data"].get("delivery_root")])
+
+    def problems(self, source, loop, cfg):
+        problems = super().problems(source, loop, cfg)
+        if source.get("tracker") not in ("github", "jira"):
+            problems.append("a closed-specs source needs tracker = github or jira")
+        return problems
+
+    def fetch(self, loop, source, cfg, sid, cursor):
+        from . import spec_retro
+
+        return spec_retro.closed_specs(cfg, source["tracker"], sid), None
+
+
+SOURCES: dict[str, Source] = {
+    "github": GitHub(), "jira": Jira(), "log": Log(), "command": Command(), "closed-specs": ClosedSpecs(),
+}

@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 
 from .. import util
+from . import factory
 from .db import db, reader
 
 TABLES = {
@@ -159,6 +160,7 @@ def release_settled_claims() -> None:
     with db() as c:
         rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
                          "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
+                         f"{factory.exclude_retained(c, 'q.run_id')} "
                          "AND (r.status IS NULL OR r.status != 'running')").fetchall()
         for row in rows:
             finish_claim(c, dict(row), "dead" if row["status"] == "stopped" else "retry",

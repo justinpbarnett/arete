@@ -19,7 +19,10 @@ SETTLE_POLL_SECONDS = 1
 
 def stream(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], timeout: float,
            on_line: Callable[[str], None], *, actor_confined: bool = False) -> subprocess.CompletedProcess:
-    child = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    from . import factory_control
+    from .store import factory
+
+    key, child = factory_control.spawn(scratch.spawn, cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, errors="replace", env=env, actor_confined=actor_confined)
     out: list[str] = []
     err: list[str] = []
@@ -48,6 +51,7 @@ def stream(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], ti
         raise
     finally:
         release(child)
+        factory.forget(key)
         for helper in helpers:
             helper.join(DRAIN_SECONDS)
     if cuts:

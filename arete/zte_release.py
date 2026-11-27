@@ -341,9 +341,15 @@ def stage(install: Installation, delivery, client) -> Path:
 def active(delivery, install: Installation):
     previous = delivery.data.get("last_good") or selected(install)
     policy = zte.active(delivery, engine=previous[:12])
-    pilot.require(installation() == install and policy.rehearsal == install.to_receipt()["rehearsal"]
-                  and zte.settings(config.load(), policy)[2] == delivery.data["config"],
+    cfg = config.load()
+    pilot.require(installation() == install and policy.rehearsal == install.to_receipt()["rehearsal"],
                   "the release profile or admitted configuration changed")
+    repo, _, digest = zte.settings(cfg, policy)
+    pilot.require(digest == delivery.data["config"], "the release profile or admitted configuration changed")
+    environment = "staging" if policy.rehearsal else "production"
+    pilot.require(repo.allows_unattended_deploy(environment) and
+                  cfg.repo(cfg.arete_repo).allows_unattended_deploy(environment),
+                  f"the repo enrollment does not allow unattended deployment to {environment}")
     zte_delivery.check_stop(delivery, policy, engine=previous[:12])
     return policy
 

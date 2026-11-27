@@ -15,9 +15,11 @@ The reviewer also left notes. Fix a note only when the fix is small and inside t
 
 $notes
 
-Use a focused reproduction when it helps establish that a blocker is fixed, and read its output and exit code.
-Arete runs targeted checks after each repair and the full repository suite on the final tree before publication.
-Do not duplicate the full suite in this repair step.
+When investigating a failed check, first rerun its configured command if available and permitted, even if it runs
+the full suite. If it cannot run, report the blocker and name the configured command if known. Do not build a
+replacement verifier environment.
+Use a focused reproduction for other blockers or to narrow a failure after the configured rerun. Read its output
+and exit code. Rerunning a failed check is not rerunning the entire publication gate; Arete owns that gate.
 Name exactly what you ran and any environmental limitation; never report an unrun check as passed.
 
 Do not expand scope beyond the issue. End with one line per blocker id: `B1 fixed: how` or `B1 left open: why`. The

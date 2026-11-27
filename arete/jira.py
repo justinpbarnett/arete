@@ -34,6 +34,24 @@ class JiraUnsure(JiraError):
     pass
 
 
+def site_url(env_file: Path | None) -> str:
+    base = os.environ.get("JIRA_BASE_URL")
+    if not base and env_file:
+        base = util.read_env_file(env_file).get("JIRA_BASE_URL")
+    if not base:
+        raise JiraError("no Jira site configured for ticket publication")
+    return checked_base(base)
+
+
+def checked_base(value: str) -> str:
+    base = value.rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if (parts.scheme not in ("http", "https") or not parts.netloc or parts.username is not None
+            or parts.password is not None or parts.query or parts.fragment):
+        raise JiraError("JIRA_BASE_URL must be a full HTTP(S) URL without credentials, query, or fragment")
+    return base
+
+
 def credentials(env_file: Path | None) -> tuple[str, str, str]:
     if paths.ISOLATED:
         raise JiraError(paths.ISOLATED_LOGINS)
@@ -43,11 +61,7 @@ def credentials(env_file: Path | None) -> tuple[str, str, str]:
     if missing:
         where = f" or in {env_file}" if env_file else "; or name an env file in [jira] env_file"
         raise JiraError(f"missing {', '.join(missing)}: set them in the environment{where}")
-    base = vals[0].rstrip("/")
-    parts = urllib.parse.urlsplit(base)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise JiraError(f"JIRA_BASE_URL {base!r} is not a full URL; write it like https://your-site.atlassian.net")
-    return base, vals[1], vals[2]
+    return checked_base(vals[0]), vals[1], vals[2]
 
 
 def parse_time(s: str) -> datetime:
@@ -82,30 +96,33 @@ class Client:
     def browse_url(self, key: str) -> str:
         return f"{self.base}/browse/{key}"
 
-    def request(self, method: str, path: str, params: dict | None = None, body=None):
-        raw = self._send(method, path, params, body)
+    def request(self, method: str, path: str, params: dict | None = None, body=None, *, single_attempt=False):
+        raw = self._send(method, path, params, body, **({"single_attempt": True} if single_attempt else {}))
         return json.loads(raw) if raw.strip() else None
 
     def attachment(self, attachment_id: str) -> bytes:
         return self._send("GET", f"/rest/api/2/attachment/content/{_path_segment(attachment_id)}", accept="*/*")
 
     def _send(self, method: str, path: str, params: dict | None = None, body=None,
-              accept: str = "application/json") -> bytes:
+              accept: str = "application/json", *, single_attempt=False) -> bytes:
         url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Authorization": self._auth, "Accept": accept}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        for attempt in range(RETRIES + 1):
+        retries = 0 if single_attempt else RETRIES
+        for attempt in range(retries + 1):
+            from .store import factory
+            factory.check_worker()
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
-                if method == "POST" and e.code >= 500:
+                if (single_attempt or method == "POST") and e.code >= 500:
                     raise JiraUnsure(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}", e.code) from None
-                if (e.code == 429 or e.code >= 500) and attempt < RETRIES and wait <= MAX_RETRY_WAIT:
+                if (e.code == 429 or e.code >= 500) and attempt < retries and wait <= MAX_RETRY_WAIT:
                     time.sleep(wait)
                     continue
                 later = f" (retry after {wait:.0f} s)" if wait > MAX_RETRY_WAIT else ""
@@ -113,9 +130,9 @@ class Client:
             except (urllib.error.URLError, TimeoutError, OSError, RemoteDisconnected) as e:
                 never_sent = isinstance(e, urllib.error.URLError) and isinstance(
                     e.reason, (socket.gaierror, ConnectionRefusedError))
-                if method == "POST" and not never_sent:
+                if (single_attempt or method == "POST") and not never_sent:
                     raise JiraUnsure(f"jira {method} {path}: {e}") from None
-                if attempt < RETRIES:
+                if attempt < retries:
                     if not util.online():
                         util.wait_for_network()
                     time.sleep(2**attempt)
@@ -162,6 +179,21 @@ class Client:
 
     def issue(self, key: str, fields: list[str]) -> dict:
         return _read_description(self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {})
+
+    def project_key(self, key: str) -> str:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]+", key):
+            raise ValueError("enter a Jira project key, such as APP")
+        row = self.get(f"/rest/api/3/project/{_path_segment(key)}")
+        if not isinstance(row, dict) or row.get("key") != key or row.get("archived"):
+            raise JiraError(f"Jira did not confirm an active project with key {key}")
+        return key
+
+    def subtask_type(self, project: str) -> str:
+        types = self._paged(f"/rest/api/3/issue/createmeta/{_path_segment(project)}/issuetypes", key="issueTypes")
+        ids = {row.get("id") for row in types if row.get("subtask") is True and row.get("id")}
+        if len(ids) != 1:
+            raise JiraError(f"{project} needs exactly one available subtask type to publish a child")
+        return str(ids.pop())
 
     def statuses(self, project: str) -> set[str]:
         if project not in self._statuses:
@@ -223,12 +255,38 @@ class Client:
                                  getattr(e, "status", 0)) from e
         return self.comment_url(key, posted["id"]) if return_url and isinstance(posted, dict) and posted.get("id") else None
 
+    def find_task_marker(self, project: str, account: str, marker: str) -> str:
+        # A single alphanumeric word survives Jira's description tokenization.
+        if not re.fullmatch(r"areteemit[a-f0-9]{64}", marker):
+            raise ValueError("invalid ticket publication marker")
+        query = (f"project = {json.dumps(project)} AND creator = {json.dumps(account)} "
+                 f'AND description ~ "{marker}"')
+        issues = self.search(query, ["description"], limit=1, include=lambda issue:
+                             marker in adf.to_text((issue.get("fields") or {}).get("description")).splitlines())
+        return self.browse_url(issues[0]["key"]) if issues else ""
+
+    def create_task(self, project: str, account: str, title: str, body: str, labels: list[str], *,
+                    parent: str = "", subtask_type: str = "") -> str:
+        fields = {"project": {"key": project}, "issuetype": {"name": "Task"}, "assignee": {"accountId": account},
+                  "summary": outbound.screen(title), "description": adf.from_markdown(outbound.screen(body)),
+                  "labels": labels}
+        if parent:
+            fields.update(parent={"key": parent}, issuetype={"id": subtask_type})
+        try:
+            result = self.request("POST", "/rest/api/3/issue", body={"fields": fields})
+        except (ValueError, UnicodeError) as error:
+            raise JiraUnsure("Jira returned an unreadable reply after creating the task") from error
+        key = result.get("key") if isinstance(result, dict) else None
+        if not isinstance(key, str) or not KEY_RE.fullmatch(key) or key.rsplit("-", 1)[0] != project.upper():
+            raise JiraUnsure("Jira did not confirm the created task key")
+        return self.browse_url(key)
+
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]
         if ops:
             self.request("PUT", f"/rest/api/2/issue/{_path_segment(key)}", body={"update": {"labels": ops}})
 
-    def move(self, key: str, target: str) -> bool:
+    def move(self, key: str, target: str, *, category: str = "") -> bool:
         try:
             status_exists = target.lower() in {s.lower() for s in self.statuses(key.rsplit("-", 1)[0])}
         except JiraError:
@@ -240,6 +298,10 @@ class Client:
             pick = next((t for t in found if t.get("name", "").lower() == want), None)
         if pick is None:
             return False
+        if category:
+            destination = ((pick.get("to") or {}).get("statusCategory") or {}).get("key")
+            if not destination or (destination == "done") != (category == "done"):
+                return False
         try:
             self.request("POST", f"/rest/api/2/issue/{_path_segment(key)}/transitions", body={"transition": {"id": pick["id"]}})
         except JiraUnsure as e:

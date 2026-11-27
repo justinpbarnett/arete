@@ -10,6 +10,7 @@ from . import (
     board,
     config,
     control,
+    factory_control,
     gh,
     paths,
     pipeline,
@@ -160,6 +161,11 @@ def answer_lock(chat_id: int) -> str:
 
 
 def send(chat_id: int, text: str) -> dict:
+    from .store import factory as factory_state
+
+    from . import factory_control
+
+    version = factory_state.admit()
     chat_row(chat_id)
     sessions.tell_chats()
     held = util.lock_file(answer_lock(chat_id))
@@ -170,7 +176,11 @@ def send(chat_id: int, text: str) -> dict:
 
         def locked_answer() -> None:
             with held:
-                answer(chat_id, text, message_id, row["project"])
+                try:
+                    with factory_control.activity("chat", version):
+                        answer(chat_id, text, message_id, row["project"])
+                except factory_state.Off as error:
+                    chats_store.chat_say(chat_id, "arete", str(error), busy=0)
 
         threading.Thread(target=locked_answer, daemon=True).start()
     except BaseException:
@@ -375,6 +385,7 @@ def reply_and_draft(result: Result) -> tuple[str, dict | None]:
     return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
 
 
+@factory_control.work
 def file_draft(chat_id: int, publication=None, *, draft=None) -> dict:
     with filing:
         if publication and publication.pending and "result" in publication.pending:
@@ -462,6 +473,9 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
 
 def start_session(chat_id: int, prompt: str, *, repo: str | None = None, device: str = "", model: str = "",
                   runner: str = "", budget_usd: float | None = None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     with starting, slots.admitting():
         row = chat_row(chat_id)
         cfg = config.load()

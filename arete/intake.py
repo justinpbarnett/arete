@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 
-from . import config, gh, jev, tracker
+from . import config, factory_control, gh, jev, tracker
 
 FIX, FEATURE, RESEARCH, PERSON = "fix", "feature", "research", "person"
 KINDS = (FIX, FEATURE, RESEARCH, PERSON)
@@ -98,11 +98,12 @@ def add_labels(source: tracker.Tracker, tid: str, labels: list[str]) -> None:
         source.client.edit_labels(tid, labels)
 
 
+@factory_control.work
 def route_ticket(cfg: config.Config, repo: config.Repo, source: tracker.Tracker, ticket: tracker.Ticket, *,
                  dry_run: bool = False, log=print) -> tracker.Ticket:
     if not cfg.triage.route_fixes or dry_run or not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)):
         return ticket
-    if ticket.blocker or not ticket.open:
+    if ticket.is_spec or ticket.blocker or not ticket.open:
         return ticket
     if ticket.kind == "fix" or FIX in ticket.labels or FEATURE in ticket.labels:
         return ticket

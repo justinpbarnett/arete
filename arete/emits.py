@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config, gh, outbound, screening, sources, util
+from . import config, gh, idempotency, jira, outbound, screening, sources, ticket_publication, util
 from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
 from .store import loops as loop_store
 
@@ -103,24 +103,45 @@ class Emit:
         pass
 
 
+def configured_ticket_target(cfg: config.Config, name: str) -> dict:
+    repo = config_repo(cfg, name) if name else None
+    if not repo:
+        raise ValueError(f"configured ticket emit needs a registered target repo: {name!r}")
+    return ticket_publication.target_for(cfg, repo)
+
+
 class Ticket(Emit):
-    approving = "It files the ticket on GitHub, so it can take a few seconds."
+    approving = "It files the ticket on the selected tracker, so it can take a few seconds."
 
     def problems(self, spec: dict, loop: Loop, cfg: config.Config) -> list[str]:
+        if spec.get("tracker", "github") not in ("github", "configured"):
+            return ["ticket emit tracker must be github or configured"]
         if spec.get("repo") == "$finding.repo":
             return (["ticket emit repo = '$finding.repo' needs internal-or-higher trigger trust"]
                     if trust_rank(loop.trigger.trust) < trust_rank("internal") else [])
+        if spec.get("tracker") == "configured":
+            try:
+                configured_ticket_target(cfg, spec.get("repo", ""))
+            except (ValueError, jira.JiraError) as error:
+                return [str(error)]
+            return []
         return sources.repo_problems(cfg, [spec.get("repo", "")], "ticket emit")
 
     def resolve(self, spec: dict, findings: list[dict], outcome: dict, cfg: config.Config) -> dict:
-        if spec.get("repo") != "$finding.repo":
-            return spec
-        if trust_rank(outcome.get("trust")) < trust_rank("internal"):
-            raise ValueError("dynamic ticket repository requires internal-or-higher input trust")
-        name = findings[0].get("repo")
-        if not isinstance(name, str) or not name or not config_repo(cfg, name):
-            raise ValueError("dynamic ticket finding repo is missing or unknown")
-        return {**spec, "repo": name}
+        name = spec.get("repo")
+        if name == "$finding.repo":
+            if trust_rank(outcome.get("trust")) < trust_rank("internal"):
+                raise ValueError("dynamic ticket repository requires internal-or-higher input trust")
+            name = findings[0].get("repo")
+            if not isinstance(name, str) or not name or not config_repo(cfg, name):
+                raise ValueError("dynamic ticket finding repo is missing or unknown")
+            spec = {**spec, "repo": name}
+        if spec.get("tracker") == "configured":
+            target = configured_ticket_target(cfg, name)
+            if "_reviewed_destination" in findings[0] and findings[0]["_reviewed_destination"] != target:
+                raise ValueError("A retrospective finding's destination changed since the review")
+            return {**spec, "repo": config_repo(cfg, name).name, "destination": target}
+        return spec
 
     def batches(self, findings: list[dict], outcome: dict) -> list[list[dict]]:
         return [[f] for f in findings]
@@ -129,9 +150,17 @@ class Ticket(Emit):
         f = findings[0]
         if spec.get("repo") == "$finding.repo":
             raise ValueError("dynamic ticket repository must be resolved before rendering")
-        return {"repo": spec["repo"], "title": outbound.plain(spec.get("prefix", "") + f["title"], 120),
+        delivery = {}
+        if spec.get("tracker") == "configured":
+            identity = [loop.name, spec["repo"], f.get("fingerprint_key") or f["fingerprint"]]
+            key = idempotency.fingerprint("POST", ticket_publication.LOOP_ROUTE, {}, identity)
+            delivery = {"destination": spec["destination"], "publication_key": key}
+        labels = as_list(spec.get("labels", [] if delivery else ["agent"]))
+        if spec.get("destination", {}).get("tracker", "github") == "github" and "github_labels" in spec:
+            labels = list(dict.fromkeys([*labels, *as_list(spec["github_labels"])]))
+        return {**delivery, "repo": spec["repo"], "title": outbound.plain(spec.get("prefix", "") + f["title"], 120),
                 "body": ticket_body(loop, run_id, f, outcome.get("trust", "")),
-                "labels": as_list(spec.get("labels", ["agent"])), "trust": outcome.get("trust", ""), "run": run_id}
+                "labels": labels, "trust": outcome.get("trust", ""), "run": run_id}
 
     def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
         if why := super().held(spec, item, cfg):
@@ -147,6 +176,8 @@ class Ticket(Emit):
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
                 *, publication=None) -> str:
+        if "destination" in item:
+            return ticket_publication.finding(item, cfg, publication)
         repo = publication.pending.get("repo") if publication else ""
         if not repo:
             repo = sources.github_name(cfg, item["repo"])
@@ -203,6 +234,9 @@ class PullRequest(Emit):
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
                 *, publication=None) -> str:
+        repo = config_repo(cfg, item["repo"])
+        if repo and repo.target_branch and (item["base"] != repo.target_branch or item["branch"] == repo.target_branch):
+            raise ValueError(f"the queued PR must target {repo.target_branch} from a separate work branch")
         if publication:
             if url := gh.find_pr_marker(item["repo"], item["branch"], publication.marker):
                 return url

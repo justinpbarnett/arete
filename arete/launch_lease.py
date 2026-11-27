@@ -4,8 +4,9 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,14 +60,19 @@ def state_path() -> Path:
 
 
 @contextmanager
-def opened(repo: str, tid: str, *, create: bool = True):
-    # Never unlink these files: replacing an inode would split the launch lock.
+def lock_directory(*, create: bool):
     with paths.directory_fd(state_path(), create=create) as state:
         private_directory(state)
         with paths.directory_fd(paths.LOCKS_DIR.relative_to(paths.STATE_DIR), state, create=create) as parent:
             private_directory(parent)
-            with opened_file(parent, filename(repo, tid), create=create) as fd:
-                yield fd
+            yield parent
+
+
+@contextmanager
+def opened(repo: str, tid: str, *, create: bool = True):
+    # Never unlink these files: replacing an inode would split the launch lock.
+    with lock_directory(create=create) as parent, opened_file(parent, filename(repo, tid), create=create) as fd:
+        yield fd
 
 
 @contextmanager
@@ -101,6 +107,17 @@ def held(repo: str, tid: str) -> bool:
             return not take(fd)
     except FileNotFoundError:
         return False
+
+
+def held_launches() -> list[str]:
+    held = []
+    with suppress(FileNotFoundError), lock_directory(create=False) as parent:
+        for name in sorted(os.listdir(parent)):
+            if re.fullmatch(r"task-launch-[0-9a-f]{64}\.lock", name):
+                with suppress(FileNotFoundError), opened_file(parent, name, create=False) as fd:
+                    if not take(fd):
+                        held.append(name)
+    return held
 
 
 @dataclass

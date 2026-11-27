@@ -126,7 +126,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
         <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
       </div>
       <header class="page-head">
-        <div class="head-row"><h1>${page.title}</h1><div class="head-tools">
+        <div class="head-row"><h1>${page.title}</h1><div class="head-tools"><factory-switch></factory-switch>
           ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
           ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
         </div></div>

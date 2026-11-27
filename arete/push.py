@@ -63,6 +63,8 @@ class Push(Emit):
 
     def only_a_person(self, spec: dict, item: dict, cfg: config.Config) -> str:
         repo = push_repo(cfg, item)
+        if reason := policy_refusal(repo, item["base"]):
+            return reason
         layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
         if layer.trust_level != "automerge":
             return f"the trust level of {item['repo']} is pr, so a person lands each push"
@@ -111,6 +113,8 @@ class Push(Emit):
             raise RuntimeError("it has no check to run after the rebase, so it cannot land: reject it. Its loop now "
                                "loads only with a push check, so every later push from it has one")
         src, base = Path(item["workdir"]), item["base"]
+        if reason := policy_refusal(push_repo(cfg, item), base):
+            raise RuntimeError(reason)
         if "origin" not in util.git(["remote"], src, check=False).split():
             raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
         with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
@@ -144,6 +148,16 @@ def approve_rules(spec: dict) -> dict:
 
 def push_repo(cfg: config.Config, item: dict) -> config.Repo | None:
     return config_repo(cfg, item["repo"]) or cfg.repo_for_path(item["workdir"])
+
+
+def policy_refusal(repo: config.Repo | None, base: str) -> str:
+    if repo is None:
+        return ""
+    if repo.landing == "pr":
+        return f"{repo.name} requires a PR; direct push is disabled"
+    if repo.target_branch and base != repo.target_branch:
+        return f"{repo.name} now targets {repo.target_branch}, not {base}"
+    return ""
 
 
 def push_check(spec: dict, loop: Loop) -> str:

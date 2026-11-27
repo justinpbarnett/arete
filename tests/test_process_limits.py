@@ -55,6 +55,8 @@ from arete import (
     steps,
     tasks,
     tracker,
+    unblock,
+    unblock_watch,
     util,
     vault,
     workspace,
@@ -71,9 +73,11 @@ from arete.store import insights as insights_store
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
+from arete.store import unblock as recovery_store
 from arete.store import worker_exchange as exchange
 from arete.store import zte as zte_store
 from arete.zte_github import Identity, IssueApp
+from tests import support
 from tests.harness import set_task_body
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
@@ -1551,7 +1555,7 @@ class PolicyRestartLineageTests(Isolated):
             ledger.transition(lease, action["id"], state, result)
         return action
 
-    def saved(self):
+    def saved(self, *, policy_changed=True):
         controller = self.controller()
         prepared = factory.Outcome("pass", data={
             "layer": str(self.repo.layer_dir), "checkouts": [self.checkout.to_row()],
@@ -1566,19 +1570,26 @@ class PolicyRestartLineageTests(Isolated):
         with patch.object(controller, "atomic", side_effect=prepare_step):
             self.assertIsNone(controller.prepare())
         evidence, produced = {}, {}
+        policy = self.OLD_POLICY if policy_changed else controller.policy_sha()
+        tree = "old-tree" if policy_changed else controller.fingerprint()
         args = {"checks": {"scope": "full"}, "verify": {"route_id": "verify", "effort": "low"},
                 "review": {"route_id": "review", "effort": "low"}}
         for op, gate in self.GATES:
-            evidence[gate] = {"tree": "old-tree", "policy": self.OLD_POLICY, "result": {"summary": f"old {gate}"},
+            evidence[gate] = {"tree": tree, "policy": policy, "result": {"summary": f"old {gate}"},
                               "acceptance": controller.data["acceptance"], "producer": "d0000-0",
                               "observed": "2026-11-20T00:00:00Z"}
-            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate])
+            if gate == "checks":
+                evidence[gate]["result"]["full"] = True
+            details = {"verdict": "pass"} if gate == "verify" else {}
+            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate],
+                                 **details)
             produced[gate] = action["id"]
         job = controller.job
         job.review = pipeline.Review.stored({"verdict": "approve", "summary": "old review", "problems": []})
         job.verified, job.reviews, job.ci_result = pipeline.verify.Verified("pass", "old verify"), 1, "old ci"
+        controller.data.pop("review_method", None)  # This saved lineage predates the Standards/Spec review.
         controller.data.update(evidence=evidence, checked={"tree": "old-tree"}, report="old checks",
-                               policy_sha=self.OLD_POLICY)
+                               policy_sha=policy)
         controller.persist()
         record.move(controller.run.id, "failed", ("running",))
         return controller, produced
@@ -1595,12 +1606,111 @@ class PolicyRestartLineageTests(Isolated):
             return results[name]
 
         with (patch.object(controller, "atomic", side_effect=atomic),
-              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: SimpleNamespace(step=roles[0]))):
-            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "verify", "effort": "low"},
+              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: controller.run.settings(roles[0]))):
+            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "model:verify:0", "effort": "low"},
                                                      {"route_id": "review", "effort": "low"})):
                 done = self.action(controller, op, args)
                 self.assertIsNone(controller.dispatch(done))
         return atomic_calls
+
+    def test_legacy_continuation_replaces_only_its_review_and_preserves_the_new_review_on_resume(self):
+        prior, produced = self.saved(policy_changed=False)
+        resumed = self.controller(prior.run.id)
+        self.assertIsNone(resumed.prepare())
+        self.assertTrue(resumed.run.code_review)
+        self.assertEqual(resumed.data["stale_actions"], [produced["review"]])
+        self.assertTrue(resumed.current("checks"))
+        self.assertTrue(resumed.current("verify"))
+        self.assertFalse(resumed.current("review"))
+        self.assertIsNone(resumed.job.review.verdict)
+        self.assertEqual(resumed.latest_code_review(), {})
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: review$"):
+            resumed.publish()
+
+        report = {"method": "code-review", "verdict": "pending", "summary": "fresh finding", "problems": [],
+                  "findings": [{"id": "spec-1", "axis": "Spec", "file": "example.py", "finding": "Missing case"}]}
+        outcome = factory.Outcome("pass", data={"review": report, "attempt": 1})
+        fresh = self.action(resumed, "review.run", {"route_id": "review", "effort": "low"})
+
+        def review_step(name, **kwargs):
+            self.assertTrue(kwargs["code_review"])
+            resumed.job.take(name, outcome, stored=False)
+            return outcome
+
+        with (patch.object(resumed, "atomic", side_effect=review_step),
+              patch.object(orchestration.Catalog, "route", return_value=SimpleNamespace(step="review"))):
+            self.assertIsNone(resumed.dispatch(fresh))
+        record.move(resumed.run.id, "stopped", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(repeated.data["evidence"]["review"]["producer"], fresh["id"])
+        self.assertEqual(repeated.job.review.verdict, "pending")
+        self.assertTrue(repeated.current("review"))
+
+    def test_batched_review_waits_for_full_checks_on_the_integrated_candidate(self):
+        prior, _ = self.saved()
+        ctl = self.controller(prior.run.id)
+        self.assertIsNone(ctl.prepare())
+        fingerprint = self.enterContext(patch.object(ctl, "fingerprint", return_value="candidate"))
+        self.enterContext(patch.object(orchestration.code_review, "bases", return_value={"": "base"}))
+        pending = {"method": "code-review", "verdict": "pending", "summary": "Missing edge", "problems": [],
+                   "findings": [{"id": "spec-1", "finding": "Missing edge"}], "bases": {"": "base"}}
+        reviewer = Mock(return_value=factory.Outcome("pass", data={"review": pending, "attempt": 1}))
+        check = Mock()
+
+        def step(name, args, kwargs):
+            if name == "review":
+                self.assertTrue(kwargs["code_review"])
+                return reviewer()
+            self.assertEqual(name, "checks")
+            return check()
+
+        self.enterContext(patch.object(ctl.flow, "run", side_effect=step))
+        review = {"op": "review.run", "args": OPERATIONS["review.run"].arguments(
+            {"route_id": "model:review:0", "effort": "low"})}
+
+        def batch(*calls):
+            turn = ledger.begin(ctl.lease, {}, 100)
+            actions = ledger.accept(ctl.lease, turn, ledger.snapshot(ctl.lease)["version"], {"calls": list(calls)}, 100)
+            for action in actions:
+                ctl.dispatch(action)
+            return ledger.actions(ctl.lease)[-1]
+
+        def checks(scope, status):
+            check.return_value = factory.Outcome(status, data={
+                "scope": scope, "full": scope == "full" and status == "pass", "report": "configured check result"})
+            return {"op": "checks.run", "args": OPERATIONS["checks.run"].arguments(
+                {"scope": "quick" if scope == "quick" else "full"})}
+
+        for scope, status in (("full", "fail"), ("quick", "pass"), ("failed", "fail"), ("failed", "pass")):
+            with self.subTest(scope=scope, status=status):
+                deferred = batch(checks(scope, status), review)
+                self.assertEqual(deferred["state"], "failed")
+                self.assertTrue(deferred["result"]["review_deferred"])
+                reviewer.assert_not_called()
+        batch(checks("full", "pass"))
+        fingerprint.return_value = "later integration"
+        self.assertTrue(batch(review)["result"]["review_deferred"])
+        reviewer.assert_not_called()
+
+        first = batch(checks("full", "pass"), review)
+        self.assertEqual(first["state"], "succeeded")
+        reviewer.assert_called_once()
+        fingerprint.return_value = "repair"
+        self.assertEqual(batch(review)["result"]["reused_review"], first["id"])
+        fingerprint.return_value = "later integration"
+        ctl.data["acceptance"] = "new owner requirements"
+        self.assertTrue(batch(review)["result"]["review_deferred"])
+        ctl.recover()
+        self.assertEqual(ctl.data["evidence"]["review"]["producer"], first["id"])
+        ctl.executing = ""
+        self.assertEqual(ctl.latest_code_review()["id"], first["id"])
+        self.assertFalse(ctl.current("review"))
+        reviewer.assert_called_once()
+        with (patch.object(ctl.run, "environment_release", "live"),
+              patch.object(ctl.flow, "run", return_value=reviewer.return_value) as legacy):
+            self.assertEqual(batch(review)["state"], "succeeded")
+            self.assertNotIn("code_review", legacy.call_args.args[2])
 
     def test_changed_policy_at_a_decision_boundary_reruns_every_gate_before_the_merge_gate(self):
         prior, produced = self.saved()
@@ -1618,7 +1728,7 @@ class PolicyRestartLineageTests(Isolated):
         for gate in produced:
             self.assertFalse(resumed.current(gate))
             self.assertNotIn(produced[gate], resumed.catalog.context)
-        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review, verify"):
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review$"):
             resumed.publish()
 
         fresh = {
@@ -1626,8 +1736,8 @@ class PolicyRestartLineageTests(Isolated):
                                                     "checked": {"tree": "fresh-tree", "commands": {}}}),
             "verify": factory.Outcome("pass", data={"verified": {"verdict": "pass", "summary": "fresh verify"},
                                                     "names": []}),
-            "review": factory.Outcome("pass", data={"review": {"verdict": "approve", "summary": "fresh review",
-                                                               "problems": []}, "attempt": 1}),
+            "review": factory.Outcome("pass", data={"review": {"method": "code-review", "verdict": "approve",
+                                                               "summary": "fresh review", "problems": []}, "attempt": 1}),
         }
         self.assertEqual(self.rerun_gates(resumed, fresh), ["checks", "verify", "review"])
         for gate, old_action in produced.items():
@@ -1880,14 +1990,75 @@ class OrchestrationRecoveryFixture(Isolated):
     def receipt(self, controller, action):
         return next(a for a in ledger.actions(controller.lease) if a["id"] == action)
 
-
-class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
     def commit_base(self):
         tree = self.repo.path
         (tree / "fixture.txt").write_text("base\n")
         util.git(["init", "-q", "-b", "main", "--template="], tree)
         util.git(["add", "fixture.txt"], tree)
         util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], tree)
+
+    def complete_at_launch(self, run, action, request):
+        worker = self.spawn(run, action, request)
+        self.report_worker_result(action, "Replay result")
+        return worker
+
+    def completed_dependent(self, controller):
+        prerequisite, = self.send(controller, self.start(controller))
+        selected, = self.send(controller, self.start(controller, depends_on=[prerequisite]))
+        self.finish_worker(controller, prerequisite)
+        controller.resume_queued()
+        self.finish_worker(controller, selected)
+        return selected
+
+
+class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
+    def test_writing_prerequisite_exposes_integrated_tree_across_restart_under_limits(self):
+        self.commit_base()
+        c = self.controller(builders=2)
+
+        def build_call(path, **args):
+            return self.start(c, **self.route(c, "build"), prompt_id="build", tool_bundle="write",
+                              write_paths=[path], acceptance_check=f"Inspect {path}", **args)
+
+        writer_a, = self.send(c, build_call("fixture.txt"))
+        dependent_b, = self.send(c, build_call("fixture.txt", depends_on=[writer_a]))
+        unrelated_c, = self.send(c, build_call("other.txt"))
+        self.assertEqual(set(c.workers), {writer_a, unrelated_c})
+        self.assertNotIn(dependent_b, self.producers)
+        visible = {w["id"]: w for w in c.observe()["workers"]}
+        self.assertEqual((visible[dependent_b]["phase"], visible[dependent_b]["depends_on"]), ("queued", [writer_a]))
+        self.assertIn(f"waiting for prerequisite {writer_a}", visible[dependent_b]["reason"])
+        with self.assertRaisesRegex(ValueError, "overlap an outstanding builder claim"):
+            self.accept(c, build_call("fixture.txt"))
+        with self.assertRaisesRegex(ValueError, "exceed available worker or builder capacity"):
+            self.accept(c, build_call("third.txt"))
+
+        self.finish_worker(c, unrelated_c)
+        c.close()
+        resumed = self.restart(c)
+        self.assertTrue(ledger.queued_start(self.receipt(resumed, dependent_b)))
+        self.assertNotIn(dependent_b, self.producers)
+
+        def decisions():
+            retry_a = exchange.workers(resumed.lease)[writer_a]["attempt"]
+            (self.producers[retry_a].cwd / "fixture.txt").write_text("from-a\n")
+            self.report_worker_result(retry_a)
+            yield self.accept(resumed, {"op": "run.wait", "args": {}})
+            self.assertEqual(exchange.workers(resumed.lease)[writer_a]["phase"], "integrated")
+            self.assertEqual(set(resumed.workers), {dependent_b})
+            self.assertEqual((self.producers[dependent_b].cwd / "fixture.txt").read_text(), "from-a\n")
+            (self.producers[dependent_b].cwd / "fixture.txt").write_text("from-b\n")
+            self.finish_worker(resumed, dependent_b)
+            yield self.accept(resumed, {"op": "run.finish", "args": {"reason": "noop"}})
+
+        with (patch.object(resumed, "prepare", return_value=None),
+              patch.object(resumed, "decide", side_effect=decisions()),
+              patch.object(resumed.job.b, "restage", return_value=SimpleNamespace(empty=True)),
+              patch.object(flows, "finish", return_value=("nothing", "Fixture noop", ""))):
+            self.assertEqual(resumed.drive()[0], "nothing")
+        self.assertEqual(exchange.workers(resumed.lease)[dependent_b]["phase"], "integrated")
+        self.assertEqual((self.repo.path / "fixture.txt").read_text(), "from-b\n")
+        self.producers[dependent_b].allow.assert_called_once()
 
     def test_admission_interruption_cleans_up_only_the_uncommitted_candidate(self):
         self.commit_base()
@@ -1982,19 +2153,8 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
         self.assertEqual((self.repo.path / "fixture.txt").read_text(), "recovered\n")
         producer.allow.assert_called_once()
 
-    def complete_at_launch(self, run, action, request):
-        worker = self.spawn(run, action, request)
-        self.report_worker_result(action, "Replay result")
-        return worker
 
-    def completed_dependent(self, controller):
-        prerequisite, = self.send(controller, self.start(controller))
-        selected, = self.send(controller, self.start(controller, depends_on=[prerequisite]))
-        self.finish_worker(controller, prerequisite)
-        controller.resume_queued()
-        self.finish_worker(controller, selected)
-        return selected
-
+class DependentWorkerRerunTests(OrchestrationRecoveryFixture):
     def test_standalone_dependent_rerun_does_not_dispatch_older_wait(self):
         self.commit_base()
         c = self.controller(builders=1)
@@ -2130,6 +2290,11 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
             for standalone in (True, False):
                 with self.subTest(op=op, standalone=standalone):
                     c = self.restart(c)
+                    if op == "review.run":
+                        c.executing = originals[0]
+                        c.stamp("checks", {"full": True})
+                    elif op == "verification.run":
+                        c.fingerprint = lambda tag=f"rerun-{standalone}": tag
                     c.run.action, c.run.action_only = selected, standalone
                     request = self.receipt(c, selected)["request"]
 
@@ -2170,6 +2335,9 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
                     c = self.controller()
                     passed = factory.Outcome("pass", data=evidence)
                     call = {"op": op, "args": self.route(c, role) if role != "checks" else {}}
+                    if op == "review.run":
+                        with patch.object(c, "atomic", return_value=factory.Outcome("pass", data={"full": True})):
+                            self.send(c, {"op": "checks.run", "args": {}})
                     with patch.object(c, "atomic", return_value=passed):
                         selected, = self.send(c, call)
                     prior, = self.send(c, self.start(c))
@@ -2196,6 +2364,8 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
                     launch.assert_called_once()
                     self.assertEqual(launch.call_args.args[3][-2:], ["--continue", source])
                     resumed = self.controller(source)
+                    if op == "verification.run":
+                        resumed.fingerprint = lambda: "rerun-tree"
 
                     def decisions():
                         self.assertEqual(self.receipt(resumed, accepted["id"])["state"], "succeeded")
@@ -2368,6 +2538,8 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
                 self.assertEqual(ledger.actions(c.lease), before)
                 self.assertNotIn(dependent, self.producers)
 
+
+class DependentWorkerIntegrationTests(OrchestrationRecoveryFixture):
     def test_restart_attempts_follow_the_writer_without_bypassing_retry_or_integration(self):
         self.commit_base()
         c = self.controller(builders=1)
@@ -2510,6 +2682,8 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
             self.producers[dependent].allow.assert_called_once()
         c.resume_queued()
 
+
+class DependentWorkerSchedulingTests(OrchestrationRecoveryFixture):
     def test_batched_wait_keeps_explicit_launch_ahead_of_the_queue(self):
         self.commit_base()
         for builders in (1, None):
@@ -2655,13 +2829,17 @@ class DependentWorkerRecoveryTests(OrchestrationRecoveryFixture):
                     args = self.route(c, role) if role in {"verify", "review"} else {}
                     if op == "run.finish":
                         args["reason"] = "noop"
+                    if op == "review.run":
+                        c.stamp("checks", {"full": True})
                     if op == "publication.request":
                         for gate in ("checks", "verify", "review"):
                             c.stamp(gate, {"full": False} if gate == "checks" else {"verdict": "pass"})
                             self.assertTrue(c.current(gate))
                     cancel, guarded = self.accept(c, {"op": "worker.cancel", "args": {
                         "worker_id": reader, "reason": "Fixture cancellation"}}, {"op": op, "args": args})
-                    with (patch.object(c, "atomic", return_value=factory.Outcome("pass")) as atomic,
+                    outcome_data = {"checks": {"full": True}, "verify": {"verified": {"verdict": "pass"}},
+                                    "review": {"review": {"verdict": "pass"}}}.get(role, {})
+                    with (patch.object(c, "atomic", return_value=factory.Outcome("pass", data=outcome_data)) as atomic,
                           patch.object(flows, "finish", return_value=("nothing", "Fixture noop", "")) as finish):
                         c.dispatch_batch([cancel, guarded], fresh=True)
                     self.assertEqual(self.receipt(c, cancel["id"])["result"]["cancelled"], reader)
@@ -2769,6 +2947,7 @@ class OrchestrationReceiptContextTests(OrchestrationRecoveryFixture):
             key = "verified" if role == "verify" else "review"
             return factory.Outcome("pass", data={key: {"verdict": "pass"}})
 
+        c.stamp("checks", {"full": True})
         with patch.object(c, "atomic", side_effect=gate) as atomic:
             for op, role, field in (("verification.run", "verify", "goal_refs"), ("review.run", "review", "context_refs")):
                 self.send(c, {"op": op, "args": {**self.route(c, role), field: refs}})
@@ -2782,6 +2961,38 @@ class OrchestrationReceiptContextTests(OrchestrationRecoveryFixture):
 
 
 class BudgetTests(Isolated):
+    def test_monitor_reconsiders_a_park_when_poll_readmission_appears_or_is_spent(self):
+        self.cfg.unblock_repos = (self.repo.name,)
+        self.cfg.replay = config.ReplayConfig(all=True)
+        run = self.made_run()
+        run.budget.park("the repair chain used its 2 repair cycles")
+        record.settle(run.id, "failed")
+        row = run_store.run_get(run.id)
+
+        def inspect():
+            case = recovery_store.get(self.repo.name, self.ticket)
+            unblock_watch.inspect(self.cfg, self.repo, self.ticket, row, [], case)
+            return recovery_store.get(self.repo.name, self.ticket)
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(unblock, "diagnose", return_value={"action": "wait_for", "evidence": ["run"],
+                                                               "reason": "Wait for changed inputs."}) as diagnose):
+            first = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            with foundation.db() as connection:
+                set_task_body(self.ticket, "Revised specification", connection=connection)
+            admitted = inspect()
+            observation = diagnose.call_args.args[-2]["poll_readmission"]
+            self.assertEqual(observation["parked_run"], run.id)
+            self.assertEqual(json.loads(admitted["snapshot"])["poll_readmission"], observation)
+            self.assertEqual(inspect()["generation"], admitted["generation"])
+            _, proof = runlimits.poll_admission(self.repo, self.ticket, self.local.get(self.ticket), run.budget.policy)
+            self.assertFalse(proof.attempted(record=True))
+            spent = inspect()
+            self.assertNotIn("poll_readmission", diagnose.call_args.args[-2])
+            self.assertEqual([c["generation"] for c in (first, admitted, spent)], [1, 2, 3])
+            self.assertEqual(diagnose.call_count, 3)
+
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
@@ -3889,8 +4100,10 @@ class UnansweredRepairBudgetTests(OwnerAnswerBudgetFixture):
             labels.difference_update(remove)
             labels.update(add)
 
+        api = support.parentless_github_issue(self.repo.github, self.ticket, issue_view)
         with (patch.object(gh, "issue", side_effect=issue_view), patch.object(gh, "issues", side_effect=issue_list),
-              patch.object(gh, "issue_labels", side_effect=edit_labels), patch.object(gh, "issue_comment")):
+              patch.object(gh, "gh_json", side_effect=api), patch.object(gh, "issue_labels", side_effect=edit_labels),
+              patch.object(gh, "issue_comment")):
             first, asked = self.spent_question(structured=True)
             self.assertIn(source.label_name("needs-info"), labels)
             self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched before label removal")), 0)
@@ -4364,17 +4577,25 @@ class ParkedRetryBudgetTests(Isolated):
 class DeniedWorkerEditsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
-        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
+        root = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
+        with support.workspace_state(root):
+            foundation.migrate()
+            cls.workspace_db_seed = paths.DB_FILE.read_bytes()
+        cls.base = root / "repo"
+        cls.base.mkdir()
         (cls.base / "guarded.txt").write_text("base\n")
         (cls.base / "removed.txt").write_text("base\n")
         util.git(["init", "-q", "-b", "main", "--template="], cls.base)
         util.git(["add", "."], cls.base)
         util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
 
-    def prepare_controller(self):
+    def prepare_controller(self, *, real_ledger=False):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(support.workspace_state(root))
+        paths.ensure_dirs()
+        paths.DB_FILE.write_bytes(self.workspace_db_seed)
         self.wt = root / "repo"
         shutil.copytree(self.base, self.wt)
         repo = config.Repo("fixture/repo", self.wt, tracker="local")
@@ -4382,14 +4603,13 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                                       deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
                                       checks={"goal": 'test "$(cat goal.txt)" = reached'})
         cfg = config.Config(replay=config.ReplayConfig(all=True))
-        run_dir = root / "runs" / "fixture"
+        run_dir = paths.RUNS_DIR / "fixture"
         run_dir.mkdir(parents=True)
         self.run_fixture = pipeline.Run(id="fixture", repo=repo, dir=run_dir, tracker=tracker.LocalTracker(repo),
                                         tid="1", path="orchestrate")
         job = flows.Job(cfg, self.run_fixture, self.wt, ticket=tracker.Ticket("1", "#1", "Fixture goal"),
                         checkouts=[workspace.Checkout("", repo.name, repo.path, self.wt, "main")])
         self.run_fixture.workspace = self.wt, job.checkouts
-        self.enterContext(patch.object(paths, "RUNS_DIR", run_dir.parent))
         self.enterContext(patch.object(paths, "CHECK_LOCKS_DIR", root / "check-locks"))
         self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
         self.enterContext(patch.multiple(record, mark=Mock(), note=Mock()))
@@ -4403,9 +4623,10 @@ class DeniedWorkerEditsTests(unittest.TestCase):
         self.enterContext(patch.multiple(workspace, note_made=Mock(), kept_work=Mock(return_value=""),
                                          scratch_left=Mock(return_value=[]), drop_untracked_bytecode=Mock()))
         self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
-        self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
-                                         save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
-                                             "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
+        if not real_ledger:
+            self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
+                                             save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
+                                                 "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
         job.use_layer(self.layer)
         self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
         flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
@@ -4459,6 +4680,84 @@ class DeniedWorkerEditsTests(unittest.TestCase):
                          route_id="model:build:0", effort=model.effort or "low")
             self.assertTrue(controller.collect())
             return worker.call_args.args[2]["role"]
+
+    def test_failed_test_runs_before_full_suite_on_the_final_candidate(self):
+        self.prepare_controller(real_ledger=True)
+        ctl = self.controller
+        ctl.data["acceptance"] = "fixture"
+
+        def check(**args):
+            turn = ledger.begin(ctl.lease, {}, 100)
+            action, = ledger.accept(ctl.lease, turn, ledger.snapshot(ctl.lease)["version"], {"calls": [{
+                "op": "checks.run", "args": OPERATIONS["checks.run"].arguments(args)}]}, 100)
+            self.assertIsNone(ctl.dispatch(action))
+            return ledger.actions(ctl.lease)[-1]["result"]
+
+        selector = "test_order.OrderTests.test_rollback"
+        script = self.wt.parent / "check.py"
+        script.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            "if Path('goal.txt').read_text().strip() != 'fixed':\n"
+            "    if sys.argv[1:] or Path('goal.txt').read_text().strip() != 'class only':\n"
+            "        print('test_rollback (test_order.OrderTests.test_rollback)')\n"
+            "    print('AssertionError: wrong order')\n"
+            "    print('Failed classes: test_order.OrderTests')\n"
+            "    print('Ran 3 tests in 0.04s: FAILED')\n"
+            "    sys.exit(1)\n"
+            "if sys.argv[1:] not in ([], ['test_order.OrderTests.test_rollback']): sys.exit(2)\n")
+        self.layer.checks = {"lint": "true", "behavior": shlex.join([sys.executable, str(script)])}
+        self.layer.targeted_commands = {"classes": self.layer.checks["behavior"]}
+
+        self.write("goal.txt", "class only")
+        failed = check()
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["remaining_checks"], [{"name": "behavior", "selectors": ["test_order.OrderTests"]}])
+        self.assertFalse(failed["runner_blocked"])
+
+        narrowed = check()
+        self.assertEqual(narrowed["remaining_checks"], [{"name": "behavior", "selectors": [selector]}])
+        reproduced = check()
+        self.assertEqual((reproduced["scope"], reproduced["checks_executed"]), ("failed", ["behavior"]))
+        repeated = check()
+        self.assertEqual(repeated["reused_checks"], ledger.actions(ctl.lease)[-2]["id"])
+        self.assertEqual(repeated["checks_executed"], [])
+        ctl.recover()
+        self.assertFalse(ctl.current("checks"))
+        self.assertEqual(check()["reused_checks"], repeated["reused_checks"])
+
+        self.write("goal.txt", "fixed")
+        first = check()
+        self.assertEqual((first["scope"], first["passed"], first["full"]), ("failed", True, False))
+        self.assertEqual(first["checks_executed"], ["behavior"])
+        self.assertIn(selector, first["report"])
+        self.write("another.txt", "later integration")
+        self.assertEqual(check()["scope"], "failed")
+
+        final = check(scope="quick")
+        self.assertEqual((final["scope"], final["passed"], final["full"]), ("full", True, True))
+        self.assertEqual(final["checks_executed"], ["lint", "behavior"])
+        self.assertEqual(final["remaining_checks"], [])
+
+        producer = ctl.data["evidence"]["checks"]["producer"]
+        self.assertEqual(check()["reused_checks"], producer)
+        ctl.recover()
+        self.assertTrue(ctl.current("checks"))
+        self.assertEqual(check(scope="quick")["reused_checks"], producer)
+        with patch.object(ctl.run, "action", producer):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["acceptance"] = "owner confirmed the runner is ready"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data["ci_failed"] = True
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        ctl.data.pop("ci_failed")
+        with patch.object(ctl.run, "environment_release", "new release"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        with patch.object(ctl.run, "path", "pilot"):
+            self.assertEqual(check()["checks_executed"], ["lint", "behavior"])
+        self.layer.checks["new"] = "true"
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
+        self.write("another.txt", "changed again")
+        self.assertEqual(check()["checks_executed"], ["lint", "behavior", "new"])
 
     def test_second_worker_passes_checks_without_the_denied_paths(self):
         self.prepare_controller()
@@ -5352,6 +5651,8 @@ class EnvironmentRequeueTests(Isolated):
         self.time = datetime(2026, 11, 21, 8, tzinfo=UTC)
         self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}"
         self.authority = self.root / "authority"
+        api = support.parentless_github_issue(self.repo.github, self.issue, self.issue_view)
+        self.patches.enter_context(patch.object(gh, "gh_json", side_effect=api))
         for module, name, func in (
             (config, "load", lambda: self.cfg),
             (codebase, "STAMP", "old-engine"),

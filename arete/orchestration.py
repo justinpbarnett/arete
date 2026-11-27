@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from math import inf
 from pathlib import Path
@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from . import (
     builder_workspaces,
+    check_repair,
+    code_review,
     codebase,
     config,
     delegation,
@@ -18,19 +20,29 @@ from . import (
     factory,
     flows,
     gh,
+    hosted_check,
     journeys,
     merge_review,
     outbound,
     owner_asks,
     pilot,
     pipeline,
+    pr_recovery,
     principals,
     prompt_loader,
     repairs,
+    requirement_revision,
     run_lines,
     runlimits,
     slots,
+    spec_amendments,
+    spec_delivery,
+    spec_graph,
+    spec_graph_delivery,
+    tracker,
     util,
+    vault,
+    verification_attempts,
     worker_turns,
     workspace,
     zte,
@@ -38,14 +50,18 @@ from . import (
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, WORKER_PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
+from .store import db
 from .store import insights as insights_store
 from .store import orchestration as ledger
+from .store import specs as spec_store
 from .store import triage as triage_store
 from .store import worker_exchange as exchange
 from .verify import Verified
 
 CI_FAILURES = "ci:failures"
 MAX_CI_FAILURE_CHARS = 24000
+ACTION_GATES = {"checks.run": "checks", "verification.run": "verify", "verification.decide": "verify",
+                "review.run": "review", "review.decide": "review"}
 CATCH_UP_FAILURE = "catch-up:failure"
 MAX_CATCH_UP_FEEDBACK_CHARS = 12000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
@@ -119,6 +135,7 @@ class Controller(worker_turns.WorkerTurns):
     merge_lease: TextIO | None = None
     starts_new_lineage = False
     rerun_context = None
+    route_noted = False
 
     def __init__(self, flow, *, max_builders=None):
         self.flow, self.job = flow, flow.ctx
@@ -127,13 +144,14 @@ class Controller(worker_turns.WorkerTurns):
         configured = pipeline.config.load_layer(self.run.repo.layer_dir).orchestration
         if max_builders is not None:
             configured = replace(configured, max_builders=config.orchestration_table({"max_builders": max_builders}).max_builders)
-        tid = str(getattr(self.run, "tid", ""))
-        private = (configured.max_builders and self.run.path == "orchestrate"
-                   and not pilot.is_pilot_task(tid) and not zte.reserved(tid))
+        private = configured.max_builders and self.default_code_review and not self.is_spec
         protocol = WORKER_PROTOCOL if private else PROTOCOL
         self.lease = ledger.acquire(self.run.id, flow.continues,
-                                    {"protocol": protocol, "mode": self.run.path, "evidence": {}})
+                                    {"protocol": protocol, "mode": self.run.path, "evidence": {},
+                                     "review_method": code_review.METHOD if self.default_code_review else "legacy"},
+                                    **({"spec_root": self.run.spec_root} if self.is_spec else {}))
         self.data = ledger.snapshot(self.lease)["data"]
+        self.run.code_review = self.uses_code_review
         self.protocol = self.data.get("protocol")
         if self.protocol not in (PROTOCOL, WORKER_PROTOCOL) or self.data.get("mode") != self.run.path:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
@@ -153,6 +171,10 @@ class Controller(worker_turns.WorkerTurns):
         self.issue_goal = getattr(self.run.budget, "issue_goal", False) is True
         self.catalog = None
         self.last_progress, self.ending = -inf, None
+
+    @property
+    def is_spec(self):
+        return bool(spec_store.run_root(self.run))
 
     @property
     def decision_limit(self):
@@ -189,7 +211,7 @@ class Controller(worker_turns.WorkerTurns):
         self.job.take(name, outcome, stored=False)
         return outcome
 
-    def continuation_blocker(self, *, decision_boundary=False):
+    def continuation_blocker(self, *, decision_boundary=False, settling=""):
         for turn in ledger.pending(self.lease):
             launch = turn["response"] or {}
             if delegation.live(launch.get("pid"), launch.get("identity")):
@@ -201,7 +223,9 @@ class Controller(worker_turns.WorkerTurns):
                 return f"worker {action['id']} is still live; no replacement was launched"
         if decision_boundary:
             for action in actions:
-                if action["state"] not in ledger.TERMINAL:
+                if action["state"] not in ledger.TERMINAL and not (
+                    settling and (action["id"] == settling or action["state"] == "accepted")
+                ):
                     return f"accepted action {action['id']} is unfinished ({action['state']})"
         return ""
 
@@ -226,6 +250,11 @@ class Controller(worker_turns.WorkerTurns):
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
         merge_verification = self.run.recovery.get("merge_verification") is True
+        if self.is_spec and self.data.get("preparing") and not self.data.get("prepared"):
+            if recovered := flows.prepared_data(self.flow.continues):
+                self.data["prepared"] = recovered
+            elif not factory.started(self.flow.continues, "prepare"):
+                self.data.pop("preparing")
         prepared = self.data.get("prepared")
         restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
         if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
@@ -235,13 +264,15 @@ class Controller(worker_turns.WorkerTurns):
         if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
+            if restore_prs:
+                published = flows.publication(self.flow.continues).get("prs") or {}
+                for c in prepared["checkouts"]:
+                    if not c.get("pr") and c["github"] in published:
+                        c["pr"] = published[c["github"]]
+            if ending := self.refresh_requirements(prepared, pending_push):
+                return ending
             if merge_verification and not pending_push:
-                ticket = self.run.tracker.get(self.run.tid)
-                prepared["ticket"] = asdict(ticket)
                 prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
-                self.data["goal_base"] = f"Check the issue and owner's answers in use:\n{ticket.title}\n{ticket.body}"
-                if feedback := self.data.get("feedback"):
-                    self.data["goal_base"] += f"\n\nCheck the owner's PR feedback:\n{pipeline.feedback_markdown(feedback)}"
             layer_dir, source_file = Path(prepared["layer"]), None
             if not layer_dir.exists():
                 for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
@@ -250,12 +281,20 @@ class Controller(worker_turns.WorkerTurns):
                         break
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
-            self.lineage()
-            if self.starts_new_lineage:
+            receipt = pr_recovery.pending_receipt(self.data)
+            self.lineage(settling=receipt.get("action", ""))
+            if receipt:
+                self.note_route()
+                self.settle_recovered_publication(prepared, receipt["action"])
+            elif self.starts_new_lineage:
                 self.discard_gate_state()
             if restore_prs:
                 if ending := self.restore_pr_targets(prepared):
                     return ending
+                tid = str(self.run.tid)
+                if not (self.run.dry_run or self.run.action or pilot.is_pilot_task(tid) or zte.reserved(tid)):
+                    self.job.before_pr_recovery = self.before_pr_recovery
+                    self.job.on_pr_plan_installed = self.record_pr_recovery_checkout
             else:
                 self.job.closed_prs = set(prepared.get("closed_prs", ()))
                 if self.run.action_only and (ending := self.hold_dirty_closed_checkout(prepared["checkouts"])):
@@ -280,6 +319,8 @@ class Controller(worker_turns.WorkerTurns):
                     if why := self.job.restore(line, layer=self.job.layer):
                         raise factory.Refused(why)
                 self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
+            if self.job.pr_plans:
+                self.discard_pr_recovery_state()
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
                     setattr(self.job, name, value)
@@ -292,6 +333,9 @@ class Controller(worker_turns.WorkerTurns):
             self.job.b.ignored_denied_paths = self.data.get("ignored_denied_paths", {})
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
+            if self.job.pr_plans:
+                workspace.note_made(self.job.ws, self.job.checkouts, excluded=self.run.closed_checkout_paths)
+                self.persist()
             if pending_push:
                 self.catalog.refresh_context()
                 self.quiescent()
@@ -347,12 +391,15 @@ class Controller(worker_turns.WorkerTurns):
             self.run.story.append(feedback)
             self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
-        if self.run.answers_due:
-            answer = owner_asks.fresh_note(self.run.answers_due)
+        answers = [a for a in self.run.answers_due or [] if not a.get("call", "").startswith("requirements.")]
+        if answers:
+            answer = owner_asks.fresh_note(answers)
             self.run.story.append(answer)
-            self.data.setdefault("owner_answers", []).append(answer)
-        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
-        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+            notes = self.data.setdefault("owner_answers", [])
+            for note in owner_asks.decision_notes(answers):
+                if note not in notes:
+                    notes.append(note)
+        self.acceptance_goal()
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         if self.exchanged and not prepared and (reason := self.serial_reason()):
@@ -360,15 +407,18 @@ class Controller(worker_turns.WorkerTurns):
             self.policy = replace(self.policy, max_builders=None)
             self.data["serial_reason"] = reason
             self.run.log(f"using the serial writer before dispatch: {reason}")
-        run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
+        if not self.job.pr_plans:
+            self.note_route()
         lineage, old_lineage = self.lineage()
         self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
-        self.data["recovery_code"] = codebase.STAMP
         self.data["limits"] = self.configured_limits()
-        self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
-                                                 self.job.left_for_a_person])
+        self.acceptance_stamp()
+        if (self.flow.continues and self.default_code_review and not self.run.environment_release
+                and not self.uses_code_review):
+            self.adopt_code_review()
+        self.job.recheck_pr_plans("before restoring controller actions", installed=True)
         self.recover()
         if self.run.environment_release or merge_verification:
             self.data.pop("published", None)
@@ -391,7 +441,249 @@ class Controller(worker_turns.WorkerTurns):
                                           **({"new_lineage": True} if old_lineage.keys() - REFRESHABLE_LINEAGE else {})}
         self.persist()
         self.write_lineage_event()
+        self.job.recheck_pr_plans("before resuming work", installed=True)
         return None
+
+    def current_ticket(self):
+        ticket = spec_amendments.child_ticket(self.run.tracker, self.run.tracker.get(self.run.tid))
+        if self.is_spec:
+            why = tracker.spec_blocker(self.job.cfg, self.run.tracker, ticket)
+            if not why and ticket.spec_identity != self.run.spec_identity:
+                why = "the spec tracker identity changed"
+        elif graph_hold := spec_graph_delivery.active_child_blocker(self.run):
+            why = graph_hold
+        elif not ticket.open:
+            why = "the source ticket is closed"
+        elif {"no-agent", "agent:hold"} & set(ticket.labels):
+            why = "the owner placed the ticket on hold"
+        elif ticket.is_spec:
+            why = "the ordinary ticket now requires the spec delivery route"
+        else:
+            why = ticket.blocker
+        return ticket, why
+
+    def scope_question(self, ticket, reason):
+        key = ledger.digest([self.lease.root, requirement_revision.version(ticket), reason])
+        call = f"requirements.{key}"
+        # The ask and ticket notice are persisted through the normal owner-question seam.
+        if (not self.run.dry_run and not self.run.alone and not self.run.owner_questions_blocked
+                and not ask_store.carry_scope_ask(self.run.repo.name, self.run.tid, call, self.run.id)):
+            request = {"questions": [{"header": "Ticket scope", "kind": "done",
+                                      "question": "Can you confirm the current requirements on the tracker?",
+                                      "steps": [reason, "Reconcile the identified change, then resume this ticket."]}],
+                       "why": "The current tracker text must authorize the next action.",
+                       "tried": "Compared the saved requirements with the current tracker and execution receipts."}
+            self.atomic("orchestrate_ask", request=request, call=call)
+        return "needs-info", reason, ""
+
+    def reconcile_answers(self, old, ticket, observations=None):
+        notes = ask_store.individual_scope_notes(self.data.get("runs", []), self.data.get("owner_answers", []))
+        retained, retired, uncertain = requirement_revision.prior_answers(old, ticket, notes)
+        if not (uncertain or observations):
+            return retained, retired, None
+        basis = [self.lease.root, requirement_revision.version(ticket), uncertain]
+        if observations:
+            basis.append(observations)
+        key = ledger.digest(basis)
+        call = f"requirements.decisions.{key}"
+        keep, revised = "Keep the listed decisions", "Use the revised ticket"
+        keep_answers = "Keep decisions and use revised checks"
+        asked = ask_store.carry_scope_ask(self.run.repo.name, self.run.tid, call, self.run.id)
+        if asked and asked["status"] in ("answered", "taken") and len(asked["answers"]) == 1:
+            answer = asked["answers"][0]
+            if not answer.get("by", "").startswith("rule:"):
+                if answer.get("picked") == [keep]:
+                    return [*retained, *uncertain], retired, None
+                if answer.get("picked") == [revised] or (observations and uncertain and answer.get("picked") == [keep_answers]):
+                    if observations:
+                        self.data["required_verification_requirements"] = [
+                            n for n in self.data["required_verification_requirements"] if n not in observations]
+                        self.data.setdefault("superseded_verification_requirements", {})[key] = {
+                            "previous": requirement_revision.version(old), "current": requirement_revision.version(ticket),
+                            "asked": asked["id"], "observations": observations}
+                    if answer.get("picked") == [keep_answers]:
+                        return [*retained, *uncertain], retired, None
+                    return retained, [*retired, *uncertain], None
+        reason = "The revised ticket leaves the applicability of these earlier owner decisions unresolved."
+        if observations:
+            reason = ("Should the revised ticket replace the listed observations from the old verifier and any "
+                      "listed earlier decisions? Every AC-N candidate check in the revised ticket must be measured anew.")
+        previous = [*uncertain, *(observations or {})]
+        if not asked and not (self.run.dry_run or self.run.alone or self.run.owner_questions_blocked):
+            request = {"questions": [{"header": "Prior scope", "kind": "choice",
+                       "question": reason + "\n\n" + "\n\n".join(previous),
+                       "options": [{"label": revised, "description": "Recommended. The current ticket replaces these "
+                                    "decisions. Add any detail you want to retain to its requirements."},
+                                   {"label": keep, "description": "I confirm all the listed decisions still apply to this revision."}]}],
+                       "why": "Previously accepted decisions must be reconciled with the owner's current scope.",
+                       "tried": "Kept decisions tied to unchanged checks and retired decisions the ticket explicitly supersedes."}
+            if observations and uncertain:
+                request["questions"][0]["options"].append({
+                    "label": keep_answers, "description": "Retain the earlier owner decisions and replace only "
+                    "the listed verifier observations with the revised candidate checks and protected receipt."})
+            self.atomic("orchestrate_ask", request=request, call=call)
+        return retained, retired, ("needs-info", reason, "")
+
+    def refresh_requirements(self, prepared, pending_push):
+        if not self.default_code_review:  # Reserved pilot and ZTE tasks have their own immutable grant.
+            return None
+        ticket, why = self.current_ticket()
+        self.data.pop("scope_needs_refresh", None)
+        if why:
+            if self.data.get("scope_revoked") != why:
+                self.data["scope_revoked"] = why
+                ledger.save(self.lease, self.data)
+                run_lines.write(self.run.id, "requirements", held=why)
+            self.run.scope_revoked = True
+            return "noop", f"Work held because {why}.", ""
+        old = tracker.Ticket(**prepared["ticket"])
+        previous, current = requirement_revision.version(old), requirement_revision.version(ticket)
+        if not self.data.get("scope_revoked") and previous == current and (not self.is_spec or not self.data.get("definition")
+                                    or self.data["spec_source"] == current):
+            return None
+        if isinstance(self.run.tracker, tracker.GitHubTracker):
+            if why := requirement_revision.github_conflict(self.run.tracker, ticket):
+                return self.scope_question(ticket, why)
+        self.quiescent()
+        actions = ledger.actions(self.lease)
+        workers = exchange.workers(self.lease) if self.exchanged else {}
+        keep = set() if self.data.get("scope_revoked") else requirement_revision.independent_workers(old, ticket, workers)
+        if (pending_push or self.data.get("publication_intent")
+                or any(a["op"] == "publication.request" and a["state"] in ("running", "reconciliation-required")
+                       for a in actions)
+                or any(w["phase"] in ("integrating", "reconciliation-required") for wid, w in workers.items() if wid not in keep)):
+            return self.scope_question(ticket, "An earlier publication or worker integration has unsettled effects.")
+        observations = {}
+        if (self.is_spec and self.data.get("definition") and self.data.get("required_verification_requirements")
+                and spec_delivery.delivery_declarations(ticket)):
+            previous_promise = spec_delivery.obligation(self.run.repo.name, old, self.data["definition"], self.run.spec_identity)
+            if previous_promise:
+                observations = spec_delivery.superseded_observations(
+                    actions, ticket, self.data["required_verification_requirements"],
+                    self.data.get("superseded_actions", ()), previous_promise)
+        retained_notes, retired_notes, waiting = self.reconcile_answers(old, ticket, observations)
+        if waiting:
+            return waiting
+        reason = "the owner revised the ticket requirements"
+        for worker, w in workers.items():
+            if worker not in keep and w["phase"] not in exchange.CLOSED:
+                exchange.cancel(self.lease, worker, f"scope-{current}", reason)
+        retained = keep | {w["attempt"] for wid, w in workers.items() if wid in keep}
+        superseded = {a["id"] for a in actions if a["id"] not in retained
+                      and a["result"].get("worker_id", a["request"].get("worker_id")) not in keep}
+        for action in ledger.actions(self.lease):
+            if action["id"] in superseded and action["state"] in ("accepted", "running"):
+                ledger.transition(self.lease, action["id"], "cancelled", {"reason": reason,
+                                  "usage_unknown": action["state"] == "running"})
+        self.discard_gate_state()
+        self.data["superseded_actions"] = sorted({*self.data.get("superseded_actions", ()),
+                                                  *superseded})
+        self.data["owner_answers"] = retained_notes
+        if retired_notes:
+            history = self.data.setdefault("retired_owner_answers", {}).setdefault(previous, [])
+            history.extend(note for note in retired_notes if note not in history)
+        for key in ("scope_revoked", "definition", "spec_source", "published", "published_tree", "ci_retry", "ci_failed",
+                    "ci_failures", "verification_required_for", "denied_feedback"):
+            self.data.pop(key, None)
+        job = self.data.get("job", {})
+        for key in ("plan_text", "build_summary", "left_for_a_person", "fix_reply", "document", "report_body",
+                    "draft_why", "summary"):
+            job.pop(key, None)
+        prepared["ticket"] = {key: getattr(ticket, key) for key in flows.TICKET_FIELDS}
+        prepared["ticket"]["comments"] = ticket.owner_comments or ""
+        prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
+        self.data["goal_base"] = f"Check the current authorized ticket in use:\n{ticket.title}\n{ticket.body}"
+        if feedback := self.data.get("feedback"):
+            self.data["goal_base"] += f"\n\nOwner PR feedback predating this ticket revision:\n{pipeline.feedback_markdown(feedback)}"
+        ledger.save(self.lease, self.data)
+        run_lines.write(self.run.id, "requirements", previous=previous, current=current,
+                        superseded=self.data["superseded_actions"])
+        return None
+
+    def candidate_scope(self, worker):
+        if not self.data.get("prepared"):
+            return True
+        current, why = self.current_ticket()
+        saved = self.job.ticket
+        if not why and (requirement_revision.version(saved) == requirement_revision.version(current)
+                        or worker["id"] in requirement_revision.independent_workers(saved, current, {worker["id"]: worker})):
+            return True
+        reason = why or "the owner revised this worker's acceptance check"
+        exchange.cancel(self.lease, worker["id"], "scope-" + requirement_revision.version(current), reason)
+        self.data["scope_needs_refresh"] = reason
+        if why:
+            self.run.scope_revoked = True
+            self.data["scope_revoked"] = why
+        ledger.save(self.lease, self.data)
+        return False
+
+    def publication_scope(self):
+        if not self.data.get("prepared") or not self.default_code_review:
+            return
+        current, why = self.current_ticket()
+        if why:
+            self.run.scope_revoked = True
+            self.data["scope_revoked"] = why
+            ledger.save(self.lease, self.data)
+        if not why and requirement_revision.version(self.job.ticket) != requirement_revision.version(current):
+            why = "the source requirements changed; resume to verify the revised ticket"
+        if why:
+            self.ending = ("failed", why, "")
+            raise factory.Refused(why)
+
+    def acceptance_goal(self):
+        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        if self.is_spec and (done := self.data.get("definition")):
+            goal += (f"\n\n{spec_delivery.describe(done)}\n\n"
+                     f"Required in-use evidence: check the criterion and return its exact wording in 'what':\n"
+                     f"{done['criterion']}")
+            if done.get("environment"):
+                goal += ("\nMeasure the behavior on this candidate now. The engine separately requires evidence "
+                         "in the named runtime before closure; do not claim to have checked that runtime here.")
+        if self.job.pr_plans:
+            if discussion := pr_recovery.owner_discussion(self.job.ticket.comments):
+                goal += f"\n\n## Current ticket discussion\n\n{discussion}"
+            known_replies = {(pipeline.feedback_key(f), f["body"]) for f in self.data.get("feedback", [])}
+            for plan in self.job.pr_plans:
+                pr = plan.inputs.checkout.pr
+                replies = self.run.pr_recovery_discussion[pr].replies
+                if replies is None:
+                    replies = pr_recovery.pr_replies(pr, self.run.repo.name, str(self.run.tid))
+                unseen = [row for row in replies if (pipeline.feedback_key(row), row["body"]) not in known_replies]
+                if unseen:
+                    latest = sorted(unseen, key=lambda row: row["created"] or "")[-tracker.MAX_COMMENTS:]
+                    discussion = f"## Owner discussion on the reconciled PR\n\n{pipeline.feedback_markdown(latest)}"
+                    self.run.story.append(discussion)
+                    goal += f"\n\n{discussion}"
+        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+
+    def acceptance_stamp(self):
+        self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal, self.job.left_for_a_person])
+        if self.is_spec and (done := self.data.get("definition")):
+            self.catalog.add_context("definition of done", spec_delivery.describe(done))
+
+    def spec_ticket(self):
+        source = self.run.tracker.get(self.run.tid)
+        if (why := tracker.spec_blocker(self.job.cfg, self.run.tracker, source)) or source.spec_identity != self.run.spec_identity:
+            raise factory.Refused(why or "the spec tracker identity changed")
+        return source
+
+    def define_spec(self, args):
+        found = spec_delivery.definition(args)
+        found["environment"] = spec_delivery.protected_environment(self.run.repo.name, str(self.run.tid), found["environment"])
+        if prior := self.data.get("definition"):
+            if found != prior:
+                raise ValueError("the spec already has a durable definition of done; do not silently replace it")
+            return prior
+        source = spec_delivery.source_version(self.spec_ticket())
+        if source != spec_delivery.source_version(self.job.ticket):
+            raise factory.Refused("the spec changed during preparation; resume to read the updated scope")
+        self.data.update(definition=found, spec_source=source)
+        self.acceptance_goal()
+        self.acceptance_stamp()
+        self.persist()
+        self.run.say(spec_delivery.describe(found), on_ticket=True)
+        return found
 
     def restore_pr_targets(self, prepared):
         targets = {c["pr"]: c for c in prepared["checkouts"] if c.get("pr")}
@@ -429,8 +721,55 @@ class Controller(worker_turns.WorkerTurns):
             if why := workspace.kept_checkout(job.ws, checkout, self.run.repo.path, job.layer.copy, closed=True):
                 return self.hold_revision(revision_pr or checkout.pr, why)
 
+    def before_pr_recovery(self):
+        if why := self.continuation_blocker():
+            raise factory.Refused(f"cannot reconcile the PR while {why}; settle the pending work first")
+        if self.job.pr_plans:
+            return
+        if self.exchanged:
+            try:
+                self.worker_barrier()
+            except ValueError as error:
+                raise factory.Refused(f"cannot reconcile the PR: {error}; settle the private assignments first") from error
+        ticket = self.run.tracker.get(self.run.tid)
+        if not ticket.open:
+            raise factory.Refused("the ticket closed before the PR could be reconciled")
+        self.job.ticket.comments = ticket.comments
+        self.note_route()
+        self.run.capture_pr_recovery_discussion([c.pr for c in self.job.with_prs])
+
+    def note_route(self):
+        if not self.route_noted:
+            run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=self.protocol)
+            self.route_noted = True
+
+    def record_pr_recovery_checkout(self, checkout):
+        rows = self.data["prepared"]["checkouts"]
+        self.data["prepared"]["checkouts"] = [checkout.to_row() if row["github"] == checkout.github else row for row in rows]
+        ledger.save(self.lease, self.data)
+
+    def discard_pr_recovery_state(self):
+        self.invalidate_reconciled_inputs()
+        for plan in self.job.pr_plans:
+            self.data.get("worker_trees", {}).pop(plan.inputs.checkout.github, None)
+        self.data["prepared"]["ticket"]["comments"] = self.job.ticket.comments
+
+    def invalidate_reconciled_inputs(self):
+        self.discard_gate_state()
+        self.data["pr_recovery_stale_actions"] = self.data["stale_actions"]
+        for action in ledger.actions(self.lease):
+            if action["state"] == "accepted":
+                ledger.transition(self.lease, action["id"], "cancelled", {"reason": "PR reconciliation invalidated the input"})
+        for name in ("publication", "published", "published_tree", "ci_failed", "ci_retry", "ci_failures",
+                     "steering", "catch_up_hold", "catch_ups"):
+            self.data.pop(name, None)
+
     def check_push_targets(self):
+        self.publication_scope()
+        recovery = self.job.recovery_publication
         for checkout in self.job.with_prs:
+            if recovery and recovery.bound(checkout):
+                continue
             if not self.pr_target_open(checkout.pr, checkout.base):
                 raise workspace.RunFailed(f"{checkout.pr} closed before publication")
 
@@ -465,6 +804,12 @@ class Controller(worker_turns.WorkerTurns):
                 if job.merge_moved_base("orchestrate", before_resolve=self.check_merged_policy):
                     self.check_merged_policy()
             return
+        if job.pr_plans:
+            self.check_merged_policy()
+            if self.run.answers_due:
+                self.run.kept_note = pipeline.kept_edits_note([c for c in job.checkouts if c.onto])
+            job.b.workspace = job.workspace
+            return
         deny = diffguard.denied_paths(job.layer)
         b = job.b
 
@@ -490,9 +835,11 @@ class Controller(worker_turns.WorkerTurns):
 
         for checkout in prs:
             checkout.resumes = True
-            workspace.fetch(checkout.src, checkout.base)
+            if not checkout.recovery_base:
+                workspace.fetch(checkout.src, checkout.base)
         policy_dir = self.run.repo.layer or job.ws / ".agents"
-        merge_order = sorted(prs, key=lambda c: -len(c.wt.parts) if policy_dir.is_relative_to(c.wt) else 0)
+        merge_order = sorted((c for c in prs if not c.recovery_base),
+                             key=lambda c: -len(c.wt.parts) if policy_dir.is_relative_to(c.wt) else 0)
         merged = pipeline.merge_moved_bases(self.run, merge_order, job.layer, job.ticket, allow_untracked=True,
                                            retained_workspace=job.ws,
                                            before_merge=remember_denied,
@@ -541,12 +888,12 @@ class Controller(worker_turns.WorkerTurns):
         self.data["evidence"] = {}
         self.data["review"] = pipeline.Review.stored({}).asdict()
         self.data["verified"] = asdict(Verified("unverified"))
-        for name in ("checked", "report"):
+        for name in ("checked", "report", "remaining_checks"):
             self.data.pop(name, None)
         if "job" in self.data:
             self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
 
-    def lineage(self):
+    def lineage(self, *, settling=""):
         tid = str(getattr(self.run, "tid", ""))
         pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
         restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
@@ -555,7 +902,8 @@ class Controller(worker_turns.WorkerTurns):
         saved_policy = self.data.get("policy_sha")
         if saved_policy is not None and self.matches_policy(saved_policy, policy):
             policy = saved_policy
-        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations(self.protocol)),
+        found = {"catalog_sha": self.catalog.fingerprint,
+                 "operations_sha": ledger.digest(describe_operations(self.protocol, spec=self.is_spec)),
                  "policy_sha": policy,
                  "controller_prompt": ledger.digest(prompt_loader.template(self.controller_prompt).template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
@@ -567,7 +915,7 @@ class Controller(worker_turns.WorkerTurns):
                 raise factory.Refused(f"{changes}; outstanding private assignments need reconciliation before resuming")
         if old.keys() - REFRESHABLE_LINEAGE and not restarts:
             raise factory.Refused(f"{changes}; reconcile before resuming")
-        if why := self.continuation_blocker(decision_boundary=bool(old)):
+        if why := self.continuation_blocker(decision_boundary=bool(old), settling=settling):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
         self.starts_new_lineage = bool(old.keys() - REFRESHABLE_LINEAGE)
         return found, old
@@ -589,24 +937,351 @@ class Controller(worker_turns.WorkerTurns):
             self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
-        prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
-        return ledger.digest(prints) if prints and all(prints.values()) else ""
+        pr_recovery.check_staging(self.job.checkouts)
+        trees = pipeline.checkout_trees(self.job.checkouts)
+        pr_recovery.check_staging(self.job.checkouts)
+        return ledger.digest(trees) if trees else ""
 
     def stamp(self, gate, result):
-        tree = self.fingerprint()
+        run = getattr(self, "run", None)
+        ticket = getattr(getattr(self, "job", None), "ticket", None)
+        spec_graph_delivery.require_active_child(run, ticket)
+        checked_trees = result.get("checked", {}).get("trees") if gate == "checks" else None
+        tree = ledger.digest(checked_trees) if checked_trees else self.fingerprint()
         if not tree:
             raise ValueError("current workspace fingerprint is unavailable; evidence cannot authorize publication")
         self.data.setdefault("evidence", {})[gate] = {"tree": tree, "policy": self.policy_sha(), "result": result,
             "acceptance": self.data["acceptance"], "producer": self.executing, "observed": util.iso()}
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
 
-    def current(self, gate):
+    @property
+    def default_code_review(self):
+        tid = str(getattr(self.run, "tid", ""))
+        return self.run.path == "orchestrate" and not (pilot.is_pilot_task(tid) or zte.reserved(tid))
+
+    @property
+    def uses_code_review(self):
+        return self.data.get("review_method") == code_review.METHOD and not self.run.environment_release
+
+    def required_gates(self):
+        if self.is_spec:
+            return ("checks", "review", "verify")
+        owner_required = any(verification_attempts.REQUIRED_IN_USE.search(note) for note in self.data.get("owner_answers", []))
+        if (self.uses_code_review and not code_review.requires_behavior(self.job.b) and not owner_required
+                and not any(c.recovery_head for c in self.job.checkouts)
+                and not self.data.get("verification_required_for")):
+            return ("checks", "review")
+        return ("checks", "review", "verify")
+
+    def reuse_checks(self, evidence, focused):
+        if (not self.uses_code_review or not self.default_code_review or self.run.action or self.run.alone
+                or self.run.answers_due or self.run.recovery.get("merge_verification") or self.data.get("ci_failed")
+                or self.data.get("catch_up_hold") or self.data.get("denied_feedback")):
+            return None
+        stale = self.data.get("stale_actions", ())
+        if focused:
+            source = next((a for a in reversed(ledger.actions(self.lease)) if a["op"] == "checks.run"
+                           and a["id"] != self.executing and a["state"] != "accepted"
+                           and not a["result"].get("reused_checks")), {})
+            result = source.get("result", {})
+            stamp = result.get("input_stamp", {})
+            failures = result.get("failed_checks", [])
+            if (source.get("state") == "succeeded" and source["id"] not in stale and result.get("passed") is False
+                    and result.get("scope") == "failed" and failures
+                    and all(f.get("selectors") and not f.get("capability") for f in failures)
+                    and result.get("policy") == self.job.policy("checks", {"focused": focused})
+                    and stamp.get("acceptance") == self.data["acceptance"] and stamp.get("policy") == self.policy_sha()
+                    and stamp.get("tree") and stamp["tree"] == self.fingerprint()):
+                return {"reused_checks": source["id"], "passed": False, "scope": "failed", "full": False,
+                        "checks_executed": [], "failed_checks": failures, "remaining_checks": self.data["remaining_checks"],
+                        "next": "Repair the recorded failure before retrying the focused check."}
+            return None
+        result = evidence.get("result", {})
+        if (not result.get("full") or self.data.get("remaining_checks") or evidence.get("producer") in stale
+                or not self.current("checks")):
+            return None
+        checked = result.get("checked", {})
+        trees = pipeline.checkout_trees(self.job.checkouts)
+        recorded_trees = checked.get("trees")
+        if (result.get("policy") not in {self.job.policy("checks", {"quick": q}) for q in (False, True)}
+                or checked.get("commands") != self.job.layer.checks or not checked.get("tree")
+                or checked["tree"] != pipeline.check_tree(trees) or evidence.get("tree") != ledger.digest(trees)
+                or checked.get("report") != result.get("report")):
+            return None
+        if (recorded_trees is not None or any(c.recovery_head for c in self.job.checkouts)) and recorded_trees != trees:
+            return None
+        b = self.job.b
+        staged = b.restage()
+        if staged.denied:
+            return None
+        b.validate_diff(staged, "the build and its fixes")
+        b.checked, b.report = checked, checked["report"]
+        return {"reused_checks": evidence["producer"], "passed": True, "full": True, "scope": "full",
+                "checks_executed": [], "failed_checks": [], "remaining_checks": []}
+
+    def latest_code_review(self):
+        stale = set(self.data.get("stale_actions", ()))
+        return next((a for a in reversed(ledger.actions(self.lease))
+                     if a["op"] == "review.run" and a["id"] not in stale
+                     and a["state"] != "accepted" and a["id"] != self.executing
+                     and not (a["result"].get("reused_review") or a["result"].get("review_deferred"))), {})
+
+    def applicable_report(self, source):
+        stamp = source.get("result", {}).get("evidence", {})
+        report = stamp.get("result", {})
+        if (source.get("state") == "succeeded" and report.get("method") == code_review.METHOD
+                and stamp.get("acceptance") == self.data["acceptance"]
+                and self.matches_policy(stamp.get("policy"), self.policy_sha())
+                and report.get("bases") == code_review.bases(self.job.checkouts)):
+            return report
+        return {}
+
+    def decide_findings(self, request):
+        if not self.uses_code_review:
+            raise ValueError("this workflow uses the original independent review policy")
+        source = self.latest_code_review()
+        report = self.applicable_report(source)
+        if source.get("id") != request["review_id"] or report.get("verdict") != "pending":
+            raise ValueError("decisions require the latest completed review for this issue, base and policy")
+        if not self.full_checks_passed():
+            raise ValueError("run the full configured checks on the candidate before deciding findings")
+        judged = code_review.disposition(report, request["decisions"], code_review.candidate_trees(self.job.checkouts))
+        self.stamp("review", judged.asdict())
+        self.job.review = judged
+        pipeline.note_review(self.run, judged, self.job.verified)
+        return judged.asdict()
+
+    def full_checks_passed(self):
+        return self.current("checks") and self.data["evidence"]["checks"].get("result", {}).get("full") is True
+
+    def current(self, gate, *, tree=None):
         if gate == "checks" and self.data.get("denied_feedback"):
             return False
         found = self.data.get("evidence", {}).get(gate, {})
-        return bool(found and found["tree"] == self.fingerprint()
-                    and self.matches_policy(found["policy"], self.policy_sha())
-                    and found.get("acceptance") == self.data["acceptance"])
+        if not (found and found["tree"] == (self.fingerprint() if tree is None else tree)
+                and self.matches_policy(found["policy"], self.policy_sha())
+                and found.get("acceptance") == self.data["acceptance"]):
+            return False
+        result = found.get("result", {})
+        if gate == "verify" and (promise := result.get("delivery_obligation")):
+            if (not self.is_spec or not (done := self.data.get("definition"))
+                    or promise != spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity)):
+                return False
+            if any(not spec_delivery.confirmed_observation(self.run.tracker, self.run.tid, r["text"], r["comment"])
+                   for r in result.get("delivery_directions", {}).values()):
+                return False
+        if gate == "checks" and not hosted_check.current(result):
+            return False
+        if gate == "verify" and result.get("verification_environment"):
+            setting = self.catalog.settings.get(result["verification_route"])
+            return bool(setting and result["verification_environment"] == verification_attempts.environment(
+                verification_attempts.host(), verification_attempts.capabilities(self.job.b, setting)))
+        return True
+
+    def verification_guidance(self, report, tools, unattempted, history):
+        remaining = verification_attempts.outstanding(report)
+        guidance = {"remaining_requirements": remaining, "observed_requirements": sorted(verification_attempts.observed(report))}
+        if report.verdict != "blocked":
+            return guidance
+        required = ("verify" in self.required_gates() or self.job.requires_behavior_on_block
+                    or not verification_attempts.advisory(report, self.job.goal + "\n" + self.job.ticket.title + "\n" + self.job.ticket.body))
+        routes = []
+        for key, setting in self.catalog.settings.items():
+            if setting.step != "verify":
+                continue
+            candidate = verification_attempts.capabilities(self.job.b, setting)
+            if verification_attempts.supplies_missing(tools, candidate, report.missing_tools) and not (
+                    verification_attempts.already_blocked(history, verification_attempts.environment(
+                        verification_attempts.host(), candidate), remaining)):
+                routes.append(key)
+        if report.nonblocking_reason:
+            next_action = "publication.request"
+        elif routes or unattempted or report.invalid_candidate_report:
+            next_action = "verification.run"
+        else:
+            next_action = "owner.ask" if required else "verification.decide"
+        return {**guidance, "unattempted_requirements": unattempted, "missing_capability": report.missing_capability or report.blocked_by,
+                "verification_required": required, "capable_routes": routes,
+                "next_action": next_action}
+
+    def verification_attempt(self, args):
+        setting = self.catalog.route(args["route_id"], args["effort"], ("verify",))
+        tools = verification_attempts.capabilities(self.job.b, setting)
+        host = verification_attempts.host()
+        environment = verification_attempts.environment(host, tools)
+        tree = self.fingerprint()
+        requirements = verification_attempts.names(args.get("requirements", []))
+        stamp = self.data.get("evidence", {}).get("verify", {})
+        source = stamp.get("result", {}) if self.current("verify") else {}
+        done = self.data.get("definition") if self.is_spec else None
+        promise = spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity) if done else {}
+        if promise:
+            self.data["protected_spec_source"] = promise["source"]
+        elif done and self.data.get("protected_spec_source") == spec_delivery.source_version(self.job.ticket):
+            raise factory.Refused("the protected delivery enrollment for this spec is missing")
+        declared, delivery_name = spec_delivery.declared_observations(self.job.ticket, promise) if done else ({}, "")
+        carried = self.data.get("required_verification_requirements", [])
+        directions = spec_delivery.legacy_directions(self.lease, done, carried, promise, self.data.get("superseded_actions", [])) if promise else {}
+        confirmed = spec_delivery.confirmed_directions(self.run.tracker, self.run.tid, directions) if directions else {}
+        if promise and (source.get("delivery_obligation") != promise or source.get("invalid_candidate_report")
+                        or confirmed and source.get("delivery_directions") != confirmed):
+            source = {}  # Historical stamps remain available for inspection. Only a fresh baseline can bind this promise.
+        scope = verification_attempts.plan(source, requirements, host, tools)
+        prior, pending = scope.prior, scope.requirements
+        unattempted = source.get("unattempted_requirements", [])
+        history = dict(source.get("blocked_environments", {})) if prior else {}
+        if scope.reuse:
+            guidance = self.verification_guidance(prior, source["verification_tools"], unattempted, history)
+            if source.get("owner_delivery_directions"):
+                guidance.update(owner_delivery_directions=source["owner_delivery_directions"],
+                                delivery_direction_help=source["delivery_direction_help"])
+            return {"reused_verification": stamp["producer"], "verdict": prior.verdict,
+                    "retry_blocked": prior.verdict == "blocked", **guidance}
+        refs = args["goal_refs"]
+        detail = "\n\nReference material, not owner authority:\n" + "\n".join(
+            self.context_for_action(ref) for ref in refs) if refs else ""
+        goal = self.job.goal
+        outstanding_required = [name for name in carried if name not in confirmed]
+        if confirmed:
+            outstanding_required += [check for name in confirmed for check in directions[name]["checks"]]
+            detail += ("\n\nThe publisher assigned these historical observations to the protected delivery receipt. "
+                       "Repeat every previous candidate check independently on the current tree.\n" + "\n".join(confirmed))
+        if done:
+            outstanding_required = list(dict.fromkeys([done["criterion"], *declared, *outstanding_required]))
+            if promise:
+                detail += spec_delivery.candidate_instructions(promise)
+            if delivery_name:
+                detail += ("\nThe exact named post-merge receipt is " + delivery_name + ". In the structured "
+                           "unmeasured_requirements array, this receipt uses only the pending_delivery identifier. "
+                           "A missing candidate observation uses candidate_requirement and reason; for a declared check "
+                           "use its AC-N identifier as candidate_requirement. Put additional explanations in summary. "
+                           "For each candidate check below, use only its stable AC-N identifier as 'what', and "
+                           "describe the interaction and observed result in 'how' and 'saw'.\n" + "\n".join(declared.values()))
+        if not pending and (outstanding_required or scope.baseline_targets):
+            detail += ("\n\nOn the full baseline, include these requirements and use their exact wording in 'what'.\n"
+                       + "\n".join(f"- {name}" for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets])))
+        if pending:
+            detail += ("\n\nFor this follow-up, use the product only for the following requirements. Return one check "
+                       "for each with its exact wording in 'what'. The engine retains previously measured behavior.\n"
+                       + "\n".join(f"- {name}" for name in pending))
+        try:
+            self.job.goal = goal + detail
+            with self.selected(setting):
+                proven = verification_attempts.observed(prior) if pending else set()
+                covered = tuple(c["what"] for c in prior.checks if (c.get("driver") or c.get("probe"))
+                                and c.get("passed") and c["what"].casefold() in proven) if pending else ()
+                outcome = self.atomic("verify", tree=str(self.job.ws), single=True, covered_commands=covered,
+                                      **({"delivery_token": ledger.digest(promise)} if delivery_name else {}))
+        finally:
+            self.job.goal = goal
+        if not tree or tree != self.fingerprint() or host != verification_attempts.host():
+            raise ValueError("the candidate or environment changed during verification; run a new baseline")
+        raw = Verified.stored(outcome.data["verified"])
+        if promise or raw.pending_delivery:
+            if promise and promise != spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity):
+                raise factory.Refused("the protected delivery obligation changed during candidate verification")
+            raw = spec_delivery.candidate_report(raw, promise)
+        fresh = verification_attempts.unattempted(raw)
+        measured = verification_attempts.partial(raw)
+        unattempted = [name for name in dict.fromkeys([*(unattempted if pending else []), *fresh])
+                       if name.casefold() not in {target.casefold() for target in pending}]
+        if pending:
+            measured = verification_attempts.combine(prior, measured, pending)
+        observed = verification_attempts.observed(measured)
+        if declared:
+            documented = {pipeline.verify.one_line(c.get("what")).casefold() for c in measured.checks
+                          if c.get("passed") is True and pipeline.verify.one_line(c.get("how")) and pipeline.verify.one_line(c.get("saw"))}
+            observed -= {n.casefold() for n in declared} - documented
+        owed = [name for name in dict.fromkeys([*outstanding_required, *scope.baseline_targets]) if name.casefold() not in observed]
+        if owed:
+            absent = [name for name in owed if name not in verification_attempts.outstanding(measured)]
+            measured = verification_attempts.partial(replace(measured, unmeasured_requirements=list(dict.fromkeys(
+                [*measured.unmeasured_requirements, *absent]))))
+            unattempted = list(dict.fromkeys([*unattempted, *absent]))
+        elif outstanding_required:
+            self.data.pop("required_verification_requirements", None)
+            self.data.pop("verification_required_for", None)
+        if measured.saved and (pending or measured.verdict != outcome.data["verified"]["verdict"]):
+            self.run.save(Path(measured.saved).name, measured.markdown())
+        if measured.verdict == "blocked":
+            attempted = {name.casefold() for name in verification_attempts.outstanding(measured)} - {
+                name.casefold() for name in unattempted}
+            history[environment] = sorted(set(history.get(environment, [])) | attempted)
+        result = {**asdict(measured), "blocked_environments": history, "verification_environment": environment, "verification_host": host,
+                  "verification_tools": tools, "verification_requirements": pending, "verification_route": args["route_id"],
+                  "unattempted_requirements": unattempted}
+        self.job.verified = measured
+        guidance = self.verification_guidance(measured, tools, unattempted, history)
+        if measured.verdict == "fail" or guidance.get("verification_required"):
+            self.remember_required_verification(measured, self.data["acceptance"])
+        elif flows.retry_passed(measured):
+            self.data.pop("verification_required_for", None)
+        result.update(guidance)
+        if confirmed:
+            result["delivery_directions"] = confirmed
+        unresolved = {name: rule["text"] for name, rule in directions.items() if name not in confirmed}
+        if unresolved and measured.verdict == "blocked":
+            result["owner_delivery_directions"] = unresolved
+            result["delivery_direction_help"] = ("If a historical gap refers solely to the enrolled delivery receipt, "
+                "ask its publisher to post the exact directive on the spec ticket. Otherwise it still needs a candidate check.")
+        self.stamp("verify", result)
+        return {"operation_passed": outcome.passed, **result}
+
+    def decide_verification(self, args):
+        stamp = self.data.get("evidence", {}).get("verify", {})
+        if (not self.uses_code_review or not self.current("verify") or stamp.get("producer") != args["verification_id"]
+                or "verify" in self.required_gates()):
+            raise ValueError("a nonblocking decision requires a current advisory verification gap")
+        report = self.job.verified
+        authority = self.job.goal + "\n" + self.job.ticket.title + "\n" + self.job.ticket.body
+        if not verification_attempts.advisory(report, authority) or self.job.requires_behavior_on_block:
+            raise ValueError("required or unclassified behavior cannot be marked nonblocking")
+        self.job.verified = replace(report, nonblocking_reason=args["reason"].strip(),
+                                    nonblocking_trees=code_review.candidate_trees(self.job.checkouts))
+        result = {**stamp["result"], **asdict(self.job.verified)}
+        self.stamp("verify", result)
+        return result
+
+    def adopt_code_review(self):
+        stale = set(self.data.get("stale_actions", ()))
+        stale.update(a["id"] for a in ledger.actions(self.lease)
+                     if ACTION_GATES.get(a["op"]) == "review" and a["state"] != "accepted")
+        self.data["stale_actions"] = sorted(stale)
+        self.data.setdefault("evidence", {}).pop("review", None)
+        self.job.review, self.job.reviews = pipeline.Review(), 0
+        self.data["review_method"] = code_review.METHOD
+        self.run.code_review = True
+        self.run.log("Adopted Standards and Spec code review for this continuation.")
+
+    def remember_required_verification(self, report, acceptance):
+        self.data["verification_required_for"] = acceptance
+        authority = self.job.goal + "\n" + self.job.ticket.title + "\n" + self.job.ticket.body
+        supplemental = {name.casefold() for name in report.advisory_gaps
+                        if name.casefold() not in pipeline.verify.one_line(authority).casefold()}
+        failures = {c.get("what", "").casefold() for c in report.failed_checks if c.get("cause") != "environment"}
+        required = [name for name in verification_attempts.outstanding(report)
+                    if name.casefold() not in supplemental or name.casefold() in failures]
+        observed = verification_attempts.observed(report)
+        self.data["required_verification_requirements"] = [name for name in dict.fromkeys(
+            [*self.data.get("required_verification_requirements", []), *required]) if name.casefold() not in observed]
+
+    def restore_verification(self, result):
+        stamp = result["evidence"]
+        raw = Verified.stored(stamp["result"] if "verdict" in stamp["result"] else result)
+        self.job.verified = raw
+        if not self.uses_code_review:
+            return
+        report = self.job.verified = verification_attempts.partial(raw)
+        if raw is not report:
+            # A historic pass can explicitly list an unmeasured criterion. Preserve the immutable ledger entry.
+            self.data["evidence"]["verify"] = {**stamp, "result": {
+                **stamp["result"], **asdict(report), "unattempted_requirements": verification_attempts.unattempted(raw)}}
+        if report.verdict == "fail" or (report.verdict == "blocked" and not report.nonblocking_reason and
+                (result.get("verification_required") or not verification_attempts.advisory(report, self.job.goal))):
+            self.remember_required_verification(report, stamp["acceptance"])
+        elif flows.retry_passed(report) or report.nonblocking_reason or result.get("verification_required") is False:
+            self.data.pop("verification_required_for", None)
+            self.data.pop("required_verification_requirements", None)
 
     def recover(self):
         self.quiescent()
@@ -617,12 +1292,14 @@ class Controller(worker_turns.WorkerTurns):
         actions = ledger.actions(self.lease)
         self.has_queued_starts = any(ledger.queued_start(a) for a in actions)
         for action in actions:
+            if action["id"] in self.data.get("superseded_actions", ()):
+                continue
             result = action["result"]
-            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+            gate = ACTION_GATES.get(action["op"])
             old_gate = bool(gate) and action["id"] in stale
             if action["id"] == catch_up.get("action"):
                 self.data["evidence"] = {}
-            if action["op"] == "owner.ask" and result.get("awaiting_owner"):
+            if result.get("awaiting_owner"):
                 answers = [ask_store.ask_get(ask) for ask in result["ask_ids"]]
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
                     raise factory.Refused("owner answers or interrupted question settlement need reconciliation before resuming")
@@ -632,9 +1309,20 @@ class Controller(worker_turns.WorkerTurns):
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
             if not old_gate:
                 self.restore_result_context(action)
-            if gate and not old_gate and action["state"] != "accepted":
+            if gate and not old_gate and action["state"] != "accepted" and not (
+                    result.get("reused_checks") or result.get("reused_review") or result.get("reused_verification")
+                    or result.get("review_deferred") or result.get("preserved_verification")
+                    or action["op"] in ("review.decide", "verification.decide") and action["state"] != "succeeded"):
                 self.data.setdefault("evidence", {}).pop(gate, None)
             if action["state"] == "succeeded":
+                if gate == "checks" and not old_gate and self.uses_code_review and not result.get("reused_checks"):
+                    if "remaining_checks" in result:
+                        self.data["remaining_checks"] = check_repair.retry_targets(result["remaining_checks"])
+                    elif result.get("passed") is False:
+                        self.data["remaining_checks"] = check_repair.retry_targets(check_repair.historical_failures(
+                            self.job.layer, result.get("report", "")))
+                    elif result.get("full"):
+                        self.data.pop("remaining_checks", None)
                 if result.get("writing"):
                     self.job.build_summary = self.job.b.build_summary = result.get("text", self.job.build_summary)
                 elif result.get("effective", {}).get("prompt_id", "").removeprefix("prompt:") == "plan":
@@ -644,9 +1332,11 @@ class Controller(worker_turns.WorkerTurns):
                     if gate == "checks":
                         self.job.b.checked, self.job.b.report = result.get("checked", {}), result.get("report", "")
                     elif gate == "review":
-                        self.job.review = pipeline.Review.stored(result)
+                        self.job.review = pipeline.Review.stored(result["evidence"]["result"])
+                        if code_review.completed(self.job.review):
+                            self.run.facts["review"] = self.job.review.report()
                     else:
-                        self.job.verified = Verified.stored(result)
+                        self.restore_verification(result)
         self.data["writes"] = max(self.data.get("writes", 0), sum(bool(a["result"].get("writing"))
                                                                  for a in ledger.actions(self.lease)))
         if self.data.get("publication_intent") or any(a["state"] == "reconciliation-required"
@@ -664,6 +1354,42 @@ class Controller(worker_turns.WorkerTurns):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
 
+    def resolved_pr_conflicts(self, actions):
+        # A recovery grant names the remote revisions that conflicted. Verify their local merge
+        # from Git itself, including when a restart happened before the controller saved its state.
+        conflicts = {url: pr for url, pr in self.run.recovery.get("binding", {}).get("prs", {}).items()
+                     if pr.get("mergeable") == "CONFLICTING"}
+        if not conflicts or not self.default_code_review:
+            return {}
+        trees = {}
+        merged = {}
+        for checkout in self.job.checkouts:
+            trees[checkout.github] = factory.fingerprint(checkout.wt)
+            pr = conflicts.get(checkout.pr)
+            if not pr:
+                continue
+            if checkout.lease != pr.get("headRefOid") or checkout.base_commit != pr.get("baseRefOid"):
+                return {}
+            # Both tracking refs were fetched during preparation. A newer fetch or local edit
+            # invalidates this handoff; publication independently checks the remote again.
+            refs = util.git(["rev-parse", "--revs-only", checkout.origin_base, f"origin/{self.job.branch}"], checkout.wt)
+            if refs.splitlines() != [checkout.base_commit, checkout.lease]:
+                return {}
+            head, tree, *parents = util.git(["show", "-s", "--format=%H %T %P", "HEAD"], checkout.wt).split()
+            if parents != [checkout.lease, checkout.base_commit] or tree != trees[checkout.github]:
+                return {}
+            merged[checkout.pr] = {"pr_head": checkout.lease, "base": checkout.base_commit, "merge": head, "tree": tree}
+        if merged.keys() != conflicts.keys() or not all(trees.values()):
+            return {}
+        stamp = {"tree": ledger.digest(trees), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}
+        stale = set(self.data.get("stale_actions", ()))
+        last = next((a for a in reversed(actions) if a["op"] == "checks.run" and a["id"] not in stale
+                     and a["state"] in ("succeeded", "failed") and a["result"].get("input_stamp") == stamp), {})
+        result = last.get("result", {})
+        partial_pass = result.get("passed") is True and result.get("scope") in ("quick", "failed")
+        return {"merges": merged, "checks_action": last.get("id", ""), "run_full_checks": not last or partial_pass,
+                "status": "Arete resolved the conflicts locally. Use the current checks to continue recovery."}
+
     def observe(self, limit=20, after=0):
         all_actions = ledger.actions(self.lease)
         actions = [a for a in all_actions if a["result"].get("revision", 0) > after]
@@ -677,7 +1403,12 @@ class Controller(worker_turns.WorkerTurns):
         return {**work, "version": self.protocol, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 **({"serial_reason": self.data["serial_reason"]} if self.data.get("serial_reason") else {}),
+                "review_method": self.data.get("review_method", "legacy") if self.uses_code_review else "legacy",
+                "required_gates": self.required_gates(),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
+                **({"resolved_pr_conflicts": receipt} if (receipt := self.resolved_pr_conflicts(all_actions)) else {}),
+                **({"spec": {"guide": spec_delivery.GUIDANCE, "definition": self.data.get("definition")}}
+                   if self.is_spec else {}),
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
@@ -705,6 +1436,8 @@ class Controller(worker_turns.WorkerTurns):
         return self.catalog.read(ref, 0, 8000)["text"]
 
     def excerpt(self, action):
+        if action["id"] in self.data.get("superseded_actions", ()):
+            return {"superseded": "the owner revised the ticket requirements"}
         ref, result = action["id"], action["result"]
         text = ledger.encoded(result)
         if len(text) > 4000:
@@ -761,9 +1494,17 @@ class Controller(worker_turns.WorkerTurns):
         observation = self.observe()
         turn = ledger.begin(self.lease, observation, self.decision_limit)
         observation["decision_id"] = turn
+        receipt = observation.get("resolved_pr_conflicts")
+        if (receipt and receipt["run_full_checks"] and not (self.run.answers_due or self.run.feedback or self.workers)
+                and all(w["phase"] in exchange.CLOSED for w in observation.get("workers", []))):
+            response = {"version": self.protocol, "decision_id": turn, "state_version": observation["state_version"],
+                        "rationale": "Check the locally resolved PR before continuing recovery.",
+                        "calls": [{"op": "checks.run", "args": {"scope": "full"}}]}
+            return ledger.accept(self.lease, turn, observation["state_version"], response, self.action_limit)
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
-        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol), observation=json.dumps(observation))
+        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol, spec=self.is_spec),
+                                      observation=json.dumps(observation))
         result = {}
         for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
             request = delegation.request(self.job, turn, prompt, setting, (), [])
@@ -788,7 +1529,8 @@ class Controller(worker_turns.WorkerTurns):
             if response is None:
                 response = json_from_text(result.get("text", ""))
             calls = self.catalog.validate(response, turn, observation["state_version"],
-                                          {a["id"]: a for a in ledger.actions(self.lease)})
+                                          {a["id"]: a for a in ledger.actions(self.lease)
+                                           if a["id"] not in self.data.get("superseded_actions", ())})
             if self.exchanged:
                 self.preflight(calls["calls"])
             actions = ledger.accept(self.lease, turn, observation["state_version"], calls, self.action_limit)
@@ -807,9 +1549,32 @@ class Controller(worker_turns.WorkerTurns):
         if self.workers:
             raise ValueError("workers are still active; wait for confirmed completion or cancellation first")
 
+    def current_check_diagnostics(self, actions, assignment=None):
+        latest = next((a for a in reversed(actions) if a["op"] == "checks.run"
+                       and a["state"] not in ("accepted", "running")), None)
+        if (not latest or latest["state"] != "succeeded" or latest["id"] in self.data.get("stale_actions", ())
+                or latest["id"] in self.data.get("superseded_actions", ())):
+            return ""
+        result = latest["result"]
+        failures = result.get("failed_checks", [])
+        stamp = result.get("input_stamp", {})
+        tree = stamp.get("tree")
+        if (result.get("passed") is not False or not failures or not tree
+                or stamp.get("acceptance") != self.data["acceptance"] or stamp.get("policy") != self.policy_sha()
+                or tree != self.fingerprint()):
+            return ""
+        if assignment:
+            pinned = {c.github: part["tree"] for c, part in
+                      zip(self.job.checkouts, assignment["candidate"]["parts"], strict=True)}
+            if tree != ledger.digest(pinned):
+                return ""
+        return check_repair.diagnostics(failures)
+
     def worker_start(self, action, args, prior=None, *, same_batch=False):
         setting, name, writing = self.catalog.worker(args)
         writing = writing and args["tool_bundle"] == "write"
+        if self.is_spec and writing and not self.data.get("definition"):
+            raise ValueError("record the spec's definition of done or ask the owner before implementation")
         if len(self.workers) >= self.policy.max_workers or (not self.exchanged and self.workers and (
                 writing or any(worker.writing for worker in self.workers.values()))):
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
@@ -863,12 +1628,22 @@ class Controller(worker_turns.WorkerTurns):
             inputs.update(workspace=str(private), class_check="")
         if not writing:
             inputs["class_check"] = ""
+        if self.is_spec and (done := self.data.get("definition")):
+            inputs["goal"] += "\n\n" + spec_delivery.describe(done)
+            inputs["verify"] = self.job.goal
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         if assignment:
             messages = exchange.inbox(self.lease, logical_id)
             prompt += worker_turns.instructions(assignment, messages)
-        if writing and denied_feedback:
-            prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
+        if writing:
+            if denied_feedback:
+                prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
+            if (not assignment or not prior) and (diagnostics := self.current_check_diagnostics(ledger.actions(self.lease), assignment)):
+                prompt += f"\n\n## Current candidate check failures (reference only)\n\n{diagnostics}"
+            prompt = check_repair.builder_prompt(prompt)
+            if assignment:
+                prompt += ("\n\nThe shared check launcher targets the delivery checkout, not this private workspace. "
+                           "Do not use its result to verify private edits.")
         session = NO_SESSION
         previous = (prior or {}).get("result", {})
         if not assignment and previous.get("runner") == setting.runner and previous.get("model") == setting.model:
@@ -962,6 +1737,13 @@ class Controller(worker_turns.WorkerTurns):
                         self.run.launch_done(worker.step, bool(message.get("ok")))
                     self.run.cost += message.get("cost_usd", 0)
                     self.run.paid += message.get("paid_usd", 0)
+                    ticket = getattr(getattr(self, "job", None), "ticket", None)
+                    if reason := spec_graph_delivery.active_child_blocker(self.run, ticket):
+                        if self.exchanged:
+                            exchange.cancel(self.lease, worker.logical_id, key, reason)
+                        else:
+                            ledger.transition(self.lease, key, "cancelled", {"reason": reason, "usage_unknown": False})
+                        raise workspace.RunFailed(reason)
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if self.exchanged:
                         phase = self.settle_turn(worker, message)
@@ -1058,8 +1840,7 @@ class Controller(worker_turns.WorkerTurns):
         after = "the final orchestrated tree"
         if any(c.lease for c in checkouts):
             bases = {
-                c.github: (c.base_commit if c in staged.merged
-                           else util.git(["merge-base", c.origin_base, "HEAD"], c.wt).strip())
+                c.github: (c.base_commit if c in staged.merged else pipeline.base_of_head(c))
                 for c in checkouts
             }
             if not any(util.git(["diff", "--cached", "--name-only", bases[c.github]], c.wt) for c in checkouts):
@@ -1070,10 +1851,11 @@ class Controller(worker_turns.WorkerTurns):
                 for c in checkouts
             ):
                 merge_verification = self.run.recovery.get("merge_verification") is True
-                if ((self.run.environment_release or merge_verification) and not self.data.get("ci_failed")
-                        and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
-                    whole = staged if b.from_base else b.restage(from_base=True)
-                    return b.validate_diff(whole, after, from_base=True)
+                recovered = [c for c in checkouts if c.recovery_head]
+                if (any(pr_recovery.current_head(c) != c.lease for c in recovered)
+                        or ((self.run.environment_release or merge_verification or recovered) and not self.data.get("ci_failed")
+                            and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts))):
+                    return b.validate_diff(staged if b.from_base else b.restage(from_base=True), after, from_base=True)
                 label = "head" if len(heads) == 1 else "heads"
                 shas = ", ".join(f"`{head}`" for head in heads.values())
                 raise UnchangedPushedHead(f"nothing changed since the pushed {label} {shas}")
@@ -1083,25 +1865,61 @@ class Controller(worker_turns.WorkerTurns):
         self.worker_barrier()
         self.barrier()
         if pending := ledger.catch_up_push(self.data):
+            self.publication_scope()
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
-        needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
+        if self.is_spec:
+            if not (done := self.data.get("definition")) or self.job.left_for_a_person or unverified_measurement:
+                raise ValueError("a spec needs one complete definition of done and cannot ship a partial or unverified outcome")
+            if spec_delivery.source_version(self.spec_ticket()) != self.data["spec_source"]:
+                raise factory.Refused("the published spec changed after the definition of done was recorded")
+            promise = spec_delivery.obligation(self.run.repo.name, self.job.ticket, done, self.run.spec_identity)
+            if self.job.verified.delivery_obligation != promise or (not promise and
+                    self.data.get("protected_spec_source") == self.data["spec_source"]):
+                raise factory.Refused("the protected delivery obligation changed before publication")
+            if not spec_delivery.behavior(self.job.verified, done):
+                raise ValueError("verify the exact spec criterion in use and record how it was checked and what was observed")
+        recovering = any(c.recovery_head for c in self.job.checkouts)
+        tree = self.fingerprint() if recovering else None
+        gates = self.required_gates()
+        needed = [gate for gate in gates if not self.current(gate, **({"tree": tree} if recovering else {}))]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
-        if not self.data["evidence"]["checks"]["result"].get("full"):
+        checks = self.data["evidence"]["checks"]["result"]
+        if not checks.get("full"):
             raise ValueError("publication requires the full owner check policy")
+        if recovering and ledger.digest(checks.get("checked", {}).get("trees", {})) != tree:
+            raise ValueError("recovered publication requires fresh full checks fingerprinted for every participating checkout")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
+        if self.uses_code_review:
+            recorded = self.data["evidence"]["review"]["result"]
+            if (recorded.get("verdict") != "approve" or not self.job.review.approved()
+                    or not code_review.completed(self.job.review)):
+                raise ValueError("review findings need an explicit orchestrator decision before publication")
+            if (self.job.review.trees != code_review.candidate_trees(self.job.checkouts)
+                    or self.job.review.asdict().get("bases") != code_review.bases(self.job.checkouts)):
+                raise ValueError("the candidate or comparison base changed since the review decision")
+            if (self.current("verify") and self.job.verified.verdict == "blocked"
+                    and not self.job.verified.nonblocking_reason):
+                raise ValueError("resolve the missing verification capability or explicitly settle an advisory gap")
+            if "verify" in self.required_gates() and not flows.retry_passed(self.job.verified):
+                raise ValueError("the configured behavioral check must pass")
+            if "verify" not in self.required_gates() and not self.current("verify"):
+                self.job.verified = code_review.unverified()
+            pipeline.note_review(self.run, self.job.review, self.job.verified)
         catch_up = self.data.get("catch_up_hold")
-        if catch_up and (not flows.retry_passed(self.job.verified) or not self.job.review.approved()):
+        if catch_up and (("verify" in self.required_gates() and not flows.retry_passed(self.job.verified))
+                         or not self.job.review.approved()):
             raise ValueError("publication after a catch-up hold requires passing verification and an approving review")
         measurement_section = (pipeline.unverified_measurement_section(unverified_measurement)
                                if unverified_measurement else "")
         if (not self.run.dry_run and not zte.reserved(str(self.run.tid)) and self.data.get("ci_failed")
-                and (retry := self.data.get("ci_retry")) and (tree := self.fingerprint())
+                and (retry := self.data.get("ci_retry")) and (tree := tree or self.fingerprint())
                 and tree == self.data.get("published_tree")):
             return self.retry_publication_ci(retry, tree, measurement_section=measurement_section)
+        self.publication_scope()
         self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow, measurement_section=measurement_section)
@@ -1111,36 +1929,136 @@ class Controller(worker_turns.WorkerTurns):
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
         self.check_pilot_publication()
+        publication = None
+        if recovering:
+            publication = self.recovered_publication()
+            if tree != self.fingerprint() or tree != ledger.digest(publication.trees):
+                raise ValueError("the staged candidate does not match the reconciled tree's gates; refresh the gates")
+            self.job.recovery_publication = publication
         if catch_up:
             checkout, = self.job.checkouts
             self.take_merge_lease(checkout)
-        self.data["publication_intent"] = {"tree": self.fingerprint()}
-        self.persist()
+        self.begin_publication(tree if recovering else self.fingerprint())
         outcome = self.atomic("pr", tree=str(self.job.ws), measurement_section=measurement_section)
         if not outcome.passed:
             self.ending = flows.ended(self.flow, outcome)
             return outcome.data
-        self.data.pop("publication_intent", None)
         self.data.pop("worker_trees", None)
         self.job.b.worker_trees = {}
         self.data.pop("ignored_denied_paths", None)
         self.job.b.ignored_denied_paths = {}
-        self.data["publication"] = outcome.data
-        self.persist()
-        if catch_up:
-            for checkout in self.job.picked(self.job.changed):
-                pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, self.job.verified, self.job.review)
-        if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
+        changed = self.job.picked(self.job.changed)
+        if not publication:
+            self.data.pop("publication_intent", None)
+            self.data["publication"] = outcome.data
+            self.persist()
+            if catch_up:
+                for c in changed:
+                    pipeline.publish_gate_evidence(self.run, self.job.ticket, c, self.job.verified, self.job.review)
+        failure = self.publication_ci(changed) if self.run.repo.parts else None
+        if publication:
+            publication.recheck(during="before recording publication")
+            self.data["publication"] = outcome.data
+            if self.job.with_prs:
+                pipeline.note_prs(self.run, self.job.branch, self.job.with_prs)
+        if failure:
+            self.keep_failed_publication()
             return self.settle_publication_failure(failure)
         return self.finish_publication()
+
+    def recovered_publication(self):
+        authors = flows.authors(self.job.continues) | {self.run.id}
+        publication = pr_recovery.Publication(self.job.checkouts, self.job.branch, authors,
+                                              record=self.record_recovery_effects,
+                                              reported_gates=self.data.get("recovered_gate_reports", ()))
+        self.run.capture_pr_recovery_discussion([target.refs.url for target in publication.targets.values()])
+        return publication
+
+    def begin_publication(self, tree, *, phase=""):
+        intent = {"tree": tree}
+        if phase:
+            intent["phase"] = phase
+        if recovery := self.job.recovery_publication:
+            intent["recovery_receipt"] = recovery.receipt(self.executing)
+        self.data["publication_intent"] = intent
+        self.persist()
+
+    def end_publication_intent(self, *, keep_recovery=False):
+        if recovery := self.job.recovery_publication:
+            recovery.recheck(during="before clearing publication intent")
+            if keep_recovery:
+                for target in recovery.targets.values():
+                    c = target.checkout
+                    c.recovery_head, c.recovery_base = recovery.expected_head(c), target.refs.base
+            else:
+                for checkout in self.job.checkouts:
+                    checkout.recovery_head = checkout.recovery_base = ""
+            self.job.recovery_publication = None
+        self.data.pop("publication_intent", None)
+
+    def keep_failed_publication(self):
+        if self.job.recovery_publication:
+            self.end_publication_intent(keep_recovery=True)
+            self.persist()
+
+    def record_recovery_effects(self, **effects):
+        if effects.get("attempt"):
+            workspace.note_made(self.job.ws, self.job.checkouts, excluded=self.run.closed_checkout_paths)
+        self.data["publication_intent"].update(effects)
+        self.persist()
+
+    def settle_recovered_publication(self, prepared, action_id):
+        if (self.run.dry_run or self.run.action or self.run.environment_release or self.run.recovery
+                or self.run.repairs or self.run.alone or self.run.from_poll):
+            raise factory.Refused("use a whole-run resume to settle the interrupted recovered publication")
+        intent = self.data["publication_intent"]
+        actions = ledger.actions(self.lease)
+        prior = next((a for a in actions if a["id"] == action_id), None)
+        if (not prior or prior["op"] != "publication.request"
+                or prior["result"].get("input_stamp", {}).get("tree") != intent["tree"]
+                or prior["state"] not in ("running", "reconciliation-required")):
+            raise factory.Refused("the interrupted publication has no matching durable action; inspect its effects manually")
+        if any(a["id"] != action_id and (a["state"] == "reconciliation-required"
+               or a["state"] == "running" and a["op"] == "publication.request") for a in actions):
+            raise factory.Refused("another action still has unconfirmed effects; inspect it before resuming")
+        checkouts = [workspace.Checkout.from_row(row) for row in prepared["checkouts"]
+                     if row.get("pr") not in prepared.get("closed_prs", ())]
+        if any(not (c.wt / ".git").exists() for c in checkouts):
+            raise factory.Refused("settling publication requires the original retained worktrees")
+        try:
+            reports = pr_recovery.settle(checkouts, prepared["branch"], workspace.made_before(self.job.ws),
+                                         intent, flows.authors(self.flow.continues))
+        except factory.Refused:
+            raise
+        except (RuntimeError, OSError, ValueError, KeyError) as error:
+            raise factory.Refused(f"could not verify the interrupted publication: "
+                                  f"{util.first_line(vault.hidden(str(error)), 300)}") from error
+        settled = {c.github: c.to_row() for c in checkouts}
+        prepared["checkouts"] = [settled.get(row["github"], row) for row in prepared["checkouts"]]
+        posted = self.data.setdefault("recovered_gate_reports", [])
+        posted.extend(report for report in reports if report not in posted)
+        with ledger.tx():
+            ledger.transition(self.lease, action_id, "failed", {**prior["result"], "publication_settled": True},
+                              expected=(prior["state"],))
+            self.invalidate_reconciled_inputs()
+            self.data.pop("publication_intent")
+            ledger.save(self.lease, self.data)
+        self.run.log("Verified the interrupted open PR publication. Fresh gates are required; confirmed gate reports "
+                     "will not be reposted for the same head and base.")
 
     def retry_publication_ci(self, retry, tree, *, measurement_section=""):
         job = self.job
         self.check_pilot_publication()
         flows.require_environment_owner_clear(job)
+        recovery = self.job.recovery_publication = (self.recovered_publication()
+                                                    if any(c.recovery_head for c in job.checkouts) else None)
+        if recovery:
+            self.begin_publication(tree, phase="ci-rerun")
+            recovery.recheck(during="before retrying publication CI")
         flows.refuse_changed_prs(job)
         checkouts = {c.github: c for c in job.with_prs}
-        heads = self.data["publication"]["heads"]
+        publication = self.data["publication"]
+        heads = publication["heads"]
         retried = self.data.get("ci_retried_heads", {})
         pushed = []
         targets = retry["targets"]
@@ -1152,21 +2070,28 @@ class Controller(worker_turns.WorkerTurns):
             pushed.append(checkout)
         automatic_requested = self.rerun_requested(pushed)
         if not automatic_requested and (failure := self.second_ci_failure(targets, retried)):
+            self.keep_failed_publication()
             return failure
         if retry["caught_up"]:
             checkout, = pushed
             self.take_merge_lease(checkout)
-        for checkout in pushed:
-            row = gh.pr_merge_details(checkout.pr)
-            if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
-                    or row.get("baseRefName") != checkout.base):
-                raise ValueError("the PR no longer matches this run's published head and base")
+        if not recovery:
+            for checkout in pushed:
+                row = gh.pr_merge_details(checkout.pr)
+                if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
+                        or row.get("baseRefName") != checkout.base):
+                    raise ValueError("the PR no longer matches this run's published head and base")
         observed = [] if measurement_section else pipeline.observed_measurements(self.run, job.verified)
         if measurement_section or observed:
             for checkout in pushed:
                 try:
-                    pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
-                                                            observed_requirements=observed)
+                    if recovery:
+                        report = publication.get("report_body", "")
+                        pipeline.report_recovered_measurement(self.run, recovery, checkout, report,
+                                                              measurement_section, observed, job.verified)
+                    else:
+                        pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
+                                                                observed_requirements=observed)
                 except gh.GhError as error:
                     raise ValueError(f"could not update the unverified requirement in {checkout.pr}") from error
         saved = retry.get("reruns")
@@ -1174,6 +2099,7 @@ class Controller(worker_turns.WorkerTurns):
             if self.refresh_publication_ci(pushed, retry, automatic_requested):
                 return self.finish_ci_retry()
             if saved is None:
+                self.keep_failed_publication()
                 return self.settle_publication_failure(self.publication_ci_failure())
         launches = {}
         if saved is not None:
@@ -1183,31 +2109,32 @@ class Controller(worker_turns.WorkerTurns):
             reruns = {c.github: gh.failed_job_reruns(c.github, c.pr, c.lease, targets[c.github]["jobs"])
                       for c in pushed if c.lease not in retried.get(c.github, [])}
             if not any(reruns.values()):
+                self.keep_failed_publication()
                 raise ValueError("the failed CI has no GitHub Actions jobs to rerun")
             for checkout in pushed:
                 if reruns.get(checkout.github):
                     retried.setdefault(checkout.github, []).append(checkout.lease)
             launches = reruns
-        self.data["publication_intent"] = {"tree": tree, "phase": "ci-rerun"}
-        self.persist()
+        if not recovery:
+            self.begin_publication(tree, phase="ci-rerun")
         for repo, requested in launches.items():
             for rerun in requested:
-                gh.rerun_failed_jobs(repo, rerun.run)
+                self.request_ci_rerun(repo, rerun.run)
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
-            self.data.pop("publication_intent", None)
-            if saved is not None and not automatic_requested:
-                targets = self.data["ci_retry"]["targets"]
-                if second_failure := self.second_ci_failure(targets, retried):
-                    return second_failure
-            return self.settle_publication_failure(failure)
+            second_failure = (self.second_ci_failure(self.data["ci_retry"]["targets"], retried)
+                              if saved is not None and not automatic_requested else None)
+            self.end_publication_intent(keep_recovery=True)
+            return second_failure or self.settle_publication_failure(failure)
         return self.finish_ci_retry()
 
     def finish_ci_retry(self):
         job = self.job
         flows.require_environment_owner_clear(job)
         fresh = [c for c in job.picked(job.opened) if c.github not in job.found]
-        pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
+        options = {"recovery": recovery} if (recovery := job.recovery_publication) else {}
+        pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why,
+                              **options, ready_drafts=flows.can_ready_drafts(job))
         return self.finish_publication()
 
     def refresh_publication_ci(self, pushed, retry, automatic_requested):
@@ -1248,6 +2175,16 @@ class Controller(worker_turns.WorkerTurns):
         self.data.setdefault("ci_rerun_requested_heads", {}).setdefault(repo, []).append(head)
         self.persist()
 
+    def request_ci_rerun(self, repo, workflow):
+        recovery = self.job.recovery_publication
+        write = nullcontext()
+        if recovery:
+            checkout = next(c for c in self.job.with_prs if c.github == repo)
+            write = recovery.pr_write(checkout, "CI rerun", "before rerunning CI", "after rerunning CI", workflow=workflow)
+        with write:
+            gh.rerun_failed_jobs(repo, workflow)
+        return True
+
     def publication_ci_failure(self):
         return {"ci": self.job.ci_result, "failures": CI_FAILURES,
                 "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
@@ -1259,20 +2196,29 @@ class Controller(worker_turns.WorkerTurns):
 
     def report_publication_ci(self, pushed, caught_up, section):
         self.check_pilot_publication()
-        if caught_up:
+        if recovery := self.job.recovery_publication:
+            body = pipeline.public_text(self.run, section)
+            for checkout in pushed:
+                recovery.comment(checkout, body, kind="Recovered CI evidence",
+                                 during="before refreshing PR CI evidence")
+        elif caught_up:
             for checkout in pushed:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
 
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
-        tree = self.fingerprint()
+        recovery = self.job.recovery_publication
+        tree = self.data["publication_intent"]["tree"] if recovery else self.fingerprint()
         saved = self.data.get("ci_retry", {}) if reruns is not None else {}
         max_rounds = saved.get("max_rounds", 2) if reruns is not None else self.run.settings("ci_repair").tries
         earlier = [pipeline.ci.Round(n, [], story) for n, story in enumerate(saved.get("round_stories", []), 1)]
         requested_heads = {(repo, head) for name in ("ci_rerun_requested_heads", "ci_retried_heads")
                            for repo, heads in self.data.get(name, {}).items() for head in heads}
-        automatic = pipeline.AutomaticCIReruns(requested_heads, self.remember_ci_rerun)
+        automatic = pipeline.AutomaticCIReruns(requested_heads, self.remember_ci_rerun,
+                                               self.request_ci_rerun if recovery else None)
+        if recovery:
+            recovery.recheck(during="before watching publication CI")
         rounds = pipeline.watch_publication_ci(self.job.b, self.job.slot, pushed, max_rounds,
                                                automatic=automatic, reruns=reruns)
         current = rounds[-1]
@@ -1316,12 +2262,13 @@ class Controller(worker_turns.WorkerTurns):
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         check_head = caught_up or self.data.get("catch_up_hold")
         watched_heads = {w.target.pr: w.target.sha for w in current.seen}
+        draft_options = {"recovery": recovery} if recovery else {}
         for checkout in self.job.with_prs:
             self.check_pilot_publication()
             if check_head and (watched_heads.get(checkout.pr) != checkout.lease
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
-            pipeline.set_draft(self.run, checkout, True)
+            pipeline.set_draft(self.run, checkout, True, **draft_options)
         return self.publication_ci_failure()
 
     def take_merge_lease(self, checkout):
@@ -1341,12 +2288,22 @@ class Controller(worker_turns.WorkerTurns):
             return None
         about = pipeline.automerge_about(job.ticket, job.build_summary)
         track_base = not pilot.is_pilot_task(str(self.run.tid))
+        recovery = job.recovery_publication
         for checkout in candidates:
+            if recovery:
+                recovery.recheck(during="before considering automerge")
+                hold = (merge_review.MULTIPLE if len(job.checkouts) != 1 else
+                        pipeline.unpinned_merge_hold(checkout, recovery.checked_base(checkout)))
+                pipeline.report_automerge(self.run, checkout, hold, recovery=recovery)
+                continue
             if len(job.checkouts) == 1:
                 self.take_merge_lease(checkout)
+            options = ({"require_pinned_base": True}
+                       if self.data.get("recovered_merge_heads", {}).get(checkout.pr) == checkout.lease else {})
             while True:
+                self.publication_scope()
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
-                                              track_moved_base=track_base)
+                                              track_moved_base=track_base, **options)
                 if hold is None:
                     self.clear_catch_up_hold()
                     return None
@@ -1440,10 +2397,12 @@ class Controller(worker_turns.WorkerTurns):
 
     def park_catch_up(self, reason, *, on_ticket=False, close_failed=False):
         held = self.data["catch_up_hold"]["reason"]
-        for checkout in self.job.with_prs:
-            if pipeline.own_draft_state(self.run, checkout) is False:
-                pipeline.set_draft(self.run, checkout, True, "automerge")
-        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
+        recovering = any(c.recovery_head for c in self.job.checkouts)
+        if not recovering:
+            for checkout in self.job.with_prs:
+                if pipeline.own_draft_state(self.run, checkout) is False:
+                    pipeline.set_draft(self.run, checkout, True, "automerge")
+        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket or bool(recovering))
         reason = f"{held}. {reason}"
         if close_failed:
             return pipeline.record_park(self.run, reason, {}, comment=False)
@@ -1522,12 +2481,20 @@ class Controller(worker_turns.WorkerTurns):
 
     def finish_publication(self):
         self.check_pilot_publication()
-        self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
-        self.persist()
+        recovery = self.job.recovery_publication
+        if recovery:
+            self.data["publication_intent"]["phase"] = "publish"
+            self.persist()
+        else:
+            self.begin_publication(self.fingerprint(), phase="publish")
         outcome = self.atomic("publish", merge=self.automerge)
-        self.data.pop("publication_intent", None)
+        tree = self.fingerprint() if outcome.passed else ""
+        self.end_publication_intent()
         if outcome.passed:
-            self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
+            if recovery:
+                self.data.setdefault("recovered_merge_heads", {}).update(
+                    (c.pr, c.lease) for c in self.job.picked(self.job.changed) if c.pr)
+            self.data["published"], self.data["published_tree"] = outcome.data, tree
         else:
             self.data.pop("published", None)
             if not self.data.get("ci_retry"):
@@ -1535,6 +2502,13 @@ class Controller(worker_turns.WorkerTurns):
         self.persist()
         if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
             return self.settle_publication_failure(outcome.data)
+        if self.is_spec and outcome.passed:
+            if not all(self.current(gate) for gate in self.required_gates()):
+                raise factory.Refused("the published tree no longer has current spec gates")
+            receipt = spec_delivery.candidate(self.job, self.data["definition"], self.policy_sha(), self.data["acceptance"],
+                                              code_review.candidate_trees(self.job.checkouts))
+            if not spec_store.advance(self.run.spec_identity, self.run.id, "building", "published", receipt):
+                raise factory.Refused("the spec delivery claim changed during publication")
         self.ending = flows.ended(self.flow, outcome)
         self.release_merge_lease()
         return outcome.data
@@ -1576,25 +2550,30 @@ class Controller(worker_turns.WorkerTurns):
                 "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
                 (self.lease.root, turn)).fetchone()
         rationale = ledger.decoded(row).get("response", {}).get("rationale")
-        for checkout in self.job.with_prs:
-            try:
-                pr = gh.pr_merge_details(checkout.pr)
-                if not isinstance(pr, dict):
-                    raise ValueError("PR lookup did not return a JSON object")
-            except (gh.GhError, ValueError) as error:
-                self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
-                continue
-            if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
-                pipeline.set_draft(self.run, checkout, True, "failed")
-        if rationale is None:
+        recovering = any(c.recovery_head for c in self.job.checkouts)
+        if recovering:
+            self.recovered_publication().recheck(during="before reporting the failure")
+        else:
+            for checkout in self.job.with_prs:
+                try:
+                    pr = gh.pr_merge_details(checkout.pr)
+                    if not isinstance(pr, dict):
+                        raise ValueError("PR lookup did not return a JSON object")
+                except (gh.GhError, ValueError) as error:
+                    self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
+                    continue
+                if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
+                    pipeline.set_draft(self.run, checkout, True, "failed")
+        if rationale is None and not recovering:
             yield
             return
-        comment_rationale = outbound.screen(rationale.strip()).encode("utf-8", "backslashreplace").decode("utf-8")
-        with principals.acting(f"run:{self.run.id}/respond"):
-            self.run.say(f"Run `{self.run.id}` failed without delivery.\n\n{comment_rationale}"
-                         f"\n\n{self.run.retry_hint}.")
         say = self.run.say
-        self.run.say = lambda _body: ""
+        if rationale is not None:
+            comment_rationale = outbound.screen(rationale.strip()).encode("utf-8", "backslashreplace").decode("utf-8")
+            with principals.acting(f"run:{self.run.id}/respond"):
+                options = {"on_ticket": True} if recovering else {}
+                say(f"Run `{self.run.id}` failed without delivery.\n\n{comment_rationale}\n\n{self.run.retry_hint}.", **options)
+        self.run.say = (lambda _body: "") if rationale is not None else (lambda body: say(body, on_ticket=True))
         try:
             yield
         finally:
@@ -1613,6 +2592,9 @@ class Controller(worker_turns.WorkerTurns):
 
     def perform(self, action):
         args, op = action["request"], action["op"]
+        stale = self.data.get("superseded_actions", ())
+        if (args.get("worker_id") in stale or any(dep in stale for dep in args.get("depends_on", []))):
+            raise ValueError("the worker or dependency belongs to superseded ticket requirements")
         if op == "worker.start":
             return self.worker_start(action, args)
         if self.exchanged and op == "worker.messages":
@@ -1620,6 +2602,8 @@ class Controller(worker_turns.WorkerTurns):
             return {k: page[k] for k in ("messages", "message_cursor", "more_messages")}
         if self.exchanged and op in ("worker.reply", "worker.steer"):
             return exchange.queue(self.lease, action, self.validate_scope)
+        if op == "worker.continue" and args["worker_id"] in self.data.get("pr_recovery_stale_actions", ()):
+            raise ValueError("the worker predates PR reconciliation; start a new worker against the reconciled tree")
         if op == "worker.continue" and self.exchanged:
             w = exchange.workers(self.lease)[args["worker_id"]]
             prior = next(a for a in ledger.actions(self.lease) if a["id"] == w["id"])
@@ -1675,21 +2659,58 @@ class Controller(worker_turns.WorkerTurns):
         if (op != "owner.ask" and not (op == "run.finish" and args["reason"] == "failed")
                 and not self.serial_gate_rerun(action)):
             self.worker_barrier()
+        if op == "spec.define" and self.is_spec:
+            return self.define_spec(args)
         if op == "checks.run":
+            remaining = self.data.get("remaining_checks", [])
+            focused = check_repair.focus(self.job.layer, remaining) if remaining and self.uses_code_review else {}
+            quick = args["scope"] == "quick" and not (remaining and self.uses_code_review)
+            evidence = self.data.get("evidence", {}).get("checks", {})
+            if reused := self.reuse_checks(evidence, focused):
+                return reused
+            if focused and evidence.get("result", {}).get("scope") == "failed" and self.current("checks"):
+                focused = {}
             self.data.setdefault("evidence", {}).pop("checks", None)
             self.persist()
             b = self.job.b
             b.denied_feedback = self.data.get("denied_feedback", "")
             b.on_denied_edit = self.hold_for_denied_edit
             try:
-                outcome = self.atomic("checks", tree=str(self.job.ws), quick=args["scope"] == "quick")
+                outcome = self.atomic("checks", tree=str(self.job.ws), quick=quick,
+                                      **({"focused": focused} if focused else {}))
             finally:
                 b.on_denied_edit = None
             if self.data.get("denied_feedback"):
                 self.data["denied_feedback"] = b.report
             if outcome.passed:
                 self.stamp("checks", outcome.data)
-            return {"passed": outcome.passed, **outcome.data}
+            if self.uses_code_review:
+                if outcome.data.get("full"):
+                    remaining = []
+                elif failures := outcome.data.get("failed_checks"):
+                    skipped = [item for item in remaining if item["name"] not in outcome.data["checks_executed"]]
+                    remaining = check_repair.retry_targets([*failures, *skipped])
+                    if skipped:
+                        outcome.data["runner_blocked"] = False
+                self.data["remaining_checks"] = remaining
+            return {"passed": outcome.passed, **outcome.data, "remaining_checks": remaining}
+        if op == "verification.decide":
+            return self.decide_verification(args)
+        if op == "verification.run" and self.uses_code_review:
+            return self.verification_attempt(args)
+        if op == "review.decide":
+            return self.decide_findings(args)
+        if op == "review.run" and self.uses_code_review:
+            source = self.latest_code_review()
+            report = self.applicable_report(source)
+            if report and (self.current("review") or
+                           (report["verdict"] == "pending" and self.job.review.verdict == "pending")):
+                return {"reused_review": source["id"], "findings": report["findings"],
+                        "next": "Use the source review ID to settle pending findings, or publish a settled review."}
+            if not self.full_checks_passed():
+                return {"review_deferred": True,
+                        "error": "Standards and Spec review requires passing full checks on the current candidate. "
+                                 "Resolve the failing checks or runner issue. After a focused pass, request full checks."}
         if op in ("verification.run", "review.run"):
             role = "verify" if op == "verification.run" else "review"
             self.data.setdefault("evidence", {}).pop(role, None)
@@ -1703,7 +2724,7 @@ class Controller(worker_turns.WorkerTurns):
             try:
                 with self.selected(setting):
                     outcome = self.atomic(role, **({"tree": str(self.job.ws), "single": True} if role == "verify"
-                                                   else {"attempt": self.job.reviews + 1}))
+                                                   else {"attempt": self.job.reviews + 1, **({"code_review": True} if self.uses_code_review else {})}))
             finally:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
@@ -1730,13 +2751,15 @@ class Controller(worker_turns.WorkerTurns):
                 published = self.data.get("published", {})
                 if (published.get("ending") not in ("done", "pr") or self.data.get("ci_failed")
                         or self.data.get("published_tree") != self.fingerprint()
-                        or not all(self.current(gate) for gate in ("checks", "verify", "review"))):
+                        or not all(self.current(gate) for gate in self.required_gates())):
                     raise ValueError("delivery has no successful current engine publication")
                 self.ending = (published["ending"], published.get("summary", ""),
                                " ".join(c.pr for c in self.job.with_prs))
             elif self.data.get("catch_up_hold"):
                 self.ending = self.park_catch_up("the orchestrator stopped without delivery")
             elif args["reason"] == "noop":
+                if self.is_spec:
+                    raise ValueError("a spec cannot finish without delivery-point evidence")
                 if feedback := self.data.get("denied_feedback"):
                     raise ValueError(feedback)
                 if not self.job.b.restage().empty:
@@ -1757,6 +2780,10 @@ class Controller(worker_turns.WorkerTurns):
     def hold_for_denied_edit(self, feedback):
         self.data["denied_feedback"] = feedback
         self.persist()
+
+    def dispatch_publication(self, action):
+        publication = getattr(getattr(self, "job", None), "recovery_publication", None)
+        return publication, action["op"] == "publication.request" and bool(getattr(self, "data", {}).get("publication_intent"))
 
     def dispatch(self, action, *, admit=False, same_batch=False) -> ValueError | None:
         if action["state"] != "accepted" or ledger.queued_start(action) != admit:
@@ -1779,21 +2806,44 @@ class Controller(worker_turns.WorkerTurns):
                 result = self.worker_start(action, action["request"], same_batch=True)
             else:
                 result = self.perform(action)
+                if (action["op"] == "checks.run" and result and result.get("runner_blocked") and self.uses_code_review
+                        and not self.run.dry_run and not self.run.alone and not self.run.action_only
+                        and not self.run.owner_questions_blocked and (request := owner_asks.check_runner_request(result))):
+                    self.atomic("orchestrate_ask", request=request, call=owner_asks.CHECK_RUNNER_CALL)
         except owner_asks.Asked as asked:
             ledger.transition(self.lease, action["id"], "succeeded",
-                              {"ask_ids": asked.ask_ids, "awaiting_owner": True})
+                              {**(result or {}), "ask_ids": asked.ask_ids, "awaiting_owner": True})
             self.persist()
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
-        except RetargetedPR as error:
-            refusal = error
-            self.ending = self.hold_revision(error.pr, str(error))
-            self.data.pop("publication_intent", None)
-            result = {"error": str(error)}
-            ledger.transition(self.lease, action["id"], "failed", result)
+        except pr_recovery.Hold as error:
+            publication, pending = self.dispatch_publication(action)
+            reconcile = pending and (publication is None or publication.effected or error.recovery.get("publication_unconfirmed"))
+            state = "reconciliation-required" if reconcile else "failed"
+            if pending and not reconcile:
+                self.data.pop("publication_intent", None)
+            ledger.transition(self.lease, action["id"], state, {"error": error.why, **error.recovery})
+            self.persist()
+            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
+            if reconcile and publication is None:
+                raise workspace.RunFailed(f"Unconfirmed publication must be reconciled. {error.why}") from error
+            raise
         except ValueError as error:
+            publication, reconcile = self.dispatch_publication(action)
+            if publication and (reconcile or publication.effected):
+                why = f"{error.pr}: {error}" if isinstance(error, RetargetedPR) else str(error)
+                failure = publication.failure(util.first_line(vault.hidden(why), 300))
+                ledger.transition(self.lease, action["id"], "reconciliation-required",
+                                  {"error": failure.why, "pushed": dict(publication.pushed)})
+                self.persist()
+                raise failure from error
             refusal = error
             result = {"error": str(error)[:2000]}
+            if isinstance(error, RetargetedPR):
+                self.ending = self.hold_revision(error.pr, str(error))
+                self.data.pop("publication_intent", None)
+            if isinstance(error, verification_attempts.Refused):
+                result["preserved_verification"] = True
             if self.exchanged and action["op"] in ("worker.start", "worker.continue"):
                 wid = action["request"].get("worker_id", action["id"])
                 found = exchange.workers(self.lease).get(wid)
@@ -1810,12 +2860,17 @@ class Controller(worker_turns.WorkerTurns):
                 return refusal
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
-            if defer or admit or action["id"] in self.workers:
+            if defer or admit or action["id"] in getattr(self, "workers", {}):
                 raise
-            state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
-            ledger.transition(self.lease, action["id"], state,
-                              {"error": f"stopped by {type(error).__name__}",
-                               "usage_unknown": action["op"] in ("worker.start", "worker.continue", "verification.run", "review.run")})
+            publication, reconcile = self.dispatch_publication(action)
+            state = "reconciliation-required" if reconcile else "interrupted"
+            result = {"error": f"stopped by {type(error).__name__}",
+                      "usage_unknown": action["op"] in ("worker.start", "worker.continue", "verification.run", "review.run")}
+            if reconcile and publication:
+                result["pushed"] = dict(publication.pushed)
+                if isinstance(error, workspace.RunFailed):
+                    result["error"] = error.why
+            ledger.transition(self.lease, action["id"], state, result)
             self.persist()
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
             raise
@@ -1824,7 +2879,7 @@ class Controller(worker_turns.WorkerTurns):
                 run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="accepted", phase="queued")
                 return
             if result is not None and not (self.exchanged and action["op"] in ("worker.steer", "worker.reply", "worker.cancel")):
-                gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+                gate = ACTION_GATES.get(action["op"])
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
                 state = "failed" if action["op"] != "run.observe" and "error" in result else "succeeded"
@@ -1847,8 +2902,10 @@ class Controller(worker_turns.WorkerTurns):
                 self.resume_queued(batch=batch)
 
     def dispatch_rerun(self, action, known):
+        stale = set(self.data.get("superseded_actions", ()))
         self.rerun_context = {key: text for key, prior in known.items()
-                              if prior["op"] in {"worker.start", "worker.continue", "context.read"}
+                              if key not in stale
+                              and prior["op"] in {"worker.start", "worker.continue", "context.read"}
                               and (text := receipt_text(prior)) is not None}
         try:
             self.dispatch(action)
@@ -1856,6 +2913,30 @@ class Controller(worker_turns.WorkerTurns):
                 self.resume_queued(rerun_id=action["id"])
         finally:
             self.rerun_context = None
+
+    def spec_intake(self):
+        if not self.is_spec:
+            return None
+        try:
+            found = spec_graph.intake(self.job, self.data.get("spec_direct"))
+        except spec_graph.Pending as error:
+            summary = f"Spec intake awaiting tracker reconciliation: {error}"
+            self.run.log(summary)
+            return "interrupted", summary, ""
+        except (db.IncompatibleSchema, *spec_graph.READ_ERRORS) as error:
+            raise workspace.RunFailed(f"Spec intake held: {error}") from error
+        if not found:
+            return None
+        if found["mode"] == "direct":
+            self.data["spec_direct"] = found["input"]
+            self.persist()
+            return None
+        if found["preview"]:
+            return "dry-run", "Reviewed the spec breakdown without publishing it", ""
+        refs = ", ".join(tid if "#" in tid else self.run.tracker.ref(tid) for tid in found["children"])
+        summary = f"Published or adopted the native spec graph: {refs}"
+        self.run.leave("running")
+        return "done", summary, ""
 
     def drive(self):
         verification_passed = False
@@ -1868,9 +2949,13 @@ class Controller(worker_turns.WorkerTurns):
                 prior = known.get(self.run.action)
                 allowed = (("verification.run",) if self.run.environment_release else
                            ("worker.start", "worker.continue", *SAVED_GATE_OPS))
+                if prior and prior["id"] in self.data.get("superseded_actions", ()):
+                    raise factory.Refused("the requested action belongs to superseded requirements")
                 if (prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL
                         or ledger.unlaunched_start(prior)):
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
+                if prior["op"].startswith("worker.") and prior["id"] in self.data.get("pr_recovery_stale_actions", ()):
+                    raise factory.Refused("the worker predates PR reconciliation; resume and start a fresh worker")
                 call = {"op": prior["op"], "args": prior["request"]}
                 if prior["op"] in ("worker.start", "worker.continue"):
                     self.barrier()
@@ -1911,8 +2996,17 @@ class Controller(worker_turns.WorkerTurns):
                             return "failed", f"{wid} ended its standalone attempt {phase}; resume the controller", ""
                     return ("step" if result["state"] == "succeeded" else "failed",
                             f"{rerun['id']} {result['state']}; dependent evidence must be refreshed", "")
+            if not (self.run.alone or self.run.action or self.run.repairs or self.run.environment_release
+                    or self.run.feedback or self.run.recovery or ledger.actions(self.lease)):
+                if ended := self.spec_intake():
+                    return ended
             while not self.ending:
                 self.collect()
+                if reason := self.data.get("scope_needs_refresh"):
+                    if self.workers:
+                        time.sleep(0.05)
+                        continue
+                    return "failed", f"{reason}; resume to verify the current ticket", ""
                 pending = [a for a in ledger.actions(self.lease) if a["state"] == "accepted" and not ledger.queued_start(a)]
                 if not pending:
                     if self.exchanged:
@@ -1974,8 +3068,8 @@ class Controller(worker_turns.WorkerTurns):
 
 
 @factory.step("orchestrate_ask")
-def orchestrate_ask(flow, request):
-    flow.ctx.run.owner_ask("orchestrate", [request], NO_SESSION)
+def orchestrate_ask(flow, request, call="orchestrate"):
+    flow.ctx.run.owner_ask(call, [request], NO_SESSION)
     return factory.Outcome("pass")
 
 

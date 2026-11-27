@@ -300,6 +300,8 @@ class WorkerTurns:
 
     def settle_candidate(self, w):
         wid, data = w["id"], w["data"]
+        if w["phase"] == "candidate" and not self.candidate_scope(w):
+            return
         with util.lock("builder-integration-" + ledger.digest(str(self.job.ws.resolve()))[:24], wait=True) as held:
             if not held:
                 raise ValueError("cannot acquire delivery integration lease")
@@ -336,7 +338,8 @@ class WorkerTurns:
     def worker_summaries(self):
         ws = exchange.workers(self.lease)
         self.job.build_summary = self.job.b.build_summary = "\n\n".join(
-            f"{wid}: {w['data']['summary']}" for wid, w in ws.items() if w["phase"] == "integrated")
+            f"{wid}: {w['data']['summary']}" for wid, w in ws.items()
+            if w["phase"] == "integrated" and wid not in self.data.get("superseded_actions", ()))
 
     def settle_turn(self, worker, message):
         result = {**message, "effective": worker.effective, "writing": worker.writing}
@@ -379,6 +382,8 @@ class WorkerTurns:
 
     def defer_start(self, action):
         args = action["request"]
+        if any(dep in self.data.get("superseded_actions", ()) for dep in args.get("depends_on", ())):
+            raise ValueError("the worker or dependency belongs to superseded ticket requirements")
         setting, _, writing = self.catalog.worker(args)
         writing = writing and args["tool_bundle"] == "write"
         known, retries = self.dependency_receipts()
@@ -420,7 +425,7 @@ class WorkerTurns:
         return ""
 
     def resume_queued(self, *, launch=True, wait_turn=None, batch=None, rerun_id=None):
-        if not self.has_queued_starts:
+        if not self.has_queued_starts or (launch and self.data.get("scope_needs_refresh")):
             return
         known, retries = self.dependency_receipts()
         pending = [a for a in known.values() if ledger.queued_start(a)]
