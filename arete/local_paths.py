@@ -9,6 +9,9 @@ from pathlib import Path
 SCRATCH_PREFIX = ".arete-scratch-"
 SCRATCH_SUFFIX = ".noindex"
 SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
+VERIFY_SCRATCH_ROOT = Path(".arete-sandbox")
+VERIFY_SCRATCH_MARKER = ".arete-owned"
+VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
 SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}(?:" + re.escape(SCRATCH_SUFFIX) + ")?")
 SEARCH_ONLY = getattr(os, "O_SEARCH", 0)
 SERVE_BEAT_NAME = "serve.json"
@@ -162,3 +165,27 @@ def local_dirs(home: Path, *, guard_hook: bool = False) -> tuple[Path, Path, boo
 def log_dir(home: Path, state: Path, isolated: bool) -> Path:
     default = home / "Library" / "Logs" / "arete" if sys.platform == "darwin" and not isolated else state / "logs"
     return Path(os.environ.get("ARETE_LOG_DIR", default))
+
+
+def is_verify_sandbox_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    return bool(parts) and parts[0] == VERIFY_SCRATCH_ROOT.name
+
+
+def verify_sandbox_owned(base: Path) -> bool:
+    try:
+        if base.is_symlink():
+            return False
+        with directory_fd(base.resolve()) as base_fd, directory_fd(VERIFY_SCRATCH_ROOT, base_fd) as folder:
+            if os.fstat(folder).st_uid != os.getuid():
+                return False
+            fd = os.open(VERIFY_SCRATCH_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+            with os.fdopen(fd, "rb") as marker:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                    return False
+                return marker.read(len(VERIFY_SCRATCH_CONTENT) + 2) in (
+                    VERIFY_SCRATCH_CONTENT, VERIFY_SCRATCH_CONTENT + b"\n",
+                )
+    except OSError:
+        return False
