@@ -198,16 +198,22 @@ def landing_policy(tk: tracker.Tracker) -> list[list[str]]:
 
 def candidate(job, done: dict, policy: str, acceptance: str, trees: dict) -> dict:
     observed = behavior(job.verified, done)
-    if not observed or not job.review.approved() or not job.with_prs:
+    raw_direct = getattr(job, "direct_push", None)
+    direct = raw_direct if isinstance(raw_direct, dict) else {}
+    if not observed or not job.review.approved() or not (job.with_prs or direct):
         raise ValueError("publication has no reviewed, observed spec outcome on its PR candidate")
     targets = []
     for c in job.checkouts:
-        head = c.lease if c.pr else util.git(["rev-parse", "HEAD"], c.wt).strip()
+        pushed = direct.get(c.github or job.run.repo.name)
+        head = c.lease if (c.pr or pushed) else util.git(["rev-parse", "HEAD"], c.wt).strip()
         tree = util.git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip() if SHA.fullmatch(head or "") else ""
         if (not SHA.fullmatch(tree) or tree != trees.get(c.prefix)
                 or c.pr and gh.pr_repo(c.pr).casefold() != c.github.casefold()):
             raise ValueError("a release checkout does not match the verified spec tree")
-        targets.append({"pr": c.pr, "repo": c.github, "base": c.base, "tree": tree, "head": head})
+        target = {"pr": c.pr, "repo": c.github, "base": c.base, "tree": tree, "head": head}
+        if pushed and not c.pr:
+            target["direct_push"] = True
+        targets.append(target)
     receipt = {"definition": done, "source_format": 2, "source": source_version(job.ticket), "policy": policy, "acceptance": acceptance,
                "landing": landing_policy(job.run.tracker), "targets": targets, "behavior": observed}
     if promise := job.verified.delivery_obligation:
@@ -235,6 +241,10 @@ def reached(data: dict) -> list[dict]:
             merge = (pr.get("mergeCommit") or {}).get("oid", "")
             if (pr.get("state") != "MERGED" or not pr.get("mergedAt") or not SHA.fullmatch(merge or "")
                     or pr.get("headRefOid") != target["head"] or pr.get("baseRefName") != target["base"]):
+                return []
+        elif target.get("direct_push"):
+            merge = target.get("head", "")
+            if not SHA.fullmatch(merge or ""):
                 return []
         at, tree = revision(target["repo"], branch)
         if merge and merge != at:
