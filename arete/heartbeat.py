@@ -21,6 +21,7 @@ from . import (
     pi,
     routing,
     runner,
+    secretstore,
     steps,
     tool_events,
     util,
@@ -215,9 +216,8 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
     configured = accounts.mapping(pi.model_configuration().get("providers"))
     stored = accounts.read(pi.owner_dir() / "auth.json")
     names = set(configured) | set(stored) | set(cfg.environment.providers)
-    names |= {p for p in pi.KEY_NAMES if os.environ.get(pi.KEY_NAMES[p])}
-    keys = util.read_env_file(pi.KEYS_FILE)
-    names |= {p for p, n in pi.KEY_NAMES.items() if keys.get(n)}
+    keys = secretstore.set_names(pi.KEY_NAMES.values())
+    names |= {p for p, n in pi.KEY_NAMES.items() if n in keys}
     if default := pi.default_provider():
         names.add(default)
     calls = [(f"{p}/*", None, "local", False) for p in names]
@@ -242,8 +242,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
         key = f"pi:{provider}:auth" + (f":{repo.name}" if repo else "")
         if devices.resolve(device).remote:
             key += f":{devices.resolve(device).name}"
-        missing = (f"pi {provider}: no usable login or supported key; checked {selected.owner}, "
-                   f"{pi.KEYS_FILE} and Arete environment")
+        missing = pi.missing_key(provider, selected.owner)
         optional_missing = not required and selected.error == missing
         check = Check(key, not selected.error or optional_anthropic, f"{provider}: {detail}",
                       "warn" if optional_missing else "fail")
@@ -350,6 +349,11 @@ def check_serve() -> list[Check]:
         out.append(Check("serve:tick", False, detail, "fail" if fails else "warn"))
     else:
         out.append(Check("serve:tick", True, "every tick part runs"))
+    migration = beat.get("secret_migration") or {}
+    if notices := [*migration.get("notes", ()), *migration.get("ignored", ())]:
+        out.append(Check("secrets:migration", True, "; ".join(notices)))
+    if problems := migration.get("problems"):
+        out.append(Check("secrets:legacy-files", False, "; ".join(problems), "warn"))
     for name, error in (beat.get("broken") or {}).items():
         out.append(Check(f"loop:{name}:broken", False, error, "warn"))
     for sid, error in (beat.get("poll_errors") or {}).items():

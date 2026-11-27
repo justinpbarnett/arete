@@ -1,74 +1,46 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from urllib.parse import quote
 
-from . import paths, util
+from . import config, secret_move, secretstore
 
-FOLDER = paths.CONFIG_DIR / "secrets"
-SUFFIX = ".secrets"
 SHORTEST, LONGEST = 8, 4096
 REDACTED = "[redacted]"
-LOCK = "secret-store"
 SCAN = ("--no-ext-diff", "--no-textconv", "--no-color", "--text")
 
 
-def file_of(repo: str) -> Path:
-    return FOLDER / (quote(repo, safe="") + SUFFIX)
-
-
-def load(path: Path) -> dict[str, str]:
-    try:
-        found = json.loads(paths.read_confined(path))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(found, dict):
-        return {}
-    return {k: v for k, v in found.items() if isinstance(k, str) and isinstance(v, str)}
+def item_value(row):
+    if row["status"] == "set":
+        value = secretstore.read(row["scope"], row["name"])
+        if value is not None:
+            return value.decode()
+    return ""
 
 
 def read(repo: str) -> dict[str, str]:
-    return load(file_of(repo))
+    scope = f"repo:{repo}"
+    legacy = secret_move.fallback(secret_move.repo_file(repo), repo=True)
+    found = secret_move.read_repo(legacy) if legacy else {}
+    for row in secretstore.rows():
+        if row["scope"] == scope:
+            name = row["name"]
+            found.pop(name, None)
+            if value := item_value(row):
+                found[name] = value
+    return found
 
 
-def save(repo: str, found: dict[str, str]) -> None:
-    target = file_of(repo)
-    if not found:
-        target.unlink(missing_ok=True)
-        return
-    FOLDER.mkdir(mode=0o700, parents=True, exist_ok=True)
-    FOLDER.chmod(0o700)
-    util.write_bytes_atomic(target, json.dumps(found).encode())
-
-
-def put_all(repo: str, given: dict[str, str]) -> None:
-    if not given:
-        return
-    with util.lock(LOCK, wait=True):
-        save(repo, {**read(repo), **given})
-
-
-def put(repo: str, name: str, value: str) -> None:
-    put_all(repo, {name: value})
-
-
-def remove(repo: str, name: str) -> bool:
-    with util.lock(LOCK, wait=True):
-        found = read(repo)
-        if name not in found:
-            return False
-        del found[name]
-        save(repo, found)
-        return True
+def legacy_every() -> list[tuple[str, str]]:
+    if secret_move.retired() and config.secret_settings().store:
+        return []
+    return [(name, value) for file in secret_move.repo_files() if secret_move.fallback(file, repo=True)
+            for name, value in secret_move.read_repo(file).items() if value]
 
 
 def every() -> list[tuple[str, str]]:
-    try:
-        files = sorted(FOLDER.glob("*" + SUFFIX))
-    except OSError:
-        return []
-    return [(name, value) for f in files for name, value in load(f).items() if value]
+    stored = [(row["name"], value) for row in secretstore.rows() if row["scope"].startswith("repo:")
+              and (value := item_value(row))]
+    return list(dict.fromkeys([*stored, *legacy_every()]))
 
 
 def values() -> set[str]:

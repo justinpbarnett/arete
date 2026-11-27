@@ -159,7 +159,6 @@ def batch_ids(t: Ticket) -> list[str]:
     return [own, *sorted(set(named) - {own}, key=int)]
 
 
-_clients: dict[str, jira.Client] = {}
 
 
 def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
@@ -418,16 +417,15 @@ class JiraTracker:
         self.cfg = jcfg
         self.project = jira_project(repo, jcfg)
         self.route = route_label(repo)
+        self._client: jira.Client | None = None
 
     @property
     def client(self) -> jira.Client:
-        key = str(self.cfg.env_file or "")
-        if key not in _clients:
-            _clients[key] = jira.Client.from_env(self.cfg.env_file)
-        client = _clients[key]
-        if self.repo.jira_site and client.base != self.repo.jira_site:
+        if self._client is None:
+            self._client = jira.Client.from_env(self.cfg)
+        if self.repo.jira_site and self._client.base != self.repo.jira_site:
             raise jira.JiraError(f"{self.repo.name}: connected Jira site differs from the enrolled site")
-        return client
+        return self._client
 
     @property
     def queue_hint(self) -> str:

@@ -18,7 +18,7 @@ def target_for(cfg: config.Config, repo: config.Repo) -> dict:
     if repo.tracker == "jira":
         if project := tracker.jira_project(repo, cfg.jira):
             return {"tracker": "jira", "project": project, "route": tracker.route_label(repo),
-                    "site": repo.jira_site or jira.site_url(cfg.jira.env_file)}
+                    "site": repo.jira_site or jira.site_url(cfg.jira)}
         raise ValueError(f"{repo.name} has no Jira project configured")
     raise ValueError(f"{repo.name} needs a configured GitHub or Jira destination")
 
@@ -118,7 +118,7 @@ def send(item: dict, cfg: config.Config, receipt: idempotency.Publication, appro
     parent = item.get("parent", "")
 
     if target["tracker"] == "jira":
-        client = jira.Client.from_env(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira)
         if client.base != target["site"]:
             raise jira.JiraError("the queued ticket belongs to a different Jira site")
         account = client.me().get("accountId")

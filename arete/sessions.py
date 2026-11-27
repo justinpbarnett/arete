@@ -142,10 +142,9 @@ def remote_refusal(repo: config.Repo, device: devices.Device, cfg: config.Config
         return (f"repo {repo.name} has no github setting, so {device.name} cannot clone it; "
                 "a repo with parts or no github starts on local")
     if missing := cfg.github_app.missing():
-        return (f"a session on {device.name} clones {repo.name} with a GitHub App token; set {', '.join(missing)} "
-                f"in [github_app] of {paths.short_path(paths.CONFIG_FILE)}")
-    if not cfg.github_app.private_key.is_file():
-        return f"[github_app] private_key {paths.short_path(cfg.github_app.private_key)} is not a file"
+        settings = [f"[github_app] {name}" if not name.startswith("secret:") else name for name in missing]
+        return (f"a session on {device.name} clones {repo.name} with a GitHub App token; configure "
+                f"{', '.join(settings)}")
     if not repo.path.is_dir():
         return f"repo {repo.name} has no folder at {paths.short_path(repo.path)} to fetch the session's work into"
     return ""

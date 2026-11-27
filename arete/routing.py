@@ -324,12 +324,12 @@ def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
 
 
 def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=foundation.reader,
-             mode: str = "", *, source=None) -> pi.Route | None:
+             mode: str = "", *, source=None, materialize=False) -> pi.Route:
     if devices.resolve(device).remote:
         return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
     return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
                      held=lambda auth, name: auth_hold(auth, name, connect), mode=mode, source=source,
-                     local_providers=cfg.local_providers)
+                     local_providers=cfg.local_providers, metadata_only=not materialize)
 
 
 def hold_words(hold: dict) -> str:
@@ -589,6 +589,9 @@ class Discovery:
             self.probes[model, mode] = pi_route(model, self.cfg, self.repo, self.device, self.connect, mode=mode)
         return self.probes[model, mode]
 
+    def materialize(self, model: str, mode: str) -> pi.Route:
+        return pi_route(model, self.cfg, self.repo, self.device, self.connect, mode=mode, materialize=True)
+
     def claude_status(self) -> dict:
         return self.remembered("claude_status", lambda: claude.auth_status(claude.agent_env(self.passing)))
 
@@ -599,18 +602,20 @@ class Discovery:
     def codex_auth(self) -> accounts.Auth:
         return self.remembered("codex_auth", lambda: codex.authentication(self.passing))
 
-    def cli_key_route(self, way: Way | Candidate) -> pi.Route:
+    def cli_key_route(self, way: Way | Candidate, *, materialize=False) -> pi.Route:
         vendor, ident = way_identity(way)
         if claude_openrouter(way.runner, vendor):
-            return self.remembered(f"openrouter_key:{way.model}", lambda: pi_route(
+            return self.remembered(f"openrouter_key:{way.model}:{materialize}", lambda: pi_route(
                 f"{vendor}/{way.model}", self.cfg, self.repo, self.device, self.connect, mode="api_key",
-                source={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}))
-        return self.probe(f"{vendor}/{ident}", "api_key")
+                source={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}, materialize=materialize))
+        return (self.materialize(f"{vendor}/{ident}", "api_key") if materialize else
+                self.probe(f"{vendor}/{ident}", "api_key"))
 
-    def cli_key_auth(self, way: Way | Candidate) -> accounts.Auth:
-        selected = self.cli_key_route(way)
-        return accounts.keyed(selected.provider, ("cli-key", selected.provider, selected.key),
-                              (way.runner, selected.provider, selected.key))
+    def cli_key_auth(self, way: Way | Candidate, selected=None) -> accounts.Auth:
+        selected = selected or self.cli_key_route(way)
+        key = selected.key_identity or selected.key
+        return accounts.keyed(selected.provider, ("cli-key", selected.provider, key),
+                              (way.runner, selected.provider, key))
 
     def openrouter(self) -> dict:
         if self.listed is None:
@@ -656,7 +661,7 @@ class Discovery:
         if vendor == "anthropic":
             native = link.model if link.runner == "claude" else link.model.partition("/")[2]
             found = [Way(link, "claude", native, "cli_login", "free")]
-            if not self.device.remote and self.probe(f"anthropic/{ident}", "api_key").key:
+            if not self.device.remote and self.probe(f"anthropic/{ident}", "api_key").key_available:
                 found.append(Way(link, "claude", native, "cli_key", "paid", "api_key"))
             return [*found, self.keyed_way(link, f"anthropic/{ident}")]
         if vendor == "openai":
@@ -665,7 +670,7 @@ class Discovery:
             found = [cli, Way(link, "pi", f"openai/{ident}", "pi_login", "free", "login"),
                      Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login")]
             if not self.device.remote and self.codex_auth().mode == "subscription" and self.probe(
-                    f"openai/{ident}", "api_key").key:
+                    f"openai/{ident}", "api_key").key_available:
                 found.append(Way(link, "codex", native, "cli_key", "paid", "api_key"))
             return [*found, self.keyed_way(link, f"openai/{ident}")]
         probe = self.probe(link.model, "")
@@ -813,7 +818,7 @@ class Discovery:
             if way.mode == "login" and not selected.login_available:
                 return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
-                found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
+                found = f"no supported {selected.provider or 'pi'} key at {pi.key_setting(selected.provider)} or in the environment"
                 return "missing_key", found, ""
             if selected.error:
                 return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
@@ -822,8 +827,8 @@ class Discovery:
             selected = self.cli_key_route(way)
             if selected.token_error:
                 return "refused", scrub.scrub(selected.token_error, selected.hidden), ""
-            if not selected.key:
-                return "missing_key", f"no supported {selected.provider} key in {pi.KEYS_FILE.name} or the environment", ""
+            if not (selected.key_identity or selected.key):
+                return "missing_key", f"no supported key at {pi.key_setting(selected.provider)} or in the environment", ""
             if selected.error:
                 return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
             auth, model = self.cli_key_auth(way), way.model

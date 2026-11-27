@@ -95,7 +95,6 @@ class EnrollAndPublish(unittest.TestCase):
         self.enterContext(mock.patch.object(gh, "gh", side_effect=self.trackers.github_call))
         self.enterContext(mock.patch.object(jira.Client, "from_env", return_value=self.trackers.client))
         self.enterContext(mock.patch.object(self.trackers.client, "_send", side_effect=self.trackers.jira_call))
-        self.enterContext(mock.patch.object(tracker, "_clients", {}))
         self.enterContext(mock.patch("sys.stdin", StringIO()))
         self.enterContext(mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1"))
         self.body = self.root / "body.md"

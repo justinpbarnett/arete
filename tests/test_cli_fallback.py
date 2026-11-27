@@ -30,10 +30,134 @@ from arete import (
     record,
     routing,
     runner,
+    secret_move,
     steps,
     util,
 )
-from tests.test_behavior import _CliThroughServeCase
+from tests.test_behavior import (
+    SECRET_CLI_HTTP_FIXTURE,
+    SECRET_HTTP_FIXTURE,
+    _CliThroughServeCase,
+    _SecretFileWorkflowCase,
+)
+
+
+REPO_ASK_FIXTURE = r"""
+from arete import tasks, vault
+from arete.store import asks
+
+
+def answer_ask(values):
+    questions = [{'kind': 'secret', 'header': 'Credential', 'name': name} for name in values]
+    asks.ask_add('demo-ask', 'run1', 'demo', '1', 'build', '', '', '', questions, {})
+    cfg = config.load()
+    row = {'id': 'run1', 'status': 'needs-info', 'issue': '1'}
+    body = {'answers': [{'secret': value} for value in values.values()]}
+    with mock.patch.multiple(tasks, run_of=mock.Mock(return_value=(cfg, cfg.repo('demo'), row)),
+                             no_later_run=mock.Mock(), live_run=mock.Mock(return_value=None),
+                             free_to_start=mock.Mock(), continuing=mock.Mock(),
+                             continue_asked=mock.Mock(return_value={'state': 'running'})):
+        assert tasks.answer_ask('demo-ask', body) == {'state': 'running'}
+    answered = asks.ask_get('demo-ask')
+    assert answered['status'] == 'answered'
+    assert all(entry['set'] for entry in answered['answers'])
+    assert not any(value in json.dumps(answered) for value in values.values())
+"""
+
+
+class SecretRepoCompatibilityTests(_SecretFileWorkflowCase):
+    def test_no_store_secret_answer_and_local_removal_use_the_legacy_file(self):
+        self.run_file_workflow(REPO_ASK_FIXTURE + r"""
+from arete import client
+
+paths.CONFIG_FILE.write_text('')
+add_repo()
+assert config.secret_settings().store is None
+write_fixture(repo_file, json.dumps({'OTHER_TOKEN': 'fixture-keep-existing'}))
+answer_ask({'_answerKey': repo_value})
+assert vault.read('demo') == {'_answerKey': repo_value, 'OTHER_TOKEN': 'fixture-keep-existing'}
+assert secretstore.get('repo:demo', '_answerKey') is None
+with mock.patch.object(client, 'call', side_effect=AssertionError('local removal contacted serve')):
+    status, out, err = run_cli('secrets', 'rm', 'demo', '_answerKey')
+    assert (status, out, err) == (0, 'removed _answerKey from demo\n', '')
+    assert run_cli('secrets', 'rm', 'demo', '_answerKey')[0] == 1
+assert json.loads(repo_file.read_text()) == {'OTHER_TOKEN': 'fixture-keep-existing'}
+""")
+
+    def test_configured_answers_and_adoption_preserve_repo_environment_names_only(self):
+        self.run_file_workflow(REPO_ASK_FIXTURE + r"""
+add_repo()
+answers = {'_answerKey': repo_value, 'camelCase': 'fixture-mixed-case-key'}
+answer_ask(answers)
+assert not repo_file.exists()
+assert all(secretstore.get('repo:demo', name)['kind'] == 'repo_answer' for name in answers)
+legacy = {'_legacyKey': 'fixture-private-legacy-key', 'legacyKey': 'fixture-mixed-legacy-key'}
+write_fixture(repo_file, json.dumps(legacy))
+assert not secretstore.move_files()['problems']
+assert not repo_file.exists() and vault.read('demo') == {**answers, **legacy}
+assert all([e['event'] for e in secretstore.history('repo:demo', name)] == ['moved'] for name in legacy)
+for scope in ('global', 'connector:demo', 'line:demo', 'device:demo'):
+    for name in answers:
+        with case.assertRaisesRegex(ValueError, 'invalid secret name'):
+            secretstore.validate(scope, name)
+""")
+
+    def test_mixed_case_repo_recovery_record_is_not_skipped_or_overwritten(self):
+        self.run_file_workflow(r"""
+add_repo()
+secretstore.fingerprint_key()
+scope, name = 'repo:demo', '_pendingKey'
+with mock.patch.object(secretstore, 'save_change', side_effect=OSError('fixture interrupted registry write')):
+    with case.assertRaisesRegex(OSError, 'fixture interrupted'):
+        secretstore.put(scope, name, repo_value, 'repo_answer', 'hand')
+journal, _ = secretstore.pending_path(f'{scope}/{name}')
+assert secretstore.get(scope, name) is None
+receipt = journal.read_bytes()
+write_fixture(repo_file, json.dumps({name: 'fixture-unpublished-legacy-value'}))
+assert secretstore.move_files()['problems'] and repo_file.exists()
+assert journal.read_bytes() == receipt
+assert secretstore.check(scope, name)['status'] == 'set'
+assert secretstore.read(scope, name) == repo_value.encode()
+""")
+
+
+class AuthorityRepoRemovalTests(_SecretFileWorkflowCase):
+    def test_cli_presence_refusal_leaves_both_copies_until_owner_uses_the_route(self):
+        self.run_file_workflow(SECRET_HTTP_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
+add_repo()
+name, scope = '_removeKey', 'repo:demo'
+write_fixture(repo_file, json.dumps({name: repo_value, 'KEEP': 'fixture-retained-key'}))
+row = secretstore.put(scope, name, repo_value, 'repo_answer', actor)
+ref = secretstore.Reference(row['store'], db.schema_metadata()['instance_tag'], f'{scope}/{name}')
+settings = config.secret_settings()
+route = root + '/repo%3Ademo/' + name
+before = repo_file.read_bytes()
+with cli_over_http() as trace, mock.patch.object(client, 'configured_server', return_value=None):
+    status, out, err = run_cli('secrets', 'rm', 'demo', name)
+    assert status == 1 and json.loads(out)['reason'] == 'presence_required', (status, out, err)
+    assert 'paired owner browser' in json.loads(out)['hint'] and repo_value not in out + err
+assert ('DELETE', route, 403) in trace, trace
+assert repo_file.read_bytes() == before and secretstore.read_item(ref, settings) == repo_value.encode()
+
+_, result = request('DELETE', route, cookie=browser_session(), key='remove-repo-answer')
+assert result['secret']['present'] is False and repo_value not in json.dumps(result)
+assert secretstore.read_item(ref, settings) is None
+assert json.loads(repo_file.read_text()) == {'KEEP': 'fixture-retained-key'}
+""")
+
+    def test_remote_missing_store_does_not_trigger_local_legacy_removal(self):
+        self.run_file_workflow(SECRET_HTTP_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('')
+add_repo()
+write_fixture(repo_file, json.dumps({'_legacyKey': repo_value}))
+before = repo_file.read_bytes()
+route = root + '/repo%3Ademo/_legacyKey'
+with cli_over_http() as trace, mock.patch.dict(os.environ, {client.ENV: 'https://127.0.0.1:8796'}):
+    status, out, err = run_cli('secrets', 'rm', 'demo', '_legacyKey')
+    assert status == 1 and json.loads(out)['code'] == 'secret_store_missing', (status, out, err)
+assert ('DELETE', route, 501) in trace, trace
+assert repo_file.read_bytes() == before
+""")
 
 
 class CliRouteFallbackTests(unittest.TestCase):
@@ -65,7 +189,7 @@ class CliRouteFallbackTests(unittest.TestCase):
     problem = _CliThroughServeCase.problem
 
     @contextmanager
-    def stub(self, response):
+    def stub(self, response, url="http://serve.example.test"):
         def connect(where, seconds=client.CONNECT_SECONDS):
             transport = mock.Mock()
 
@@ -86,7 +210,7 @@ class CliRouteFallbackTests(unittest.TestCase):
 
             return SimpleNamespace(sock=transport, request=request, getresponse=getresponse, close=transport.close)
 
-        with (mock.patch.dict(os.environ, {client.ENV: "http://serve.example.test"}),
+        with (mock.patch.dict(os.environ, {client.ENV: url}),
               mock.patch.object(client, "connect", side_effect=connect)):
             yield
 
@@ -104,6 +228,10 @@ class CliRouteFallbackTests(unittest.TestCase):
         info = "GET /api/runs/r1"
         feed = "GET /api/feed/r1?after=0"
         loop = "GET /api/loops/example"
+        webhook = "GET /api/v1/loops/example"
+        rotate = "POST /api/v1/loops/example/webhook/rotate"
+        base = "https://serve.example.test:8796"
+        hook_path = "/hook/example"
         ask = "GET /api/asks"
         events_route = "GET /api/runs/r1/events?from=0"
         follow_events = events_route + "&follow=1"
@@ -118,6 +246,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         replies = {
             **config_replies,
             meta: {"instance": {"id": "fallback"}}, loop: {"running": "r1"},
+            webhook: {"loop": {"detail": {"webhook_path": hook_path, "secret_present": True}}},
             ask: {"asks": [{"run": "r1", "id": "1", "questions": []}]},
             feed: {"restore_epoch": 0, "lines": []},
             events_route: report, follow_events: report,
@@ -149,6 +278,10 @@ class CliRouteFallbackTests(unittest.TestCase):
         after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
                  "session start --attach work": [info, feed, info, feed, info]}
         values = dict(task="t-1234", run="r1", session="r1", id=1, step="build", name="example", chat=1)
+        command_values = {
+            "webhook example": dict(values, id="example"),
+            "webhook example --rotate": dict(values, loop="example"),
+        }
         config_values = dict(values, kind="step_settings", name="defaults")
         seen = []
         old = historical = False
@@ -162,18 +295,21 @@ class CliRouteFallbackTests(unittest.TestCase):
                 if historical:
                     return 404, {"error": "Nothing at GET /api/v1/tasks."}, {}
                 return 404, {"code": "unknown_route", "error": "No such route."}, {}
+            if route == rotate:
+                return 403, {"code": "forbidden", "reason": "presence_required", "error": "Owner presence required."}, {}
             if route == info:
                 return 200, {"run": {"kind": "session", "status": "done", "version": 7}}, {}
             if route in replies:
                 return 200, replies[route], {"Arete-Seq": seq} if route == "POST /api/runs/r1/stop" else {}
             return 500, {"error": f"unexpected request {route}"}, {}
 
-        with self.stub(response):
+        with self.stub(response, base):
             for command, template in self.routes.items():
                 if template is None:
                     continue
                 with self.subTest(command=command):
-                    legacy = template.format(**(config_values if "{kind}" in template else values))
+                    params = config_values if "{kind}" in template else command_values.get(command, values)
+                    legacy = template.format(**params)
                     if legacy == "GET /api/runs/r1/events":
                         legacy = follow_events if command == "wait r1" else events_route
                     primary = canonical.get(legacy, legacy)
@@ -187,9 +323,18 @@ class CliRouteFallbackTests(unittest.TestCase):
                     old = False
                     seen.clear()
                     current = self.cli(command)
-                    self.assertEqual(current[0], 0, current)
-                    if primary in config_replies:
-                        self.assertEqual(list(map(json.loads, current[1])), [config_replies[primary]])
+                    if primary == rotate:
+                        code, lines, err = current
+                        self.assertEqual((code, len(lines), err), (1, 1, ""), current)
+                        problem = json.loads(lines[0])
+                        self.assertEqual((problem["code"], problem["reason"]), ("forbidden", "presence_required"))
+                        self.assertNotIn("text", problem)
+                    else:
+                        self.assertEqual(current[0], 0, current)
+                        if primary in config_replies:
+                            self.assertEqual(list(map(json.loads, current[1])), [config_replies[primary]])
+                        if primary == webhook:
+                            self.assertEqual(current, (0, [f"POST {base}{hook_path}", "secret_present: true"], ""))
                     self.assertEqual([(route, key) for route, key, _ in seen], expected([*prefix, primary, *suffix]))
                     current_requests = seen.copy()
 
@@ -201,7 +346,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                         with self.subTest(historical=historical):
                             seen.clear()
                             result = self.cli(command)
-                            if primary in config_replies:
+                            if primary in config_replies or primary in (webhook, rotate):
                                 code, lines, err = result
                                 self.assertEqual((code, len(lines), err), (1, 1, ""), result)
                                 self.assertEqual(json.loads(lines[0])["code"], "unknown_route")
@@ -545,15 +690,16 @@ class ClaudeOpenRouterTests(unittest.TestCase):
         self.state = self.root / "state"
         self.repo = self.root / "repo"
         self.repo.mkdir()
-        self.keys = self.root / "keys.conf"
+        self.keys = self.root / "pi.env"
         self.keys.write_text(f"OPENROUTER_API_KEY={self.key}\nANTHROPIC_API_KEY={self.anthropic_key}\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "OPENROUTER_API_KEY": "", "ANTHROPIC_API_KEY": "ambient-anthropic-key",
             "ANTHROPIC_AUTH_TOKEN": "ambient-anthropic-auth", "CLAUDE_CODE_OAUTH_TOKEN": "ambient-oauth",
             "CLAUDE_CONFIG_DIR": str(self.root / "owner-config"),
         }))
-        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.state, RUNS_DIR=self.state / "runs"))
-        self.enterContext(mock.patch.object(pi, "KEYS_FILE", self.keys))
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.state, RUNS_DIR=self.state / "runs",
+                                              DB_FILE=self.state / "arete.db", PI_KEYS_FILE=self.keys))
+        self.enterContext(mock.patch.object(secret_move, "STATE", self.state / "secret-move.json"))
         self.enterContext(mock.patch.object(pi, "owner_dir", return_value=self.root / "pi"))
         self.snapshot = self.enterContext(mock.patch.object(prices, "load", return_value=None))
         self.enterContext(mock.patch.object(routing, "auth_hold", return_value=None))
@@ -836,6 +982,7 @@ class ClaudeOpenRouterTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 2)
 
     def test_anthropic_routes_and_api_key_are_preserved(self):
+        os.environ.pop("ANTHROPIC_API_KEY", None)
         cfg, settings = self.settings(f'{{ runner = "claude", model = "{self.anthropic_model}" }}',
                                       instructions=("user", "repo"))
         routes = routing.Discovery(cfg).routes(settings)

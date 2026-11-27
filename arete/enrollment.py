@@ -61,7 +61,7 @@ def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr"
             raise Refused("No Jira project selected; enroll with --jira-project KEY. config.toml is unchanged.")
         if jira_label and not re.fullmatch(r"[A-Za-z0-9_.-]+", jira_label):
             raise Refused("Use one Jira route label containing letters, numbers, dots, underscores or hyphens.")
-        client = jira.Client.from_env(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira)
         project = client.project_key(project.strip().upper())
         route = jira_label or f"repo-{name}"
         if any(r.tracker == "jira" and r.jira_site in ("", client.base)
