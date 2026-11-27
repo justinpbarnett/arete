@@ -121,6 +121,39 @@ def accept(key: GraphKey, repo, data, existing):
         return get(key, repo)
 
 
+def find_parent(repo: str, parent: str):
+    with db.reader() as c:
+        if not installed(c):
+            return None
+        row = c.execute("SELECT * FROM spec_graphs WHERE repo = ? AND parent = ?", (repo, str(parent))).fetchone()
+        if not row:
+            return None
+        key = GraphKey(row["scope"], row["parent"])
+        child_rows = c.execute("SELECT node, ticket, native_id FROM spec_graph_children WHERE scope = ? AND parent = ?", key)
+        mapped = {r["node"]: (r["ticket"], r["native_id"]) for r in child_rows}
+        return key, orchestration.decoded(row), mapped
+
+
+def active_parents(repo: str) -> list[str]:
+    with db.reader() as c:
+        if not installed(c):
+            return []
+        has_deliveries = bool(c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'spec_deliveries' AND type = 'table'"
+        ).fetchone())
+        if not has_deliveries:
+            rows = c.execute("SELECT parent FROM spec_graphs WHERE repo = ? ORDER BY parent", (repo,))
+            return [row["parent"] for row in rows]
+        rows = c.execute(
+            "SELECT g.parent FROM spec_graphs g "
+            "LEFT JOIN spec_deliveries s ON s.repo = g.repo AND s.issue = g.parent "
+            "WHERE g.repo = ? AND (g.complete = 0 OR s.state IS NULL OR s.state <> 'complete') "
+            "ORDER BY g.parent",
+            (repo,),
+        )
+        return [row["parent"] for row in rows]
+
+
 def children(key):
     with db.reader() as c:
         rows = c.execute("SELECT node, ticket, native_id FROM spec_graph_children WHERE scope = ? AND parent = ?", key)
@@ -188,7 +221,7 @@ def amend(key, previous, updated, *, claim=None):
         if claim:
             revision = updated["ticket_version"]
             payload = {**claim["data"], "source_format": 2, "source": revision, "amended": revision}
-            for field in ("notes", "delivery", "observation_request"):
+            for field in ("notes", "delivery", "observation_request", "integrated_verification"):
                 payload.pop(field, None)
             changed = c.execute("UPDATE spec_deliveries SET data=? WHERE identity=? AND run=? AND state='published' AND data=?",
                                 (orchestration.encoded(payload), claim["identity"], claim["run"],
