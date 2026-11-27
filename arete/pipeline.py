@@ -23,6 +23,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from textwrap import indent
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -61,6 +62,7 @@ from . import (
     runner,
     sandbox,
     scratch,
+    scrub,
     slots,
     steps,
     tracker,
@@ -86,6 +88,7 @@ from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import specs as spec_store
+from .store import ticket_progress as ticket_progress_store
 from .store import triage as triage_store
 from .store import workspaces
 from .store.db import IncompatibleSchema, NoDatabase
@@ -137,6 +140,7 @@ RUN_START_SECONDS = 10
 SLOT_QUEUE_FAILED_EXIT = 75
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
+CHECK_COLOR = re.compile(r"\x1b\[[0-9;:]*m")
 CHECK_LANE_POLL_SECONDS = 2
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
@@ -306,13 +310,20 @@ class AgentRun:
             run_lines.write(self.id, event, **fields)
 
     @contextmanager
-    def waiting(self, cause: str):
-        with ExitStack() as stack:
-            if self.budget is not None:
-                stack.enter_context(self.budget.idling(cause))
-            if self.writes_lines:
-                stack.enter_context(run_lines.waiting(self.id, cause))
-            yield
+    def waiting(self, cause: str, **detail):
+        with self.budget.idling(cause) if self.budget is not None else nullcontext():
+            if not self.writes_lines:
+                yield
+                return
+            since = util.iso()
+            self.write_line("wait", cause=cause, phase="start", at=since, **detail)
+            try:
+                yield
+            finally:
+                at = util.iso()
+                seconds = (util.parse_iso(at) - util.parse_iso(since)).total_seconds()
+                self.write_line("wait", cause=cause, phase="end", at=at, since=since,
+                                minutes=round(max(0.0, seconds) / 60, 2), **detail)
 
     def save(self, name: str, data) -> None:
         text = data if isinstance(data, str) else json.dumps(data, indent=2, default=str)
@@ -568,6 +579,7 @@ class Run(AgentRun):
     facts: dict = field(default_factory=dict)
     catch_up_owns_checkout: bool = field(default=False, init=False)
     catch_up_repair_held: bool = field(default=False, init=False)
+    publication_check_attempt: str = field(default="", init=False)
     catch_up_preserved: set[str] = field(default_factory=set)
     catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
@@ -885,6 +897,12 @@ def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
     return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), checkouts)
 
 
+def note_run_workspace(run: AgentRun) -> None:
+    if isinstance(run, Run) and run.workspace and not run.catch_up_owns_checkout:
+        workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                            preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
+
+
 def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
     owner = workspace_owner(run, ws, checkouts)
     workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
@@ -1179,9 +1197,9 @@ def lines_by_file(staged: diffguard.Diff, top: int = 12) -> str:
     return "\n".join(out)
 
 
-VERIFY_SCRATCH_ROOT = Path(".arete-sandbox")
-VERIFY_SCRATCH_MARKER = ".arete-owned"
-VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
+VERIFY_SCRATCH_ROOT = local_paths.VERIFY_SCRATCH_ROOT
+VERIFY_SCRATCH_MARKER = local_paths.VERIFY_SCRATCH_MARKER
+VERIFY_SCRATCH_CONTENT = local_paths.VERIFY_SCRATCH_CONTENT
 
 
 def names_verification_wrapper(rule: str) -> bool:
@@ -1205,6 +1223,11 @@ def initialize_resolver_scratch(wt: Path, bash_rules: list[str]) -> None:
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=folder)
                 with os.fdopen(fd, "wb") as file:
                     file.write(content)
+
+
+def initialize_run_scratch(run: AgentRun, cwd: Path, commands: list[str]) -> None:
+    if isinstance(run, Run) and run.workspace and not run.catch_up_owns_checkout and cwd.is_dir():
+        initialize_resolver_scratch(cwd, commands)
 
 
 def resolver_scratch_paths(names: set[str], roots: set[Path]) -> set[str]:
@@ -1296,6 +1319,36 @@ def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
 
 
+CHECK_NUMBER = r"\d+(?:\.\d+)?(?:e[+-]?\d+)?"
+CHECK_LOAD = rf"(?:{CHECK_NUMBER}|unavailable)"
+CHECK_RUNNER_NORMALIZATION = (
+    (rf"^[\w.]+: (?:waiting for host load to fall from {CHECK_NUMBER} to \d+ or less|"
+     rf"starting alone at host load {CHECK_LOAD} after waiting {CHECK_NUMBER}s)$\n?", ""),
+    (r"^(?:Worker reports and output retained in: .+|\.\.\. \d+ earlier output lines dropped; "
+     r"all of them are in .+ \.\.\.)$\n?", ""),
+    (rf"^Slowest classes:\n(?:  {CHECK_NUMBER}s [\w.]+ \(\d+ tests\)\n)+"
+     rf"(?=(?:Failed classes: .+\n)?Ran \d+ tests in {CHECK_NUMBER}s: (?:OK|FAILED)\b)", ""),
+    (rf"^(Ran \d+ tests?) in {CHECK_NUMBER}s(?=$|: (?:OK|FAILED)(?: |$))", r"\1"),
+    (rf"^([\w.]+: \d+ tests, (?:ok|FAIL)) \({CHECK_NUMBER}s\)$", r"\1"),
+    (rf"^([\w.]+: (?:failed|ran past its deadline) on its first run), "
+     rf"(?:ran past its deadline alone at host load {CHECK_NUMBER}, )?then passed alone"
+     rf"(?: at host load {CHECK_LOAD})? within three times its deadline in {CHECK_NUMBER}s$",
+     r"\1, then passed alone within three times its deadline"),
+    (rf"^class exceeded {CHECK_NUMBER}s \(deadline ({CHECK_NUMBER})s x load {CHECK_NUMBER}\)$", r"class exceeded \1s"),
+)
+
+
+def check_diagnostic_fingerprint(stdout: str, stderr: str) -> str:
+    hidden, diagnostics = scrub.secrets(), []
+    for stream in (stdout, stderr):
+        text = scrub.replaced(CHECK_COLOR.sub("", stream), hidden).replace("\r\n", "\n")
+        for pattern, replacement in CHECK_RUNNER_NORMALIZATION:
+            text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+        diagnostics.append(text.strip())
+    return (orchestration_store.digest(diagnostics)
+            if any(stream.replace(vault.REDACTED, "").strip() for stream in diagnostics) else "")
+
+
 def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
     selected = set(layer.quick_checks) & layer.checks.keys()
     for pattern, names in layer.targeted_checks.items():
@@ -1305,21 +1358,23 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 
 @contextmanager
-def worker_suite_lane(layer: config.RepoLayer, run: AgentRun):
+def worker_suite_lane(layer: config.RepoLayer, run: AgentRun, suite: dict):
     with ExitStack() as stack:
         files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
         if not lanes.take_free(files):
-            run.log("checks: waiting for an agent's full suite run to finish")
-            with run.waiting("slot"):
+            with run.waiting("slot", resource="full-suite-lock", **suite):
+                run.log("checks: waiting for an agent's full suite run to finish")
                 while not lanes.take_free(files):
                     time.sleep(CHECK_LANE_POLL_SECONDS)
         yield
 
 
 @contextmanager
-def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with (slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
-          worker_suite_lane(layer, run)):
+def check_lane(layer: config.RepoLayer, run: AgentRun, suite: dict):
+    slot_run = SimpleNamespace(config=run.config, log=run.log,
+                               waiting=partial(run.waiting, resource="check-slot", **suite))
+    with (slots.check_slot(slot_run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
+          worker_suite_lane(layer, run, suite)):
         yield hold_fds
 
 
@@ -1328,6 +1383,18 @@ def selected_class_command(layer: config.RepoLayer, test_class: str) -> str:
     if command and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", test_class, re.ASCII):
         return shlex.join([*config.class_command_words(command), test_class])
     return ""
+
+
+def report_ticket_progress(run: AgentRun, evidence: Iterator[tuple[str, str, str]], *,
+                           defer_to_checks_action: bool = False) -> None:
+    if not isinstance(run, Run) or run.alone or run.dry_run:
+        return
+    try:
+        if not (defer_to_checks_action and orchestration_store.find(run.id)):
+            ticket_progress_store.record_evidence(run.id, evidence)
+    except (NoDatabase, OSError, sqlite3.Error, IncompatibleSchema) as error:
+        if not isinstance(error, NoDatabase):
+            run.log(f"could not record ticket progress: {type(error).__name__}")
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
@@ -1363,21 +1430,30 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
+    suite = {"suite": f"{run.id}/checks/{uuid4().hex}"}
+    if calls := factory.inside(run.id):
+        suite.update({"step": calls.step, "try": calls.n})
+    cursor = orchestration_store.timeline_cursor(run.id)
     report, ok = [], True
     cleanup_untracked = not defer_failed_cleanup
 
-    def execute(items, hold_fds):
+    def execute(items, hold_fds, first=1):
         nonlocal ok
         held = {"hold_fds": hold_fds} if hold_fds else {}
-        for name, cmd in items:
-            with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
-                check["exit"] = res.returncode
+        for check_no, (name, cmd) in enumerate(items, first):
+            cfg, limit = run.config, run.time_for(timeout)
+            fields = {**suite, "name": name, "check_no": check_no}
+            record.mark(run.id, "check_start", **fields)
+            with record.timed(run.id, "check", command=cmd, **fields) as check:
+                res = environment.sh(cmd, cfg, run.repo, cwd=cwd, timeout=limit, **held)
+                code = check["exit"] = res.returncode
+                if code and (fingerprint := check_diagnostic_fingerprint(res.stdout, res.stderr)):
+                    check["diagnostic_sha"] = fingerprint
             if processes is not None:
                 processes[name] = res
-            passed = res.returncode == 0
+            passed = code == 0
             ok = ok and passed
-            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
+            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {code})'}")
             detail = {"name": name}
             if passed:
                 report.append(f"### {name} passed: `{cmd}`")
@@ -1392,19 +1468,25 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 results.append({**detail, "passed": passed})
 
     try:
-        with check_lane(layer, run) as hold_fds:
+        initialize_run_scratch(run, cwd, list(commands.values()))
+        with check_lane(layer, run, suite) as hold_fds:
             execute(quick, hold_fds)
             if slow and ok:
-                execute(slow, hold_fds)
+                execute(slow, hold_fds, len(quick) + 1)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if focused or (selected is not None and set(commands) != set(layer.checks)):
             report.append("Targeted pass only; the full suite is still required before publication.")
         cleanup_untracked = cleanup_untracked or ok
     finally:
+        if not ok and cursor is not None and isinstance(run, Run):
+            attempt = run.publication_check_attempt if run.catch_up_owns_checkout else ""
+            report_ticket_progress(run, orchestration_store.failed_checks(run.id, attempt, cursor, suite["suite"]),
+                                   defer_to_checks_action=not attempt)
         if cleanup_untracked:
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
+        note_run_workspace(run)
     return ok, "\n\n".join(report)
 
 
@@ -5786,14 +5868,35 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
              role="check_repair")
 
 
+def verification_failures(attempt: str, verified: verify.Verified) -> Iterator[tuple[str, str, str]]:
+    unmeasured = {verify.one_line(name).casefold() for name in verified.unmeasured_requirements}
+    hidden = scrub.secrets()
+    for check in verified.failed_checks:
+        if (check.get("passed") is not False or str(check.get("cause") or "").strip().casefold() == "environment"
+                or not all(isinstance(check.get(key), str) and check[key].strip() for key in ("what", "how", "saw"))
+                or verify.one_line(check["what"]).casefold() in unmeasured):
+            continue
+        name, observed = (verify.one_line(scrub.replaced(check[key], hidden)) for key in ("what", "saw"))
+        visible = "".join(char for char in name if char.isprintable())
+        label = outbound.plain(outbound.screen(visible), 100) or "unnamed requirement"
+        cause = "verification:" + orchestration_store.digest([name.casefold(), observed.casefold()])
+        yield cause, attempt, f"In-use verification failed again: {label}."
+
+
 @runlimits.verification
-def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[str, ...] = (), delivery_token="") -> verify.Verified:
+def check_in_use(b: Build, goal: str, summary: str, *, covered_commands: tuple[str, ...] = (), delivery_token="",
+                 progress_attempt: str = "") -> verify.Verified:
     if needed := b.in_use_repair_checks():
         goal += "\n\nObserve each of these repair requirements separately. Use the exact finding ID as the check's `what`:\n"
         goal += "\n".join(f"- {key}: {acceptance}" for key, acceptance in needed.items())
-    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000], covered_commands=covered_commands,
-                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-                       **({"delivery_token": delivery_token} if delivery_token else {}))
+    verified = use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
+                           covered_commands=covered_commands,
+                           diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+                           **({"delivery_token": delivery_token} if delivery_token else {}))
+    if verified.verdict == "fail" and verified.finished and verified.behavior_reached:
+        attempt = progress_attempt or f"{b.run.id}/verify/{uuid4().hex}"
+        report_ticket_progress(b.run, verification_failures(attempt, verified))
+    return verified
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
@@ -5874,6 +5977,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 blocked_by=reason, finished=False))
     agent_started, agent_finished = False, False
     observed_candidate = {}
+    agent_runner = ""
     lifetime = {"stopped": True}
     fixture_blocker = ""
     probes = None
@@ -5895,6 +5999,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 fixture_blocker = "Required service needs unavailable scratch fixtures for start command: " + json.dumps(v.start)
                 v = replace(v, start="", url="", notes=v.notes + "\n" + fixture_blocker)
         bash = b.read_bash + v.bash
+        initialize_run_scratch(run, b.ws, [v.start, *v.probes.values(), *v.drivers.values(), *v.allow_bash, *b.read_bash])
         with verify.serving(
                 v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo, lifetime=lifetime,
                 attempt=attempt) as url:
@@ -5948,6 +6053,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 agent_finished = True
                 if checked_trees:
                     observed_candidate = verification_trees(b)
+                agent_runner = getattr(res, "runner", "")
     except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise
@@ -5981,6 +6087,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(retained_line(step, attempt))
         finally:
             removed = restore_worktrees(untracked_before, evidence)
+            note_run_workspace(run)
     if probes and probes.verdict != "pass":
         verified = probes
     elif replay_only:
@@ -5992,6 +6099,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             return save_verification(run, step, verified, removed) if removed else verified
     else:
         verified = verify.Verified.from_agent(res.structured, delivery_token=delivery_token)
+        if delivery_verification and agent_runner == runner.REPLAY:
+            verified.behavior_reached = False
     if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
     if candidate and candidate.verdict == "pass":
@@ -6007,7 +6116,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     measured = verified.verdict == "pass" or (getattr(run, "code_review", False) is True and verified.verdict == "blocked"
                                             and any(c.get("passed") is True for c in verified.checks))
-    if (measured and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+    if (measured and checked_trees and agent_finished and agent_runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         if observed_candidate == checked_trees:
             verified.observed_trees = checked_trees

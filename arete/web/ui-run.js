@@ -1,5 +1,6 @@
 import { h, Component } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
+import { effect } from "./vendor-signals.js";
 import { createList, ListHeader } from "./ui-list.js";
 import { syncList, selectItem, pane, activatePane } from "./ui-keys.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
@@ -9,6 +10,8 @@ import { webFetch } from "./ui-request.js";
 import { notice } from "./ui-notice.js";
 import { parse } from "./ui-router.js";
 import { runHash as hashOf, taskHash } from "./ui-data.js";
+import { runView, snapshot } from "./ui-live.js";
+import { TicketProgress } from "./ui-work.js";
 
 const html = htm.bind(h);
 export const GROUPS = ["Running", "Recovering", "Waiting on you", "Fault", "Done"];
@@ -16,7 +19,7 @@ const GLYPHS = { Running: "▷", Recovering: "▷", "Waiting on you": "◆", Fau
 const FAULTS = ["failed", "interrupted", "stopped"];
 const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
 const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
-const safeLink = (url) => /^https?:\/\//i.test(String(url ?? "")) ? url : "";
+const pullUrls = (urls) => String(urls ?? "").split(/\s+/).filter((url) => /^https?:\/\//i.test(url));
 
 export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
   : FAULTS.includes(status) ? "Fault" : "Done";
@@ -46,7 +49,7 @@ function elapsed(run, now) {
 function rowOf(run) {
   const seconds = Number.isFinite(run.seconds) ? run.seconds : elapsed(run, Date.now());
   return { id: run.id, title: [run.ticket || run.id, run.summary].filter(Boolean).join(" · "), state: runWord(run), status: run.status,
-    group: runGroup(run), repo: run.repo ?? "", priority: "", number: duration(seconds), url: safeLink(run.pr_url) };
+    group: runGroup(run), repo: run.repo ?? "", priority: "", number: duration(seconds), url: pullUrls(run.pr_url)[0] ?? "" };
 }
 
 const queue = createList({ rows: [], empty: "No runs yet", facets: [], sorts: [{ id: "source", label: "Newest first" }, { id: "id", label: "Id", key: "id" }],
@@ -175,6 +178,7 @@ function Steps({ view }) {
 
 export const stepsOf = (view) => reduceSteps(view.events).filter((row) => row.kind === "step").length;
 const recordedTurns = (view) => view.events.reduce((sum, event) => sum + (event.event === "step_end" && Number.isFinite(event.turns) ? event.turns : 0), 0);
+const liveProgress = (rows, run) => rows?.find((row) => row.repo === run.repo && String(run.issue) === row.issue);
 
 function Head({ view, now }) {
   const run = view.detail.run;
@@ -183,7 +187,12 @@ function Head({ view, now }) {
   const models = view.detail.models ?? [];
   const tokensIn = models.reduce((sum, model) => sum + (model.tokens_in || 0), 0);
   const tokensOut = models.reduce((sum, model) => sum + (model.tokens_out || 0), 0);
-  const link = safeLink(run.pr_url);
+  const prs = pullUrls(run.pr_url);
+  let progress = view.detail.ticket_progress;
+  const current = progress && liveProgress(snapshot.value.live?.ticket_progress?.rows, run);
+  if (current && !(Date.parse(progress.timing?.as_of) > Date.parse(current.timing?.as_of))) {
+    progress = { ...current, timing: current.timing?.run_ids?.includes(run.id) ? current.timing : progress.timing };
+  }
   return html`<header class="run-head">
     <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${runWord(run)}</span>
       <span class="run-id mono">${run.id}</span>
@@ -194,7 +203,8 @@ function Head({ view, now }) {
       ${view.detail.recovery.detail ? ` · ${view.detail.recovery.detail}` : ""}</p>` : null}
     <p class="run-meta mono"><span>step ${steps} of ${steps}</span><span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
       <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${recordedTurns(view)} turns</span>
-      ${link ? html`<a href=${link} target="_blank" rel="noopener noreferrer">PR</a>` : null}</p>
+      ${prs.map((url, i) => html`<a key=${url} href=${url} target="_blank" rel="noopener noreferrer">${prs.length === 1 ? "PR" : `PR ${i + 1}`}</a>`)}</p>
+    ${progress ? html`<section class="ops-section"><h3>Ticket progress</h3><${TicketProgress} progress=${progress} /></section>` : null}
   </header>`;
 }
 
@@ -227,9 +237,8 @@ function Orchestration({ view, retry }) {
   const run = view.detail.run;
   const rerun = (id) => dispatch(retryStep(), { ...runContext(run, "steps", {}, id), stale: retry,
     commit: (_, result) => { retry(); if (result.run) location.hash = hashOf(result.run); return { label: `Started ${id} alone; dependent evidence must be refreshed` }; } });
-  const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
-    && (!data.workers || data.workers.every(w => ["completed", "cancelled", "integrated"].includes(w.phase)))
-    && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
+  const eligible = (a) => data.action_rerun_available && run.status !== "running"
+    && !a.result.depends_on && (!data.workers || !a.op.startsWith("worker.") || a.result.effective)
     && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
     && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
   return html`<section class="run-orchestration" aria-label="Orchestration"><h3>Orchestration</h3>
@@ -250,7 +259,7 @@ export class RunFocus extends Component {
   go = (id) => { location.hash = hashOf(id); };
   link = () => {
     const run = this.props.view.detail?.run;
-    const url = safeLink(run?.pr_url);
+    const [url] = pullUrls(run?.pr_url);
     if (url) window.open(url, "_blank", "noopener,noreferrer");
     else if (taskOf(run)) location.hash = taskOf(run);
     else notice.value = "Nothing to open for this run";
@@ -272,14 +281,32 @@ export class RunFocus extends Component {
     if (!open.delete(key)) open.add(key);
     this.setState({ open });
   };
-  componentDidMount() { focus = this; this.sync(); }
+  componentDidMount() {
+    focus = this;
+    this.sync();
+    let before, wasListed, wasMissing;
+    this.unwatchProgress = effect(() => {
+      const { id, detail } = runView.value;
+      const rows = snapshot.value.live?.ticket_progress?.rows;
+      if (id !== this.props.view.id || !detail?.ticket_progress) return;
+      const current = liveProgress(rows, detail.run);
+      const missing = rows && !current && (wasListed || detail.ticket_progress.follow_up?.draft);
+      const ended = before?.run.status === "running" && detail.run.status !== "running"
+        && detail.ticket_progress === before.ticket_progress;
+      const refresh = ended || missing && !wasMissing;
+      if (rows) [wasListed, wasMissing] = [Boolean(current), missing];
+      before = detail;
+      if (refresh) this.props.retry();
+    });
+  }
   componentDidUpdate() { focus = this; this.sync(); }
   componentWillUnmount() {
     if (focus === this) focus = null;
+    this.unwatchProgress();
     this.unregister?.();
   }
   sync() {
-    const id = this.props.view.detail?.run?.id ?? "";
+    const id = this.props.view.detail?.run.id ?? "";
     if (this.registered !== id) {
       this.unregister?.();
       this.registered = id;

@@ -5825,7 +5825,7 @@ class CatchUpRepairFixture(PublicationFixture):
                 return mock.DEFAULT
             return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
 
-        def verification(*_, trees=None):
+        def verification(*_, trees=None, progress_attempt=""):
             failed = gate == "verify" and holds()
             summary = self.message if failed else "verified with the new base" if incoming.exists() else "pre-catch-up verification"
             return verify.Verified("fail" if failed else "pass", summary, checks=[

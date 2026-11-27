@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 from . import builder_workspaces as candidates
-from . import delegation, factory, runlimits, sandbox, util
+from . import delegation, factory, run_lines, runlimits, sandbox, util
 from .orchestration_api import WORKER_PROTOCOL
 from .store import orchestration as ledger
 from .store import worker_exchange as exchange
@@ -21,8 +22,106 @@ Optional evidence_refs may only name supplied context references. Transcript mes
 """
 
 
+def latest_retry(prior, retries):
+    while prior["state"] == "interrupted" and prior["id"] in retries:
+        prior = retries[prior["id"]]
+    return prior
+
+
+def attempted_continuation(action):
+    if action["op"] != "worker.continue":
+        return False
+    state, result = action["state"], action["result"]
+    if state == "failed":
+        return bool(result.get("worker_id") or result.get("pid") or result.get("phase") in {"ready", "parked"})
+    return state == "interrupted" and (bool(result.get("pid")) or "effective" in result)
+
+
+def dependency_retries(known):
+    retries = {}
+    for action in known.values():
+        if retry_of := action["result"].get("retry_of"):
+            retries.setdefault(retry_of, action)
+    return retries
+
+
+def interrupted_dependency(prior, workers, *, private):
+    if not private:
+        if prior["op"] in {"worker.start", "worker.continue"} and "effective" in prior["result"]:
+            return "interrupted; needs continuation"
+        return ""
+    if prior["op"] == "worker.continue":
+        w = workers.get(prior["request"]["worker_id"])
+        if w and w["attempt"] == prior["id"]:
+            if w["phase"] == "parked" and w["data"].get("resume_interrupted"):
+                return "parked after interruption"
+            if w["phase"] == "ready" and w["data"].get("retry_of") == prior["id"]:
+                return "ready to retry after interruption"
+    return ""
+
+
+def dependency_blocker(action, known, retries, workers, *, private):
+    waiting = ""
+    for dep in action["request"]["depends_on"]:
+        prior = known[dep]
+        if not (private and prior["op"] == "worker.start"):
+            prior = latest_retry(prior, retries)
+        op, phase, result = prior["op"], prior["state"], prior["result"]
+        owner = None
+        if private:
+            if op == "worker.start" and (phase != "failed" or result.get("worker_id")
+                                         or result.get("phase") == "ready"):
+                owner = prior["id"]
+            elif (phase == "succeeded" and op in {"worker.steer", "worker.reply", "worker.continue"}
+                  or attempted_continuation(prior)):
+                owner = result.get("worker_id") or prior["request"]["worker_id"]
+        w = workers.get(owner)
+        if w:
+            phase = w["phase"]
+            if phase == ("integrated" if w["data"]["writing"] else "completed"):
+                continue
+            if phase == "cancelled":
+                return True, f"prerequisite {dep} was cancelled"
+            if phase == "parked":
+                state = known[w["attempt"]]["state"]
+                if state == "failed":
+                    return True, f"prerequisite {dep} failed ({phase})"
+                if state == "interrupted":
+                    phase = "parked after interruption"
+        elif phase == "succeeded":
+            if owner is None:
+                continue
+            phase = "worker receipt missing"
+        elif phase in ledger.TERMINAL:
+            interrupted = interrupted_dependency(prior, workers, private=private) if phase == "interrupted" else ""
+            if not interrupted:
+                return True, f"prerequisite {dep} is {phase}"
+            phase = interrupted
+        if not waiting:
+            waiting = f"waiting for prerequisite {dep} ({phase})"
+    return False, waiting
+
+
+def private_rerun_blocked(known, workers):
+    outstanding = {wid for wid, w in workers.items() if w["phase"] not in exchange.CLOSED}
+    if not outstanding or any(workers[wid]["phase"] != "queued" for wid in outstanding):
+        return bool(outstanding)
+    projected = workers.copy()
+    retries = dependency_retries(known)
+    for action in known.values():
+        wid = action["id"]
+        if wid in outstanding and ledger.queued_start(action):
+            cancelled, _ = dependency_blocker(action, known, retries, projected, private=True)
+            if not cancelled:
+                return True
+            outstanding.remove(wid)
+            projected[wid] = {**workers[wid], "phase": "cancelled"}
+    return bool(outstanding)
+
+
 class WorkerTurns:
     protocol = 1
+    has_queued_starts = False
 
     @property
     def exchanged(self):
@@ -65,7 +164,7 @@ class WorkerTurns:
                     or (action["op"] == "review.run" and result.get("verdict") == "request_changes")):
                 return "check_repair"
         for w in workers.values():
-            if w["data"]["writing"] and (w["data"]["role"] != "build"
+            if w["data"].get("candidate") and w["data"]["writing"] and (w["data"]["role"] != "build"
                     or candidates.overlaps(args["write_paths"], w["data"]["write_paths"])):
                 return "check_repair"
         return "build"
@@ -77,12 +176,13 @@ class WorkerTurns:
             if wid is not None and wid not in ws:
                 raise ValueError("address the logical worker by its original action ID")
         if any(w["phase"] in {"integrating", "reconciliation-required"} for w in ws.values()) and any(
-                call["op"] in ("worker.start", "worker.continue") for call in calls):
+                call["op"] == "worker.continue" or (call["op"] == "worker.start" and not call["args"]["depends_on"])
+                for call in calls):
             raise ValueError("an incomplete integration needs reconciliation before another launch")
         active = len(self.workers)
         builders = sum(w.writing for w in self.workers.values())
-        claims = [w["data"]["write_paths"] for w in ws.values() if w["phase"] not in exchange.CLOSED]
-        repairs = sum(w.role in runlimits.REPAIRS and not w.admitted for w in self.workers.values())
+        claims = [w["data"]["write_paths"] for w in ws.values() if exchange.holds_claim(w)]
+        repairs = 0
         starts = [call for call in calls if call["op"] in ("worker.start", "worker.continue")]
         if sum(w["phase"] not in exchange.CLOSED for w in ws.values()) + sum(
                 call["op"] == "worker.start" for call in starts) > self.policy.max_actions:
@@ -90,8 +190,10 @@ class WorkerTurns:
         if len(starts) > 1 and len(starts) != len(calls):
             raise ValueError("a fan-out decision must contain only worker launches")
         continuing = set()
+        immediate = False
         for call in starts:
             args = call["args"]
+            deferred = call["op"] == "worker.start" and args["depends_on"]
             if call["op"] == "worker.continue":
                 w = ws.get(args["worker_id"])
                 if not w or w["phase"] not in {"conflict", "handoff", "parked"} or w["id"] in continuing:
@@ -107,36 +209,77 @@ class WorkerTurns:
                     candidates.validate_claims(args["write_paths"], self.job.layer, self.job.checkouts)
                     if args["acceptance_check"] == "none":
                         raise ValueError("a builder requires a focused acceptance_check")
-                    if any(candidates.overlaps(args["write_paths"], other) for other in claims):
-                        raise ValueError("write_paths overlap an outstanding builder claim")
-                    claims.append(args["write_paths"])
+                    if not deferred:
+                        if any(candidates.overlaps(args["write_paths"], other) for other in claims):
+                            raise ValueError("write_paths overlap an outstanding builder claim")
+                        claims.append(args["write_paths"])
                 elif args["write_paths"]:
                     raise ValueError("readers cannot claim write paths")
-                role = self.assignment_role(args, writing, setting.step, ws)
+                role = setting.step if deferred else self.assignment_role(args, writing, setting.step, ws)
             if not self.job.cfg.replay.all and setting.runner != "pi":
                 raise ValueError("this private worker needs a local Pi route; select the approved Pi route or a serial layer")
+            if deferred:
+                continue
+            immediate = True
             active += 1
             builders += int(writing)
             repairs += int(writing and role in runlimits.REPAIRS)
-        if starts and (active > self.policy.max_workers or builders > self.policy.builder_limit):
+        if immediate and (active > self.policy.max_workers or builders > self.policy.builder_limit):
             raise ValueError("requested workers exceed available worker or builder capacity")
+        if immediate and self.repair_capacity_blocked(repairs):
+            raise ValueError("worker batch exceeds remaining repair calls")
+
+    def repair_capacity_blocked(self, repairs):
         budget = self.run.budget
-        if starts and budget and repairs and not getattr(budget, "issue_goal", False):
-            if budget.prior_repairs + budget.repair_calls + repairs > budget.policy.max_repair_cycles:
-                raise ValueError("worker batch exceeds remaining repair calls")
+        if not budget or getattr(budget, "issue_goal", False):
+            return False
+        repairs += sum(w.role in runlimits.REPAIRS and not w.admitted for w in self.workers.values())
+        return repairs and budget.prior_repairs + budget.repair_calls + repairs > budget.policy.max_repair_cycles
 
     def validate_scope(self, w, names, workers):
         if not w["data"]["writing"]:
             raise ValueError("only a builder can request an expanded write scope")
         candidates.validate_claims(names, self.job.layer, self.job.checkouts)
-        if any(other["id"] != w["id"] and other["phase"] not in exchange.CLOSED and
+        if any(other["id"] != w["id"] and exchange.holds_claim(other) and
                candidates.overlaps(names, other["data"]["write_paths"]) for other in workers.values()):
             raise ValueError("revised write_paths overlap another worker's claim")
 
-    def private_assignment(self, action, args, prior, writing, role):
+    def batch_snapshot(self, action, workers):
+        for w in workers.values():
+            data = w["data"]
+            if data["turn"] == action["turn"] and data.get("batch_snapshot", not data.get("depends_on")):
+                if candidate := data.get("candidate"):
+                    return candidate
+        return None
+
+    @contextmanager
+    def assigning_candidate(self, wid, pinned):
+        candidate = None
+        try:
+            candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=pinned)
+            yield candidate
+        except BaseException as error:
+            if candidate is not None:
+                try:
+                    worker = exchange.workers(self.lease).get(wid)
+                    recorded = worker["data"].get("candidate") if worker else None
+                    if recorded is None or recorded["token"] != candidate["token"]:
+                        candidates.release(candidate)
+                except Exception as cleanup_error:
+                    error.add_note(f"Could not confirm or clean up an unassigned candidate: {cleanup_error}")
+            raise
+
+    def private_assignment(self, action, args, prior, writing, role, *, same_batch=False):
         ws = exchange.workers(self.lease)
         wid = action["request"]["worker_id"] if prior else action["id"]
         w = ws.get(wid)
+        if w and w["phase"] == "queued" and ledger.queued_start(action):
+            if writing:
+                candidates.validate_claims(args["write_paths"], self.job.layer, self.job.checkouts)
+            role = self.assignment_role(args, writing, role, ws)
+            pinned = self.batch_snapshot(action, ws) if same_batch else None
+            with self.assigning_candidate(wid, pinned) as candidate:
+                return wid, exchange.admit(self.lease, wid, candidate, role, batch_snapshot=same_batch)
         if w:
             if w["phase"] not in {"assigned", "conflict", "handoff", "parked"}:
                 raise ValueError(f"worker {wid} is {w['phase']}")
@@ -150,17 +293,12 @@ class WorkerTurns:
             return wid, data
         self.preflight([{"op": "worker.start", "args": args}])
         role = self.assignment_role(args, writing, role, ws)
-        sibling = next((w["data"]["candidate"] for w in ws.values() if w["data"]["turn"] == action["turn"]), None)
-        candidate = candidates.create(self.job.checkouts, self.job.ws, pinned=sibling)
-        data = {"effective": args, "role": role, "writing": writing, "write_paths": args["write_paths"],
-                "turn": action["turn"], "candidate": candidate}
-        if writing and (findings := self.data.get("repair_state", {}).get("findings")):
-            data["repair_findings"] = findings
-        try:
+        with self.assigning_candidate(wid, self.batch_snapshot(action, ws)) as candidate:
+            data = {"effective": args, "role": role, "writing": writing, "write_paths": args["write_paths"],
+                    "turn": action["turn"], "candidate": candidate}
+            if writing and (findings := self.data.get("repair_state", {}).get("findings")):
+                data["repair_findings"] = findings
             exchange.assign(self.lease, wid, data)
-        except Exception:
-            candidates.release(candidate)
-            raise
         return wid, data
 
     def settle_candidate(self, w):
@@ -217,10 +355,10 @@ class WorkerTurns:
             except (ValueError, TypeError) as error:
                 result.update(ok=False, error=str(error)[:2000])
         phase = exchange.finish(self.lease, worker.logical_id, worker.action, result, outcome)
-        if outcome:
-            self.catalog.add_context(worker.action, outcome["text"])
-            if phase == "completed" and worker.effective["prompt_id"].removeprefix("prompt:") == "plan":
-                self.job.plan_text = self.job.b.plan_text = outcome["text"]
+        if result.get("event") in {"result", "error"} or outcome:
+            self.catalog.add_context(worker.action, outcome["text"] if outcome else result.get("error", ""))
+        if outcome and phase == "completed" and worker.effective["prompt_id"].removeprefix("prompt:") == "plan":
+            self.job.plan_text = self.job.b.plan_text = outcome["text"]
         if phase == "candidate":
             self.settle_candidate(exchange.workers(self.lease)[worker.logical_id])
         self.persist()
@@ -230,15 +368,102 @@ class WorkerTurns:
         actions = {a["id"]: a for a in ledger.actions(self.lease)}
         ws = exchange.workers(self.lease).values()
         for w in sorted(ws, key=lambda item: item["phase"] == "candidate"):
-            if w["phase"] in ("running", "assigned") and actions[w["attempt"]]["state"] != "accepted":
-                exchange.change(self.lease, w["id"], "ready", reason="interrupted turn; redelivering outstanding messages")
-            if w["phase"] == "parked" and w["data"].get("resume_interrupted"):
-                exchange.change(self.lease, w["id"], "ready", resume_interrupted=False)
+            attempt = actions[w["attempt"]]
+            if attempt["state"] == "interrupted" and (w["phase"] in {"running", "assigned"}
+                    or w["phase"] == "parked" and w["data"].get("resume_interrupted")):
+                exchange.change(self.lease, w["id"], "ready", retry_of=attempt["id"], resume_interrupted=False,
+                                reason="interrupted turn; redelivering outstanding messages")
             if w["phase"] in ("candidate", "integrating", "reconciliation-required"):
                 if w["phase"] == "reconciliation-required":
                     exchange.change(self.lease, w["id"], "integrating")
                 self.settle_candidate(w)
         self.worker_summaries()
+
+    def dependency_receipts(self):
+        known = {a["id"]: a for a in ledger.actions(self.lease)}
+        return known, dependency_retries(known)
+
+    def defer_start(self, action):
+        args = action["request"]
+        if any(dep in self.data.get("superseded_actions", ()) for dep in args.get("depends_on", ())):
+            raise ValueError("the worker or dependency belongs to superseded ticket requirements")
+        setting, _, writing = self.catalog.worker(args)
+        writing = writing and args["tool_bundle"] == "write"
+        known, retries = self.dependency_receipts()
+        workers = exchange.workers(self.lease) if self.exchanged else {}
+        _, reason = dependency_blocker(action, known, retries, workers, private=self.exchanged)
+        data = None
+        if self.exchanged:
+            self.preflight([{"op": "worker.start", "args": args}])
+            data = {"effective": args, "role": setting.step, "writing": writing, "write_paths": args["write_paths"],
+                    "turn": action["turn"], "depends_on": args["depends_on"]}
+        exchange.declare_start(self.lease, action, reason or "waiting for admission", data)
+        self.has_queued_starts = True
+
+    def admission_blocker(self, action, workers):
+        if len(self.workers) >= self.policy.max_workers:
+            return "waiting for worker capacity"
+        if not self.exchanged:
+            writing = action["request"]["tool_bundle"] == "write"
+            if self.workers and (writing or any(w.writing for w in self.workers.values())):
+                return "waiting for the shared workspace mutation lease"
+            return ""
+        w = workers[action["id"]]
+        for other in workers.values():
+            if other["phase"] in {"integrating", "reconciliation-required"}:
+                return f"waiting for integration of {other['id']} ({other['phase']})"
+        data = w["data"]
+        if data["writing"]:
+            for other in workers.values():
+                if other["id"] != w["id"] and exchange.holds_claim(other) and candidates.overlaps(
+                        data["write_paths"], other["data"]["write_paths"]):
+                    return f"waiting for write claim held by {other['id']} ({other['phase']})"
+            if sum(other.writing for other in self.workers.values()) >= self.policy.builder_limit:
+                return "waiting for builder capacity"
+            role = data["role"]
+            if w["phase"] == "queued":
+                role = self.assignment_role(data["effective"], True, role, workers)
+            if role in runlimits.REPAIRS and self.repair_capacity_blocked(1):
+                return "waiting for repair allowance"
+        return ""
+
+    def resume_queued(self, *, launch=True, wait_turn=None, batch=None, rerun_id=None):
+        if not self.has_queued_starts or (launch and self.data.get("scope_needs_refresh")):
+            return
+        known, retries = self.dependency_receipts()
+        pending = [a for a in known.values() if ledger.queued_start(a)]
+        if not pending:
+            self.has_queued_starts = False
+            return
+        if rerun_id is not None:
+            pending = [a for a in pending if a["id"] == rerun_id]
+        elif launch and any(
+                a["state"] == "accepted" and not ledger.queued_start(a)
+                and (a["turn"] != wait_turn or a["op"] == "worker.continue"
+                     or (a["op"] == "worker.start" and not a["request"].get("depends_on"))
+                     or (a["op"] == "run.finish" and a["request"]["reason"] == "failed"))
+                for a in known.values()):
+            return
+        workers = exchange.workers(self.lease) if self.exchanged else {}
+        for action in pending:
+            if batch is not None and action["id"] not in batch:
+                continue
+            cancelled, reason = dependency_blocker(action, known, retries, workers, private=self.exchanged)
+            if not reason:
+                reason = self.admission_blocker(action, workers)
+            if not reason and not launch:
+                reason = "waiting for admission"
+            if reason:
+                exchange.update_admission(self.lease, action, reason, private=self.exchanged, cancelled=cancelled)
+                if not cancelled:
+                    continue
+                run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="cancelled")
+            else:
+                self.dispatch(action, admit=True, same_batch=batch is not None)
+            known, retries = self.dependency_receipts()
+            if self.exchanged:
+                workers = exchange.workers(self.lease)
+        self.has_queued_starts = any(ledger.queued_start(a) for a in known.values())
 
     def resume_ready(self):
         workers = exchange.workers(self.lease).values()
@@ -255,8 +480,14 @@ class WorkerTurns:
             self.dispatch(action)
 
     def worker_barrier(self):
-        pending = [f"{w['id']} ({w['phase']})" for w in exchange.workers(self.lease).values()
-                   if w["phase"] not in exchange.CLOSED]
+        self.resume_queued(launch=False)
+        if self.exchanged:
+            pending = [f"{w['id']} ({w['phase']})" for w in exchange.workers(self.lease).values()
+                       if w["phase"] not in exchange.CLOSED]
+        elif self.has_queued_starts:
+            pending = [f"{a['id']} (queued)" for a in ledger.actions(self.lease) if ledger.queued_start(a)]
+        else:
+            return
         if pending:
             raise ValueError("outstanding worker work: " + ", ".join(pending[:20]))
 

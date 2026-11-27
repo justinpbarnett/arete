@@ -1454,7 +1454,7 @@ def retry_passed(verified: Verified) -> bool:
 
 @factory.step("verify")
 def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands: tuple[str, ...] = (),
-           delivery_token="", *, return_focused_hold: bool = False) -> Outcome:
+           delivery_token="", progress_attempt: str = "", *, return_focused_hold: bool = False) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
     check_only = single or bool(job.run.environment_release)
@@ -1467,7 +1467,8 @@ def verify(flow: factory.Flow, tree: str, single: bool = False, covered_commands
         verified = pipeline.check_in_use(
             b, goal, job.build_summary,
             **({"covered_commands": covered_commands} if single and covered_commands else {}),
-            **({"delivery_token": delivery_token} if single and delivery_token else {}))
+            **({"delivery_token": delivery_token} if single and delivery_token else {}),
+            **({"progress_attempt": progress_attempt} if progress_attempt else {}))
     else:
         try:
             verified = pipeline.verify_in_use(b, goal, job.build_summary, return_focused_hold=return_focused_hold)

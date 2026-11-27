@@ -1117,7 +1117,7 @@ from arete import accounts
 value = 'fixture-fingerprint-input'
 row = secretstore.put('global', 'EXAMPLE', value, 'api_key', 'hand')
 first = secretstore.fingerprint(value)
-assert first == row['fingerprint'] and first != accounts.fingerprint(value)
+assert first == row['fingerprint'] == accounts.fingerprint(value) and first != accounts.legacy_fingerprint(value)
 meta = db.schema_metadata()
 second = Path('state2').resolve()
 with mock.patch.multiple(paths, STATE_DIR=second, DB_FILE=second / 'arete.db',
@@ -1276,10 +1276,10 @@ from arete import tailnet
 from arete.agent import Session
 
 assert principals.owner() == 'hand'
-auth = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-account'}, 'fixture')
 settings = paths.CONFIG_FILE.read_text()
 paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
 with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    auth = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-account'}, 'fixture')
     result = launch_picked(auth, 'cli_login', agent='codex',
                            result=Result(ok=True, session=Session(id='fixture', runner='codex')))
     assert result.ok and result.session.account == runner.account_of(auth)
@@ -1325,7 +1325,7 @@ import subprocess
 
 principals.seed_owner(login)
 key = 'synthetic-provider-key'
-auth = accounts.pi('openai', {'key': key})
+auth = accounts.Auth('api_key', credential=key, provider='openai')
 route = pi.Route('openai', 'demo', auth, key=key)
 locked = subprocess.CompletedProcess([], 1, b'', b'fixture locked')
 with (mock.patch.object(paths, 'ISOLATED', False),
@@ -1422,6 +1422,204 @@ assert unrelated['id'] not in (original['id'], provisional['id'])
 with db.reader() as c:
     assert c.execute('SELECT count(*) FROM accounts').fetchone()[0] == 2
     assert tuple(c.execute('SELECT account_id, version FROM secrets').fetchone()) == (original['id'], 2)
+""")
+
+
+class AccountFingerprintScopeTests(_SecretChildCase):
+    def test_fingerprint_uses_instance_key_and_differs_across_instances(self):
+        self.run_secret_child(r"""
+import hashlib
+import json
+
+from arete import accounts, runner
+
+inputs = ('fixture-login', {'id': 'synthetic'})
+plain = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()
+first = accounts.fingerprint(*inputs)
+assert first != plain and accounts.legacy_fingerprint(*inputs) == plain and first == secretstore.fingerprint(*inputs)
+auth1 = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-acct'}, 'fixture')
+scope1 = accounts.scope(auth1, 'codex')
+account1 = runner.account_of(auth1)
+assert scope1.startswith('subscription-v2:') and account1.startswith('account-v2:')
+
+second = Path('state2').resolve()
+with mock.patch.multiple(paths, STATE_DIR=second, DB_FILE=second / 'arete.db',
+                         FINGERPRINT_KEY_FILE=second / 'fingerprint-fixture', LOCKS_DIR=second / 'locks'):
+    db.migrate()
+    assert accounts.fingerprint(*inputs) != first
+    auth2 = accounts.codex({'auth_mode': 'chatgpt', 'account_id': 'synthetic-acct'}, 'fixture')
+    scope2 = accounts.scope(auth2, 'codex')
+    account2 = runner.account_of(auth2)
+    assert auth2.identity != auth1.identity and auth2.credential != auth1.credential
+    assert auth2.generation != auth1.generation and scope2 != scope1 and account2 != account1
+    assert accounts.legacy_scope(auth2, 'codex') == accounts.legacy_scope(auth1, 'codex')
+""")
+
+    def test_legacy_credit_hold_migrates_to_v2_and_releases_either_form(self):
+        self.run_secret_child(r"""
+from datetime import timedelta
+
+from arete import accounts, heartbeat, routing, util
+from arete.store import devices
+
+value = 'fixture-codex-credit'
+old_key = accounts.legacy_fingerprint('credential-v1', 'codex', 'fixture', value)
+old_scope = 'credit-v1:' + accounts.legacy_fingerprint('openai', old_key)
+devices.hold(old_scope, '', 'legacy credit hold')
+assert heartbeat.check_legacy_accounts()[0].detail == '1 active v1 holds, 0 unfinished runs with v1 sessions'
+
+auth = accounts.codex({'OPENAI_API_KEY': value}, 'fixture')
+assert accounts.legacy_scope(auth, 'credit') == old_scope
+devices.hold(accounts.scope(auth, 'credit'), '2099-01-01T00:00:00Z', 'temporary hold')
+found = routing.auth_hold(auth, 'gpt-fixture')
+assert found['why'] == 'legacy credit hold' and found['until'] == ''
+assert found['scope'] == accounts.scope(auth, 'credit') and found['scope'].startswith('credit-v2:')
+assert [row['scope'] for row in devices.holds()] == [found['scope']]
+assert heartbeat.check_legacy_accounts()[0].detail == '0 active v1 holds, 0 unfinished runs with v1 sessions'
+
+devices.clear_holds([found['scope']], util.iso(util.now() + timedelta(seconds=1)))
+devices.hold(old_scope, '', 'unmigrated v1 hold')
+devices.clear_holds([accounts.scope(auth, 'credit')], util.iso(util.now() + timedelta(seconds=1)))
+assert devices.holds() == []
+""")
+
+    def test_credit_hold_survives_enabling_pve_store(self):
+        self.run_secret_child(r"""
+from arete import accounts, routing
+from arete.store import devices
+
+configured = paths.CONFIG_FILE.read_text()
+paths.CONFIG_FILE.write_text('[secrets]\nstore = ""\n')
+value = 'fixture-pre-store-key'
+with mock.patch.object(paths, 'FINGERPRINT_KEY_FILE', paths.STATE_DIR / 'fingerprint-fixture'):
+    before = accounts.codex({'OPENAI_API_KEY': value}, 'fixture')
+    hold_scope = accounts.scope(before, 'credit')
+    assert hold_scope.startswith('credit-v2:')
+    devices.hold(hold_scope, '', 'credit hold before store')
+    assert secretstore.KEY_REF not in db.schema_metadata() and paths.FINGERPRINT_KEY_FILE.exists()
+
+    paths.CONFIG_FILE.write_text(configured)
+    after = accounts.codex({'OPENAI_API_KEY': value}, 'fixture')
+    found = routing.auth_hold(after, 'gpt-fixture')
+    assert found and found['scope'] == hold_scope and found['why'] == 'credit hold before store'
+    assert secretstore.KEY_REF in db.schema_metadata()
+""")
+
+
+class AccountFingerprintResumeTests(_SecretChildCase):
+    def test_saved_resume_with_v1_account_returns_session_and_counts_in_heartbeat(self):
+        self.run_secret_child(r"""
+from dataclasses import asdict
+from types import SimpleNamespace
+
+from arete import accounts, heartbeat, runner, util
+from arete.agent import Session
+from arete.store import asks
+
+value = 'fixture-session-credential'
+old_credential = accounts.legacy_fingerprint('credential-v1', 'codex', 'fixture', value)
+old_account = accounts.legacy_fingerprint('api_key', '', 'openai', old_credential)
+saved = Session(id='synthetic-session', runner='codex', account=old_account)
+auth = accounts.codex({'OPENAI_API_KEY': value}, 'fixture')
+candidate = SimpleNamespace(runner='codex', provider='openai', model='gpt-fixture')
+trip = SimpleNamespace(resume=saved)
+picked = SimpleNamespace(auth=auth, candidate=candidate)
+assert runner.account_of(auth).startswith('account-v2:')
+assert runner.session_for(trip, picked, 'continue', None, None, {}, 'run-fixture') == ('continue', saved)
+stopped = runner.Stopped(SimpleNamespace(session=saved, turns=2), SimpleNamespace(auth=accounts.Auth()))
+assert runner.continues(stopped, picked, True)
+
+with db.tx() as c:
+    c.execute("INSERT INTO runs (id, kind, repo, issue, status, started) VALUES "
+              "('old-run', 'pipeline', 'fixture', 1, 'needs-info', ?)", (util.iso(),))
+asks.ask_add('old-ask', 'old-run', 'fixture', '1', 'build', 'call', '', '', [], asdict(saved))
+assert heartbeat.check_legacy_accounts()[0].detail == '0 active v1 holds, 1 unfinished runs with v1 sessions'
+""")
+
+    def test_v1_pi_oauth_without_account_id_resumes_after_refresh(self):
+        self.run_secret_child(r"""
+import json
+from types import SimpleNamespace
+
+from arete import accounts, pi, routing, runner
+from arete.agent import Session
+from arete.store import devices
+
+provider = 'github-copilot'
+owner = (paths.CONFIG_DIR / 'login-fixture.json').absolute()
+before = {'type': 'oauth', 'access': 'synthetic-access-before', 'refresh': 'synthetic-refresh-before', 'expires': 10}
+after = {**before, 'access': 'synthetic-access-after', 'refresh': 'synthetic-refresh-after', 'expires': 20}
+
+def select(credential):
+    owner.write_text(json.dumps({provider: credential}))
+    return pi.select(provider + '/demo', passing=[], providers={}, mode='login', source={}, owner_auth=owner)
+
+inputs = ('pi', str(owner), provider, before)
+credential_v1 = accounts.legacy_fingerprint('credential-v1', *inputs)
+saved = Session(id='synthetic-session', runner='pi',
+                account=accounts.legacy_fingerprint('subscription', '', provider, credential_v1),
+                generation=accounts.legacy_fingerprint(*inputs))
+old_hold = 'subscription-v1:' + json.dumps(['', credential_v1, provider], separators=(',', ':'))
+devices.hold(old_hold, '', 'legacy oauth hold')
+
+route = select(before)
+assert route.using_login and not route.auth.identity
+pi.observed_refresh(route, {'provider': provider, 'before': before, 'after': after})
+
+refreshed = select(after)
+picked = SimpleNamespace(auth=refreshed.auth, candidate=SimpleNamespace(runner='pi', provider=provider, model=provider + '/demo'))
+assert runner.session_for(SimpleNamespace(resume=saved), picked, 'continue', None, None, {}, 'run-fixture') == ('continue', saved)
+found = routing.auth_hold(refreshed.auth, provider + '/demo')
+assert found and found['why'] == 'legacy oauth hold' and found['scope'].startswith('subscription-v2:')
+""")
+
+    def test_keyless_route_records_no_account_and_credential_file_matches_v1_hold(self):
+        self.run_secret_child(r"""
+import json
+
+from arete import accounts, pi, routing, runner
+from arete.store import devices
+
+local = pi.select('ollama/demo', passing=[], providers={}, source={}, local_providers=())
+assert local.local and not local.auth.identity and not local.auth.credential and not local.auth.generation
+assert runner.account_of(local.auth) == '' and accounts.record(local.auth) is None
+assert not Path('store').exists()
+
+aws_dir = (paths.CONFIG_DIR / 'aws').resolve()
+aws_dir.mkdir(parents=True)
+aws_creds = aws_dir / 'credentials'
+aws_cfg = aws_dir / 'config'
+aws_creds.write_text('[demo]\naws_access_key_id = synthetic-id\naws_secret_access_key = synthetic-secret\n')
+aws_cfg.write_text('[profile demo]\nregion = us-east-1\n')
+aws_env = {'AWS_PROFILE': 'demo', 'AWS_SHARED_CREDENTIALS_FILE': str(aws_creds),
+           'AWS_CONFIG_FILE': str(aws_cfg), 'AWS_REGION': 'us-east-1'}
+aws_material = ['profile', {k: v for k, v in aws_env.items() if k != 'AWS_REGION'}, [
+    (str(aws_creds), accounts.legacy_fingerprint({'demo': {'aws_access_key_id': 'synthetic-id',
+                                                           'aws_secret_access_key': 'synthetic-secret'}})),
+    (str(aws_cfg), accounts.legacy_fingerprint({'demo': {}})),
+]]
+aws_v1_cred = accounts.legacy_fingerprint('credential-v1', 'pi', 'amazon-bedrock', 'managed', '',
+                                          aws_material, {'AWS_REGION': 'us-east-1', 'baseUrl': ''})
+aws_v1_scope = 'credit-v1:' + accounts.legacy_fingerprint('amazon-bedrock', aws_v1_cred)
+devices.hold(aws_v1_scope, '', 'legacy aws profile hold')
+aws_route = pi.select('amazon-bedrock/demo', passing=[], providers={}, source=aws_env)
+aws_found = routing.auth_hold(aws_route.auth, 'amazon-bedrock/demo')
+assert aws_found and aws_found['why'] == 'legacy aws profile hold' and aws_found['scope'].startswith('credit-v2:')
+
+adc = (paths.CONFIG_DIR / 'adc.json').resolve()
+adc_bytes = json.dumps({'type': 'authorized_user', 'client_id': 'synthetic-client'}).encode()
+adc.write_bytes(adc_bytes)
+vertex_env = {'GOOGLE_APPLICATION_CREDENTIALS': str(adc), 'GOOGLE_CLOUD_PROJECT': 'proj-fixture',
+              'GOOGLE_CLOUD_LOCATION': 'us-central1'}
+vertex_material = ['adc', {'GOOGLE_APPLICATION_CREDENTIALS': str(adc)},
+                   [(str(adc), accounts.legacy_fingerprint(adc_bytes))]]
+vertex_v1_cred = accounts.legacy_fingerprint('credential-v1', 'pi', 'google-vertex', 'managed', '',
+                                             vertex_material, {'GOOGLE_CLOUD_PROJECT': 'proj-fixture', 'baseUrl': ''})
+vertex_v1_scope = 'credit-v1:' + accounts.legacy_fingerprint('google-vertex', vertex_v1_cred)
+devices.hold(vertex_v1_scope, '', 'legacy vertex adc hold')
+vertex_route = pi.select('google-vertex/demo', passing=[], providers={}, source=vertex_env)
+vertex_found = routing.auth_hold(vertex_route.auth, 'google-vertex/demo')
+assert vertex_found and vertex_found['why'] == 'legacy vertex adc hold' and vertex_found['scope'].startswith('credit-v2:')
 """)
 
 

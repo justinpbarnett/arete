@@ -475,7 +475,7 @@ function applyRun(run, event) {
     run.positions.set("detail", event.id);
     if (current.status === "running" && !running) {
       if (row.kind === "pipeline") run.reportUntil = Date.now() + REPORT_GRACE_MS;
-      invalidate(run, ["transcript"]);
+      invalidate(run, rs.detail.orchestration ? ["detail", "transcript"] : ["transcript"]);
     }
   }
   if (id === rs.id) refreshUsage(run, event.id);
