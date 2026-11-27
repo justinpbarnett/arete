@@ -7,7 +7,7 @@ import shlex
 import sys
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,6 +21,7 @@ from . import (
     context,
     devices,
     environment,
+    factory_control,
     guard,
     jev,
     jev_ask,
@@ -237,6 +238,7 @@ def admitted(kw: dict, limits: dict | None) -> dict:
                     for key, value in limits.items()}}
 
 
+@factory_control.work
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",
@@ -360,15 +362,21 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         launch_kw = admitted(launch_kw, on_launch(route))
-        started = util.iso()
-        with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
-            res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                          tier, kind, picked.auth, route, try_no, atom,
-                          openrouter_quote=chosen_route.price if openrouter else None)
+        account = account_of(picked.auth)
+        with ExitStack() as after_attempt:
+            if account and (picked.selected is None or picked.selected.using_login or picked.selected.key_available):
+                local_claude = sys.platform == "linux" and chosen_route.runner == "claude" and not target.remote
+                if accounts.record_resolved(picked.auth, defer_unconfigured=local_claude):
+                    after_attempt.callback(enroll_after_attempt, picked)
+            started = util.iso()
+            with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
+                res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target,
+                              launch_kw, tier, kind, picked.auth, route, try_no, atom,
+                              openrouter_quote=chosen_route.price if openrouter else None)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
-            res.session = replace(res.session, credential=chosen_route.credential, account=account_of(picked.auth),
+            res.session = replace(res.session, credential=chosen_route.credential, account=account,
                                   generation=picked.auth.generation)
             if openrouter:
                 res.session = replace(res.session, openrouter_model=picked.name, openrouter_run=config_run)
@@ -393,6 +401,14 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
                                 picked.auth)
         say(f"{routing.hold_words({'why': why, 'until': limit.until})}, trying another route")
+
+
+def enroll_after_attempt(picked: Picked) -> None:
+    accounts.record_resolved(picked.auth, wait_for_activation=True)
+    if picked.selected:
+        for refreshed in picked.selected.refreshed_auths:
+            if not refreshed.identity:
+                accounts.record_resolved(refreshed, refresh_only=True, wait_for_activation=True)
 
 
 def unresumable(which: str, name: str, resume: Session) -> Result:

@@ -71,7 +71,7 @@ def lookup(c, run_id):
                      (run_id, run_id, run_id, run_id)).fetchone()
 
 
-def acquire(run_id: str, previous: str, data: dict) -> Lease:
+def acquire(run_id: str, previous: str, data: dict, *, spec_root: str = "") -> Lease:
     if data.get("protocol") == 2:
         migrate_on_demand(WORKER_EXCHANGE_SCHEMA)
     with tx() as c:
@@ -84,7 +84,11 @@ def acquire(run_id: str, previous: str, data: dict) -> Lease:
             row = c.execute("SELECT status FROM runs WHERE id = ?", (old["current_run"],)).fetchone()
             if row is None or row["status"] == "running":
                 raise Conflict("the previous controller has not been settled")
-        root, generation = (old["root"], old["generation"] + 1) if old else (run_id, 1)
+        root, generation = (old["root"], old["generation"] + 1) if old else (spec_root or run_id, 1)
+        if spec_root:
+            claim = c.execute("SELECT run FROM spec_deliveries WHERE root = ?", (spec_root,)).fetchone()
+            if root != spec_root or claim is None or claim[0] != run_id:
+                raise Conflict("the run does not hold the spec delivery claim")
         data = decoded(old)["data"] if old else data
         data["runs"] = list(dict.fromkeys([*data.get("runs", [root]), run_id]))
         if old:

@@ -199,7 +199,7 @@ def release_repo(cfg: config.Config) -> config.Repo | None:
 
 
 def release_base(repo: config.Repo) -> str:
-    return config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
+    return repo.target_branch or config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
 
 
 def release_contains_fixes(repo: config.Repo, numbers: list[int], sha: str) -> bool:
@@ -299,8 +299,9 @@ def ticket_gate(source: tracker.Tracker, tid: str) -> tuple[str | None, list[tup
     if isinstance(source, tracker.GitHubTracker):
         if not re.fullmatch(r"[1-9][0-9]*", tid) or not (ticket := open_ticket(source, int(tid))):
             return None, []
-        refs = tracker.github_waits(ticket.get("body") or "", source.repo.github)
-        return source.wait_blocker(refs), refs
+        remembered = source.remember(tid, ticket)
+        refs = tracker.github_waits(remembered.body, source.repo.github)
+        return source.ticket_wait_blocker(remembered, include_environment=False), refs
     ticket = source.get(tid, include_environment=False)
     return (ticket.blocker if ticket.open else None), []
 

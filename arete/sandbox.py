@@ -5,7 +5,15 @@ import fcntl
 import os
 import pwd
 import re
+import select
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
 import sys
+import time
+from contextlib import ExitStack, closing, suppress
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -15,6 +23,7 @@ SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
 LOGIN_DIR = paths.STATE_DIR / "pi-login"
 KEY_DIR = paths.STATE_DIR / "pi-key"
+LINUX_SHM = Path("/dev/shm")
 TEMPORARY_ROOTS = ("/private/tmp", "/private/var/folders")
 WRITABLE_ALWAYS = (*TEMPORARY_ROOTS, "/dev")
 WRITABLE_DEVICES = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/dtracehelper", "/dev/tty")
@@ -32,6 +41,113 @@ except KeyError:
 
 class ConfinementUnavailable(PermissionError):
     pass
+
+
+class WorkerLease(ExitStack):
+    active = False
+
+    def acquire(self) -> None:
+        if sys.platform == "linux":
+            from . import secretstore
+
+            self.enter_context(secretstore.credential_activation())
+            self.active = True
+            self.callback(setattr, self, "active", False)
+
+    def command(self, argv, descriptors=()):
+        if not self.active:
+            return argv
+        entry = (f"import os, sys; env = os.environ.copy(); sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                 "from arete.sandbox import linux_worker_relay; sys.exit(linux_worker_relay(env, *sys.argv[1:]))")
+        return [sys.executable, "-I", "-c", entry, str(os.getpid()), str(paths.STATE_DIR.resolve()),
+                ",".join(map(str, descriptors)), *argv]
+
+
+def worker_authority(lease: WorkerLease) -> tuple[Path, ...]:
+    roots = authority_roots()
+    if lease.active:
+        with suppress(OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error):
+            store, active = linux_store_policy(has_local=paths.FINGERPRINT_KEY_FILE.exists(), had_local=False)
+            if active and store in roots:
+                lease.close()
+    return roots
+
+
+def drain_worker_children(children: Path) -> None:
+    while True:
+        try:
+            if os.waitpid(-1, os.WNOHANG)[0]:
+                continue
+        except ChildProcessError:
+            return
+        try:
+            live = children.read_text().split()
+        except OSError:
+            os.waitpid(-1, 0)
+            continue
+        for pid in live:
+            with suppress(ProcessLookupError, PermissionError):
+                os.kill(int(pid), signal.SIGKILL)
+        time.sleep(0.02)
+
+
+def monitor_linux_worker(peer, descriptors, command, env) -> None:
+    from .check_process import PR_SET_CHILD_SUBREAPER
+
+    if ctypes.CDLL(None).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise ConfinementUnavailable("could not supervise the Linux worker's descendants")
+    children = Path(f"/proc/self/task/{os.getpid()}/children")
+    children.read_text()
+    if select.select([peer], [], [], 0)[0]:
+        return
+    proc = subprocess.Popen(command, env=env, pass_fds=descriptors, start_new_session=True)
+    try:
+        for fd in (0, 1, 2, *descriptors):
+            os.close(fd)
+        while proc.poll() is None and not select.select([peer], [], [], 0.05)[0]:
+            pass
+    finally:
+        with suppress(PermissionError):
+            proc.kill()
+        code = proc.wait()
+        drain_worker_children(children)
+    with suppress(BrokenPipeError):
+        peer.sendall(str(code if code >= 0 else 128 - code).encode())
+
+
+def linux_worker_relay(env, parent, state, descriptors, *command):
+    from . import secretstore
+
+    descriptors = tuple(map(int, descriptors.split(","))) if descriptors else ()
+    relay, peer = socket.socketpair()
+
+    def cancel(*_):
+        with suppress(OSError):
+            relay.shutdown(socket.SHUT_WR)
+
+    with relay, peer, secretstore.credential_activation(state=Path(state)):
+        signal.signal(signal.SIGTERM, cancel)
+        set_parent_death_signal = 1
+        if ctypes.CDLL(None).prctl(set_parent_death_signal, signal.SIGTERM, 0, 0, 0) or os.getppid() != int(parent):
+            return 125
+        launcher = os.fork()
+        if launcher == 0:
+            try:
+                relay.close()
+                os.setsid()
+                if os.fork() == 0:
+                    monitor_linux_worker(peer, descriptors, command, env)
+            except OSError as error:
+                with suppress(OSError):
+                    os.write(2, f"Linux worker supervision failed: {error}\n".encode())
+            finally:
+                os._exit(0)
+        peer.close()
+        os.waitpid(launcher, 0)
+        for fd in (0, 1, 2, *descriptors):
+            os.close(fd)
+        with relay.makefile("rb") as receipt:
+            return int(receipt.read() or b"125")
 
 
 def secret_path(p: Path | str) -> bool:
@@ -85,9 +201,20 @@ def sandboxed() -> bool:
     return lib.sandbox_check(os.getpid(), None, 0) != 0
 
 
+def secret_store_roots() -> tuple[Path, ...]:
+    from . import config
+
+    try:
+        directory = config.secret_settings().store_dir
+    except (OSError, ValueError, TypeError, KeyError):
+        return ()
+    return (directory,) if directory else ()
+
+
 def authority_roots() -> tuple[Path, ...]:
     return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
             paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
+            paths.FINGERPRINT_KEY_FILE, *secret_store_roots(),
             *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
 
 
@@ -109,9 +236,10 @@ def already_protects_authority() -> bool:
         return False
 
     for path in authority_roots():
-        if denied(path, b"file-read-data", b"file-write-data", b"file-write-create"):
+        fingerprint = path == paths.FINGERPRINT_KEY_FILE
+        if denied(real_path(path) if fingerprint else path, b"file-read-data", b"file-write-data", b"file-write-create"):
             continue
-        if absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
+        if not fingerprint and absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
                 paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority"))):
             continue
         return False
@@ -125,6 +253,223 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
+
+
+def linux_git_metadata(source: Path) -> Path | None:
+    source = Path(os.path.abspath(source))
+    marker = source / ".git"
+    if source.resolve() != source or marker.is_symlink():
+        return None
+    if marker.is_dir():
+        return marker
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--is-bare-repository"],
+            cwd=source, env={"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    fields = os.fsdecode(probe.stdout).removesuffix("\n").split("\n")
+    if probe.returncode or len(fields) != 3:
+        return None
+    git_dir, common = (Path(p) for p in fields[:2])
+    if not common.is_absolute() or common.resolve() != common:
+        return None
+    if not marker.exists() and git_dir == common == source and fields[2] == "true":
+        return common
+    if marker.is_file() and git_dir.parent == common / "worktrees" and git_dir.resolve() == git_dir:
+        from . import workspace
+
+        backlink = git_dir / "gitdir"
+        if (backlink.is_file() and not backlink.is_symlink() and backlink.stat().st_size <= 4096
+                and workspace.registered_root_checkout(source)):
+            return common
+    return None
+
+
+def linux_repository_roots(checkouts: tuple[Path, ...]) -> set[Path]:
+    repositories = set()
+    for checkout in checkouts:
+        for parent in (checkout, *checkout.parents):
+            if parent in (LINUX_SHM, paths.WORKTREES_DIR.resolve(), parent.parent):
+                break
+            if (parent / ".git").exists():
+                repositories.add(parent)
+                break
+    return repositories
+
+
+def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path], session_checkout) -> set[Path]:
+    from . import config
+    from .store import db, workspaces
+
+    base = paths.WORKTREES_DIR.resolve()
+    requested: dict[str, list[Path]] = {}
+    for root in checkouts:
+        if base in root.parents:
+            requested.setdefault(root.relative_to(base).parts[0], []).append(root)
+    selected = set()
+    if session_checkout:
+        worktree, source = session_checkout
+        expected = base / worktree.name
+        if worktree.parent.resolve() == base and expected in repositories and checkouts[0].is_relative_to(expected):
+            selected.add((expected, source))
+    if requested:
+        with suppress(db.NoDatabase), db.reader() as conn:
+            if db.migration_applied(db.WORKSPACE_SNAPSHOT_SCHEMA, conn):
+                for name, roots in requested.items():
+                    if row := workspaces.open_for(name):
+                        for checkout in workspaces.owner_of(row).checkouts:
+                            worktree = checkout.wt.resolve()
+                            if worktree.is_relative_to(base / name) and any(
+                                    worktree.is_relative_to(root) or root.is_relative_to(worktree) for root in roots):
+                                selected.add((worktree, checkout.src))
+    # A configured linked checkout can also be selected directly.
+    linked = {repo for repo in repositories if (repo / ".git").is_file()}
+    if linked:
+        configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
+                      for part in ["", *(p.dir for p in repo.parts)]}
+        selected.update((repo, repo) for repo in linked & configured)
+    metadata = set()
+    for worktree, source in selected:
+        common = linux_git_metadata(worktree)
+        if common is not None and common == linux_git_metadata(source):
+            metadata.add(common)
+    return metadata
+
+
+def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, run_id="", temporary=None,
+                       store=None, managed_profile=False, session_checkout=None):
+    from . import guard
+
+    state = paths.STATE_DIR.resolve()
+    config_root = paths.CONFIG_DIR.resolve()
+    worktrees = paths.WORKTREES_DIR.resolve()
+    run_dirs = guard.run_folders(run_id)
+    protected = (state, config_root, store) if store else (state, config_root)
+    repositories = linux_repository_roots(checkouts)
+    writable = set(checkouts) | linux_checkout_metadata(checkouts, repositories, session_checkout)
+    writable.update(p.resolve() for p in run_dirs)
+    if profile is not None:
+        writable.add(profile)
+    if temporary is not None:
+        writable.add(temporary)
+    resumed_profile = (managed_profile and profile and profile.name == "claude-openrouter"
+                       and profile.parent.parent == paths.RUNS_DIR.resolve())
+    for root in writable:
+        if root in (LINUX_SHM, LINUX_SHM.parent) or any(p.is_relative_to(root) for p in protected):
+            raise ConfinementUnavailable("Claude writable directories must be separate from its protected state")
+        if root.is_relative_to(config_root) or (store and root.is_relative_to(store)):
+            raise ConfinementUnavailable("Claude cannot write to its configuration or secret store")
+        if root.is_relative_to(state) and not (
+                (worktrees != state and worktrees in root.parents) or (root == profile and resumed_profile)
+                or any(root.is_relative_to(p.absolute()) for p in run_dirs)):
+            raise ConfinementUnavailable("Claude cannot write to instance coordination state")
+    for path in (*run_dirs, *((profile,) if profile is not None else ())):
+        with paths.directory_fd(path.absolute(), create=True):
+            pass
+    mounts = ["--ro-bind", str(state), str(state)] if state.is_dir() else []
+    for repo in sorted(repositories - writable):
+        if LINUX_SHM in repo.parents and not any(repo.is_relative_to(p) or p.is_relative_to(repo) for p in protected):
+            mounts += ["--ro-bind", str(repo), str(repo)]
+    if temporary is not None and LINUX_SHM in temporary.parents:
+        address = str(temporary.parent / "hook")
+        mounts += ["--ro-bind", address, address]
+    for root in sorted(writable):
+        if writable.isdisjoint(root.parents):
+            mounts += ["--bind", str(root), str(root)]
+    return mounts
+
+
+def claude_confinement(command: list[str], cwd: Path | str, opened: tuple[Path, ...] = (), *,
+                       profile: Path | None = None, mount_lease: ExitStack | None = None,
+                       activation_lease: WorkerLease | None = None, run_id: str = "",
+                       temporary: Path | None = None, managed_profile: bool = False,
+                       session_checkout: tuple[Path, Path] | None = None) -> list[str]:
+    if sys.platform == "darwin" and not can_confine(False):
+        raise ConfinementUnavailable("Claude on macOS requires sandbox-exec for secret confinement")
+    if sys.platform != "linux":
+        return command
+    from . import secretstore
+
+    launcher = shutil.which("bwrap", path=os.defpath)
+    if not launcher:
+        raise ConfinementUnavailable("Claude on Linux requires bubblewrap for secret confinement")
+    try:
+        key = secretstore.local_key_path()
+        info = linux_key_info(key)
+        had_local = info is not None
+        if activation_lease is not None:
+            activation_lease.acquire()
+            info = linux_key_info(key)
+        if info is not None and mount_lease is not None:
+            had_local = True
+            info = mount_lease.enter_context(secretstore.local_key_mount_lease(key))
+        store, activated = linux_store_policy(has_local=info is not None, had_local=had_local)
+        if activated and activation_lease is not None:
+            activation_lease.close()
+        work = Path(cwd).resolve()
+        checkouts = (work, *(Path(root).resolve() for root in opened))
+        profile = (work / profile).resolve() if profile is not None else None
+        targets = checkouts + ((profile,) if profile is not None else ())
+        if store is not None and any(root.is_relative_to(store) for root in targets):
+            raise ConfinementUnavailable("Claude cannot start inside the secret store")
+        masks = linux_fingerprint_mounts(key, info, targets) if info is not None else []
+        restored = linux_claude_mounts(checkouts, profile, run_id=run_id, temporary=temporary,
+                                      store=store, managed_profile=managed_profile, session_checkout=session_checkout)
+    except ConfinementUnavailable:
+        raise
+    except secretstore.FingerprintKeyMissing as error:
+        raise ConfinementUnavailable(str(error)) from error
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as error:
+        raise ConfinementUnavailable("Claude could not determine Linux secret confinement paths") from error
+    if store is not None:
+        try:
+            with secretstore.file_parent(store / "mount", store, create=True, private=True):
+                pass
+        except OSError as error:
+            raise ConfinementUnavailable("Claude could not prepare the Linux secret store mount") from error
+        masks += ["--tmpfs", str(store), "--remount-ro", str(store)]
+    return [launcher, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL",
+            "--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            *restored, *masks, "--chdir", str(work), "--", *command]
+
+
+def linux_key_info(key: Path) -> os.stat_result | None:
+    with suppress(FileNotFoundError):
+        return key.lstat()
+    return None
+
+
+def linux_fingerprint_mounts(key: Path, info: os.stat_result, opened: tuple[Path, ...]) -> list[str]:
+    from . import secretstore
+
+    if any(Path(root).resolve().is_relative_to(key) for root in opened):
+        raise ConfinementUnavailable("Claude cannot open the instance fingerprint key as a workspace")
+    if not secretstore.private_file(info) or info.st_size != 32:
+        raise ConfinementUnavailable("Claude requires a private regular fingerprint key file for confinement")
+    return ["--ro-bind", os.devnull, str(key)]
+
+
+def linux_store_policy(*, has_local: bool, had_local: bool) -> tuple[Path | None, bool]:
+    from . import config, secretstore
+    from .store import credentials, db
+
+    meta = {}
+    required = had_local
+    with suppress(db.NoDatabase), closing(db.read_connection()) as c, db.read_snapshot(c):
+        meta = db.metadata(c)
+        required = required or secretstore.KEY_LOCAL in meta or (
+            not has_local and bool(meta) and db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c)
+            and credentials.has_fingerprints(c))
+    settings = config.secret_settings()
+    activated = secretstore.KEY_REF in meta
+    if activated and settings.store == "pve_store":
+        secretstore.referenced_key(meta, settings)
+    elif activated or (required and not has_local):
+        raise secretstore.FingerprintKeyMissing("fingerprint_key_missing")
+    return settings.store_dir, activated
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,

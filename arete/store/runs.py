@@ -8,7 +8,7 @@ from datetime import timedelta
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
-from .db import WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
+from .db import SPEC_DELIVERY_SCHEMA, WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -630,11 +630,15 @@ def _prune(c, days, lines_days):
         "WHERE w.phase NOT IN ('completed','integrated','cancelled') "
         "AND EXISTS (SELECT 1 FROM json_each(o.data,'$.runs') WHERE value=runs.id)) "
     ) if migration_applied(WORKER_EXCHANGE_SCHEMA, c) else ""
+    keep_specs = (
+        "AND NOT EXISTS (SELECT 1 FROM spec_deliveries s WHERE s.repo = runs.repo AND s.issue = runs.issue "
+        "AND s.state != 'complete') "
+    ) if migration_applied(SPEC_DELIVERY_SCHEMA, c) else ""
     eligible = c.execute(
         "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
         "AND status NOT IN ('running', 'pr', 'needs-info') "
         "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-        + keep_workers
+        + keep_workers + keep_specs
         + "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
         "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
         "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
@@ -658,7 +662,11 @@ def running_runs(conn):
 
 
 def insert_run(run_id: str, row: dict) -> None:
-    writes.insert("runs", row, run_id, "run.started")
+    from . import factory
+
+    with writes.atomic() as c:
+        writes.insert("runs", row, run_id, "run.started")
+        factory.registered_run(c, run_id, row)
 
 
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
@@ -694,7 +702,14 @@ def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
 def note(run_id: str, *, base_version=None, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run's status")
-    writes.update("runs", run_id, fields, base_version=base_version)
+    if fields.get("pid"):
+        from . import factory
+
+        with writes.atomic() as c:
+            writes.update("runs", run_id, fields, base_version=base_version)
+            factory.register(c, run_id, fields["pid"], "run")
+    else:
+        writes.update("runs", run_id, fields, base_version=base_version)
 
 
 def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
@@ -727,10 +742,13 @@ def ask_stop(run_id: str, base_version=None) -> dict | None:
 
 
 def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> dict | None:
-    with writes.atomic():
+    from . import factory
+
+    with writes.atomic() as c:
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        factory.finish_run(c, run_id)
         if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
             from . import insights
 

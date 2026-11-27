@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import config, gh, paths, record, sandbox, scratch, tracker, util
-from .store import db, runs
-from .store import workspaces
+from .store import db, runs, workspaces
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -42,6 +41,8 @@ class Checkout:
     onto: str = ""
     kept: str = ""
     pushed_head: str = ""
+    recovery_head: str = ""
+    recovery_base: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> Checkout:
@@ -92,12 +93,12 @@ class Checkout:
 
     @property
     def diff_from_base(self) -> str:
-        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.origin_base}...HEAD"
+        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.recovery_base or self.origin_base}...HEAD"
 
     @property
     def diff_from_fork(self) -> str:
         try:
-            fork = git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
+            fork = self.recovery_base or git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
         except (RuntimeError, OSError):
             fork = ""
         return f"git {f'-C {self.dir} ' if self.dir else ''}diff {fork or self.origin_base}"
@@ -761,8 +762,10 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
                    copies: list[str], *, preview_of: str = "",
                    excluded: Collection[Path] = ()) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
-    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
+    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
+                          repo.target_branch or base or gh.default_branch(p.github))
                  for p in repo.parts if ws / p.dir not in excluded]
+    require_target_branch(repo, checkouts, work_branch=branch)
     if any(wt.resolve().is_relative_to(c.wt.resolve()) or c.wt.resolve().is_relative_to(wt.resolve())
            for c in checkouts for wt in excluded):
         raise worktree_failure("an active worktree overlaps a closed PR worktree", ws, branch)
@@ -772,11 +775,22 @@ def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: 
         if preview_of:
             return bool(remote_head(c.src, preview_of))
         c.pr = gh.open_pr_url(c.github, branch)
+        require_target_branch(repo, [c])
         c.lease = remote_head(c.src, branch)
         return bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
 
     place_checkouts(run_id, checkouts, kept, branch, resumes_for, starting_branch=preview_of or branch)
     return ws, checkouts
+
+
+def require_target_branch(repo: config.Repo, checkouts: list[Checkout], *, work_branch: str = "") -> None:
+    target = repo.target_branch
+    if not target:
+        return
+    if work_branch == target:
+        raise RunFailed(f"the work branch is the saved target {target}; choose a separate work branch")
+    if any(c.base != target or c.pr and gh.pr_view(c.pr).get("baseRefName") != target for c in checkouts):
+        raise RunFailed(f"the existing checkout or PR does not target {target}; publication refused")
 
 
 def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False, owner: str = "") -> Path:
@@ -916,17 +930,3 @@ def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str]
                         git(["worktree", "remove", "--force", str(c.wt)], c.src)
                 add_worktree(c, branch, start_of(c, starting_branch))
             clone["resumed"] = c.resumes
-
-
-# Processes started before the cutover retain their original snapshot protocol.
-if not db.WORKSPACE_ROWS_ACTIVE:
-    from . import workspace_legacy as legacy
-
-    OWNER_KEY = legacy.OWNER_KEY
-    WorkspaceOwner = legacy.WorkspaceOwner
-    remove_workspace = legacy.remove_workspace
-    remove_checkouts = legacy.remove_checkouts
-    made_record = legacy.made_record
-    made_before = legacy.made_before
-    owner_in = legacy.owner_in
-    _note_made = legacy._note_made

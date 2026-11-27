@@ -555,7 +555,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
     except (ValueError, TypeError) as e:
         p.error(str(e))
     script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
-                             args.repairs, args.action, args.only_action, args.environment_release)
+                             args.repairs, args.action, args.only_action, args.environment_release, tuple(args.sets))
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)

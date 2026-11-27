@@ -5,6 +5,79 @@ The controller chooses bounded actions and supervises delegates; Arete retains p
 A separate planner, learning pass and documentation pass are optional, not hidden prerequisites.
 An explicitly invoked fixed or custom script keeps its strategy.
 
+## Code review
+
+New and resumed orchestrated tickets finish with the repository’s full checks and a two-part code review.
+After the full configured checks pass on the current candidate, two fresh read-only reviewers inspect it against its pinned base.
+The controller can request checks and review in one decision. After a failed or partial check, it requests review again once the full suite passes.
+Standards checks the repository’s written rules and flags possible code smells. Spec checks the issue and owner clarifications.
+This adapts [Matt Pocock’s code-review skill](https://github.com/mattpocock/skills/blob/d65391149dbb5fe76478e76fa8d5122b2aa5a70e/skills/engineering/code-review/SKILL.md) to Arete’s uncommitted delivery tree.
+
+A clean report can go straight to publication. With findings, the orchestrator decides which ones need work.
+It delegates repairs, runs full checks on the resulting candidate, then calls `review.decide` with the source review action ID
+and a `fixed` or `nonblocking` decision and reason for each finding. The action ledger retains the original findings
+and the delivery report includes the decisions. Repairs to those findings can proceed without a second full code review.
+A material scope or base change calls for a fresh review. Configured probes and explicit journey IDs require behavioral
+verification. The orchestrator can also request it for ticket acceptance or a specific uncertainty.
+When an older ticket resumes, its next publication requires a fresh Standards and Spec review.
+Its previous reviews remain in the action history. Current checks, retained work and owner decisions carry forward.
+A release-specific verification retry uses its original evidence requirements.
+
+## Check repairs and verification retries
+
+After a configured check fails, the next check run exercises the failed command on the repaired candidate.
+For an Arete Python test run with identifiable failures, it runs the named methods or classes first.
+A focused pass is evidence for the repair. Publication still requires the full suite on the final integrated tree.
+Repeated requests can reuse that full pass or an identical focused failure on unchanged inputs. An explicit
+operator rerun executes the checks again.
+When every failure points to the same macOS sandbox profile installation problem, the owner sees one runner
+question listing the affected tickets. Confirming readiness releases the eligible tickets to retry independently.
+
+Behavioral verification records the scenarios observed, the remaining requirements and the missing capability.
+The controller can request a follow-up by exact requirement name. Compatible evidence carries forward, and
+switching models on the same blocked tool surface reuses the recorded result. For a required behavior, the
+controller can select an approved runner with the missing capability or request the fixture or access it needs.
+For a supplemental scenario the verifier identified as advisory, the controller can record its reason to proceed
+with `verification.decide`. The PR retains the gap and decision. Each required behavior still needs evidence.
+
+For a native spec enrolled in protected release verification, the candidate verifier exercises the full
+definition of done against the candidate and returns the controller’s `pending_delivery` identifier.
+The controller binds that identifier to the native ticket, its approved scope, definition, destination and
+protected observation policy. After merge, the release check must record the matching deployed behavior
+before Arete posts the delivery evidence and closes the ticket.
+
+An older baseline can have a single named release observation recorded as an unmeasured candidate requirement.
+If the existing evidence includes a successful observation of each local check, the next verification result
+can offer the spec publisher an `owner_delivery_directions` entry for that exact remaining requirement.
+The publisher can assign it to the enrolled release check by posting the supplied line alone on the native
+ticket. Arete verifies the publisher and current comment, retains the historical evidence, and requires fresh
+observations of all the previous candidate checks. A separate open owner question still needs its own reply
+on the dashboard or through `arete answer`. Other missing requirements still need candidate evidence.
+
+A publisher can enumerate individual candidate checks in the native spec body as `AC-1`, `AC-2`, and so on.
+To bind those checks to an enrolled release, add the following line using the enrolled values.
+
+```text
+Delivery observation: Protected release receipt for DESTINATION PATH under policy SHA256
+```
+The destination, path and complete digest must match
+the protected policy. Each candidate check needs its identifier, how the verifier exercised it, and what it saw.
+For this format the independent verifier reports a missing local observation with its name and reason.
+Its pending release entry can contain only the controller-supplied identifier. Additional local gaps still block
+publication. A malformed report permits a fresh baseline and supplies no release evidence.
+
+When a publisher revises such a spec, Arete shows which unmeasured observations came from a completed
+baseline for the superseded scope. Choosing **Keep decisions and use revised checks** retains the earlier owner
+answers while requiring fresh observations on the amended spec. **Use the revised ticket** also replaces the listed
+owner decisions. **Keep the listed decisions** retains both. The linked historical action, report digest and owner
+answer remain available for audit. A requirement lacking this provenance or still named in the revised spec
+remains due. The protected receipt must still come from the running release.
+
+The Outcomes dashboard and `GET /api/outcomes` report repeated and suppressed verification retries, full-suite
+runs per published PR, and median time from the first failing check to a passing repair. Older receipts without
+a comparable runner fingerprint appear as unclassified. When an existing run needs new behavioral evidence
+and its last report predates environment tracking, it takes one fresh baseline before a focused follow-up.
+
 ## Select or revert
 
 Set the layer deliberately:
@@ -52,7 +125,8 @@ The model retains the runner's filesystem confinement, JEV/tool checks and close
 ## Worker questions and parallel builders
 
 Set `max_builders` in the repository layer to opt new orchestrated lineages into worker protocol 2.
-Start a pilot at one and use two for a comparison on independent work.
+Set worker and builder limits to fit the resources available to each run. For example, this layer
+allows three active workers, up to two of whom can write concurrently.
 
 ```toml
 [orchestration]
@@ -66,7 +140,9 @@ pinned per lineage. Private workers read repository instructions inside their ch
 session, without external instruction files or MCP servers. Provider admission and layer payment policy apply.
 
 Both limits take integers from 1 through 10000. Each active worker occupies a worker slot.
-The builder ceiling is the smaller limit. The controller can use fewer slots.
+The builder ceiling is the smaller limit. Within a ticket, the controller can start independent
+assignments together when their inputs are ready and their write paths are disjoint. A change that
+depends on another builder's edits waits for those edits to be integrated.
 Omitting `max_builders` selects the original protocol and its exclusive writer. Setting it to one keeps the
 question and receipt protocol with serial builders. Existing lineages retain their recorded mode and ceilings.
 Local Pi on macOS and replay support private turns. Unavailable confinement, unsupported build routes,
@@ -183,6 +259,7 @@ Recursive secret exclusions remain active while ordinary directory creation and 
 Reads are limited to the granted workspace/directories, the installed Arete/Python/Node/uv runtimes and operating-system-managed tool/library/configuration roots, not arbitrary host directories.
 Hard-linked regular files in granted workspaces and mutable runtime read roots are excluded and commands cannot create hard links; hard-link-dependent fixtures are unsupported on this route.
 Owner-configured `[agent] read_roots` in a repository layer can admit absolute paths for additional read-only command runtimes, such as a verification wrapper outside the workspace.
+Private builder shell commands use the candidate and standard command runtimes. The independent verifier can use the additional read-only roots.
 These roots receive the same recursive-secret, hard-link and protected-path restrictions, never a write grant or trusted cleanup authority.
 They are part of the pinned layer policy and cannot be supplied by a model's shell request.
 Runtime roots must be outside all agent-writable trees, including shared temporary and runner-support directories; their canonical targets are pinned before model execution and a changed target is refused.
@@ -206,6 +283,7 @@ A dry run retains its local diff/report/workspace and performs no publication or
 SQLite orchestration tables are authoritative; run lines and viewer state are projections.
 A successor fences the old generation, checks producer identities and restores durable workspace authority and matching results.
 Completed evidence remains usable only for its matching tree, policy and owner acceptance inputs.
+When automatic PR recovery resolves a conflict locally, the orchestrator can see the PR head, target revision and resolved tree. Once the workspace is settled, Arete sends that candidate through full checks. A failed check returns to the usual repair process.
 Interrupted inference may have unknown usage, which is not an unlaunched free call.
 
 A changed admitted controller/catalog/policy, missing durable preparation, live prior producer or uncertain publication effect refuses automatic continuation.
@@ -265,9 +343,9 @@ to accepted delivery, acceptance rate and cost per acceptance including failed a
 size, uncertainty, controller calls, owner interventions and rework. Trial timing includes that ticket's own waits.
 Measure queue delay for other tickets in the same worker pool separately.
 
-The proposed threshold for promoting two builders to the default is at least 20% lower median accepted-delivery
-time on eligible tickets, with acceptance at least as high and cost per acceptance at most as high. Keep two
-opt-in while the model-backed comparison is inconclusive. Setting the layer cap to one rolls back new runs.
+For the one-versus-two comparison, the proposed threshold is at least 20% lower median time to accepted
+delivery on eligible tickets, with acceptance at least as high and cost per acceptance at most as high.
+Setting the layer cap to one returns new runs to serial builds.
 
 Shared finite experiment limits govern admitted calls, concurrent token/spend reservations and elapsed time.
 A grant only narrows a launch's existing limits.
@@ -276,3 +354,37 @@ Missing or uncertain usage stops the experiment for reconciliation and leaves ch
 Results include total actual usage, controller/worker breakdowns, owner interventions, accepted outcomes and cost per acceptance, including failed attempts.
 Legacy manifests without `executor` retain their atom behavior and design shape.
 Replay demonstrates execution mechanics, not native isolation, model quality or an economic advantage for orchestration.
+
+### Hosted macOS check for Arete
+
+A suppressed nested macOS sandbox profile can block the behavior suite before the worker-isolation assertion runs.
+The local owner can enroll Arete’s own GitHub repository by creating `hosted-macos.toml` in the private Arete config
+directory. Set `repo = "justinpbarnett/arete"` and set `workflow_blob` to the quoted Git blob ID printed by
+`git rev-parse origin/main:.github/workflows/ci.yml` after the candidate-check workflow reaches protected main.
+Removing the file disables new requests and invalidates cached hosted passes. Changing the workflow requires a new owner pin.
+
+An authorized orchestrated ticket on this repo can then request the existing read-only `arete-checks` macOS job
+when its only failing check is the recognized behavior-suite profile denial. Arete applies its full outbound diff
+and stored-secret checks. A dedicated `arete-check/` branch carries a snapshot of the admitted tree, with its
+public base as the only parent. A separate commit supplies main’s protected workflow definition. Local WIP history
+and private runner data stay on the host. Each tree, policy and workflow pin identifies one branch, including across
+a retry or restart. The GitHub job retains its existing time limit and installs uv and Node. It runs the full suite
+on the candidate with the published test runner. Candidates that change this runner require another route.
+Before candidate setup or tests execute, GitHub separately projects the entire test directory from the candidate’s
+public comparison base onto a clean copy of the candidate product. An isolated Python interpreter runs the named
+worker-isolation witness from that protected copy. Candidate changes to the witness or its test support cannot
+supply this result. A missing, skipped or expected-failure witness holds the gate.
+
+The check action and its run folder (`hosted-check.json`) record the candidate tree and commit, policy digest,
+workflow blob and directory digest, protected witness base and tests digest, GitHub run and attempt, conclusion and the behavior process’s exit code when it ran. Cancelled, missing, failed, incomplete
+and stale results keep the gate closed. The other check commands still run locally. A hosted pass lets the ordinary
+independent review and behavioral-verification gates proceed. An already-held ticket uses the existing runner
+readiness confirmation to resume once the enrolled route is available.
+
+## Delivery points for graph prerequisites
+
+A published spec can schedule independent children together up to the configured worker capacity. An unqualified prerequisite or `api@merge` waits for verified behavior on the child and its reviewed PR head to be merged into the enrolled target branch. Use `service@release` when the consumer needs the deployed behavior. That edge requires a protected release receipt for the merged change.
+
+Use `publisher@artifact=@team/library:1.2.3` when the consumer needs a specific published version. Enroll a protected read-only observation of the package registry or artifact endpoint on the publisher ticket. Its receipt must identify the merged change and match the exact string values in `/name` and `/version`. Publishing a different version leaves the consumer waiting. Include the package name and version in the approved spec so the plan reviewer can check them.
+
+The parent stays open after its children merge. Arete checks its enrolled scenario against the release containing those changes and records the observed revision on the parent. A production promise in a staging-only repository also waits for the tested revision’s QA and production receipt.

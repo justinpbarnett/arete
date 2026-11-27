@@ -146,7 +146,9 @@ def openapi(registry, minor, source_hashes, oldest_client):
             if contract.keyed_write(op):
                 entry["parameters"].append({"name": "Idempotency-Key", "in": "header", "required": True,
                                             "schema": {"type": "string", "minLength": 8, "maxLength": 128}})
-            if method != "DELETE" or fields.keys() - path_fields:
+            if media := op.get("body_media"):
+                entry["requestBody"] = {"required": True, "content": {media: {"schema": {"type": "string"}}}}
+            elif method != "DELETE" or fields.keys() - path_fields:
                 body = inputs if not path_fields else {**inputs, "properties": {k: v for k, v in fields.items()
                          if k not in path_fields}, "required": [k for k in required if k not in path_fields]}
                 entry["requestBody"] = {"required": True, "content": {"application/json": {
@@ -177,6 +179,9 @@ def from_document(document):
                                 "errors": entry["x-arete-errors"],
                                 **{k: entry[v] for k, v in (("deprecated", "deprecated"), ("sunset", "x-arete-sunset"))
                                    if v in entry}}
+            content = entry.get("requestBody", {}).get("content", {})
+            if content.keys() - {"application/json"}:
+                operations[name]["body_media"], = content
     version = document["info"]["version"]
     if not re.fullmatch(r"1\.\d+", version):
         raise ValueError(f"invalid v1 version {version!r}")
@@ -324,6 +329,8 @@ def compare(old, new):
             new_input, new_result = batch_io(after, new["operations"])
         changes = [*schema_breaks(old_input, new_input, "input"),
                    *schema_breaks(old_result, new_result, "result", result=True)]
+        if before.get("body_media") != after.get("body_media"):
+            changes.append("request body media type changed")
         for code in sorted(set(before["errors"]) | set(after["errors"])):
             error = f"errors.{code}"
             if code not in before["errors"] or code not in after["errors"] or code not in new["errors"]:

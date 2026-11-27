@@ -29,13 +29,15 @@ class CheckProgressTests(ProgressFixture):
         super().setUp()
         self.ws = self.root / "checkout"
         util.git(["init", "-q", "-b", "fixture", "--template=", self.ws.name], self.root)
+        util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                  "commit", "--allow-empty", "-q", "-m", "fixture"], self.ws)
         self.repo = config.Repo(REPO, self.ws, github="owner/fixture")
         self.cfg = config.Config(repos=[self.repo], max_parallel_checks=1)
-        self.serial, self.diagnostic = count(1), DIAGNOSTIC
+        self.serial, self.diagnostic, self.tree = count(1), DIAGNOSTIC, "fixture-tree"
         for ctx in (patch.object(pipeline.environment, "sh", side_effect=self.launch),
                     patch.object(paths, "CHECK_LOCKS_DIR", self.root / "check-locks"),
                     patch.object(scrub, "secrets", return_value=SECRETS), patch.object(pipeline.Build, "resume"),
-                    patch.object(pipeline.Run, "log"), patch.object(factory, "fingerprint", return_value="fixture-tree"),
+                    patch.object(pipeline.Run, "log"), patch.object(factory, "fingerprint", side_effect=lambda *_: self.tree),
                     patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"file.py": 1}))):
             self.enterContext(ctx)
 
@@ -111,13 +113,18 @@ class CheckProgressTests(ProgressFixture):
             ctl = self.controller(mode, checks={"unit": FAIL, "unfinished": "true"})
             first, second, alternate, silent, repeat = admit(ctl.lease, *([CHECK] * 5))
             prior = []
-            for action, diagnostic, command in ((first, DIAGNOSTIC, FAIL), (second, other, FAIL),
-                                                (alternate, DIAGNOSTIC, ALTERNATE), (silent, "", FAIL)):
+            for index, (action, diagnostic, command) in enumerate((
+                    (first, DIAGNOSTIC, FAIL), (second, other, FAIL),
+                    (alternate, DIAGNOSTIC, ALTERNATE), (silent, "", FAIL)), 1):
+                ctl.data.pop("remaining_checks", None)
+                self.tree = f"fixture-tree-{mode}-{index}"
                 self.diagnostic = diagnostic
                 ctl.job.layer.checks["unit"] = command
                 ctl.dispatch(action)
                 if diagnostic:
                     prior.append((cause(diagnostic, command), attempt(action)))
+            ctl.data.pop("remaining_checks", None)
+            self.tree = f"fixture-tree-{mode}-repeat"
             self.diagnostic = DIAGNOSTIC
             if mode == "crashed":
                 ledger.transition(ctl.lease, repeat["id"], "running", {})
@@ -155,6 +162,7 @@ class CheckProgressTests(ProgressFixture):
 
         with patch.object(orchestration.Controller, "publish", publish):
             ctl = self.controller("catch-up")
+            ctl.run.code_review = False
             checks, publication = admit(ctl.lease, CHECK, {"op": "publication.request", "args": {}})
             for action in (checks, publication):
                 ctl.dispatch(action)
@@ -163,6 +171,7 @@ class CheckProgressTests(ProgressFixture):
             pairs = [(cause(), attempt(action)) for action in (checks, settled)]
             self.progress(ctl.run.tid, *pairs)
             resumed = self.controller(ctl.run.tid, ctl.run.id)
+            resumed.run.code_review = False
             resumed.executing = settled["id"]
             self.assertEqual(resumed.perform(settled)["failures"], orchestration.CATCH_UP_FAILURE)
             self.progress(ctl.run.tid, *pairs)

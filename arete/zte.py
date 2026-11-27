@@ -170,7 +170,8 @@ def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.Re
                       and (cfg.github_app.private_key is None or cfg.github_app.private_key.resolve() != ISSUE_KEY),
                       "the production issue App is reserved for the release supervisor")
     pilot.require(repo.github == target and repo.pipeline and len(repo.parts) == 1 and not repo.parts[0].dir
-                  and repo.parts[0].github == target and repo.layer and layer.base_branch in ("", "main")
+                  and repo.parts[0].github == target and repo.layer
+                  and (repo.target_branch or layer.base_branch) in ("", "main")
                   and layer.trust_level == "pr" and layer.factory_path == "orchestrated" and not cfg.replay.all
                   and layer.verify and not layer.verify.start and not layer.verify.probes
                   and set(layer.checks) >= {"lint", "compile", "imports", "web", "behavior"}

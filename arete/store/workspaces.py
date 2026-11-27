@@ -10,9 +10,8 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
-from .. import config, paths, util
-from .. import workspace
-from . import asks, db, events, runs, writes
+from .. import config, paths, util, workspace
+from . import asks, events, runs, writes
 from .db import reader, require_workspace_contract
 
 TABLES = {"workspaces": "kept, including removed rows", "workspace_files": "with workspace"}
@@ -619,58 +618,3 @@ def sweep(cfg: config.Config) -> None:
                 _sweep_unowned(cfg, folder, cutoff)
     finally:
         workspace.prune_repos(cfg)
-
-
-# Processes started before the cutover retain their original snapshot protocol.
-if not db.WORKSPACE_ROWS_ACTIVE:
-    from . import workspaces_legacy as legacy
-
-    JSON_FIELDS = legacy.JSON_FIELDS
-    WRITABLE = legacy.WRITABLE
-    NO_LEGACY_RECORD = legacy.NO_LEGACY_RECORD
-    SnapshotUnavailable = legacy.SnapshotUnavailable
-    UnreadableSnapshot = legacy.UnreadableSnapshot
-    UnstatableSnapshot = legacy.UnstatableSnapshot
-    get = legacy.get
-    open_for = legacy.open_for
-    by_state = legacy.by_state
-    files = legacy.files
-    _emit = legacy._emit
-    create = legacy.create
-    _create = legacy._create
-    update = legacy.update
-    _change_current = legacy._change_current
-    claim = legacy.claim
-    owner_of = legacy.owner_of
-    keep = legacy.keep
-    legacy_owner = legacy.legacy_owner
-    _run_for = legacy._run_for
-    _state_for = legacy._state_for
-    snapshot_fields = legacy.snapshot_fields
-    _snapshot = legacy._snapshot
-    made_before = legacy.made_before
-    _release_selection = legacy._release_selection
-    release = legacy.release
-    unlink_record = legacy.unlink_record
-    save_snapshot = legacy.save_snapshot
-    clear_snapshot = legacy.clear_snapshot
-    _save_snapshot = legacy._save_snapshot
-    _refresh_released = legacy._refresh_released
-    _record_version = legacy._record_version
-    _record_stat = legacy._record_stat
-    _require_record_version = legacy._require_record_version
-    require_unstatable_record = legacy.require_unstatable_record
-    _read_record = legacy._read_record
-    _reconcile = legacy._reconcile
-    import_legacy = legacy.import_legacy
-    _legacy_takeover = legacy._legacy_takeover
-    _reconcile_record = legacy._reconcile_record
-    _background_lock = legacy._background_lock
-    refresh_released = legacy.refresh_released
-    _import_new = legacy._import_new
-    backfill = legacy.backfill
-    record_release = legacy.record_release
-    _sweep_row = legacy._sweep_row
-    _sweep_owned = legacy._sweep_owned
-    _sweep_unowned = legacy._sweep_unowned
-    sweep = legacy.sweep

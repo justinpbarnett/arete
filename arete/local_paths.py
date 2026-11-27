@@ -73,7 +73,7 @@ def open_directory(part: str, parent: int, above_target: bool) -> int:
 
 
 @contextmanager
-def directory_fd(p: Path, parent: int | None = None, create: bool = False):
+def directory_fd(p: Path, parent: int | None = None, create: bool = False, *, durable: bool = False):
     parts = p.parts
     if ".." in parts or (parent is not None and p.is_absolute()):
         raise PermissionError("directory traversal refused")
@@ -81,11 +81,20 @@ def directory_fd(p: Path, parent: int | None = None, create: bool = False):
     try:
         walked = parts if parent is not None else p.absolute().parts[1:]
         for index, part in enumerate(walked):
+            created = False
             if create:
                 try:
                     os.mkdir(part, 0o700, dir_fd=fd)
+                    created = True
                 except FileExistsError:
                     pass
+            # A retry can encounter a directory created before its parent was synced.
+            if durable and (created or os.access(".", os.W_OK, dir_fd=fd)):
+                readable = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    os.fsync(readable)
+                finally:
+                    os.close(readable)
             next_fd = open_directory(part, fd, index < len(walked) - 1)
             os.close(fd)
             fd = next_fd

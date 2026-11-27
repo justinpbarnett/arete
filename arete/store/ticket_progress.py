@@ -79,8 +79,9 @@ def prerequisite_state(previous: dict, reads: dict, deployed: dict, retained: di
 
 
 def record_evidence(run_id: str, evidence: Iterable[tuple[str, str, str]]) -> None:
-    if ((run := runs.run_get(run_id)) and run["kind"] == "pipeline" and run["repo"] and run["issue"]
-            and not (run["only_step"] or run["dry_run"] or run["status"] == "dry-run") and (fresh := list(evidence))):
+    if ((run := runs.run_get(run_id)) and run.get("kind") == "pipeline" and run.get("repo") and run.get("issue")
+            and not (run.get("only_step") or run.get("dry_run") or run.get("status") == "dry-run")
+            and (fresh := list(evidence))):
         record(run["repo"], run["issue"], evidence=fresh)
 
 

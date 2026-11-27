@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from . import config, gh, jira, principals, util
 from .store import runs as run_store
+from .store import specs as spec_store
 from .store import tasks as tasks_store
 
 LABEL = "agent"
+SPEC_LABEL = "spec"
 ZTE_LABEL = "agent:zte"
 ZTE_QUEUE = f"its `{ZTE_LABEL}` label reserves it for zero-touch delivery"
 BATCH_LABEL = "agent:batch"
@@ -78,9 +81,31 @@ class Ticket:
     blocker: str = ""
     images: list[Image] = field(default_factory=list)
     github_repo: str = ""
+    github_blockers: list[int | str] = field(default_factory=list)
+    spec_identity: str = ""
+    owner_comments: str | None = None
+    saved_scope_matches: bool = False
+    graph_body: str | None = None
+
+    @property
+    def is_spec(self) -> bool:
+        return SPEC_LABEL in self.labels
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
+
+
+def github_issue_identity(repo: str, tid: str | int) -> str:
+    return f"github:{repo.casefold()}#{int(tid)}"
+
+
+def jira_issue_identity(site: str, issue_id) -> str:
+    if not isinstance(site, str) or not str(issue_id or "").isdigit():
+        return ""
+    url = urlsplit(site)
+    if not url.scheme or not url.netloc:
+        return ""
+    return f"jira:{url.scheme.casefold()}://{url.netloc.casefold()}{url.path.rstrip('/')}:{int(issue_id)}"
 
 
 def is_task_id(tid) -> bool:
@@ -119,6 +144,8 @@ def error_of(call: Callable[[], object]) -> str:
 def batch_ids(t: Ticket) -> list[str]:
     if BATCH_LABEL not in t.labels:
         return [t.id]
+    if t.is_spec:
+        raise TaskError("a spec cannot also be a batch")
     lines = [line for line in t.body.splitlines() if line.strip()]
     header = BATCH_LINE.fullmatch(lines[0]) if lines else None
     if (not header or not BATCH_REFS.fullmatch(header[1].strip())
@@ -155,8 +182,7 @@ class GitHubTracker:
     def __init__(self, repo: config.Repo):
         self.repo = repo
         self.owner = repo.github.split("/")[0]
-        self._bodies: dict[str, str] = {}
-        self._labels: dict[str, list[str]] = {}
+        self._tickets: dict[str, Ticket] = {}
         self._open: dict[int, bool | None] = {}
         self._open_agent_tickets: list[Ticket] = []
         self._dependency_tickets: list[Ticket] = []
@@ -185,26 +211,35 @@ class GitHubTracker:
     def dependency_tickets(self) -> tuple[Ticket, ...]:
         return tuple(self._dependency_tickets)
 
+    def remember(self, tid: str, issue: dict) -> Ticket:
+        tid = str(tid)
+        ticket = Ticket(tid, self.ref(tid), issue.get("title") or "", body=issue.get("body") or "",
+                        url=issue.get("url", ""), created=issue.get("createdAt", ""),
+                        labels=[label["name"] for label in issue.get("labels", [])], github_repo=self.repo.github)
+        try:
+            ticket.github_blockers = gh.open_issue_blockers(self.repo.github, int(tid), issue)
+        except (gh.GhError, TypeError, ValueError) as error:
+            ticket.blocker = f"it waits on GitHub blocking links that Arete could not read: {error}"
+        self._tickets[tid] = ticket
+        return ticket
+
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         failed = self.label_name("failed")
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
-        self._bodies, self._labels, self._open = {}, {}, {}
+        self._tickets, self._open = {}, {}
         self._open_agent_tickets, self._dependency_tickets = [], []
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             tid = str(i["number"])
-            self._bodies[tid] = i.get("body") or ""
-            self._open[int(i["number"])] = True
-            names = {lb["name"] for lb in i.get("labels", [])}
-            self._labels[tid] = sorted(names)
-            ticket = Ticket(tid, self.ref(tid), i["title"], body=self._bodies[tid],
-                            url=i.get("url", ""), created=i.get("createdAt", ""), labels=self._labels[tid].copy(),
-                            github_repo=self.repo.github)
+            ticket = self.remember(tid, i)
+            self._open[int(tid)] = True
+            ticket.labels.sort()
+            names = set(ticket.labels)
             self._open_agent_tickets.append(ticket)
             owned = self.by_owner(i)
             if owned and not names & {ZTE_LABEL, BATCH_LABEL}:
                 self._dependency_tickets.append(ticket)
-            if (names & skip or not owned
+            if (names & skip or not self.by_publisher(i, ticket.is_spec)
                     or failed in names and not (parked and parked(tid))):
                 continue
             out.append(ticket)
@@ -217,28 +252,39 @@ class GitHubTracker:
 
     def failed_queue(self) -> list[str]:
         return [str(i["number"]) for i in gh.issues(self.repo.github, self.label_name("failed"), limit=MAX_AGENT_ISSUES)
-                if self.by_owner(i) and self.queued_failure([label["name"] for label in i.get("labels", [])])]
+                if self.by_owner(i) and self.queued_failure([label["name"] for label in i.get("labels", [])])
+                and not any(label["name"] == SPEC_LABEL for label in i.get("labels", []))]
 
     def by_owner(self, item: dict) -> bool:
         login = (item.get("author") or {}).get("login") or ""
         return bool(login) and login.lower() == self.owner.lower()
 
+    def by_publisher(self, item: dict, spec: bool) -> bool:
+        if not spec:
+            return self.by_owner(item)
+        login = (item.get("author") or {}).get("login") or ""
+        return bool(login) and login.casefold() == gh.me().casefold()
+
     def blocker(self, tid: str) -> str:
-        body = self._bodies.get(tid)
-        if body is None:
-            issue = gh.issue(self.repo.github, int(tid)) or {}
-            body = issue.get("body") or ""
-            self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
-        ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
-        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
-            self.ticket_waits(tid, body))
+        ticket = self._tickets.get(tid) or self.remember(tid, gh.issue(self.repo.github, int(tid)) or {})
+        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(
+            lambda: batch_ids(ticket)) or self.ticket_wait_blocker(ticket)
 
-    def ticket_waits(self, tid: str, body: str) -> list[tuple[str, int]]:
-        return list(dict.fromkeys(github_waits(body, self.repo.github) + run_store.environment_waits(self.repo.name, tid)))
-
-    def wait_blocker(self, waits: list[tuple[str, int]]) -> str:
+    def ticket_wait_blocker(self, ticket: Ticket, *, include_environment: bool = True) -> str:
+        if ticket.blocker:
+            return ticket.blocker
         own = self.repo.github.casefold()
-        return wait_blocker([n if repo == own else f"{repo}#{n}" for repo, n in waits], self.wait_is_open)
+        waits = github_waits(ticket.body, own)
+        if include_environment:
+            waits.extend(run_store.environment_waits(self.repo.name, ticket.id))
+        refs = [n if repo == own else f"{repo}#{n}" for repo, n in waits]
+        native = set(ticket.github_blockers)
+        if native:
+            from . import spec_graph_delivery
+            satisfied = spec_graph_delivery.satisfied_native(self, ticket.id, native)
+            native -= satisfied
+            refs = [ref for ref in refs if ref not in satisfied]
+        return wait_blocker([*refs, *sorted(native, key=str)], lambda ref: ref in native or self.wait_is_open(ref))
 
     def wait_is_open(self, ref: int | str) -> bool | None:
         if isinstance(ref, int):
@@ -263,46 +309,49 @@ class GitHubTracker:
         out = []
         for i in gh.issues(self.repo.github, self.label_name("needs-info")):
             labels = {lb["name"] for lb in i.get("labels", [])}
-            if LABEL not in labels or ZTE_LABEL in labels or not self.by_owner(i):
+            if LABEL not in labels or ZTE_LABEL in labels or not self.by_publisher(i, SPEC_LABEL in labels):
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
-            self._bodies[str(i["number"])] = full.get("body") or ""
-            self._labels[str(i["number"])] = [lb["name"] for lb in full.get("labels", [])]
-            if ZTE_LABEL in self._labels[str(i["number"])]:
+            ticket = self.remember(str(i["number"]), full)
+            if ZTE_LABEL in ticket.labels:
                 continue
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
-                    if self.by_owner(c) and c.get("createdAt")]
+                    if self.by_publisher(c, ticket.is_spec) and c.get("createdAt")]
             if answered(mine):
                 out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], url=i.get("url", ""),
-                                  created=i.get("createdAt", "")))
+                                  created=i.get("createdAt", ""), labels=ticket.labels.copy()))
         return sorted(out, key=lambda t: t.created)
 
     def reply_since(self, tid: str, since: str) -> str:
         full = gh.issue(self.repo.github, int(tid))
-        if any(label["name"] == ZTE_LABEL for label in full.get("labels", [])):
+        labels = {label["name"] for label in full.get("labels", [])}
+        if ZTE_LABEL in labels:
             return ""
         return reply_text([(datetime.fromisoformat(c["createdAt"]), c.get("body") or "")
-                           for c in full.get("comments", []) if self.by_owner(c) and c.get("createdAt")], since)
+                           for c in full.get("comments", [])
+                           if self.by_publisher(c, SPEC_LABEL in labels) and c.get("createdAt")], since,
+                          strict=SPEC_LABEL in labels)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
-    def get(self, tid: str) -> Ticket:
-        i = gh.issue(self.repo.github, int(tid))
-        labels = [lb["name"] for lb in i.get("labels", [])]
-        self._bodies[str(tid)] = i.get("body") or ""
-        self._labels[str(tid)] = labels
+    def get(self, tid: str, *, issue: dict | None = None, saved_comments: str | None = None) -> Ticket:
+        i = gh.issue(self.repo.github, int(tid)) if issue is None else issue
+        ticket = self.remember(tid, i)
+        labels = ticket.labels
+        spec = SPEC_LABEL in labels
         author = (i.get("author") or {}).get("login", "")
-        comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
-                    if self.by_owner(c)]
+        comments = [(self.owner if not spec else c["author"]["login"], c.get("createdAt", ""), c.get("body", ""))
+                    for c in i.get("comments", []) if self.by_publisher(c, spec)]
+        publisher = "the configured GitHub user" if spec else self.owner
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
-            "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
-            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
-            self.ticket_waits(str(i["number"]), i.get("body") or ""))
-        ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
-                      comments=comments_text(comments), open=i.get("state") == "OPEN",
-                      kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
-                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker, github_repo=self.repo.github)
+            "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
+            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
+        ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
+                         owner_comments=scope_comments(comments), saved_scope_matches=same_comment_scope(comments, comments, saved_comments),
+                         open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
+                         updated=i.get("updatedAt") or "", blocker=blocker,
+                         spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -345,11 +394,18 @@ class GitHubTracker:
         if ZTE_LABEL in t.labels:
             raise TaskError(ZTE_QUEUE)
         ids = batch_ids(t)
-        if not whole:
+        if t.is_spec or not whole:
             return f"Part of #{t.id}"
         for tid in ids[1:]:
-            self.require_ordinary(tid)
-        return "\n".join(f"Closes #{tid}" for tid in ids)
+            labels = {label["name"] for label in gh.issue(self.repo.github, int(tid)).get("labels", [])}
+            if ZTE_LABEL in labels:
+                raise TaskError(ZTE_QUEUE)
+            if SPEC_LABEL in labels or spec_store.find(self.repo.name, tid, identity=github_issue_identity(self.repo.github, tid)):
+                raise TaskError(f"#{tid} is a spec and cannot be closed by a batch")
+        from . import release_proof
+
+        return "\n".join(f"Refs #{tid}" if release_proof.required(self.repo.name, tid) else f"Closes #{tid}"
+                         for tid in ids)
 
 
 class JiraTracker:
@@ -360,7 +416,7 @@ class JiraTracker:
     def __init__(self, repo: config.Repo, jcfg: config.JiraConfig):
         self.repo = repo
         self.cfg = jcfg
-        self.project = repo.jira_project or jcfg.project
+        self.project = jira_project(repo, jcfg)
         self.route = route_label(repo)
 
     @property
@@ -368,7 +424,10 @@ class JiraTracker:
         key = str(self.cfg.env_file or "")
         if key not in _clients:
             _clients[key] = jira.Client.from_env(self.cfg.env_file)
-        return _clients[key]
+        client = _clients[key]
+        if self.repo.jira_site and client.base != self.repo.jira_site:
+            raise jira.JiraError(f"{self.repo.name}: connected Jira site differs from the enrolled site")
+        return client
 
     @property
     def queue_hint(self) -> str:
@@ -424,17 +483,33 @@ class JiraTracker:
                 out.append(search_ticket(self.client, i))
         return out
 
-    def reply_since(self, tid: str, since: str) -> str:
+    def reply_since(self, tid: str, since: str, *, strict: bool = False) -> str:
         me = self.client.me().get("accountId", "")
         return reply_text([(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(tid)
-                           if _authored_by(c, me) and c.get("created")], since)
+                           if _authored_by(c, me) and c.get("created")], since, strict=strict)
 
-    def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
+    def get(self, tid: str, *, include_environment: bool = True, saved_comments: str | None = None) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
         me = self.client.me().get("accountId", "")
-        blocker, approved_at = check_approval(me, issue, self.client.changelog(tid), self.route)
+        history = self.client.changelog(tid)
+        blocker, approved_at = check_approval(me, issue, history, self.route)
         f = issue.get("fields") or {}
         labels = list(f.get("labels") or [])
+        spec_identity = jira_issue_identity(getattr(self.client, "base", ""), issue.get("id"))
+        if SPEC_LABEL in labels:
+            creator = (f.get("creator") or {}).get("accountId")
+            key = issue.get("key", "")
+            if not me or creator != me:
+                blocker = blocker or "the Jira spec was not created by the configured Jira user"
+            elif (not spec_identity or key != tid or not jira.KEY_RE.fullmatch(key)
+                  or key.rsplit("-", 1)[0] != self.project.upper()):
+                blocker = blocker or "the Jira spec has no stable identity in the configured project"
+            additions = [h for h in history for item in _label_items(h)
+                         if SPEC_LABEL in _tokens(item.get("toString")) - _tokens(item.get("fromString"))]
+            if additions and not _authored_by(max(additions, key=lambda h: jira.parse_time(h["created"])), me):
+                blocker = blocker or "the `spec` label was not added by the configured Jira user"
+            if (f.get("issuetype") or {}).get("subtask"):
+                blocker = blocker or "a Jira subtask cannot be a bootstrap spec"
         body = f.get("description") or "(no description)"
         blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
         if include_environment and not blocker:
@@ -444,16 +519,20 @@ class JiraTracker:
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
         itype = (f.get("issuetype") or {}).get("name", "").lower()
         status = f.get("status") or {}
+        approved_comments = trusted(me, approved_at, self.client.comments(tid))
         comments = [((c.get("author") or {}).get("displayName", "someone"), c.get("created", ""), c.get("body") or "")
-                    for c in trusted(me, approved_at, self.client.comments(tid))]
+                    for c in approved_comments]
+        directed = [text for c, text in zip(approved_comments, comments)
+                    if not c.get("updateAuthor") or (c["updateAuthor"].get("accountId") == me)
+                    or approved_at and jira.parse_time(c.get("updated") or c["created"]) <= approved_at]
         images = [Image(str(a["id"]), a.get("filename") or "image", int(a.get("size") or 0))
                   for a in trusted(me, approved_at, f.get("attachment") or [])
                   if (a.get("mimeType") or "").startswith("image/")]
-        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments),
-                      open=((status.get("statusCategory") or {}).get("key") != "done"),
+        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=scope_comments(directed),
+                      saved_scope_matches=same_comment_scope(comments, directed, saved_comments), open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
-                      labels=labels, blocker=blocker, images=images)
+                      labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         out = SavedImages()
@@ -477,16 +556,17 @@ class JiraTracker:
     def comment(self, tid: str, body: str) -> str:
         return error_of(lambda: self.client.comment(tid, body))
 
-    def move(self, tid: str, state: str) -> str:
+    def move(self, tid: str, state: str, *, keep_open: bool = False) -> str:
         try:
-            return self.move_to(tid, self.cfg.transitions.get(state, ""))
+            target = self.cfg.transitions.get(state, "")
+            return self.shift(tid, target, keep_done=True, keep_open=True).error if keep_open else self.move_to(tid, target)
         except jira.JiraError as e:
             return str(e)
 
     def move_to(self, tid: str, target: str) -> str:
         return self.shift(tid, target).error
 
-    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False) -> Moved:
+    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False, *, keep_open: bool = False) -> Moved:
         if not target:
             return Moved()
         f = self.client.issue(tid, ["status", "updated"]).get("fields") or {}
@@ -494,8 +574,8 @@ class JiraTracker:
         done = ((f.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
         if status.lower() == target.lower() or keep_done and done:
             return Moved(before=f.get("updated") or "")
-        if not self.client.move(tid, target):
-            return Moved(f"{tid} has no transition to '{target}' from '{status}'")
+        if not (self.client.move(tid, target, category="open") if keep_open else self.client.move(tid, target)):
+            return Moved(f"{tid} has no {'non-closing ' if keep_open else ''}transition to '{target}' from '{status}'")
         after = ""
         if stamps:
             after = (self.client.issue(tid, ["updated"]).get("fields") or {}).get("updated") or ""
@@ -559,13 +639,14 @@ class LocalTracker:
     def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
-        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
-                    for c in tasks_store.task_comments(tid)]
+        history = tasks_store.task_comments(tid)
+        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "") for c in history]
+        directed = [text for c, text in zip(history, comments) if c["author"] != "arete" and principals.is_person(c["author"])]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
                    else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
         if include_environment and not blocker:
             blocker = environment_blocker(self.repo.name, tid)
-        return task_ticket(row, comments_text(comments), blocker)
+        return replace(task_ticket(row, comments_text(comments), blocker), owner_comments=scope_comments(directed))
 
     def prepare(self) -> list[str]:
         return []
@@ -601,6 +682,26 @@ class LocalTracker:
 Tracker = GitHubTracker | JiraTracker | LocalTracker
 
 
+def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_open: bool = True) -> str:
+    if not ticket.is_spec or not isinstance(tk, (GitHubTracker, JiraTracker)):
+        return "the ticket no longer carries spec publication authority"
+    if {"no-agent", "agent:hold"} & set(ticket.labels):
+        return "the owner has placed this spec on hold"
+    if require_open and not ticket.open:
+        return "the spec is not open"
+    if ticket.blocker or not ticket.spec_identity:
+        return ticket.blocker or "the spec has no stable tracker identity"
+    if not tk.repo.pipeline or not tk.repo.parts:
+        return "the spec needs a configured pipeline checkout and PR target"
+    if isinstance(tk, JiraTracker):
+        routed = [r.name for r in cfg.repos if r.tracker == "jira" and r.pipeline
+                  and (r.jira_project or cfg.jira.project).upper() == tk.project.upper()
+                  and route_label(r) in ticket.labels]
+        if routed != [tk.repo.name]:
+            return "the Jira spec must route to exactly one configured pipeline checkout"
+    return ""
+
+
 def item_state(tk: Tracker, t: Ticket) -> str:
     return next((s for s in config.RUN_LABELS if tk.label_name(s) in t.labels), "open" if t.open else "closed")
 
@@ -614,6 +715,10 @@ def task_ticket(row: dict, comments: str = "", blocker: str = "") -> Ticket:
                   comments=comments, open=row["state"] not in config.TASK_FINISHED,
                   kind=row["kind"] if row["kind"] in config.KINDS else "feat", created=row["created"] or "",
                   updated=row["updated"] or "", blocker=blocker)
+
+
+def jira_project(repo: config.Repo, jcfg: config.JiraConfig) -> str:
+    return repo.jira_project or jcfg.project
 
 
 def route_label(repo: config.Repo) -> str:
@@ -708,16 +813,65 @@ def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
 
 
-def reply_text(comments: list[tuple[datetime, str]], since: str) -> str:
+DELIVERY_DIRECTION = re.compile(r"Assign release observation [0-9a-f]{24} to delivery")
+
+
+def reply_text(comments: list[tuple[datetime, str]], since: str, *, strict: bool = False) -> str:
     cutoff = util.parse_iso(since)
     return "\n\n".join(body.strip() for when, body in sorted(comments, key=lambda c: c[0])
-                       if when >= cutoff and body.strip() and not from_arete(body))
+                       if (when > cutoff if strict else when >= cutoff) and body.strip()
+                       and not from_arete(body) and not DELIVERY_DIRECTION.fullmatch(body.strip()))
 
 
 def answered(comments: list[tuple[datetime, str]]) -> bool:
     asked = [when for when, body in comments if from_arete(body)]
-    replies = [when for when, body in comments if not from_arete(body)]
+    replies = [when for when, body in comments if not from_arete(body) and not DELIVERY_DIRECTION.fullmatch(body.strip())]
     return bool(asked and replies) and max(replies) > max(asked)
+
+
+def spec_observation(body: str) -> tuple[str, str, str] | None:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if (len(lines) != 3 or not (token := re.fullmatch(r"Spec evidence ([0-9a-f]{24})", lines[0]))
+            or not lines[1].startswith("How:") or not lines[2].startswith("Saw:")):
+        return None
+    how, saw = [line.partition(":")[2].strip() for line in lines[1:]]
+    return (token[1], how, saw) if how and saw else None
+
+
+def graph_resolution(body: str):
+    lines = body.strip().splitlines()
+    header = re.fullmatch(r"Graph amendment ([0-9a-f]{24})", lines[0]) if lines else None
+    if not header or not 2 <= len(lines) <= 21:
+        return None
+    if lines[1:] == ["No child acceptance changes"]:
+        return header[1], {}
+    mapped = {}
+    for line in lines[1:]:
+        match = re.fullmatch(r"([a-z][a-z0-9-]{0,39}): (\S[^\r\n]{0,999})", line)
+        if not match or match[2] in mapped.setdefault(match[1], []):
+            return None
+        mapped[match[1]].append(match[2])
+    return header[1], mapped
+
+
+def scope_comments(comments: list[tuple[str, str, str]]) -> str:
+    return comments_text([c for c in comments if c[0] != "Arete" and c[2].strip() and not from_arete(c[2])
+                          and not gh.has_arete_mark(c[2]) and not spec_observation(c[2]) and not graph_resolution(c[2])
+                          and not re.fullmatch(r"Promote [0-9a-f]{40} to production", c[2].strip())
+                          and not DELIVERY_DIRECTION.fullmatch(c[2].strip())])
+
+
+def same_comment_scope(history, directed, saved: str | None) -> bool:
+    """Compare an old displayed snapshot to actual tracker records, including interleaved machine notices."""
+    if saved is None:
+        return False
+    current = scope_comments(directed)
+    approved = set(directed)
+    for end in range(len(history), -1, -1):
+        if comments_text(history[max(0, end - MAX_COMMENTS):end]) == saved:
+            if scope_comments([row for row in history[:end] if row in approved]) == current:
+                return True
+    return False
 
 
 def comments_text(comments: list[tuple[str, str, str]]) -> str:

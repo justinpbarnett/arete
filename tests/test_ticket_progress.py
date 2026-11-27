@@ -54,8 +54,8 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
 
     def issue(_, number):
         if number == FOLLOW_UP and state == "closed":
-            return {"state": "CLOSED"}
-        return listed.get(number, {"state": "OPEN" if dependencies else "CLOSED"})
+            return {"number": number, "state": "CLOSED"}
+        return listed.get(number, {"number": number, "state": "OPEN" if dependencies else "CLOSED"})
 
     unreadable = gh.GhError("temporarily unreadable closure")
     closed = Mock(return_value=MERGE, side_effect={"closure-unreadable": unreadable,
@@ -66,6 +66,18 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
         found = {(GITHUB, 49): ("open", "main", "") if state == "open" else ("merged", "main", MERGE)}
         return found if dependencies else {**found, (GITHUB, 50): ("open", "main", "")}
 
+    def gh_json(args, **_kw):
+        if args and args[0] == "api":
+            path = args[1]
+            if path.endswith("/parent"):
+                raise gh.GhError("HTTP 404: Not Found")
+            num = int(path.rsplit("/", 1)[-1])
+            row = issue(GITHUB, num)
+            return {"id": num, "number": num, "title": row.get("title", ""), "body": row.get("body", ""),
+                    "labels": row.get("labels", []), "state": (row.get("state") or "OPEN").lower(),
+                    "repository_url": f"{gh.GITHUB_API}/repos/{GITHUB}"}
+        return {"state": "OPEN", "isDraft": state != "ready", "headRefOid": HEAD}
+
     hold = environment_gaps.Hold([environment_gaps.Gap(SIG, "", "", "")], {DRAFT: HEAD})
     linked = Mock(side_effect=pulls)
     with (
@@ -73,7 +85,7 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
                        live_release=lambda: "" if state in ("open", "merged", "removed") else RELEASE),
         patch.multiple(gh, issue=issue, me=lambda: "owner", pr_comment=comment,
                        issue_merge_commit=closed, prerequisite_pulls=linked,
-                       gh_json=lambda _: {"state": "OPEN", "isDraft": state != "ready", "headRefOid": HEAD},
+                       gh_json=gh_json,
                        pr_discussion=lambda _: gh.Discussion([], [], comments),
                        branch_contains=lambda _, base, head: (base, head) in (("main", RELEASE), (RELEASE, MERGE))),
         patch.object(flows, "check_environment_workspace", side_effect=preflight),
@@ -84,7 +96,7 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
         if not dependencies:
             if at_capacity:
                 errors = []
-                queue = SimpleNamespace(repo=repo, selected=set())
+                queue = SimpleNamespace(repo=repo, tracker=tracker.GitHubTracker(repo), selected=set())
                 assert not poll.resume_environment_holds(cfg, [queue], dry_run, errors, Counter(), 0)
                 assert not errors, errors
                 return False
