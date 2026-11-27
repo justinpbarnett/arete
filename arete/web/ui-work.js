@@ -1,6 +1,7 @@
-import { Component } from "./vendor-preact.js";
+import { Component, h } from "./vendor-preact.js";
 import { runHash, taskHash } from "./ui-data.js";
 import { Decisions, DetailLink, Panel, Read, Rows, Text, html } from "./ui-operations.js";
+import { ticketProgressParts } from "./ui-progress.js";
 import { Empty, Fault, Gate } from "./ui-states.js";
 
 const states = { "needs-info": "Needs you", recovering: "Recovering", failed: "Failed", running: "Running", pr: "In review", todo: "To do", done: "Done", closed: "Closed" };
@@ -63,13 +64,27 @@ export function FloorQueue({ snapshot, retry }) {
       <${Rows} id="floor-runs" rows=${rows ?? []} empty="No running work" /><//>`;
 }
 
+export function TicketProgress({ progress }) {
+  if (!progress) return null;
+  const link = (href, text) => h(DetailLink, { href }, text);
+  return h("div", { "data-ticket-progress": "" }, ticketProgressParts(progress, {
+    element: h, stamp, link, pullLinks: (urls) => urls.flatMap((url) => [link(url, url), " "]),
+  }));
+}
+
 export function FloorFocus({ snapshot, retry }) {
   const feedback = snapshot.live?.waiting;
+  const progress = snapshot.live?.ticket_progress;
   return html`<div class="ops-detail">
     <section class="ops-section"><h3>Needs you</h3>
       <p>${snapshot.needsYou == null || !snapshot.questions?.data || snapshot.questions.error ? "See the inbox for current work." :
     `${snapshot.needsYou + snapshot.questions.data.asks.length} items in the inbox`}</p>
       <a href="#triage">Open Triage</a></section>
+    ${progress && (progress.error || progress.rows?.length) ? html`<${Panel} panel=${progress} title="Ticket progress" retry=${retry}>
+      ${(rows) => rows.map((row) => html`<article key=${`${row.repo}:${row.issue}`}>
+        <h4><a href=${row.run ? runHash(row.run) : taskHash(row.issue, row.repo)}>${row.ticket}</a></h4>
+        <${TicketProgress} progress=${row} />
+      </article>`)}<//>` : null}
     ${snapshot.live?.recovery?.rows?.length ? html`<section class="ops-section"><h3>Automatic recovery</h3>
       <${Rows} id="recovery-queue" rows=${snapshot.live.recovery.rows.map((item) => ({
         id: `${item.repo}/${item.ticket}`, href: item.source ? runHash(item.source) : taskHash(item.ticket, item.repo),

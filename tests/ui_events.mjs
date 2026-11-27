@@ -60,7 +60,8 @@ globalThis.EventSource = Source;
 globalThis.document = new EventTarget();
 const page = new EventTarget();
 globalThis.addEventListener = page.addEventListener.bind(page);
-const ui = await import("../arete/web/ui-live.js?browser");
+const ui = await import("../arete/web/ui-live.js");
+const { RunFocus } = await import("../arete/web/ui-run.js");
 
 const event = (id, kind = "run.changed", run = { id: "first", status: "running" }) => ({
   id, kind, subject: `run:${run.id}`, data: { ...run, run: run.id }, ver: run.version,
@@ -171,6 +172,7 @@ async function snapshots() {
   const reads = (key) => calls.filter((call) => call.key === key);
   const snapshots = () => reads("live").length + reads("runs").length + reads("run").length + reads("/api/v1/runs").length;
   const running = () => runs.filter((run) => run.status === "running");
+  let progress;
   const live = () => ({ waiting, live: { rows: { slots, max_parallel: 3,
     runs: running().map(({ status, ...row }) => ({ ...row, slot: row.id === notedRun ? slotNote : "" })) } } });
   const sidebar = () => ({ running: running().length, needs_you: needsYou, health, serve });
@@ -188,7 +190,8 @@ async function snapshots() {
     }
     let position = seq;
     let payload;
-    if (view === "live") payload = { sidebar: sidebar(), asks, view: live() };
+    if (view === "live") payload = { sidebar: sidebar(), asks,
+      view: { ...live(), ticket_progress: { rows: progress?.follow_up.draft ? [progress] : [] } } };
     else if (view === "runs") {
       payload = { view: { runs: runs.slice(0, 25).map(({ version, ...row }) => row), more: true } };
     } else if (view === "run") {
@@ -200,7 +203,8 @@ async function snapshots() {
         Object.assign(run, { status: "pr", version: 2 });
       }
       const usage = run.id === "first" ? { paid, models } : { paid: 0, models: [] };
-      payload = { sidebar: sidebar(), asks, view: { run: { ...run, paid: usage.paid }, models: usage.models, lines_from: "log" } };
+      payload = { sidebar: sidebar(), asks, view: { run: { ...run, paid: usage.paid }, models: usage.models,
+        lines_from: "log", ticket_progress: run.id === "past-29" ? progress : undefined } };
     } else if (url.pathname === "/api/v1/runs") {
       position = seq === "5.40" ? "5.41" : seq;
       payload = { runs };
@@ -482,6 +486,7 @@ async function snapshots() {
       "404 falls back to legacy shell and Health while the stream drops the run subscription");
     assert.equal(ui.screenReads.value.health.error, null);
     assert.equal(reads("/api/sidebar").length, 1);
+    assert.equal(settings.snapshot.value.live.ticket_progress, undefined);
     last().open();
     last().send(event("6.3", "run.started", { id: "new", status: "running", version: 1 }));
     assert.equal(settings.snapshot.value.running, 1);
@@ -493,8 +498,29 @@ async function snapshots() {
     assert.equal(reads("live").at(-1).status, 404);
     assert.equal(reads("/api/sidebar").length, 1);
 
+    missingShell = false;
+    seq = "6.4";
+    progress = { repo: "arete", issue: "964", blocker: "Verification needs input", follow_up: { draft: true } };
+    Object.assign(runs.at(-1), { repo: progress.repo, issue: progress.issue });
+    const oldRun = ui.live("run", "past-29");
+    await until(() => ui.runView.value.detail?.ticket_progress?.blocker
+      && last().url.searchParams.get("turns") === "past-29", "the old run shows the held draft");
+    assert.deepEqual(oldRun.snapshot.value.live.ticket_progress.rows, [progress]);
+    last().open();
+    const focus = new RunFocus({ view: ui.runView.value, retry: oldRun.retry });
+    focus.componentDidMount();
+    try {
+      seq = "6.5";
+      progress = { ...progress, blocker: "", follow_up: {} };
+      const detailReads = reads("run").length;
+      refresh();
+      await until(() => ui.runView.value.detail?.ticket_progress?.blocker === "", "confirmed readiness refreshes the open run");
+      assert.equal(reads("run").length, detailReads + 1);
+      assert.equal(ui.runView.value.detail.run.status, "pr");
+    } finally { focus.componentWillUnmount(); }
+
     globalThis.fetch = async () => json({ code: "client_too_old", error: "Too old" }, 400);
-    await settings.retry();
+    await oldRun.retry();
     await until(() => clientNotice.value, "client_too_old shows a notice");
     assert.match(clientNotice.value, /Reload the page/);
   } finally {

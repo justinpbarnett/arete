@@ -1,9 +1,28 @@
 "use strict";
 
+async function loadScreen(view, fallback, id = "") {
+  const { screen } = await import("./ui-data.js");
+  try {
+    const data = await call(screen(view, id));
+    return { ...data.view, seq: data.seq };
+  } catch (error) {
+    if (error.status !== 404) throw error;
+    return call(fallback);
+  }
+}
+
+async function ticketProgressRenderer() {
+  const { ticketProgressParts } = await import("./ui-progress.js");
+  return (progress) => ticketProgressParts(progress, {
+    element: el, link, stamp: zonedClock, pullLinks: (urls) => pullLinks(urls.join(" ")),
+  });
+}
+
 const LOADERS = {
   live: async () => {
-    const data = await call("/api/live");
-    return staged(() => drawLive(data), data);
+    const data = await loadScreen("live", "/api/live");
+    const renderProgress = data.ticket_progress && await ticketProgressRenderer();
+    return staged(() => drawLive(data, renderProgress), data);
   },
   runs: async (r) => {
     const q = r.detail ? lastQuery.runs || {} : r.query;
