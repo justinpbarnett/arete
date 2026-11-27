@@ -857,6 +857,12 @@ def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
     return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), checkouts)
 
 
+def note_run_workspace(run: AgentRun) -> None:
+    if isinstance(run, Run) and run.workspace and not run.catch_up_owns_checkout:
+        workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                            preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths)
+
+
 def claim_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> None:
     owner = workspace_owner(run, ws, checkouts)
     workspaces.claim(ws, owner.repo, owner.ticket, owner.run, checkouts=owner.checkouts)
@@ -1150,9 +1156,9 @@ def lines_by_file(staged: diffguard.Diff, top: int = 12) -> str:
     return "\n".join(out)
 
 
-VERIFY_SCRATCH_ROOT = Path(".arete-sandbox")
-VERIFY_SCRATCH_MARKER = ".arete-owned"
-VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
+VERIFY_SCRATCH_ROOT = local_paths.VERIFY_SCRATCH_ROOT
+VERIFY_SCRATCH_MARKER = local_paths.VERIFY_SCRATCH_MARKER
+VERIFY_SCRATCH_CONTENT = local_paths.VERIFY_SCRATCH_CONTENT
 
 
 def names_verification_wrapper(rule: str) -> bool:
@@ -1176,6 +1182,11 @@ def initialize_resolver_scratch(wt: Path, bash_rules: list[str]) -> None:
                 fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=folder)
                 with os.fdopen(fd, "wb") as file:
                     file.write(content)
+
+
+def initialize_run_scratch(run: AgentRun, cwd: Path, commands: list[str]) -> None:
+    if isinstance(run, Run) and run.workspace and not run.catch_up_owns_checkout and cwd.is_dir():
+        initialize_resolver_scratch(cwd, commands)
 
 
 def resolver_scratch_paths(names: set[str], roots: set[Path]) -> set[str]:
@@ -1402,6 +1413,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 results.append({**detail, "passed": passed})
 
     try:
+        initialize_run_scratch(run, cwd, list(commands.values()))
         with check_lane(layer, run, suite) as hold_fds:
             execute(quick, hold_fds)
             if slow and ok:
@@ -1419,6 +1431,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
         if cleanup_untracked:
             for d, name in untracked_added_since(untracked_before):
                 workspace.remove_untracked(d, name)
+        note_run_workspace(run)
     return ok, "\n\n".join(report)
 
 
@@ -5254,6 +5267,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 fixture_blocker = "Required service needs unavailable scratch fixtures for start command: " + json.dumps(v.start)
                 v = replace(v, start="", url="", notes=v.notes + "\n" + fixture_blocker)
         bash = b.read_bash + v.bash
+        initialize_run_scratch(run, b.ws, [v.start, *v.probes.values(), *v.drivers.values(), *v.allow_bash, *b.read_bash])
         with verify.serving(
                 v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo, lifetime=lifetime,
                 attempt=attempt) as url:
@@ -5339,6 +5353,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(retained_line(step, attempt))
         finally:
             removed = restore_worktrees(untracked_before, evidence)
+            note_run_workspace(run)
     if probes and probes.verdict != "pass":
         verified = probes
     elif replay_only:

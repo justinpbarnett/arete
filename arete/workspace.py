@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, paths, record, sandbox, scratch, tracker, util
+from . import config, gh, local_paths, paths, record, sandbox, scratch, tracker, util
 from .store import db, runs, workspaces
 from .util import git
 
@@ -236,8 +236,8 @@ def refresh_released(ws: Path, root: str) -> bool:
 
 def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[Path]) -> dict:
     examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    loose = {c.prefix + n for c in checkouts if c.wt in examined for n in ignored_files(c.wt)}
-    loose |= set(unexamined(ws, examined))
+    loose = {c.prefix + n for c in checkouts if c.wt in examined for n in non_sandbox_ignored(c.wt)}
+    loose |= set(non_sandbox_unexamined(ws, examined))
     return {"roots": sorted({p.name for p in held if p.name.startswith(paths.SCRATCH_PREFIX)}),
             "names": [n for n in names if n in loose]}
 
@@ -355,7 +355,7 @@ def unverified(made: dict, base: Path, name: str, prefix: str = "") -> bool:
 
 def outside_blockers(ws: Path, made: dict, examined: set[Path]) -> list[str]:
     try:
-        return [n for n in unexamined(ws, examined) if ws / n not in examined and unverified(made, ws, n)]
+        return [n for n in non_sandbox_unexamined(ws, examined) if ws / n not in examined and unverified(made, ws, n)]
     except OSError:
         return ["."]
 
@@ -414,8 +414,8 @@ def registered_root_checkout(ws: Path) -> list[Checkout]:
 
 def checkout_blockers(c: Checkout, made: dict, edits: bool, *, strict: bool) -> list[str]:
     try:
-        found = (uncommitted(c.wt) + ignored_files(c.wt) if edits
-                 else ignored_files(c.wt) + sorted(untracked_files(c.wt)))
+        ignored = non_sandbox_ignored(c.wt)
+        found = uncommitted(c.wt) + ignored if edits else ignored + sorted(untracked_files(c.wt))
         return [c.prefix + n for n in dict.fromkeys(found) if unverified(made, c.wt, n, c.prefix)]
     except (OSError, RuntimeError) as e:
         if strict:
@@ -523,6 +523,13 @@ def ignored_files(wt: Path) -> list[str]:
                                              "--untracked-files=normal"], wt) if r.startswith("!! ")]
 
 
+def non_sandbox_ignored(wt: Path) -> list[str]:
+    found = ignored_files(wt)
+    if any(local_paths.is_verify_sandbox_path(n) for n in found) and local_paths.verify_sandbox_owned(wt):
+        return [n for n in found if not local_paths.is_verify_sandbox_path(n)]
+    return found
+
+
 def unexamined(ws: Path, examined: set[Path]) -> list[str]:
     if ws in examined or not ws.is_dir():
         return []
@@ -534,10 +541,17 @@ def unexamined(ws: Path, examined: set[Path]) -> list[str]:
     return sorted(found)
 
 
+def non_sandbox_unexamined(ws: Path, examined: set[Path]) -> list[str]:
+    found = unexamined(ws, examined)
+    if any(local_paths.is_verify_sandbox_path(n) for n in found) and local_paths.verify_sandbox_owned(ws):
+        return [n for n in found if not local_paths.is_verify_sandbox_path(n)]
+    return found
+
+
 def leftovers(ws: Path, checkouts: list[Checkout], *, excluded: Collection[Path] = ()) -> list[str]:
     examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    found = [c.prefix + n for c in checkouts if c.wt in examined for n in uncommitted(c.wt) + ignored_files(c.wt)]
-    return found + unexamined(ws, examined.union(excluded))
+    found = [c.prefix + n for c in checkouts if c.wt in examined for n in uncommitted(c.wt) + non_sandbox_ignored(c.wt)]
+    return found + non_sandbox_unexamined(ws, examined.union(excluded))
 
 
 def head_key(c: Checkout) -> str:
@@ -633,7 +647,7 @@ def kept_checkout(ws: Path, c: Checkout, source: Path, copies: list[str], *,
             return f"The closed PR checkout `{c.github}` at `{c.wt}` has uncommitted edits. Arete left them in place."
         edits = unrecorded_files(ws, [c.prefix + n for n in edits], source, copies, made, held)
         ignored = [] if force else unrecorded_files(
-            ws, [c.prefix + n for n in ignored_files(c.wt)], source, copies, made, held)
+            ws, [c.prefix + n for n in non_sandbox_ignored(c.wt)], source, copies, made, held)
         ahead = "0"
         if not closed:
             ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
@@ -665,7 +679,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
     if force:
         return ""
     try:
-        others = unrecorded_files(ws, unexamined(ws, examined.union(excluded)), source, copies, made, held)
+        others = unrecorded_files(ws, non_sandbox_unexamined(ws, examined.union(excluded)), source, copies, made, held)
     except OSError as e:
         if strict:
             raise
