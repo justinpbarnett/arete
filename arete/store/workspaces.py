@@ -215,9 +215,9 @@ def claim(ws: Path, repo: str, ticket: str, owner_run: str, *,
         row = open_for(ws.name)
         if row and row["kept_reason"] == SNAPSHOT_UNAVAILABLE:
             raise workspace.worktree_failure(SNAPSHOT_UNAVAILABLE, ws, "")
-        fields = dict(repo=repo, ticket=str(ticket), owner_run=owner_run, state="live",
-                      kept_reason="", held_by=[], released_at="", release_excluded=None,
-                      remove_asked_by="", last_sweep_error="")
+        fields = {"repo": repo, "ticket": str(ticket), "owner_run": owner_run, "state": "live",
+                      "kept_reason": "", "held_by": [], "released_at": "", "release_excluded": None,
+                      "remove_asked_by": "", "last_sweep_error": ""}
         if checkouts is not None:
             fields["checkouts"] = workspace.WorkspaceOwner("", "", "", checkouts).checkout_rows()
         return (change(row, **fields) if row else create(ws.name, **fields))["id"]
@@ -245,13 +245,13 @@ def _repo_for(cfg: config.Config, ws: Path) -> tuple[str, str]:
 
 
 def snapshot_fields(made: dict) -> dict:
-    return dict(
-        salt=workspace.salt_of(made),
-        heads={k.removeprefix("\0head "): v for k, v in made.items() if k.startswith("\0head ")},
-        onto={k.removeprefix("\0onto "): v for k, v in made.items() if k.startswith("\0onto ")},
-        retained=workspace.retained_in(made) or {},
-        files={name: digest for name, digest in made.items() if not name.startswith("\0")},
-    )
+    return {
+        "salt": workspace.salt_of(made),
+        "heads": {k.removeprefix("\0head "): v for k, v in made.items() if k.startswith("\0head ")},
+        "onto": {k.removeprefix("\0onto "): v for k, v in made.items() if k.startswith("\0onto ")},
+        "retained": workspace.retained_in(made) or {},
+        "files": {name: digest for name, digest in made.items() if not name.startswith("\0")},
+    }
 
 
 def _snapshot(row: dict) -> dict:
@@ -344,7 +344,7 @@ def retry_quarantine(name: str, folder: Path) -> None:
 
 def _release_selection(checkouts: list[workspace.Checkout], excluded: Collection[Path]) -> dict:
     owner = workspace.WorkspaceOwner("", "", "", checkouts)
-    return dict(checkouts=owner.checkout_rows(), release_excluded=sorted(map(str, excluded)))
+    return {"checkouts": owner.checkout_rows(), "release_excluded": sorted(map(str, excluded))}
 
 
 def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
@@ -440,7 +440,7 @@ def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | No
     with writes.atomic():
         row = get(row["id"]) if row else None
         if result.state == "held":
-            fields = dict(state="held", held_by=blockers(ws, result.held_by), bytes=size)
+            fields = {"state": "held", "held_by": blockers(ws, result.held_by), "bytes": size}
             if row:
                 change(row, **fields)
             else:

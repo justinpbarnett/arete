@@ -1,5 +1,4 @@
 import contextlib
-import json
 import subprocess
 import tempfile
 import unittest
@@ -22,7 +21,6 @@ from arete import (
     release_proof,
     ticket_feedback as tf,
     tracker,
-    util,
 )
 from arete.store import asks as ask_store
 from arete.store import db as foundation

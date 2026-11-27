@@ -517,7 +517,8 @@ def numbered_events(path: Path) -> Iterator[dict]:
 
     def numbered() -> Iterator[dict]:
         nonlocal number
-        for number, raw in enumerate(raw_lines(path), 1):
+        for idx, raw in enumerate(raw_lines(path), 1):
+            number = idx
             yield from entries([raw])
 
     for event in normalized(numbered()):
@@ -687,10 +688,8 @@ def read_pi(e: dict) -> list[dict]:
 def mcp_call(item: dict) -> dict:
     arguments = item.get("arguments")
     if isinstance(arguments, str):
-        try:
+        with contextlib.suppress(ValueError):
             arguments = json.loads(arguments)
-        except ValueError:
-            pass
     return {"kind": "tool_call", "id": item.get("id", ""), "name": f"mcp__{item.get('server', '')}__{item.get('tool', '')}",
             "input": arguments}
 

@@ -671,10 +671,8 @@ def end_session(pid) -> None:
         except OSError:
             pass
     for group in groups:
-        try:
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(group, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
 
 
 def process_rows(columns: str) -> list[list[int]]:
@@ -848,10 +846,8 @@ def group_alive(proc: subprocess.Popen) -> bool:
 
 
 def kill_group(proc: subprocess.Popen) -> None:
-    try:
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def stop_group(proc: subprocess.Popen) -> None:

@@ -7,9 +7,9 @@ from contextlib import contextmanager
 from . import builder_workspaces as candidates
 from . import delegation, factory, run_lines, runlimits, sandbox, util
 from .orchestration_api import WORKER_PROTOCOL
+from .store import db
 from .store import orchestration as ledger
 from .store import worker_exchange as exchange
-from .store.db import reader
 
 WORKER_INSTRUCTIONS = """
 Use only your private working directory. Read the repository instructions that apply to your paths before editing.
@@ -143,7 +143,7 @@ class WorkerTurns:
         return ""
 
     def worker_observation(self, after=0, limit=20, outstanding=False):
-        with reader() as c:
+        with db.reader() as c:
             return exchange.projection(c, self.lease, vars(self.policy), after=after, limit=limit, outstanding=outstanding)
 
     def assignment_role(self, args, writing, role, workers):

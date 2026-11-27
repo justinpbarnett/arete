@@ -120,15 +120,15 @@ def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence
             seen = attempts[cause]
             if attempt not in seen:
                 if seen:
-                    updates.append(dict(kind="recurring-blocker", cause=cause, attempt=attempt, message=message))
+                    updates.append({"kind": "recurring-blocker", "cause": cause, "attempt": attempt, "message": message})
                 seen.add(attempt)
                 fresh.append([cause, attempt])
         known = {u["pr"] for item in history for u in item["updates"] if u["kind"] == "prerequisite-pr"}
         for pr in prs:
             if pr["key"] not in known:
                 delivery = "deployed" if pr["deployed_release"] else pr["state"]
-                updates.append(dict(kind="prerequisite-pr", pr=pr["key"],
-                                    message=f"Found prerequisite PR {pr['url']} ({delivery})."))
+                updates.append({"kind": "prerequisite-pr", "pr": pr["key"],
+                                    "message": f"Found prerequisite PR {pr['url']} ({delivery})."})
         if fresh or updates or current != prior:
             events.emit(KIND, subject(repo, ticket), cls="durable", task=str(ticket) if str(ticket).startswith("t-")
                         else None, data={**current, "evidence": fresh, "updates": updates})

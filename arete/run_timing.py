@@ -58,7 +58,7 @@ class Span:
         return self.start <= at and (self.end is None or at < self.end)
 
     def detail(self) -> dict:
-        detail = dict(run_id=self.run_id, category=self.category, since=iso(self.start), source_id=self.source_id)
+        detail = {"run_id": self.run_id, "category": self.category, "since": iso(self.start), "source_id": self.source_id}
         detail["cause" if self.wait else "activity"] = self.activity
         if self.wait:
             detail["next_event"] = WAITS[self.activity][1]
@@ -67,7 +67,7 @@ class Span:
         elif self.name:
             detail.update(name=self.name, suite=self.suite, check_no=self.check_no)
         if self.step_attempt and (not self.wait or self.resource):
-            detail.update(zip(("step", "try"), self.step_attempt))
+            detail.update(zip(("step", "try"), self.step_attempt, strict=True))
         return detail
 
 

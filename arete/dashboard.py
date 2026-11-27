@@ -717,8 +717,11 @@ class Handler(BaseHTTPRequestHandler):
             if rest is not None:
                 try:
                     if method == "POST" and route in CLI_ALIASES and not (route is post_chat and rest.endswith("/file")):
-                        return self.keyed_action(method, template, {"path": rest}, lambda: route(self, rest, query),
-                                                 atomic=atomic_alias(route, unquote(rest)))
+                        return self.keyed_action(
+                            method, template, {"path": rest},
+                            lambda route=route, rest=rest: route(self, rest, query),
+                            atomic=atomic_alias(route, unquote(rest)),
+                        )
                     return route(self, rest, query)
                 except NoRoute:
                     break

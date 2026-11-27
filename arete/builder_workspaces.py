@@ -186,7 +186,7 @@ def stage(data, checkouts, layer, claims):
         proposed = util.git([*util.ARETE_IDENTITY, "commit-tree", candidate, "-p", part["base"], "-m", "Candidate"],
                             repo).strip()
         util.git(["update-ref", "refs/arete/candidate", proposed], repo)
-    for part, c, wt, repo in parts(data, checkouts):
+    for part, c, _wt, repo in parts(data, checkouts):
         proposed = util.git(["rev-parse", "refs/arete/candidate"], repo).strip()
         candidate = util.git(["rev-parse", proposed + "^{tree}"], repo).strip()
         pre = factory.fingerprint(c.wt)

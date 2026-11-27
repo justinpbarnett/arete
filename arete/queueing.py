@@ -26,7 +26,7 @@ def scores(tickets: list[tracker.Ticket]) -> dict[str, tuple[int, int]]:
             dependents[parent].add(str(ticket.id))
     parents = {key: set() for key in dependents}
     remaining = {key: len(children) for key, children in dependents.items()}
-    depth = {key: 1 for key in dependents}
+    depth = dict.fromkeys(dependents, 1)
     for parent, children in dependents.items():
         for child in children:
             parents[child].add(parent)

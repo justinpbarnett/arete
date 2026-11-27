@@ -78,7 +78,7 @@ def parsed(value):
 
 
 def idle_waits(run_id: str, row: dict) -> dict[str, float]:
-    found = {cause: 0.0 for cause in IDLE_WAITS}
+    found = dict.fromkeys(IDLE_WAITS, 0.0)
     began = parsed(row.get("started"))
     if began is None:
         return found
@@ -155,7 +155,7 @@ def apply(conn, *, running=()):
     columns = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
     for raw in conn.execute("SELECT * FROM runs WHERE kind IN ('pipeline') "
                             "AND measured_at IS NULL").fetchall():
-        row = dict(zip(columns, raw))
+        row = dict(zip(columns, raw, strict=True))
         rid = row["id"]
         if row["status"] == "running" and rid not in running:
             continue
@@ -178,7 +178,7 @@ def apply(conn, *, running=()):
                 values = (active_seconds(rid, row), verification_seconds(rid, row, conn),
                           0, repair_count(rid), "")
             for field, value in zip(("active_seconds", "verify_seconds", "verify_open_seconds", "repair_calls"),
-                                    values):
+                                    values, strict=False):
                 measured_seconds(rid, {field: value}, field)
             conn.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
                          "repair_calls=?, measured_at=? WHERE id=?", (*values, rid))

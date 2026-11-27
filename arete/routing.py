@@ -15,6 +15,7 @@ from .agent import REPLAY, TRAITS, model_scope, traits_of
 from .store import db as foundation
 from .store import devices as devices_store
 from .store import runs as run_store
+import contextlib
 
 if TYPE_CHECKING:
     from .steps import Settings
@@ -533,10 +534,8 @@ def openrouter_prices() -> dict[str, dict]:
                 "structured_output": "structured_outputs" in parameters if isinstance(parameters, list) else None})
     except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, AttributeError):
         return {}
-    try:
+    with contextlib.suppress(OSError):
         util.write_json(file, {"fetched": util.now().astimezone(UTC).isoformat(timespec="seconds"), "models": models})
-    except OSError:
-        pass
     return models
 
 

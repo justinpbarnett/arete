@@ -61,7 +61,7 @@ def untrusted(value, schema=None, field=None, *, selectors=True):
 def protect_problem(data):
     current = {"task_version_conflict": contract.TASK, "version_conflict": contract.RUN}.get(data["code"])
     details = {key: value for key, value in data.items() if key not in PROBLEM_METADATA}
-    fields = {**dict.fromkeys(PROBLEM_FIELDS, {}), "current": current}
+    fields = {**{key: {} for key in PROBLEM_FIELDS}, "current": current}
     return {**untrusted(details, {"properties": fields}, selectors=False),
             **{key: value for key, value in data.items() if key in PROBLEM_METADATA}}
 

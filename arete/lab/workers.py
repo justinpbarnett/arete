@@ -149,7 +149,7 @@ def accounted(run_id: str, launches: list[dict]) -> list[dict]:
     for launch, end in zip(launches, ends, strict=True):
         framed = [experiment.framed(f) for f in files[launch["start"]:end]] if launch["launched"] else []
         found.append([r for h, r in framed if r and not h.get("refused") and h.get("step") == launch["step"]])
-    return [attempt_entry(n, launch, results) for n, (launch, results) in enumerate(zip(launches, found), 1)]
+    return [attempt_entry(n, launch, results) for n, (launch, results) in enumerate(zip(launches, found, strict=True), 1)]
 
 
 def outcomes_of(run_id: str, launches: list[dict], handoff: str) -> dict:

@@ -9,22 +9,7 @@ KEPT_LINES = 40
 LINE_CHARS = 400
 TOTAL_CHARS = 4000
 EDGE = "()[]{}'\",;:."
-WORDS = frozenset("""
-a about access address after again all already also an and any applied are arete as at backfill backup be because
-been before block both brace bracket busy but by call can cannot catalog changes checkout class close closed closing
-code column commit commits config configuration connection contract could current database deploy deployed denied
-dashboard def did differs digest directory disk do does during each eof else error errors except exception exist
-exists existing exit exited expand expansion expected failed failure fails file files folder for found from full guard
-has hash have healthy held hold holds if import imported in indent indentation indented into invalid is it its last
-ledger line load loaded lock locked may migrate migration migrations mismatch missing module modules more most must
-named need needs network never new no none not of old on only open opened opening or other out over package packages
-parenthesis parse parsed pending permission phase port previous raise read ready recent refuse refused rejected
-restart restarted restarts restore return rolled rollback run running runs schema serve sha sha256 snapshot so space
-start started starting startup state statement status still stop stopped such syntax than that the their then there
-these this tick ticks timed timeout to too traceback tracked try unable under unexpected unhealthy unindent unknown
-unmatched until up use used using version waiting waits was were what when where which while with without would write
-yet
-""".split())
+WORDS = frozenset(["a", "about", "access", "address", "after", "again", "all", "already", "also", "an", "and", "any", "applied", "are", "arete", "as", "at", "backfill", "backup", "be", "because", "been", "before", "block", "both", "brace", "bracket", "busy", "but", "by", "call", "can", "cannot", "catalog", "changes", "checkout", "class", "close", "closed", "closing", "code", "column", "commit", "commits", "config", "configuration", "connection", "contract", "could", "current", "database", "deploy", "deployed", "denied", "dashboard", "def", "did", "differs", "digest", "directory", "disk", "do", "does", "during", "each", "eof", "else", "error", "errors", "except", "exception", "exist", "exists", "existing", "exit", "exited", "expand", "expansion", "expected", "failed", "failure", "fails", "file", "files", "folder", "for", "found", "from", "full", "guard", "has", "hash", "have", "healthy", "held", "hold", "holds", "if", "import", "imported", "in", "indent", "indentation", "indented", "into", "invalid", "is", "it", "its", "last", "ledger", "line", "load", "loaded", "lock", "locked", "may", "migrate", "migration", "migrations", "mismatch", "missing", "module", "modules", "more", "most", "must", "named", "need", "needs", "network", "never", "new", "no", "none", "not", "of", "old", "on", "only", "open", "opened", "opening", "or", "other", "out", "over", "package", "packages", "parenthesis", "parse", "parsed", "pending", "permission", "phase", "port", "previous", "raise", "read", "ready", "recent", "refuse", "refused", "rejected", "restart", "restarted", "restarts", "restore", "return", "rolled", "rollback", "run", "running", "runs", "schema", "serve", "sha", "sha256", "snapshot", "so", "space", "start", "started", "starting", "startup", "state", "statement", "status", "still", "stop", "stopped", "such", "syntax", "than", "that", "the", "their", "then", "there", "these", "this", "tick", "ticks", "timed", "timeout", "to", "too", "traceback", "tracked", "try", "unable", "under", "unexpected", "unhealthy", "unindent", "unknown", "unmatched", "until", "up", "use", "used", "using", "version", "waiting", "waits", "was", "were", "what", "when", "where", "which", "while", "with", "without", "would", "write", "yet"])
 KNOWN_EXCEPTIONS = frozenset({"IncompatibleSchema", "NoDatabase", "Refused", "Down", "Failed", "GhError", "GhUnsure",
                               "UnknownRepo"})
 EXCEPTION = re.compile(r"(?:[a-z][a-z0-9_]*\.)*[A-Z][A-Za-z0-9]*(?:Error|Exit|Exception|Warning|Interrupt)")

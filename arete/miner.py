@@ -369,14 +369,14 @@ def render_runs(digests: list[dict], limit: int) -> tuple[str, int]:
         f"## run {clean(d['session'], 120)} ({clean(d['kind'], 30)}, repo: {clean(d['repo'], 60) or 'none'}, "
         f"ticket: {clean(d['issue'], 60) if d['issue'] not in (None, '') else 'none'}, "
         f"status: {clean(d['status'], 30)}, {d['minutes']:.0f} min; signals: {', '.join(d['signals'])})"
-        + "\n" + "\n".join(d["items"]) + "\n"
+         "\n" + "\n".join(d["items"]) + "\n"
         for d in digests), limit)
 
 
 def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple[str, int]:
     return fit_blocks((
         f"## session {s['session']} in {s['cwd'] or '?'} (repo: {repo.name if repo else 'none'})"
-        + "\n" + "\n".join(s["items"]) + "\n"
+         "\n" + "\n".join(s["items"]) + "\n"
         for s in sessions for repo in [cfg.repo_for_path(s["cwd"]) if s["cwd"] else None]), limit)
 
 
@@ -853,7 +853,7 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path, base: str, h
         return ""
     revs = [base, head] if head else ["--cached", base]
     rows = util.git_records(["diff", "--name-status", "--no-renames", *revs], wt)
-    for status, f in zip(rows[::2], rows[1::2]):
+    for status, f in zip(rows[::2], rows[1::2], strict=False):
         if not util.matches_any(f, [ARETE_PROMPT_GLOB]):
             continue
         if status == "A":

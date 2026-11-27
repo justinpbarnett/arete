@@ -20,6 +20,7 @@ from typing import NoReturn
 
 from . import codebase, config, credential_http, paths, principals, util
 from .store import db, tokens
+import contextlib
 
 CERT_SECONDS = 120
 RENEW_SECONDS = 7 * 24 * 3600
@@ -261,10 +262,8 @@ class Server(ThreadingHTTPServer):
             secure.settimeout(None)
             self.RequestHandlerClass(secure, client_address, self)
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 secure.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
             secure.close()
 
 

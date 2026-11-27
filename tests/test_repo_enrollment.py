@@ -438,18 +438,17 @@ class EnrollAndPublish(unittest.TestCase):
         self.assertTrue(new.allows_unattended_deploy("staging"))
         self.assertFalse(new.allows_unattended_deploy("production"))
         item = {"repo": new.name, "workdir": str(new.path), "base": new.target_branch, "check": "true"}
-        with mock.patch.object(push.util, "git") as git:
-            with self.assertRaisesRegex(RuntimeError, "requires a PR"):
-                push.Push().execute(item, [], "fixture", "fixture", cfg)
+        with mock.patch.object(push.util, "git") as git, self.assertRaisesRegex(RuntimeError, "requires a PR"):
+            push.Push().execute(item, [], "fixture", "fixture", cfg)
         git.assert_not_called()
         self.assertEqual(push.policy_refusal(old, "old-base"), "")
         c = workspace.Checkout("", new.github, new.path, self.root / "worktree", "old-base")
         with self.assertRaisesRegex(workspace.RunFailed, "release/v2"):
             workspace.require_target_branch(new, [c])
         c.base, c.pr = new.target_branch, "https://github.com/me/new/pull/10"
-        with mock.patch.object(gh, "pr_view", return_value={"baseRefName": "old-base"}):
-            with self.assertRaisesRegex(workspace.RunFailed, "release/v2"):
-                workspace.require_target_branch(new, [c])
+        with (mock.patch.object(gh, "pr_view", return_value={"baseRefName": "old-base"}),
+              self.assertRaisesRegex(workspace.RunFailed, "release/v2")):
+            workspace.require_target_branch(new, [c])
         with mock.patch.object(workspace, "kept_or_cleared"), mock.patch.object(workspace, "place_checkouts") as place:
             with self.assertRaisesRegex(workspace.RunFailed, "separate work branch"):
                 workspace.make_workspace("fixture-run", new, "old-base", new.target_branch, "fixture", [])

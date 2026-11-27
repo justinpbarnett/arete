@@ -46,7 +46,7 @@ def parsed(value):
 
 
 def idle_waits(run_id: str, row: dict) -> dict[str, float]:
-    found = {cause: 0.0 for cause in IDLE_WAITS}
+    found = dict.fromkeys(IDLE_WAITS, 0.0)
     began = parsed(row.get("started"))
     if began is None:
         return found

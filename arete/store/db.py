@@ -787,7 +787,7 @@ def metadata(conn) -> dict:
 
 def sequences(conn: sqlite3.Connection) -> dict[str, int]:
     try:
-        return {name: seq for name, seq in conn.execute("SELECT name, seq FROM sqlite_sequence")}
+        return dict(conn.execute("SELECT name, seq FROM sqlite_sequence"))
     except sqlite3.OperationalError:
         return {}
 

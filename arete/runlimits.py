@@ -407,7 +407,7 @@ class Budget:
         self.parents = [rid for rid in chain if rid not in left]
         kept = [rows[rid] for rid in self.parents]
         self.prior_seconds = sum(active_seconds(row["id"], row) for row in kept)
-        self.earlier_idle = {cause: 0.0 for cause in IDLE_WAITS}
+        self.earlier_idle = dict.fromkeys(IDLE_WAITS, 0.0)
         for row in kept:
             for cause, seconds in idle_waits(row["id"], row).items():
                 self.earlier_idle[cause] += seconds

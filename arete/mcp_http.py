@@ -8,23 +8,20 @@ import time
 from . import api, api_http, contract, credential_http, mcp_protocol
 from .store import db, tokens
 
-REMOTE = frozenset("""
-    screen.get inbox.list inbox.get inbox.resolve task.list task.get task.create task.run
-    comment.create run.list run.get run.stop run.steer turn.list event.page intake.add outbox.list outbox.get
-""".split())
+REMOTE = frozenset(["screen.get", "inbox.list", "inbox.get", "inbox.resolve", "task.list", "task.get", "task.create", "task.run", "comment.create", "run.list", "run.get", "run.stop", "run.steer", "turn.list", "event.page", "intake.add", "outbox.list", "outbox.get"])
 FLOOR_PREFIXES = ("secret.", "token.", "principal.", "pairing.", "push.", "export.")
 FLOOR_OPERATIONS = {"session.end", "webhook.rotate", "serve.install", "account.list"}
 TARGET_DEPENDENT_FLOORS = {"inbox.resolve", "outbox.approve", "config.activate"}
 CALL_RATES = api_http.RateLimits(command_limit=(2, 10))
 SIMPLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-HOOK_RESULT = contract.envelope({"events": contract.array(contract.obj(dict.fromkeys(
-    contract.HOOK_EVENT["properties"], {})))})
+HOOK_RESULT = contract.envelope({"events": contract.array(contract.obj(
+    {key: {} for key in contract.HOOK_EVENT["properties"]}))})
 RESEARCH_ROW = contract.obj({"id": {}, "detail": contract.obj({**contract.RESEARCH["properties"], "ref": {}})})
-SCREEN_LOOP = contract.obj(dict.fromkeys((
+SCREEN_LOOP = contract.obj({key: {} for key in (
     *contract.LOOP["properties"], "origin", "description", "repo", "trigger", "sources", "runner", "device", "queue",
     "budget_usd", "daily_budget_usd", "emits", "dir", "error", "next_due", "last_fire", "spent_24h", "last",
     "findings", "waiting", "cursors", "webhook_path",
-), {}))
+)})
 
 
 def permitted(credential, op):

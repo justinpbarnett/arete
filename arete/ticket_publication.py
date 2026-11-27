@@ -62,9 +62,8 @@ def plan(cfg: config.Config, repo: config.Repo, kind: str, title: str, body: str
     item = {"destination": target, "title": payload["title"], "parent": parent, "labels": labels,
             "body": gh.marked(body + (f"\n\nSource: [source issue]({source})" if source else ""))}
     lock_key = hashlib.sha256(key.encode()).hexdigest()
-    with idempotency.owning("repo.publish", key, sha, PLAN_ROUTE) as context:
-        with util.lock(f"repo-publish-{lock_key}", wait=True):
-            return publish(item, cfg, context)
+    with idempotency.owning("repo.publish", key, sha, PLAN_ROUTE) as context, util.lock(f"repo-publish-{lock_key}", wait=True):
+        return publish(item, cfg, context)
 
 
 def finding(item: dict, cfg: config.Config, approval) -> str:

@@ -24,6 +24,38 @@ wheel-exclude = ["arete/durable/node_modules/**"]
 
 [tool.ruff]
 line-length = 120
+target-version = "py313"
 
 [tool.ruff.lint]
+select = [
+    "E4",      # import errors
+    "E7",      # statement errors
+    "E9",      # runtime syntax/IO errors
+    "F",       # Pyflakes (unused imports/vars, undefined names)
+    "W",       # pycodestyle warnings
+    "B",       # flake8-bugbear (B006 mutable defaults, B007 unused loop vars, B023 closures, B904/B905/B911)
+    "ANN401",  # disallow typing.Any in annotations
+    "C4",      # flake8-comprehensions
+    "ISC",     # implicit string concatenation pitfalls
+    "PIE",     # flake8-pie common bugs and smells
+    "UP",      # pyupgrade for Python 3.13+
+    "T10",     # disallow leftover debugger statements (breakpoint(), pdb)
+    "SIM103",  # needless bool return
+    "SIM105",  # use contextlib.suppress
+    "SIM117",  # combine nested with statements
+    "SIM905",  # static str.split()
+    "RUF006",  # asyncio dangling task
+    "RUF010",  # explicit f-string conversion flag
+    "RUF012",  # mutable class attribute defaults
+    "RUF013",  # implicit Optional
+    "RUF015",  # unnecessary iterable allocation for first element
+    "RUF019",  # unnecessary key check before dict.get
+    "RUF024",  # mutable object passed to dict.fromkeys
+    "RUF034",  # useless if-else with identical arms
+]
 ignore = ["BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test methods frequently define synchronous stub helpers inside subTest loops
+# and declare read-only fixture dicts/lists as unittest.TestCase class attributes.
+"tests/**" = ["B023", "RUF012"]

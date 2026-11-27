@@ -6,6 +6,7 @@ import tomllib
 from urllib.parse import urlsplit
 
 from . import paths, util
+import contextlib
 
 SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]*[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
                        r"|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
@@ -48,10 +49,8 @@ def keep_private(*hosts: str) -> None:
 
 
 def keep_verify_private(url: str) -> None:
-    try:
+    with contextlib.suppress(ValueError):
         keep_private(urlsplit(re.sub(r"\{port\d*\}", "0", url)).hostname or "")
-    except ValueError:
-        pass
 
 
 def keep_configured_private() -> None:

@@ -411,9 +411,9 @@ def ticket_projection(repo: str, issue: str, *, queued: dict, recovery: dict, as
                 activity, blocker = RETRY_ACTIVITIES["verifying"], saved_blocker
                 next_event = saved["next_event"] if retry_activity else "Automatic verification finishes"
         elif draft:
-            hold = dict(state="owner-review", prs=list(draft.prs), draft=True)
+            hold = {"state": "owner-review", "prs": list(draft.prs), "draft": True}
         elif status == "pr" and run.get("pr_url"):
-            hold = dict(state="pr", prs=run["pr_url"].split(), draft=None)
+            hold = {"state": "pr", "prs": run["pr_url"].split(), "draft": None}
         else:
             hold = None
     since = queued.get("since", "") if blocker and activity in (queued.get("activity"), "Owner answered") else ""

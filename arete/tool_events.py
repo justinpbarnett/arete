@@ -579,7 +579,7 @@ def read_events(since_hours: float | None = None, since_ts: float | None = None,
     if since_hours is not None:
         cutoff = datetime.now(UTC).timestamp() - since_hours * 3600
     out = []
-    for attempt in range(8):
+    for _attempt in range(8):
         before = event_stats()
         out = []
         try:

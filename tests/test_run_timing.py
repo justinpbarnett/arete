@@ -42,7 +42,7 @@ class TimingFixture(ProgressFixture):
         self.assertTrue(self.at(at, runs.move, rid, status, (previous,), **fields))
 
     def log(self, rid, at, event, /, **fields):
-        self.append(run_lines.path(rid), json.dumps(dict(run=rid, ts=stamp(at), event=event) | fields))
+        self.append(run_lines.path(rid), json.dumps({"run": rid, "ts": stamp(at), "event": event} | fields))
 
     def message(self, rid, at, text):
         self.append(run_lines.path(rid).with_name("run.log"), f"{stamp(at)} [arete#964] {text}")
@@ -62,7 +62,7 @@ class TimingFixture(ProgressFixture):
                  since=stamp(since) if since is not None else None, **fields)
 
     def check(self, rid, at, suite, seconds=None, **fields):
-        kind, result = ("check_start", {}) if seconds is None else ("check", dict(seconds=seconds))
+        kind, result = ("check_start", {}) if seconds is None else ("check", {"seconds": seconds})
         record.mark(rid, kind, at=stamp(at), suite=suite, **result, **fields)
 
     def project(self, rid, at, *linked, categories=None, **expected):
@@ -78,7 +78,7 @@ class TimingFixture(ProgressFixture):
 class RunTimingTests(TimingFixture):
     def accept(self, rid, at, *ops, resumes=""):
         lease = self.at(at, orchestration.acquire, rid, resumes, {})
-        return partial(self.transition, lease), *(row["id"] for row in admit(lease, *(dict(op=op, args={}) for op in ops)))
+        return partial(self.transition, lease), *(row["id"] for row in admit(lease, *({"op": op, "args": {}} for op in ops)))
 
     def transition(self, lease, aid, at, state, *, end=None, **result):
         self.at(at, orchestration.transition, lease, aid, state, result)
@@ -120,8 +120,8 @@ class RunTimingTests(TimingFixture):
         self.assertIsNone(run_timing.project("specific-step", as_of=clock(150)))
         self.project("resume", 150, "first", "repair", run_ids=["first", "repair", "resume"], elapsed_complete=True,
                      elapsed_seconds=87, unattributed_seconds=25, active=[], blockers=[],
-                     categories=dict(writing=15, checks=12, review=9, owner_wait=12, queue_wait=10, retry=4),
-                     overlap_seconds=6, overlap=[dict(activity=dict(writing=2), seconds=6)])
+                     categories={"writing": 15, "checks": 12, "review": 9, "owner_wait": 12, "queue_wait": 10, "retry": 4},
+                     overlap_seconds=6, overlap=[{"activity": {"writing": 2}, "seconds": 6}])
 
     def test_scoped_check_wait_does_not_pause_another_suite_or_builder(self):
         rid, scope = "adaptive", {"step": "checks", "try": 3}
@@ -129,15 +129,15 @@ class RunTimingTests(TimingFixture):
         action, gate, builder = self.accept(rid, 1, "checks.run", "worker.start")
         action(gate, 2, "running")
         self.step(rid, "checks", 6, 26, **{"try": 3})
-        held = dict(suite="held", resource="full-suite-lock")
+        held = {"suite": "held", "resource": "full-suite-lock"}
         self.wait(rid, 7, **held)
         self.wait(rid, 11, since=7, suite="other", resource="full-suite-lock")
         action(builder, 13, "running", writing=True, role="build", end=22)
         self.check(rid, 15, "other", 4, **scope)
         self.wait(rid, 21, since=7, **held)
         self.check(rid, 21, "held", 4, **scope)
-        working = self.project(rid, 17, categories=dict(writing=4, checks=7, queue_wait=10), overlap_seconds=4)
-        self.assertIn(dict(activity=dict(checks=1, queue_wait=1, writing=1), seconds=2), working["overlap"])
+        working = self.project(rid, 17, categories={"writing": 4, "checks": 7, "queue_wait": 10}, overlap_seconds=4)
+        self.assertIn({"activity": {"checks": 1, "queue_wait": 1, "writing": 1}, "seconds": 2}, working["overlap"])
         self.fields(working["blockers"][0], cause="slot", since=stamp(7), **held, **scope)
 
     def test_check_start_pairs_with_its_receipt_and_does_not_extend_past_interruption(self):
@@ -146,10 +146,10 @@ class RunTimingTests(TimingFixture):
         for suite in ("a", "b"):
             self.check(rid, 2, suite, name=suite, check_no=1)
         self.check(rid, 3, "a", 2, check_no=1)
-        [active] = self.project(rid, 6, categories=dict(checks=4), overlap_seconds=3)["active"]
+        [active] = self.project(rid, 6, categories={"checks": 4}, overlap_seconds=3)["active"]
         self.fields(active, suite="b", name="b", check_no=1)
         self.settle(rid, 12, "interrupted")
-        self.project(rid, 20, elapsed_seconds=12, unattributed_seconds=9, categories=dict(checks=3), overlap=[], active=[])
+        self.project(rid, 20, elapsed_seconds=12, unattributed_seconds=9, categories={"checks": 3}, overlap=[], active=[])
 
     def test_inline_repair_pauses_verification_but_not_independent_checks(self):
         rid, scope = "patch", {"step": "verify", "try": 2}
@@ -161,8 +161,8 @@ class RunTimingTests(TimingFixture):
         self.check(rid, 7, "verify", 2, **scope)
         self.log(rid, 10, "step_end", **scope)
         self.settle(rid, 11, "done")
-        self.project(rid, 20, elapsed_seconds=11, unattributed_seconds=3, categories=dict(checks=6, retry=3),
-                     overlap=[dict(activity=dict(checks=1, retry=1), seconds=1), dict(activity=dict(checks=2), seconds=2)])
+        self.project(rid, 20, elapsed_seconds=11, unattributed_seconds=3, categories={"checks": 6, "retry": 3},
+                     overlap=[{"activity": {"checks": 1, "retry": 1}, "seconds": 1}, {"activity": {"checks": 2}, "seconds": 2}])
 
     def test_publication_catch_up_counts_its_nested_checks_and_review(self):
         rid, scope = "catch-up", {"step": "publish", "try": 2}
@@ -175,7 +175,7 @@ class RunTimingTests(TimingFixture):
         record.mark(rid, "agent", at=stamp(13), step="review3", seconds=3)
         self.log(rid, 17, "step_end", **scope)
         self.settle(rid, 19, "pr")
-        self.project(rid, 25, elapsed_seconds=19, unattributed_seconds=11, categories=dict(checks=5, review=3), overlap=[])
+        self.project(rid, 25, elapsed_seconds=19, unattributed_seconds=11, categories={"checks": 5, "review": 3}, overlap=[])
 
     def test_interrupted_waits_cut_off_at_settlement_and_survive_resume(self):
         for cause in ("ci", "slot"):
@@ -190,4 +190,4 @@ class RunTimingTests(TimingFixture):
                 self.step(resumed, "verify", 17)
                 self.settle(resumed, 18, "failed")
                 self.project(resumed, 20, rid, elapsed_seconds=18, unattributed_seconds=10,
-                             categories=dict(queue_wait=6, writing=2), blockers=[], overlap=[])
+                             categories={"queue_wait": 6, "writing": 2}, blockers=[], overlap=[])

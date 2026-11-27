@@ -242,9 +242,9 @@ for _name, _shape in RESOURCE.items():
     _plural = PLURALS[_name]
     _selectors = {"run": STRING} if _name == "step" else {}
     OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
-                             obj(_selectors, list(_selectors)), {k: "example" for k in _selectors}),
+                             obj(_selectors, list(_selectors)), dict.fromkeys(_selectors, "example")),
                    operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
-                             obj({"id": STRING, **_selectors}), {"id": "example", **{k: "example" for k in _selectors}})]
+                             obj({"id": STRING, **_selectors}), {"id": "example", **dict.fromkeys(_selectors, "example")})]
 CONFIG_KIND = {"type": "string", "enum": list(configkinds.REGISTRY)}
 CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkinds.DEFAULTS_LAYER_ADDRESS})$",
                "description": "For step_settings, defaults selects config.toml and defaults@layer selects "

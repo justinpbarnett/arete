@@ -129,11 +129,8 @@ def read_secret(fd: int, name: str = SECRET) -> bytes:
 @contextmanager
 def authority_fd(create: bool = False):
     if create:
-        with paths.directory_fd(sandbox.AUTHORITY.parent) as parent:
-            try:
-                os.mkdir(sandbox.AUTHORITY.name, 0o700, dir_fd=parent)
-            except FileExistsError:
-                pass
+        with paths.directory_fd(sandbox.AUTHORITY.parent) as parent, suppress(FileExistsError):
+            os.mkdir(sandbox.AUTHORITY.name, 0o700, dir_fd=parent)
     with paths.directory_fd(sandbox.AUTHORITY) as fd:
         st = os.fstat(fd)
         if st.st_uid != os.getuid() or st.st_mode & 0o077:
@@ -1728,7 +1725,7 @@ def cleanup(a: Attempt, data: dict, fd: int, key: bytes) -> list[str]:
                         store(fd, key, data)
                         raise OSError(errno.ESTALE, "restored source retained for revalidation") from None
                     if unknown(a, replaced):
-                        raise OSError(errno.ESTALE, "scratch changed before archival")
+                        raise OSError(errno.ESTALE, "scratch changed before archival") from None
                     os.rename(Path(a.root).name, "tree", src_dir_fd=workspace, dst_dir_fd=archive)
                 try:
                     if transaction.get("restore"):

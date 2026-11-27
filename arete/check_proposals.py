@@ -127,10 +127,10 @@ def comparable_examples(known_bad: str, allowed: str, correction: str) -> bool:
     bad_tree = ast.parse(known_bad.encode())
     allowed_tree = ast.parse(allowed.encode())
     changed = False
-    for bad_node, allowed_node in zip(ast.walk(bad_tree), ast.walk(allowed_tree)):
+    for bad_node, allowed_node in zip(ast.walk(bad_tree), ast.walk(allowed_tree), strict=False):
         if not isinstance(bad_node, ast.Compare) or not isinstance(allowed_node, ast.Compare):
             continue
-        for index, (before, after) in enumerate(zip(bad_node.ops, allowed_node.ops)):
+        for index, (before, after) in enumerate(zip(bad_node.ops, allowed_node.ops, strict=False)):
             if isinstance(before, identity) and isinstance(after, equality):
                 if changed:
                     return False

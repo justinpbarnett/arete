@@ -32,12 +32,12 @@ def snapshot_source(conn, explicit):
         return None
     meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('instance_id', 'new_workspace_store')"))
     try:
-        with paths.directory_fd(paths.DB_FILE.parent.resolve() / paths.backups_dir().name) as fd:
-            with os.fdopen(os.open("instance.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), "rb") as src:
-                info = os.fstat(src.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
-                    return None
-                marker = json.loads(src.read(4097))
+        with (paths.directory_fd(paths.DB_FILE.parent.resolve() / paths.backups_dir().name) as fd,
+              os.fdopen(os.open("instance.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), "rb") as src):
+            info = os.fstat(src.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                return None
+            marker = json.loads(src.read(4097))
     except (OSError, ValueError):
         return None
     if (meta.get("new_workspace_store") == "0" or not isinstance(marker, dict)
@@ -186,7 +186,7 @@ def quarantine(conn, ws, row, error):
     reason = workspaces.SNAPSHOT_UNAVAILABLE
     detail = util.first_line(str(error), 300)
     print(f"workspace {ws.name} held: {detail}", flush=True)
-    fields = dict(state="held", kept_reason=reason, last_sweep_error=detail, remove_asked_by="", released_at="")
+    fields = {"state": "held", "kept_reason": reason, "last_sweep_error": detail, "remove_asked_by": "", "released_at": ""}
     if row:
         update(conn, row, fields)
     else:
@@ -269,7 +269,7 @@ def import_snapshot(conn, ws, row, path, before, made):
     if removed and snapshot_precedes_removal(removed, modified):
         return
     fields = workspaces.snapshot_fields(made)
-    identity = dict(owner_run=owner.run, repo=owner.repo, ticket=owner.ticket, checkouts=owner.checkout_rows())
+    identity = {"owner_run": owner.run, "repo": owner.repo, "ticket": owner.ticket, "checkouts": owner.checkout_rows()}
     if removed:
         if owner_data is None or not owner.run or owner.run == removed["owner_run"]:
             return
@@ -326,8 +326,8 @@ def update(conn, row, fields):
 def keep_fields():
     from arete.store import workspaces
 
-    return dict(state="kept", kept_reason=workspaces.LEGACY_RESUME, released_at="",
-                remove_asked_by="", held_by=[], last_sweep_error="")
+    return {"state": "kept", "kept_reason": workspaces.LEGACY_RESUME, "released_at": "",
+                "remove_asked_by": "", "held_by": [], "last_sweep_error": ""}
 
 
 @contextmanager

@@ -1,2 +1,7 @@
 #!/bin/sh
-exec uvx ruff@0.15.15 check --no-cache arete
+set -eu
+uvx ruff@0.15.15 check --no-cache arete adws tests tools
+if [ -x .venv/bin/python ]; then
+  exec .venv/bin/python -B tools/lint-smells.py
+fi
+exec python3 -B tools/lint-smells.py

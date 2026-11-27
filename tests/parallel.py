@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import import_module
 from unittest.loader import _FailedTest
+import contextlib
 
 KEPT_LINES = 40
 DEFAULT_CLASS_TIMEOUT = 10
@@ -150,10 +151,8 @@ class Runner:
         self.history = history if isinstance(history, dict) else {}
 
     def kill(self, process):
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
 
     def stop(self, *args):
         with self.lock:

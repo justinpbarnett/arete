@@ -5344,9 +5344,9 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
 
     def test_release_is_durable_before_filesystem_removal(self):
         ws, c, _ = self.checkout("7", "done")
-        with mock.patch.object(workspace, "remove_checkouts", side_effect=OSError("interrupted")):
-            with self.assertRaisesRegex(OSError, "interrupted"):
-                workspace.remove_workspace(ws, [c])
+        with (mock.patch.object(workspace, "remove_checkouts", side_effect=OSError("interrupted")),
+              self.assertRaisesRegex(OSError, "interrupted")):
+            workspace.remove_workspace(ws, [c])
         row = workspaces.open_for(ws.name)
         self.assertEqual(row["state"], "released")
         self.assertTrue(row["released_at"])
@@ -5476,9 +5476,9 @@ class WorkspaceRemovalGuardTests(_WorkspaceWorkflowCase):
                 late.write_text("arrived under lock\n")
                 yield
 
-        with mock.patch.object(util, "repo_lock", write_under_lock):
-            with self.assertRaisesRegex(workspace.RunFailed, r"\(api/hand\.txt\)"):
-                workspace.clear_workspace(ws, [c], c.src, [])
+        with (mock.patch.object(util, "repo_lock", write_under_lock),
+              self.assertRaisesRegex(workspace.RunFailed, r"\(api/hand\.txt\)")):
+            workspace.clear_workspace(ws, [c], c.src, [])
         self.assertTrue(self.registered(c.wt))
         late.unlink()
 
@@ -6289,7 +6289,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
             (f'"ask" = {{ max_per_run = 0x4, push_contact = {contact} }} # owner attention\n' + original,
              "settle = false"),
             ('"ask" . max_per_run = 0x4 # keep the rate\n'
-             + f"ask.push_contact = {contact} # keep the contact\n" + original, "ask.settle = false\n"),
+              f"ask.push_contact = {contact} # keep the contact\n" + original, "ask.settle = false\n"),
         )
         for initial, added in forms:
             paths.CONFIG_FILE.write_text(initial)
@@ -7626,9 +7626,9 @@ class HookUploadTests(unittest.TestCase):
             self.hook("pending")
             before = files()
             out = StringIO()
-            with mock.patch.object(client, "connect", side_effect=AssertionError("doctor contacted serve")) as connect:
-                with redirect_stdout(out):
-                    cli.main(["doctor"])
+            with (mock.patch.object(client, "connect", side_effect=AssertionError("doctor contacted serve")) as connect,
+                  redirect_stdout(out)):
+                cli.main(["doctor"])
             connect.assert_not_called()
             self.assertIn("quick_check ok", out.getvalue())
             self.assertEqual(files(), before)

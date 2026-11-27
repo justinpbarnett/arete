@@ -623,8 +623,8 @@ def preview(folder: Path, found: list[dict], end: dict) -> int:
             f"{held['reason']} ({held['accepted']} of {held['done']} against {held['other_accepted']} of "
             f"{held['other_done']})"),
            f"config: {paths.short_path(paths.CONFIG_FILE)}, table [{table}]"]
-    out += [line for line in difflib.unified_diff(text.splitlines(), after.splitlines(),
-                                                  paths.short_path(paths.CONFIG_FILE), "after promote", lineterm="")]
+    out += list(difflib.unified_diff(text.splitlines(), after.splitlines(),
+                                     paths.short_path(paths.CONFIG_FILE), "after promote", lineterm=""))
     if after == text:
         out.append("no change: config.toml already holds these values")
     if follows:

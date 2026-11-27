@@ -64,9 +64,8 @@ model = "gpt-5.4"
         cfg = config.load(self.config_file, strict=True)
         layer = config.load_layer(self.layer_dir)
         for launch in (self.launch, self.full_launch):
-            with self.subTest(config_sha=launch["config_sha"]):
-                with self.assertRaises(delegation.PolicyChanged):
-                    delegation.check_policy(launch, cfg, layer)
+            with self.subTest(config_sha=launch["config_sha"]), self.assertRaises(delegation.PolicyChanged):
+                delegation.check_policy(launch, cfg, layer)
 
     def legacy_requests(self):
         self.config_file.write_text(CONTROLLER_SETTINGS + self.settings)
@@ -94,9 +93,8 @@ model = "gpt-5.4"
             self.config_file.write_text(original.replace(before, after))
             cfg = config.load(self.config_file, strict=True)
             for launch in launches:
-                with self.subTest(edit=after, config_sha=launch["config_sha"]):
-                    with self.assertRaises(delegation.PolicyChanged):
-                        delegation.check_policy(launch, cfg, layer)
+                with self.subTest(edit=after, config_sha=launch["config_sha"]), self.assertRaises(delegation.PolicyChanged):
+                    delegation.check_policy(launch, cfg, layer)
 
     def test_layer_edit_changes_worker_policy(self):
         launches = list(self.legacy_requests())
@@ -105,6 +103,5 @@ model = "gpt-5.4"
         (self.layer_dir / "config.toml").write_text("[limits]\nmax_attempts = 4\n")
         layer = config.load_layer(self.layer_dir, strict=True)
         for launch in (self.launch, self.full_launch, *launches):
-            with self.subTest(config_sha=launch["config_sha"]):
-                with self.assertRaises(delegation.PolicyChanged):
-                    delegation.check_policy(launch, cfg, layer)
+            with self.subTest(config_sha=launch["config_sha"]), self.assertRaises(delegation.PolicyChanged):
+                delegation.check_policy(launch, cfg, layer)

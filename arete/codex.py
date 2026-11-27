@@ -324,7 +324,7 @@ def kept_out(roots: list[Path], hidden: list[Path | str], floor: guard.Floor | N
     denied |= {str(paths.HOME / d): "deny" for d in sorted(sandbox.SECRET_DIRS)}
     denied |= {p: "deny" for d in (*floor.closed, *floor.files) for p in both(d)}
     if gh := shutil.which("gh"):
-        denied |= {p: "deny" for p in both(gh)}
+        denied |= dict.fromkeys(both(gh), "deny")
     return denied
 
 
@@ -355,7 +355,7 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
                 any(sandbox.secret_path(p) or p.name in ("auth.json", "config.toml", *sandbox.SECRET_DIRS)
                     for p in map(Path, spellings))):
             continue
-        granted |= {p: "read" for p in spellings}
+        granted |= dict.fromkeys(spellings, "read")
     return granted
 
 
@@ -364,11 +364,11 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
             temp_dir: Path | None = None, authority: tuple[Path, ...] | None = None) -> list[str]:
     floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     name = WRITE_PROFILE if writing else READ_PROFILE
-    granted = {path: "write" if writing else "read" for path in both(cwd)}
+    granted = dict.fromkeys(both(cwd), "write" if writing else "read")
     if writing:
         granted |= {path: "write" for d in add_dirs for path in both(d)}
     elif temp_dir is not None:
-        granted |= {path: "write" for path in both(temp_dir)}
+        granted |= dict.fromkeys(both(temp_dir), "write")
     metadata = {path: "read" for root in [cwd, *add_dirs] for path in both(root / ".git")}
     result = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd=cwd,
                      timeout=10, env=agent_env(), inherit=False)

@@ -45,7 +45,7 @@ def classify(saved, key, ticket):
         # Equal-length replacements preserve check identity; insertions/deletions require explicit mapping.
         if kind != "replace" or b - a != j - i:
             return None
-        for previous, latest in zip(old[a:b], new[i:j]):
+        for previous, latest in zip(old[a:b], new[i:j], strict=True):
             previous, latest = (PREFIX.sub("", line, count=1).strip() for line in (previous, latest))
             ids = KEY.findall(previous)
             if not latest or (ids and KEY.findall(latest) != ids):
@@ -64,9 +64,7 @@ def verified_change(source, remote, key, saved, parent, ticket):
     if (not saved["complete"] or remote.scope != data["destination"] or remote.account() != data["account"]
             or parent.ref != key.parent or parent.native_id != data["native_id"] or not spec_graph.authorized(ticket, parent)):
         return False
-    if isinstance(source, tracker.GitHubTracker) and requirement_revision.github_conflict(source, ticket):
-        return False
-    return True
+    return not (isinstance(source, tracker.GitHubTracker) and requirement_revision.github_conflict(source, ticket))
 
 
 def unaffected(source, remote, key, saved, parent, ticket, ref):

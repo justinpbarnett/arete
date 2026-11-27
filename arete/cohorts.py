@@ -310,7 +310,7 @@ def report(name):
             ]
             runs, answers, wait = facts(cohort["repo"], ids)
             obs += [
-                dict(kind="touch", at=a["answered"], evidence="ask:" + a["id"], detail="owner answer consumed")
+                {"kind": "touch", "at": a["answered"], "evidence": "ask:" + a["id"], "detail": "owner answer consumed"}
                 for a in answers
                 if a["answered"]
             ]
@@ -342,39 +342,39 @@ def report(name):
                 )
             )
             goals.append(
-                dict(
-                    root=root,
-                    tickets=ids,
-                    arrived=arrived,
-                    status=status,
-                    terminal_evidence=terminal["evidence"] if terminal else None,
-                    reason=reason,
-                    age_seconds=max(0, age),
-                    deadline=util.iso(deadline),
-                    overdue=(util.parse_iso(verified["at"]) if verified else now) > deadline,
-                    provenance=provenance,
-                    first_touch=first,
-                    release=verified,
-                    regressions=[
+                {
+                    "root": root,
+                    "tickets": ids,
+                    "arrived": arrived,
+                    "status": status,
+                    "terminal_evidence": terminal["evidence"] if terminal else None,
+                    "reason": reason,
+                    "age_seconds": max(0, age),
+                    "deadline": util.iso(deadline),
+                    "overdue": (util.parse_iso(verified["at"]) if verified else now) > deadline,
+                    "provenance": provenance,
+                    "first_touch": first,
+                    "release": verified,
+                    "regressions": [
                         r for r in obs if verified and r["at"] >= deliveries[0]["at"] and r["kind"] == "regression"
                     ],
-                    pull_requests=sorted({url for run in runs for url in (run["pr_url"] or "").split()}),
-                    attempts=len(runs),
-                )
+                    "pull_requests": sorted({url for run in runs for url in (run["pr_url"] or "").split()}),
+                    "attempts": len(runs),
+                }
             )
     counts = {s: dict.fromkeys(("touched", "untouched", "unknown"), 0) for s in ("verified", "failed", "pending")}
     for g in goals:
         counts[g["status"]][g["provenance"]] += 1
-    return dict(
-        cohort=cohort,
-        observed=observed,
-        arrivals=sum(m["source"] != "replacement" for group in groups.values() for m in group),
-        goals=len(goals),
-        pending_overdue=sum(g["status"] == "pending" and g["deadline"] < observed for g in goals),
-        outcomes=counts,
-        members=goals,
-        intake_complete=not cohort["label"] or cohort["scanned"] >= cohort["closes"],
-    )
+    return {
+        "cohort": cohort,
+        "observed": observed,
+        "arrivals": sum(m["source"] != "replacement" for group in groups.values() for m in group),
+        "goals": len(goals),
+        "pending_overdue": sum(g["status"] == "pending" and g["deadline"] < observed for g in goals),
+        "outcomes": counts,
+        "members": goals,
+        "intake_complete": not cohort["label"] or cohort["scanned"] >= cohort["closes"],
+    }
 
 
 def candidates(name):
@@ -384,10 +384,10 @@ def candidates(name):
         for event in [goal["first_touch"], *goal["regressions"]]:
             if event:
                 selected.append(
-                    dict(goal=goal["root"], kind=event["kind"], evidence=event["evidence"], detail=event["detail"])
+                    {"goal": goal["root"], "kind": event["kind"], "evidence": event["evidence"], "detail": event["detail"]}
                 )
         if goal["status"] == "failed":
             selected.append(
-                dict(goal=goal["root"], kind="failed", detail=goal["reason"], evidence=goal["terminal_evidence"])
+                {"goal": goal["root"], "kind": "failed", "detail": goal["reason"], "evidence": goal["terminal_evidence"]}
             )
     return selected

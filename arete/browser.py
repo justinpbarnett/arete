@@ -540,10 +540,8 @@ def stop_browser(data: dict) -> None:
         if not (pids := writers()):
             return
         for pid in pids:
-            try:
+            with suppress(OSError):
                 os.kill(pid, sig)
-            except OSError:
-                pass
         deadline = time.monotonic() + BROWSER_GRACE_SECONDS
         while time.monotonic() < deadline and writers():
             time.sleep(0.1)

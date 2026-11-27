@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from . import accounts, config, outbound, paths, refusals, util
 from .store import asks as asks_store
 from .store import push as push_store
+import contextlib
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
@@ -63,10 +64,8 @@ def private_key_file() -> Path:
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(pem)
-            try:
+            with contextlib.suppress(FileExistsError):
                 os.link(temp, target)
-            except FileExistsError:
-                pass
         finally:
             os.unlink(temp)
     if stat.S_IMODE(target.stat().st_mode) & 0o077:

@@ -119,7 +119,7 @@ def read_blocking_links(issues: list[dict]) -> None:
     by_id = {row["id"]: row for row in issues if isinstance(row.get("id"), str) and row["id"]}
     query = ("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Issue { id blockedBy(first: 100) "
              "{ totalCount nodes { number state url } } } } }")
-    for ids in itertools.batched(by_id, 100):
+    for ids in itertools.batched(by_id, 100, strict=False):
         payload = Outgoing(json.dumps({"query": query, "variables": {"ids": ids}}))
         try:
             reply = json.loads(gh(["api", "graphql", "--input", "-"], input=payload, timeout=15, retry=False))
