@@ -23,12 +23,20 @@ def denied_paths(layer: config.RepoLayer) -> list[str]:
     return ALWAYS_DENY + layer.deny
 
 
+def staged_pathspec(deny: Sequence[str] = ()) -> list[str]:
+    return [*NEVER_STAGED, *(f":(exclude,glob){p}" for p in deny)]
+
+
+def denied_pathspec(deny: Sequence[str] = ()) -> list[str]:
+    return [f":(glob){p}" for p in deny]
+
+
 def is_lockfile(name: str) -> bool:
     return Path(name).name in LOCKFILES
 
 
 def add(wt: Path) -> None:
-    util.git(["add", "-A", "--", ".", *NEVER_STAGED], wt)
+    util.git(["add", "-A", "--", ".", *staged_pathspec(())], wt)
 
 
 @dataclass
