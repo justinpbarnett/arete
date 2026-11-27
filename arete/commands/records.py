@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import closing
+from urllib.parse import quote
 
 from .. import config, paths
 from .common import print_lines
@@ -89,7 +90,7 @@ def cmd_record(args) -> int:
 
 
 def cmd_secrets(args) -> int:
-    from .. import vault
+    from .. import client, refusals, secret_move, vault
 
     words = args.words
     if len(words) == 1:
@@ -99,12 +100,29 @@ def cmd_secrets(args) -> int:
             print(f"{words[0]} has no stored secrets", file=sys.stderr)
         return 0
     if len(words) == 3 and words[0] == "rm":
-        repo = config.load().repo(words[1])
-        if vault.remove(repo.name, words[2]):
-            print(f"removed {words[2]} from {words[1]}")
-            return 0
-        print(f"{words[1]} has no stored secret {words[2]}", file=sys.stderr)
-        return 1
+        repo, name = words[1:]
+        scope = f"repo:{repo}"
+        if client.configured_server() or config.secret_settings().store:
+            path = f"/api/v1/secrets/{quote(scope, safe='')}/{quote(name, safe='')}"
+            try:
+                client.call("DELETE", path)
+            except client.Failed as error:
+                if error.code == 403 and client.reason(error.answer) == "presence_required":
+                    error.answer["hint"] = (
+                        f"Send DELETE {path} from a paired owner browser on the HTTPS dashboard. "
+                        "See 'Remove a stored repo secret' in the README."
+                    )
+                raise
+        else:
+            try:
+                removed = secret_move.remove_legacy_repo(repo, name)
+            except (OSError, ValueError) as error:
+                raise refusals.Refusal(f"could not remove {name} from {repo} ({error})") from None
+            if not removed:
+                print(f"{repo} has no stored secret {name}", file=sys.stderr)
+                return 1
+        print(f"removed {name} from {repo}")
+        return 0
     print("usage: arete secrets REPO | arete secrets rm REPO NAME", file=sys.stderr)
     return 2
 
@@ -148,8 +166,9 @@ def register(sub) -> None:
     p.add_argument("--text", action="store_true", help="print the text alone")
     p.set_defaults(fn=cmd_document)
 
-    p = sub.add_parser("secrets", help="list the names of the secrets stored for a repo (REPO), or remove one "
-                                       "(rm REPO NAME); it never prints a value")
+    p = sub.add_parser("secrets", help="list or remove stored repo secrets without printing their values",
+                       description="Use REPO to list secret names. Local rm REPO NAME works only without a "
+                                   "configured store or server; server removal requires a paired owner browser.")
     p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
     p.set_defaults(fn=cmd_secrets, local_read=lambda args: len(args.words) == 1)
 

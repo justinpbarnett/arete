@@ -30,6 +30,8 @@ from . import (
     pi_shell,
     sandbox,
     scratch,
+    secret_move,
+    secretstore,
     util,
     vault,
 )
@@ -58,7 +60,6 @@ TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": 
             "MultiEdit": ("edit",), "Write": ("write",), "Bash": (pi_shell.TOOL,)}
 WRITING = {"edit", "write", pi_shell.TOOL}
 PI_HOME = paths.HOME / ".pi"
-KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
 ASK_FILE = paths.PACKAGE_DIR / "pi_ask.mjs"
 SHELL_FILE = paths.PACKAGE_DIR / "pi_shell.mjs"
@@ -68,7 +69,8 @@ SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 ANTHROPIC_LOGIN_REASON = "a Claude plan login runs only on the claude runner"
 ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
-                          "put an Anthropic Console key in pi.env or use claude:<model>")
+                          f"set an Anthropic Console key at {secretstore.address('global', 'ANTHROPIC_API_KEY')} "
+                          "or use claude:<model>")
 REMOTE_AUTH_UNVERIFIED = ("pi cannot validate or isolate credentials on a remote device; "
                           "run pi locally or use the claude runner")
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
@@ -106,6 +108,7 @@ MANAGED_NAMES = ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "A
 CREDENTIAL_FILES = ("AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
                     "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
                     "ANTHROPIC_IDENTITY_TOKEN_FILE")
+SERVICE_KEYS = {"JIRA_API_TOKEN", "GITHUB_APP_PRIVATE_KEY", "VAPID_PRIVATE_KEY", "FINGERPRINT_KEY"}
 REFERENCES = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
 SAFE_HEADERS = {"accept": r"application/json|text/event-stream", "content-type": r"application/json(?:; ?charset=utf-8)?",
                 "anthropic-version": r"\d{4}-\d{2}-\d{2}",
@@ -155,13 +158,14 @@ class Route:
     sensitive_files: tuple[Path, ...] = field(default=(), repr=False)
     local: bool = False
     key_supported: bool = False
+    key_identity: str = field(default="", repr=False)
 
     @property
     def key_available(self) -> bool:
-        return bool(self.key or self.managed)
+        return bool(self.key or self.key_identity or self.managed)
 
 
-def managed_credential(provider: str, available: dict) -> ManagedCredential | None:
+def managed_credential(provider: str, available: dict, *, opaque=()) -> ManagedCredential | None:
     if provider == "cloudflare-ai-gateway":
         names = ("CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID")
         if all(available.get(name) for name in names):
@@ -196,7 +200,7 @@ def managed_credential(provider: str, available: dict) -> ManagedCredential | No
         location = available.get("GOOGLE_CLOUD_LOCATION")
         path = paths.expand(available.get("GOOGLE_APPLICATION_CREDENTIALS") or
                             paths.HOME / ".config" / "gcloud" / "application_default_credentials.json").absolute()
-        if project and location and path.is_file():
+        if project and location and ("GOOGLE_APPLICATION_CREDENTIALS" in opaque or path.is_file()):
             return ManagedCredential("adc", {"GOOGLE_CLOUD_PROJECT": project, "GOOGLE_CLOUD_LOCATION": location,
                                              "GOOGLE_APPLICATION_CREDENTIALS": str(path)}, (path,))
     return None
@@ -267,6 +271,14 @@ def credential_config(value) -> list[str]:
         return [s for k, v in value.items() for s in
                 (credential_values(v) if k in ("apiKey", "headers", "env") else credential_config(v))]
     return [s for v in value for s in credential_config(v)] if isinstance(value, list) else []
+
+
+def key_addresses(values):
+    return ((secretstore.address("global", n) if secretstore.NAME.fullmatch(n) else n, v) for n, v in values.items())
+
+
+def key_references(value):
+    return {n for pair in REFERENCES.findall(value) for n in pair if n} if isinstance(value, str) else set()
 
 
 def configured_key(value, available: dict) -> str:
@@ -363,8 +375,18 @@ def withheld(store: dict, raw_credentials: list[str], keys: dict[str, str], avai
     return tuple(v for v in hidden if len(v) >= vault.SHORTEST), tuple(sorted(files))
 
 
+def key_setting(provider):
+    name = KEY_NAMES.get(provider)
+    return secretstore.address("global", name) if name else "the provider's global secret address"
+
+
+def missing_key(provider, owner):
+    return (f"pi {provider}: no usable login or supported key; checked {owner}, {key_setting(provider)} "
+            "and Arete environment")
+
+
 def select(model: str, passing=None, providers=None, *, held=lambda auth, model: None, mode: str = "",
-           source=None, local_providers=(), owner_auth: Path | None = None) -> Route:
+           source=None, local_providers=(), owner_auth: Path | None = None, metadata_only=False) -> Route:
     if passing is None or providers is None:
         cfg = config.load()
         passing = environment.passed(cfg) if passing is None else passing
@@ -391,34 +413,42 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
              and not isinstance(credential["expires"], bool) and math.isfinite(credential["expires"]))
     login_refused = ANTHROPIC_LOGIN_REASON if provider == "anthropic" and credential.get("type") == "oauth" else ""
     login = login and provider != "anthropic"
-    auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
-    keys = util.read_env_file(KEYS_FILE)
     source = os.environ if source is None else source
-    token_error = plan_token_error(source.items()) or plan_token_error(keys.items(), f"{KEYS_FILE} variable ")
-    available = {**source, **keys}
+    legacy = secret_move.pi_env()
     configured = accounts.mapping(accounts.mapping(models.get("providers")).get(provider))
     supported = (provider in KEY_NAMES or bool(configured.get("api")) or
                  any(accounts.mapping(m).get("api") for m in configured.get("models", []) if isinstance(m, dict)))
     names = [KEY_NAMES[provider]] if provider in KEY_NAMES else []
     raw = configured.get("apiKey", "")
-    resolved_key = configured_key(raw, available)
-    token_error = token_error or plan_token_error(
-        [(f"{owner.parent / 'models.json'} provider {provider} apiKey", resolved_key)])
-    if login:
-        token_error = token_error or plan_token_error([(f"{owner} provider {provider}", credential)])
-    if supported and provider != "openai-codex":
+    bound_key = bool(configured.get("baseUrl") and "apiKey" in configured)
+    login = login and not bound_key
+    auth = accounts.pi(provider, credential, str(owner)) if login else accounts.Auth("api_key")
+    if supported and provider != "openai-codex" and not bound_key:
         names += list(providers.get(provider, ()))
     else:
         names = []
     context = {*MANAGED_NAMES, *TRANSPORT_NAMES.get(provider, ())}
     exact = [n for n in names if isinstance(n, str) and re.fullmatch(r"[A-Za-z_]\w*", n) and n not in context]
-    key_name = next((n for n in exact if keys.get(n)), "") or next((n for n in exact if available.get(n)), "")
+    wanted = {*exact, *context, *key_references(raw)} - SERVICE_KEYS
+    fingerprints = {}
+    read_keys = secretstore.env_status if metadata_only else secretstore.env
+    keys = read_keys(wanted, source=source, fingerprints=fingerprints, legacy=legacy)
+    available = {**source, **keys}
+    resolved_key = configured_key(raw, available)
+    token_error = (plan_token_error(source.items()) or plan_token_error(key_addresses(legacy)) or
+                   plan_token_error(key_addresses(keys)) or
+                   plan_token_error([(f"{owner.parent / 'models.json'} provider {provider} apiKey", resolved_key)]))
+    if login:
+        token_error = token_error or plan_token_error([(f"{owner} provider {provider}", credential)])
+    key_name = next((n for n in exact if source.get(n)), "") or next((n for n in exact if fingerprints.get(n)), "")
+    key_name = key_name or next((n for n in exact if available.get(n)), "")
     key = available.get(key_name, "")
-    if supported and provider != "openai-codex" and raw and not keys.get(key_name):
+    if supported and provider != "openai-codex" and raw and not key:
         key = resolved_key
         key_name = "ARETE_PI_SELECTED_KEY" if key else ""
-    managed = (managed_credential(provider, available)
-               if provider != "anthropic" and (not key or provider == "cloudflare-ai-gateway") else None)
+    managed = (managed_credential(provider, available, opaque=fingerprints if metadata_only else ())
+               if not bound_key and provider != "anthropic" and (not key or provider == "cloudflare-ai-gateway")
+               else None)
     if provider == "cloudflare-ai-gateway":
         key, key_name = "", ""
     if provider == "cloudflare-workers-ai" and not available.get("CLOUDFLARE_ACCOUNT_ID"):
@@ -434,39 +464,50 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     error = token_error
     if not error and not provider:
         error = f"pi needs provider/model or defaultProvider in {owner.parent / 'settings.json'} before choosing credentials"
+    elif not error and bound_key and not key:
+        error = f"pi {provider}: no usable apiKey for the custom endpoint in {owner.parent / 'models.json'}"
     elif not error and provider == "anthropic" and (mode in ("login", "subscription") or not key):
         error = ANTHROPIC_KEY_REQUIRED
     elif not error and provider != "anthropic" and (
             (mode in ("login", "subscription") and not login) or (not chosen_login and not (has_key or local))):
-        error = (f"pi {provider}: no usable login or supported key; checked {owner}, {KEYS_FILE} and Arete environment")
+        error = missing_key(provider, owner)
+    identity_env = {**available, **fingerprints}
+    key_identity = (configured_key(raw, identity_env) if key_name == "ARETE_PI_SELECTED_KEY" else
+                    identity_env.get(key_name, "")) if key else ""
     chosen_auth = auth if chosen_login else accounts.Auth(
         "subscription" if mode in ("login", "subscription") and provider in accounts.PI_SUBSCRIPTIONS else "api_key",
         provider=provider)
     if not chosen_login and has_key:
         source_kind = ("managed" if managed else "configured" if key_name == "ARETE_PI_SELECTED_KEY" else
-                       "keys" if keys.get(key_name) else "environment")
-        credential_context = {n: available[n] for n in TRANSPORT_NAMES.get(provider, ()) if available.get(n)
+                       "registry" if key_name in fingerprints else "keys" if key_name in legacy and
+                       not source.get(key_name) else "environment")
+        credential_context = {n: identity_env[n] for n in TRANSPORT_NAMES.get(provider, ()) if identity_env.get(n)
                               and re.search(r"REGION|PROJECT|ACCOUNT|RESOURCE|GATEWAY|BASE_URL|ENDPOINT", n)}
         credential_context["baseUrl"] = configured.get("baseUrl", "")
-        material = managed_material(managed, provider) if managed else [key_name, key]
+        material = (managed_material(replace(managed, env={n: fingerprints.get(n, v) for n, v in managed.env.items()}),
+                                     provider) if managed else [key_name, key_identity])
         chosen_auth = accounts.keyed(provider, ("pi-managed" if managed else "pi-key", material),
                                      ("pi", provider, source_kind,
                                       str(owner) if source_kind == "configured" else
-                                      str(KEYS_FILE) if source_kind == "keys" else "",
+                                      str(paths.PI_KEYS_FILE) if source_kind == "keys" else "",
                                       material, credential_context),
                                      mode=chosen_auth.mode)
     raw_credentials = credential_config(models)
     env, never = child_env(provider, available, passing, providers, raw_credentials, chosen_login, managed, key,
                            key_name)
     clean_models, clean_settings = views(models, settings, provider, chosen_login, managed, key, local)
-    hidden, sensitive_files = withheld(store, raw_credentials, keys, available, never, key, managed)
+    hidden, sensitive_files = withheld(store, raw_credentials, {**legacy, **keys}, available, never, key, managed)
+    if metadata_only:
+        env, key = {}, ""
+        if managed:
+            managed = replace(managed, env={})
     return Route(provider, resolved, chosen_auth, error, token_error=token_error,
                  login_available=login, login_refused=login_refused,
                  login_held=login_held,
                  owner=owner, key=key, key_name=key_name, models=clean_models, settings=clean_settings, env=env,
                  hidden=hidden, managed=managed if not chosen_login else None,
                  using_login=chosen_login, sensitive_files=sensitive_files, local=local,
-                 key_supported=supported and provider != "openai-codex")
+                 key_supported=supported and provider != "openai-codex", key_identity=key_identity)
 
 
 def private_dir(path: Path) -> None:
@@ -564,7 +605,7 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
              Path("/proc"), Path("/dev")]
     auth = [PI_HOME / "agent" / "auth.json", owner_dir() / "auth.json", sandbox.AGENT_DIR / "auth.json",
             *(auth_paths or [])]
-    files = [*floor.files, *protected, KEYS_FILE, paths.CONFIG_FILE,
+    files = [*floor.files, *protected, paths.PI_KEYS_FILE, paths.CONFIG_FILE,
              *(source / name for source in sorted(sources) for name in ("models.json", "settings.json"))]
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))

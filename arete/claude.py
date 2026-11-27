@@ -14,7 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 
-from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, tool_events, util
+from . import accounts, background, child, config, device_turns, devices, environment, jev, paths, sandbox, ssh, tool_events, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -76,6 +76,8 @@ def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = N
     elif api_key:
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         env.update(ANTHROPIC_API_KEY=api_key, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1")
+    if sys.platform == "linux":
+        env.pop(jev.KEY_NAME, None)
     return env
 
 
@@ -204,6 +206,7 @@ def _run(
     api_key: str = "",
     openrouter_config: Path | None = None,
     leaf: str = "",
+    worker_jev: jev.WorkerPolicy | None = None,
 ) -> Result:
     openrouter = openrouter_config is not None
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
@@ -252,7 +255,23 @@ def _run(
                 release_mount_lease()
                 on_line(line)
 
-            with sandbox.WorkerLease() as activation, tool_events.worker_hook_sink(env) as temporary:
+            judge = None
+            if sys.platform == "linux":
+                token = jev.worker_key() if worker_jev or openrouter else ""
+                if token and api_key == token:
+                    return Result(ok=False, session=resume,
+                                  error="Confined Claude requires a provider credential separate from the JEV credential")
+                if token:
+                    env = {name: value for name, value in env.items() if value != token}
+                if token and worker_jev:
+                    try:
+                        roots = (Path(cwd).resolve(), *(Path(root).resolve() for root in add_dirs or ()))
+                        checkout_repo = worker_jev.cfg.repo_for_work_dir(roots[0])
+                    except (OSError, RuntimeError, ValueError):
+                        raise sandbox.ConfinementUnavailable("Claude could not resolve JEV workspace paths") from None
+                    if worker_jev.cfg.jev_allowed([worker_jev.repo, checkout_repo]):
+                        judge = jev.WorkerJudge(worker_jev, token, env.get("ARETE_RUN_ID", ""), roots)
+            with sandbox.WorkerLease() as activation, tool_events.worker_hook_sink(env, judge) as temporary:
                 try:
                     confined = sandbox.claude_confinement(
                         cmd, cwd, tuple(add_dirs or ()), profile=profile, mount_lease=mounts,

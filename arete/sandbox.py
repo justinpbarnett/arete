@@ -379,9 +379,15 @@ def linux_claude_mounts(checkouts: tuple[Path, ...], profile: Path | None, *, ru
     for repo in sorted(repositories - writable):
         if LINUX_SHM in repo.parents and not any(repo.is_relative_to(p) or p.is_relative_to(repo) for p in protected):
             mounts += ["--ro-bind", str(repo), str(repo)]
-    if temporary is not None and LINUX_SHM in temporary.parents:
-        address = str(temporary.parent / "hook")
-        mounts += ["--ro-bind", address, address]
+    if temporary is not None:
+        sockets = temporary.parent
+        if (sockets / "judge").is_socket() and any(sockets.is_relative_to(root) for root in writable):
+            raise ConfinementUnavailable("Claude's judge socket must be outside writable directories")
+        if LINUX_SHM in temporary.parents:
+            for name in ("hook", "judge"):
+                address = sockets / name
+                if address.is_socket():
+                    mounts += ["--ro-bind", str(address), str(address)]
     for root in sorted(writable):
         if writable.isdisjoint(root.parents):
             mounts += ["--bind", str(root), str(root)]

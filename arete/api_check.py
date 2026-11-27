@@ -463,7 +463,7 @@ class Check:
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
                 denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401,
-                          "secret.set": 426, "secret.remove": 403}
+                          "secret.set": 426, "secret.remove": 403, "webhook.rotate": 426}
                 if name in denied:
                     self.request(method, path, values, headers=key, status=denied[name])
                     continue

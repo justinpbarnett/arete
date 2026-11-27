@@ -19,7 +19,7 @@ def cmd_jira_check(args) -> int:
 
     cfg = config.load()
     try:
-        client = jira.Client.from_env(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira)
         me = client.me()
         print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
         routes = poll.jira_routes_by_project(cfg)

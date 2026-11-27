@@ -26,6 +26,7 @@ from itertools import chain, repeat
 from pathlib import Path
 from socket import socketpair
 from tempfile import TemporaryDirectory
+from textwrap import indent
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
@@ -8457,6 +8458,89 @@ class SelfDeployRollbackTests(unittest.TestCase):
                               env=plist["EnvironmentVariables"], capture_output=True, text=True,
                               timeout=CHILD_HANG_TIMEOUT)
 
+    def run_secret_start(self, check, *, failure=None):
+        root = self.checkout.parent
+        env = api_check.isolated_env(root)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        paths.CONFIG_FILE.write_text('[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
+        legacy = paths.CONFIG_DIR / "pi.env"
+        legacy.write_text("OPENAI_API_KEY=offline-deploy-key\n")
+        entry = f"""
+from pathlib import Path
+from unittest import mock
+from arete import api_check, paths, secretstore, serve, serve_guard
+from arete.store import db
+
+paths.PACKAGE_DIR = Path({str(self.checkout / 'arete')!r})
+legacy = paths.PI_KEYS_FILE
+
+def check_start(server):
+    assert 'stage:secret-move' not in server.failing, server.failing
+{indent(check.strip(), '    ')}
+    raise SystemExit(0)
+
+with (api_check.offline(),
+      mock.patch.object(db.migrations, 'load', return_value=db._CHAIN[:db.SECRET_REGISTRY_SCHEMA]),
+      mock.patch.object(serve.codebase, 'load'),
+      mock.patch.object(serve, 'code_stamp', return_value=frozenset({{('HEAD', {self.tip[:12]!r})}})),
+      mock.patch.object(serve.install, 'rotate_own_log', return_value=[]),
+      mock.patch.object(serve, 'start_notes', return_value=[]),
+      mock.patch.object(serve.dashboard, 'serve'),
+      mock.patch.object(serve.Server, 'run_pass', check_start)):
+    serve.run()
+"""
+        done = subprocess.run(api_check.child_command(api_check.SOURCE, entry), cwd=root, env=env,
+                              capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(done.returncode, int(failure is not None), done.stdout + done.stderr)
+        if failure is not None:
+            self.assertEqual(done.stderr.strip(), failure)
+        return legacy
+
+    def test_unhealthy_start_leaves_legacy_secret_for_code_only_rollback(self):
+        self.prepare_checkout({})
+        self.write_receipt(starts=serve_guard.START_LIMIT - 1)
+        self.assertFalse(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        legacy = self.run_secret_start("""
+assert legacy.is_file()
+server.move_secrets_when_due()
+assert legacy.is_file()
+assert server.secret_moved_at is None
+assert secretstore.get('global', 'OPENAI_API_KEY') is None
+raise SystemExit('candidate failed before health')
+""", failure="candidate failed before health")
+        with redirect_stdout(StringIO()):
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertEqual(self.receipt()["rollback"], "code_only")
+        self.assertEqual(legacy.read_bytes(), b"OPENAI_API_KEY=offline-deploy-key\n")
+
+    def test_deploy_secret_move_retries_after_health_is_persisted(self):
+        self.prepare_checkout({})
+        self.write_receipt(starts=1)
+        self.run_secret_start("""
+assert legacy.is_file()
+with mock.patch.object(serve, 'dashboard_answers', side_effect=[False, True]) as probe:
+    server.acknowledge_deploy(False)
+    probe.assert_not_called()
+    server.acknowledge_deploy(True)
+    server.move_secrets_when_due()
+    assert legacy.is_file()
+    assert serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent) is not None
+    server.acknowledge_deploy(True)
+assert serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent) is None
+server.move_secrets_when_due()
+assert not legacy.exists(), server.secret_migration
+assert secretstore.read('global', 'OPENAI_API_KEY') == b'offline-deploy-key'
+""")
+        self.assertTrue(self.receipt()["healthy"])
+
+    def test_ordinary_start_moves_secret_without_waiting_for_a_tick(self):
+        self.prepare_state()
+        self.run_secret_start("""
+assert not legacy.exists(), server.secret_migration
+assert secretstore.read('global', 'OPENAI_API_KEY') == b'offline-deploy-key'
+""")
+
     def test_import_rejection_counts_as_a_failed_start(self):
         self.prepare_state()
         self.write_receipt()
@@ -8947,6 +9031,7 @@ class ServeDeploymentMergeTests(ServeDeploymentFixture):
             with mock.patch.object(util, "restore_deploy_paths", side_effect=restore) as restored:
                 self.assertEqual(self.deploy(), self.start)
                 restored.assert_called_once()
+                self.assertIsNone(serve_guard.pending(paths.STATE_DIR, self.checkout))
         finally:
             lock.unlink()
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "?? untracked.txt")
@@ -9142,6 +9227,7 @@ signal.pause()
             self.assertEqual(self.deploy(), self.start)
 
         restore.assert_not_called()
+        self.assertEqual(serve_guard.pending(self.state, self.checkout).tip, tip)
         self.assertIn(f"left alone for {tip} ({error})", self.server.say.call_args.args[0])
 
     def test_timed_out_merge_releases_its_lock_and_retries(self):
@@ -9716,6 +9802,7 @@ class ServeTicketCountsTests(unittest.TestCase):
         server.db_health = {}
         server.contracts_waiting = False
         server.workspace_contract_children = set()
+        server.secret_migration = {}
         server.every_loop = server.live = []
         server.failing = server.errors = {}
         server.started = util.now()

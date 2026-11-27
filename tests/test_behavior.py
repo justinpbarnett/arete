@@ -2493,6 +2493,700 @@ assert secretstore.get('global', 'DEMO_KEY') is None
 """)
 
 
+SECRET_FILE_FIXTURE = r"""
+import json
+import os
+import subprocess
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+
+from arete import api_check, cli, codebase, loops, util
+
+fixture_root = Path.cwd()
+pi_file = paths.CONFIG_DIR / 'pi.env'
+jira_file = paths.CONFIG_DIR / 'jira.env'
+app_file = paths.CONFIG_DIR / 'github-app.pem'
+hook_file = paths.CONFIG_DIR / 'hooks/demo.secret'
+repo_file = paths.CONFIG_DIR / 'secrets/demo.secrets'
+vapid_file = paths.STATE_DIR / 'webpush.key'
+openai_value = 'fixture-openai-token'
+openrouter_value = 'fixture-openrouter-token'
+jira_url = 'https://jira.example.invalid'
+jira_email = 'fixture@example.invalid'
+jira_token = 'fixture-jira-token'
+app_pem = '-----BEGIN PRIVATE KEY-----\nZml4dHVyZS1hcHAtcHJpdmF0ZS1rZXk=\n-----END PRIVATE KEY-----'
+vapid_pem = '-----BEGIN EC PRIVATE KEY-----\nfixture-vapid-material\n-----END EC PRIVATE KEY-----\n'
+hook_value = 'fixture-loop-webhook-secret'
+repo_value = 'fixture-demo-repo-token'
+
+# Block subprocess-based credential lookups as well as network access by the child.
+def offline_file_workflow(event, args):
+    if globals().get('allow_worker_sockets') and event in ('socket.bind', 'socket.connect') and isinstance(args[1], str):
+        address = Path(args[1])
+        assert address.parent.parent == fixture_root / 'tmp' and address.name in ('hook', 'judge'), args[1]
+        return
+    api_check.loopback_only(event, args)
+    if event == 'subprocess.Popen':
+        program = Path(os.fsdecode(args[0])).name
+        assert program in {'git', 'openssl', 'find'}, ('unexpected executable', program)
+
+sys.addaudithook(offline_file_workflow)
+for name in ('ARETE_CONFIG_DIR', 'ARETE_STATE_DIR', 'ARETE_LOG_DIR', 'ARETE_WORKTREES_DIR', 'TMPDIR', 'HOME'):
+    directory = Path(os.environ[name])
+    assert directory.is_dir() and directory.resolve().is_relative_to(fixture_root), (name, directory)
+assert config.secret_settings().store == 'pve_store'
+assert config.secret_settings().store_dir == fixture_root / 'store'
+loops.BUNDLED_LOOPS_DIR = fixture_root / 'no-bundled-loops'
+util.github_token = mock.Mock(return_value='')
+
+
+def write_fixture(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode())
+    path.chmod(0o600)
+
+
+def add_settings(text):
+    with paths.CONFIG_FILE.open('a') as file:
+        file.write('\n' + text)
+
+
+def provider_file():
+    write_fixture(pi_file, f'OPENAI_API_KEY={openai_value}\nOPENROUTER_API_KEY={openrouter_value}\n')
+
+
+def jira_fixture(path=jira_file):
+    write_fixture(path, f'JIRA_BASE_URL={jira_url}\r\nJIRA_EMAIL={jira_email}\r\nJIRA_API_TOKEN={jira_token}\r\n')
+    add_settings(f'[jira]\nenv_file = {json.dumps(str(path))}\n')
+
+
+def app_fixture(pem=app_pem):
+    write_fixture(app_file, pem)
+    add_settings(f'[github_app]\napp_id = "123"\ninstallation_id = "456"\nprivate_key = {json.dumps(str(app_file))}\n')
+
+
+def all_legacy_files():
+    provider_file()
+    jira_fixture()
+    app_fixture()
+    write_fixture(hook_file, hook_value + '\n')
+
+
+def add_repo():
+    checkout = fixture_root / 'checkout'
+    checkout.mkdir()
+    add_settings(f'[[repo]]\nname = "demo"\npath = {json.dumps(str(checkout))}\ntracker = "local"\n')
+
+
+def add_loop():
+    loop = paths.CONFIG_DIR / 'loops/demo/loop.toml'
+    write_fixture(loop, 'kind = "command"\n[run]\ncommand = ["true"]\n[trigger]\nwebhook = true\n')
+
+
+def run_cli(*argv):
+    out, err = StringIO(), StringIO()
+    with (redirect_stdout(out), redirect_stderr(err), mock.patch.object(codebase, 'load', return_value='fixture')):
+        status = cli.main(list(argv))
+    return status, out.getvalue(), err.getvalue()
+"""
+
+
+class _SecretFileWorkflowCase(_SecretChildCase):
+    def run_file_workflow(self, entry):
+        self.run_secret_child(SECRET_FILE_FIXTURE + entry)
+
+
+class SecretFileAdoptionTests(_SecretFileWorkflowCase):
+    def test_adoption_removes_legacy_files_and_records_each_move_once(self):
+        self.run_file_workflow(r"""
+import tomllib
+
+all_legacy_files()
+secretstore.move_files()
+found = subprocess.check_output(['find', str(paths.CONFIG_DIR), '-type', 'f', '-print'], text=True, timeout=3)
+assert not ({str(path) for path in (pi_file, jira_file, app_file, hook_file)} & set(found.splitlines())), found
+secretstore.move_files()
+expected = [
+    ('global', 'OPENAI_API_KEY', openai_value, 'api_key', 'openai', 'external'),
+    ('global', 'OPENROUTER_API_KEY', openrouter_value, 'api_key', 'openrouter', 'external'),
+    ('global', 'JIRA_API_TOKEN', jira_token, None, None, None),
+    ('global', 'GITHUB_APP_PRIVATE_KEY', app_pem, 'app_private_key', None, None),
+    ('connector:loop.demo', 'WEBHOOK_SECRET', hook_value, 'webhook_secret', None, 'arete'),
+]
+for scope, name, value, kind, provider, managed_by in expected:
+    row = secretstore.get(scope, name)
+    assert row and row['status'] == 'set', (scope, name, row)
+    for field, want in [('kind', kind), ('provider', provider), ('managed_by', managed_by)]:
+        if want is not None:
+            assert row[field] == want, (name, field, row[field])
+    assert secretstore.read(scope, name) == value.encode(), name
+    assert row['fingerprint'] == secretstore.fingerprint(value), name
+    assert [e['event'] for e in secretstore.history(scope, name)] == ['moved'], name
+assert secretstore.get('connector:demo', 'WEBHOOK_SECRET') is None
+saved = paths.CONFIG_FILE.read_text()
+table = tomllib.loads(saved)['jira']
+assert (table['base_url'], table['email']) == (jira_url, jira_email), table
+assert jira_token not in saved
+assert all(secretstore.get('global', name) is None for name in ('JIRA_BASE_URL', 'JIRA_EMAIL'))
+""")
+
+
+class SecretFileBoundaryTests(_SecretFileWorkflowCase):
+    def test_external_jira_file_is_left_in_place_after_adoption(self):
+        self.run_file_workflow(r"""
+from arete import devices, jira, runner, scrub
+
+outside = fixture_root / 'external-jira.env'
+jira_fixture(outside)
+before = outside.read_bytes()
+secretstore.move_files()
+secretstore.move_files()
+assert outside.read_bytes() == before
+assert secretstore.read('global', 'JIRA_API_TOKEN') == jira_token.encode()
+
+watching = True
+
+def refuse_legacy_read(event, args):
+    if watching and event == 'open' and args[0] in (str(outside), str(outside).encode()):
+        raise AssertionError('Jira reopened its retained legacy file')
+
+sys.addaudithook(refuse_legacy_read)
+cfg = config.load()
+assert jira.credentials(cfg.jira) == (jira_url, jira_email, jira_token)
+assert outside not in runner.secret_files([], devices.LOCAL, cfg)
+assert jira_token in scrub.secrets(outside)
+watching = False
+""")
+
+    def test_vapid_key_is_fingerprinted_in_place(self):
+        self.run_file_workflow(r"""
+from arete import webpush
+
+assert secretstore.get('global', 'VAPID_PRIVATE_KEY') is None
+write_fixture(vapid_file, vapid_pem)
+before = vapid_file.read_bytes()
+secretstore.move_files()
+row = secretstore.get('global', 'VAPID_PRIVATE_KEY')
+assert row and (row['kind'], row['store'], row['status']) == ('signing_key', 'owner_file', 'set'), row
+assert row['fingerprint'] == secretstore.fingerprint(before.decode())
+assert webpush.private_key_file() == vapid_file and vapid_file.read_bytes() == before
+""")
+
+
+class SecretFileConsumerTests(_SecretFileWorkflowCase):
+    def test_jev_and_pi_resolve_moved_keys_and_pi_reports_a_missing_registry_key(self):
+        self.run_file_workflow(r"""
+from arete import jev, pi
+
+provider_file()
+secretstore.move_files()
+assert not pi_file.exists()
+options = dict(passing=[], providers={}, mode='api_key')
+for env, want in (({}, openrouter_value), ({'OPENROUTER_API_KEY': 'fixture-env-override'}, 'fixture-env-override')):
+    with mock.patch.dict(os.environ, env):
+        route = pi.select('openrouter/fixture', **options)
+        assert not route.error and jev.key() == route.env['OPENROUTER_API_KEY'] == want, route.error
+assert secretstore.read('global', 'OPENAI_API_KEY') == openai_value.encode()
+secretstore.remove('global', 'OPENAI_API_KEY', 'hand')
+error = pi.select('openai/fixture', **options).error
+assert 'secret:global/OPENAI_API_KEY' in error and 'pi.env' not in error and openai_value not in error, error
+""")
+
+    def test_jira_credentials_use_config_and_the_moved_token(self):
+        self.run_file_workflow(r"""
+from arete import jira
+
+jira_fixture()
+secretstore.move_files()
+assert not jira_file.exists()
+saved = config.load().jira
+assert isinstance(saved, config.JiraConfig)
+assert jira.credentials(saved) == (jira_url, jira_email, jira_token)
+env = dict(JIRA_BASE_URL='https://other.example.invalid', JIRA_EMAIL='other@example.invalid',
+           JIRA_API_TOKEN='fixture-jira-env-override')
+with mock.patch.dict(os.environ, env):
+    assert jira.credentials(saved) == tuple(env.values())
+""")
+
+    def test_webhook_checks_signatures_with_the_moved_secret(self):
+        self.run_file_workflow(r"""
+import hmac
+
+from arete import webhooks
+from arete.refusals import Stated
+
+write_fixture(hook_file, hook_value + '\n')
+secretstore.move_files()
+assert not hook_file.exists()
+body = b'{"action":"opened"}'
+
+def headers(key):
+    return {'X-Hub-Signature-256': 'sha256=' + hmac.digest(key.encode(), body, 'sha256').hex()}
+
+webhooks.check('demo', headers(hook_value), body)
+with case.assertRaises(Stated) as wrong:
+    webhooks.check('demo', headers('fixture-wrong-hook-key'), body)
+assert wrong.exception.status == 403
+""")
+
+
+class SecretEndpointBindingTests(_SecretFileWorkflowCase):
+    def test_custom_pi_endpoint_uses_its_configured_key_even_with_an_ambient_key(self):
+        self.run_file_workflow(r"""
+from arete import pi
+
+owner = fixture_root / 'pi' / 'auth.json'
+endpoint = 'https://proxy.example.invalid/v1'
+explicit = 'fixture-custom-endpoint-key'
+write_fixture(owner.parent / 'models.json', json.dumps({'providers': {'openai': {
+    'baseUrl': endpoint, 'apiKey': explicit,
+}}}))
+source = {'OPENAI_API_KEY': 'fixture-unrelated-ambient-key'}
+route = pi.select('openai/fixture', passing=['OPENAI_API_KEY'], providers={}, source=source, owner_auth=owner)
+assert not route.error, route.error
+assert route.env['ARETE_PI_SELECTED_KEY'] == explicit
+assert source['OPENAI_API_KEY'] not in route.env.values()
+assert route.models['providers']['openai'] == {'baseUrl': endpoint, 'apiKey': '$ARETE_PI_SELECTED_KEY'}
+
+write_fixture(owner, json.dumps({'openai': {
+    'type': 'oauth', 'access': 'fixture-oauth-access', 'refresh': 'fixture-oauth-refresh', 'expires': 9999999999999,
+}}))
+route = pi.select('openai/fixture', passing=[], providers={}, source=source, owner_auth=owner)
+assert not route.error and not route.using_login and route.env['ARETE_PI_SELECTED_KEY'] == explicit
+""")
+
+    def test_custom_pi_endpoint_does_not_fall_back_if_its_key_reference_is_unset(self):
+        self.run_file_workflow(r"""
+from arete import pi
+
+owner = fixture_root / 'pi' / 'auth.json'
+write_fixture(owner.parent / 'models.json', json.dumps({'providers': {'openai': {
+    'baseUrl': 'https://proxy.example.invalid/v1', 'apiKey': '$PROXY_API_KEY',
+}}}))
+provider_file()
+secretstore.move_files()
+assert not pi_file.exists()
+kwargs = dict(passing=[], providers={}, source={}, owner_auth=owner)
+for metadata_only in (False, True):
+    route = pi.select('openai/fixture', metadata_only=metadata_only, **kwargs)
+    assert 'no usable apiKey for the custom endpoint' in route.error, route.error
+    assert not route.key_available and 'ARETE_PI_SELECTED_KEY' not in route.env
+secretstore.put('global', 'PROXY_API_KEY', 'fixture-registry-proxy-key', 'api_key', 'hand')
+route = pi.select('openai/fixture', **kwargs)
+probe = pi.select('openai/fixture', metadata_only=True, **kwargs)
+assert not route.error and route.env['ARETE_PI_SELECTED_KEY'] == 'fixture-registry-proxy-key'
+assert not probe.error and probe.key_available and not probe.env
+assert route.auth.credential == probe.auth.credential
+""")
+
+
+class SecretLegacyJiraRedactionTests(_SecretFileWorkflowCase):
+    def test_extra_legacy_jira_credential_is_scrubbed_after_adoption_refuses_the_file(self):
+        self.run_file_workflow(r"""
+from arete import devices, runner, scrub
+
+jira_fixture()
+extra = 'fixture legacy password'
+with jira_file.open('a') as legacy:
+    legacy.write(f'export EXTRA_PASSWORD = "{extra}"\n')
+secretstore.put('global', 'JIRA_API_TOKEN', 'fixture-registry-jira-token', 'api_key', 'hand')
+result = secretstore.move_files()
+assert result['pending'] and jira_file.is_file(), result
+cfg = config.load()
+found = runner.secret_files([], devices.LOCAL, cfg)
+assert jira_file not in found
+hidden = scrub.secrets(*found)
+shown = scrub.scrub(f'Jira {jira_url} {jira_email}: {extra}, {jira_token}', hidden)
+assert extra not in shown and jira_token not in shown, shown
+assert jira_url in shown and jira_email in shown, shown
+""")
+
+
+class SecretFileRedactionTests(_SecretFileWorkflowCase):
+    def test_scrubber_keeps_moved_values_and_the_repo_key_stays_scoped_and_guarded(self):
+        self.run_file_workflow(r"""
+from arete import environment, scrub, vault
+
+add_repo()
+all_legacy_files()
+write_fixture(repo_file, json.dumps({'DEMO_TOKEN': repo_value}))
+write_fixture(vapid_file, vapid_pem)
+secretstore.move_files()
+assert all(not path.exists() for path in (pi_file, jira_file, app_file, hook_file, repo_file))
+redacted = set(scrub.secrets())
+assert {openai_value, openrouter_value, jira_token, app_pem, hook_value, repo_value, vapid_pem} <= redacted
+assert not ({jira_url, jira_email} & redacted)
+row = secretstore.get('repo:demo', 'DEMO_TOKEN')
+assert row and (row['status'], row['kind'], row['managed_by']) == ('set', 'api_key', 'external'), row
+cfg = config.load()
+assert environment.commands(cfg, cfg.repo('demo'))['DEMO_TOKEN'] == repo_value
+assert 'DEMO_TOKEN' not in environment.commands(cfg)
+patch = f'diff --git a/fixture b/fixture\n@@ -0,0 +1 @@\n+{repo_value}\n'
+assert vault.held(patch) == {'fixture': ['DEMO_TOKEN']}
+assert repo_value not in vault.hidden(patch)
+""")
+
+
+SECRET_APP_FIXTURE = r"""
+from arete import gh
+
+
+def openssl(*args, **kwargs):
+    return subprocess.run(['openssl', *args], check=True, capture_output=True, timeout=4, **kwargs).stdout
+
+
+def rsa_key():
+    return openssl('genrsa', '2048').decode().strip()
+
+
+def verify_signature(pem, data, signature):
+    pub = openssl('pkey', '-pubout', input=pem.encode())
+    pub_input, pub_output = os.pipe()
+    sig_input, sig_output = os.pipe()
+    try:
+        with os.fdopen(pub_output, 'wb') as writer:
+            writer.write(pub)
+        with os.fdopen(sig_output, 'wb') as writer:
+            writer.write(signature)
+        result = openssl('dgst', '-sha256', '-verify', f'/dev/fd/{pub_input}',
+                         '-signature', f'/dev/fd/{sig_input}', input=data, pass_fds=(pub_input, sig_input))
+        assert result.strip() == b'Verified OK', result
+    finally:
+        os.close(pub_input)
+        os.close(sig_input)
+"""
+
+
+class SecretAppSigningTests(_SecretFileWorkflowCase):
+    def test_github_app_signs_from_the_store_without_a_key_file(self):
+        self.run_file_workflow(SECRET_APP_FIXTURE + r"""
+from arete import dbstats
+
+pem = rsa_key()
+add_settings('[github_app]\napp_id = "123"\ninstallation_id = "456"\n')
+secretstore.put('global', 'GITHUB_APP_PRIVATE_KEY', pem, 'app_private_key', 'hand')
+assert secretstore.read('global', 'GITHUB_APP_PRIVATE_KEY') == pem.encode()
+app = config.load().github_app
+assert not app.missing(), app.missing()
+message = b'fixture App JWT signing input'
+file_opens = []
+signing = False
+
+def observe_writes(event, args):
+    if signing and event == 'open':
+        path, _, flags = args
+        if not isinstance(path, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            file_opens.append(path)
+
+sys.addaudithook(observe_writes)
+before = set(fixture_root.rglob('*'))
+# Registry reads emit transaction telemetry; suppress it without filtering the write audit.
+with mock.patch.object(dbstats.Timing, 'finished', return_value=None):
+    signing = True
+    try:
+        signature = gh.key_signature(app, message, timeout=4)
+    finally:
+        signing = False
+assert not file_opens, file_opens
+assert set(fixture_root.rglob('*')) == before
+verify_signature(pem, message, signature)
+""")
+
+
+class SecretFileRecoveryTests(_SecretFileWorkflowCase):
+    def test_adoption_does_not_overwrite_existing_registered_or_unregistered_items(self):
+        self.run_file_workflow(SECRET_RECOVERY_FIXTURE + r"""
+provider_file()
+write_fixture(pi_file, pi_file.read_text() + 'GEMINI_API_KEY=fixture-legacy-gemini-key\n')
+registered = 'fixture-registered-store-bytes'
+row = secretstore.put('global', 'GEMINI_API_KEY', registered, 'api_key', 'hand')
+ref = item_reference(row)
+existing = secretstore.Reference(ref.store, ref.tag, 'global/OPENAI_API_KEY')
+settings = config.secret_settings()
+original = b'fixture-orphan-store-bytes'
+secretstore.write_item(existing, settings, original)
+secretstore.move_files()
+assert secretstore.read_item(existing, settings) == original
+assert secretstore.read('global', 'GEMINI_API_KEY') == registered.encode()
+assert secretstore.read('global', 'OPENROUTER_API_KEY') == openrouter_value.encode()
+""")
+
+    def test_adoption_preserves_a_pending_recovery_record(self):
+        self.run_file_workflow(SECRET_RECOVERY_FIXTURE + r"""
+name = 'OPENAI_API_KEY'
+pending = 'fixture-unpublished-provider-key'
+reject_change(secretstore.put, name, pending, 'api_key', 'hand')
+original = receipt(name).read_bytes()
+provider_file()
+secretstore.move_files()
+assert receipt(name).read_bytes() == original
+assert secretstore.get('global', name) is None
+assert pi_file.exists() and openai_value in pi_file.read_text()
+assert secretstore.read('global', 'OPENROUTER_API_KEY') == openrouter_value.encode()
+""")
+
+    def test_serve_daily_pass_repairs_a_row_left_behind_by_the_set_flow(self):
+        self.run_file_workflow(SECRET_RECOVERY_FIXTURE + r"""
+from datetime import timedelta
+from types import SimpleNamespace
+
+from arete import serve
+
+name, newest = 'DAILY_KEY', 'fixture-new-backend-value'
+original = secretstore.put('global', name, 'fixture-original-value', 'api_key', 'hand')
+server = serve.Server()
+start, elapsed = util.now(), 0
+clock = SimpleNamespace(monotonic=lambda: 172800 + elapsed, time=lambda: start.timestamp() + elapsed)
+
+# Exercise the real tick while suppressing unrelated background work.
+quiet = dict.fromkeys(('zte_when_due', 'unblock_when_due', 'prune_when_due', 'sweep_when_due',
+                      'sweep_workspaces_when_due', 'rotate_when_due', 'release_closed_when_due', 'remind'),
+                     lambda: None)
+with (mock.patch.multiple(server, **quiet), mock.patch.object(serve, 'time', clock),
+      mock.patch.object(util, 'now', side_effect=lambda: start + timedelta(seconds=elapsed))):
+    assert server.tick(), server.failing
+    reject_change(secretstore.put, name, newest, 'api_key', 'hand')
+    assert secretstore.get('global', name)['fingerprint'] == original['fingerprint']
+    assert secretstore.read_item(item_reference(original), config.secret_settings()) == newest.encode()
+    assert secretstore.read('global', name) is None
+    elapsed = 3601
+    assert server.tick(), server.failing
+    assert secretstore.get('global', name)['fingerprint'] == original['fingerprint']
+    elapsed = 86401
+    assert server.tick(), server.failing
+
+row = secretstore.get('global', name)
+assert row['status'] == 'set' and row['check_ok'], row
+assert row['fingerprint'] == secretstore.fingerprint(newest)
+assert secretstore.read('global', name) == newest.encode()
+assert event_names(name)[-1] == 'checked'
+""")
+
+
+SECRET_CLI_HTTP_FIXTURE = r"""
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+
+from arete import client, credential_files
+from tests.test_behavior import _CliThroughServeCase
+
+
+@contextmanager
+def cli_over_http():
+    requests = []
+
+    class Handler(dashboard.Handler):
+        def log_request(self, code='-', size='-'):
+            requests.append((self.command, self.path, int(code)))
+
+    address = '127.0.0.1'
+    instance = db.schema_metadata()['instance_id']
+    with mock.patch('socket.getfqdn', return_value=address):
+        fixture = ThreadingHTTPServer((address, 0), Handler)
+    fixture.node, fixture.logins, fixture.tls = server.node, server.logins, server.tls
+    where = client.Server('https', address, fixture.server_port, address, instance)
+    credential_files.write_client(where.tag, bearer)
+
+    def connect(where, seconds=3):
+        conn = HTTPConnection(address, fixture.server_port, timeout=seconds)
+        conn.connect()
+        return conn
+
+    # No real TLS setup is needed; the HTTP handler still applies its TLS/presence policy.
+    with (_CliThroughServeCase.listening(fixture), mock.patch.object(client, 'discover', return_value=where),
+          mock.patch.object(client, 'connect', side_effect=connect)):
+        yield requests
+"""
+
+
+class SecretRepoRemovalTests(_SecretFileWorkflowCase):
+    def test_paired_owner_removes_both_copies_after_cli_refusal(self):
+        self.run_file_workflow(SECRET_RECOVERY_FIXTURE + SECRET_HTTP_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
+add_repo()
+scope, name = 'repo:demo', 'DEMO_TOKEN'
+retained = {'OTHER_TOKEN': 'fixture-retained-repo-token'}
+write_fixture(repo_file, json.dumps({name: repo_value, **retained}))
+before = repo_file.read_bytes()
+row = secretstore.put(scope, name, repo_value, 'repo_answer', actor)
+ref, settings = item_reference(row), config.secret_settings()
+route = root + '/repo%3Ademo/DEMO_TOKEN'
+with cli_over_http() as trace:
+    status, out, err = run_cli('secrets', 'rm', 'demo', name)
+assert ('DELETE', route, 403) in trace, trace
+assert status == 1 and repo_value not in out + err, (status, out, err)
+problem = json.loads(out)
+assert problem['reason'] == 'presence_required', problem
+assert f'DELETE {route}' in problem['hint'] and 'paired owner browser' in problem['hint'], problem
+assert repo_file.read_bytes() == before and secretstore.get(scope, name) == row
+assert secretstore.read_item(ref, settings) == repo_value.encode()
+
+_, result = request('DELETE', route, cookie=browser_session(), key='remove-repo-secret')
+assert result['secret']['present'] is False and repo_value not in json.dumps(result)
+assert secretstore.read_item(ref, settings) is None
+assert json.loads(repo_file.read_text()) == retained
+secretstore.move_files()
+assert secretstore.read(scope, name) is None
+""")
+
+    def test_remove_route_also_removes_a_legacy_repo_answer(self):
+        self.run_file_workflow(SECRET_HTTP_FIXTURE + r"""
+add_repo()
+write_fixture(repo_file, json.dumps({'DEMO_TOKEN': repo_value}))
+assert secretstore.get('repo:demo', 'DEMO_TOKEN') is None
+picked = root + '/repo%3Ademo/DEMO_TOKEN'
+request('DELETE', picked, cookie=browser_session(), key='remove-legacy-repo-answer')
+assert not repo_file.exists() or 'DEMO_TOKEN' not in json.loads(repo_file.read_text())
+secretstore.move_files()
+assert secretstore.read('repo:demo', 'DEMO_TOKEN') is None
+""")
+
+
+WEBHOOK_ROTATE_FIXTURE = SECRET_HTTP_FIXTURE + r"""
+add_loop()
+loop_route = '/api/v1/loops/demo'
+rotate_route = loop_route + '/webhook/rotate'
+scope, name = 'connector:loop.demo', 'WEBHOOK_SECRET'
+"""
+
+
+class AuthorityWebhookRotateTests(_SecretFileWorkflowCase):
+    def test_rotate_reports_missing_store_without_minting(self):
+        self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + r"""
+paths.CONFIG_FILE.write_text('')
+assert config.secret_settings().store is None
+request('POST', rotate_route, cookie=browser_session(), status=501, code='secret_store_missing')
+assert secretstore.get(scope, name) is None and not hook_file.exists()
+""")
+
+    def test_rotate_requires_tls_and_owner_presence(self):
+        self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + r"""
+server.tls = None
+request('POST', rotate_route, token=bearer, status=426, code='tls_required')
+server.tls = object()
+request('POST', rotate_route, token=bearer, status=403, code='forbidden', reason='presence_required')
+cookie = browser_session()
+request('POST', rotate_route, cookie=cookie, csrf=False, status=403, code='csrf')
+principals.update(actor, role='viewer')
+request('POST', rotate_route, cookie=cookie, key='non-owner-rotate', status=403)
+assert secretstore.get(scope, name) is None and not hook_file.exists()
+""")
+
+    def test_rotate_shows_new_secret_once_and_persists_a_redacted_receipt(self):
+        self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + r"""
+from arete.store import idempotency as claims
+
+previous = secretstore.put(scope, name, hook_value, 'webhook_secret', 'hand')
+cookie = browser_session()
+status = contract.BY_NAME['webhook.rotate']['success_status']
+kwargs = dict(cookie=cookie, key='rotate-once', status=status)
+_, first = request('POST', rotate_route, **kwargs)
+assert_shape('webhook.rotate', first)
+value = first['text']
+assert len(value) >= 8 and value not in (hook_value, '[shown once]')
+assert json.dumps(first).count(value) == 1
+assert secretstore.read(scope, name) == value.encode()
+row = secretstore.get(scope, name)
+assert row['version'] == previous['version'] + 1 and not hook_file.exists()
+receipt = claims.lookup(actor, 'rotate-once')
+assert receipt and receipt['status'] == status
+assert json.loads(receipt['response'])['text'] == '[shown once]'
+assert value.encode() not in receipt['response']
+
+_, replay = request('POST', rotate_route, **kwargs)
+assert replay['text'] == '[shown once]' and value not in json.dumps(replay)
+assert secretstore.get(scope, name)['version'] == row['version']
+assert secretstore.read(scope, name) == value.encode()
+""")
+
+
+class AuthorityWebhookCliTests(_SecretFileWorkflowCase):
+    def test_webhook_show_uses_loop_get_and_discloses_only_presence(self):
+        self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
+from arete import webhooks
+
+with cli_over_http() as trace:
+    for present in (False, True):
+        row = secretstore.put(scope, name, hook_value, 'webhook_secret', 'hand') if present else None
+        _, detail = request('GET', loop_route, token=bearer)
+        assert detail['loop']['detail']['secret_present'] is present and hook_value not in json.dumps(detail)
+        status, out, err = run_cli('webhook', 'demo')
+        assert status == 0 and '/hook/demo' in out and f'secret_present: {json.dumps(present)}' in out, out
+        assert hook_value not in out + err and secretstore.get(scope, name) == row and not hook_file.exists()
+        if not present:
+            assert not webhooks.secret('demo')
+            assert secretstore.get(scope, name) is None and not hook_file.exists()
+assert [call for call in trace if call[1] == loop_route] == [('GET', loop_route, 200)] * 2, trace
+""")
+
+    def test_cli_token_cannot_rotate_without_presence(self):
+        self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
+with cli_over_http() as trace:
+    status, out, err = run_cli('webhook', 'demo', '--rotate')
+assert status != 0 and 'presence_required' in out + err, (status, out, err)
+assert ('POST', rotate_route, 403) in trace, trace
+assert secretstore.get(scope, name) is None and not hook_file.exists()
+""")
+
+
+class AuthorityWorkspaceCredentialTests(_SecretFileWorkflowCase):
+    def test_successful_app_and_jira_authentication_records_redacted_workspace_accounts(self):
+        self.run_file_workflow(SECRET_HTTP_FIXTURE + SECRET_APP_FIXTURE + r"""
+import base64
+from io import BytesIO
+from urllib.response import addinfourl
+
+from arete import jira
+
+pem = rsa_key()
+app_fixture(pem)
+jira_fixture()
+secretstore.move_files()
+assert not app_file.exists() and not jira_file.exists()
+app_row = secretstore.get('global', 'GITHUB_APP_PRIVATE_KEY')
+jira_row = secretstore.get('global', 'JIRA_API_TOKEN')
+account_route = '/api/v1/accounts'
+assert request('GET', account_route, token=bearer)[1]['accounts'] == []
+cfg = config.load()
+app_token = 'fixture-github-installation-token'
+
+def github_reply(req, **_kwargs):
+    assert (req.get_method(), req.full_url) == ('POST', 'https://api.github.com/app/installations/456/access_tokens')
+    assert json.loads(req.data)['repositories'] == ['demo']
+    scheme, signed = req.get_header('Authorization').split()
+    assert scheme == 'Bearer'
+    data, signature = signed.rsplit('.', 1)
+    verify_signature(pem, data.encode(), base64.urlsafe_b64decode(signature + '=' * (-len(signature) % 4)))
+    return BytesIO(json.dumps({'token': app_token, 'permissions': {'contents': 'read'}}).encode())
+
+
+def jira_reply(req, **_kwargs):
+    assert (req.get_method(), req.full_url) == ('GET', jira_url + '/rest/api/3/myself')
+    assert req.get_header('Authorization') == 'Basic ' + base64.b64encode(f'{jira_email}:{jira_token}'.encode()).decode()
+    return addinfourl(BytesIO(b'{"accountId":"fixture-jira-account"}'), {}, req.full_url, 200)
+
+with (mock.patch.object(gh.urllib.request, 'urlopen', side_effect=github_reply) as github_call,
+      mock.patch.object(jira._opener, 'open', side_effect=jira_reply) as jira_call):
+    assert gh.clone_token(cfg.github_app, 'fixture/demo') == app_token
+    assert jira.Client.from_env(cfg.jira).me()['accountId'] == 'fixture-jira-account'
+    github_call.assert_called_once()
+    jira_call.assert_called_once()
+
+_, result = request('GET', account_route, token=bearer)
+assert_shape('account.list', result)
+rows = result['accounts']
+assert len(rows) == 2 and {r['secret_name']: r['usage'] for r in rows} == {
+    'GITHUB_APP_PRIVATE_KEY': 'workspace', 'JIRA_API_TOKEN': 'workspace'}, rows
+raw = json.dumps(result)
+for row, value in ((app_row, pem), (jira_row, jira_token)):
+    assert json.dumps(value)[1:-1] not in raw and row['reference'] not in raw
+assert app_token not in raw
+with db.reader() as conn:
+    linked = {r['secret_id'] for r in conn.execute('SELECT secret_id FROM accounts')}
+assert linked == {app_row['id'], jira_row['id']}, linked
+""")
+
+
 class AuthorityAccountIsolationTests(_SecretChildCase):
     def test_resolved_account_refuses_state_from_another_instance(self):
         self.run_secret_child(r"""
@@ -2716,6 +3410,161 @@ assert result.ok and result.session.id == 'fixture'
 with case.assertRaises(ProcessLookupError):
     os.kill(int((work / 'child.pid').read_text()), 0)
 assert len(secretstore.fingerprint_key()) == 32
+""")
+
+
+SECRET_WORKER_JUDGE_FIXTURE = r"""
+from types import SimpleNamespace
+
+from arete import guard, jev, runner, tool_events
+from arete.commands.hooks import cmd_guard
+
+provider_file()
+secretstore.move_files()
+assert not pi_file.exists()
+assert jev.key() == openrouter_value
+work = linux_checkout()
+run_id = 'fixture-confined-jev'
+args = SimpleNamespace(scratch='', scratch_id='', scratch_saves='', judge=True, open=[work], closed=[])
+
+
+def decision(tool='Bash', **tool_input):
+    payload = {'tool_name': tool, 'tool_input': tool_input, 'cwd': str(work)}
+    with mock.patch('sys.stdin', StringIO(json.dumps(payload))), redirect_stdout(StringIO()) as out:
+        assert cmd_guard(args) == 0
+    return json.loads(out.getvalue())['hookSpecificOutput'] if out.getvalue() else {}
+
+
+@contextmanager
+def confined_child(env):
+    before = Path.cwd()
+    os.chdir(work)
+    try:
+        with (mock.patch.dict(os.environ, env, clear=True),
+              mock.patch.object(secretstore, 'env', side_effect=AssertionError('confined credential lookup'))):
+            yield
+    finally:
+        os.chdir(before)
+
+
+def judged_launch(child_action, upstream, *, ask=True):
+    with linux_claude() as (_, stream), mock.patch.object(jev, 'worker_post', side_effect=upstream) as sent:
+        options = runner.local_claude({'tools': ['Bash'], 'passing': [],
+                                      'extra_env': {'OPENROUTER_API_KEY': openrouter_value}},
+                                     config.load(), run_id, ask, lambda _: None, None,
+                                     floor=guard.floor(run_id, work, ()))
+        if ask:
+            assert any(rule.startswith('Bash(') and ' ask ' in rule for rule in options['allowed_tools'])
+        result = stream.return_value
+
+        def invoke(argv, _, __, env, *rest):
+            assert_linux_policy(argv, env, work, [*key_mask, *store_mask] if key.exists() else store_mask)
+            settings = json.loads(argv[argv.index('--settings') + 1])
+            assert '--judge' in settings['hooks']['PreToolUse'][0]['hooks'][0]['command']
+            assert openrouter_value not in env.values() and openrouter_value not in ' '.join(argv)
+            with confined_child(env):
+                child_action(env, sent)
+            return result
+
+        stream.side_effect = invoke
+        assert run_claude(work, **{k: v for k, v in options.items() if k != 'passing'}).ok
+"""
+
+
+class AuthorityConfinedJevTests(_SecretFileWorkflowCase):
+    def run_judge_workflow(self, entry):
+        self.run_file_workflow("allow_worker_sockets = True\n" + SECRET_LINUX_CLAUDE_FIXTURE
+                               + SECRET_WORKER_JUDGE_FIXTURE + entry)
+
+    def test_hook_keeps_jev_verdicts_and_local_denials_after_adoption(self):
+        self.run_judge_workflow(r"""
+def upstream(body, token):
+    request = json.loads(body)
+    assert token == openrouter_value and request['model'] == config.load().jev.model
+    assert set(request['questions']) == {'effect', 'secrets'}
+    risk = 0.97 if request['state'].endswith('git clean -fd') else 0.04
+    return {'answers': {'effect': {'choice': 'irreversible', 'probabilities': {'irreversible': risk}},
+                        'secrets': {'noul': 0.01}}}
+
+
+def child_action(env, sent):
+    deny = decision(command='git clean -fd')
+    assert deny['permissionDecision'] == 'deny' and 'JEV reads it' in deny['permissionDecisionReason'], deny
+    assert not decision(command='git status')
+    assert decision('Read', file_path=str(store / 'item'))['permissionDecision'] == 'deny'
+    assert not tool_events.worker_judge_request('ask', work, 'text', question=jev.yes_no('Safe?'))
+    assert sent.call_count == 2
+
+
+judged_launch(child_action, upstream, ask=False)
+""")
+
+    def test_ask_gets_only_the_validated_answer_after_adoption(self):
+        self.run_judge_workflow(r"""
+def upstream(body, token):
+    request = json.loads(body)
+    assert token == openrouter_value and set(request['questions']) == {'q'}
+    assert 'fixture text' in request['state']
+    return {'model': token, 'error': token,
+            'answers': {'q': {'choice': 'good', 'confidence': .9, 'probabilities': {'good': .9, token: .1}}}}
+
+
+def child_action(env, sent):
+    doc = work / 'sample.txt'
+    doc.write_text('fixture text')
+    with mock.patch('sys.stdin', StringIO('fixture text')):
+        status, out, err = run_cli('ask', 'How is it?', '--choice', 'good', 'bad', '--json')
+    assert status == 0 and not err, (status, out, err)
+    assert json.loads(out) == {'path': '', 'answer': 'good', 'confidence': .9, 'probabilities': {'good': .9}}
+    status, out, err = run_cli('ask', 'How is it?', 'sample.txt', '--choice', 'good', 'bad', '--json')
+    assert status == 0 and json.loads(out)[0]['answer'] == 'good' and openrouter_value not in out + err
+    assert sent.call_count == 2
+
+
+judged_launch(child_action, upstream)
+""")
+
+    def test_rejects_other_launches_and_context_and_preserves_unavailable_behavior(self):
+        self.run_judge_workflow(r"""
+stale = {}
+question = jev.yes_no('Is this text?')
+opt_out = work / 'private'
+opt_out.mkdir()
+add_settings(f'[[repo]]\nname = "private"\npath = {json.dumps(str(opt_out))}\njev = false\n')
+
+
+def child_action(env, sent):
+    stale.update(env)
+    other = {'ARETE_RUN_ID': run_id}
+    with tool_events.worker_hook_sink(other, lambda req: {}):
+        with mock.patch.dict(os.environ, {tool_events.WORKER_JUDGE_CAPABILITY: other[tool_events.WORKER_JUDGE_CAPABILITY]}):
+            assert not tool_events.worker_judge_request('ask', work, 'text', question=question)
+    with mock.patch.dict(os.environ, {'ARETE_RUN_ID': 'wrong-run'}):
+        assert not tool_events.worker_judge_request('ask', work, 'text', question=question)
+    call = tool_events.worker_judge_request
+    assert not call('ask', fixture_root, 'text', question=question)
+    assert not call('ask', opt_out, 'text', question=question)
+    (work / 'escape').symlink_to(fixture_root)
+    assert not call('ask', work / 'escape', 'text', question=question)
+    assert not call('ask', work, 'text', question=question, model='unauthorized')
+    assert not call('ask', work, 'x' * (tool_events.MAX_JUDGE_REQUEST + 1), question=question)
+    assert not call('secret.read', work, 'text')
+    sent.assert_not_called()
+    with mock.patch('sys.stdin', StringIO('text')):
+        status, out, err = run_cli('ask', 'Is this text?', '--json')
+    assert status and json.loads(out)['error'] == jev.WORKER_UNAVAILABLE and openrouter_value not in out + err
+    assert not call('ask', work, 'text', question=question)
+    sent.assert_called_once()
+
+
+with mock.patch.dict(jev.WORKER_CALL_LIMITS, {'ask': 1}):
+    judged_launch(child_action, lambda *_: {'error': openrouter_value})
+with confined_child(stale):
+    assert not decision(command='git status')
+    assert decision('Read', file_path=str(store / 'item'))['permissionDecision'] == 'deny'
+    with mock.patch('sys.stdin', StringIO('text')):
+        status, out, err = run_cli('ask', 'Is this text?', '--json')
+    assert status and json.loads(out)['error'] == jev.WORKER_UNAVAILABLE and openrouter_value not in out + err
 """)
 
 
@@ -6261,6 +7110,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "loop enable example": "POST /api/loops/{name}/enable",
         "loop disable example": "POST /api/loops/{name}/disable",
         "loop stop example": "POST /api/runs/{run}/stop",
+        "webhook example": "GET /api/v1/loops/{id}",
         "session start work": "POST /api/sessions",
         "session attach r1": None,
         "session send r1 hello": None,
@@ -6278,6 +7128,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "record unpin r1": None,
         "approve 1 --reject": "POST /api/approvals/{id}",
         "loop start example -f": "POST /api/loops/{name}/start",
+        "webhook example --rotate": "POST /api/v1/loops/{loop}/webhook/rotate",
         "session start --attach work": "POST /api/sessions",
         "session --chat 1 start work": "POST /api/chats/{chat}/sessions",
         "session --chat 1 list": "GET /api/chats/{chat}/sessions",
@@ -6316,7 +7167,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "repo standing-production": "commands.setup",
         "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
-        "upload-guard": "uploads", "webhook secret": "webhooks.secret",
+        "upload-guard": "uploads",
         "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
         "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
         "verifiers run": "lab.verifier_suites", "verifiers sample": "lab.verifier_suites",
@@ -6332,7 +7183,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "triage --refresh": "triage.run", "hold claude 1h": "store.devices",
         "hold claude --release": "store.devices", "costs --correct r1 1 --why correction": "record.correct",
         "costs --backfill": "store.runs", "backup": "backup.snapshot", "backup --restore backup.db": "backup.restore",
-        "secrets rm replay-sample secret": "vault",
+        "secrets rm replay-sample secret": "secret.remove",
         "repo enroll fixture checkout --target-branch main": "commands.setup",
         "repo publish fixture spec --title Example --body-file - --key fixture-spec": "commands.setup",
         "repo show fixture --json": "commands.setup",
@@ -8474,8 +9325,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 69)
-        self.assertEqual(len({op["name"] for op in operations}), 69)
+        self.assertEqual(len(operations), 70)
+        self.assertEqual(len({op["name"] for op in operations}), 70)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
