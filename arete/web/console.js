@@ -8,6 +8,7 @@ let chatTimer = 0;
 let chatCount = 0;
 let openChat = 0;
 let visibleDraft = null;
+const pendingDraftActions = new Set();
 let chatPickKey = "";
 let chatProjectsKey = "";
 const unsent = new Map();
@@ -164,7 +165,8 @@ function switchChat(id) {
   chatSeen = "";
   chatLength = -1;
   chatPickKey = "";
-  for (const line of ["chat-result", "draft-result"]) document.getElementById(line).hidden = true;
+  document.getElementById("chat-result").hidden = true;
+  showDraft(null);
 }
 
 function chatAbout(c) {
@@ -180,28 +182,43 @@ function messageCost(m) {
   return m.cost ? `${money(m.cost)} reported · payment unknown` : "";
 }
 
+function canActOnDraft() {
+  return visibleDraft?.chat === openChat && !pendingDraftActions.has(openChat);
+}
+
+function updateDraftActions() {
+  const disabled = !canActOnDraft();
+  document.getElementById("draft-file").disabled = disabled;
+  document.getElementById("draft-drop").disabled = disabled;
+}
+
+function showDraft(draft) {
+  visibleDraft = draft?.chat === openChat ? draft : null;
+  if (visibleDraft) {
+    document.getElementById("draft-title").textContent = visibleDraft.title;
+    document.getElementById("draft-body").textContent = visibleDraft.body;
+  } else {
+    document.getElementById("draft-result").hidden = true;
+  }
+  document.getElementById("draft").hidden = !visibleDraft;
+  updateDraftActions();
+}
+
 function drawChat(c) {
+  if ((c?.id ?? 0) !== openChat) return;
   const about = document.getElementById("chat-about");
   const working = document.getElementById("working");
   document.getElementById("chat").hidden = !c;
   about.hidden = !c;
   working.hidden = !c?.busy;
-  document.getElementById("draft").hidden = !c?.draft;
-  if (!c?.draft) document.getElementById("draft-result").hidden = true;
+  showDraft(c?.draft);
   if (!c) {
-    visibleDraft = null;
     chatSeen = "";
     document.getElementById("chat-sessions").hidden = true;
     return fill("messages", quiet("No chat yet. Pick a project, or none, under New chat on and press New chat."));
   }
-  if (c.id !== openChat) return;
-  visibleDraft = c.draft;
   about.textContent = chatAbout(c);
   document.getElementById("chat-send").disabled = c.busy;
-  if (c.draft) {
-    document.getElementById("draft-title").textContent = c.draft.title;
-    document.getElementById("draft-body").textContent = c.draft.body;
-  }
   if (c.busy) {
     const asked = [...c.messages].reverse().find((m) => m.sender === "you");
     working.textContent = `Working on it · sent ${clock(asked?.ts)} · the answer shows here when it comes`;
@@ -262,17 +279,26 @@ async function newChat(event) {
 }
 
 async function draftAction(action, btn) {
+  if (!canActOnDraft()) return;
+  const { chat: id, fingerprint } = visibleDraft;
+  pendingDraftActions.add(id);
+  updateDraftActions();
   trackAction(btn.id);
   document.getElementById("draft-result").hidden = true;
-  btn.disabled = true;
   try {
-    const body = action === "file" && visibleDraft?.chat === openChat ? { draft: visibleDraft.fingerprint } : {};
-    const answered = await call(`/api/chats/${openChat}/${action}`, body);
+    const body = action === "file" ? { draft: fingerprint } : {};
+    const answered = await call(`/api/chats/${id}/${action}`, body);
+    if (id !== openChat) return;
     drawChat(answered);
     if (action === "file") say("draft-result", "ok", answered.messages.at(-1)?.text || "Filed the issue.");
   } catch (e) {
-    say("draft-result", "fault", e.message);
+    if (id === openChat) say("draft-result", "fault", e.message);
+  } finally {
+    pendingDraftActions.delete(id);
+    if (id === openChat) {
+      updateDraftActions();
+      chatCount++;
+      pollSoon();
+    }
   }
-  btn.disabled = false;
-  pollSoon();
 }

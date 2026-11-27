@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 import signal
 import subprocess
@@ -22,6 +24,7 @@ CACHE_FILE = paths.STATE_DIR / "devices.json"
 KINDS = ("local", "ssh", "exe", "proxmox")
 PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi codex arete ollama; do command -v $t >/dev/null && echo has:$t; "
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
+FACTORY_HOLD = "its session is paused by the factory switch"
 VM_NAME_CHARS = 60
 VM_PREFIX = "arete-"
 EXE_EGRESS = ("integrations", "all")
@@ -156,25 +159,48 @@ def vm_name(label: str) -> str:
 @contextmanager
 def lease(device: Device | str, run_id: str, log=lambda text: None, hold=lambda: ""):
     from . import device_turns
-    from .store import db
+    from .store import db, factory
 
     d = resolve(device)
     turns = device_turns.component(f"{db.schema_metadata()['instance_tag']}-{run_id}-1") if d.remote else ""
-    if d.kind == "proxmox":
-        with proxmox_clone(d, run_id, log, hold) as clone:
-            record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=clone.host)
-            yield replace(clone, turns=turns)
-    elif d.kind == "exe":
-        with fresh_sandbox(d, run_id, log, hold) as vm:
+    if d.kind in ("proxmox", "exe"):
+        directory = paths.RUNS_DIR / run_id
+        saved = directory / "factory-device.json"
+        resume = os.getenv(factory.CONTINUATION) == run_id
+        if resume:
+            data = util.read_json(saved, None)
+            if not data or data["source"] != asdict(d):
+                raise DeviceError("The original device lease is unavailable or its configuration changed")
+            leased = device_turns.saved_device(data["leased"])
+            try:
+                yield replace(leased, turns=f"{turns}-{factory.admit()}")
+            finally:
+                if not d.keep and not factory.interrupted(run_id) and not hold():
+                    release(run_id, log)
+            return
+
+        def preserve():
+            return FACTORY_HOLD if factory.interrupted(run_id) else hold()
+
+        allocate = proxmox_clone if d.kind == "proxmox" else fresh_sandbox
+        with allocate(d, run_id, log, preserve) as vm:
+            if vm.known_hosts:
+                pinned = directory / "factory-known-hosts"
+                util.write_durably(pinned, Path(vm.known_hosts).read_bytes(), 0o600)
+                vm = replace(vm, known_hosts=str(pinned))
+            leased = replace(vm, turns=turns)
+            util.write_durably(saved, json.dumps({"source": asdict(d), "leased": asdict(leased)}).encode(), 0o600)
             record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=vm.host)
-            yield replace(vm, turns=turns)
+            yield leased
     else:
         record.mark(run_id, "lease", device=d.name, device_kind=d.kind)
+        if d.remote and os.getenv(factory.CONTINUATION) == run_id:
+            turns = f"{turns}-{factory.admit()}"
         leased = replace(d, turns=turns)
         try:
             yield leased
         finally:
-            if d.remote:
+            if d.remote and not factory.interrupted(run_id):
                 try:
                     device_turns.cleanup(leased, device_turns.folder(leased), stop=True, discard=True, base=True)
                 except (OSError, subprocess.SubprocessError, RuntimeError) as e:
@@ -243,7 +269,8 @@ def kept_or_deleted(vm: proxmox.Clone | exedev.Sandbox, log, hold=lambda: ""):
         if vm.device.keep:
             log(f"keeping {vm} up until {vm.delete_command()} deletes it")
         elif reason := hold():
-            device_store.forget_vm(vm.name)
+            if reason != FACTORY_HOLD:
+                device_store.forget_vm(vm.name)
             log(f"keeping {vm} up because {reason}; {vm.delete_command()} deletes it")
         else:
             delete_or_say_why(vm, log)
@@ -301,6 +328,9 @@ def sweep(log_for: Callable[[str | None], Callable[[str], None]]) -> None:
     now = util.now()
     give_up_before = util.iso(now - timedelta(days=SWEEP_GIVES_UP_DAYS))
     for row in device_store.vms_left_over(util.iso(now - timedelta(minutes=PROBE_SANDBOX_MINUTES))):
+        from .store import factory
+        if row["run_id"] and factory.retained(row["run_id"]):
+            continue
         vm, log = listed_vm(row), log_for(row["run_id"])
         if not row["failing_since"]:
             delete_or_say_why(vm, log)

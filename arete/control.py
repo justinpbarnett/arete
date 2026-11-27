@@ -116,7 +116,16 @@ def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] 
 def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = (), *,
            start_new_session: bool = True) -> subprocess.Popen:
     paths.ensure_dirs()
+    from . import factory_control
+    from .store import factory
+
+    version = factory.admit()
     keep, env = launch_lease.child_environment(keep)
+    if factory.available():
+        env[factory.LAUNCH_VERSION] = str(version)
+    env.pop(factory.CONTINUATION, None)
+    if parent := factory_control.continuation.get():
+        env[factory.CONTINUATION] = parent
     cli_prefix = paths.cli_command()
     env.pop(WORKER_ENV, None)
     if command[:len(cli_prefix)] == cli_prefix and (kind := worker_kind(command[len(cli_prefix):])):
@@ -124,12 +133,16 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
         if kind == "file-rule":
             env["ARETE_RUN_ID"] = record.new_id(kind)
     with open(paths.LOG_DIR / log_name, "a") as log:
-        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+        key, proc = factory_control.spawn(subprocess.Popen, command, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=start_new_session, pass_fds=keep,
                                 env={**env, "ARETE_ACTOR": principals.current(),
                                      "ARETE_VIA": events.provenance() or ""})
     launch_lease.passed()
-    threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
+    def reap():
+        proc.wait()
+        factory.forget(key)
+
+    threading.Thread(target=reap, name=f"reap-{proc.pid}", daemon=True).start()
     return proc
 
 
@@ -151,6 +164,17 @@ def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
     r = writes.check_run(run_id, base_version, public=public, for_stop=True)
     if not r:
         raise NotFound(f"no run {run_id}")
+    from .store import factory
+
+    with foundation.tx() as c:
+        if factory.retained(run_id):
+            writes.check_run(run_id, base_version, public=public, for_stop=True)
+            c.execute("UPDATE factory_targets SET cancelled=1 WHERE id=?", (run_id,))
+            c.execute("UPDATE factory_targets SET phase='done', reason='Cancelled by operator' WHERE id=? "
+                      "AND phase IN ('paused','starting','held')", (run_id,))
+            record.move(run_id, "stopped", ("interrupted",), summary="Cancelled by operator", stop_asked=util.iso())
+            events.emit("factory.cancelled", f"run:{run_id}", cls="durable", data={"cancelled": True})
+            return {"id": run_id, "stopped": True}
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     with record.dead(r) as gone:
@@ -259,6 +283,10 @@ def feed(run_id: str, after: int = 0) -> dict:
 
 
 def decide(approval_id: int, yes: bool, *, publication=None) -> dict:
+    from .store import factory
+
+    if yes:
+        factory.admit()
     try:
         result = delivery.decide(approval_id, yes, publication=publication)
         return {"id": approval_id, "approved": yes, "result": result}

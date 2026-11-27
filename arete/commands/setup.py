@@ -4,6 +4,7 @@ import json
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 
 from .. import __version__, client, config, paths, routing, steps
 from ..store import db as foundation
@@ -230,11 +231,25 @@ def cmd_uninstall(args) -> int:
 
 def cmd_migrate(args) -> int:
     try:
-        foundation.migrate(contracts=not args.no_contracts)
+        if args.retry_quarantined_workspace is not None:
+            from ..store import workspaces
+
+            if args.workspace_snapshots is None:
+                raise ValueError("retry requires --workspace-snapshots DIR")
+            workspaces.retry_quarantine(args.retry_quarantined_workspace, args.workspace_snapshots)
+            print(f"Restored snapshot for {args.retry_quarantined_workspace}")
+            return 0
+        if args.retire_quarantined_workspace is not None:
+            from ..store import workspaces
+
+            workspaces.retire_quarantine(args.retire_quarantined_workspace)
+            print(f"Retired quarantine for {args.retire_quarantined_workspace}")
+            return 0
+        waiting = foundation.migrate(contracts=not args.no_contracts, workspace_snapshots=args.workspace_snapshots)
     except Exception as e:
         print(f"arete migrate: {e}", file=sys.stderr)
         return 1
-    return 0
+    return int(waiting and args.workspace_snapshots is not None)
 
 
 def cmd_doctor(args) -> int:
@@ -275,7 +290,106 @@ def cmd_dashboard(args) -> int:
     return dashboard.serve(args.port)
 
 
+def choose_jira_project() -> str:
+    print("Jira project key for this repo (blank to cancel): ", end="", flush=True, file=sys.stderr)
+    return sys.stdin.readline().strip()
+
+
+def cmd_repo(args) -> int:
+    from .. import enrollment, gh, jira, outbound, release_profile, ticket_publication
+
+    try:
+        if args.repo_action == "enroll":
+            repo = enrollment.enroll(args.name, args.path, target_branch=args.target_branch, landing=args.landing,
+                                     unattended_environment=args.unattended_environment, destination=args.tracker,
+                                     jira_project=args.jira_project, jira_label=args.jira_label, pipeline=args.pipeline,
+                                     choose_project=choose_jira_project if sys.stdin.isatty() else None,
+                                     staging_profile=args.staging_profile)
+            cfg = config.load_required()
+        else:
+            cfg = config.load_required()
+            repo = cfg.repo(args.name)
+        if args.repo_action == "staging-profile":
+            release_profile.install(repo, args.policy_file)
+        if args.repo_action == "standing-production":
+            if args.promise_file:
+                release_profile.set_standing(repo, args.after_issue, args.promise_file, args.observer_file, args.production_checks)
+            else:
+                if args.after_issue is not None or args.observer_file or args.production_checks:
+                    raise ValueError("use --promise-file to install a standing production grant")
+                if args.revoke:
+                    release_profile.revoke_standing(repo)
+            status = release_profile.standing_status(repo, release_profile.current(repo)) or {"active": False}
+            print(json.dumps(status, indent=None if args.json else 2))
+        elif args.repo_action == "publish":
+            body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text()
+            url = ticket_publication.plan(cfg, repo, args.kind, args.title, body, args.key,
+                                          parent=args.parent, source=args.source, draft=args.draft)
+            print(url)
+        else:
+            print(json.dumps(enrollment.show(cfg, repo), indent=None if args.json else 2))
+    except (OSError, ValueError, gh.GhError, jira.JiraError) as error:
+        print(f"arete repo {args.repo_action}: {outbound.sanitize(str(error), 300)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def repo_commands(sub) -> None:
+    group = sub.add_parser("repo", help="enroll a checkout and publish to its saved tracker")
+    actions = group.add_subparsers(dest="repo_action", required=True)
+    p = actions.add_parser("enroll", help="save tracker and delivery policy together in config.toml")
+    p.add_argument("name")
+    p.add_argument("path", type=Path, help="root of the Git checkout")
+    p.add_argument("--target-branch", required=True)
+    p.add_argument("--landing", choices=config.LANDING_METHODS, default="pr",
+                   help="pr forbids direct pushes; direct-push allows existing guarded push deliveries")
+    p.add_argument("--unattended-environment", choices=config.DEPLOYMENT_ENVIRONMENTS, default="none",
+                   help="deployment ceiling, not permission to deploy (default: none)")
+    p.add_argument("--tracker", choices=("github", "jira"), default="",
+                   help="override GitHub for personal repos or Jira for [jira] github_owner")
+    p.add_argument("--jira-project", default="", help="select Jira and use this existing project instead of [jira] project")
+    p.add_argument("--jira-label", default="", help="override the repo's Jira routing label")
+    p.add_argument("--pipeline", action="store_true", help="enable the repo's existing factory queue")
+    p.add_argument("--staging-profile", type=Path, help="owner-approved reusable staging destinations, checks and QA authority")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("staging-profile", help="set the protected staging defaults of an existing repository")
+    p.add_argument("name")
+    p.add_argument("--policy-file", type=Path, required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("standing-production", help="inspect, grant or revoke automatic promotion for future GitHub issues")
+    p.add_argument("name")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--promise-file", type=Path, help="install the default protected ticket promise")
+    mode.add_argument("--revoke", action="store_true", help="withdraw the repository's standing production approval")
+    p.add_argument("--after-issue", type=int, help="apply only to issue numbers greater than this number")
+    p.add_argument("--observer-file", type=Path, help="observer program matching the promise's SHA-256")
+    p.add_argument("--production-checks", type=Path, help="production job policy JSON, defaults to the profile's staging checks")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("show", help="read back tracker, branch, landing and deployment settings")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("publish", help="publish to the enrolled tracker; a published spec enters its enabled pipeline")
+    p.add_argument("name", help="enrolled destination repo name")
+    p.add_argument("kind", choices=("spec", "child", "follow-up"))
+    p.add_argument("--title", required=True)
+    p.add_argument("--body-file", required=True, help="Markdown file, or - for stdin")
+    p.add_argument("--key", required=True, help="stable request key; use the same key to reconcile a retry")
+    p.add_argument("--draft", action="store_true", help="file a spec without authorizing pickup")
+    p.add_argument("--parent", default="", help="child's parent in the same destination: GitHub number or Jira key")
+    p.add_argument("--source", default="", help="follow-up's source issue URL")
+    p.set_defaults(fn=cmd_repo)
+
+
 def register(sub) -> None:
+    repo_commands(sub)
     p = sub.add_parser("init", help="write the default global config")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
@@ -294,7 +408,14 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_uninstall)
 
     p = sub.add_parser("migrate", help="apply pending database migrations")
-    p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
+    p.add_argument("--workspace-snapshots", type=Path, metavar="DIR",
+                   help="hand off or retry legacy workspace snapshots from this directory")
+    mode.add_argument("--retire-quarantined-workspace", metavar="NAME",
+                      help="retire a workspace quarantine after preserving and moving the workspace aside")
+    mode.add_argument("--retry-quarantined-workspace", metavar="NAME",
+                      help="retry a repaired legacy snapshot for an idle quarantined workspace")
     p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("prompts", help="validate prompt templates and list their required inputs, without model calls")

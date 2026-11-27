@@ -248,7 +248,7 @@ def canonical_methods(path: str) -> tuple[str, ...]:
         return ("GET", "POST")
     if path in ("/api/v1/events", "/api/v1/principals") or re.fullmatch(r"/api/v1/principals/[^/]+", path):
         return ("GET",)
-    return tuple(method for method in ("GET", "POST", "PATCH", "DELETE") if contract.match(method, path))
+    return tuple(method for method in ("GET", *credential_http.WRITES) if contract.match(method, path))
 
 
 def fault_run_id(path: str, query: dict[str, str]) -> str | None:
@@ -325,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if self.command not in ("GET", "POST", "PATCH", "DELETE") and canonical_methods(self.api_path):
+        if self.command not in ("GET", *credential_http.WRITES) and canonical_methods(self.api_path):
             self.answer(self.command)
             return False
         return True
@@ -362,6 +362,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         self.write("PATCH")
+
+    def do_PUT(self) -> None:
+        allowed = canonical_methods(request_path(self.path))
+        if "PUT" in allowed:
+            self.write("PUT")
+        elif allowed:
+            self.answer("PUT")
+        else:
+            self.send_error(501)
 
     def do_DELETE(self) -> None:
         self.write("DELETE")
@@ -413,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise contract.Problem("draining", RESTARTING)
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
                 return self.send_json(202 if got["queued"] else 200, got)
-            if method in ("POST", "PATCH", "DELETE"):
+            if method in credential_http.WRITES:
                 self.check_write_instance()
             self.validate_transport(method, path)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
@@ -437,7 +446,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_evidence(int(item[1]))
             if method == "GET" and (run_events := EVENTS_PATH.fullmatch(path)):
                 return self.send_events(unquote(run_events[1]), query)
-            if method == "GET" or path == "/api/v1/batch":
+            if self.operation and (method == "GET" or self.operation[0]["name"] == "batch.run"):
+                result = self.api(method, path, query)
+                self.read_seq = result["seq"]
+            elif method == "GET":
                 with foundation.one_read() as conn:
                     self.read_seq = events.metadata(conn)["head"]
                     result = self.api(method, path, query)
@@ -531,7 +543,7 @@ class Handler(BaseHTTPRequestHandler):
         if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
             required = contract.OLDEST_CLIENT[found[1]]
             raise contract.Problem("client_too_old", f"This client needs version {required}", required_version=required)
-        post = method in ("POST", "PATCH", "DELETE")
+        post = method in credential_http.WRITES
         legacy = bool(self.alias) and "Idempotency-Key" not in self.headers
         self.content_size = api_http.content_length(self.headers, required=post and not legacy and method != "DELETE")
         if not post and self.content_size:
@@ -544,20 +556,26 @@ class Handler(BaseHTTPRequestHandler):
             if not legacy or "Content-Type" in self.headers:
                 api_http.check_media(self.headers, {"application/octet-stream", *capture.EXTENSIONS}, self.content_size)
         elif post:
+            media = self.operation[0].get("body_media") if self.operation else None
             if not legacy or "Content-Type" in self.headers:
-                api_http.check_media(self.headers, {"application/json"}, self.content_size)
+                api_http.check_media(self.headers, {media or "application/json"}, self.content_size)
             if len(self.headers.get_all("Idempotency-Key", [])) > 1:
                 raise contract.Problem("invalid_framing", "Send at most one Idempotency-Key.")
             if self.operation and contract.keyed_write(self.operation[0]) and "Idempotency-Key" not in self.headers:
                 raise contract.Problem("invalid_input", "Send an Idempotency-Key for a write.")
             if batch:
                 requests = self.body().get("requests")
+                if self.credential is None and isinstance(requests, list) and any(
+                    isinstance(item, dict) and credential_http.registry_operation(item.get("operation"))
+                    for item in requests
+                ):
+                    raise credential_http.problem("unauthenticated")
                 if isinstance(requests, list) and 2 <= len(requests) <= 50:
                     api_http.RATES.take(self.person, command=False, cost=len(requests) - 1)
             if self.alias:
                 rest = route_rest(self.alias["path"], path) or ""
                 contract.reject_unknown(self.body(), contract.alias_input(self.alias["provider"], unquote(rest)))
-            else:
+            elif media is None:
                 self.body()
         if self.alias:
             api_http.record_alias(method, self.alias["path"])
@@ -610,12 +628,12 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(row["response"])
 
     def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False, claim=None,
-                     read_only=False):
+                     read_only=False, hash_body=None):
         if claim is None:
             key = self.headers.get("Idempotency-Key")
             if key is None:
                 return action()
-            sha = idempotency.fingerprint(method, route, parameters, self.body())
+            sha = idempotency.fingerprint(method, route, parameters, self.body() if hash_body is None else hash_body)
             owning = write_claim(self, key, sha, route)
         else:
             actor, key, claim_route, body = claim
@@ -1245,6 +1263,10 @@ def post_run(handler, rest, query):
         result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
     else:
         raise NoRoute
+    if result.get("run") and result["run"] != run_id and action in ("answer", "repair", "resume"):
+        from . import cohorts
+
+        cohorts.owner_intervention(result, f"owner {action}")
     handler.write_receipt = event_store.committed_receipt(f"run:{run_id}")
     if result.get("run") and result["run"] != run_id:
         handler.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started")
@@ -1402,14 +1424,22 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
             if not inside_serve:
                 raise
             time.sleep(RESTART_RETRY_SECONDS)
-    chat.recover()
-    if inside_serve:
+    from . import factory_control
+    from .store import factory
+
+    installed = factory.available()
+    if installed:
+        factory_control.notify()
+    accepting = not installed or factory.view()["phase"] == "on"
+    if accepting:
+        chat.recover()
+    if accepting and inside_serve:
         capture.recover()
-    else:
+    elif accepting:
         from . import serve
 
         with util.lock(serve.SERVE_LOCK) as free:
-            if free:
+            if free and (not installed or factory.view()["phase"] == "on"):
                 capture.recover()
     with util.repeating(60, maintain_credentials, "credential-maintenance"):
         tailnet.serve(handlers(), cfg, port, inside_serve, host)

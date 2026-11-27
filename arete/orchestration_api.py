@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, replace
 
-from . import config, owner_asks, prompt_loader, routing, steps
+from . import config, owner_asks, prompt_loader, routing, steps, verification_attempts
 from .agent import BUILD_TOOLS, READ_TOOLS, traits_of
+from .store import specs as spec_store
 from .store.orchestration import digest
 
 PROTOCOL = 1
@@ -32,7 +33,7 @@ class Operation:
             item = value.get(name, default)
             if type(item) is not kind:
                 raise ValueError(f"{name} must be {kind.__name__}")
-            if kind is str and (not item.strip() or len(item) > 16000):
+            if kind is str and ((not item.strip() and default != "") or len(item) > 16000):
                 raise ValueError(f"{name} must be nonempty and at most 16000 characters")
             constraints = self.constraints.get(name, {})
             if "enum" in constraints and item not in constraints["enum"]:
@@ -76,13 +77,20 @@ OPERATIONS = {
                               {"worker_id": required(str), "message": required(str)}),
     "worker.cancel": Operation("Stop a worker and confirm producer cleanup before releasing its lease.",
                                {"worker_id": required(str), "reason": required(str)}),
-    "checks.run": Operation("Run owner-configured checks. Focused resolves blank selectors through an independent "
-                            "selector step, then runs named regressions on the integrated tree; it is not full check evidence.",
+    "checks.run": Operation("Run owner-configured checks. After a failure, rerun the failing tests first, then request full checks on the repaired candidate. "
+                            "Scope focused resolves blank selectors through an independent selector step, then runs named regressions on the integrated tree; it is not full check evidence.",
                             {"scope": (str, "full")}, {"scope": {"enum": ["quick", "full", "focused"]}}),
-    "verification.run": Operation("One independent in-use attempt; never silently repairs implementation.",
-                                   {"goal_refs": (list, []), "route_id": required(str), "effort": required(str)}),
-    "review.run": Operation("One independent review of the current tree.",
+    "verification.run": Operation("Verify behavior; target exact outstanding requirements after a current baseline.",
+                                   {"goal_refs": (list, []), "route_id": required(str), "effort": required(str),
+                                    "requirements": (list, [])}),
+    "verification.decide": Operation("Record why an independently identified advisory verification gap can ship.",
+                                      {"verification_id": required(str), "reason": required(str)}),
+    "review.run": Operation("Review the current tree. Starting a Standards and Spec review requires passing full checks "
+                            "on that tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
+    "review.decide": Operation("Settle the latest code review after full checks. Give each finding ID a decision "
+                               "with status fixed or nonblocking and a reason. Delegate fixes before settling.",
+                               {"review_id": required(str), "decisions": required(dict)}),
     "owner.ask": Operation("Ask through the existing owner-question lifecycle. request must match its schema: "
                            "questions holds 1 to 4 questions and why says why you need the answer. "
                            "A rejected request names what to fix; send it again before finishing failed.",
@@ -116,8 +124,15 @@ WORKER_OPERATIONS = {
 }
 
 
-def operations(protocol):
-    return WORKER_OPERATIONS if protocol == WORKER_PROTOCOL else OPERATIONS
+SPEC_DEFINE = Operation("Persist one observable completion criterion and a reproducible procedure grounded in the "
+                        "published spec and its owner answers. Ask about missing product decisions instead of assuming. "
+                        "Omit environment unless the spec requires an observation in that named runtime.",
+                        {"criterion": required(str), "procedure": required(str), "environment": (str, "")})
+
+
+def operations(protocol, *, spec=False):
+    found = WORKER_OPERATIONS if protocol == WORKER_PROTOCOL else OPERATIONS
+    return {**found, "spec.define": SPEC_DEFINE} if spec else found
 
 
 class Catalog:
@@ -171,6 +186,11 @@ class Catalog:
         self.refresh_context()
         self.fingerprint = digest(self.entries)
 
+    @property
+    def operations(self):
+        run = getattr(getattr(self, "job", None), "run", None)
+        return operations(self.protocol, spec=bool(spec_store.run_root(run)))
+
     def refresh_context(self) -> None:
         job = self.job
         self.context.update(task=f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
@@ -191,8 +211,8 @@ class Catalog:
             raise ValueError("describe takes between 1 and 10 IDs")
         found = []
         for key in ids:
-            if key in operations(self.protocol):
-                found.append({"id": key, **operations(self.protocol)[key].describe()})
+            if key in self.operations:
+                found.append({"id": key, **self.operations[key].describe()})
             elif key in self.entries:
                 entry = dict(self.entries[key])
                 if entry["kind"] == "models":
@@ -260,16 +280,18 @@ class Catalog:
         calls = []
         for call in response["calls"]:
             if (not isinstance(call, dict) or set(call) != {"op", "args"} or type(call["op"]) is not str
-                    or call["op"] not in operations(self.protocol)):
+                    or call["op"] not in self.operations):
                 raise ValueError("unknown operation or malformed call")
             op = call["op"]
-            args = operations(self.protocol)[op].arguments(call["args"])
+            args = self.operations[op].arguments(call["args"])
             if op == "worker.start":
                 args["tool_bundle"] = args["tool_bundle"].removeprefix("tools:")
                 self.worker(args)
                 if (len(args["depends_on"]) > 20 or any(type(dep) is not str or dep not in known
                                                         for dep in args["depends_on"])):
                     raise ValueError("dependencies must name existing actions, not future or cyclic work")
+            if op == "verification.run":
+                args["requirements"] = verification_attempts.names(args.get("requirements", []))
             if op in ("verification.run", "review.run"):
                 self.route(args["route_id"], args["effort"], ("verify" if op.startswith("verification") else "review",))
                 self.refs(args.get("context_refs", args.get("goal_refs", [])))
@@ -290,7 +312,7 @@ class Catalog:
             if op == "catalog.describe":
                 ids = args["ids"]
                 if (not 1 <= len(ids) <= 10 or any(type(key) is not str or key not in self.entries
-                                                and key not in operations(self.protocol) for key in ids)):
+                                                and key not in self.operations for key in ids)):
                     raise ValueError("describe needs between 1 and 10 known catalog or operation IDs")
             if op == "context.read":
                 self.read(**args)
@@ -310,9 +332,9 @@ class Catalog:
         return {**response, "calls": calls}
 
 
-def describe_operations(protocol=PROTOCOL) -> dict:
-    return {name: operation.describe() for name, operation in operations(protocol).items()}
+def describe_operations(protocol=PROTOCOL, *, spec=False) -> dict:
+    return {name: operation.describe() for name, operation in operations(protocol, spec=spec).items()}
 
 
-def help_text(protocol=PROTOCOL) -> str:
-    return json.dumps(describe_operations(protocol), separators=(",", ":"))
+def help_text(protocol=PROTOCOL, *, spec=False) -> str:
+    return json.dumps(describe_operations(protocol, spec=spec), separators=(",", ":"))

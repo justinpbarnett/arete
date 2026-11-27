@@ -4,6 +4,32 @@ Agent loops that keep running and keep making the harness they run in better.
 
 Arete is one global engine for every repo on the machine. Each repo gets a thin layer that says how to set up, what checks must pass, and how much the agents are trusted there. The layer is `.agents/` in the repo, or a folder outside it when the rest of the team does not use arete. Agents edit files. Arete's own code commits, pushes and opens PRs, so no agent ever holds git write access.
 
+## Dark software factory
+
+A dark software factory repeatedly turns authorized goals for a defined class of work into working software at its agreed point of delivery, without requiring a person to implement, review, approve, or advance ordinary changes. It verifies the delivered behavior using acceptance checks the builder cannot waive or weaken. It recovers from routine failures on its own and, when it cannot safely proceed, stops the affected work and makes the reason visible.
+
+### Measure a delivery cohort
+
+Declare eligible work, its unattended destination, its arrival window and hours allowed for delivery before the first pickup. A scheduled batch accepts repeated `--ticket` flags and admits the whole batch at the opening time. For a continuous GitHub cohort, use `--label agent`. Each matching label application to a repository-owner-authored issue in the window qualifies, including issues that close before the next poll. An active hold remains visible as waiting work. The declaration is immutable. These commands run on the Arete host.
+
+```sh
+arete cohort declare november --repo arete --label agent --destination arete-serve \
+  --work-class 'Owner-authored issues receiving the agent label this week' --closes 2026-12-02T00:00:00Z --deadline-hours 48
+arete cohort sync
+arete cohort replacement november 71 83
+arete cohort note november 83 touch --evidence 'tracker-comment:142' --detail 'Owner resolved the ambiguous acceptance condition'
+arete cohort report november
+arete cohort candidates november
+```
+
+The scheduler catches up label events before picking work. A failed tracker read preserves the previous cursor. Reports show the cursor and whether intake covers the whole window. Repeated polls and re-added labels count one goal. The read-only CLI and authenticated `GET /api/v1/cohorts/{name}` report delivery, terminal failure, or a pending goal with age, reason and deadline. All successive attempts and their PRs share the goal. Link a replacement even when it already started independently. Capture any necessary hand merge or rescope using `note ... touch` and its source reference. A terminal abandonment uses `failed`. Use `pending` to record a subsequent readmission.
+
+The integer `pending_overdue` counts each pending goal whose `deadline` is strictly before the report's `observed` time, including a readmitted goal that previously delivered on time. An empty cohort reports zero. The member's `overdue` field continues to use the latest verified delivery time when one exists.
+
+A verified delivery requires a protected observation on a specific release at the declared destination. A consumed owner question, an authenticated manual intervention, or attested external work records a touch. On a delivery with a complete retrospective review of the ticket, PR and run history, `note ... audit` records positive evidence of absence of intervention through that delivery. Missing evidence stays unknown. A later `regression` observation on the goal or its successor preserves the prior delivery history. Keep the owner-state `cohorts.sqlite` alongside the instance state when backing it up or moving it.
+
+The `candidates` command selects failed goals, first interventions and escaped defects with their source references. Promote a corroborated case into the protected cases under `.github/workflows/cohort-regressions/`. The existing `arete-checks` job reads those cases from the base revision, reproduces their historical failures and corrections, and checks the candidate against the same observations. To repeat on a disposable worker, use `python .github/workflows/cohort-regressions/run.py --candidate . --calibrate`.
+
 ## Database transactions and the timing rollout
 
 Retain at least one full day of rollback-mode measurements before deploying this WAL release.
@@ -93,7 +119,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 | Loop | Kind | When | What it does |
 |------|------|------|--------------|
 | `heartbeat` | command | hourly, and when serve starts | Checks serve's beat, the loops, log freshness, real probe calls, claude login expiry, the event hook, and disk. Each failing check opens one issue on `alert_repo`; recovery closes it. |
-| `mine` | command | nightly | Reads the day's Claude Code transcripts, hook events and PR feedback, plus arete's own recorded runs that failed, needed a retry, hit a budget or ran long, finds corrections and repeated friction, and opens harness PRs (CLAUDE.md, skills, `.agents/`, arete's own step prompts) in the repo where the fix belongs. Claude Code denies agent writes under `.claude/`, so a fix there is listed in `arete status` to make by hand. |
+| `mine` | watch | when a published parent spec closes | Reviews the spec and its delivery runs. Publishes code-quality tickets in the target tracker and factory improvements in Arete’s tracker. `arete mine` still runs transcript mining on demand. |
 | `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used, and the [doctor](#doctor)'s read of arete's own state. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
@@ -645,7 +671,11 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 
 ## When a worktree is kept and when it is removed
 
-A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The workspace row in `arete.db` records the owner, checkouts and cleanup state. Arete records fingerprints of files it made, including setup outputs such as `.venv/`, and writes compatible `workspaces/<name>.json` records for rollback.
+A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The workspace row in `arete.db` records the owner, checkouts and cleanup state. Arete stores fingerprints of files it made, including setup outputs such as `.venv/`, in `workspace_files`.
+
+A verified in-place upgrade imports workspace snapshots from the historical `workspaces` folder under the state directory. If the database was moved or restored before the workspace contract, or Arete cannot match the database to its snapshot directory, set `[serve] workspace_snapshots` to the absolute path of the authoritative directory or pass `arete migrate --workspace-snapshots DIR`. An explicit directory takes precedence and must exist; use an empty directory only if there are no snapshots to import. Confirm that older runs, loops and rule-filing workers have exited, including detached processes from a stopped service, and prevent older code from starting during the handoff. Serve resumes scheduling after the old children have drained and the handoff commits. Keep the original snapshots with the pre-contract database backup. A code-only rollback to a revision older than the contract is refused after it applies.
+
+Health lists workspaces held because a legacy snapshot was unreadable, changed during handoff, or conflicted with its row. After repairing a snapshot, run `arete migrate --retry-quarantined-workspace NAME --workspace-snapshots DIR`, using the workspace name from Health and the authoritative snapshot directory. The retry requires an idle ticket and a snapshot whose recorded owner matches the workspace; normal checkout checks still apply when work resumes. If the snapshot cannot be recovered, preserve the workspace's commits, files and scratch resources and move it out of its original location. Use Git's worktree commands for registered checkouts, and save unpublished commits under a separate ref before reusing the ticket branch. Run `arete migrate --retire-quarantined-workspace NAME`. The command checks that the original path is vacant and records the retirement in SQLite. The next run can use the original workspace location.
 
 - Kept after a failed, parked or stopped run, a waiting ask, a dry run, leftover verification scratch, or any file the record does not cover.
 - Removed by the run itself at a `pr`, `done`, no-change or plain needs-info ending. When the removal is blocked, `run.log` says `workspace kept at ...: removal blocked by` and lists the names.
@@ -993,7 +1023,7 @@ A permitted gap is reported as unverified, never as a pass.
 Sensitive ADW changes also remain held when behavioral verification is blocked.
 
 The poller orders new candidates by the longest remaining downstream dependency chain, then by the number of downstream tickets, then by age.
-It uses queued ticket bodies and existing `Waits on` declarations without extra per-ticket API fetches for ranking.
+It ranks queued tickets using their dependency declarations and GitHub's native blocking links to other tickets in the queue.
 Approval, dependency, running-ticket and capacity checks still decide whether a candidate can start, and the existing cross-repo scheduling remains in place.
 
 ## Layout
@@ -1005,7 +1035,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, workspace cleanup state, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` rollback records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, workspace cleanup state, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.
@@ -1059,12 +1089,12 @@ private_key = "~/.config/arete/github-app.pem"
 | `[models]` | Model per role: `plan`, `build` (also fix and revise), `verify`, `review`, `learn`, `uat`, `miner`, `apply`, `eval_mine`, `triage`, `research` (the reports for research tickets), `research_plan` (the planner of a staged research run), `research_search` (the search workers of a staged run), `research_synthesis` (the collator of a staged run; opus when left out), `research_audit` (the auditor of a staged run; opus when left out), `chat` (the dashboard console), `classify` (a loop's classify step, for the events JEV is unsure of), `loop` (a loop's agent, and the loop drafts from the dashboard), `session` (agent sessions), `explain` (the plain summary of each approval in Needs you), `document` (the concise writer of PR text, tickets and messages), `capture_evidence` (reads staged feedback screenshots and recordings; sonnet when left out). A role left out uses the claude CLI default, except `triage`, `classify` and `explain`, which use haiku, `loop`, `session`, `research_search` and `capture_evidence`, which use sonnet, and `research`, `research_plan` and `chat`, which use opus. `arete status` lists each role's model. |
 | `[steps]`, `[kinds]`, `[tiers]`, `[factory]` | Each pipeline step's model, runner, effort, timeout, tries, tools, MCP servers, instructions and session. See [Steps](#steps). `[factory] adws` is the folder the adw scripts come from, default `adws/` in this checkout; see [The adw scripts](#the-adw-scripts). |
 | `[mcp.<name>]` | An MCP server a step can name in its `mcp` list: `command` with optional `args`, or `url` for an HTTP server. Servers are defined here only, not in a layer. |
-| `[miner]` | `lookback_hours` and `max_digest_chars` for the nightly digest of transcripts and recorded runs; recorded runs take up to half of `max_digest_chars`. |
+| `[miner]` | `lookback_hours` and `max_digest_chars` for the on-demand digest of transcripts and recorded runs; recorded runs take up to half of `max_digest_chars`. |
 | `[[repo]]` | Every repo arete knows: `name`, `path`, `github`, and the fields below. |
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
-| `[orchestration]` | `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, and `progress_seconds = 30`. Set `max_builders = 1` to pilot addressed worker turns, or `2` to allow two private builders on independent work. Each configured limit takes an integer from 1 to 10000. [Orchestration](docs/orchestration.md) |
+| `[orchestration]` | `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, and `progress_seconds = 30`. Set `max_builders` to enable private builder turns and cap concurrent writers per run. The controller can assign independent work within the worker and builder limits. Each configured limit takes an integer from 1 to 10000. [Orchestration](docs/orchestration.md) |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
@@ -1100,9 +1130,10 @@ A dependency declaration is a body line starting with `Waits on` or `Blocked by`
 Leading spaces or tabs, one Markdown bullet (`-`, `*`, `+`) or heading (`#` through `######`), and `**` bold markers around the label are accepted, as in `- **Blocked by:** #7 and #9` or `### Waits on: #7`.
 The shared parser scans lines directly, including matching lines inside code fences or HTML comments; put examples in inline code to avoid declaring dependencies.
 GitHub issues use the bare `#N` references on these lines, such as `Waits on #7.` or `Blocked by #7 and #9`, and wait until every named issue or PR in the same repository is closed or merged.
+Arete also reads GitHub's native **Blocked by** links during polling and automatic recovery. An open blocker holds that ticket while other ready tickets can run. When the blocker closes or the link is removed, the next poll checks eligibility again. A parent issue can stay open while its independent children run.
 A number arete cannot read holds the issue too.
 Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
-References outside matching declaration lines hold nothing.
+Other references in the ticket body have no effect on scheduling.
 Each tracker reads only its own reference type on those lines: GitHub issue numbers, local task ids or Jira keys.
 
 A maintainer can consolidate a bounded group into one execution issue labelled `agent:batch`.
@@ -1277,6 +1308,12 @@ A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
+### Enroll the delivery target
+
+Use `arete repo enroll NAME CHECKOUT --target-branch staging --landing pr --unattended-environment staging --pipeline` to save the tracker, branch and furthest permitted unattended environment. `arete repo show NAME` displays the saved choices. Use `--tracker jira --jira-project KEY` to choose a team tracker explicitly.
+
+Publish an agreed spec with `arete repo publish NAME spec --title TITLE --body-file FILE --key STABLE_KEY`. An enrolled, enabled pipeline receives the spec and agent labels in the same publication. Jira also gets the enrolled project, route label and assignee. To file a draft for later approval, add `--draft`. Child tickets and follow-ups keep their normal admission process.
+
 ### Durable issue orchestration
 
 Enable issue goals for the repositories that Arete should follow through tracker closure or PR merge.
@@ -1311,7 +1348,10 @@ Disable new supervised admissions by removing the repository from `repos` or set
 
 ### Pipeline auto-merge
 
-Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
+New and resumed orchestrated tickets require passing full local checks and a settled Standards and Spec review on the delivery candidate.
+The orchestrator can fix a finding or explain why it can ship. Ticket-specific journey checks and configured probes still require behavioral verification.
+Fixed workflows and the bounded README delivery lanes use their own evidence requirements.
+See [the review and finding decisions](docs/orchestration.md#code-review).
 GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
 JEV must complete its risk screen on the diff.
 For approved issues enrolled in durable orchestration on an `automerge` repo, the issue orchestrator decides whether to merge, request revisions or wait.
@@ -1730,6 +1770,20 @@ Checks passing is not the bar.
 After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw.
 Reading the code and running the test suite do not count as checks in use.
 Task prompts share the Behavior-first policy in `arete/prompt_loader.py`; individual roles do not define a separate test-writing policy.
+
+For a classic console draft check, `uv run python docs/console-drafts-fixture.py` starts a loopback dashboard with two saved chats. It prints the controls URL. File and Drop use the dashboard API with a disposable chat credential. The fixture records filed tickets locally and supplies an `example.invalid` issue link. Closing the fixture removes its state.
+
+To select this fixture for a verification attempt, use these values in its authorized `[verify]` layer. Keep the installed sandbox wrapper's absolute path in place of `sandbox` when the layer uses one.
+
+```toml
+[verify]
+start = "sandbox uv run python docs/console-drafts-fixture.py --port {port}"
+url = "http://127.0.0.1:{port}"
+ready = "/fixture"
+notes = "Open /fixture in a second tab for Hold and Release controls and the list of filed drafts."
+```
+
+Open the console and display draft A. From the controls tab, hold A and B reads. Start an A read, then select B. Release A first and inspect File and Drop while B is still waiting. Release B, file its draft and check the filed list. Start a fresh fixture to check Drop and confirm that A still has its draft.
 
 Eligible local Codex verification attempts get a fresh mode-700 `.arete-scratch-<16 hex>` folder in their worktree. Arete exclusively creates five empty fixture slots (`config/config.toml`, `state/arete.db`, `fixtures/config.toml`, `fixtures/fixture.db` and `out/output.txt`) for fake configuration, SQLite state and output. Files and folders the verifier or the service creates in scratch are verification output. This includes a fixture slot replaced by a file created there during the attempt, as in an atomic write. Arete archives verification output with the scratch root at finalization, without any ownership claim from the guard. Entries moved or hard-linked in from elsewhere, entries made before the attempt and folders holding them at any depth, entries on another device, entries that cannot be classified, and slots replaced after the snapshot keep the worktree retained. The diagnostic names each such entry and its reason under `unknown_entries` and `reasons`. Arete classifies entries by comparing the APFS file id with the largest id in the recorded layout and does not follow links.
 
@@ -2571,6 +2625,23 @@ Read `/api/v1/meta` for the API version, contract hash, server revision, and old
 Read `/api/v1/contract` for the live registry or see the generated [OpenAPI document](docs/openapi.json) for this checkout.
 Legacy URLs keep their existing shapes and are tracked as deprecated aliases.
 
+#### Factory emergency stop
+
+The **Stop factory** button on the Floor and classic dashboard closes work admission for this Arete instance. Issue pickup, webhooks, launches and scheduled jobs pause. The dashboard and control API stay reachable. **Stopping** shows workers whose exit is still pending, including offline remote devices. **Affected work** lists their IDs and any reason a continuation needs attention.
+
+**Resume factory** reopens admission after outstanding stops are confirmed. An interrupted interactive session keeps its ID, conversation checkpoint, remaining budget and queued messages. Eligible ticket runs use their recorded workflow and retained workspace. A command or publication with uncertain external effects is held for inspection. Missed timer firings are skipped. Each loop and repository continues to honor its own saved settings, including edits made during the pause.
+
+Agents can read `GET /api/v1/factory/state` with the `read` scope. To request a change, use a credential with `factory:write`, the version from the read and a fresh idempotency key. Reuse that key and the same body when retrying a lost response.
+
+```sh
+curl -H "Authorization: Bearer $ARETE_TOKEN" "$ARETE_URL/api/v1/factory/state"
+curl -X POST -H "Authorization: Bearer $ARETE_TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $REQUEST_ID" -d '{"enabled":false,"base_version":1}' \
+  "$ARETE_URL/api/v1/factory/state"
+```
+
+Set `enabled` to `true` with the current version to resume. A stale version returns HTTP 409. A successful write records the requested state. Read `factory.phase` and `factory.unconfirmed` to follow actual stop progress.
+
 #### Checking API changes
 
 Run these steps from the checkout after `uv sync` and `git fetch origin main`:
@@ -2780,3 +2851,70 @@ If a classic dashboard sidebar or questions request fails, the view can still re
 - Triage writes to a ticket only to approve it: the labels of an auto approval, or the answers and labels you send from the dashboard. Its board goes only to a private repo.
 - Each verifier server runs on its own port and is stopped with its whole process group after the step.
 - A JEV answer settles a question alone only at or over `confidence`; under it, the model decides. A hold or a guard stop, which a person can undo, takes a lower line.
+
+### Verify the promised behavior on a running release
+
+For an installed self-deploy service, the current healthy release refreshes the standalone startup guard from its own committed source before fast-forwarding. After the new release passes its protected checks and becomes healthy, the service installs that release’s guard. The guard preserves additional fields when recording starts or rollback. If an older guard dropped a binding before the service recorded startup health, the deployment poll can recover it while that release is still serving. It matches the original transfer interval, policy and verified pre-transfer recovery receipt, then observes the running behavior. A failed or blocked check keeps the next deployment waiting. The original startup receipt retains its historical contents.
+
+Enroll the goal before pickup with `arete release enroll REPO TICKET --policy-file FILE`. Arete copies this policy to its private configuration directory outside the worker checkout. A self-deploy policy might read as follows.
+
+```json
+{
+  "destination": "arete-serve",
+  "path": "/api/v1/cohorts/example",
+  "assertions": [
+    {
+      "field": "/report/pending_overdue",
+      "count": "/report/members",
+      "where": {"/status": "pending"},
+      "before": {"member": "/deadline", "response": "/report/observed"}
+    }
+  ],
+  "recovery": [{"field": "/report/cohort/name", "equals": "example"}]
+}
+```
+
+The default binding follows the enrolled ticket's single merged factory PR to its configured target. A private policy can instead pin a full `revision` for a known release. When several commits fast-forward together, each matching goal is checked against the running tip. The normal local client exercises the protected read on the revision that answered the request. Each receipt records the goal, policy fingerprint, requested path, verified fields, revision, timestamp and outcome.
+
+The assertion counts pending member rows whose `deadline` is strictly before `observed` in the same response. Both timestamps need UTC offsets. A readmitted member can be pending past its deadline even if a previous delivery was on time.
+
+Before moving the checkout, the prior release must pass the recovery assertion. A wrong result on the new release keeps the ticket open and invokes the existing code-only rollback guard. A dirty checkout or incompatible database holds the release. After a successful rollback the running previous version rechecks its recovery assertion. The previous version must already contain this feature to perform that confirmation. `arete release status REPO TICKET` reports the receipt. `arete release observe REPO TICKET --revision SHA` reruns the enrolled check for the authorized revision.
+
+For a staging-gated repository, enroll its tracker, staging branch, PR landing policy and staging ceiling with `arete repo enroll`. Supply `--staging-profile FILE` to bind the repository's `destination`, `staging`, `production`, `production_branch`, `identity_path`, and `qa` defaults, plus optional `checks`, `immutable_host_suffix`, and `qa_require_revision`. For an existing enrollment use `arete repo staging-profile NAME --policy-file FILE`; `arete repo show NAME` reads it back. These files contain release configuration only. Each ticket then supplies its own path, assertions, recovery, instructions and optional observer. A ticket may narrow the repository's QA list. Changes to the enrolled authority invalidate earlier ticket promises until the owner re-enrolls them. For repositories with a profile, unpublished promises hold autonomous staging merges and tracker closure. Other repositories keep their existing delivery settings. Production may use its existing push-triggered deployment workflow. Set an owner-controlled revision identity document in both environments. The response from each deployed origin must identify its complete Git revision, for example `{"revision":"<40-character commit SHA>"}`.
+
+```json
+{
+  "destination": "staging",
+  "staging": "https://staging.example.com",
+  "production": "https://www.example.com",
+  "production_branch": "main",
+  "identity_path": "/.well-known/arete-release.json",
+  "path": "/api/settings",
+  "assertions": [{"field": "/selection", "equals": "Sources"}],
+  "recovery": [{"field": "/available", "equals": true}],
+  "instructions": "Open Settings and confirm that the saved selection is Sources.",
+  "qa": ["release-owner"]
+}
+```
+
+If the release workflow reports an immutable preview as the GitHub `staging` deployment's environment URL, configure `immutable_host_suffix` (e.g. `project.pages.dev`). Arete checks the exact SHA at the stable staging address and the immutable preview, then posts the preview, expected user action and evidence on the ticket.
+
+A workflow can conditionally skip deployment-only jobs on pull requests. Declare each GitHub Actions check by its exact name and publisher ID in the protected policy. For example, `"checks": {"pr": {"app_id": 15368, "required": ["Verify"], "allow_skipped": ["Deploy"]}, "staging": {"app_id": 15368, "required": ["Verify", "Deploy"], "allow_skipped": []}}`. Arete requires the named jobs to succeed on the candidate SHA and accepts a skipped result only for a listed job from the same publisher on that SHA. Failed, cancelled and pending jobs always hold.
+
+For browser checks, pin the SHA-256 of an owner-installed Python observer in `observer_sha256` and supply `--observer-file FILE` on enrollment. The observer receives a JSON object on stdin with `origin`, `path`, `revision` and `destination`. It emits one JSON object with the observations that the protected assertions evaluate. It runs outside the checkout, with a temporary home, a clean environment, and a 120-second limit. A nonzero exit leaves verification blocked. Installing an observer authorizes that program to execute as the service user. Keep its browser and other executable dependencies in a trusted installation outside candidate worktrees.
+
+A spec that requests `staging` (or the enrolled staging origin) may finish on the staging receipt. A spec that requests `production` (or its enrolled origin) needs its QA-approved production receipt. Unrecognized runtime names hold for clarification.
+
+Set `"qa_require_revision": true` to require the full revision on the explicit QA instruction. An authorized GitHub login or Jira account ID can reply to the QA handoff with `Promote FULL_SHA to production`. Arete rechecks staging and its behavior, current scope, QA authority, CI, and the running production revision. A non-forced production branch update advances the one staged commit only when it directly follows the verified production tip. Existing branch protections continue to apply. Use this adapter where the enrolled repository already deploys pushes on that production branch. A change that needs bundling, an unrelated branch advance, or a changed requirement holds for reconciliation or fresh QA. Arete records the intent before sending, reconciles the actual branch after restart, and keeps the ticket open until the production endpoint proves the expected behavior. `arete release status REPO TICKET` shows the staging handoff and production completion independently.
+
+### Standing authorization for future production releases
+
+A GitHub repository with an enrolled staging profile can authorize automatic promotion after verification. Enable automatic triage, include the repository in `[unblock].repos`, and use its `automerge` trust level to let the issue orchestrator review automatically admitted PRs. The owner grants production authority with:
+
+```sh
+arete repo standing-production REPO --after-issue NUMBER --promise-file smoke.json --observer-file smoke.py --production-checks checks.json
+```
+
+Use the last existing GitHub issue or PR number as the boundary. At admission, new issues receive the protected smoke check. An individually enrolled promise takes precedence. The promise uses the same path, assertions, recovery and observer fingerprint as a ticket release check. The production checks file names the GitHub app ID, required successful jobs and jobs allowed to skip, using the staging checks format.
+
+Arete verifies the immutable staging revision, rechecks the current grant and production parent, then promotes the same revision. Closure requires the production push checks and the live production observation. The tracker records the release under the standing grant. `arete repo show REPO` reports the active policy. `arete repo standing-production REPO --revoke` withdraws it for future promotions.

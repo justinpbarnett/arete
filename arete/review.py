@@ -199,7 +199,10 @@ class Review:
         return "\n".join(f"- [{p['severity']}] {p['file']}: {p['problem']}" for p in self.notes()) or "None."
 
     def markdown(self) -> str:
-        return f"## Review\n\n**{self.display_verdict}**: {self.summary}\n" + self.lists()
+        pending = ""
+        if self.verdict == "pending":
+            pending = "".join(f"\n- {f['id']} ({f['file']}) {f['finding']}" for f in self._extra.get("findings", []))
+        return f"## Review\n\n**{self.display_verdict}**: {self.summary}\n" + pending + self.lists()
 
     @property
     def display_verdict(self) -> str | None:
@@ -215,7 +218,8 @@ class Review:
 
     def report(self) -> dict:
         return {"verdict": str(self.verdict or ""), "summary": str(self.summary or ""),
-                "unresolved": self.verdict == "request_changes",
+                "unresolved": self.verdict in ("pending", "request_changes"),
+                **{k: self._extra[k] for k in ("method", "findings", "decisions") if k in self._extra},
                 "problems": reported(self.blocking()), "notes": reported(self.notes()),
                 **({"trees": self.trees} if self.trees and self.blocking() else {})}
 

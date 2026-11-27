@@ -1,0 +1,14 @@
+factory-switch { display: grid; gap: .25rem; align-items: start; font: inherit; }
+factory-switch > button { min-height: 44px; padding: .45rem 1rem; font: inherit; font-weight: 700;
+  border: 2px solid currentColor; border-radius: .35rem; cursor: pointer; }
+factory-switch > button[data-stop=true] { color: white; background: #942e29; border-color: #942e29; }
+factory-switch > button::before { content: ""; display: inline-block; width: 2rem; height: 1.1rem;
+  box-sizing: border-box; margin-right: .55rem; vertical-align: -.18rem; border: 1px solid currentColor;
+  border-radius: 1rem; background: radial-gradient(circle at .5rem center, currentColor .33rem, transparent .36rem); }
+factory-switch > button[aria-checked=true]::before {
+  background: radial-gradient(circle at 1.4rem center, currentColor .33rem, transparent .36rem); }
+factory-switch > button:disabled { opacity: .65; cursor: default; }
+factory-switch > button:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+factory-switch > span, factory-switch > details { font-size: .82rem; }
+factory-switch > details { max-width: min(26rem, 90vw); overflow-wrap: anywhere; }
+factory-switch ul { max-height: 12rem; overflow: auto; padding-left: 1.25rem; }

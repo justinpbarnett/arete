@@ -10,7 +10,8 @@
       "type": "object",
       "additionalProperties": {"type": "integer"}
     },
-    "session_idle_hours": {"type": "number"}
+    "session_idle_hours": {"type": "number"},
+    "workspace_snapshots": {"type": "string"}
   },
   "additionalProperties": false
 }

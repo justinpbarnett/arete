@@ -221,8 +221,12 @@ def write_checked(text: str, refusal) -> None:
         if why := refusal(cfg):
             raise Refused(why)
 
-    mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
-    util.write_durably(paths.CONFIG_FILE, text.encode(), mode, check)
+    try:
+        mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
+    except FileNotFoundError:
+        util.write_durably(paths.CONFIG_FILE, text.encode(), 0o600, check, replace=False)
+    else:
+        util.write_durably(paths.CONFIG_FILE, text.encode(), mode, check)
 
 
 def set_key(lines: list[str], table: str | None, key: str, value: str) -> None:

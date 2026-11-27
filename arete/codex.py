@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from unicodedata import normalize
 
 from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
@@ -58,6 +59,39 @@ GIT_READ_FORMS = {"stash": ("list", "show"), "worktree": ("list",), "remote": ("
                   "config": ("--get", "--get-all", "--list", "-l")}
 SHELL_BREAKS = ";|&\n()`{}"
 SHELL_TOOLS = frozenset({"Bash", "shell", "shell_command", "exec_command"})
+KEYCHAIN_COMMAND = re.compile(r"(?<![\w.-])security(?![\w.-])", re.IGNORECASE)
+REDIRECT = re.compile(r"[0-9]*(?:<<<|<<-|<<|<>|<&|>>|>\||>&|[<>])|&>>?")
+ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
+FUNCTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+LITERAL_SHELL_WORD = re.compile(r"""(?:'[^']*'|"(?:[^"$`\\]|\\[\s\S])*"|\\[\s\S]|[^$`'"\\*?\[{}~<>()])+""")
+DISPLAY_FORMAT = re.compile(r"(?!-)(?:[^%]|%[%bsdi])*")
+SHELL_PREFIX = frozenset({"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until"})
+SHELL_WORD_BREAKS = " \t\n;|&()<>"
+SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
+SED_PATTERN = r"/(?:\\[^\n]|[^/\\\n])*/"
+SED_ADDRESS = rf"(?:[0-9]+|\$|{SED_PATTERN})"
+SED_SEARCH = re.compile(SED_PATTERN + "p")
+SED_LITERAL_SEARCH = re.compile(rf"\s*(?:{SED_ADDRESS}[ \t]*,[ \t]*(?:{SED_ADDRESS}|\+[0-9]+)[ \t]*p"
+                                r"|/security/\s*(?:p|=|!d|\{\s*p\s*;?\s*\}))\s*")
+AWK_SEARCH = re.compile(r'(?:/security/|\$0[ \t]*~[ \t]*/security/|index\(\$0,[ \t]*"security"\))'
+                        r'(?:\s*\{\s*(?:print(?:[ \t]+(?:\$[0-9]+|F?NR(?:[ \t]*(?:,|"[: ]+")[ \t]*\$[0-9]+)?))?\s*;?\s*\}'
+                        r'|(?P<count>[A-Za-z_][A-Za-z_0-9]*)[ \t]*\+\+\s*;?\s*\}\s*;?\s*END\s*\{'
+                        r'\s*print[ \t]+(?P=count)(?:[ \t]*\+[ \t]*0)?\s*;?\s*\}))?\s*')
+BACKTICK = re.compile(r"`((?:\\[\s\S]|[^`\\])*)`")
+ANSI_C_QUOTE = re.compile(r"\$'((?:\\[\s\S]|[^'\\])*)'")
+ANSI_C_ESCAPE = re.compile(rb"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c(?:\\\\|[\x00-\x7f])|.)",
+                         re.DOTALL)
+ANSI_C_SIMPLE = dict(zip(b"abefnrtvE\\'\"?", b"\a\b\x1b\f\n\r\t\v\x1b\\'\"?", strict=True))
+HEREDOC_EXPANSION = re.compile(r"\\(?:[$`\\]|\n)|\$\(|`")
+COMMAND_OPTIONS = {
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "nice": {"-n", "--adjustment"},
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-r", "-t", "--user", "--group", "--chdir"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "time": {"-f", "-o", "--format", "--output"},
+    "xargs": {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--arg-file", "--delimiter", "--replace",
+             "--eof", "--max-lines", "--max-args", "--max-procs", "--max-chars"},
+}
 PATCH_PATHS = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE)
 USAGE_LIMIT_TEXT = re.compile(r"usage limit|hit your [^.\n]{0,40}limit", re.IGNORECASE)
 TRY_AT = re.compile(r"try again at ([^\n]+?)\.?\s*$", re.IGNORECASE | re.MULTILINE)
@@ -294,12 +328,16 @@ def kept_out(roots: list[Path], hidden: list[Path | str], floor: guard.Floor | N
     return denied
 
 
+def grant_path(spelling: str) -> Path:
+    return Path(normalize("NFD", os.path.normpath(spelling).casefold()))
+
+
 def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> dict[str, str]:
     granted = {}
-    blocked = [home().resolve(), (paths.HOME / ".claude").resolve(), (paths.HOME / ".pi").resolve()]
-    hidden_paths = {Path(p).resolve() for p in hidden}
+    blocked = [home(), paths.HOME / ".claude", paths.HOME / ".pi", *hidden]
     if gh := shutil.which("gh"):
-        hidden_paths.add(Path(gh).resolve())
+        blocked.append(Path(gh))
+    blocked_paths = {grant_path(spelling) for path in blocked for spelling in both(path)}
     for rule in allowed_tools or []:
         if not (rule.startswith("Bash(") and rule.endswith(")")):
             continue
@@ -310,19 +348,20 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
         if not words or not Path(words[0]).is_absolute() or any(c in words[0] for c in "*?["):
             continue
         path = Path(words[0])
-        resolved = path.resolve()
-        if (not path.is_file() or not os.access(path, os.X_OK) or resolved in hidden_paths or
-                any(resolved.is_relative_to(root) for root in blocked) or
-                any(sandbox.secret_path(p) or p.name in ("auth.json", "config.toml") for p in (path, resolved))):
+        spellings = both(path)
+        candidates = {grant_path(p) for p in spellings}
+        if (not path.is_file() or not os.access(path, os.X_OK) or
+                any(candidate.is_relative_to(root) for candidate in candidates for root in blocked_paths) or
+                any(sandbox.secret_path(p) or p.name in ("auth.json", "config.toml", *sandbox.SECRET_DIRS)
+                    for p in map(Path, spellings))):
             continue
-        granted |= {p: "read" for p in both(path)}
+        granted |= {p: "read" for p in spellings}
     return granted
-
 
 
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
             allowed_tools: list[str] | None = None, *, floor: guard.Floor | None = None,
-            temp_dir: Path | None = None) -> list[str]:
+            temp_dir: Path | None = None, authority: tuple[Path, ...] | None = None) -> list[str]:
     floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     name = WRITE_PROFILE if writing else READ_PROFILE
     granted = {path: "write" if writing else "read" for path in both(cwd)}
@@ -335,9 +374,14 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
                      timeout=10, env=agent_env(), inherit=False)
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
-    table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], [*hidden, *sandbox.authority_roots()], floor),
-             **executables(allowed_tools, [*hidden, *sandbox.authority_roots()])},
+    authority = sandbox.authority_roots() if authority is None else authority
+    protected = [*hidden, *authority]
+    denied = {grant_path(p) for root in authority for p in both(root)}
+    opened = {p: rule for p, rule in (granted | metadata).items()
+              if not any(grant_path(p).is_relative_to(root) for root in denied)}
+    table = {"extends": PROFILE_BASE[name], "filesystem": {**opened,
+             **kept_out([cwd, *add_dirs], protected, floor),
+             **executables(allowed_tools, [*protected, *floor.closed, *floor.files])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
 
@@ -444,6 +488,7 @@ def command(
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
     temp_dir: Path | None = None,
+    authority: tuple[Path, ...] | None = None,
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -468,7 +513,7 @@ def command(
     for key, value in SETTINGS.items():
         cmd += setting(key, value)
     cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools, floor=floor,
-                   temp_dir=temp_dir)
+                   temp_dir=temp_dir, authority=authority)
     shell_names = set(command_names(passing or [], extra_env)) - {
         k for server in servers.values() for k in (server.get("env") or {})}
     if temp_dir is not None:
@@ -500,7 +545,8 @@ def authentication(passing=None, extra=None, remote=None) -> accounts.Auth:
 
 def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
     auth = auth or authentication(kw.get("passing"), kw.get("extra_env"), kw.get("remote"))
-    result = _run(*args, auth=auth, **kw)
+    with sandbox.WorkerLease() as activation:
+        result = _run(*args, auth=auth, activation=activation, **kw)
     result.auth_mode = auth.mode
     if auth.mode not in ("subscription", "api_key"):
         result.usage_limit = None
@@ -575,6 +621,7 @@ def _run(
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
     api_key: str = "",
+    activation: sandbox.WorkerLease,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
     resume = resume if resume.runner == "codex" else NO_SESSION
@@ -601,15 +648,17 @@ def _run(
     temp_dir = None
     try:
         try:
+            activation.acquire()
+            authority = sandbox.worker_authority(activation)
             if not writes(tools, allowed_tools) and verification_scratch.PRODUCING.get() is None:
                 temp_dir = Path(tempfile.mkdtemp(prefix="arete-codex-tmp-"))
-                if protected_temp_dir(temp_dir, (cwd, *(add_dirs or []), *sandbox.authority_roots())):
+                if protected_temp_dir(temp_dir, (cwd, *(add_dirs or []), *authority)):
                     remove_temp_dir(temp_dir)
                     temp_dir = None
             cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                           system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config,
                           instructions=instructions, judge=judge, passing=passing, extra_env=extra_env, hidden=hidden,
-                          scratch=scratch, floor=floor, temp_dir=temp_dir)
+                          scratch=scratch, floor=floor, temp_dir=temp_dir, authority=authority)
         except (ValueError, OSError) as e:
             return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
         if temp_dir is not None:
@@ -629,8 +678,8 @@ def _run(
             on_line(line)
 
         try:
-            proc = launch(cmd, cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch, add_dirs=add_dirs,
-                          mcp_config=mcp_config)
+            proc = launch(activation.command(cmd), cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch,
+                          add_dirs=add_dirs, mcp_config=mcp_config)
         except subprocess.TimeoutExpired:
             return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
                           provider=provider)
@@ -808,21 +857,449 @@ def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str
             words = words[1:]
         if not words:
             continue
-        if Path(words[0]).name in SHELL_WORDS:
-            for i, option in enumerate(words[1:], 1):
-                if option == "--" or not option.startswith("-"):
-                    break
-                if option.startswith("--command="):
-                    if found := git_write(option.partition("=")[2], rules, depth + 1):
-                        return found
-                    break
-                if option == "--command" or (not option.startswith("--") and "c" in option[1:]):
-                    if i + 1 < len(words) and (found := git_write(words[i + 1], rules, depth + 1)):
-                        return found
-                    break
+        if Path(words[0]).name in SHELL_WORDS and (script := inline_shell(words[1:])) is not None:
+            if found := git_write(script, rules, depth + 1):
+                return found
         if denied := denied_git(words, rules):
             return denied
     return ""
+
+
+def inline_shell(args: list[str], *, skip_values: bool = False) -> str | None:
+    i = 0
+    while i < len(args):
+        option = args[i]
+        if skip_values and option in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            i += 2
+            continue
+        if option == "--" or not option.startswith("-"):
+            break
+        if option.startswith("--command="):
+            return option.partition("=")[2]
+        if option == "--command" or (not option.startswith("--") and "c" in option[1:]):
+            return args[i + 1] if i + 1 < len(args) else None
+        i += 1
+    return None
+
+
+def command_words(words: list[str]) -> list[str]:
+    while words:
+        head, *words = words
+        tool = Path(head).name
+        if tool not in WRAPPER_WORDS and tool != "timeout":
+            return [head, *words]
+        if tool == "command" and words[:1] in (["-v"], ["-V"]):
+            return []
+        takes_value = COMMAND_OPTIONS.get(tool, ())
+        while words and words[0].startswith("-") and words[0] != "-":
+            option, *words = words
+            if option == "--":
+                break
+            if tool == "env" and option in ("-S", "--split-string") and words:
+                words = shlex.split(words[0]) + words[1:]
+                break
+            if tool == "env" and option.startswith(("-S", "--split-string=")):
+                words = shlex.split(option[2:] if option.startswith("-S") else option.partition("=")[2]) + words
+                break
+            if option in takes_value:
+                words = words[1:]
+        if tool == "timeout":
+            words = words[1:]
+        if tool == "env":
+            while words and ASSIGNMENT.match(words[0]):
+                words = words[1:]
+    return []
+
+
+def sed_search(args: list[str], literal: bool = False) -> bool:
+    while args and args[0] in ("-n", "-E", "-r", "--quiet", "--silent", "--regexp-extended"):
+        args = args[1:]
+    while (literal and len(args) > 2 and args[0] in ("-e", "--expression", "-ne") and args[2] in ("-e", "--expression")
+           and (SED_SEARCH.fullmatch(args[1]) or SED_LITERAL_SEARCH.fullmatch(args[1]))):
+        args = args[2:]
+    if args[:1] in (["-e"], ["--expression"], ["--"]) or literal and args[:1] == ["-ne"]:
+        args = args[1:]
+    return bool(args and all(not arg.startswith("-") for arg in args[1:])
+                and (SED_SEARCH.fullmatch(args[0]) or literal and SED_LITERAL_SEARCH.fullmatch(args[0])))
+
+
+def denied_keychain(words: list[str], depth: int, shell: str, *, literal: bool = False) -> str:
+    if not words:
+        return ""
+    if depth > 12:
+        return "nested shell command"
+    tool, *args = words
+    program = Path(tool).name.casefold()
+    if program == "security":
+        while args and args[0] in ("-q", "-v"):
+            args = args[1:]
+        if args and args[0] in ("verify-cert", "find-certificate"):
+            return ""
+        return guard.reach("security keychain items")
+    if program in SHELL_WORDS and (script := inline_shell(args, skip_values=True)) is not None:
+        return keychain_refusal(script, depth + 1, shell=tool)
+    if tool == "eval":
+        return keychain_refusal(" ".join(args), depth + 1, shell=shell)
+    if program == "find":
+        for index, arg in enumerate(args[:-1]):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                if reason := denied_keychain(command_words(args[index + 1:]), depth + 1, shell):
+                    return reason
+    if program in SCRIPT_TOOLS and not (program == "sed" and sed_search(args, literal)):
+        if literal and program in ("awk", "gawk") and args[:1] == ["-e"]:
+            args = args[1:]
+        if literal and program in ("awk", "gawk") and args and AWK_SEARCH.fullmatch(args[0]) and all(
+                not arg.startswith("-") for arg in args[1:]):
+            return ""
+        if any(KEYCHAIN_COMMAND.search(word) for word in words):
+            return guard.reach("security keychain items")
+    return ""
+
+
+def ansi_c_escape(match: re.Match[bytes]) -> bytes:
+    code = match[1]
+    head = code[0]
+    if head in ANSI_C_SIMPLE:
+        return bytes([ANSI_C_SIMPLE[head]])
+    if head in b"01234567":
+        return bytes([int(code, 8) & 0xff])
+    if len(code) == 1:
+        return match[0]
+    if head == ord("c"):
+        return bytes([127 if code[1] == ord("?") else code[1] & 31])
+    number = int(code[1:], 16)
+    return bytes([number]) if head == ord("x") else chr(number).encode()
+
+
+def path_uses_system_sh(search_path: str) -> bool:
+    for directory in search_path.split(os.pathsep):
+        if not os.path.isabs(directory):
+            return False
+        if executable := shutil.which("sh", path=directory):
+            return executable == "/bin/sh"
+    return False
+
+
+def preserves_shell_lookup(words: list[str]) -> bool:
+    if words[0] == "printf":
+        return len(words) > 1 and DISPLAY_FORMAT.fullmatch(words[1]) is not None
+    if words[0] == "set":
+        return all(re.fullmatch(r"[-+][eufx]+", flag) for flag in words[1:]) or words[1:] == ["-o", "pipefail"]
+    return words[0] in (":", "cd", "echo", "true", "false", "pwd")
+
+
+class KeychainShell:
+    def __init__(self, source: str, *, shell: str = "bash"):
+        self.source = source
+        self.shell = shell if shell == "/bin/sh" and sys.platform == "darwin" else Path(shell).name.casefold()
+        self.pos = 0
+        self.refusal = ""
+
+    def char(self) -> str:
+        return self.source[self.pos:self.pos + 1]
+
+    def starts(self, text: str) -> bool:
+        return self.source.startswith(text, self.pos)
+
+    def escaped(self, special: str | None = None) -> str:
+        self.pos += 1
+        ch = self.char()
+        if not ch:
+            raise ValueError("trailing escape")
+        if special is not None and ch not in special:
+            return "\\"
+        self.pos += 1
+        return "" if ch == "\n" else ch
+
+    def expansion(self, depth: int) -> str:
+        start = self.pos
+        if self.char() == "`":
+            if not (match := BACKTICK.match(self.source, self.pos)):
+                raise ValueError("unclosed backtick")
+            self.pos = match.end()
+            script = re.sub(r"\\([$`\\])", r"\1", match[1])
+            self.refusal = self.refusal or keychain_refusal(script, depth + 1, shell=self.shell)
+        elif not self.scan_arithmetic(depth + 1, "$(("):
+            self.pos += 2
+            self.commands(depth + 1, closing=True)
+        return self.source[start:self.pos]
+
+    def scan_arithmetic(self, depth: int, opening: str) -> bool:
+        if not self.starts(opening):
+            return False
+        if depth > 12:
+            raise ValueError("nested shell command")
+        start, refusal = self.pos, self.refusal
+        self.pos += len(opening)
+        parens = 0
+        while ch := self.char():
+            if ch == "`" or self.starts("$("):
+                self.expansion(depth)
+            elif self.starts("$'"):
+                self.ansi_quoted()
+            elif ch in "'\"":
+                self.quoted(depth, False)
+            elif ch == "\\":
+                self.escaped()
+            elif ch == ")" and not parens:
+                if self.starts("))"):
+                    self.pos += 2
+                    return True
+                self.pos, self.refusal = start, refusal
+                return False
+            else:
+                if ch == "(":
+                    parens += 1
+                elif ch == ")":
+                    parens -= 1
+                self.pos += 1
+        raise ValueError("unclosed arithmetic expansion")
+
+    def skip_blanks(self) -> None:
+        while self.char() in (" ", "\t") or self.starts("\\\n"):
+            self.pos += 2 if self.char() == "\\" else 1
+
+    def take_literal_word(self, literal: str) -> bool:
+        start = self.pos
+        for ch in literal:
+            if self.char() != ch:
+                break
+            self.pos += 1
+            while self.starts("\\\n"):
+                self.escaped()
+        else:
+            if not (tail := self.char()) or tail in SHELL_WORD_BREAKS:
+                return True
+        self.pos = start
+        return False
+
+    def compound_timing_prefix(self) -> bool:
+        start = self.pos
+        self.skip_blanks()
+        if self.take_literal_word("-p"):
+            self.skip_blanks()
+        body = self.pos
+        if self.char() == "(" or any(self.take_literal_word(word) for word in (*SHELL_PREFIX, "for", "time")):
+            self.pos = body
+            return True
+        self.pos = start
+        return False
+
+    def scan_function_header(self) -> bool:
+        start = self.pos
+        self.skip_blanks()
+        if name := FUNCTION_NAME.match(self.source, self.pos):
+            self.pos = name.end()
+            self.skip_blanks()
+            if self.pos != name.end() and self.take_literal_word("{"):
+                return True
+        self.pos = start
+        return False
+
+    def scan_arithmetic_for(self, depth: int) -> bool:
+        self.skip_blanks()
+        if not self.starts("(("):
+            return False
+        if not self.scan_arithmetic(depth, "(("):
+            raise ValueError("unclosed arithmetic for header")
+        return True
+
+    def ansi_quoted(self) -> str:
+        if not (match := ANSI_C_QUOTE.match(self.source, self.pos)):
+            raise ValueError("unclosed ANSI-C quote")
+        self.pos = match.end()
+        value = ANSI_C_ESCAPE.sub(ansi_c_escape, match[1].encode(errors="surrogateescape"))
+        return value.partition(b"\0")[0].decode(errors="surrogateescape")
+
+    def quoted(self, depth: int, delimiter: bool) -> str:
+        quote = self.char()
+        self.pos += 1
+        start = self.pos
+        if quote == "'":
+            end = self.source.find(quote, start)
+            if end < 0:
+                raise ValueError("unclosed quote")
+            self.pos = end + 1
+            return self.source[start:end]
+        value = []
+        while (ch := self.char()) and ch != quote:
+            if ch == "\\":
+                value.append(self.escaped('$`"\\\n'))
+            elif not delimiter and (ch == "`" or self.starts("$(")):
+                value.append(self.expansion(depth))
+            else:
+                value.append(ch)
+                self.pos += 1
+        if not ch:
+            raise ValueError("unclosed quote")
+        self.pos += 1
+        return "".join(value)
+
+    def word(self, depth: int, *, delimiter: bool = False) -> str:
+        value = []
+        start = self.pos
+        while ch := self.char():
+            if not delimiter and (ch == "`" or self.starts("$(") or self.starts("<(") or self.starts(">(")):
+                value.append(self.expansion(depth))
+            elif self.starts("$'"):
+                value.append(self.ansi_quoted())
+            elif ch in "'\"":
+                value.append(self.quoted(depth, delimiter))
+            elif ch == "\\":
+                value.append(self.escaped())
+            elif ch in SHELL_WORD_BREAKS:
+                break
+            else:
+                value.append(ch)
+                self.pos += 1
+        if self.pos == start:
+            raise ValueError("expected shell word")
+        return "".join(value)
+
+    def line(self) -> str:
+        end = self.source.find("\n", self.pos)
+        if end < 0:
+            end = len(self.source)
+        text = self.source[self.pos:end]
+        self.pos = min(end + 1, len(self.source))
+        return text
+
+    def heredoc(self, delimiter: str, strip_tabs: bool, expand: bool) -> str:
+        lines = []
+        while self.char():
+            line = self.line()
+            while expand and (len(line) - len(line.rstrip("\\"))) % 2 and self.char():
+                line = line[:-1] + self.line()
+            if strip_tabs:
+                line = line.lstrip("\t")
+            if line == delimiter:
+                return "\n".join(lines)
+            lines.append(line)
+        raise ValueError("unclosed heredoc")
+
+    def inspect_heredocs(self, docs: list[tuple[str, bool, bool, list[list[str]]]], depth: int) -> None:
+        for delimiter, strip_tabs, expand, pipeline in docs:
+            body = self.heredoc(delimiter, strip_tabs, expand)
+            if expand:
+                scanner = KeychainShell(body, shell=self.shell)
+                while match := HEREDOC_EXPANSION.search(body, scanner.pos):
+                    scanner.pos = match.start()
+                    if scanner.char() == "\\":
+                        scanner.pos = match.end()
+                    else:
+                        scanner.expansion(depth)
+                self.refusal = self.refusal or scanner.refusal
+            for words in pipeline or [[]]:
+                program = Path(words[0]).name.casefold() if words else ""
+                if program in SHELL_WORDS or program in ("", ".", "source", "eval"):
+                    shell = words[0] if program in SHELL_WORDS else self.shell
+                    self.refusal = self.refusal or keychain_refusal(body, depth + 1, shell=shell)
+                elif program in SCRIPT_TOOLS and not (program == "sed" and sed_search(words[1:])):
+                    if KEYCHAIN_COMMAND.search(body):
+                        self.refusal = self.refusal or guard.reach("security keychain items")
+
+    def commands(self, depth: int, *, closing: bool = False, initial_path: str = "") -> None:
+        if depth > 12:
+            raise ValueError("nested shell command")
+        words: list[str] = []
+        pipeline: list[list[str]] = []
+        docs: list[tuple[str, bool, bool, list[list[str]]]] = []
+        needs_consumer = False
+        literal = True
+        arithmetic = self.shell in ("bash", "zsh", "/bin/sh")
+
+        def finish() -> None:
+            nonlocal needs_consumer, initial_path
+            if words:
+                command = command_words(words)
+                if command:
+                    if initial_path and words[0] == "sh" and path_uses_system_sh(initial_path):
+                        command[0] = "/bin/sh"
+                    pipeline.append(command)
+                if not preserves_shell_lookup(words):
+                    initial_path = ""
+                self.refusal = self.refusal or denied_keychain(command, depth, self.shell,
+                                                               literal=literal and command == words)
+                needs_consumer = False
+
+        while ch := self.char():
+            if ch in " \t" or self.starts("\\\n"):
+                self.skip_blanks()
+            elif ch == "#":
+                end = self.source.find("\n", self.pos)
+                self.pos = end if end >= 0 else len(self.source)
+            elif not (self.starts("<(") or self.starts(">(")) and (redirect := REDIRECT.match(self.source, self.pos)):
+                initial_path = ""
+                self.pos = redirect.end()
+                self.skip_blanks()
+                operation = redirect[0].lstrip("0123456789")
+                heredoc = operation in ("<<", "<<-")
+                start = self.pos
+                target = self.word(depth, delimiter=heredoc)
+                if heredoc:
+                    raw = self.source[start:self.pos].replace("\\\n", "")
+                    docs.append((target, operation == "<<-", raw == target, pipeline))
+            elif not words and arithmetic and self.scan_arithmetic(depth + 1, "(("):
+                initial_path = ""
+                pipeline.append([])
+                needs_consumer = False
+            elif ch in ";|&\n()":
+                finish()
+                words, literal = [], True
+                boolean = self.starts("||") or self.starts("&&")
+                self.pos += 2 if boolean or self.starts("|&") else 1
+                if ch == "|" and not boolean:
+                    needs_consumer = True
+                elif ch == "(":
+                    initial_path = ""
+                    self.commands(depth + 1, closing=True)
+                    pipeline.append([])
+                    needs_consumer = False
+                elif ch == ")" and closing:
+                    if docs:
+                        raise ValueError("unclosed heredoc")
+                    return
+                else:
+                    if ch == "\n":
+                        if docs and needs_consumer:
+                            pipeline.append([])
+                        self.inspect_heredocs(docs, depth)
+                        docs.clear()
+                    pipeline = []
+                    needs_consumer = False
+            else:
+                start = self.pos
+                word = self.word(depth)
+                raw = self.source[start:self.pos].replace("\\\n", "")
+                if not words and self.shell == "bash" and (
+                        raw == "time" and self.compound_timing_prefix() or
+                        raw == "function" and self.scan_function_header()):
+                    initial_path = ""
+                    continue
+                if not words and arithmetic and raw == "for" and self.scan_arithmetic_for(depth + 1):
+                    initial_path = ""
+                    pipeline.append([])
+                    needs_consumer = False
+                elif words or (raw not in SHELL_PREFIX and not ASSIGNMENT.match(raw)):
+                    literal = literal and LITERAL_SHELL_WORD.fullmatch(raw) is not None
+                    if not literal:
+                        initial_path = ""
+                    words.append(word)
+                else:
+                    initial_path = ""
+        if closing or docs:
+            raise ValueError("unclosed shell group or heredoc")
+        finish()
+
+
+def keychain_refusal(command: str, depth: int = 0, *, shell: str = "bash", path: str | None = None) -> str:
+    scanner = KeychainShell(command, shell=shell)
+    search_path = os.environ.get("PATH", "") if path is None else path
+    try:
+        scanner.commands(depth, initial_path=search_path if depth == 0 and sys.platform == "darwin" else "")
+    except ValueError:
+        return scanner.refusal or "unparsed shell command"
+    return scanner.refusal
 
 
 def denied_git(words: list[str], rules: list[str]) -> str:
@@ -871,6 +1348,8 @@ def guard_reason(payload: dict, judge: bool, rules: list[str], opened=()) -> str
                                   for p in PATCH_PATHS.findall(text))), "")
     if tool != "Bash" or not text.strip():
         return ""
+    if reason := keychain_refusal(text):
+        return reason
     if reason := guard.decide(payload, False, floor):
         return reason
     if re.search(r"(?:auth\.json|(?:\$CODEX_HOME|\$\{CODEX_HOME\}|~[/\\]\.codex))", text):
@@ -885,6 +1364,10 @@ def guard_main(judge: bool, rules: list[str], opened=()) -> int:
         reason = guard_reason(json.load(sys.stdin), judge, rules, opened)
     except Exception:
         return 0
+    return write_guard_decision(reason)
+
+
+def write_guard_decision(reason):
     if reason:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": reason}}))

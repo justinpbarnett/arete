@@ -5,9 +5,10 @@ import re
 import time
 
 from . import config, gh, issue_goal, merge_review, owner_asks, pilot, pipeline, principals, repairs, runlimits, slots
-from . import tasks, tracker, unblock, util
+from . import pr_recovery, tasks, tracker, unblock, util
 from .store import asks as asks_store
 from .store import db
+from .store import orchestration
 from .store import runs as runs_store
 from .store import tasks as tasks_store
 from .store import unblock as ledger
@@ -189,14 +190,47 @@ def land(repo, tid, case, attempt, candidate):
         cause, fresh = merge_review.assess(cfg, current, t, row, prs)
         if cause != "merge-review" or fresh != candidate:
             return
+        from . import release_proof
+
         hold = gh.pr_merge_auto(candidate["github"], gh.pr_number(candidate["url"]), candidate["head"],
                                 candidate["target"], candidate["base"], track_moved_base=True,
-                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)))
+                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)),
+                                **release_proof.pr_check_options(current, tid, candidate["github"], candidate["target"]))
         if hold:
             ledger.mark(case, "waiting", unblock.safe(hold), unblock.RECHECK)
         else:
+            if release_proof.required(repo.name, tid):
+                ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
+                return
             issue_goal.lifecycle(repo.name, tid, "finish")
             ledger.mark(case, "resolved", "The issue orchestrator merged the verified PR")
+
+
+def inspect_pr_recovery(cfg, repo, source, t, row, held) -> None:
+    if orchestration.publication_pending(row["id"]) or t.blocker or row.get("stop_asked"):
+        return
+    observed = unblock.pr_recovery_observation(repo, source, t, row, held)
+    changed = unblock.recovery_changed(held, observed)
+    binding = (unblock.snapshot(cfg, repo, source, t, row, recovery=observed) if changed
+               else {"run": row["id"], "pr_recovery": observed})
+    case = ledger.observe(repo.name, t.id, pr_recovery.REASON, unblock.digest(observed), binding)
+    if not changed:
+        detail = row.get("summary") or "The PR and retained work need reconciliation."
+        ledger.mark(case, "needs_owner", f"{detail} {unblock.HELD_REPLY_RETRY}", unblock.RECHECK)
+        return
+    if time.time() < case["due"]:
+        return
+    attempt = ledger.latest_attempt(case)
+    if not attempt:
+        attempt_id = ledger.begin(case)
+        ledger.decide(case, attempt_id, {"action": "retry", "reason": "The held PR, retained head or owner answer changed"},
+                      {"binding": binding})
+        attempt = ledger.latest_attempt(case)
+    if attempt.get("child") or attempt.get("grant", {}).get("binding") != binding:
+        return
+    result = tasks.launch_recovery(cfg, repo, row, attempt)
+    if result.get("state") in ("queued", "refused"):
+        ledger.mark(case, "queued", result["why"], unblock.RECHECK)
 
 
 def inspect(cfg, repo, tid, row, cycle, existing) -> None:
@@ -212,6 +246,14 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "Run stopped by request")
         return
+    from . import release_proof
+
+    if not t.open and release_proof.required(repo.name, tid):
+        release = release_proof.progress(repo, str(tid))
+        if not release or not release["completion"]:
+            if existing:
+                ledger.mark(existing, "waiting", "Tracker closed while protected delivery evidence is pending", unblock.RECHECK)
+            return
     if not t.open:
         if existing:
             issue_goal.lifecycle(repo.name, tid, "finish")
@@ -222,9 +264,18 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
             issue_goal.lifecycle(repo.name, tid, "cancel")
             ledger.mark(existing, "cancelled", "The ticket is no longer approved")
         return
+    if held := pr_recovery.blocked(row):
+        inspect_pr_recovery(cfg, repo, source, t, row, held)
+        return
     prior = existing or ledger.get(repo.name, tid)
     prs = unblock.prs_of(row)
     if all_merged(prs):
+        if release_proof.required(repo.name, tid):
+            release = release_proof.progress(repo, str(tid))
+            if not release or not release["completion"]:
+                case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
+                ledger.mark(case, "waiting", "Waiting for protected evidence at the delivery destination", unblock.RECHECK)
+                return
         if prior.get("phase") != "resolved":
             case = existing or ledger.observe(repo.name, tid, "goal", "monitor", {"run": row["id"]})
             issue_goal.lifecycle(repo.name, tid, "finish")
@@ -279,6 +330,8 @@ def inspect(cfg, repo, tid, row, cycle, existing) -> None:
                 ledger.mark(existing, "waiting", result["why"], unblock.RECHECK)
         return
     evidence = unblock.evidence_for(t, row, saved, asks, prs, cycle)
+    if cause == "budget" and "poll_readmission" in binding:
+        evidence["poll_readmission"] = binding["poll_readmission"]
     if candidate:
         evidence["merge_candidate"] = candidate
     elif cause == "merge-verification":

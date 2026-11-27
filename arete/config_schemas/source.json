@@ -1,7 +1,8 @@
 {
   "type": "object",
   "properties": {
-    "type": {"type": "string", "enum": ["github", "jira", "log", "command"]},
+    "type": {"type": "string", "enum": ["github", "jira", "log", "command", "closed-specs"]},
+    "tracker": {"type": "string", "enum": ["github", "jira"]},
     "name": {"type": "string"},
     "every": {"type": ["string", "number"]},
     "repos": {"$ref": "#/$defs/names"},

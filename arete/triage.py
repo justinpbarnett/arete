@@ -14,6 +14,7 @@ from typing import ClassVar
 from . import (
     alerts,
     config,
+    factory_control,
     gh,
     intake,
     jev,
@@ -37,8 +38,9 @@ from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
-SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
-AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
+SKIP_LABELS = {tracker.LABEL, tracker.SPEC_LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
+HOLD_LABELS = {"no-agent", "agent:hold"}
+AUTO_SKIP_LABELS = {*HOLD_LABELS, "duplicate", "invalid", "wontfix",
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
 PER_SOURCE = 50
@@ -103,6 +105,7 @@ class Candidate:
     updated: str
     in_sprint: bool | None = None
     parent: str = ""
+    on_hold: bool = False
 
 
 @dataclass
@@ -183,9 +186,10 @@ class JiraSource(Source):
         out = []
         for i in client.search(f"{mine} ORDER BY updated DESC", SEARCH_FIELDS, limit=PER_SOURCE):
             f = i.get("fields") or {}
-            if tracker.LABEL not in (f.get("labels") or []):
+            if not {tracker.LABEL, tracker.SPEC_LABEL}.intersection(f.get("labels") or []):
                 out.append(Candidate(i["key"], i["key"], (f.get("summary") or "").strip(), client.browse_url(i["key"]),
-                                     f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or ""))
+                                     f.get("updated") or "", parent=(f.get("parent") or {}).get("key") or "",
+                                     on_hold=not HOLD_LABELS.isdisjoint(f.get("labels") or [])))
         if self.jira_cfg.sprint_only:
             scoped = {i["key"] for i in client.search(f"{mine} AND ({SPRINT_JQL}) ORDER BY updated DESC", ["updated"],
                                                       limit=PER_SOURCE)}
@@ -196,6 +200,8 @@ class JiraSource(Source):
     def ticket(self, c: Candidate) -> TicketText:
         client = self.client
         f = client.issue(c.id, JIRA_FIELDS).get("fields") or {}
+        if tracker.SPEC_LABEL in (f.get("labels") or []):
+            raise tracker.TaskError("specs require explicit tracker approval")
         facts = [f"Type: {(f.get('issuetype') or {}).get('name', '')}",
                  f"Status: {(f.get('status') or {}).get('name', '')}",
                  f"Labels: {', '.join(f.get('labels') or []) or 'none'}"]
@@ -264,7 +270,7 @@ class GitHubSource(Source):
             if names & SKIP_LABELS or not tk.by_owner(i):
                 continue
             out.append(Candidate(f"{tk.repo.name}#{i['number']}", str(i["number"]), i["title"].strip(),
-                                 i.get("url", ""), i.get("updatedAt") or ""))
+                                 i.get("url", ""), i.get("updatedAt") or "", on_hold=bool(names & HOLD_LABELS)))
         return out
 
     def ticket(self, c: Candidate) -> TicketText:
@@ -277,6 +283,8 @@ class GitHubSource(Source):
         labels = tuple(lb["name"] for lb in issue.get("labels", []))
         if tracker.ZTE_LABEL in labels:
             raise tracker.TaskError(tracker.ZTE_QUEUE)
+        if tracker.SPEC_LABEL in labels:
+            raise tracker.TaskError("specs require explicit tracker approval")
         comments = [(tk.owner, cm.get("createdAt", ""), cm.get("body", ""))
                     for cm in issue.get("comments", []) if tk.by_owner(cm)]
         return TicketText(f"Labels: {', '.join(labels) or 'none'}", (issue.get("body") or "").strip(),
@@ -549,6 +557,7 @@ def preview_refresh(cfg, srcs, read, old, todo):
           "fresh labels, issue versions and required screens still decide admission")
 
 
+@factory_control.work
 def refresh(cfg: config.Config, dry_run: bool) -> int:
     old = {r["ref"]: r for r in triage_store.triage_rows()}
     meta = util.read_json(META_FILE, {})
@@ -569,7 +578,11 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     prune_records()
     triaged.waiting += [r["ref"] for r in old.values() if r["source"] not in read
                         and (changed_policy or r["ref"] in retry)]
-    meta.update(refreshed=util.iso(), policy=policy, errors=errors, waiting=triaged.waiting,
+    previous_holds = meta.get("label_holds", {})
+    label_holds = {src.name: previous_holds.get(src.name, []) for src in srcs}
+    for source, candidates in read.items():
+        label_holds[source] = [c.ref for c in candidates if c.on_hold]
+    meta.update(refreshed=util.iso(), policy=policy, errors=errors, label_holds=label_holds, waiting=triaged.waiting,
                 failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
@@ -698,6 +711,7 @@ def answers_comment(pairs: list[tuple[str, str]]) -> str:
     return f"{prompt_loader.TRIAGE_ANSWERS}:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
 
 
+@factory_control.work
 def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str,
          *, publication=None) -> str:
     with util.lock(BOARD_LOCK, wait=True):
@@ -755,6 +769,8 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
         sent_row = {**r, "repo": repo.name, "route": src.route(repo.name)}
         now = read_send_ticket(src, r)
         require_send_revision(now, r)
+        if not HOLD_LABELS.isdisjoint(now.labels):
+            raise NotSendable(f"{ref} has a hold label. Release it on the tracker before sending.")
         screen_send(cfg, r, repo, sent_row, now)
         pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
         comment = answers_comment(pairs) if pairs else ""
@@ -1193,6 +1209,7 @@ class BoardRefused(Exception):
     pass
 
 
+@factory_control.work
 def publish(cfg: config.Config, v: dict, meta: dict) -> str:
     repo = cfg.alert_repo
     if not repo:

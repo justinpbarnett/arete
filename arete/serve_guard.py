@@ -1,12 +1,15 @@
 import fcntl
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from contextlib import closing
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +40,8 @@ class Receipt:
     settled: str = ""
     rollback: str = ""
     started_at: float | None = None
+    release_checks: list = field(default_factory=list)
+    restore_status: str = ""
 
     def expired(self) -> bool:
         return bool(self.starts and time.time() - (
@@ -72,30 +77,45 @@ def flush_directory(folder: Path) -> None:
         os.close(fd)
 
 
-def pending(state: Path, checkout: Path) -> Receipt | None:
+def current(state: Path, checkout: Path) -> Receipt | None:
     data = read(state / RECEIPT)
-    if data is None:
+    if data is None or data.get("checkout") != str(checkout):
         return None
     receipt = Receipt(**{field.name: data[field.name] for field in fields(Receipt) if field.name in data})
-    if receipt.checkout != str(checkout) or receipt.healthy or receipt.settled:
-        return None
     if not all(SHA.fullmatch(sha) for sha in (receipt.previous, receipt.tip)):
         raise ValueError("deploy receipt needs full commit IDs")
     return receipt
+
+
+def pending(state: Path, checkout: Path) -> Receipt | None:
+    receipt = current(state, checkout)
+    return receipt if receipt and not receipt.healthy and not receipt.settled else None
+
+
+def original(state: Path, receipt: Receipt) -> dict:
+    data = read(state / RECEIPT) or {}
+    identity = ("checkout", "branch", "previous", "tip", "github", "created_at")
+    if not all(data.get(key) == getattr(receipt, key) for key in identity):
+        raise ValueError("the deployment changed before the receipt update")
+    return data
 
 
 def hold_path(state: Path, tip: str) -> Path:
     return state / HOLDS / f"{tip}.json"
 
 
-def git(checkout: Path, *args: str) -> str:
+def git_bytes(checkout: Path, *args: str) -> bytes:
     ran = subprocess.run(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                           "-c", "core.fsmonitor=false", *args], cwd=checkout, stdin=subprocess.DEVNULL,
-                         capture_output=True, text=True, errors="replace", timeout=30,
+                         capture_output=True, timeout=30,
                          env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
     if ran.returncode:
-        raise RuntimeError(f"git {args[0]}: {ran.stderr[:300].strip()}")
-    return ran.stdout.strip()
+        raise RuntimeError(f"git {args[0]}: {ran.stderr[:300].decode(errors='replace').strip()}")
+    return ran.stdout
+
+
+def git(checkout: Path, *args: str) -> str:
+    return git_bytes(checkout, *args).decode(errors="replace").strip()
 
 
 def log_tail(logs: Path) -> str:
@@ -113,7 +133,8 @@ def log_tail(logs: Path) -> str:
 def report_reason(held: dict) -> str:
     reason = held.get("reason", "")
     if isinstance(reason, str) and (
-            reason in ("the candidate failed the import check", "the candidate failed the migration check", AGE_FAILURE)
+            reason in ("the candidate failed the import check", "the candidate failed the migration check", AGE_FAILURE,
+                        "the protected release check failed")
             or re.fullmatch(r"[0-9]{1,6} unhealthy starts", reason)):
         return reason
     return "startup health was not confirmed"
@@ -124,8 +145,41 @@ def at_tip(checkout: Path, receipt: Receipt) -> bool:
     return head == [receipt.tip, f"refs/heads/{receipt.branch}"]
 
 
+def rollback_schema_refusal(state: Path, checkout: Path, previous: str) -> str:
+    db = state / "arete.db"
+    try:
+        if not db.stat().st_size:
+            return ""
+        with closing(sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < 28:
+                return ""
+            contracts = list(conn.execute("SELECT name, sha256 FROM schema_migrations WHERE n >= 28 "
+                                          "AND phase = 'contract'"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, sqlite3.Error, ValueError) as e:
+        return f"could not verify the database schema ({e})"
+    if not contracts:
+        return "the database contract ledger is missing"
+    return unsupported_contract(checkout, previous, contracts)
+
+
+def unsupported_contract(checkout: Path, previous: str, contracts) -> str:
+    for name, digest in contracts:
+        try:
+            body = git_bytes(checkout, "show", f"{previous}:arete/store/migrations/{name}")
+        except (RuntimeError, subprocess.SubprocessError):
+            body = b""
+        if hashlib.sha256(body).hexdigest() != digest:
+            return f"the previous code cannot open a database with {name} applied"
+    return ""
+
+
 def rollback(state: Path, checkout: Path, logs: Path, receipt: Receipt, reason: str) -> bool:
     if not at_tip(checkout, receipt):
+        return False
+    if refused := rollback_schema_refusal(state, checkout, receipt.previous):
+        print(f"deploy: code-only rollback refused because {refused}", flush=True)
         return False
     if git(checkout, "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=untracked"):
         raise RuntimeError("deploy rollback refused because the checkout has tracked changes")
@@ -134,12 +188,13 @@ def rollback(state: Path, checkout: Path, logs: Path, receipt: Receipt, reason: 
     if git(checkout, "merge-base", receipt.previous, receipt.tip) != receipt.previous:
         raise RuntimeError("deploy rollback refused because the previous commit is not an ancestor")
     hold = hold_path(state, receipt.tip)
+    data = original(state, receipt)
     if not hold.exists():
-        write(hold, {**asdict(receipt), "reason": reason, "log_tail": log_tail(logs)})
+        write(hold, {**data, "reason": reason, "log_tail": log_tail(logs)})
     git(checkout, "reset", "--keep", receipt.previous)
     print(f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
           f"deploy: rolled back to {receipt.previous} because {reason}", flush=True)
-    write(state / RECEIPT, asdict(replace(receipt, settled="rolled_back", rollback="code_only")))
+    write(state / RECEIPT, {**data, "settled": "rolled_back", "rollback": "code_only"})
     return True
 
 
@@ -159,8 +214,7 @@ def record_start(state: Path, receipt: Receipt, at: float) -> None:
     started_at = receipt.started_at
     if started_at is None:
         started_at = receipt.created_at if receipt.starts else at
-    receipt = replace(receipt, starts=receipt.starts + 1, started_at=started_at)
-    write(state / RECEIPT, asdict(receipt))
+    write(state / RECEIPT, {**original(state, receipt), "starts": receipt.starts + 1, "started_at": started_at})
 
 
 def count_start(state: Path, checkout: Path, logs: Path) -> bool:

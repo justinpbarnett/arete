@@ -254,6 +254,9 @@ def start_try(name: str) -> dict:
 
 
 def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:
+    from .store import factory as factory_state
+
+    factory_state.admit()
     cfg = config.load()
     loop = control.find_loop(name, cfg)
     if events is None:

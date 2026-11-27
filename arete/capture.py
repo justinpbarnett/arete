@@ -954,6 +954,11 @@ def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> Non
 
 
 def submit(body: dict) -> dict:
+    from .store import factory as factory_state
+
+    from . import factory_control
+
+    version = factory_state.admit()
     revision = body.get("revision") if isinstance(body, dict) else None
     if type(revision) is not int:
         raise Refused("Send the draft's revision as a whole number.")
@@ -985,7 +990,16 @@ def submit(body: dict) -> dict:
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
             working.add(draft_id)
             resumed = False
-        threading.Thread(target=work, args=(draft_id, revision, cfg, resumed), daemon=True).start()
+        def file_draft():
+            try:
+                with factory_control.activity("capture", version):
+                    work(draft_id, revision, cfg, resumed)
+            except factory_state.Off:
+                insights_store.capture_end_checks(draft_id, INTERRUPTED)
+                with SUBMITTING:
+                    working.discard(draft_id)
+
+        threading.Thread(target=file_draft, daemon=True).start()
     return view()
 
 

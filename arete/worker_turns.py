@@ -165,6 +165,8 @@ class WorkerTurns:
 
     def settle_candidate(self, w):
         wid, data = w["id"], w["data"]
+        if w["phase"] == "candidate" and not self.candidate_scope(w):
+            return
         with util.lock("builder-integration-" + ledger.digest(str(self.job.ws.resolve()))[:24], wait=True) as held:
             if not held:
                 raise ValueError("cannot acquire delivery integration lease")
@@ -201,7 +203,8 @@ class WorkerTurns:
     def worker_summaries(self):
         ws = exchange.workers(self.lease)
         self.job.build_summary = self.job.b.build_summary = "\n\n".join(
-            f"{wid}: {w['data']['summary']}" for wid, w in ws.items() if w["phase"] == "integrated")
+            f"{wid}: {w['data']['summary']}" for wid, w in ws.items()
+            if w["phase"] == "integrated" and wid not in self.data.get("superseded_actions", ()))
 
     def settle_turn(self, worker, message):
         result = {**message, "effective": worker.effective, "writing": worker.writing}

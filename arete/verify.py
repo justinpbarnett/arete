@@ -64,9 +64,40 @@ SCHEMA = {
         }},
         "unmeasured_requirements": {"type": "array", "items": {"type": "string"}},
         "blocked_by": {"type": "string"},
+        "missing_capability": {"type": "string"},
+        "missing_tools": {"type": "array", "items": {"type": "string"}},
+        "advisory_gaps": {"type": "array", "items": {"type": "string"}},
+        "pending_delivery": {"type": "string"},
     },
     "required": ["verdict", "summary", "checks"],
 }
+
+
+def candidate_schema(token):
+    if not token:
+        return SCHEMA
+    candidate = {"type": "object", "additionalProperties": False,
+                 "properties": {"candidate_requirement": {"type": "string"}, "reason": {"type": "string"}},
+                 "required": ["candidate_requirement", "reason"]}
+    receipt = {"type": "object", "additionalProperties": False,
+               "properties": {"pending_delivery": {"type": "string", "enum": [token]}}, "required": ["pending_delivery"]}
+    return {**SCHEMA, "required": [*SCHEMA["required"], "pending_delivery", "unmeasured_requirements"],
+            "properties": {**SCHEMA["properties"], "pending_delivery": {"type": "string", "enum": [token]},
+                           "unmeasured_requirements": {"type": "array", "items": {"anyOf": [candidate, receipt]}}}}
+
+
+def candidate_gaps(rows, token):
+    if not isinstance(rows, list):
+        raise ValueError("The verifier must classify its outstanding candidate requirements.")
+    gaps = []
+    for row in rows:
+        if row == {"pending_delivery": token}:
+            continue
+        if (not isinstance(row, dict) or set(row) != {"candidate_requirement", "reason"}
+                or not all(isinstance(v, str) and v.strip() for v in row.values())):
+            raise ValueError("A verification gap needs a candidate requirement and reason, or the exact pending delivery identifier.")
+        gaps.append(row["candidate_requirement"].strip())
+    return gaps
 
 
 class ServerError(RuntimeError):
@@ -189,8 +220,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
         if is_driver:
             saw = saw[:MAX_SAW_CHARS]
         check = {"what": name, "how": public(command), "saw": saw, "passed": passed}
-        if is_driver:
-            check["driver"] = True
+        check["driver" if is_driver else "probe"] = True
         if not passed:
             check["cause"] = cause
         checks.append(check)
@@ -323,8 +353,12 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
             lifetime["stopped"] = False
         try:
             wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+            if lifetime is not None:
+                lifetime["process"] = proc
             yield reach
         finally:
+            if lifetime is not None:
+                lifetime.pop("process", None)
             util.stop_group(proc)
             pump.join(util.GROUP_STOP_SECONDS)
             if lifetime is not None:
@@ -471,15 +505,43 @@ class Verified:
     unmeasured_requirements: list[str] = field(default_factory=list)
     observed_trees: dict[str, str] = field(default_factory=dict)
     repair_observations: dict[str, str] = field(default_factory=dict)
+    missing_capability: str = ""
+    missing_tools: list[str] = field(default_factory=list)
+    advisory_gaps: list[str] = field(default_factory=list)
+    nonblocking_reason: str = ""
+    nonblocking_trees: dict[str, str] = field(default_factory=dict)
+    pending_delivery: str = ""
+    delivery_obligation: dict = field(default_factory=dict)
+    invalid_candidate_report: bool = False
 
     @classmethod
-    def from_agent(cls, found: dict) -> Verified:
+    def from_agent(cls, found: dict, *, delivery_token="") -> Verified:
         said = found.get("verdict")
-        checks = [{k: v for k, v in c.items() if k != "driver"} for c in found.get("checks", []) if isinstance(c, dict)]
+        checks = [{k: v for k, v in c.items() if k not in ("driver", "probe", "evidence_file")} for c in found.get("checks", []) if isinstance(c, dict)]
         names = found.get("unmeasured_requirements")
         unmeasured = [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
+        if delivery_token:
+            try:
+                unmeasured = candidate_gaps(names, delivery_token)
+            except ValueError as error:
+                if isinstance(names, list):
+                    unmeasured.extend(row["candidate_requirement"] for row in names if isinstance(row, dict)
+                                      and isinstance(row.get("candidate_requirement"), str) and row["candidate_requirement"].strip())
+                return cls("blocked", "The verifier returned an incomplete candidate report.", checks,
+                           blocked_by=str(error), finished=False, unmeasured_requirements=unmeasured,
+                           invalid_candidate_report=True)
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
                 checks, found.get("blocked_by", "").strip(), unmeasured_requirements=unmeasured)
+        if isinstance(found.get("pending_delivery"), str):
+            v.pending_delivery = found["pending_delivery"]
+        capability = found.get("missing_capability")
+        v.missing_capability = capability.strip()[:2000] if isinstance(capability, str) else ""
+        for key in ("missing_tools", "advisory_gaps"):
+            values = found.get(key)
+            if isinstance(values, list):
+                setattr(v, key, [one_line(item)[:2000] for item in values[:64] if isinstance(item, str) and item.strip()])
+        if any(c.get("passed") is False and c.get("cause") == "change" for c in checks):
+            v.verdict = "fail"
         if v.verdict not in VERDICTS:
             v.verdict = "blocked"
             v.blocked_by = v.blocked_by or f"the verifier's verdict {json.dumps(said)} is not pass, fail or blocked"
@@ -526,6 +588,8 @@ class Verified:
                  "evidence": self.evidence_of(c)} for c in self.checks]
 
     def evidence_of(self, check: dict) -> str:
+        if original := check.get("evidence_file"):
+            return original
         shot = Path(str(check.get("screenshot") or "")).name
         if self.saved and shot and evidence_bytes(Path(self.saved).parent / "evidence", shot, 0) is not None:
             return os.path.abspath(Path(self.saved).parent / "evidence" / shot)
@@ -535,6 +599,8 @@ class Verified:
         if self.verdict == "unverified":
             return self.summary
         lines = [f"**{self.verdict}**: {self.summary}"]
+        if self.nonblocking_reason:
+            lines.append(f"\nThe orchestrator marked the advisory verification gap nonblocking. {self.nonblocking_reason}")
         if self.blocked_by:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()

@@ -31,6 +31,7 @@ from .store import approvals as approvals_store
 from .store import asks as asks_store
 from .store import db as foundation
 from .store import devices as devices_store
+from .store import gate_metrics
 from .store import incidents as incident_store
 from .store import insights as insights_store
 from .store import loops as loop_store
@@ -182,28 +183,32 @@ def triage_board() -> dict:
     v = triage.view(connect=foundation.reader)
     srcs = {s.name: s for s in triage.sources(config.load_or_problem()[0])}
     meta = util.read_json(triage.META_FILE, {})
+    holds = meta.get("label_holds", {})
     running = loops_running()
     return {
         "refreshing": "triage" in running, "researching": "research" in running,
         "refreshed": meta.get("refreshed", ""), "posted": meta.get("posted", ""), "errors": meta.get("errors", []),
         "approved": meta.get("approved", []), "held": meta.get("held", {}),
         "summary": triage.summary(v),
-        "groups": [{"standing": name, "rows": [triage_entry(r, v, name, srcs) for r in members]}
+        "groups": [{"standing": name, "rows": [triage_entry(r, v, name, srcs, holds) for r in members]}
                    for name, members in triage.groups(v).items()],
     }
 
 
-def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageSource]) -> dict:
+def triage_entry(r: dict, v: dict, standing: str, srcs: dict[str, triage.TriageSource], label_holds: dict) -> dict:
     own = v["research"].get(r["ref"]) if standing == triage.RESEARCH_WORK else None
     report = v["research"].get(own["answered_by"]) if own and own.get("answered_by") else own
     verdict = (triage.sent_note(r, False) if standing == triage.SENT
                else triage.research_progress(r, own) if standing == triage.RESEARCH_WORK else triage.verdict(r))
+    on_hold = r["ref"] in label_holds.get(r.get("source"), ())
+    if on_hold and standing in triage.SENDABLE:
+        verdict = "Held on the tracker. Release the hold label there to send this ticket."
     return {"ref": r["ref"], "repo": r["repo"] or "", "title": r["title"] or "", "url": r["url"] or "",
             "kind": r["kind"] or "", "size": r["size"] or "", "verdict": verdict,
             "prs": " ".join(triage.sent_prs(r)) if standing == triage.SENT else (report or {}).get("filed_url") or "",
             "questions": r.get("questions") or [], "assumptions": r["assumptions"] or [], "checks": r.get("checks") or [], "plan": r["plan"] or [],
             "summary": report["summary"] if report else "", "report": report["report"] if report else "",
-            "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE else None,
+            "send": send_form(r, srcs.get(r.get("source", ""))) if standing in triage.SENDABLE and not on_hold else None,
             "research": triage.research_offer(r, own) if standing == triage.RESEARCH_WORK else None}
 
 
@@ -276,7 +281,8 @@ def needs_you_count(asks: dict) -> int:
 
 def ready_in_one_click(v: dict) -> list[dict]:
     srcs = {s.name: s for s in triage.sources(config.load_or_problem()[0])}
-    ready = [triage_entry(r, v, triage.READY, srcs) for r in triage.groups(v)[triage.READY] if not r.get("closed")]
+    holds = util.read_json(triage.META_FILE, {}).get("label_holds", {})
+    ready = [triage_entry(r, v, triage.READY, srcs, holds) for r in triage.groups(v)[triage.READY] if not r.get("closed")]
     return [r for r in ready if r["send"] and not r["send"]["pick"]]
 
 
@@ -439,7 +445,8 @@ def find() -> dict:
 
 def outcomes() -> dict:
     figures = trend_figures()
-    return {**figures, "decisions": decisions(figures["since"])}
+    return {**figures, "decisions": decisions(figures["since"]),
+            "check_verification": gate_metrics.check_verification(figures["since"])}
 
 
 def decisions(since: str) -> dict:

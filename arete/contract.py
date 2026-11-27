@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 5
+MINOR = 9
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -44,6 +44,9 @@ RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
 RUN["properties"]["version"] = INTEGER
+FACTORY_STATE = obj({"enabled": BOOLEAN, "phase": STRING, "version": INTEGER, "actor": STRING, "changed": STRING,
+                     "unconfirmed": INTEGER, "paused": INTEGER, "targets": array(obj(dict.fromkeys(
+                         ("id", "phase", "reason", "successor"), STRING)))})
 NULL_TEXT = {"type": ["string", "null"]}
 LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
             "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
@@ -106,6 +109,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("method_not_allowed", 405, "The route does not accept this method."),
     ("conflict", 409, "The request conflicts with current state."),
     ("invalid_state", 409, "The task cannot be closed from its current state."),
+    ("factory_off", 409, "The factory has stopped admitting work."),
+    ("factory_version_conflict", 409, "Read the current factory setting before retrying."),
     ("task_version_conflict", 409, "The task was updated since the requested base version."),
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
@@ -118,6 +123,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("headers_too_large", 431, "A request takes at most 100 headers."),
     ("internal_error", 500, "The server could not complete the request."),
     ("not_implemented", 501, "The server does not implement this method."),
+    ("secret_store_missing", 501, "This instance has no secret store configured."),
+    ("secret_internal", 409, "This secret is managed by its owning service."),
     ("upstream_failed", 502, "The target could not complete the request."),
     ("draining", 503, "Serve is loading new code. Try again after Retry-After."),
     ("unsupported_http_version", 505, "Use HTTP/1.0 or HTTP/1.1."),
@@ -138,8 +145,8 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
-    optional_errors = {"invalid_state", "task_version_conflict"}
-    if noun not in ("token", "pairing", "principal") and name != "session.end":
+    optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict", "secret_store_missing", "secret_internal"}
+    if noun not in ("token", "pairing", "principal", "secret") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -163,7 +170,7 @@ def sample(schema):
 for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
-                "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
+                "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
@@ -194,7 +201,8 @@ ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema":
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
                  "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
-                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER},
+                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER,
+                 "body_media": STRING},
                 ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
              "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
@@ -208,9 +216,22 @@ TOKEN_ISSUE = obj({"label": STRING, "scopes": array(STRING), "profile": {**STRIN
                    "expires": STRING, "commands": array(STRING), "spend_cap_usd": {**NUMBER, "minimum": 0}},
                   ["label", "scopes"])
 TOKEN_ISSUED = envelope({"token": TOKEN, "text": STRING})
+COHORT_REPORT = obj({"cohort": mapping(JSON), "observed": STRING, "arrivals": INTEGER, "goals": INTEGER,
+                     "outcomes": mapping(mapping(INTEGER)), "members": array(mapping(JSON)),
+                     "intake_complete": BOOLEAN,
+                     "pending_overdue": {**INTEGER, "minimum": 0,
+                                         "description": "Number of pending members with a deadline before the report observation time."}},
+                    ["cohort", "observed", "arrivals", "goals", "outcomes", "members", "intake_complete"],
+                    additional=JSON)
 OPERATIONS = [operation("meta.get", "meta", META),
+              operation("factory.get", "factory/state", envelope({"factory": FACTORY_STATE})),
+              operation("factory.set", "factory/state", envelope({"factory": FACTORY_STATE}),
+                        obj({"enabled": BOOLEAN, "base_version": {**INTEGER, "minimum": 1}}),
+                        {"enabled": True, "base_version": 1}, "POST", errors=("factory_version_conflict",)),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
+              operation("cohort.get", "cohorts/{name}", envelope({"report": COHORT_REPORT}),
+                        obj({"name": STRING}), {"name": "example"}),
               operation("error.list", "errors", envelope({"errors": array(ERROR)})),
               operation("screen.get", "screen", envelope({"sidebar": SIDEBAR, "asks": obj({"asks": array(ASK)}),
                         "view": mapping(JSON)}), obj({"view": STRING, "id": STRING}, []))]
@@ -230,7 +251,31 @@ CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkind
 CONFIG_ID = {"kind": CONFIG_KIND, "name": CONFIG_NAME}
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
 CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
+SECRET = obj({**dict.fromkeys(("subject", "name", "scope", "reference_kind"), STRING),
+              **dict.fromkeys(("service", "fingerprint", "last_checked", "rotated"), NULL_TEXT),
+              "present": BOOLEAN, "expose": BOOLEAN, "uses": array(STRING),
+              "check_ok": {"type": ["boolean", "null"]}})
+SECRET_HISTORY = obj({"id": INTEGER, "event": STRING, "actor": STRING, "ok": BOOLEAN,
+                      "fingerprint_after": NULL_TEXT, "at": STRING})
+SECRET_TARGET = obj({"scope": STRING, "name": STRING})
+SECRET_EXAMPLE = {"scope": "global", "name": "DEMO_KEY"}
+ACCOUNT = obj({**dict.fromkeys(("id", "service", "mode", "usage", "holder"), STRING), "secret_name": NULL_TEXT})
+
+
+def secret_operation(action, suffix, result, method="GET", internal=False):
+    errors = ("secret_store_missing", "secret_internal") if internal else ("secret_store_missing",)
+    return operation(f"secret.{action}", "secrets/{scope}/{name}" + suffix, envelope({"secret": SECRET, **result}),
+                     SECRET_TARGET, SECRET_EXAMPLE, method, errors=errors)
+
+
 OPERATIONS += [
+    operation("secret.list", "secrets", envelope({"secrets": array(SECRET)}), errors=("secret_store_missing",)),
+    secret_operation("get", "", {}),
+    secret_operation("history", "/history", {"history": array(SECRET_HISTORY)}),
+    {**secret_operation("set", "/value", {}, "PUT", internal=True), "body_media": "text/plain"},
+    secret_operation("remove", "", {}, "DELETE", internal=True),
+    {**secret_operation("check", "/check", {}, "POST", internal=True), "scope": "config:activate"},
+    operation("account.list", "accounts", envelope({"accounts": array(ACCOUNT)})),
     operation("config.list", "config/{kind}", envelope({"items": array(obj(CONFIG_ITEM))}),
               obj({"kind": CONFIG_KIND}), {"kind": "step_settings"}),
     operation("config.read", "config/{kind}/{name}",

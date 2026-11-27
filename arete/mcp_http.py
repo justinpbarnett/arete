@@ -13,7 +13,7 @@ REMOTE = frozenset("""
     comment.create run.list run.get run.stop run.steer turn.list event.page intake.add outbox.list outbox.get
 """.split())
 FLOOR_PREFIXES = ("secret.", "token.", "principal.", "pairing.", "push.", "export.")
-FLOOR_OPERATIONS = {"session.end", "webhook.rotate", "serve.install"}
+FLOOR_OPERATIONS = {"session.end", "webhook.rotate", "serve.install", "account.list"}
 TARGET_DEPENDENT_FLOORS = {"inbox.resolve", "outbox.approve", "config.activate"}
 CALL_RATES = api_http.RateLimits(command_limit=(2, 10))
 SIMPLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
