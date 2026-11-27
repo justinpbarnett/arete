@@ -1,10 +1,11 @@
 "use strict";
 
-function drawLive(d) {
+function drawLive(d, renderProgress) {
   fill("live-body",
     heading(1, "Running now"),
     panelParts(d.live, "The live runs", runningParts),
     panelParts(d.waiting, "The review feedback", upNextParts),
+    renderProgress ? panelParts(d.ticket_progress, "Ticket progress", (rows) => ticketStatusParts(rows, renderProgress)) : null,
     heading(2, "Needs you"),
     needsParts(d.needs_you),
     saidLine("needs"));
@@ -34,6 +35,13 @@ function upNextParts(waiting) {
       waiting.tickets.map((w) => el("tr", {}, cell(w.ticket), cell(w.comments, "num"),
         cell(w.at_once ? `review submitted ${clock(w.submitted)}` : `last comment ${clock(w.last)}`))), { stack: true }),
   ];
+}
+
+function ticketStatusParts(rows, renderProgress) {
+  if (!rows.length) return null;
+  return [heading(2, "Ticket progress"), ...rows.map((row) => el("section", {},
+    el("h3", {}, row.run ? rowLink("run", row.run, row.ticket) : row.url ? link(row.url, row.ticket) : row.ticket),
+    renderProgress(row)))];
 }
 
 function stopLiveRun(run, btn) {

@@ -1065,7 +1065,7 @@ def get_sidebar(handler, rest, query):
 
 
 def get_live(handler, rest, query):
-    return board.live_board(chat.pulse()["draft"])
+    return board.live_board(chat.pulse()["draft"], include_ticket_progress=handler is None)
 
 
 def get_runs(handler, rest, query):
@@ -1073,7 +1073,8 @@ def get_runs(handler, rest, query):
 
 
 def get_run(handler, rest, query):
-    return board.run_board(unquote(rest), messages_after=whole_number(query.get("messages_after", "0")))
+    return board.run_board(unquote(rest), messages_after=whole_number(query.get("messages_after", "0")),
+                           include_ticket_progress=handler is None)
 
 
 def get_tasks(handler, rest, query):
