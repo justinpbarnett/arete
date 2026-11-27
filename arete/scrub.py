@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
-from . import paths, util, vault
+from . import config, paths, secret_move, secretstore, util, vault
 
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
 LARGEST_SECRET_FILE = 64 * 1024
@@ -43,15 +43,28 @@ class Redactions:
 
 def secrets(*files: Path, given: Iterable[str] = ()) -> tuple[str, ...]:
     found = {v for k, v in os.environ.items() if paths.CREDENTIAL_NAME.search(k)}
-    found |= {util.github_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values(), *given}
+    found |= {util.github_token(), *secretstore.values(), *(value for _, value in vault.legacy_every()), *given}
+    jira_file = None
+    if not secret_move.retired():
+        if pi_file := secret_move.fallback(paths.PI_KEYS_FILE):
+            found |= file_secrets(pi_file, every_value=True)
+        with contextlib.suppress(OSError, ValueError):
+            jira_file = secret_move.fallback(secret_move.configured_path(config.read_data(), "jira"))
+            if jira_file:
+                found |= file_secrets(jira_file, ignore_assignments=secret_move.JIRA_FIELDS)
+                found.add(util.read_env_file(jira_file).get("JIRA_API_TOKEN", ""))
+    skipped = secret_move.external_files()
+    if jira_file:
+        skipped.add(jira_file.resolve())
     for f in files:
-        found |= file_secrets(f)
+        if not skipped or f.resolve() not in skipped:
+            found |= file_secrets(f)
     found = {v for v in found if len(v) >= vault.SHORTEST}
     as_json = {json.dumps(v, ensure_ascii=ascii_only)[1:-1] for v in found for ascii_only in (False, True)}
     return tuple(sorted(found | as_json, key=len, reverse=True))
 
 
-def file_secrets(path: Path, every_value: bool = False) -> set[str]:
+def file_secrets(path: Path, every_value: bool = False, *, ignore_assignments: Iterable[str] = ()) -> set[str]:
     try:
         if path.stat().st_size > LARGEST_SECRET_FILE:
             return set()
@@ -67,6 +80,8 @@ def file_secrets(path: Path, every_value: bool = False) -> set[str]:
         return found | {fields[-1] for line in lines if len(fields := pgpass_fields(line)) == PGPASS_FIELDS}
     for line in lines:
         key, sep, raw = line.removeprefix("export ").partition("=")
+        if sep and key.strip() in ignore_assignments:
+            continue
         if sep and (every_value or paths.CREDENTIAL_NAME.search(key) or looks_secret(util.env_value(raw))):
             found.add(util.env_value(raw))
         pairs = [(name, unquoted(value)) for name, value in NAMED_VALUE.findall(line)]

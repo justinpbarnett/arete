@@ -46,7 +46,7 @@ def adapter(tk, *, fresh=False, repos=()):
     if isinstance(tk, tracker.GitHubTracker):
         return GitHub(tk.repo.github, (repo.github for repo in repos if repo.tracker == "github"))
     if isinstance(tk, tracker.JiraTracker):
-        client = jira.Client.from_env(tk.cfg.env_file) if fresh else tk.client
+        client = jira.Client.from_env(tk.cfg) if fresh else tk.client
         return Jira(client, tk.project, tk.route)
     return None
 

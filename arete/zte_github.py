@@ -398,8 +398,8 @@ class GitHub:
         pilot.require(pilot.private(key.parent, stat.S_ISDIR) and pilot.private(key, stat.S_ISREG)
                       and key.lstat().st_nlink == 1, "the App signing key must be private")
         identity = self.identity
-        app = config.GithubApp(app_id=str(actor.app), installation_id=str(actor.installation), private_key=key)
-        jwt = gh.app_jwt(app, timeout=self.time_left(30))
+        app = config.GithubApp(app_id=str(actor.app), installation_id=str(actor.installation))
+        jwt = gh.app_jwt(app, timeout=self.time_left(30), key_file=key)
         path = f"/app/installations/{actor.installation}"
         allowed = {**permissions, "metadata": "read"}
         if check_registration:
