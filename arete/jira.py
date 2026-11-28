@@ -97,7 +97,17 @@ class AuthStaysOnHost(urllib.request.HTTPRedirectHandler):
         return new
 
 
-_opener = urllib.request.build_opener(AuthStaysOnHost)
+class _LazyOpener:
+    def __init__(self):
+        self._inner = None
+
+    def open(self, *args, **kwargs):
+        if self._inner is None:
+            self._inner = urllib.request.build_opener(AuthStaysOnHost)
+        return self._inner.open(*args, **kwargs)
+
+
+_opener = _LazyOpener()
 
 
 def require_local_if_isolated(url):

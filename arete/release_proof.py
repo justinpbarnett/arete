@@ -97,10 +97,14 @@ def pointer(value):
     return value[1:].split("/")
 
 
+PROMOTION_MODES = ("single", "per-change", "whole-branch")
+
+
 def validate(data):
     need(isinstance(data, dict) and set(data) <= {"destination", "path", "assertions", "recovery", "revision",
          "staging", "production", "qa", "instructions", "identity_path", "observer_sha256",
-         "production_branch", "immutable_host_suffix", "checks", "qa_require_revision"} and data.get("destination") in ("arete-serve", "staging", "production"),
+         "production_branch", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode"}
+         and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
     need(isinstance(path, str) and re.fullmatch(r"/[a-zA-Z0-9/_.~%-]*", path) and "//" not in path
@@ -112,7 +116,7 @@ def validate(data):
     if "observer_sha256" in data:
         need(re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None, "invalid observer fingerprint")
     if data["destination"] == "arete-serve":
-        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks", "qa_require_revision"} & set(data)), "invalid Arete client route")
+        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode"} & set(data)), "invalid Arete client route")
     else:
         identity = data.get("identity_path")
         need(isinstance(identity, str) and re.fullmatch(r"/[A-Za-z0-9/_.-]+", identity)
@@ -124,6 +128,8 @@ def validate(data):
         if data["destination"] == "staging":
             need(config.valid_target_branch(data.get("production_branch")), "invalid production branch")
             need(type(data.get("qa_require_revision", False)) is bool, "qa_require_revision must be a boolean")
+            need(data.get("promotion_mode", "single") in PROMOTION_MODES,
+                 "promotion_mode must be single, per-change, or whole-branch")
             if "checks" in data:
                 gates = data["checks"]
                 need(isinstance(gates, dict) and set(gates) == {"pr", "staging"}, "declare PR and staging checks")
@@ -386,7 +392,7 @@ def completion(repo: str, ticket: str, revision: str) -> dict | None:
     state = serve_guard.read(state_dir(repo, ticket) / "promotion.json") or {}
     if revision not in (state.get("revision"), state.get("staged_revision")) and serve_guard.SHA.fullmatch(revision or ""):
         state = serve_guard.read(state_dir(repo, ticket) / revision / "completed-promotion.json") or {}
-    if state.get("graph_parent") and state.get("staged_revision") == revision:
+    if state.get("staged_revision") == revision and state.get("revision"):
         revision = state.get("revision")
     if not serve_guard.SHA.fullmatch(revision or ""):
         return None
@@ -442,13 +448,36 @@ def pr_check_options(repo, ticket, github, base):
     return {}
 
 
+def record_direct_push(repo, ticket, branch, revision, *, tree="", base_sha="", run_id=""):
+    need(isinstance(repo, config.Repo) and repo.landing == "direct-push" and repo.target_branch == branch
+         and repo.unattended_environment not in ("", "none"),
+         "direct push recording requires an opted-in direct-push enrollment")
+    need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision), "a full pushed revision is required")
+    record = {"repo": repo.name, "ticket": str(ticket), "branch": branch, "revision": revision,
+              "tree": tree, "base": base_sha, "run": run_id, "at": util.iso()}
+    with util.lock("release-" + key(repo.name, str(ticket)), wait=True):
+        serve_guard.write(state_dir(repo.name, str(ticket)) / "direct-push.json", record)
+    return record
+
+
+def direct_push_revision(repo, ticket, base):
+    saved = serve_guard.read(state_dir(repo.name, str(ticket)) / "direct-push.json") or {}
+    revision = saved.get("revision", "")
+    if (saved.get("repo") == repo.name and saved.get("ticket") == str(ticket)
+            and saved.get("branch") == base and serve_guard.SHA.fullmatch(revision or "")):
+        return revision
+    return ""
+
+
 def merge_revision(repo, ticket, base):
     row = run_store.newest_live_whole_run(repo.name, ticket) or {}
     links = (row.get("pr_url") or "").split()
-    if len(links) == 1 and gh.pr_repo(links[0]).lower() == repo.github.lower():
+    if len(links) == 1 and repo.github and gh.pr_repo(links[0]).lower() == repo.github.lower():
         pr = gh.pr_view(links[0])
         if pr.get("state") == "MERGED" and pr.get("baseRefName") == base:
             return (pr.get("mergeCommit") or {}).get("oid", "")
+    if pushed := direct_push_revision(repo, ticket, base):
+        return pushed
     return ""
 
 
@@ -662,7 +691,7 @@ def finish_verified(cfg, repo, ticket, revision, delivered=None):
             finish_standing(repo, ticket, tk, proof)
             return
     item = tk.get(ticket)
-    if "spec" in item.labels or item.blocker or not unblock.approval(tk, item)[0]:
+    if not item.open or "spec" in item.labels or item.blocker or not unblock.approval(tk, item)[0]:
         return
     reason = f"Verified {proof['path']} on {proof['destination']} at {revision}. Receipt {proof['receipt_id']}."
     if isinstance(tk, tracker.GitHubTracker):
@@ -687,6 +716,20 @@ def advance(cfg):
                         revision = promotion["revision"]
                         if receipt := completion(repo.name, ticket, revision):
                             finish_verified(cfg, repo, ticket, revision, receipt)
+                    continue
+                if data and data["destination"] == "production":
+                    if not (repo.pipeline and repo.target_branch and repo.allows_unattended_deploy("production")):
+                        continue
+                    revision = data.get("revision") or merge_revision(repo, ticket, repo.target_branch)
+                    if not revision or not serve_guard.SHA.fullmatch(revision):
+                        continue
+                    receipt = completion(repo.name, ticket, revision)
+                    if not receipt:
+                        result = observe(repo.name, ticket, revision, destination="production", pinned=digest(data))
+                        if result["status"] == "verified":
+                            receipt = completion(repo.name, ticket, revision)
+                    if receipt:
+                        finish_verified(cfg, repo, ticket, revision, receipt)
                     continue
                 row = progress(repo, ticket)
                 if row and row["evidence"] and row["destination"] == "arete-serve":

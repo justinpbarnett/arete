@@ -8,7 +8,8 @@ from support import isolate_live_state
 from arete import config, release_lane as lane, serve_guard
 from arete.store import specgraphs
 
-isolate_live_state()
+def setUpModule():
+    isolate_live_state()
 
 
 class StagingLane(unittest.TestCase):
