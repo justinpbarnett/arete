@@ -1,6 +1,6 @@
 "use strict";
 
-const RUN_LIMITS = [["max-parallel", "max_parallel"], ["max-parallel-per-repo", "max_parallel_per_repo"]];
+const RUN_LIMITS = [["max-parallel", "max_parallel"]];
 let settingsData = null;
 
 function defaultModel(data, role) {
@@ -149,7 +149,6 @@ async function saveSettings(event) {
     const saved = await call("/api/settings", payload);
     drawSettings(saved);
     const words = [changes.max_parallel ? `runs at once ${saved.max_parallel}` : "",
-      changes.max_parallel_per_repo ? `runs per repo ${saved.max_parallel_per_repo}` : "",
       ...Object.keys(changes.models || {}).map((role) => (saved.models[role] ? `${role} ${saved.models[role]}`
         : `${role} back to its default (${defaultModel(saved, role)})`))].filter(Boolean);
     say("settings-result", "ok", `Saved ${words.join(", ")}. The pipeline takes it at its next poll.`);

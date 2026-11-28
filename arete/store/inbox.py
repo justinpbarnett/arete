@@ -123,29 +123,34 @@ def raise_item(
     run_id: str = "",
     line: str = "",
 ) -> tuple[dict, int | None, bool]:
+    from . import projects as projects_store
+
     now = util.iso()
+    line_str = str(line or "")
+    initial_state = "paused" if (line_str and projects_store.line_is_paused(c, line_str)) else "open"
     cur = c.execute(
         "INSERT OR IGNORE INTO inbox "
         "(kind, subject, task_id, run_id, line, priority, title, detail, verbs, options, state, raised, version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, 1)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
         (
             kind,
             subject,
             str(task_id or ""),
             str(run_id or ""),
-            str(line or ""),
+            line_str,
             int(priority),
             str(title or ""),
             _encode_json(detail if detail is not None else {}),
             _encode_json(list(verbs or ())),
             _encode_json(list(options or ())),
+            initial_state,
             now,
         ),
     )
     if cur.rowcount == 1:
         row = c.execute("SELECT * FROM inbox WHERE id = ?", (cur.lastrowid,)).fetchone()
         seq = _emit(c, "inbox.raised", row)
-        if row["priority"] == 1:
+        if row["priority"] == 1 and initial_state == "open":
             _queue_high_push(row["id"])
         return decode(row), seq, True
     existing = c.execute(
@@ -153,6 +158,29 @@ def raise_item(
         (kind, subject),
     ).fetchone()
     return decode(existing), None, False
+
+
+def set_line_paused(c, line_id: str, paused: bool) -> list[dict]:
+    if not line_id or not available(c):
+        return []
+    from_state, to_state = ("open", "paused") if paused else ("paused", "open")
+    rows = c.execute(
+        "SELECT * FROM inbox WHERE line = ? AND state = ? ORDER BY id ASC",
+        (line_id, from_state),
+    ).fetchall()
+    moved: list[dict] = []
+    for row in rows:
+        new_ver = int(row["version"]) + 1
+        changed = c.execute(
+            "UPDATE inbox SET state = ?, version = ? WHERE id = ? AND state = ?",
+            (to_state, new_ver, row["id"], from_state),
+        ).rowcount
+        if not changed:
+            continue
+        after = c.execute("SELECT * FROM inbox WHERE id = ?", (row["id"],)).fetchone()
+        _emit(c, "inbox.changed", after, {"line_paused": paused})
+        moved.append(decode(after))
+    return moved
 
 
 def update_item(

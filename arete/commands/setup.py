@@ -135,7 +135,7 @@ def print_status(cfg, problem, views, snap, records, server_url):
         print(f"config problems: {'; '.join(p.text() for p in cfg.problems)}")
     if cfg.ignored:
         print(f"config names this engine ignores: {', '.join(cfg.ignored)}")
-    print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
+    print(f"max_parallel {cfg.max_parallel}")
     print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")

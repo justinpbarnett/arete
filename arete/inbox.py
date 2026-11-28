@@ -71,6 +71,9 @@ RESERVED_MANUAL_PREFIXES = (
     "outbox:",
     "secret:",
     "step:",
+    "project:",
+    "line:",
+    "view:",
 )
 
 

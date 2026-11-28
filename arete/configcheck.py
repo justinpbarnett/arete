@@ -85,7 +85,7 @@ REACH_KEYS = frozenset((
 
 # Keys that are Gate A from an owner/hand on step_settings / config.toml (within ceilings).
 STEP_SETTINGS_A_LEAF_KEYS = frozenset(("model", "effort", "timeout_minutes", "tries"))
-CONFIG_ROOT_A_KEYS = frozenset(("max_parallel", "max_parallel_per_repo"))
+CONFIG_ROOT_A_KEYS = frozenset(("max_parallel",))
 SOURCE_A_KEYS = frozenset(("every", "enabled"))
 LOOP_A_KEYS = frozenset(("enabled",))
 KIND_A_DEFAULTS = frozenset(("prompt", "sound", "attention", "models", "prices", "retention", "schema"))
@@ -193,7 +193,7 @@ def _is_reach_change(kind: str, dotted: str, old_val: object, new_val: object) -
     if leaf == "tries" and isinstance(new_val, int) and not isinstance(new_val, bool):
         if new_val > TRIES_CEILING:
             return True
-    if leaf in ("max_parallel", "max_parallel_per_repo") and isinstance(new_val, int) and not isinstance(new_val, bool):
+    if leaf == "max_parallel" and isinstance(new_val, int) and not isinstance(new_val, bool):
         if new_val > settings.PARALLEL_MAX:
             return True
     # Rule kind with approve/remember/audience

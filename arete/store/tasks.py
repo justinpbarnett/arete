@@ -461,6 +461,15 @@ class TaskStore:
         body = str(values.get("body") or "")
         title = str(values.get("title") or "")
         repo = str(values.get("repo") or "")
+        if contracted or expand:
+            from .. import lines as lines_mod
+
+            lines_mod.validate_task_assignment(
+                conn,
+                repo=repo,
+                project=values.get("project"),
+                line=values.get("line"),
+            )
         kind = str(values.get("kind") or "feat")
         raw_state = str(values.get("state") or ("ready" if contracted else "todo"))
         raw_fault = int(values.get("fault") or 0)
@@ -2097,9 +2106,15 @@ def update_pr_ref_state(ref_id: int, *, ext_state: str, facts: dict, fetched_at:
 
 def task_add(repo: str, body: str, title: str = "", kind: str = "feat", parent: str = "", claim=None,
              *, reserved_id: str = "", extra: dict | None = None, actor: str | None = None) -> str:
+    from contextlib import nullcontext
+
+    from .. import configrepo
+    from .db import in_write
+
     extra = extra or {}
     actor_id = actor or principals.current()
-    with writes.atomic() as c:
+    needs_fence = not in_write() and (extra.get("line") is not None or extra.get("project") is not None)
+    with (configrepo.maybe_instance_fence() if needs_fence else nullcontext()), writes.atomic() as c:
         values = {
             "repo": repo,
             "title": title,
@@ -2264,7 +2279,14 @@ def task_set_state(tid: str | int, new: str, fault: int | None = None,
 
 
 def task_update(tid: str | int, base_version: int, fields: dict) -> dict | None:
-    with writes.atomic() as c:
+    from contextlib import nullcontext
+
+    from .. import configrepo
+    from .. import lines as lines_mod
+    from .db import in_write
+
+    needs_fence = not in_write() and ("line" in fields or "project" in fields)
+    with (configrepo.maybe_instance_fence() if needs_fence else nullcontext()), writes.atomic() as c:
         row = _select_task_row(c, tid)
         if row is None:
             return None
@@ -2289,6 +2311,15 @@ def task_update(tid: str | int, base_version: int, fields: dict) -> dict | None:
                 updates[key] = value
             else:
                 raise ValueError(f"invalid task field {key!r}")
+        if (contracted or expand) and ("project" in updates or "line" in updates):
+            eff_project = updates["project"] if "project" in updates else row["project"]
+            eff_line = updates["line"] if "line" in updates else row["line"]
+            lines_mod.validate_task_assignment(
+                c,
+                repo=str(row["repo"] or ""),
+                project=eff_project,
+                line=eff_line,
+            )
         try:
             changed = writes.update("tasks", identity, updates, base_version=base_version)
         except writes.VersionConflict as err:
