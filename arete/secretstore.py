@@ -817,6 +817,34 @@ def items():
         return credentials.secrets(c)
 
 
+def missing_required_for_run(c, *, repo: str = "", loop: str = "") -> list[dict]:
+    scopes = ["global"]
+    if repo:
+        scopes.extend((f"repo:{repo}", f"line:{repo}"))
+    if loop:
+        scopes.extend((f"line:{loop}", f"connector:loop.{loop}"))
+    return credentials.missing_required(c, scopes)
+
+
+def missing_required_for_outbox(c, target: str, *, kind: str = "", loop: str = "", repo: str = "") -> list[dict]:
+    rows_found = credentials.missing_required(c)
+    if not rows_found:
+        return []
+    target_low = (target or "").lower()
+    connector_scopes = {s for s in (f"connector:{target}" if target else "", f"connector:{kind}" if kind else "") if s}
+    loop_scopes = {f"line:{loop}", f"connector:loop.{loop}"} if loop else set()
+    repo_scopes = {f"repo:{repo}", f"line:{repo}"} if repo else set()
+    matched = []
+    for row in rows_found:
+        scope = row["scope"]
+        provider = (row.get("provider") or "").lower()
+        if scope in connector_scopes or scope in loop_scopes or scope in repo_scopes:
+            matched.append(row)
+        elif scope == "global" and (not provider or provider == target_low or target_low.startswith(provider)):
+            matched.append(row)
+    return matched
+
+
 def history(scope, name):
     validate(scope, name)
     with registry() as c:
@@ -1291,9 +1319,16 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
         if got is None or item_digest(key, got) != change["fingerprint"]:
             raise StoreError("store readback failed the fingerprint check")
         row = save_change(c, scope, name, row, ref, change)
+        from . import inbox
         from .store import devices as device_store
 
-        device_store.clear_waits_for_blocker(c, f"secret:{scope}/{name}")
+        blocker = f"secret:{scope}/{name}"
+        waiting_subjects = [w["subject"] for w in device_store.open_waits_for_blocker(c, blocker)]
+        device_store.clear_waits_for_blocker(c, blocker)
+        inbox.resolve_secret_continue_in_tx(c, scope, name, actor=actor, at=change["at"])
+        unblocked = tuple(s for s in waiting_subjects if not device_store.has_open_waits(c, s))
+        if unblocked:
+            db.after_commit(lambda subjects=unblocked: inbox.resume_unblocked_subjects(subjects))
         retire_pending(item, raw, row)
         return row
 

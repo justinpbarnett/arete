@@ -205,6 +205,13 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         except foundation.IncompatibleSchema as e:
             raise control.Refused(str(e)) from e
         run_id = pipeline.queue_run(repo.name, tid)
+        from . import inbox
+
+        if missing := inbox.check_run_missing_secrets(run_id, repo=repo.name):
+            cmd = pipeline.run_command(repo.name, tid, force, run_id=run_id)
+            record.write_launch(run_id, cmd, pipeline.RUNS_LOG)
+            names = ", ".join(f"{s['scope']}/{s['name']}" for s in missing)
+            return answer(tid, repo.name, run_id, "queued", f"waiting on missing secret {names}")
         spawn_queued(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force, run_id=run_id))
         result = answer(tid, repo.name, run_id, "running", "started")
         if owner_forcing:
@@ -311,6 +318,11 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
             run_id = pipeline.queue_run(repo.name, tid, continues=continues, restart=restart, only_step=only_step)
         full_command = [*command, "--run-id", run_id]
         record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
+        from . import inbox
+
+        if missing := inbox.check_run_missing_secrets(run_id, repo=repo.name):
+            names = ", ".join(f"{s['scope']}/{s['name']}" for s in missing)
+            return answer(tid, repo.name, run_id, "queued", f"waiting on missing secret {names}")
         spawn_queued(repo.name, tid, lambda: control.launch(full_command, pipeline.RUNS_LOG))
         return answer(tid, repo.name, run_id, "running", "started")
 
@@ -401,7 +413,20 @@ def reply(run_id: str, text: str) -> dict:
         if not waiting and ask_store.asks_of(run_id):
             raise AlreadyResolved(f"run {run_id}'s asks were already resolved, so this answer was not stored")
         if row["status"] != "needs-info":
-            raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
+            from .store import inbox as inbox_store
+
+            has_stop = inbox_store.get_open_by_kind_and_subject("stop", f"run:{run_id}") is not None
+            if not has_stop:
+                raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
+            tid = str(row["issue"])
+            if row["status"] == "running":
+                run_dir = paths.RUNS_DIR / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                util.write_bytes_atomic(run_dir / pipeline.ANSWER_FILE, text.encode())
+                run_store.add_feed(run_id, "redirect", text)
+                if tracker.is_task_id(tid):
+                    task_store.task_comment(tid, principals.current(), text)
+                return answer(tid, repo.name, run_id, "running", "redirected")
         no_later_run(row)
         tid = str(row["issue"])
         if waiting:
@@ -413,10 +438,12 @@ def reply(run_id: str, text: str) -> dict:
                     if not task_store.task_comment(tid, principals.current(), text):
                         raise control.NotFound(f"no task {tid}")
                     new_run_id = pipeline.queue_run(repo.name, tid, continues=row["id"], restart="answer")
+                (paths.RUNS_DIR / run_id).mkdir(parents=True, exist_ok=True)
                 util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
                 spawn_queued(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, True, run_id=new_run_id))
             return answer(tid, repo.name, new_run_id, "running", "started")
         kept = store_answer(cfg, repo, tid, text)
+        (paths.RUNS_DIR / run_id).mkdir(parents=True, exist_ok=True)
         util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
         started = begin(cfg, repo, tid, force=True, poller_picks=repo.pipeline)
         return {**started, "why": f"{started['why']}; {kept}"} if kept else started

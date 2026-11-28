@@ -1538,11 +1538,14 @@ def startup_beat() -> foundation.ServeChildren:
 
 def recover_queued(say: Callable[[str], None] = lambda text: None, *, min_age: float | None = None) -> list[dict]:
     from . import pipeline
+    from .store import devices as device_store
 
     cutoff = pipeline.RUN_START_SECONDS if min_age is None else min_age
     handled: list[dict] = []
     for row in run_store.runs_queued():
         run_id = row["id"]
+        if device_store.open_waits_for_subject(f"run:{run_id}"):
+            continue
         kind = row.get("kind") or ""
         try:
             age = (util.now() - util.parse_iso(row["started"])).total_seconds()

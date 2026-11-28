@@ -508,6 +508,9 @@ class Check:
             failure_detail="HTTP 403 access denied",
         )
         fixture_evidence_item = inbox_store.get_open_by_subject(f"evidence:{ev_id}")
+        fault_run = record.start("pipeline", repo=replay.SAMPLE_REPO, issue=self.task, status="failed")
+        record.step(fault_run, "verify", agent.Result(ok=False, error="AssertionError: fixture", runner="replay"), 0.1)
+        fixture_fault_item = inbox_store.get_open_by_kind_and_subject("fault", f"step:{fault_run}/verify")
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
@@ -615,6 +618,12 @@ class Check:
                     with patch.object(triage, "sources", return_value=[send_src]), \
                             patch.object(triage, "read_send_ticket", return_value=fake_text):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "inbox.retry":
+                    retry_path = f"/api/v1/inbox/{quote(fixture_fault_item['id'], safe='')}/retry"
+                    q_run = pipeline.queue_run(replay.SAMPLE_REPO, self.task)
+                    stub_ans = tasks_mod.answer(self.task, replay.SAMPLE_REPO, q_run, "queued", "started")
+                    with patch.object(tasks_mod, "resume", return_value=stub_ans):
+                        headers, raw = self.request(method, retry_path, values, headers=key, status=op["success_status"])
                 elif name == "inbox.upload_evidence":
                     import struct
                     import zlib

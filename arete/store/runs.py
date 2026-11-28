@@ -597,6 +597,8 @@ def start_step(step_id: int | None, *, account_id: str | None, device: str, runn
 def fail_step(step_id: int | None, error: str, *, runner: str = "", model: str = "", provider: str = "") -> None:
     if step_id is None:
         return
+    from .. import inbox
+
     with writes.atomic() as c:
         if not has_steps_lifecycle(c):
             return
@@ -606,6 +608,7 @@ def fail_step(step_id: int | None, error: str, *, runner: str = "", model: str =
             "provider = COALESCE(NULLIF(provider, ''), ?), version = version + 1 WHERE id = ?",
             ((error or "")[:500], util.iso(), runner or "", model or "", provider or "", step_id),
         )
+        inbox.on_step_settled(c, step_id)
 
 
 def insert_turn(step_id: int, n: int, run_id: str, *, at: str, status: str, tool: str, excerpt: str,
@@ -944,6 +947,7 @@ def _sync_inbox_runs(c) -> None:
     from .. import inbox
 
     inbox.sync(c, "runs")
+    inbox.sync(c, "stops")
     inbox.sync(c, "asks")
 
 
@@ -1188,6 +1192,10 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                 )
             writes.update("runs", run_id, {}, increments={"cost_usd": delta_cost, "tokens_in": delta_tin,
                                                          "tokens_out": delta_tout})
+            if lifecycle and written_step_id is not None:
+                from .. import inbox
+
+                inbox.on_step_settled(c, written_step_id)
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
