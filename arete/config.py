@@ -48,6 +48,7 @@ ROLES = (
     Role("explain", "haiku"),
     Role("document", read_only=True, keeps_session=False),
     Role("capture_evidence", "sonnet", read_only=True, keeps_session=False),
+    Role("config_ask", "sonnet", read_only=True, keeps_session=False),
     Role("check_repair", inherits="build"),
     Role("review_repair", inherits="build"),
     Role("ci_repair", inherits="build"),
@@ -1941,6 +1942,12 @@ def paused(cfg: Config, repo: str = "", role: str = "", kind: str = "", mcp: tup
     for problem in problems:
         if _scope_matches(problem.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
             return problem.text()
+    if role:
+        from . import prompts
+
+        for pp in prompts.binding_problems(cfg):
+            if _scope_matches(pp.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
+                return pp.message
     return ""
 
 
@@ -1968,7 +1975,10 @@ def repo_paused(cfg: Config, repo_name: str, *, kind: str = "") -> str:
             return f"{type(e).__name__}: {e}"
         if why := paused(cfg, repo=repo_name, layer=layer):
             return why
-    if not cfg.problems and not (layer and layer.problems):
+    from . import prompts
+
+    prompt_probs = prompts.binding_problems(cfg)
+    if not cfg.problems and not (layer and layer.problems) and not prompt_probs:
         return ""
     for k in (kind,) if kind else ("", *KINDS):
         for role in STEP_ROLES:

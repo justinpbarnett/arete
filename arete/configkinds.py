@@ -12,7 +12,7 @@ ROLE_NAMES = (
     "plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage",
     "chat", "classify", "loop", "session", "research", "research_plan", "research_search",
     "research_synthesis", "research_audit", "explain", "document", "capture_evidence",
-    "check_repair", "review_repair", "ci_repair", "eval_grade", "orchestrate",
+    "config_ask", "check_repair", "review_repair", "ci_repair", "eval_grade", "orchestrate",
 )
 
 

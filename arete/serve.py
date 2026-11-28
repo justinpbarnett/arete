@@ -458,6 +458,11 @@ class Server:
         self.jobs: dict[str, Future] = {}
         self.outbox_pool = factory_control.WorkPool(1, thread_name_prefix="outbox")
         self.outbox_job: Future | None = None
+        if paths.DB_FILE.exists():
+            try:
+                self.sync_prompt_overrides()
+            except Exception as e:
+                self.say(f"startup prompt override sync failed: {type(e).__name__}: {util.first_line(str(e), 200)}")
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -523,6 +528,7 @@ class Server:
             self.cfg = cfg
         self.report_config()
         if problem:
+            self.guard("stage:prompt-overrides", self.sync_prompt_overrides)
             self.guard("stage:inbox-config", self.sync_config_inbox)
             raise ValueError(problem)
         every_loop = loops.load_all(cfg)
@@ -588,6 +594,7 @@ class Server:
             ("prune", self.prune_when_due, ()), ("sweep", self.sweep_when_due, ()),
             ("workspaces", self.sweep_workspaces_when_due, ()),
             ("asks", self.expire_asks, ()), ("closed", self.release_closed_when_due, ()),
+            ("prompt-overrides", self.sync_prompt_overrides, ()),
             ("inbox", self.sync_inbox, ()),
             ("watch", self.watch_drafts, ()),
             ("remind", self.remind, ()),
@@ -730,6 +737,11 @@ class Server:
             self.checked_closed = time.monotonic()
             for note in tasks.release_closed(self.cfg):
                 self.say(note)
+
+    def sync_prompt_overrides(self) -> None:
+        from . import prompts
+
+        prompts.sync_overrides()
 
     def sync_inbox(self) -> None:
         from . import inbox

@@ -83,3 +83,12 @@ instructions = []
 modalities = ["image"]
 structured_output = true
 budget_usd = 0.25
+
+[steps.config_ask]
+timeout_minutes = 10
+tries = 1
+tools = []
+mcp = []
+instructions = []
+session = "fresh"
+structured_output = true

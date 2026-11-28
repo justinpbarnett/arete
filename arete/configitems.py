@@ -7,12 +7,15 @@ import re
 import stat
 import subprocess
 import tomllib
+from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from difflib import unified_diff
 from pathlib import Path
 
-from . import config, configkinds, configrepo, paths, refusals, settings
+from . import config, configkinds, configrepo, paths, prompts, refusals, settings
 from .store import config as config_store
+from .store import db as foundation
+from .store import inbox as inbox_store
 
 MAX_CONTENT = 1024 * 1024
 REVISION = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
@@ -36,12 +39,96 @@ def _content_version_of(kind: str, name: str, raw: bytes) -> str:
     return f"{kind}/{name}@{hashlib.sha256(raw).hexdigest()[:12]}"
 
 
+def _prompt_appends(name: str, conn=None) -> list[dict[str, str]]:
+    if name.endswith(".append") or not prompts.NAME_RE.fullmatch(name):
+        return []
+    root = paths.CONFIG_DIR.resolve()
+    candidates: list[tuple[str, Path]] = []
+    seen_paths: set[Path] = set()
+
+    layers_root = root / "layers"
+    if layers_root.is_dir():
+        for file in sorted(layers_root.glob(f"*/prompts/{name}.append.md")):
+            if not file.is_file():
+                continue
+            resolved = file.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            repo_name = file.parent.parent.name
+            candidates.append((repo_name, resolved))
+
+    cfg, _ = config.load_or_problem()
+    for repo in cfg.repos:
+        append_file = repo.layer_dir / "prompts" / f"{name}.append.md"
+        if not append_file.is_file():
+            continue
+        resolved = append_file.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        candidates.append((repo.name, resolved))
+
+    out: list[dict[str, str]] = []
+    for repo_name, file_path in sorted(candidates, key=lambda pair: (pair[0], str(pair[1]))):
+        append_name = f"{repo_name}.{name}.append"
+        rel_path = (
+            file_path.relative_to(root).as_posix()
+            if file_path.is_relative_to(root)
+            else f"layers/{repo_name}/prompts/{name}.append.md"
+        )
+        row = config_store.live_item("prompt", append_name, conn) or config_store.live_by_path(rel_path, conn)
+        if row and row.get("version"):
+            version = str(row["version"])
+        else:
+            raw = file_path.read_bytes() if file_path.is_file() else b""
+            version = _content_version_of("prompt", append_name, raw)
+        out.append({
+            "layer": f"layer:{repo_name}",
+            "name": append_name,
+            "path": rel_path,
+            "version": version,
+        })
+    return out
+
+
+def _prompt_has_drift(name: str, conn=None) -> bool:
+    if name.endswith(".append"):
+        return False
+    subject = f"config:prompt/{name}"
+    if conn is not None:
+        return inbox_store.get_open_by_kind_and_subject("drift", subject, connect=lambda: nullcontext(conn)) is not None
+    if not paths.DB_FILE.exists():
+        return False
+    try:
+        return inbox_store.get_open_by_kind_and_subject("drift", subject) is not None
+    except (foundation.NoDatabase, foundation.IncompatibleSchema, OSError):
+        return False
+
+
+def _prompt_fields(name: str, raw: bytes, conn=None) -> dict[str, object]:
+    overrides: str | None = None
+    base: str | None = None
+    with suppress(UnicodeDecodeError, ValueError):
+        meta, _ = prompts.parse(raw)
+        if isinstance(meta.get("overrides"), str) and meta["overrides"]:
+            overrides = meta["overrides"]
+        if isinstance(meta.get("base"), str) and meta["base"]:
+            base = meta["base"]
+    return {
+        "overrides": overrides,
+        "base": base,
+        "drift": _prompt_has_drift(name, conn),
+        "appends": _prompt_appends(name, conn),
+    }
+
+
 def _enrich(entry: dict, conn=None) -> dict:
     kind, name, rel = entry["kind"], entry["name"], entry["path"]
     if entry.get("engine"):
         engine_path = Path(entry["engine"])
         raw = engine_path.read_bytes() if engine_path.is_file() else b""
-        return {
+        out: dict[str, object] = {
             "kind": kind,
             "name": name,
             "path": rel,
@@ -50,17 +137,20 @@ def _enrich(entry: dict, conn=None) -> dict:
             "content_version": _content_version_of(kind, name, raw),
             "level": "engine",
         }
+        if kind == "prompt":
+            out.update(_prompt_fields(name, raw, conn))
+        return out
     lookup_kind = "step_settings" if kind == "attention" else kind
     row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(rel, conn)
     ver = int(row["ver"]) if row and row.get("ver") is not None else 0
+    file_path = paths.CONFIG_DIR.resolve() / rel
+    raw = file_path.read_bytes() if file_path.is_file() else b""
     if row and kind != "attention":
         cv = row["version"]
     else:
-        file_path = paths.CONFIG_DIR.resolve() / rel
-        raw = file_path.read_bytes() if file_path.is_file() else b""
         cv = _content_version_of(kind, name, raw)
     level = row["origin"] if row and row["origin"].startswith("layer:") else configrepo.level_of(rel)
-    return {
+    out = {
         "kind": kind,
         "name": name,
         "path": rel,
@@ -69,6 +159,9 @@ def _enrich(entry: dict, conn=None) -> dict:
         "content_version": cv,
         "level": level,
     }
+    if kind == "prompt":
+        out.update(_prompt_fields(name, raw, conn))
+    return out
 
 
 def _engine_items(kind: str) -> dict[str, dict]:
@@ -203,6 +296,13 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 **_enrich({"kind": kind, "name": name, "path": f"arete/prompts/{name}.md", "engine": str(target)}),
                 "_engine_file": str(target),
             }
+    if kind == "schema" and re.fullmatch(configkinds.NAME_PATTERN, name):
+        target = paths.SCHEMAS_DIR / f"{name}.json"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": f"arete/schemas/{name}.json", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
     return None
 
 
@@ -223,7 +323,7 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
         if level is not None and entry["level"] != level:
             raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
         return entry
-    if level is None and kind in ("prompt", "retention") and (engine := _engine_item(kind, name)) is not None:
+    if level is None and kind in ("prompt", "schema", "retention") and (engine := _engine_item(kind, name)) is not None:
         return engine
     raise refusals.NotFound(f"No config item {kind}/{name}")
 
