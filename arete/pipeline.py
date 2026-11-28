@@ -832,12 +832,14 @@ class Run(AgentRun):
                 self.log(f"tracker: {util.first_line(moved, 300)}")
             return
         labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id)
-        record.note(self.id, label_pending=status if labeled else "")
+        if not isinstance(self.tracker, tracker.JiraTracker):
+            record.note(self.id, label_pending=status if labeled else "")
         from . import release_proof
 
         guarded_jira = isinstance(self.tracker, tracker.JiraTracker) and (
             self.spec_root or spec_store.find(self.repo.name, str(self.tid)) or release_proof.required(self.repo.name, self.tid))
-        moved = (self.tracker.move(self.tid, status, keep_open=True) if guarded_jira
+        moved = (self.tracker.move(self.tid, status, keep_open=True, run_id=self.id) if guarded_jira
+                 else self.tracker.move(self.tid, status, run_id=self.id) if isinstance(self.tracker, tracker.JiraTracker)
                  else self.tracker.move(self.tid, status))
         for err in (labeled, moved):
             if err:
@@ -2501,7 +2503,10 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             flow.route()
         if not run_lines.ended_in_error(run.id, reply="respond" if flow else ""):
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
-    pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
+    existing_pr_url = str((run_store.run_get(run.id) or {}).get("pr_url") or "")
+    if pr_url and not existing_pr_url:
+        record.note(run.id, pr_url=pr_url)
+    pr_url = pr_url or existing_pr_url
     end_line = f"done: {status} {pr_url or summary}"
     if echo_end:
         run.log(end_line)
@@ -2510,7 +2515,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         from . import environment_gaps
 
         environment_gaps.save_hold(run.id, pr_url)
-    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url,
+    record.settle(run.id, status, end_line=end_line, summary=summary,
                   **classified)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
@@ -3852,16 +3857,33 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     opened: list[workspace.Checkout] = []
     for c in staged.changed:
         if not c.pr:
-            c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
-                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
+            from . import outbox
+
+            head = git(["rev-parse", "HEAD"], c.wt).strip()
+            created = outbox.publish_pr(
+                action="create",
+                repo=c.github,
+                name=c.github or c.dir,
+                base=c.base,
+                branch=branch,
+                head=head,
+                lease=c.lease,
+                title=tk.pr_title(subject, t),
+                body=pr_report,
+                link=link,
+                labels=tk.pr_labels,
+                draft_pr=bool(draft_why),
+                run_id=run.id,
+                drafted_by=f"run:{run.id}",
+                retry_unknown=True,
+            )
+            c.pr = str(created.get("sent_url") or "")
             opened.append(c)
-            note_prs(run, branch, [x for x in checkouts if x.pr])
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}")
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
-    note_prs(run, branch, with_prs)
     ci_stopped = sync_pr_bodies(run, t, with_prs, opened, pushed, pushed, pr_report, left_for_a_person, link)
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
     heads = {c.github: c.lease for c in staged.changed}
@@ -4513,8 +4535,20 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return risk.hold
     if hold := release_lane.merge_hold(b.run.repo, getattr(b.ticket, "id", None), base_sha):
         return hold
-    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
-                            **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
+    from . import outbox
+
+    opts = release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base)
+    return outbox.publish_pr_merge(
+        repo=c.github,
+        number=number,
+        head=head,
+        base=c.base,
+        base_sha=base_sha,
+        track_moved_base=track_moved_base,
+        stage_checks=opts.get("stage_checks"),
+        run_id=b.run.id,
+        drafted_by=f"run:{b.run.id}",
+    )
 
 
 def direct_push_refusal(repo: config.Repo, base: str, *, ticket: str = "") -> str:
@@ -4586,9 +4620,20 @@ def direct_push_checkout(b: Build, c: workspace.Checkout, verified: verify.Verif
         base_sha = fetch_merge_base(c)
         if workspace.remote_head(c.src, c.base) != base_sha:
             raise workspace.RunFailed(f"origin/{c.base} moved before direct push; rerun checks on the latest base")
+        from . import outbox
+
         try:
-            git(["push", "-q", "--no-follow-tags", "--recurse-submodules=no", "origin",
-                 f"{head}:refs/heads/{c.base}"], c.wt, timeout=600, retry=False)
+            outbox.publish_push(
+                repo_name=c.github or c.dir,
+                base=c.base,
+                branch=c.base,
+                head=head,
+                use_lease=False,
+                mode="branch",
+                run_id=b.run.id,
+                drafted_by=f"run:{b.run.id}",
+                timeout=600,
+            )
         except RuntimeError as error:
             raise workspace.RunFailed(f"direct push to {c.base} was refused by origin", str(error)) from error
         if workspace.remote_head(c.src, c.base) != head:
@@ -4650,20 +4695,42 @@ def publish_unverified_measurement(run: Run, t: tracker.Ticket, pr: str, section
     updated = with_unverified_measurement(text, public_text(run, section),
                                          observed_requirements=observed_requirements, existing_only=True)
     if updated != text and gh.outgoing(updated, kept) != body:
-        gh.pr_edit_body(pr, updated, link=kept)
+        from . import outbox
+
+        outbox.publish_pr(
+            action="body",
+            repo=gh.pr_repo(pr),
+            url=pr,
+            body=updated,
+            link=kept,
+            run_id=run.id,
+            drafted_by=f"run:{run.id}",
+        )
 
 
 def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True, *,
                    measurement_section: str = ""):
+    from . import outbox
+
     stops = stops or {}
     ci_stopped = []
+    run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
             if others:
                 text = f"{report}{others}"
                 stop = stops.get(c.github, "")
-                gh.pr_edit_body(c.pr, ci.with_section(text, stop) if stop else text, link=link)
+                outbox.publish_pr(
+                    action="body",
+                    repo=c.github,
+                    name=c.github or c.dir,
+                    url=c.pr,
+                    body=ci.with_section(text, stop) if stop else text,
+                    link=link,
+                    run_id=run_id,
+                    drafted_by=f"run:{run_id}" if run_id else "arete",
+                )
             continue
         body = gh.pr_body(c.pr)
         if c in standing and ci.stopped(body):
@@ -4674,11 +4741,17 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         if c in standing:
             text = with_unverified_measurement(text, public_text(run, measurement_section))
         if gh.outgoing(text, kept) != body:
-            gh.pr_edit_body(c.pr, text, link=kept)
+            outbox.publish_pr(
+                action="body",
+                repo=c.github,
+                name=c.github or c.dir,
+                url=c.pr,
+                body=text,
+                link=kept,
+                run_id=run_id,
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+            )
         if c in pushed and c.pr not in run.feedback_prs:
-            from . import outbox
-
-            run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
             obj = f"github:{gh.pr_repo(c.pr)}#{gh.pr_number(c.pr)}"
             item_id = outbox.draft(
                 target="github",
@@ -4790,9 +4863,19 @@ def left_on_prs(urls: list[str]) -> str:
 
 
 def record_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> str:
-    urls = [c.pr for c in with_prs]
+    urls = [c.pr for c in with_prs if c.pr]
     supersede_older_runs(run, urls)
-    record.note(run.id, branch=branch)
+    if urls:
+        row = run_store.run_get(run.id)
+        if row is not None and not row.get("pr_url"):
+            if row.get("version") is not None:
+                record.note(run.id, base_version=int(row["version"]), branch=branch, pr_url=" ".join(urls))
+            else:
+                record.note(run.id, branch=branch, pr_url=" ".join(urls))
+        else:
+            record.note(run.id, branch=branch)
+    else:
+        record.note(run.id, branch=branch)
     return " ".join(urls)
 
 
@@ -4826,24 +4909,29 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
         raise workspace.RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
                         "Someone pushed to that branch after this run started. A retry builds on top of their work.")
     pushed: list[workspace.Checkout] = []
-    attempt = {"before_attempt": check_targets} if check_targets else {}
+    from . import outbox
+
     for c in changed:
-        if before_push:
-            head = before_push(c)
-            ref = f"refs/heads/{branch}"
-            argv = ["push", "-q", "--no-follow-tags", "--recurse-submodules=no", f"--force-with-lease={ref}:{c.lease}",
-                    "origin", f"{head}:{ref}"]
-        else:
-            head = ""
-            argv = ["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch]
+        if check_targets:
+            check_targets()
+        head = before_push(c) if before_push else util.git(["rev-parse", "HEAD"], c.wt).strip()
         try:
-            git(argv, c.wt, timeout=600, retry=not before_push, **attempt)
+            outbox.publish_push(
+                repo_name=c.github or c.dir,
+                base=c.base,
+                branch=branch,
+                head=head,
+                lease=c.lease,
+                use_lease=True,
+                mode="branch",
+                timeout=600,
+            )
         except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
             aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
-        c.note_pushed_head(head or git(["rev-parse", "HEAD"], c.wt).strip())
+        c.note_pushed_head(head)
         c.onto = ""
         pushed.append(c)
 
@@ -4911,8 +4999,20 @@ def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci",
     write = (recovery.pr_write(c, "draft state", "before changing the PR draft state",
                                f"after attempting to mark the PR {now}", draft=draft) if recovery else nullcontext())
     try:
+        from . import outbox
+
+        run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
         with write:
-            gh.pr_set_draft(c.pr, draft, **({"single_attempt": True} if recovery else {}))
+            outbox.publish_pr(
+                action="draft",
+                repo=c.github,
+                name=c.github or c.dir,
+                url=c.pr,
+                draft_pr=draft,
+                run_id=run_id,
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+                retry_unknown=not recovery,
+            )
     except gh.GhError as e:
         run.log(f"{by}: could not mark {c.pr} {now}: {util.first_line(str(e), 300)}")
         return False
@@ -5797,11 +5897,23 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
 
 
 def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
+    from . import outbox
+
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    run_id = run.id if isinstance(getattr(run, "id", None), str) else ""
     for c in pushed:
         try:
             kept, text = gh.split_link(gh.pr_body(c.pr), links)
-            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
+            outbox.publish_pr(
+                action="body",
+                repo=c.github,
+                name=c.github or c.dir,
+                url=c.pr,
+                body=public_text(run, ci.with_section(text, ci_section)),
+                link=kept,
+                run_id=run_id,
+                drafted_by=f"run:{run_id}" if run_id else "arete",
+            )
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
@@ -5852,7 +5964,17 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
         if exact:
             gh.pr_write_body(pr, gh.Outgoing(body))
         else:
-            gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
+            from . import outbox
+
+            outbox.publish_pr(
+                action="body",
+                repo=gh.pr_repo(pr),
+                url=pr,
+                body=public_text(run, body.rstrip()),
+                link=kept,
+                run_id=run.id,
+                drafted_by=f"run:{run.id}",
+            )
     except gh.GhError as e:
         run.log(f"automerge: could not update gate evidence in {pr}: {util.first_line(str(e), 300)}")
         return False
@@ -6847,7 +6969,7 @@ def sync_labels(cfg: config.Config) -> None:
         except KeyError:
             continue
         tk = tracker.for_ticket(cfg, repo, key[1])
-        if isinstance(tk, tracker.GitHubTracker):
+        if isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)):
             continue
         err = tk.label(key[1], add=[want], remove=[s for s in tk.states if s != want])
         if err:

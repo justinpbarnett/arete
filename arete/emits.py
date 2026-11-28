@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from . import config, gh, idempotency, jira, outbound, principals, screening, sources, ticket_publication, util
@@ -56,7 +57,19 @@ def config_repo(cfg: config.Config, name: str) -> config.Repo | None:
     try:
         return cfg.repo(name)
     except config.UnknownRepo:
-        return next((r for r in cfg.repos if r.github == name), None)
+        found = next((r for r in cfg.repos if r.github == name), None)
+        if found is not None:
+            return found
+        for r in cfg.repos:
+            for p in r.parts:
+                if p.github == name or (p.dir and name in (f"{r.name}/{p.dir}", p.dir)):
+                    return replace(
+                        r,
+                        name=f"{r.name}/{p.dir}" if p.dir else r.name,
+                        path=(r.path / p.dir) if p.dir else r.path,
+                        github=p.github,
+                    )
+        return None
 
 
 class LoopOff(RuntimeError):
@@ -252,28 +265,19 @@ class PullRequest(Emit):
         title = f"{loop.name}: {outcome.get('facts', '')}" if public else \
             outcome.get("title") or f"{loop.name}: {outcome.get('summary', '')}"
         told = outcome.get("facts", "") if public else outcome.get("report")
-        return {"repo": outcome.get("github", ""), "branch": outcome.get("branch", ""), "base": outcome.get("base", ""),
-                "workdir": outcome.get("workdir", ""), "title": outbound.plain(spec.get("title") or title, 120),
-                "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{outbound.plain(told, 6000)}"),
+        head = str(outcome.get("head") or "")
+        if not head and outcome.get("workdir") and outcome.get("branch"):
+            head = util.git(["rev-parse", outcome["branch"]], Path(outcome["workdir"])).strip()
+        return {"action": "create", "repo": outcome.get("github", ""), "name": loop.repo or outcome.get("repo", ""),
+                "branch": outcome.get("branch", ""), "base": outcome.get("base", ""),
+                "head": head, "lease": str(outcome.get("lease") or ""), "push_branch": True,
+                "title": outbound.plain(spec.get("title") or title, 120),
+                "body": f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{outbound.plain(told, 6000)}",
                 "draft": bool(spec.get("draft", True)), "labels": as_list(spec.get("labels"))}
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
                 *, publication=None) -> str:
-        repo = config_repo(cfg, item["repo"])
-        if repo and repo.target_branch and (item["base"] != repo.target_branch or item["branch"] == repo.target_branch):
-            raise ValueError(f"the queued PR must target {repo.target_branch} from a separate work branch")
-        if publication:
-            if url := gh.find_pr_marker(item["repo"], item["branch"], publication.marker):
-                return url
-            publication.require_unsent()
-        for label in item["labels"]:
-            gh.ensure_label(item["repo"], label, restyle=False)
-        util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
-        body = publication.text(item["body"]) if publication else item["body"]
-        if publication:
-            publication.begin_send()
-        return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], body, item["labels"],
-                            draft=item["draft"], single_attempt=publication is not None)
+        raise RuntimeError("pr emits deliver through the outbox sender")
 
     def describe(self, item: dict) -> str:
         return f"open a {'draft ' if item['draft'] else ''}PR on {item['repo']} from {item['branch']}: {item['title']}"
@@ -281,9 +285,10 @@ class PullRequest(Emit):
     def detail(self, item: dict) -> str:
         return item["body"]
 
-    def rejected(self, item: dict) -> None:
-        if item.get("workdir"):
-            util.delete_branch(Path(item["workdir"]), item["branch"])
+    def rejected(self, item: dict, cfg: config.Config | None = None) -> None:
+        repo = config_repo(cfg or config.load(), item.get("name") or item.get("repo") or "")
+        if repo is not None and repo.path.is_dir() and item.get("branch"):
+            util.delete_branch(repo.path, item["branch"])
 
 
 class ToLoop(Emit):

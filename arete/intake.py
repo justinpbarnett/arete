@@ -103,7 +103,20 @@ def add_labels(source: tracker.Tracker, tid: str, labels: list[str]) -> None:
             summary=f"add {', '.join(labels)} on {source.repo.github}#{int(tid)}",
         )
     elif isinstance(source, tracker.JiraTracker):
-        source.client.edit_labels(tid, labels)
+        import secrets
+
+        from . import outbox
+
+        outbox.draft(
+            target="jira",
+            kind="label",
+            object=f"jira:{tid}",
+            body=json.dumps({"add": labels, "remove": [], "family": ""}),
+            drafted_by="intake",
+            slot=f"intake:jira:{tid}:{','.join(sorted(labels))}:{secrets.token_hex(4)}",
+            task_id=f"{source.repo.name} {tid}",
+            summary=f"add {', '.join(labels)} on {tid}",
+        )
 
 
 @factory_control.work

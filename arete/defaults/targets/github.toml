@@ -1,5 +1,5 @@
 connector = "github"
-kinds = ["issue", "comment", "reply", "label", "status"]
+kinds = ["issue", "comment", "reply", "label", "status", "pr"]
 audience = "self"
 posts_as = "gh"
 send_window = 60

@@ -1,0 +1,5 @@
+connector = "jira"
+kinds = ["comment", "issue", "label", "status", "transition"]
+audience = "self"
+posts_as = "jira"
+send_window = 60

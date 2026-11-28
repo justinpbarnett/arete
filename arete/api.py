@@ -607,7 +607,8 @@ def command(handler, op, values, path_values, *, claim=None):
                                 atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
                                                                       "settings.update", "loop.enable", "loop.disable",
                                                                       "device.probe", "outbox.approve",
-                                                                      "outbox.retry", "outbox.reject", "chat.file"),
+                                                                      "outbox.retry", "outbox.reject", "chat.file",
+                                                                      "triage.send"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
@@ -755,6 +756,26 @@ def mutation(name, values, handler):
         result = {"item": outbox.retry(values["item"], base_version=values["base_version"])}
     elif name == "outbox.discard":
         result = {"item": outbox.discard(values["item"], base_version=values["base_version"])}
+    elif name == "triage.send":
+        try:
+            item = triage.send(
+                config.load_or_problem()[0],
+                values["ticket"],
+                values["questions"],
+                values["answers"],
+                str(values.get("repo") or ""),
+                base_version=values["base_version"],
+                return_item=True,
+            )
+        except triage.NotOnBoard as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except triage.NotSendable as error:
+            raise contract.Problem("invalid_state", str(error)) from None
+        except triage.BadAnswers as error:
+            raise contract.Problem("validation", str(error)) from None
+        except refusals.Upstream as error:
+            raise contract.Problem("upstream_failed", str(error)) from None
+        result = {"data": item}
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)

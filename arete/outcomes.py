@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import tomllib
 from collections import Counter
@@ -204,6 +206,11 @@ def sync_moves(cfg: config.Config) -> None:
                   + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
 
 
+def landing_slot(ticket: str, kind: str, obj: str, branch: str, prs: list[str]) -> str:
+    digest = hashlib.sha256(json.dumps([ticket, kind, obj, branch, sorted(set(prs))]).encode()).hexdigest()
+    return f"landing:{digest}"
+
+
 def carried_by_newer(rows: list[dict], i: int) -> bool:
     row = rows[i]
     prs = set((row.get("pr_url") or "").split())
@@ -227,28 +234,34 @@ def sync_landings(cfg: config.Config) -> None:
         if repo.tracker != "jira" or tracker.is_task_id(r["issue"]):
             continue
         try:
-            reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
+            prs = r["pr_url"].split()
+            reached = furthest_branch(branches, prs, str(r["issue"]))
             progress = [older.get("landed") for older in rows[i:]
                         if older["status"] == "merged" and older["repo"] == r["repo"] and older["issue"] == r["issue"]
-                        and set((older.get("pr_url") or "").split()) == set(r["pr_url"].split())]
+                        and set((older.get("pr_url") or "").split()) == set(prs)]
             already = max((branches.index(b) for b in progress if b in branches), default=-1)
             if reached is None or branches.index(reached) <= already:
                 continue
             target = cfg.jira.landed[reached]
             tk = tracker.for_repo(cfg, repo)
-            claim = spec_store.find(repo.name, str(r["issue"]))
+            tid = str(r["issue"])
+            obj = f"jira:{tid}"
+            claim = spec_store.find(repo.name, tid)
             if claim and (reached == branches[-1] or claim["state"] in ("evidenced", "complete")):
                 continue
             from . import release_proof
 
-            keep_open = claim or release_proof.required(repo.name, str(r["issue"]))
-            err = (tk.shift(str(r["issue"]), target, keep_done=True, keep_open=True).error if keep_open
-                   else tk.move_to(str(r["issue"]), target))
+            keep_open = claim or release_proof.required(repo.name, tid)
+            move_slot = landing_slot(tid, "transition", obj, reached, prs)
+            err = (tk.shift(tid, target, keep_done=True, keep_open=True, slot=move_slot).error if keep_open
+                   else tk.move_to(tid, target, slot=move_slot))
             if reached != branches[-1]:
-                run = pipeline.Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]), writes_lines=False)
+                run = pipeline.Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=tid, writes_lines=False)
                 moved = "" if err else f" and moved to {target}"
-                if say_err := run.say(f"This reached `{reached}`{moved}. To test it there:\n\n"
-                                      + uat_steps(cfg, run, r, reached)):
+                comment_slot = landing_slot(tid, "comment", obj, reached, prs)
+                comment_body = (f"{tracker.ARETE_TAG} This reached `{reached}`{moved}. To test it there:\n\n"
+                                + uat_steps(cfg, run, r, reached))
+                if say_err := tk.comment(tid, comment_body, run_id=r["id"], slot=comment_slot):
                     raise pipeline.RetryNextPoll(say_err)
         except (gh.GhError, jira.JiraError, pipeline.RetryNextPoll) as e:
             print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
@@ -375,13 +388,36 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
             return
         f.write_text(new)
         util.git_as_owner(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
-        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt)
-        for lb in labels:
-            gh.ensure_label(repo.github, lb, "0e8a16", "Trust level change proposed by arete")
+        from . import outbox
+
+        head = git(["rev-parse", "HEAD"], wt).strip()
+        lease = workspace.remote_head(repo.path, branch)
+        outbox.publish_push(
+            repo_name=repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            use_lease=True,
+            mode="branch",
+            drafted_by="outcomes",
+        )
         n = streak(repo.name)
-        gh.pr_create(repo.github, branch, base, "chore(agents): raise trust to automerge",
-                     f"The last {n} arete PRs in this repo merged with none rejected or failed in between.\n\n"
-                     "Merging this lets arete enable automerge on PRs that pass checks and review. "
-                     "Close it to keep every PR waiting for you.", labels=labels)
+        outbox.publish_pr(
+            action="create",
+            repo=repo.github,
+            name=repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            title="chore(agents): raise trust to automerge",
+            body=(f"The last {n} arete PRs in this repo merged with none rejected or failed in between.\n\n"
+                  "Merging this lets arete enable automerge on PRs that pass checks and review. "
+                  "Close it to keep every PR waiting for you."),
+            labels=labels,
+            drafted_by="outcomes",
+            retry_unknown=True,
+        )
     finally:
         workspace.remove_worktree(repo, wt)

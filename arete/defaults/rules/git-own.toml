@@ -1,0 +1,5 @@
+domain = "outbox"
+target = "git"
+audience = "self"
+drafter = "non-person"
+action = "approve"

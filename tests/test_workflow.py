@@ -1687,25 +1687,21 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertNotIn("publication_intent", ctl.data)
 
     def test_retarget_during_network_backoff_stops_the_retry_push(self):
+        from arete import outbox, send_push
+
         ctl, c, publication = self.unpushed_merge_publication()
-
-        def retarget():
-            self.prs[c.pr]["baseRefName"] = "release"
-            return True
-
-        failure = subprocess.CompletedProcess([], 1, "", "connection reset")
+        push = mock.Mock(side_effect=send_push.PushUnsure("connection reset"))
         with (mock.patch.object(workspace, "remote_head", return_value=self.head),
-              mock.patch.object(util, "wait_for_network", side_effect=retarget) as wait,
-              mock.patch.object(util, "sh", return_value=failure) as push,
-              redirect_stdout(StringIO())):
+              mock.patch.object(send_push, "push_pr_branch", side_effect=push),
+              redirect_stdout(StringIO()),
+              self.assertRaisesRegex(workspace.RunFailed, "the push to fixture/primary failed")):
             orchestration.Controller.dispatch(ctl, publication)
 
-        wait.assert_called_once_with()
         push.assert_called_once()
-        self.assertEqual(push.call_args.args[0][:2], ["git", "push"])
-        self.assert_retargeted(ctl.ending, c.pr)
         self.assertEqual(c.lease, self.head)
-        self.assertNotIn("publication_intent", ctl.data)
+        items = [it for it in outbox.list_items() if it["kind"] == "push"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["state"], "approved")
 
     def test_retarget_before_a_catch_up_push_stops_the_git_command(self):
         ctl = self.controller
@@ -3898,7 +3894,7 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
 
         pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link,
                                 measurement_section=section)
-        self.assertEqual(self.pr_text, f"{original}\n\n{section}")
+        self.assertTrue(self.pr_text.startswith(f"{original}\n\n{section.rstrip()}\n\n<!-- arete:"), self.pr_text)
 
     def test_refreshing_a_standing_pr_measurement_preserves_maintainer_notes_and_ci_stop(self):
         checkout = self.checkout
@@ -3914,10 +3910,10 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
                                           self.link, measurement_section=measurement)
 
         self.assertEqual(stopped, [checkout])
-        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_stop}")
+        self.assertTrue(self.pr_text.startswith(f"{summary}\n\n{measurement}{notes}\n\n{ci_stop}\n\n<!-- arete:"), self.pr_text)
         ci_pass = ci.section([], 0, "Checks passed.")
         pipeline.publish_ci(self.run, self.build.ticket, [checkout], ci_pass)
-        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_pass}")
+        self.assertTrue(self.pr_text.startswith(f"{summary}\n\n{measurement}{notes}\n\n{ci_pass}\n\n<!-- arete:"), self.pr_text)
 
     def test_refresh_after_repair_removes_the_disclosure_when_the_requirement_is_verified(self):
         checkout = self.checkout
@@ -3935,7 +3931,7 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
         outbox.send_due()
 
         self.assertEqual(stopped, [checkout])
-        self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
+        self.assertTrue(self.pr_text.startswith(f"{summary}\n\n{notes}\n\n{ci_stop}\n\n<!-- arete:"), self.pr_text)
         self.comment.assert_called_once()
         self.assertEqual(self.comment.call_args.args[0], checkout.pr)
         self.assertTrue(self.comment.call_args.args[1].startswith(f"Pushed more work for #7.\n\n{report}"))
@@ -3992,7 +3988,7 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
         self.pr_text = published
 
         def reruns(*_):
-            self.assertEqual(self.pr_text, ci.with_section(original, failed_ci))
+            self.assertTrue(self.pr_text.startswith(f"{ci.with_section(original, failed_ci)}\n\n<!-- arete:"), self.pr_text)
             return [gh.WorkflowRerun(456, 2, {"checks": 101})]
 
         with (mock.patch.object(pipeline, "set_draft"),
@@ -4008,7 +4004,7 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
                   self.assertRaisesRegex(ValueError, "could not update the unverified requirement")):
                 controller.publish()
             self.assertTrue(controller.data["ci_failed"])
-            self.assertEqual(self.pr_text, ci.with_section(published, failed_ci))
+            self.assertTrue(self.pr_text.startswith(f"{ci.with_section(published, failed_ci)}\n\n<!-- arete:"), self.pr_text)
             gh.gh.assert_not_called()
             controller.finish_publication.assert_not_called()
             self.assertEqual(controller.publish(), {"ending": "done"})
@@ -4601,15 +4597,15 @@ class ClosedPRPublicationTests(PublicationFixture):
         remote = lease
         pushes = []
 
-        def git(args, cwd, **kw):
+        from arete import send_push
+
+        def push_branch(cfg, *, repo_name, branch: str, head: str, lease: str = "", use_lease: bool = True, **kw):
             nonlocal remote
-            if args[0] != "push":
-                return util.git(args, cwd, **kw)
-            pushes.append(args)
+            pushes.append((repo_name, branch, lease, use_lease))
             self.assertEqual(remote, lease)
-            self.assertEqual(args, ["push", "-q", f"--force-with-lease={branch}:{lease}", "-u", "origin", branch])
-            remote = util.git(["rev-parse", "HEAD"], cwd).strip()
-            return ""
+            self.assertEqual((branch, lease, use_lease), ("arete/7-edit-fixture", remote, True))
+            remote = head
+            return head
 
         pr = "https://github.com/fixture/repo/pull/8"
         with (mock.patch.object(paths, "WORKTREES_DIR", other / "worktrees"),
@@ -4618,7 +4614,7 @@ class ClosedPRPublicationTests(PublicationFixture):
               mock.patch.object(gh, "open_pr_url", return_value=""),
               mock.patch.object(gh, "closed_pr_heads", return_value={lease}),
               mock.patch.object(workspace.record, "timed", return_value=nullcontext({})),
-              mock.patch.object(pipeline, "git", side_effect=git),
+              mock.patch.object(send_push, "push_pr_branch", side_effect=push_branch),
               mock.patch.object(pipeline, "release_workspace"),
               mock.patch.object(pipeline, "supersede_older_runs"),
               mock.patch.object(pipeline.record, "note"),
@@ -5343,17 +5339,19 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
         self.publication_job(repo, branch, verified=verify.Verified("pass"))
         controller.stamp("verify", {"verdict": "pass"})
-        push = mock.Mock(side_effect=RuntimeError("stubbed push"))
+        from arete import send_push
 
-        def git(args, cwd, **kw):
-            return push(args, cwd) if args[0] == "push" else util.git(args, cwd, **kw)
+        push = mock.Mock(side_effect=send_push.PushError("stubbed push"))
 
         with (mock.patch.object(workspace, "remote_head", return_value=c.lease),
-              mock.patch.object(pipeline, "git", side_effect=git),
+              mock.patch.object(send_push, "push_pr_branch", side_effect=push),
               self.assertRaisesRegex(workspace.RunFailed, "the push to fixture/repo failed")):
             controller.dispatch(self.action)
-        push.assert_called_once_with(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch],
-                                     self.root)
+        push.assert_called_once()
+        self.assertEqual(
+            (push.call_args.kwargs["branch"], push.call_args.kwargs["lease"], push.call_args.kwargs["use_lease"]),
+            (branch, c.lease, True),
+        )
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
@@ -5948,12 +5946,12 @@ class CatchUpRepairFixture(PublicationFixture):
 
             self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve))
 
-        def git(args, cwd, **kw):
-            if args[0] != "push":
-                return util.git(args, cwd, **kw)
-            self.head = self.git("rev-parse", "HEAD")
-            self.pushes.append(self.head)
-            return ""
+        from arete import send_push
+
+        def push_branch(cfg, *, head, **kw):
+            self.head = head
+            self.pushes.append(head)
+            return head
 
         def ci_watch(target, _log):
             if not self.ci_heads:
@@ -5987,8 +5985,8 @@ class CatchUpRepairFixture(PublicationFixture):
             self.labels.update(add)
 
         patches = {
-            pipeline: {"git": mock.Mock(side_effect=git),
-                       "run_checks": mock.Mock(side_effect=check, wraps=pipeline.run_checks),
+            send_push: {"push_pr_branch": mock.Mock(side_effect=push_branch)},
+            pipeline: {"run_checks": mock.Mock(side_effect=check, wraps=pipeline.run_checks),
                        "check_in_use": mock.Mock(side_effect=verification), "_review": mock.Mock(side_effect=review),
                        "release_workspace": mock.DEFAULT},
             workspace: {"fetch": mock.DEFAULT, "remote_head": mock.Mock(side_effect=lambda *_: self.head)},
@@ -8582,8 +8580,9 @@ class MeasurementCatchUpPublicationTests(MovedBasePublicationFixture, unittest.T
         section = pipeline.unverified_measurement_section(disclosure)
         example = f"```markdown\n{section}```"
         retained = section if unmeasured else ""
-        self.assertEqual(body, f"Closes #7\n\n## Checked in use\n\n{checked}\n\n{retained}{notes}\n\n"
+        expected_body = (f"Closes #7\n\n## Checked in use\n\n{checked}\n\n{retained}{notes}\n\n"
                          f"{lookalike}\n\n{review.markdown().rstrip()}\n\n{example}\n\n{ci_text}")
+        self.assertTrue(body.startswith(f"{expected_body}\n\n<!-- arete:"), body)
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
@@ -12941,14 +12940,17 @@ class MinerLifecycleTests(unittest.TestCase):
         self.diff.return_value = staged
         self.eval.return_value = evals.Comparison("")
 
+        from arete import send_push
+
         def apply_git(args, cwd, **kwargs):
-            if cwd == wt:
-                if args == ["rev-parse", "HEAD"]:
-                    return self.UPDATED
-                self.assertEqual(args, ["push", "-q", "--force-with-lease", "-u", "origin", self.BRANCH])
-                self.head = self.UPDATED
-                return ""
+            if cwd == wt and args == ["rev-parse", "HEAD"]:
+                return self.UPDATED
             return self.git(args, cwd, **kwargs)
+
+        def push_branch(cfg, *, repo_name, branch, head, lease="", use_lease=True, **kw):
+            self.assertEqual((branch, head, use_lease), (self.BRANCH, self.UPDATED, True))
+            self.head = head
+            return head
 
         with (
             mock.patch.multiple(gh, open_pr_url=mock.Mock(return_value=""), prs=mock.Mock(return_value=[]),
@@ -12957,7 +12959,8 @@ class MinerLifecycleTests(unittest.TestCase):
                                 remove_worktree=mock.DEFAULT, remote_head=mock.Mock(return_value=self.HEAD)),
             mock.patch.object(miner, "miner_branch", return_value=self.BRANCH),
             mock.patch.object(miner, "apply_in", return_value=Result(ok=True)),
-            mock.patch.object(miner, "git", side_effect=apply_git) as git,
+            mock.patch.object(miner, "git", side_effect=apply_git),
+            mock.patch.object(send_push, "push_pr_branch", side_effect=push_branch) as pushed_branch,
             mock.patch.object(diffguard, "stage", return_value=staged),
             mock.patch.object(util, "git_records", return_value=["M", relative]),
             mock.patch.object(util, "git_as_owner") as commit,
@@ -12968,8 +12971,7 @@ class MinerLifecycleTests(unittest.TestCase):
             self.assertEqual(self.run_miner(proposals=[proposal], apply_repo=miner.apply_repo), 0)
             commit.assert_called_once()
             self.assertEqual(commit.call_args.args[1], wt)
-            self.assertIn(mock.call(["push", "-q", "--force-with-lease", "-u", "origin", self.BRANCH], wt, timeout=300),
-                          git.call_args_list)
+            pushed_branch.assert_called_once()
             owner = miner.workspace.make_worktree.call_args.kwargs["owner"]
             miner.workspace.remove_worktree.assert_called_once_with(self.repo, wt, owner=owner)
             gh.pr_create.assert_called_once()

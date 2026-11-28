@@ -653,6 +653,7 @@ def _outbox_items(c) -> list[dict]:
         detail = {
             "outbox_id": ob_id,
             "id": row["id"],
+            "legacy_approval": row.get("legacy_approval"),
             "rev": row["rev"],
             "version": row["version"],
             "state": row["state"],
@@ -1598,14 +1599,21 @@ def resolve(
             stored_answer = verb
         elif prefix == "outbox":
             from . import outbox
+            from .store import outbox as outbox_store
 
             ob_id = int(ident)
+            raw_ob = outbox_store.get_raw(ob_id)
             if verb == "approve":
                 if outbox.needs_presence("outbox.approve", ob_id) and not allow_legacy_auth:
                     if credential is None or credential.kind != "session":
                         raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required")
-                rev = item["detail"].get("rev")
-                handler_result = outbox.approve(ob_id, rev=rev)
+                if raw_ob is not None and raw_ob["state"] == "failed":
+                    handler_result = outbox.retry(ob_id)
+                else:
+                    if raw_ob is not None and raw_ob["audience"] != "self" and raw_ob["opened_at"] is None:
+                        outbox.open(ob_id)
+                    rev = item["detail"].get("rev")
+                    handler_result = outbox.approve(ob_id, rev=rev)
                 resolution = "approved"
             else:
                 handler_result = outbox.reject(ob_id, reason=str(reason or answer or ""))

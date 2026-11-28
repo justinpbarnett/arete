@@ -1,0 +1,5 @@
+domain = "outbox"
+target = "jira"
+audience = "self"
+drafter = "non-person"
+action = "approve"
