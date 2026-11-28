@@ -25626,3 +25626,318 @@ assert matches == [], f"forbidden DELETE SQL found in: {matches}"
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class TopBarShellTests(unittest.TestCase):
+    def test_topbar_assets_served_and_safe(self):
+        db.migrate()
+        principals.seed_owner("fixture@example.test")
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-topbar.js"
+        css_path = web / "ui-topbar.css"
+        js_text = js_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-topbar.js", served)
+        self.assertIn("/ui-topbar.css", served)
+        self.assertEqual(served["/ui-topbar.js"][0], js_path.read_bytes())
+        self.assertEqual(served["/ui-topbar.css"][0], css_path.read_bytes())
+        for path, expected in (("/ui-topbar.js", js_path.read_bytes()), ("/ui-topbar.css", css_path.read_bytes())):
+            status, _, body = VersionedApiTests.wire_exchange("GET", path, {}, b"")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, expected)
+        self.assertIn("/api/v1/screens/shell", js_text)
+        for forbidden in ("setInterval", "LIVE_MS", "style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, css_text)
+
+    def test_topbar_renders_and_updates_on_stream_events(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { setTimeout as delay } from "node:timers/promises";
+
+            const streams = [];
+            class Source {
+              static CLOSED = 2;
+              constructor(url) {
+                this.url = new URL(url, "http://dashboard.test");
+                this.readyState = 0;
+                this.handlers = new Map();
+                streams.push(this);
+              }
+              addEventListener(kind, handler) { this.handlers.set(kind, handler); }
+              open() { this.readyState = 1; this.onopen(); }
+              close() { this.readyState = Source.CLOSED; }
+              send(event, frame = "message", id = event.id) {
+                const handle = frame === "message" ? this.onmessage : this.handlers.get(frame);
+                handle({ data: JSON.stringify(event), lastEventId: id });
+              }
+            }
+            const locks = {
+              request(_name, { signal }, use) {
+                return signal.aborted ? Promise.resolve() : use();
+              },
+            };
+            Object.defineProperty(globalThis, "navigator", { value: { locks } });
+            globalThis.EventSource = Source;
+            globalThis.document = new EventTarget();
+            globalThis.addEventListener = () => {};
+            globalThis.setInterval = () => 0;
+
+            const fetches = [];
+            const lines = [
+              { id: "arete", name: "arete", repo: "arete", runs_going: 2, stations: [{ name: "plan", state: "waiting", wip: 1 }] },
+              { id: "trailhead", name: "trailhead", repo: "trailhead", runs_going: 1, stations: [{ name: "plan", state: "running", wip: 1 }] },
+              { id: "protolearn", name: "protolearn", repo: "protolearn", runs_going: 0, stations: [] },
+              { id: "repair", name: "repair", repo: "repair", runs_going: 0, stations: [{ name: "verify", state: "fault", wip: 0 }] },
+              { id: "upkeep", name: "upkeep", repo: "upkeep", runs_going: 0, stations: [{ name: "run", state: "fault", wip: 0 }] },
+              { id: "bugbash", name: "bugbash", repo: "bugbash", runs_going: 1, stations: [{ name: "build", state: "running", wip: 1 }] },
+              { id: "research", name: "research", repo: "research", runs_going: 1, stations: [{ name: "study", state: "running", wip: 1 }] },
+              { id: "workshop", name: "workshop", repo: "workshop", runs_going: 0, paused: true, stations: [] },
+            ];
+            const inboxItems = [
+              { id: "TR-1", priority: 1, state: "open", line: "arete", title: "T-109 stopped" },
+              { id: "TR-2", priority: 1, state: "open", line: "trailhead", title: "CAMP-412 question" },
+              { id: "TR-3", priority: 1, state: "open", line: "protolearn", title: "ASANA_TOKEN missing" },
+              ...Array.from({ length: 7 }, (_, i) => ({ id: `TR-${i + 4}`, priority: 2, state: "open", line: "trailhead", title: `Med ${i}` })),
+            ];
+            globalThis.fetch = async (url) => {
+              const path = new URL(url, "http://dashboard.test").pathname;
+              fetches.push(path);
+              if (path === "/api/v1/screens/shell") {
+                return Response.json({ seq: "1.10", now: "2026-11-28T13:00:00Z", zone: "REACTIVE",
+                  andon: { count: 10, high: 3, med: 7, low: 3, standing: 13, limit: 10, aim: 5, zone: "REACTIVE", why: "13 standing, limit 10" } });
+              }
+              if (path === "/api/v1/screens/floor") {
+                return Response.json({ seq: "1.10", lines, live: [] });
+              }
+              if (path === "/api/v1/inbox") {
+                return Response.json({ seq: "1.10", items: inboxItems });
+              }
+              if (path === "/api/v1/screen") {
+                return Response.json({ seq: "1.10", sidebar: { running: 6, needs_you: 10, health: "ok", serve: { at: "2026-11-28T13:00:00Z", age_seconds: 3, alive: true } },
+                  asks: { asks: [] }, view: { live: { rows: { slots: 6, max_parallel: 8, runs: [] } } } },
+                  { headers: { "Arete-Seq": "1.10" } });
+              }
+              return Response.json({ error: "not found" }, { status: 404 });
+            };
+
+            const uiLive = await import("./arete/web/ui-live.js");
+            const topbar = await import("./arete/web/ui-topbar.js");
+
+            function textOf(node) {
+              if (node == null || typeof node === "boolean") return "";
+              if (typeof node === "string" || typeof node === "number") return String(node);
+              if (Array.isArray(node)) return node.map(textOf).join("");
+              return textOf(node.props?.children);
+            }
+            function* walk(node) {
+              if (Array.isArray(node)) { for (const c of node) yield* walk(c); }
+              else if (node && typeof node === "object") { yield node; yield* walk(node.props?.children); }
+            }
+
+            const feed = uiLive.live("floor");
+            const unsub = topbar.connectTopbar();
+            await topbar.loadTopbar();
+            for (let i = 0; i < 50 && !streams.length; i++) await delay(1);
+            assert.equal(streams.length, 1);
+            streams[0].open();
+
+            const renderBar = (screen = "floor", path = []) => {
+              const bar = new topbar.TopBar();
+              return bar.render({
+                route: { screen, path, hash: `#${screen}`, active: screen },
+                snapshot: { slots: 6, capacity: 8, serve: { at: "2026-11-28T13:00:00Z", age_seconds: 3, alive: true }, received: 1000 },
+                now: 1000,
+                runs: {},
+                page: { title: screen === "triage" ? "Triage" : "Floor" },
+              });
+            };
+
+            const initial = renderBar();
+            const nodes = [...walk(initial)];
+            const zoneEl = nodes.find((n) => n.props?.class === "topbar-zone");
+            assert.equal(textOf(zoneEl), "REACTIVE");
+            assert.equal(zoneEl.props.title, "13 standing, limit 10");
+            const cells = nodes.filter((n) => n.props?.["data-act"] === "strip");
+            assert.equal(cells.length, 8);
+            assert.ok(cells[0].props.class.includes("ny"));
+            assert.ok(cells[3].props.class.includes("fault"));
+            assert.ok(cells[5].props.class.includes("run"));
+            assert.ok(cells[7].props.class.includes("idle"));
+            assert.equal(textOf(nodes.find((n) => n.props?.["data-slots"] === "")), "● 6 of 8 running");
+            assert.equal(textOf(nodes.find((n) => n.props?.["data-beat"] === "")), "beat 3s");
+            assert.match(textOf(nodes.find((n) => n.props?.["data-act"] === "palette")), /Command.*⌘K/);
+            const chip = nodes.find((n) => n.props?.["data-act"] === "andon");
+            assert.equal(chip.props.href, "#triage");
+            assert.equal(textOf(chip), "◆ 10 need you · 3 high · 7 med");
+
+            assert.equal(cells[0].props.href, "#floor");
+            cells[0].props.onClick();
+            assert.equal(topbar.selectedLine.value, "arete");
+
+            const fetchesBeforeEvent = fetches.length;
+            streams[0].send({
+              id: "1.11",
+              kind: "inbox.raised",
+              subject: "inbox:99",
+              data: { id: "TR-99", priority: 1, state: "open", line: "workshop", title: "Urgent check" },
+            });
+            assert.equal(fetches.length, fetchesBeforeEvent);
+            const afterRaise = [...walk(renderBar())];
+            assert.equal(textOf(afterRaise.find((n) => n.props?.["data-act"] === "andon")), "◆ 11 need you · 4 high · 7 med");
+            const workshopCell = afterRaise.find((n) => n.props?.["data-line"] === "workshop");
+            assert.ok(workshopCell.props.class.includes("ny"));
+
+            streams[0].send({
+              id: "1.12",
+              kind: "inbox.resolved",
+              subject: "inbox:99",
+              data: { id: "TR-99", priority: 1, state: "resolved" },
+            });
+            const afterResolve = [...walk(renderBar())];
+            assert.equal(textOf(afterResolve.find((n) => n.props?.["data-act"] === "andon")), "◆ 10 need you · 3 high · 7 med");
+
+            streams[0].send({
+              id: "1.13",
+              kind: "line.changed",
+              subject: "line:workshop",
+              data: { fields: { paused: { before: true, after: false } } },
+            });
+            assert.equal(topbar.topbarState.value.lines.find((l) => l.id === "workshop").paused, false);
+
+            const triageBar = [...walk(renderBar("triage", ["ask", "TR-201"]))];
+            assert.match(textOf(triageBar.find((n) => n.props?.class === "topbar-crumbs")), /Arete\\/Triage\\/TR-201/);
+
+            unsub();
+            uiLive.stop();
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class RunWaterfallTests(unittest.TestCase):
+    def test_run_waterfall_asset_served_and_safe(self):
+        db.migrate()
+        principals.seed_owner("fixture@example.test")
+        root = Path(__file__).resolve().parents[1]
+        js_path = root / "arete" / "web" / "ui-run-waterfall.js"
+        js_text = js_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-run-waterfall.js", served)
+        self.assertEqual(served["/ui-run-waterfall.js"][0], js_path.read_bytes())
+        status, _, body = VersionedApiTests.wire_exchange("GET", "/ui-run-waterfall.js", {}, b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, js_path.read_bytes())
+        for needle in ("/steps", "eta", "band"):
+            self.assertIn(needle, js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+
+    def test_run_waterfall_bands_eta_live_updates_and_queue_regroup(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            globalThis.location = { hash: "#run/pip-live-1", replace() {} };
+            const wf = await import("./arete/web/ui-run-waterfall.js");
+            const uiRun = await import("./arete/web/ui-run.js");
+
+            function textOf(node) {
+              if (node == null || typeof node === "boolean") return "";
+              if (typeof node === "string" || typeof node === "number") return String(node);
+              if (Array.isArray(node)) return node.map(textOf).join("");
+              return textOf(node.props?.children);
+            }
+            function* walk(node) {
+              if (Array.isArray(node)) { for (const c of node) yield* walk(c); }
+              else if (node && typeof node === "object") { yield node; yield* walk(node.props?.children); }
+            }
+
+            const t0 = Date.parse("2026-11-28T15:00:00Z");
+            const now = t0 + 10 * 60 * 1000;
+            const run = { id: "pip-live-1", status: "running", started: "2026-11-28T15:00:00Z", finished: null };
+            const apiSteps = [
+              { id: 1, name: "prepare", node: "prepare", try: 1, status: "done", seconds: 60, cost_usd: 0, model: "", queued_at: "2026-11-28T15:00:00Z", band: [30, 90] },
+              { id: 2, name: "plan", node: "plan", try: 1, status: "done", seconds: 240, cost_usd: 0.62, model: "claude-opus", turns: 23, queued_at: "2026-11-28T15:01:00Z", band: [180, 360] },
+              { id: 3, name: "implement", node: "implement", try: 1, status: "running", seconds: 300, cost_usd: 0.43, model: "claude-sonnet", turns: 12, queued_at: "2026-11-28T15:05:00Z", band: [300, 900] },
+              { id: 4, name: "checks", node: "checks", try: 1, status: "queued", seconds: 0, queued_at: null, band: [120, 240] },
+              { id: 5, name: "verify", node: "verify", try: 1, status: "queued", seconds: 0, queued_at: null, band: [360, 720] },
+              { id: 6, name: "review", node: "review", try: 1, status: "queued", seconds: 0, queued_at: null, band: [240, 480] },
+              { id: 7, name: "learn", node: "learn", try: 1, status: "queued", seconds: 0, queued_at: null, band: [60, 90] },
+              { id: 8, name: "pr", node: "pr", try: 1, status: "queued", seconds: 0, queued_at: null, band: [20, 50] },
+              { id: 9, name: "publish", node: "publish", try: 1, status: "queued", seconds: 0, queued_at: null, band: [10, 30] },
+            ];
+            const { steps } = wf.mergeSteps(apiSteps, [], []);
+            const calc = wf.computeWaterfall({ run, steps, eta: null, etaPartial: false, liveTurns: {}, now });
+            assert.equal(calc.rows.length, 9);
+            assert.equal(calc.activeStep, "implement");
+            assert.equal(calc.activeIndex, 3);
+            assert.equal(calc.activeBandWord, "NORMAL");
+            assert.ok(calc.nowX != null && calc.nowX > 0 && calc.nowX < 1000);
+            assert.match(calc.etaText, /^ETA \\d\\d:\\d\\d · about \\d+ min left$/);
+            const implRow = calc.rows[2];
+            assert.equal(implRow.bar.cls, "run");
+            assert.ok(implRow.bandBox && implRow.bandBox.width > 0);
+            assert.ok(implRow.estBox && implRow.estBox.width > 0);
+            const checksRow = calc.rows[3];
+            assert.equal(checksRow.bar, null);
+            assert.equal(checksRow.projectedSec, 180);
+            assert.ok(checksRow.bandBox && checksRow.estBox);
+            assert.ok(calc.rows[4].estBox.x >= checksRow.estBox.x + checksRow.estBox.width - 1);
+
+            const later = now + 15 * 60 * 1000;
+            const grown = wf.computeWaterfall({ run, steps, eta: null, etaPartial: false, liveTurns: {}, now: later });
+            assert.ok(grown.rows[2].elapsedSec > implRow.elapsedSec);
+            assert.equal(grown.activeBandWord, "SLOW");
+            assert.notEqual(grown.etaMs, calc.etaMs);
+
+            const colorSteps = wf.mergeSteps([
+              { id: 1, name: "a", status: "done", seconds: 30, queued_at: "2026-11-28T15:00:00Z" },
+              { id: 2, name: "b", status: "waiting", seconds: 45, queued_at: "2026-11-28T15:00:30Z" },
+              { id: 3, name: "c", status: "fault", seconds: 20, queued_at: "2026-11-28T15:01:15Z" },
+            ], [], []).steps;
+            const colorCalc = wf.computeWaterfall({ run, steps: colorSteps, now });
+            assert.deepEqual(colorCalc.rows.map((r) => r.bar.cls), ["done", "ny", "fault"]);
+
+            let state = { apiSteps, summarySteps: [], eta: null, etaPartial: false, liveTurns: {}, selectedKey: "", activeKey: "id:3" };
+            state = wf.applyWaterfallEvent(state, { kind: "turn.appended", data: { run: "pip-live-1", step: "implement" } }, "pip-live-1", now);
+            const withTurn = wf.computeWaterfall({ run, steps: wf.mergeSteps(state.apiSteps, [], []).steps, liveTurns: state.liveTurns, now });
+            assert.equal(withTurn.rows[2].turns, 13);
+
+            state = wf.applyWaterfallEvent(state, { kind: "step.ended", subject: "step:pip-live-1/implement/1", data: { run: "pip-live-1", step: "implement", try: 1, result: "pass", seconds: 610, cost_usd: 0.91, turns: 18 } }, "pip-live-1", now);
+            state = wf.applyWaterfallEvent(state, { kind: "step.started", subject: "step:pip-live-1/checks/1", data: { run: "pip-live-1", step: "checks", try: 1 } }, "pip-live-1", now + 1000);
+            const nextCalc = wf.computeWaterfall({ run, steps: wf.mergeSteps(state.apiSteps, [], []).steps, liveTurns: {}, now: now + 5000 });
+            assert.equal(nextCalc.rows[2].status, "done");
+            assert.equal(nextCalc.activeStep, "checks");
+            assert.equal(nextCalc.activeIndex, 4);
+
+            const comp = new wf.RunWaterfall({ view: { id: "pip-live-1", detail: { run }, events: [] }, now, reduceSteps: uiRun.reduceSteps });
+            comp.state = { ...comp.state, apiSteps };
+            const fullTree = comp.render({ view: { id: "pip-live-1", detail: { run }, events: [] }, now, reduceSteps: uiRun.reduceSteps }, comp.state);
+            const fullNodes = [...walk(fullTree)];
+            assert.match(textOf(fullNodes.find((n) => n.props?.class === "wf-legend")), /normal range shaded · estimate dashed/);
+            const headers = fullNodes.filter((n) => n.props?.role === "columnheader").map(textOf);
+            assert.deepEqual(headers, ["Step", "State", "Time", "Took", "Cost", "Model", "Turns"]);
+            const selectedRows = fullNodes.filter((n) => n.props?.["data-selected"] === "true");
+            assert.equal(selectedRows.length, 1);
+            assert.equal(selectedRows[0].props["data-step"], "implement");
+
+            const compactTree = comp.render({ view: { id: "pip-live-1", detail: { run }, events: [] }, now, compact: true, reduceSteps: uiRun.reduceSteps }, comp.state);
+            const compactHeaders = [...walk(compactTree)].filter((n) => n.props?.role === "columnheader").map(textOf);
+            assert.deepEqual(compactHeaders, ["Step", "State", "Time", "Took", "Cost"]);
+
+            assert.equal(uiRun.groupOf("running"), "Running");
+            assert.equal(uiRun.groupOf("waiting"), "Waiting on you");
+            assert.equal(uiRun.groupOf("needs-info"), "Waiting on you");
+            assert.equal(uiRun.groupOf("failed"), "Fault");
+            assert.equal(uiRun.groupOf("pr"), "Done");
+
+            uiRun.applyQueue({ queue: [{ id: "pip-live-1", status: "running", summary: "Live" }] });
+            const q1 = new uiRun.RunQueue().render({ shown: "pip-live-1", more: false });
+            assert.equal([...walk(q1)].find((n) => n.props?.["data-item"] === "pip-live-1").props["data-group"], "Running");
+            uiRun.applyQueue({ queue: [{ id: "pip-live-1", status: "pr", summary: "Live" }] });
+            const q2 = new uiRun.RunQueue().render({ shown: "pip-live-1", more: false });
+            assert.equal([...walk(q2)].find((n) => n.props?.["data-item"] === "pip-live-1").props["data-group"], "Done");
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+

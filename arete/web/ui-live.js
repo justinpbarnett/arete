@@ -11,6 +11,11 @@ const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
 const cache = { sidebar: null, live: null, questions: null, serve: null, heartbeatAt: 0, errors: {}, failures: 0, settled: false };
 export const screenReads = signal({});
+const streamListeners = new Set();
+export function onStreamEvent(listener) {
+  streamListeners.add(listener);
+  return () => streamListeners.delete(listener);
+}
 let active;
 let feed;
 let transport = null;
@@ -523,6 +528,9 @@ function applyEvent(run, event, includeBoard = true) {
 }
 
 function update(event) {
+  for (const listener of streamListeners) {
+    try { listener(event); } catch {}
+  }
   const run = active;
   if (!run) return;
   if (event.kind === "reset") {
