@@ -53,6 +53,7 @@ from .pipeline import (
 from .slots import slots_free_to_start
 from .store import asks as ask_store
 from .store import db
+from .store import feedback as feedback_store
 from .store import insights as insights_store
 from .store import orchestration as orchestration_store
 from .store import runs as run_store
@@ -61,6 +62,8 @@ from .store import specs as spec_store
 
 MAX_STARTS_PER_POLL = 64
 FEEDBACK_PICK = "revising the PR for your review comments"
+TICKET_FEEDBACK_PICK = "addressing authorized ticket feedback"
+CLARIFICATION_WAIT = "waiting for an authorized product clarification in the ticket thread"
 SECRET_ASK_REPLY = "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
 
 
@@ -70,6 +73,7 @@ class Pick:
     why: str
     from_queue: bool = False
     from_feedback: bool = False
+    from_ticket_feedback: bool = False
 
 
 def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
@@ -118,6 +122,9 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
                 continue
             if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
+                continue
+            if feedback_store.has_open_clarification(repo.name, tid):
+                skips.note(tracker.ticket_name(repo.name, t.ref), t, CLARIFICATION_WAIT, repo.name)
                 continue
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
@@ -173,6 +180,9 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
     for tid in feedback_due:
         if ordinary_history(tid):
             return Pick(tid, FEEDBACK_PICK, from_feedback=True)
+    for tid in feedback_store.tickets_needing_worker(repo.name):
+        if ordinary_history(tid):
+            return Pick(tid, TICKET_FEEDBACK_PICK, from_ticket_feedback=True)
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -424,6 +434,11 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         skips.note(name, tracker.Ticket(str(tid), source.ref(tid), ""), owned, repo.name)
         return "skipped"
     ticket = source.get(tid)
+    if pick.from_ticket_feedback and not ticket.open:
+        return "skipped"
+    if feedback_store.has_open_clarification(repo.name, str(tid)):
+        skips.note(name, ticket, CLARIFICATION_WAIT, repo.name)
+        return "blocked"
     claim = (spec_store.find(repo.name, str(tid), identity=ticket.spec_identity)
              if not isinstance(source, tracker.LocalTracker) else {})
     if claim or ticket.is_spec:
@@ -436,7 +451,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             skips.note(name, ticket, why, repo.name)
             return "blocked"
         if claim and (claim["state"] in ("evidenced", "complete")
-                      or claim["state"] == "published" and not pick.from_feedback):
+                      or claim["state"] == "published" and not (pick.from_feedback or pick.from_ticket_feedback)):
             return "skipped"
     continues = ""
     held_feedback = False
@@ -472,6 +487,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         mode = ("orchestrate" if ticket.is_spec else pipeline.recorded_path(answered["id"]) if answered
                  else pipeline.dispatch_path(repo, str(tid)))
         fresh_feedback = mode in (pipeline.ORCHESTRATED, "orchestrate")
+    if pick.from_ticket_feedback and not held and not dry_run and feedback_store.pending_worker_comments(repo.name, tid):
+        fresh_feedback = True
     blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
         repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or (ticket.blocker if ticket.is_spec else source.blocker(tid)) or reply

@@ -26,7 +26,8 @@ def config_snapshot() -> bytes | None:
 
 def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr",
            unattended_environment: str = "none", destination: str = "", jira_project: str = "",
-           jira_label: str = "", pipeline: bool = False, choose_project=None, staging_profile: Path | None = None) -> config.Repo:
+           jira_label: str = "", pipeline: bool = False, choose_project=None, staging_profile: Path | None = None,
+           commenters: tuple[str, ...] | list[str] = ()) -> config.Repo:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
         raise Refused("Use a repo name containing letters, numbers, hyphens or underscores.")
     checkout = paths.expand(checkout).resolve()
@@ -49,9 +50,13 @@ def enroll(name: str, checkout: Path, *, target_branch: str, landing: str = "pr"
         raise Refused("GitHub issues and PR delivery need a github.com origin remote.")
     if destination != "jira" and (jira_project or jira_label):
         raise Refused("A Jira project or route label requires the Jira tracker.")
+    if destination != "github" and commenters:
+        raise Refused("A commenter allowlist applies to GitHub tracker repositories.")
     row = {"name": name, "path": str(checkout), "github": github, "tracker": destination,
            "target_branch": target_branch, "landing": landing, "unattended_environment": unattended_environment,
            "pipeline": pipeline}
+    if commenters:
+        row["commenters"] = list(commenters)
     config.repo_table(row)
     if destination == "jira":
         project = jira_project or cfg.jira.project
@@ -109,6 +114,7 @@ def show(cfg: config.Config, repo: config.Repo) -> dict:
     grant = release_profile.standing_status(repo, profile)
     return {"name": repo.name, "destination": destination, **({"staging_profile": profile["settings"]} if profile else {}),
             **({"standing_production": grant} if grant else {}),
+            **({"commenters": list(repo.commenters)} if repo.commenters else {}),
             "target_branch": {"value": repo.target_branch or layer.base_branch or None,
                               "source": "repo" if repo.target_branch else "legacy"},
             "landing": {"value": repo.landing or None, "source": "repo" if repo.landing else "legacy",

@@ -403,6 +403,17 @@ class Controller(worker_turns.WorkerTurns):
             self.run.story.append(feedback)
             self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
+        ticket_fb = getattr(self.run, "ticket_feedback", None)
+        known_ticket_fb = {(f["tracker"], f["comment_id"]) for f in self.data.get("ticket_feedback", [])}
+        fresh_ticket_fb = ([f for f in ticket_fb if (f["tracker"], f["comment_id"]) not in known_ticket_fb]
+                           if isinstance(ticket_fb, list) else [])
+        if fresh_ticket_fb:
+            from . import ticket_feedback as tf
+
+            self.data.setdefault("ticket_feedback", []).extend(fresh_ticket_fb)
+            ticket_md = tf.worker_instructions_markdown(fresh_ticket_fb)
+            self.run.story.append(ticket_md)
+            self.data["goal_base"] += f"\n\nAddress each authorized ticket-thread correction:\n{ticket_md}"
         answers = [a for a in self.run.answers_due or [] if not a.get("call", "").startswith("requirements.")]
         if answers:
             answer = owner_asks.fresh_note(answers)
@@ -626,6 +637,25 @@ class Controller(worker_turns.WorkerTurns):
         run_lines.write(self.run.id, "requirements", previous=previous, current=current,
                         superseded=self.data["superseded_actions"])
         return None
+
+    def refresh_amended_scope(self) -> bool:
+        prepared = self.data.get("prepared")
+        if not prepared or self.workers:
+            return False
+        ending = self.refresh_requirements(prepared, ledger.catch_up_push(self.data))
+        if ending:
+            self.ending = ending
+            return False
+        ticket = tracker.Ticket(**prepared["ticket"])
+        self.job.ticket = ticket
+        if getattr(self.job, "b", None) is not None:
+            self.job.b.ticket = ticket
+        self.job.approval = prepared.get("approval")
+        self.catalog.refresh_context()
+        self.acceptance_goal()
+        self.acceptance_stamp()
+        self.persist()
+        return True
 
     def candidate_scope(self, worker):
         if not self.data.get("prepared"):
@@ -1783,6 +1813,15 @@ class Controller(worker_turns.WorkerTurns):
                             exchange.cancel(self.lease, worker.logical_id, key, reason)
                         else:
                             ledger.transition(self.lease, key, "cancelled", {"reason": reason, "usage_unknown": False})
+                        if self.data.get("prepared") and spec_amendments.before_acceptance(self.run, ticket):
+                            self.data["scope_needs_refresh"] = reason
+                            ledger.save(self.lease, self.data)
+                            changed = True
+                            continue
+                        if spec_graph_delivery.PARENT_AMENDMENT_HOLD in reason:
+                            self.ending = ("interrupted", reason, "")
+                            changed = True
+                            continue
                         raise workspace.RunFailed(reason)
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if self.exchanged:
@@ -2004,7 +2043,7 @@ class Controller(worker_turns.WorkerTurns):
             if catch_up:
                 for c in changed:
                     pipeline.publish_gate_evidence(self.run, self.job.ticket, c, self.job.verified, self.job.review)
-        failure = self.publication_ci(changed) if self.run.repo.parts else None
+        failure = self.publication_ci(changed) if self.run.repo.parts and not flows.direct_push_info(self.job) else None
         if publication:
             publication.recheck(during="before recording publication")
             self.data["publication"] = outcome.data
@@ -3085,11 +3124,23 @@ class Controller(worker_turns.WorkerTurns):
                     return ended
             while not self.ending:
                 self.collect()
+                if self.ending:
+                    break
                 if reason := self.data.get("scope_needs_refresh"):
                     if self.workers:
                         time.sleep(0.05)
                         continue
+                    if self.refresh_amended_scope():
+                        continue
+                    if self.ending:
+                        break
                     return "failed", f"{reason}; resume to verify the current ticket", ""
+                if (not self.workers and self.data.get("prepared")
+                        and spec_amendments.before_acceptance(self.run, self.job.ticket)):
+                    if self.refresh_amended_scope():
+                        continue
+                    if self.ending:
+                        break
                 pending = [a for a in ledger.actions(self.lease) if a["state"] == "accepted" and not ledger.queued_start(a)]
                 if not pending:
                     if self.exchanged:

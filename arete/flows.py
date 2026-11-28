@@ -604,6 +604,7 @@ class Job:
     sibling_pr_inputs: list[pr_recovery.Inputs] = field(default_factory=list)
     pr_recovery_ci: bool = False
     recovery_publication: pr_recovery.Publication | None = None
+    direct_push: dict[str, dict] = field(default_factory=dict)
 
     @property
     def requires_behavior_on_block(self) -> bool:
@@ -877,6 +878,7 @@ class Job:
         self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
         self.b.committed_lines = data["committed_lines"]
         self.committed = bool(data.get("committed", True))
+        self.direct_push = dict(data.get("direct_push") or {})
         if stored:
             for c in self.picked(self.changed):
                 head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
@@ -1519,6 +1521,11 @@ def documents(job: Job) -> bool:
     return config.document_for(job.cfg, job.run.repo, job.layer).enabled
 
 
+def direct_push_info(job) -> dict:
+    value = getattr(job, "direct_push", None)
+    return value if isinstance(value, dict) else {}
+
+
 def deliver(flow: factory.Flow) -> tuple[str, str, str]:
     job: Job = flow.ctx
     ws = str(job.ws)
@@ -1527,9 +1534,12 @@ def deliver(flow: factory.Flow) -> tuple[str, str, str]:
         step(flow, "document", tree=ws)
     if job.run.dry_run:
         return end_dry_run(flow)
-    for name, kw in [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]:
-        if not (outcome := step(flow, name, **kw)).passed:
-            break
+    outcome = step(flow, "pr", tree=ws)
+    if outcome.passed:
+        if job.run.repo.parts and not direct_push_info(job):
+            outcome = step(flow, "ci", tree=ws)
+        if outcome.passed:
+            outcome = step(flow, "publish")
     return ended(flow, outcome)
 
 
@@ -1665,10 +1675,12 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None, *, check
 
 
 def publication_outcome(job: Job, staged, summary, committed, draft_why="", report_body="", opened=(), pushed=(),
-                        found=(), drafted=(), ci_stopped=()) -> Outcome:
+                        found=(), drafted=(), ci_stopped=(), direct_push: dict[str, dict] | None = None) -> Outcome:
     from .store.orchestration import digest
     graph = job.ticket.body[len(job.ticket.graph_body) + 2:] if isinstance(getattr(job.ticket, "graph_body", None), str) else ""
-    data = {**({"graph_contract": digest(graph)} if graph else {}), "summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
+    data = {**({"graph_contract": digest(graph)} if graph else {}),
+            **({"direct_push": direct_push} if direct_push else {}),
+            "summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
             "opened": [c.github for c in opened], "pushed": [c.github for c in pushed], "draft_why": draft_why,
             "changed": [c.github for c in staged.changed], "report_body": report_body,
             "committed_lines": job.b.committed_lines, "heads": {c.github: c.lease for c in staged.changed},
@@ -1758,6 +1770,47 @@ def require_environment_owner_clear(job: Job) -> None:
         raise factory.Refused("owner feedback took over the held PR before publication")
 
 
+def uses_direct_push(job: Job, found: list[workspace.Checkout]) -> bool:
+    run = job.run
+    return (run.repo.landing == "direct-push" and not found and not job.recovery_publication
+            and not run.feedback and not run.repairs and not pilot.is_pilot_task(str(run.tid))
+            and not any(c.pr for c in job.checkouts))
+
+
+def publish_direct_push(job: Job) -> Outcome:
+    b, run, t = job.b, job.run, job.ticket
+    fresh = b.restage(from_base=False)
+    staged = b.restage(from_base=True) if fresh.empty or b.from_base else fresh
+    staged, _, outcome = change(job, staged)
+    if len(staged.changed) != 1 or len(job.checkouts) != 1:
+        raise workspace.RunFailed("a change spanning repositories cannot be direct-pushed atomically")
+    c = staged.changed[0]
+    subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    if spec_store.run_root(run):
+        subject = outbound.inert(subject)
+    if not fresh.empty:
+        message = f"{tracker.with_ref(subject, t.ref)}\n\nArete-Run: {run.id}"
+        if util.git(["diff", "--cached", "--name-only"], c.wt).strip():
+            before = util.git(["rev-parse", "HEAD"], c.wt).strip()
+            try:
+                util.git_as_owner(["commit", "-q", "-m", message], c.wt)
+            except RuntimeError as error:
+                raise workspace.RunFailed(f"the commit in {c.github or run.repo.name} failed, so arete pushed nothing",
+                                          str(error)) from error
+            c.onto = c.onto or before
+        b.committed_lines = max(b.committed_lines, fresh.lines)
+    else:
+        b.committed_lines = max(b.committed_lines, staged.lines)
+    b.staged = staged
+    landed = pipeline.direct_push_checkout(
+        b, c, job.verified, job.review, pipeline.automerge_about(t, job.build_summary),
+        draft_why=job.held_reason, left_for_a_person=job.left_for_a_person, slot=job.slot,
+    )
+    record.note(run.id, branch=c.base)
+    return publication_outcome(job, staged, outcome, committed=True,
+                               direct_push={c.github or run.repo.name: landed})
+
+
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_exhausted: bool = False) -> Outcome:
     from . import zte
@@ -1781,6 +1834,8 @@ def pr(flow: factory.Flow, tree: str, *, measurement_section: str = "", repair_e
     found = [] if recovery else adopt_open_prs(job)
     workspace.require_target_branch(run.repo, job.checkouts, work_branch=job.branch)
     refuse_changed_prs(job)
+    if uses_direct_push(job, found):
+        return publish_direct_push(job)
     before_push = None
     if pilot.is_pilot_task(str(run.tid)):
         if (len(job.checkouts) != 1 or run.feedback or run.repairs or found
@@ -1863,6 +1918,16 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
     run = job.run
     require_environment_owner_clear(job)
     workspace.require_target_branch(run.repo, job.checkouts, work_branch=job.branch)
+    if landed_map := direct_push_info(job):
+        from . import release_proof
+
+        landed = next(iter(landed_map.values()))
+        run.enter("done")
+        waiting = (release_proof.required(run.repo.name, run.tid) or bool(run.spec_root)
+                   or bool(spec_store.find(run.repo.name, str(run.tid))))
+        suffix = "; awaiting release verification" if waiting else ""
+        what = f"pushed {landed['revision'][:12]} directly to {landed['branch']}{suffix}"
+        return end_as("pass", "done", summary=f"{what}: {job.summary}")
     if not run.repo.parts:
         run.enter("done")
         what = (f"pushed {job.branch} to origin" if job.committed

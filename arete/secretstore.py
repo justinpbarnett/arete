@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config, launch_lease, owner_asks, paths, util
-from .store import credentials, db, writes
+from .store import credentials, db, principals, writes
 
 NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 REPO_NAME = re.compile(owner_asks.NAME_PATTERN)
@@ -29,6 +29,9 @@ KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
+VERIFICATION_KEY_NAME = "VERIFICATION_SIGNING_KEY"
+VERIFICATION_KEY_ITEM = f"global/{VERIFICATION_KEY_NAME}"
+VERIFICATION_KEY_PATH = "verification-authority/signing.secret"
 ACL_TYPE_EXTENDED = 0x100
 KEY_REF = "fingerprint_key_ref"
 KEY_PROOF = "fingerprint_key_proof"
@@ -372,14 +375,14 @@ def write_item(ref: Reference, settings: config.SecretsConfig, value: bytes, *, 
 
 def external_item(scope, name, *, changing_value=False):
     item = item_path(scope, name)
-    if item == KEY_ITEM:
+    if item in (KEY_ITEM, VERIFICATION_KEY_ITEM):
         owner = "its owning service" if changing_value else "Arete"
         raise InternalSecret(f"This secret is managed by {owner}.")
     return item
 
 
 def require_removable(item, store=None):
-    if item == KEY_ITEM or store == "owner_file":
+    if item in (KEY_ITEM, VERIFICATION_KEY_ITEM) or store == "owner_file":
         raise InternalSecret("This secret is managed by its owning service.")
 
 
@@ -993,6 +996,54 @@ def save_change(c, scope, name, previous, ref, change):
     return row
 
 
+def verification_key_row(c):
+    ref = Reference("owner_file", db.metadata(c)["instance_tag"], VERIFICATION_KEY_PATH)
+    row = credentials.secret(c, "global", VERIFICATION_KEY_NAME)
+    if row and (row["kind"], row["store"], row["reference"]) != ("signing_key", ref.store, str(ref)):
+        raise StoreError(f"{VERIFICATION_KEY_ITEM} conflicts with the verification authority's registry entry")
+    return row, ref
+
+
+def save_verification_key(c, row, ref, value: bytes, actor: str):
+    sha = item_digest(fingerprint_key(), value)
+    if row and row["fingerprint"] == sha:
+        return row
+    return save_change(c, "global", VERIFICATION_KEY_NAME, row, ref,
+                       dict(id=secrets.token_hex(16), kind="signing_key", actor=actor,
+                            at=util.iso(), fingerprint=sha, provider=None, rotated=row is not None))
+
+
+def register_verification_key(value: bytes, *, rotated: bool = False):
+    if not rotated:
+        with registry() as c:
+            if verification_key_row(c)[0] is not None:
+                return
+    with registry(write=True) as c:
+        row, ref = verification_key_row(c)
+        if row is None or rotated:
+            actor = principals.current()
+            validate_actor(actor)
+            save_verification_key(c, row, ref, value, actor)
+
+
+def check_verification_key(actor: str):
+    from . import scratch
+
+    validate_actor(actor)
+    with registry(write=True) as c:
+        previous, ref = verification_key_row(c)
+        value = None
+        with suppress(FileNotFoundError), scratch.authority_fd() as fd:
+            value = scratch.read_secret(fd)
+        row = previous if value is None else save_verification_key(c, previous, ref, value, actor)
+        if row is not None:
+            at = util.iso()
+            ok = value is not None
+            row = credentials.mark_checked(c, row, ok, at, recovered=row is not previous)
+            credentials.secret_event(c, row, "checked", actor, at, ok=ok, detail=history_detail(row["kind"], None))
+        return row
+
+
 def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
     confirmed = list(receipt.get("confirmed", ()))
 
@@ -1129,6 +1180,8 @@ def remove(scope, name, actor):
 
 
 def check(scope, name, actor="hand"):
+    if item_path(scope, name) == VERIFICATION_KEY_ITEM:
+        return check_verification_key(actor)
     return reconcile(scope, name, actor)
 
 

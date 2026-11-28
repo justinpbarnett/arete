@@ -84,6 +84,7 @@ from .review import (
     permitted_review_patches,
 )
 from .store import asks as asks_store
+from .store import feedback as feedback_store
 from .store import insights as insights_store
 from .store import orchestration as orchestration_store
 from .store import runs as run_store
@@ -572,6 +573,7 @@ class Run(AgentRun):
     force: bool = False
     from_poll: bool = False
     feedback: list[dict] = field(default_factory=list)
+    ticket_feedback: list[dict] = field(default_factory=list)
     claim_feedback_on_revise: bool = False
     closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
     answering: dict = field(default_factory=dict)
@@ -816,6 +818,9 @@ class Run(AgentRun):
     def claim_feedback(self) -> None:
         if self.feedback and not self.dry_run and not self.alone:
             self.feedback = insights_store.take_feedback(self.feedback, self.id)
+        if not self.dry_run and not self.alone:
+            if claimed := feedback_store.claim_worker_comments(self.repo.name, self.tid, self.id):
+                self.ticket_feedback = claimed
 
     @property
     def failed_state(self) -> str:
@@ -1567,8 +1572,14 @@ class TicketWork:
     @property
     def brief(self) -> prompt_loader.Brief:
         t = self.ticket
+        comments = t.comments
+        ticket_fb = getattr(self.run, "ticket_feedback", None)
+        if isinstance(ticket_fb, list) and ticket_fb:
+            from . import ticket_feedback as tf
+            extra = tf.worker_instructions_markdown(ticket_fb)
+            comments = f"{comments}\n\n{extra}" if comments else extra
         return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
-                                   comments=t.comments, attachments=self.attachments)
+                                   comments=comments, attachments=self.attachments)
 
     @property
     def git_dirs(self) -> list[Path]:
@@ -2476,6 +2487,12 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         else:
             insights_store.release_feedback(run.id)
+    ticket_fb = getattr(run, "ticket_feedback", None)
+    if isinstance(ticket_fb, list) and ticket_fb and not (run.dry_run or run.alone):
+        if status in ("pr", "merged", "done", "noop"):
+            feedback_store.settle_worker_comments(run.id, "applied")
+        else:
+            feedback_store.release_worker_comments(run.id)
     if status == "failed":
         if flow and flow.matching and flow.stepped:
             flow.route()
@@ -2703,13 +2720,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
             feedback = pending_feedback(repo.name, tid) if may_revise else []
-            if spec_claim.get("state") == "published" and not insights_store.has_new_feedback(feedback):
+            ticket_fb = feedback_store.pending_worker_comments(repo.name, tid) if may_revise else []
+            if spec_claim.get("state") == "published" and not (insights_store.has_new_feedback(feedback) or ticket_fb):
                 raise tracker.TaskError("this spec is already awaiting delivery evidence")
             if spec_claim and (previous_run := run_store.run_get(spec_claim["run"])):
                 if previous_run["status"] == "needs-info" and asks_store.asks_of(previous_run["id"], "open"):
                     raise tracker.TaskError("the spec is still waiting for an owner answer")
             feedback_readmits = (not dry_run and script and script.path == "orchestrate"
-                                 and insights_store.has_fresh_feedback(feedback))
+                                 and (insights_store.has_fresh_feedback(feedback) or bool(ticket_fb)))
             recovery, recovery_case = ({}, {}) if spec_ticket else unblock.child_grant(
                 cfg, repo, tk, str(tid), force=force, script=script, dry_run=dry_run)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
@@ -2890,6 +2908,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=poll_launch,
                       feedback=[] if mending and not repair_with_feedback else feedback,
+                      ticket_feedback=[] if mending and not repair_with_feedback else ticket_fb,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
@@ -4360,6 +4379,90 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return hold
     return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
                             **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
+
+
+def direct_push_refusal(repo: config.Repo, base: str, *, ticket: str = "") -> str:
+    from . import release_proof
+
+    if repo.landing == "pr":
+        return f"{repo.name} requires a PR; direct push is disabled"
+    if repo.landing != "direct-push":
+        return f"{repo.name} is not enrolled for direct-push delivery"
+    if not repo.target_branch:
+        return f"{repo.name} has no enrolled target branch for direct-push delivery"
+    if base != repo.target_branch:
+        return f"{repo.name} targets {repo.target_branch}, not {base}; direct push refused"
+    if repo.unattended_environment in ("", "none"):
+        return f"{repo.name} does not allow unattended deployment; direct push is disabled"
+    if ticket and (policy := release_proof.goal(repo.name, str(ticket))):
+        if policy["destination"] == "staging":
+            return "staging delivery requires a PR and QA handoff; direct push refused"
+        required_env = "production" if policy["destination"] == "arete-serve" else policy["destination"]
+        if not repo.allows_unattended_deploy(required_env):
+            return f"{repo.name} does not allow unattended deployment to {required_env}"
+    return ""
+
+
+def direct_push_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
+                     draft_why: str = "", left_for_a_person: str = "") -> str:
+    ticket_id = str(getattr(b.ticket, "id", "") or "")
+    if refusal := direct_push_refusal(b.run.repo, c.base, ticket=ticket_id):
+        return refusal
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be direct-pushed atomically"
+    if draft_why:
+        return draft_why
+    if left_for_a_person:
+        return "changes with work left for a person cannot be direct-pushed"
+    head = git(["rev-parse", "HEAD"], c.wt).strip()
+    if hold := merge_evidence_hold(b, c, verified, review, head):
+        return hold
+    base_sha = fetch_merge_base(c)
+    if not has_merge_base(c, head, base_sha):
+        return "the checked head does not contain the target base"
+    patch = checkout_patch(c, [], f"{base_sha}..{head}")
+    if not patch:
+        return "there is no diff to direct-push"
+    if not jev.ready(b.cfg, [b.run.repo]):
+        return "JEV risk screening is unavailable"
+    try:
+        risk = jev.risk(vault.hidden(patch), vault.hidden(about), b.cfg, trace=(b.run.id, "direct-push risk jev"))
+    except jev.Unjudged:
+        return "JEV could not judge the diff"
+    if risk.hold:
+        return risk.hold
+    return ""
+
+
+def direct_push_checkout(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
+                         draft_why: str = "", left_for_a_person: str = "", slot: slots.RunSlot | None = None) -> dict:
+    from . import release_proof
+
+    lock = (slots.take_merge_lease(b.run, c.github, slot=slot) if c.github and slot
+            else util.lock(slots.merge_lock(c.github), wait=True) if c.github
+            else util.repo_lock(c.src))
+    with lock:
+        if hold := direct_push_hold(b, c, verified, review, about, draft_why=draft_why,
+                                    left_for_a_person=left_for_a_person):
+            raise workspace.RunFailed(hold)
+        head = git(["rev-parse", "HEAD"], c.wt).strip()
+        tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+        base_sha = fetch_merge_base(c)
+        if workspace.remote_head(c.src, c.base) != base_sha:
+            raise workspace.RunFailed(f"origin/{c.base} moved before direct push; rerun checks on the latest base")
+        try:
+            git(["push", "-q", "--no-follow-tags", "--recurse-submodules=no", "origin",
+                 f"{head}:refs/heads/{c.base}"], c.wt, timeout=600, retry=False)
+        except RuntimeError as error:
+            raise workspace.RunFailed(f"direct push to {c.base} was refused by origin", str(error)) from error
+        if workspace.remote_head(c.src, c.base) != head:
+            raise workspace.RunFailed(f"origin/{c.base} did not confirm direct push of {head[:12]}")
+        c.note_pushed_head(head)
+        c.onto = ""
+        release_proof.record_direct_push(b.run.repo, str(b.ticket.id), c.base, head,
+                                         tree=tree, base_sha=base_sha, run_id=b.run.id)
+        b.run.log(f"direct-push: pushed {head[:12]} to {c.base}")
+        return {"branch": c.base, "revision": head, "tree": tree, "base": base_sha}
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
