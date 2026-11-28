@@ -4,6 +4,7 @@ import base64
 import hmac
 import json
 import os
+import platform
 import shutil
 import sqlite3
 import ssl
@@ -23861,3 +23862,95 @@ with api_check.offline():
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class SettingsShellTests(unittest.TestCase):
+    def test_settings_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-settings.js"
+        css_path = web / "ui-settings.css"
+        js_text = js_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-settings.js", served)
+        self.assertIn("/ui-settings.css", served)
+        self.assertEqual(served["/ui-settings.js"][0], js_path.read_bytes())
+        self.assertEqual(served["/ui-settings.css"][0], css_path.read_bytes())
+        for needle in (
+            "/api/v1/health",
+            "/api/v1/health/check",
+            "/api/v1/serve/install",
+            "/api/v1/push/subscriptions",
+            "/api/v1/meta",
+            "/api/usage?days=1",
+            "data-density",
+        ):
+            self.assertIn(needle, js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+            self.assertNotIn(forbidden, css_text)
+        boot_text = (web / "ui-boot.js").read_text(encoding="utf-8")
+        self.assertIn("`ui-${", boot_text)
+        for screen in ("floor", "triage", "board", "task", "run", "intake", "outbox", "prompts", "adws", "insights", "settings"):
+            self.assertIsNotNone(dashboard.USAGE_NAME.fullmatch(f"ui-{screen}"))
+
+    def test_meta_get_reports_server_environment(self):
+        db.migrate()
+        result = api.execute("meta.get", {})
+        server = result["server"]
+        self.assertEqual(server["python"], platform.python_version())
+        self.assertEqual(server["state_dir"], paths.short_path(paths.STATE_DIR))
+        self.assertEqual(server["config_file"], paths.short_path(paths.CONFIG_FILE))
+        self.assertEqual(server["engine_sha"], codebase.STAMP)
+        self.assertTrue(server["version"])
+        self.assertTrue(server["started"])
+        contract.validate(result, contract.BY_NAME["meta.get"]["result"], "meta.get")
+
+    def test_settings_prefs_storage_and_density_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { initSettingsPrefs, setDensity, setSound, density, sound, resolveSection, SECTIONS } from "./arete/web/ui-settings.js";
+
+            const attrs = new Map();
+            globalThis.document = { documentElement: { setAttribute(k, v) { attrs.set(k, v); }, getAttribute(k) { return attrs.get(k) ?? null; } } };
+            const store = new Map();
+            globalThis.localStorage = {
+              getItem(k) { return store.has(k) ? store.get(k) : null; },
+              setItem(k, v) { store.set(k, String(v)); },
+              removeItem(k) { store.delete(k); },
+            };
+            let fetches = 0;
+            globalThis.fetch = async () => { fetches += 1; return Response.json({}); };
+
+            initSettingsPrefs();
+            assert.equal(sound.value, false);
+            assert.equal(density.value, "compact");
+            assert.equal(attrs.get("data-density"), "compact");
+
+            setDensity("comfortable");
+            assert.equal(attrs.get("data-density"), "comfortable");
+            setDensity("compact");
+            assert.equal(attrs.get("data-density"), "compact");
+            initSettingsPrefs();
+            assert.equal(attrs.get("data-density"), "compact");
+
+            setSound(true);
+            assert.equal(sound.value, true);
+            initSettingsPrefs();
+            assert.equal(sound.value, true);
+            assert.equal(fetches, 0);
+
+            globalThis.localStorage = {
+              getItem() { throw new Error("blocked"); },
+              setItem() { throw new Error("blocked"); },
+              removeItem() { throw new Error("blocked"); },
+            };
+            initSettingsPrefs();
+            setDensity("comfortable");
+            setSound(false);
+            assert.equal(resolveSection("display")[0], "display");
+            assert.equal(resolveSection("unknown")[0], "health");
+            assert.equal(SECTIONS.length, 13);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

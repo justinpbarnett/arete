@@ -6,7 +6,8 @@ import { KeyBar, KeySheet } from "./ui-keybar.js";
 import { List } from "./ui-list.js";
 import { Fault, Gate } from "./ui-states.js";
 import { InboxFocus, InboxQueue, RunQuestions, selectedInbox } from "./ui-inbox.js";
-import { FloorFocus, FloorQueue, HealthFocus, TaskFocus, TaskQueue } from "./ui-work.js";
+import { FloorFocus, FloorQueue, TaskFocus, TaskQueue } from "./ui-work.js";
+import { SettingsFocus, SettingsQueue } from "./ui-settings.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
@@ -35,15 +36,6 @@ function NotPorted({ screen }) {
     ? "Prompt files and overrides are still managed outside the dashboard." : "Edit ADWs in your checkout. Loop operations are available in classic."}</p>`}
     ${screen === "adws" ? html`<a href="/#loops">Open loops in classic</a>` : null}
     ${screen === "insights" ? html`<a href="/#usage">Open usage in classic</a>` : null}</div>`;
-}
-
-function SettingsQueue() {
-  return html`<nav class="ops-section settings-links" aria-label="Settings sections">
-    <a href="#settings/health" aria-current="page">Health</a>
-    <a href="/#settings">Configuration in classic</a>
-    <a href="/#health">Health controls in classic</a>
-    <a href="/#incidents">Incidents in classic</a>
-  </nav>`;
 }
 
 export function Sidebar({ route, snapshot, now }) {
@@ -103,7 +95,7 @@ function panels({ route, snapshot, resources, now, retry, runs }) {
     case "run": return [runQueueBody({ view: runs, route, retry }), html`
       ${runs.detail?.run?.status === "needs-info" ? html`<${RunQuestions} resource=${snapshot.questions} run=${runs.id} retry=${retry} />` : null}
       <${RunFocus} key=${runs.id} view=${runs} now=${now} retry=${retry} />`];
-    case "settings": return [html`<${SettingsQueue} />`, html`<${HealthFocus} resource=${resources.health} retry=${retry} />`];
+    case "settings": return [html`<${SettingsQueue} route=${route} />`, html`<${SettingsFocus} route=${route} resources=${resources} now=${now} retry=${retry} />`];
     default: return [html`<${NotPorted} screen=${route.screen} />`, null];
   }
 }

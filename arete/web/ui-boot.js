@@ -14,6 +14,9 @@ import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
 import { browserPaired } from "./ui-notice.js";
+import { initSettingsPrefs } from "./ui-settings.js";
+
+initSettingsPrefs();
 
 const route = signal(current());
 const connect = ({ screen, path }) => live(screen, ...path.slice(0, 2));
@@ -26,7 +29,7 @@ let stint = null;
 let via = "hash";
 
 function start(source) {
-  if (!document.hidden && !stint) stint = { view: route.value.screen, via: source, at: performance.now() };
+  if (!document.hidden && !stint) stint = { view: `ui-${route.value.screen}`, via: source, at: performance.now() };
 }
 
 function finish() {
