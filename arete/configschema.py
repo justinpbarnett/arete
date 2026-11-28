@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from functools import cache
 from pathlib import Path
 
@@ -123,3 +124,32 @@ def check(value, shape: dict, folder: Path, filename: str, where: str, *, allow_
         if "items" in shape:
             for index, item in enumerate(value):
                 check(item, shape["items"], folder, filename, f"{where}[{index}]", allow_read_only=allow_read_only)
+    if "not" in shape:
+        try:
+            check(value, shape["not"], folder, filename, where, allow_read_only=allow_read_only)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"{where} matched disallowed schema")
+    if "allOf" in shape:
+        for branch in shape["allOf"]:
+            check(value, branch, folder, filename, where, allow_read_only=allow_read_only)
+    if "anyOf" in shape:
+        last_error: ValueError | None = None
+        for branch in shape["anyOf"]:
+            try:
+                check(value, branch, folder, filename, where, allow_read_only=allow_read_only)
+                last_error = None
+                break
+            except ValueError as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+    if "oneOf" in shape:
+        matches = 0
+        for branch in shape["oneOf"]:
+            with suppress(ValueError):
+                check(value, branch, folder, filename, where, allow_read_only=allow_read_only)
+                matches += 1
+        if matches != 1:
+            raise ValueError(f"{where} must match exactly one allowed schema form")
