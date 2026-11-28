@@ -15,18 +15,21 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import accounts, config, outbound, paths, refusals, util
-from .store import asks as asks_store
+from . import accounts, config, contract, outbound, paths, refusals, util
+from .store import db as foundation
+from .store import inbox as inbox_store
 from .store import push as push_store
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
 TOKEN_SECONDS = 12 * 3600
 MAX_DEVICES = 20
+FAILURE_ALERT_COUNT = 5
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 GONE = (404, 410)
 KEY_FIELD = re.compile(r"[A-Za-z0-9_-]{1,200}={0,2}")
 EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+SUBSCRIPTION_ID = re.compile(r"^PS-([1-9][0-9]*)$")
 SPKI_POINT_BYTES = 65
 
 known_key: tuple[tuple[int, int], str] | None = None
@@ -38,6 +41,17 @@ class Refused(refusals.Invalid, ValueError):
 
 class KeyFault(RuntimeError):
     pass
+
+
+def format_subscription_id(rowid: int) -> str:
+    return f"PS-{rowid}"
+
+
+def parse_subscription_id(value: str) -> int | None:
+    if not isinstance(value, str):
+        return None
+    m = SUBSCRIPTION_ID.fullmatch(value.strip())
+    return int(m[1]) if m else None
 
 
 def base64url(data: bytes) -> str:
@@ -149,15 +163,45 @@ def audience_of(endpoint: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def send_all(cfg: config.Config, rows: list[dict]) -> Sent:
+def _raise_failure_alerts(failed_rows: list[dict]) -> None:
+    tripped = [r for r in failed_rows if r.get("failures", 0) >= FAILURE_ALERT_COUNT]
+    if not tripped:
+        return
+    with foundation.tx() as c:
+        if not inbox_store.available(c):
+            return
+        for row in tripped:
+            sub_id = format_subscription_id(row["rowid"])
+            host = urlsplit(row["endpoint"]).hostname or ""
+            inbox_store.raise_item(
+                c,
+                kind="alert",
+                subject=f"push:{sub_id}",
+                priority=3,
+                title=f"Push delivery failing for {row['label']} ({sub_id})",
+                detail={
+                    "subscription": sub_id,
+                    "endpoint_host": host,
+                    "label": row["label"],
+                    "failures": row["failures"],
+                    "stamp": f"{sub_id}:{row.get('last_success') or 'never'}",
+                },
+                verbs=["continue"],
+                options=[],
+            )
+
+
+def send_all(cfg: config.Config, rows: list[dict], *, topic: str = "") -> Sent:
     found = Sent()
     if not rows:
         return found
     key = public_key()
-    delivered, gone = [], []
+    delivered, gone, failed = [], [], []
     for row in rows:
         headers = {"Authorization": f"vapid t={vapid_jwt(audience_of(row['endpoint']), subject(cfg, row))}, k={key}",
                    "TTL": str(TTL_SECONDS), "Urgency": "high", "Content-Length": "0"}
+        if topic:
+            headers["Topic"] = topic
         status = post(row["endpoint"], headers)
         if 200 <= status < 300:
             delivered.append(row["endpoint"])
@@ -165,9 +209,12 @@ def send_all(cfg: config.Config, rows: list[dict]) -> Sent:
             gone.append(row["endpoint"])
         else:
             found.failed += 1
+            failed.append(row["endpoint"])
     found.sent, found.removed = len(delivered), len(gone)
     push_store.push_succeeded(delivered)
     push_store.push_drop(gone)
+    if failed:
+        _raise_failure_alerts(push_store.push_failed(failed))
     return found
 
 
@@ -180,32 +227,52 @@ def words(found: Sent) -> str:
     return ", ".join(said)
 
 
-def ask_opened(cfg: config.Config, ask_ids: list[str]) -> list[str]:
+def notify_raised(lowest_id: int) -> list[str]:
     try:
         rows = push_store.push_list()
         if not rows:
             return []
-        return [f"push for ask {', '.join(ask_ids)}: {words(send_all(cfg, rows))}"]
+        cfg, _ = config.load_or_problem()
+        topic = f"tr-{lowest_id}"
+        return [f"push for {topic}: {words(send_all(cfg, rows, topic=topic))}"]
     except Exception as e:
-        return [f"push for a new ask failed: {type(e).__name__}"]
+        return [f"push for a new inbox item failed: {type(e).__name__}"]
 
 
-def remind(cfg: config.Config) -> list[str]:
+def remind_inbox(cfg: config.Config) -> list[str]:
     rows = push_store.push_list()
     if not rows:
         return []
     cutoff = util.iso(util.now() - timedelta(hours=cfg.ask.remind_hours))
     notes = []
-    for ask in asks_store.open_asks(owner_only=True, group_runners=True):
-        if ask.get("reminded") or ask["asked"] > cutoff or not asks_store.ask_remind(ask["id"]):
+    for item in inbox_store.high_due_reminders(cutoff):
+        numeric_id = inbox_store.parse_id(item["id"])
+        if numeric_id is None or not inbox_store.mark_reminded(numeric_id):
             continue
         rows = push_store.push_list()
-        notes.append(f"reminder push for ask {ask['id']}: {words(send_all(cfg, rows))}")
+        if not rows:
+            break
+        topic = f"tr-{numeric_id}"
+        notes.append(f"reminder push for {item['id']}: {words(send_all(cfg, rows, topic=topic))}")
     return notes
 
 
 def device_key(endpoint: str) -> str:
     return hashlib.sha256(endpoint.encode()).hexdigest()[:16]
+
+
+def subscription_view(row: dict) -> dict:
+    return {
+        "id": format_subscription_id(row["rowid"]),
+        "endpoint_host": urlsplit(row["endpoint"]).hostname or "",
+        "label": row["label"],
+        "created": row["created"],
+        "last_success": row["last_success"],
+    }
+
+
+def list_v1() -> list[dict]:
+    return [subscription_view(r) for r in push_store.push_list()]
 
 
 def subscription_state() -> dict:
@@ -233,7 +300,7 @@ def checked_endpoint(endpoint) -> str:
     return endpoint
 
 
-def subscribe(body: dict, contact: str) -> dict:
+def _validate_and_store(body: dict, contact: str) -> int:
     endpoint = checked_endpoint(body.get("endpoint"))
     keys = body.get("keys")
     keys = keys if isinstance(keys, dict) else {}
@@ -244,13 +311,32 @@ def subscribe(body: dict, contact: str) -> dict:
     rows = push_store.push_list()
     if endpoint not in {r["endpoint"] for r in rows} and len(rows) >= MAX_DEVICES:
         raise Refused(f"At most {MAX_DEVICES} devices can be subscribed; remove one first.")
-    push_store.push_add(endpoint, p256dh, auth, outbound.plain(body.get("label"), 40) or "Device", contact)
+    return push_store.push_add(endpoint, p256dh, auth, outbound.plain(body.get("label"), 40) or "Device", contact)
+
+
+def subscribe(body: dict, contact: str) -> dict:
+    _validate_and_store(body, contact)
     return subscription_state()
+
+
+def subscribe_v1(body: dict, contact: str) -> dict:
+    try:
+        rowid = _validate_and_store(body, contact)
+    except Refused as e:
+        raise contract.Problem("validation", str(e)) from None
+    return subscription_view(push_store.push_get(rowid))
 
 
 def remove(device_id: str) -> dict:
     push_store.push_drop([r["endpoint"] for r in push_store.push_list() if device_key(r["endpoint"]) == device_id])
     return subscription_state()
+
+
+def remove_v1(subscription_id: str) -> dict:
+    rowid = parse_subscription_id(subscription_id)
+    if rowid is None or not push_store.push_drop_by_rowid(rowid):
+        raise contract.Problem("not_found", f"No push subscription {subscription_id}")
+    return {"id": format_subscription_id(rowid), "removed": True}
 
 
 def send_test(cfg: config.Config) -> dict:

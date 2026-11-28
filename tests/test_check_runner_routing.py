@@ -62,9 +62,13 @@ class SharedCheckRunnerTests(Isolated):
             run.enter.assert_called_once_with("needs-info")
             return run.say.call_count
 
+        from arete import webpush
+        from arete.store import push as push_store
+
+        push_store.push_add("https://127.0.0.1:9443/sub", "A" * 80, "B" * 20, "test", "")
         with mock.patch.object(pipeline.run_lines, "write"), mock.patch.object(pipeline.devices, "release"), \
                 mock.patch.object(pipeline.alerts, "ask_notice") as alert, \
-                mock.patch.object(pipeline.webpush, "ask_opened", return_value=[]) as push:
+                mock.patch.object(webpush, "post", return_value=201) as push:
             self.assertEqual(hold_and_notify(self.ticket), 1)
             self.assertEqual(hold_and_notify("other"), 0)
             self.assertEqual(alert.call_count, 1)

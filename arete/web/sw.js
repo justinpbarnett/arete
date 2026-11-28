@@ -13,9 +13,25 @@ function showWaiting() {
   return self.registration.showNotification("Arete is waiting on you", { tag: WAITING_TAG, icon: ICON });
 }
 
-function showAsk(a) {
-  return self.registration.showNotification(`${a.repo} ${a.ticket}`, {
-    body: a.questions?.[0]?.header || "", tag: a.id, icon: ICON, data: { ask: a.id, reminded: a.reminded || "" } });
+function itemTag(item) {
+  return String(item.id || "").toLowerCase();
+}
+
+function askIdOf(item) {
+  return typeof item.subject === "string" && item.subject.startsWith("ask:") ? item.subject.slice(4) : "";
+}
+
+function showItem(item) {
+  const tag = itemTag(item);
+  const ask = askIdOf(item);
+  const title = item.line && item.task_id ? `${item.line} ${item.task_id}` : item.title || item.id;
+  const body = item.title || "";
+  return self.registration.showNotification(title, {
+    body,
+    tag,
+    icon: ICON,
+    data: { item: item.id, subject: item.subject || "", ask, reminded: item.reminded || "" },
+  });
 }
 
 async function setBadge(count) {
@@ -26,31 +42,34 @@ async function setBadge(count) {
   }
 }
 
-async function showAsks(asks) {
-  await setBadge(asks.length);
-  const open = new Set(asks.map((a) => a.id));
+async function showItems(items) {
+  await setBadge(items.length);
+  const open = new Set(items.map(itemTag));
   const shown = await self.registration.getNotifications();
   for (const n of shown) if (n.tag !== WAITING_TAG && !open.has(n.tag)) n.close();
-  if (!asks.length) {
+  if (!items.length) {
     return self.registration.showNotification("Arete", { body: "Nothing is waiting on you.", tag: WAITING_TAG, icon: ICON });
   }
   const seen = new Map(shown.map((n) => [n.tag, n.data?.reminded || ""]));
-  const fresh = asks.filter((a) => !seen.has(a.id) || seen.get(a.id) !== (a.reminded || ""));
-  await Promise.all((fresh.length ? fresh : [asks[asks.length - 1]]).map(showAsk));
+  const fresh = items.filter((item) => {
+    const tag = itemTag(item);
+    return !seen.has(tag) || seen.get(tag) !== (item.reminded || "");
+  });
+  await Promise.all((fresh.length ? fresh : [items[items.length - 1]]).map(showItem));
 }
 
 async function onPush() {
-  let asks;
+  let items;
   try {
-    const reply = await fetch("/api/asks", { cache: "no-store" });
+    const reply = await fetch("/api/v1/inbox?priority=1", { cache: "no-store" });
     if (!reply.ok) throw new Error("not ok");
-    asks = (await reply.json()).asks;
-    if (!Array.isArray(asks)) throw new Error("no asks");
+    items = (await reply.json()).items;
+    if (!Array.isArray(items)) throw new Error("no items");
   } catch {
     return showWaiting();
   }
   try {
-    return await showAsks(asks);
+    return await showItems(items);
   } catch {
     return showWaiting();
   }

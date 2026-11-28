@@ -48,6 +48,21 @@ def complete(context, status, payload, seq):
         return dict(row)
 
 
+def overwrite(actor, key, status, payload, seq, *, expected_status=202, connection=None):
+    def _apply(c):
+        where = "actor = ? AND key = ?"
+        args = [status, payload, seq, actor, key]
+        if expected_status is not None:
+            where += " AND status = ?"
+            args.append(expected_status)
+        return c.execute(f"UPDATE idempotency SET status = ?, response = ?, last_seq = ? WHERE {where}", args).rowcount
+
+    if connection is not None:
+        return _apply(connection)
+    with tx() as c:
+        return _apply(c)
+
+
 def target(row):
     with reader() as c:
         event = c.execute("SELECT * FROM events_log WHERE seq = ?", (row["first_seq"],)).fetchone()

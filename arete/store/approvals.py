@@ -20,12 +20,20 @@ DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
 
 
+def _sync_inbox(c, source: str) -> None:
+    from .. import inbox
+
+    inbox.sync(c, source)
+
+
 def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
     with db() as c:
         cur = c.execute("INSERT INTO approvals (loop, run_id, emit, summary, status, result, created) "
                         "VALUES (?,?,?,?,?,?,?)", (loop, run_id, json.dumps(emit, default=str), summary[:2000],
                                                    "failed" if failed else "pending", failed[:1000], util.iso()))
-        return cur.lastrowid
+        approval_id = cur.lastrowid
+        _sync_inbox(c, "approvals")
+        return approval_id
 
 
 def approvals(connect=reader) -> list[dict]:
@@ -43,7 +51,10 @@ def set_approval_note(approval_id: int, note: str, value: str, while_in: tuple[s
         before = c.total_changes
         c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(while_in))})",
                   (value, approval_id, *while_in))
-        return c.total_changes > before
+        changed = c.total_changes > before
+        if changed:
+            _sync_inbox(c, "approvals")
+        return changed
 
 
 def approval(approval_id: int) -> dict | None:
@@ -103,6 +114,7 @@ def settle_approval(approval_id: int, status: str, outcome: str, result: str = "
             return False
         if judged:
             insights.judge_approval(c, approval_id, outcome)
+        _sync_inbox(c, "approvals")
         return True
 
 
@@ -125,6 +137,7 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
                 util.iso(),
             ),
         )
+        _sync_inbox(c, "proposals")
 
 
 def check_proposal_revisions(layer: str, repo: str, family: str, revisions: str) -> list[dict]:
@@ -176,8 +189,11 @@ def proposal(proposal_id: int, connect=reader) -> dict | None:
 
 def move_proposal(proposal_id: int, before: tuple[str, ...], after: str) -> bool:
     with db() as c:
-        return c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",
-                         (after, proposal_id, *before)).rowcount > 0
+        moved = c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",
+                          (after, proposal_id, *before)).rowcount > 0
+        if moved:
+            _sync_inbox(c, "proposals")
+        return moved
 
 
 def forget_proposal(proposal_id: int) -> bool:
@@ -186,7 +202,8 @@ def forget_proposal(proposal_id: int) -> bool:
 
 def set_proposal_status_by_pr(pr_url: str, status: str) -> None:
     with db() as c:
-        c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url))
+        if c.execute("UPDATE proposals SET status = ? WHERE pr_url = ?", (status, pr_url)).rowcount > 0:
+            _sync_inbox(c, "proposals")
 
 
 def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:

@@ -18,6 +18,16 @@ VERSION = 8
 CLASSES = ("durable", "derived", "notice")
 VIA = ContextVar("event_via", default=None)
 RECEIPTS = ContextVar("event_receipts", default=None)
+CAUSE_SEQ = ContextVar("event_cause_seq", default=None)
+
+
+@contextmanager
+def caused_by(seq):
+    token = CAUSE_SEQ.set(seq)
+    try:
+        yield
+    finally:
+        CAUSE_SEQ.reset(token)
 
 
 def provenance():
@@ -85,6 +95,8 @@ def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=N
         raise ValueError("events need a principal id, not a login or owner")
     if cls not in CLASSES:
         raise ValueError("invalid event class")
+    if cause_seq is None:
+        cause_seq = CAUSE_SEQ.get()
     seq = c.execute("INSERT INTO events_log (at, kind, subject, ver, task, class, shape, actor, cause_seq, data, via) "
                     "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
                     (util.iso(), kind, subject, ver, task, cls, actor, cause_seq, json.dumps(data),
