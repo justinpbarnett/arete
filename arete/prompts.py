@@ -34,6 +34,7 @@ CALL_ROLES: dict[str, tuple[str, ...]] = {
     "grade": ("verify", "eval_grade"),
     "learn": ("learn",),
     "uat": ("uat",),
+    "intake_extract": ("intake_extract",),
 }
 
 BRIEF_INPUTS: frozenset[str] = frozenset((
@@ -66,6 +67,10 @@ OFFERS: dict[str, frozenset[str]] = {
     "grade": BRIEF_INPUTS | {"surface", "notes", "scratch", "checks", "env_example", "compare", "goal"},
     "learn": frozenset(("repo", "ref", "title", "story", "expertise", "max_lines", "owner")),
     "uat": frozenset(("ref", "title", "ticket", "prs", "branch", "owner")),
+    "intake_extract": frozenset((
+        "source", "kind", "title", "author", "origin_url", "raw",
+        "rule_guidance", "candidate_kinds", "candidate_actions", "defaults",
+    )),
 }
 
 
@@ -840,7 +845,7 @@ def binding_problems(
         return []
 
     out: list[PromptProblem] = []
-    seen_keys: set[tuple[str, str, str, str, str]] = set()
+    recorded_keys: set[tuple[str, str, str, str, str]] = set()
     parsed_cache: dict[tuple[str, bool], tuple[set[str] | None, list[str]]] = {}
 
     def _check_binding(call: str, role: str, tk: str, target: str) -> None:
@@ -850,8 +855,8 @@ def binding_problems(
             return
         if target not in engine_names:
             key = ("prompt_missing", target, call, scope, "")
-            if key not in seen_keys:
-                seen_keys.add(key)
+            if key not in recorded_keys:
+                recorded_keys.add(key)
                 where = f"prompts/{target}.md" if has_override else "config.toml"
                 out.append(PromptProblem(
                     code="prompt_missing",
@@ -878,8 +883,8 @@ def binding_problems(
         for msg in parse_probs:
             code = msg.partition(":")[0]
             key = (code, target, call, scope, msg)
-            if key not in seen_keys:
-                seen_keys.add(key)
+            if key not in recorded_keys:
+                recorded_keys.add(key)
                 out.append(PromptProblem(
                     code=code,
                     prompt=target,
@@ -897,8 +902,8 @@ def binding_problems(
             canonical = RENAMED_INPUTS.get(inp, inp)
             if canonical not in offered:
                 key = ("input_not_offered", target, call, scope, inp)
-                if key not in seen_keys:
-                    seen_keys.add(key)
+                if key not in recorded_keys:
+                    recorded_keys.add(key)
                     out.append(PromptProblem(
                         code="input_not_offered",
                         prompt=target,

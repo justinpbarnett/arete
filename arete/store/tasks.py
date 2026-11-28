@@ -223,6 +223,7 @@ def _row_to_ref(row) -> dict:
         "remote_actor": d.get("remote_actor"),
         "fetched_at": d.get("fetched_at"),
         "sync": d.get("sync") or "local",
+        "intake_item": d.get("intake_item"),
         "version": int(d.get("version") or 1),
         "created": d["created"],
         "updated": d["updated"],
@@ -244,6 +245,8 @@ def _row_to_task_ref(row, ref_dict: dict | None = None) -> dict:
         "source_rev": d.get("source_rev") or "",
         "linked_by": d.get("linked_by") or "",
         "confidence": d.get("confidence"),
+        "intake_item": d.get("intake_item"),
+        "intake_n": int(d["intake_n"]) if d.get("intake_n") is not None else None,
         "version": int(d.get("version") or 1),
         "created": d["created"],
         "updated": d["updated"],
@@ -321,15 +324,19 @@ def _present_task_row(c, row, *, include_relations: bool = True) -> dict:
         "updated": d.get("updated") or "",
     }
     if include_relations and expand and num is not None:
+        from . import intake as intake_store
+
         refs = TaskStore.task_refs(c, num)
         primary_link = next((r for r in refs if r["role"] == "primary"), None)
         out["refs"] = refs
         out["primary_ref"] = primary_link["ref_detail"] if primary_link else None
         out["links"] = TaskStore.task_links(c, num)
+        out["intake"] = intake_store.task_intake_ids(c, display_id, refs)
     elif include_relations:
         out["refs"] = []
         out["primary_ref"] = None
         out["links"] = []
+        out["intake"] = []
     return out
 
 
@@ -613,6 +620,7 @@ class TaskStore:
                    title: str = "", url: str = "", ext_state: str = "", facts: dict | None = None,
                    run_id: str | None = None, remote_updated: str | None = None,
                    fetched_at: str | None = None, sync: str = "local",
+                   intake_item: str | None = None,
                    actor: str = "hand", emit_event: bool = True) -> tuple[dict, bool]:
         sys_norm = system.strip().lower()
         key_norm = key.strip()
@@ -620,23 +628,41 @@ class TaskStore:
             raise ValueError(f"unsupported ref system {system!r}")
         if not key_norm:
             raise ValueError("ref key is required")
+        ref_cols = {r[1] for r in conn.execute("PRAGMA table_info(refs)")}
+        has_intake_col = "intake_item" in ref_cols
         existing = conn.execute(
             "SELECT * FROM refs WHERE system = ? AND key = ?", (sys_norm, key_norm)
         ).fetchone()
         if existing is not None:
+            if has_intake_col and intake_item and not existing["intake_item"]:
+                now = util.iso()
+                conn.execute(
+                    "UPDATE refs SET intake_item = ?, version = version + 1, updated = ? WHERE id = ?",
+                    (intake_item, now, existing["id"]),
+                )
+                existing = conn.execute("SELECT * FROM refs WHERE id = ?", (existing["id"],)).fetchone()
             return _row_to_ref(existing), False
         ref_kind = (kind or DEFAULT_REF_KIND_BY_SYSTEM.get(sys_norm, "issue")).strip().lower()
         if ref_kind not in REF_KINDS:
             raise ValueError(f"unsupported ref kind {ref_kind!r}")
         sync_norm = sync if sync in REF_SYNC_STATES else "local"
         now = util.iso()
-        cur = conn.execute(
-            "INSERT INTO refs (system, kind, key, connector, title, url, ext_state, facts, run_id, "
-            "remote_updated, fetched_at, sync, version, created, updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-            (sys_norm, ref_kind, key_norm, connector or "", title or "", url or "", ext_state or "",
-             json.dumps(facts or {}), run_id, remote_updated, fetched_at, sync_norm, now, now),
-        )
+        if has_intake_col:
+            cur = conn.execute(
+                "INSERT INTO refs (system, kind, key, connector, title, url, ext_state, facts, run_id, "
+                "remote_updated, fetched_at, sync, intake_item, version, created, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (sys_norm, ref_kind, key_norm, connector or "", title or "", url or "", ext_state or "",
+                 json.dumps(facts or {}), run_id, remote_updated, fetched_at, sync_norm, intake_item, now, now),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO refs (system, kind, key, connector, title, url, ext_state, facts, run_id, "
+                "remote_updated, fetched_at, sync, version, created, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (sys_norm, ref_kind, key_norm, connector or "", title or "", url or "", ext_state or "",
+                 json.dumps(facts or {}), run_id, remote_updated, fetched_at, sync_norm, now, now),
+            )
         saved = _row_to_ref(conn.execute("SELECT * FROM refs WHERE id = ?", (cur.lastrowid,)).fetchone())
         if emit_event:
             event_actor = actor if actor and actor != "owner" else _db_owner_principal(conn)
@@ -702,7 +728,7 @@ class TaskStore:
 
     @staticmethod
     def link_ref(conn, task: str | int, ref: str | int | dict, values: dict, actor: str,
-                 *, emit_event: bool = True) -> dict:
+                 *, emit_event: bool = True, append_anchor: bool = False) -> dict:
         task_num = parse_task_num(task, conn)
         if task_num is None or _select_task_row(conn, task_num) is None:
             raise LookupError(f"no task {task}")
@@ -752,27 +778,69 @@ class TaskStore:
         existing = conn.execute(
             "SELECT * FROM task_refs WHERE task_id = ? AND ref_id = ?", (task_num, ref_id)
         ).fetchone()
+        tr_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_refs)")}
+        has_intake_cols = "intake_item" in tr_cols and "intake_n" in tr_cols
         interpretation = str(values.get("interpretation") or "")
-        claims_json = json.dumps(values.get("claims") if isinstance(values.get("claims"), dict) else {})
-        anchor_json = json.dumps(values.get("anchor") if isinstance(values.get("anchor"), list) else [])
+        new_claims = values.get("claims") if isinstance(values.get("claims"), dict) else {}
+        new_anchor = values.get("anchor") if isinstance(values.get("anchor"), list) else []
         source_rev = str(values.get("source_rev") or "")
         linked_by = str(values.get("linked_by") or event_actor)
         confidence = values.get("confidence")
+        intake_item = values.get("intake_item")
+        intake_n = values.get("intake_n")
 
         if existing is not None:
-            conn.execute(
-                "UPDATE task_refs SET role = ?, interpretation = ?, claims = ?, anchor = ?, source_rev = ?, "
-                "linked_by = ?, confidence = ?, version = version + 1, updated = ? WHERE id = ?",
-                (role, interpretation, claims_json, anchor_json, source_rev, linked_by, confidence, now, existing["id"]),
-            )
+            if append_anchor:
+                merged_anchor = [*json_list(existing["anchor"]), *new_anchor]
+                merged_claims = {**json_dict(existing["claims"]), **new_claims}
+                final_role = str(values["role"]) if values.get("role_explicit") and values.get("role") else existing["role"]
+                final_interp = interpretation or (existing["interpretation"] or "")
+                final_rev = source_rev or (existing["source_rev"] or "")
+                final_conf = confidence if confidence is not None else existing["confidence"]
+                claims_json = json.dumps(merged_claims)
+                anchor_json = json.dumps(merged_anchor)
+            else:
+                final_role = role
+                final_interp = interpretation
+                final_rev = source_rev
+                final_conf = confidence
+                claims_json = json.dumps(new_claims)
+                anchor_json = json.dumps(new_anchor)
+            if has_intake_cols:
+                conn.execute(
+                    "UPDATE task_refs SET role = ?, interpretation = ?, claims = ?, anchor = ?, source_rev = ?, "
+                    "linked_by = ?, confidence = ?, "
+                    "intake_item = COALESCE(intake_item, ?), intake_n = COALESCE(intake_n, ?), "
+                    "version = version + 1, updated = ? WHERE id = ?",
+                    (final_role, final_interp, claims_json, anchor_json, final_rev, linked_by, final_conf,
+                     intake_item, intake_n, now, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_refs SET role = ?, interpretation = ?, claims = ?, anchor = ?, source_rev = ?, "
+                    "linked_by = ?, confidence = ?, version = version + 1, updated = ? WHERE id = ?",
+                    (final_role, final_interp, claims_json, anchor_json, final_rev, linked_by, final_conf,
+                     now, existing["id"]),
+                )
             link_id = int(existing["id"])
         else:
-            cur = conn.execute(
-                "INSERT INTO task_refs (task_id, ref_id, role, interpretation, claims, anchor, source_rev, "
-                "linked_by, confidence, version, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                (task_num, ref_id, role, interpretation, claims_json, anchor_json, source_rev, linked_by,
-                 confidence, now, now),
-            )
+            claims_json = json.dumps(new_claims)
+            anchor_json = json.dumps(new_anchor)
+            if has_intake_cols:
+                cur = conn.execute(
+                    "INSERT INTO task_refs (task_id, ref_id, role, interpretation, claims, anchor, source_rev, "
+                    "linked_by, confidence, intake_item, intake_n, version, created, updated) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (task_num, ref_id, role, interpretation, claims_json, anchor_json, source_rev, linked_by,
+                     confidence, intake_item, intake_n, now, now),
+                )
+            else:
+                cur = conn.execute(
+                    "INSERT INTO task_refs (task_id, ref_id, role, interpretation, claims, anchor, source_rev, "
+                    "linked_by, confidence, version, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (task_num, ref_id, role, interpretation, claims_json, anchor_json, source_rev, linked_by,
+                     confidence, now, now),
+                )
             link_id = int(cur.lastrowid)
 
         saved_row = conn.execute("SELECT * FROM task_refs WHERE id = ?", (link_id,)).fetchone()
@@ -1167,14 +1235,17 @@ class TaskStore:
     def task_refs(conn, task_num: int) -> list[dict]:
         if not has_identity_expand(conn):
             return []
+        ref_cols = {r[1] for r in conn.execute("PRAGMA table_info(refs)")}
+        intake_sel = "r.intake_item AS _r_intake_item, " if "intake_item" in ref_cols else "NULL AS _r_intake_item, "
         rows = conn.execute(
-            "SELECT tr.*, r.id AS _r_id, r.system AS _r_system, r.kind AS _r_kind, r.key AS _r_key, "
+            "SELECT tr.*, r.id AS _r_id, r.system AS _r_system, r.kind AS _r_kind, r.key AS _r_key, "  # noqa: S608
             "r.connector AS _r_connector, r.title AS _r_title, r.url AS _r_url, r.ext_state AS _r_ext_state, "
             "r.facts AS _r_facts, r.run_id AS _r_run_id, r.remote_updated AS _r_remote_updated, "
-            "r.fetched_at AS _r_fetched_at, r.sync AS _r_sync, r.version AS _r_version, "
-            "r.created AS _r_created, r.updated AS _r_updated "
+            "r.fetched_at AS _r_fetched_at, r.sync AS _r_sync, "
+            f"{intake_sel}"
+            "r.version AS _r_version, r.created AS _r_created, r.updated AS _r_updated "
             "FROM task_refs tr JOIN refs r ON r.id = tr.ref_id "
-            "WHERE tr.task_id = ? ORDER BY (tr.role = 'primary') DESC, tr.id",
+            "WHERE tr.task_id = ? ORDER BY (tr.role = 'primary') DESC, tr.created, tr.id",
             (task_num,),
         ).fetchall()
         out = []
@@ -1185,7 +1256,8 @@ class TaskStore:
                 "connector": d["_r_connector"], "title": d["_r_title"], "url": d["_r_url"],
                 "ext_state": d["_r_ext_state"], "facts": d["_r_facts"], "run_id": d["_r_run_id"],
                 "remote_updated": d["_r_remote_updated"], "fetched_at": d["_r_fetched_at"],
-                "sync": d["_r_sync"], "version": d["_r_version"], "created": d["_r_created"],
+                "sync": d["_r_sync"], "intake_item": d["_r_intake_item"],
+                "version": d["_r_version"], "created": d["_r_created"],
                 "updated": d["_r_updated"],
             })
             out.append(_row_to_task_ref(d, ref_dict))

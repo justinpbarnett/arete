@@ -6,13 +6,15 @@ import json
 import logging
 import secrets
 import threading
+from contextlib import nullcontext
 from datetime import timedelta
 from urllib.parse import parse_qs
 
-from . import loops, paths, secret_move, secretstore, sources, util
+from . import events, loops, paths, secret_move, secretstore, sources, util
 from .refusals import Stated
 from .store import db as foundation
-from .store import sources as source_store
+from .store import intake as intake_store
+from .store import loops as loop_store
 
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 KEY_NAME = "WEBHOOK_SECRET"
@@ -231,6 +233,17 @@ def schedule_spec_reconcile(event: dict) -> bool:
     return True
 
 
+def _webhook_author(e: dict) -> str:
+    data = e.get("data")
+    if isinstance(data, dict):
+        sender = data.get("sender")
+        if isinstance(sender, dict) and isinstance(sender.get("login"), str):
+            return sender["login"].strip()
+        if isinstance(data.get("author"), str):
+            return data["author"].strip()
+    return ""
+
+
 def receive(name: str, headers, body: bytes) -> dict:
     found = loops.load_all()
     loop = next((x for x in found if x.name == name), None)
@@ -247,23 +260,84 @@ def receive(name: str, headers, body: bytes) -> dict:
     if loop and (not loop.enabled or loop.error):
         raise Stated(409, f"The loop {name} is turned off.")
     e = event_of(name, headers, body)
-    if loop and (why := loop.trigger.refusal(e)):
-        raise Stated(403, f"The loop {name} {why}.")
+    did = delivery_id(headers)
+    raw_text, raw_blob, raw_sha = intake_store.prepare_raw(body)
+    now_dt = util.now()
+    now_iso = util.iso(now_dt)
+    refused_why = ""
+    item = None
+    item_id: int | None = None
     with foundation.tx() as c:
         try:
             factory.admit(c, version=version)
         except factory.Off as error:
             raise Stated(503, str(error)) from error
-        if not delivery_id(headers):
-            source_store.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
-        if not source_store.claim_seen(e["source"], [e["key"]]):
-            return {"queued": False, "why": "already received", "key": e["key"]}
-        if is_spec_hook:
-            item = None
+        intake_store.record_raw_blob(c, raw_blob, len(body))
+        if did:
+            ext_key = did
+            ext_rev = ""
         else:
-            [item] = sources.fire(loop, "webhook", [e])
+            ext_key = f"sha256:{raw_sha}"
+            newest = intake_store.newest_for_key(c, e["source"], ext_key)
+            if newest is not None and (now_dt - util.parse_iso(newest["received"])) < BODY_KEY_WINDOW:
+                ext_rev = str(newest["external_rev"])
+            elif newest is not None and str(newest["external_rev"]) == now_iso:
+                ext_rev = f"{now_iso}#{newest['id']}"
+            else:
+                ext_rev = now_iso
+        item_id, created = intake_store.insert_item(
+            c,
+            source=e["source"],
+            external_key=ext_key,
+            external_rev=ext_rev,
+            kind=str(e["type"]),
+            title=str(e.get("title") or ""),
+            author=_webhook_author(e),
+            origin_url=str(e.get("url") or ""),
+            trust="untrusted",
+            quarantined=1,
+            raw=raw_text,
+            raw_blob=raw_blob,
+            raw_sha256=raw_sha,
+            status="new",
+            shape="webhook",
+            received=now_iso,
+        )
+        if not created:
+            return {"queued": False, "why": "already received", "key": ext_key}
+        if loop:
+            why = loop.trigger.refusal(e)
+            if why:
+                refused_why = why
+                c.execute(
+                    "UPDATE intake_items SET status = 'refused', refuse_reason = ? WHERE id = ?",
+                    (why, item_id),
+                )
+        if not refused_why and not is_spec_hook:
+            grp = loop.trigger.group_of(e)
+            loop_store.add_event(loop.name, e, connect=lambda: nullcontext(c))
+            item = loop_store.enqueue(loop.name, loop.queue_name, grp, "webhook", [e], c=c)
+        if item_id is not None:
+            formatted = intake_store.format_id(item_id)
+            events.emit(
+                "intake.created",
+                f"intake:{formatted}",
+                cls="durable",
+                ver=1,
+                data={
+                    "item": formatted,
+                    "source": e["source"],
+                    "external_key": ext_key,
+                    "external_rev": ext_rev,
+                    "kind": str(e["type"]),
+                    "status": "refused" if refused_why else "new",
+                },
+                connection=c,
+            )
+    if refused_why:
+        raise Stated(403, f"The loop {name} {refused_why}.")
     reconcile = schedule_spec_reconcile(e)
     if is_spec_hook:
-        return {"queued": reconcile, "reconcile": reconcile, "key": e["key"], "at": util.iso()}
-    return {"queued": True, "item": item, "key": e["key"], "at": util.iso(),
+        return {"queued": reconcile, "reconcile": reconcile, "key": ext_key, "at": now_iso}
+    return {"queued": True, "item": item, "key": ext_key, "at": now_iso,
             **({"reconcile": True} if reconcile else {})}

@@ -356,11 +356,19 @@ def _validate_references(
     problems: list[str] = []
     warnings: list[dict[str, str]] = []
     if kind == "rule" and isinstance(parsed, dict):
+        from . import intake_rules
+
+        domain = parsed.get("domain")
         try:
-            targets = outbox_config.load_targets(config_dir)
-            if staged_targets:
-                targets.update(staged_targets)
-            outbox_config.validate_rule(name, parsed, targets=targets, where=where)
+            if domain == "intake":
+                intake_rules.validate_rule(name, parsed, config_dir=config_dir, where=where)
+            elif domain == "outbox":
+                targets = outbox_config.load_targets(config_dir)
+                if staged_targets:
+                    targets.update(staged_targets)
+                outbox_config.validate_rule(name, parsed, targets=targets, where=where)
+            else:
+                raise ValueError(f"{where}.domain must be one of outbox, intake")
         except ValueError as error:
             problems.append(str(error))
     elif kind == "adw" and isinstance(parsed, dict):
@@ -378,6 +386,11 @@ def _validate_references(
                     continue
                 if prob := routing.entry_problem(table):
                     problems.append(f"{where}: step {step_name}: {prob}")
+                if step_name == "intake_extract":
+                    if table.get("tools"):
+                        problems.append(f"{where}: step intake_extract must keep tools = [] (no-tools confinement)")
+                    if table.get("mcp"):
+                        problems.append(f"{where}: step intake_extract must keep mcp = [] (no-tools confinement)")
         if path == "config.toml":
             known_mcp = set((parsed.get("mcp") or {}).keys()) if isinstance(parsed.get("mcp"), dict) else set()
             if isinstance(raw_steps, dict):

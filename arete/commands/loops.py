@@ -278,11 +278,17 @@ def cmd_webhook(args) -> int:
         base = client.address(remote)
     else:
         reply = api.execute("loop.get", {"id": args.name})
-        base = tailnet.url(tailnet.this_node(), config.load().dashboard_port)
+        cfg = config.load()
+        if cfg.dashboard_hook_port:
+            base = f"http://127.0.0.1:{cfg.dashboard_hook_port}"
+        else:
+            base = tailnet.url(tailnet.this_node(), cfg.dashboard_port)
     detail = client.field(client.field(reply, "loop"), "detail")
     if not (hook := detail.get("webhook_path")):
         print(f"{args.name} has no webhook; set `webhook = true` under [trigger]", file=sys.stderr)
         return 1
+    if detail.get("hook_port"):
+        base = f"http://127.0.0.1:{int(detail['hook_port'])}"
     print(f"POST {base}{hook}")
     print(f"secret_present: {json.dumps(bool(detail.get('secret_present')))}")
     return 0

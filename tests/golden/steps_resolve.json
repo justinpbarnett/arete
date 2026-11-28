@@ -69,7 +69,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -80,7 +81,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//build": {
@@ -156,7 +158,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -167,7 +170,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//verify": {
@@ -240,7 +244,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -251,7 +256,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//review": {
@@ -324,7 +330,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -335,7 +342,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//learn": {
@@ -408,7 +416,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -419,7 +428,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//uat": {
@@ -492,7 +502,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -503,7 +514,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//miner": {
@@ -576,7 +588,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -587,7 +600,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//apply": {
@@ -660,7 +674,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -671,7 +686,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//eval_mine": {
@@ -744,7 +760,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -755,7 +772,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//triage": {
@@ -828,7 +846,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -839,7 +858,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//chat": {
@@ -912,7 +932,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -923,7 +944,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//classify": {
@@ -996,7 +1018,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1007,7 +1030,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//loop": {
@@ -1080,7 +1104,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1091,7 +1116,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//session": {
@@ -1164,7 +1190,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1175,7 +1202,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//research": {
@@ -1248,7 +1276,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1259,7 +1288,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//research_plan": {
@@ -1332,7 +1362,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1343,7 +1374,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//research_search": {
@@ -1415,7 +1447,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1426,7 +1459,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//research_synthesis": {
@@ -1499,7 +1533,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1510,7 +1545,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//research_audit": {
@@ -1584,7 +1620,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1595,7 +1632,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//explain": {
@@ -1668,7 +1706,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1679,7 +1718,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//document": {
@@ -1746,7 +1786,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1757,7 +1798,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//capture_evidence": {
@@ -1824,7 +1866,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1835,7 +1878,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//config_ask": {
@@ -1898,7 +1942,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1909,7 +1954,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "no layer//intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//check_repair": {
@@ -1985,7 +2107,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -1996,7 +2119,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//review_repair": {
@@ -2072,7 +2196,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2083,7 +2208,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//ci_repair": {
@@ -2159,7 +2285,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2170,7 +2297,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//eval_grade": {
@@ -2243,7 +2371,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2254,7 +2383,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer//orchestrate": {
@@ -2317,7 +2447,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2328,7 +2459,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/plan": {
@@ -2401,7 +2533,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2412,7 +2545,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/build": {
@@ -2488,7 +2622,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2499,7 +2634,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/verify": {
@@ -2572,7 +2708,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2583,7 +2720,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/review": {
@@ -2656,7 +2794,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2667,7 +2806,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/learn": {
@@ -2740,7 +2880,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2751,7 +2892,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/uat": {
@@ -2824,7 +2966,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2835,7 +2978,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/miner": {
@@ -2908,7 +3052,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -2919,7 +3064,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/apply": {
@@ -2992,7 +3138,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3003,7 +3150,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/eval_mine": {
@@ -3076,7 +3224,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3087,7 +3236,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/triage": {
@@ -3160,7 +3310,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3171,7 +3322,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/chat": {
@@ -3244,7 +3396,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3255,7 +3408,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/classify": {
@@ -3328,7 +3482,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3339,7 +3494,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/loop": {
@@ -3412,7 +3568,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3423,7 +3580,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/session": {
@@ -3496,7 +3654,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3507,7 +3666,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/research": {
@@ -3580,7 +3740,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3591,7 +3752,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/research_plan": {
@@ -3664,7 +3826,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3675,7 +3838,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/research_search": {
@@ -3747,7 +3911,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3758,7 +3923,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/research_synthesis": {
@@ -3831,7 +3997,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3842,7 +4009,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/research_audit": {
@@ -3916,7 +4084,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -3927,7 +4096,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/explain": {
@@ -4000,7 +4170,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4011,7 +4182,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/document": {
@@ -4078,7 +4250,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4089,7 +4262,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/capture_evidence": {
@@ -4156,7 +4330,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4167,7 +4342,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/config_ask": {
@@ -4230,7 +4406,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4241,7 +4418,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "no layer/feat/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/check_repair": {
@@ -4317,7 +4571,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4328,7 +4583,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/review_repair": {
@@ -4404,7 +4660,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4415,7 +4672,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/ci_repair": {
@@ -4491,7 +4749,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4502,7 +4761,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/eval_grade": {
@@ -4575,7 +4835,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4586,7 +4847,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/feat/orchestrate": {
@@ -4649,7 +4911,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4660,7 +4923,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/plan": {
@@ -4733,7 +4997,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4744,7 +5009,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/build": {
@@ -4820,7 +5086,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4831,7 +5098,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/verify": {
@@ -4904,7 +5172,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4915,7 +5184,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/review": {
@@ -4988,7 +5258,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -4999,7 +5270,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/learn": {
@@ -5072,7 +5344,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5083,7 +5356,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/uat": {
@@ -5156,7 +5430,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5167,7 +5442,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/miner": {
@@ -5240,7 +5516,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5251,7 +5528,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/apply": {
@@ -5324,7 +5602,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5335,7 +5614,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/eval_mine": {
@@ -5408,7 +5688,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5419,7 +5700,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/triage": {
@@ -5492,7 +5774,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5503,7 +5786,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/chat": {
@@ -5576,7 +5860,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5587,7 +5872,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/classify": {
@@ -5660,7 +5946,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5671,7 +5958,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/loop": {
@@ -5744,7 +6032,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5755,7 +6044,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/session": {
@@ -5828,7 +6118,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5839,7 +6130,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/research": {
@@ -5912,7 +6204,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -5923,7 +6216,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/research_plan": {
@@ -5996,7 +6290,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6007,7 +6302,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/research_search": {
@@ -6079,7 +6375,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6090,7 +6387,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/research_synthesis": {
@@ -6163,7 +6461,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6174,7 +6473,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/research_audit": {
@@ -6248,7 +6548,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6259,7 +6560,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/explain": {
@@ -6332,7 +6634,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6343,7 +6646,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/document": {
@@ -6410,7 +6714,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6421,7 +6726,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/capture_evidence": {
@@ -6488,7 +6794,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6499,7 +6806,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/config_ask": {
@@ -6562,7 +6870,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6573,7 +6882,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "no layer/fix/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/check_repair": {
@@ -6649,7 +7035,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6660,7 +7047,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/review_repair": {
@@ -6736,7 +7124,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6747,7 +7136,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/ci_repair": {
@@ -6823,7 +7213,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6834,7 +7225,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/eval_grade": {
@@ -6907,7 +7299,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6918,7 +7311,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "no layer/fix/orchestrate": {
@@ -6981,7 +7375,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -6992,7 +7387,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//plan": {
@@ -7065,7 +7461,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7076,7 +7473,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//build": {
@@ -7152,7 +7550,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7163,7 +7562,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//verify": {
@@ -7236,7 +7636,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7247,7 +7648,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//review": {
@@ -7320,7 +7722,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7331,7 +7734,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//learn": {
@@ -7404,7 +7808,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7415,7 +7820,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//uat": {
@@ -7488,7 +7894,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7499,7 +7906,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//miner": {
@@ -7572,7 +7980,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7583,7 +7992,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//apply": {
@@ -7656,7 +8066,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7667,7 +8078,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//eval_mine": {
@@ -7740,7 +8152,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7751,7 +8164,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//triage": {
@@ -7824,7 +8238,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7835,7 +8250,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//chat": {
@@ -7908,7 +8324,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -7919,7 +8336,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//classify": {
@@ -7992,7 +8410,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8003,7 +8422,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//loop": {
@@ -8076,7 +8496,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8087,7 +8508,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//session": {
@@ -8160,7 +8582,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8171,7 +8594,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//research": {
@@ -8244,7 +8668,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8255,7 +8680,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//research_plan": {
@@ -8328,7 +8754,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8339,7 +8766,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//research_search": {
@@ -8411,7 +8839,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8422,7 +8851,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//research_synthesis": {
@@ -8495,7 +8925,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8506,7 +8937,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//research_audit": {
@@ -8580,7 +9012,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8591,7 +9024,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//explain": {
@@ -8664,7 +9098,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8675,7 +9110,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//document": {
@@ -8742,7 +9178,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8753,7 +9190,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//capture_evidence": {
@@ -8820,7 +9258,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8831,7 +9270,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//config_ask": {
@@ -8894,7 +9334,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8905,7 +9346,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "sample layer//intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//check_repair": {
@@ -8981,7 +9499,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -8992,7 +9511,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//review_repair": {
@@ -9068,7 +9588,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9079,7 +9600,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//ci_repair": {
@@ -9155,7 +9677,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9166,7 +9689,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//eval_grade": {
@@ -9239,7 +9763,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9250,7 +9775,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer//orchestrate": {
@@ -9313,7 +9839,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9324,7 +9851,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/plan": {
@@ -9397,7 +9925,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9408,7 +9937,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/build": {
@@ -9484,7 +10014,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9495,7 +10026,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/verify": {
@@ -9568,7 +10100,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9579,7 +10112,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/review": {
@@ -9652,7 +10186,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9663,7 +10198,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/learn": {
@@ -9736,7 +10272,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9747,7 +10284,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/uat": {
@@ -9820,7 +10358,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9831,7 +10370,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/miner": {
@@ -9904,7 +10444,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9915,7 +10456,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/apply": {
@@ -9988,7 +10530,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -9999,7 +10542,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/eval_mine": {
@@ -10072,7 +10616,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10083,7 +10628,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/triage": {
@@ -10156,7 +10702,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10167,7 +10714,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/chat": {
@@ -10240,7 +10788,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10251,7 +10800,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/classify": {
@@ -10324,7 +10874,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10335,7 +10886,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/loop": {
@@ -10408,7 +10960,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10419,7 +10972,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/session": {
@@ -10492,7 +11046,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10503,7 +11058,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/research": {
@@ -10576,7 +11132,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10587,7 +11144,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/research_plan": {
@@ -10660,7 +11218,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10671,7 +11230,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/research_search": {
@@ -10743,7 +11303,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10754,7 +11315,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/research_synthesis": {
@@ -10827,7 +11389,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10838,7 +11401,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/research_audit": {
@@ -10912,7 +11476,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -10923,7 +11488,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/explain": {
@@ -10996,7 +11562,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11007,7 +11574,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/document": {
@@ -11074,7 +11642,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11085,7 +11654,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/capture_evidence": {
@@ -11152,7 +11722,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11163,7 +11734,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/config_ask": {
@@ -11226,7 +11798,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11237,7 +11810,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "sample layer/feat/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/check_repair": {
@@ -11313,7 +11963,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11324,7 +11975,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/review_repair": {
@@ -11400,7 +12052,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11411,7 +12064,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/ci_repair": {
@@ -11487,7 +12141,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11498,7 +12153,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/eval_grade": {
@@ -11571,7 +12227,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11582,7 +12239,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/feat/orchestrate": {
@@ -11645,7 +12303,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11656,7 +12315,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/plan": {
@@ -11729,7 +12389,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11740,7 +12401,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/build": {
@@ -11816,7 +12478,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11827,7 +12490,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/verify": {
@@ -11900,7 +12564,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11911,7 +12576,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/review": {
@@ -11984,7 +12650,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -11995,7 +12662,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/learn": {
@@ -12068,7 +12736,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12079,7 +12748,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/uat": {
@@ -12152,7 +12822,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12163,7 +12834,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/miner": {
@@ -12236,7 +12908,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12247,7 +12920,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/apply": {
@@ -12320,7 +12994,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12331,7 +13006,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/eval_mine": {
@@ -12404,7 +13080,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12415,7 +13092,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/triage": {
@@ -12488,7 +13166,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12499,7 +13178,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/chat": {
@@ -12572,7 +13252,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12583,7 +13264,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/classify": {
@@ -12656,7 +13338,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12667,7 +13350,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/loop": {
@@ -12740,7 +13424,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12751,7 +13436,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/session": {
@@ -12824,7 +13510,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12835,7 +13522,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/research": {
@@ -12908,7 +13596,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -12919,7 +13608,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/research_plan": {
@@ -12992,7 +13682,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13003,7 +13694,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/research_search": {
@@ -13075,7 +13767,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13086,7 +13779,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/research_synthesis": {
@@ -13159,7 +13853,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13170,7 +13865,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/research_audit": {
@@ -13244,7 +13940,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13255,7 +13952,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/explain": {
@@ -13328,7 +14026,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13339,7 +14038,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/document": {
@@ -13406,7 +14106,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13417,7 +14118,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/capture_evidence": {
@@ -13484,7 +14186,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13495,7 +14198,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/config_ask": {
@@ -13558,7 +14262,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13569,7 +14274,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "sample layer/fix/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/check_repair": {
@@ -13645,7 +14427,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13656,7 +14439,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/review_repair": {
@@ -13732,7 +14516,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13743,7 +14528,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/ci_repair": {
@@ -13819,7 +14605,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13830,7 +14617,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/eval_grade": {
@@ -13903,7 +14691,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13914,7 +14703,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "sample layer/fix/orchestrate": {
@@ -13977,7 +14767,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -13988,7 +14779,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//plan": {
@@ -14061,7 +14853,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14072,7 +14865,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//build": {
@@ -14148,7 +14942,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14159,7 +14954,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//verify": {
@@ -14232,7 +15028,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14243,7 +15040,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//review": {
@@ -14316,7 +15114,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14327,7 +15126,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//learn": {
@@ -14400,7 +15200,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14411,7 +15212,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//uat": {
@@ -14484,7 +15286,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14495,7 +15298,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//miner": {
@@ -14568,7 +15372,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14579,7 +15384,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//apply": {
@@ -14652,7 +15458,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14663,7 +15470,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//eval_mine": {
@@ -14736,7 +15544,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14747,7 +15556,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//triage": {
@@ -14820,7 +15630,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14831,7 +15642,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//chat": {
@@ -14904,7 +15716,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14915,7 +15728,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//classify": {
@@ -14988,7 +15802,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -14999,7 +15814,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//loop": {
@@ -15072,7 +15888,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15083,7 +15900,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//session": {
@@ -15156,7 +15974,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15167,7 +15986,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//research": {
@@ -15240,7 +16060,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15251,7 +16072,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//research_plan": {
@@ -15324,7 +16146,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15335,7 +16158,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//research_search": {
@@ -15407,7 +16231,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15418,7 +16243,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//research_synthesis": {
@@ -15491,7 +16317,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15502,7 +16329,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//research_audit": {
@@ -15576,7 +16404,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15587,7 +16416,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//explain": {
@@ -15660,7 +16490,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15671,7 +16502,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//document": {
@@ -15738,7 +16570,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15749,7 +16582,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//capture_evidence": {
@@ -15816,7 +16650,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15827,7 +16662,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//config_ask": {
@@ -15890,7 +16726,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15901,7 +16738,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "kind override//intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//check_repair": {
@@ -15977,7 +16891,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -15988,7 +16903,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//review_repair": {
@@ -16064,7 +16980,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16075,7 +16992,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//ci_repair": {
@@ -16151,7 +17069,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16162,7 +17081,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//eval_grade": {
@@ -16235,7 +17155,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16246,7 +17167,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override//orchestrate": {
@@ -16309,7 +17231,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16320,7 +17243,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/plan": {
@@ -16393,7 +17317,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16404,7 +17329,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/build": {
@@ -16480,7 +17406,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16491,7 +17418,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/verify": {
@@ -16564,7 +17492,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16575,7 +17504,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/review": {
@@ -16648,7 +17578,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16659,7 +17590,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/learn": {
@@ -16732,7 +17664,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16743,7 +17676,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/uat": {
@@ -16816,7 +17750,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16827,7 +17762,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/miner": {
@@ -16900,7 +17836,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16911,7 +17848,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/apply": {
@@ -16984,7 +17922,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -16995,7 +17934,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/eval_mine": {
@@ -17068,7 +18008,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17079,7 +18020,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/triage": {
@@ -17152,7 +18094,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17163,7 +18106,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/chat": {
@@ -17236,7 +18180,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17247,7 +18192,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/classify": {
@@ -17320,7 +18266,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17331,7 +18278,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/loop": {
@@ -17404,7 +18352,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17415,7 +18364,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/session": {
@@ -17488,7 +18438,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17499,7 +18450,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/research": {
@@ -17572,7 +18524,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17583,7 +18536,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/research_plan": {
@@ -17656,7 +18610,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17667,7 +18622,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/research_search": {
@@ -17739,7 +18695,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17750,7 +18707,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/research_synthesis": {
@@ -17823,7 +18781,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17834,7 +18793,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/research_audit": {
@@ -17908,7 +18868,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -17919,7 +18880,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/explain": {
@@ -17992,7 +18954,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18003,7 +18966,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/document": {
@@ -18070,7 +19034,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18081,7 +19046,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/capture_evidence": {
@@ -18148,7 +19114,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18159,7 +19126,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/config_ask": {
@@ -18222,7 +19190,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18233,7 +19202,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "kind override/feat/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/check_repair": {
@@ -18309,7 +19355,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18320,7 +19367,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/review_repair": {
@@ -18396,7 +19444,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18407,7 +19456,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/ci_repair": {
@@ -18483,7 +19533,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18494,7 +19545,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/eval_grade": {
@@ -18567,7 +19619,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18578,7 +19631,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/feat/orchestrate": {
@@ -18641,7 +19695,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18652,7 +19707,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/plan": {
@@ -18725,7 +19781,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18736,7 +19793,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/build": {
@@ -18812,7 +19870,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18823,7 +19882,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/verify": {
@@ -18896,7 +19956,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18907,7 +19968,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/review": {
@@ -18980,7 +20042,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -18991,7 +20054,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/learn": {
@@ -19064,7 +20128,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19075,7 +20140,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/uat": {
@@ -19148,7 +20214,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19159,7 +20226,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/miner": {
@@ -19232,7 +20300,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19243,7 +20312,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/apply": {
@@ -19316,7 +20386,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19327,7 +20398,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/eval_mine": {
@@ -19400,7 +20472,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19411,7 +20484,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/triage": {
@@ -19484,7 +20558,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19495,7 +20570,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/chat": {
@@ -19568,7 +20644,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19579,7 +20656,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/classify": {
@@ -19652,7 +20730,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19663,7 +20742,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/loop": {
@@ -19736,7 +20816,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19747,7 +20828,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/session": {
@@ -19820,7 +20902,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19831,7 +20914,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/research": {
@@ -19904,7 +20988,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19915,7 +21000,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/research_plan": {
@@ -19988,7 +21074,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -19999,7 +21086,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/research_search": {
@@ -20071,7 +21159,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20082,7 +21171,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/research_synthesis": {
@@ -20155,7 +21245,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20166,7 +21257,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/research_audit": {
@@ -20240,7 +21332,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20251,7 +21344,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/explain": {
@@ -20324,7 +21418,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20335,7 +21430,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/document": {
@@ -20402,7 +21498,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20413,7 +21510,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/capture_evidence": {
@@ -20480,7 +21578,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20491,7 +21590,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/config_ask": {
@@ -20554,7 +21654,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20565,7 +21666,84 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    }
+  },
+  "kind override/fix/intake_extract": {
+    "step": "intake_extract",
+    "tier": "",
+    "runner": "replay",
+    "provider": "",
+    "model": "sonnet",
+    "effort": "",
+    "timeout_minutes": 5,
+    "tries": 1,
+    "tools": [],
+    "mcp": [],
+    "instructions": [],
+    "session": "fresh",
+    "notes": [],
+    "chain": [
+      {
+        "model": "sonnet",
+        "runner": "replay",
+        "provider": "",
+        "tier": "",
+        "position": 0,
+        "requested": true,
+        "effort": "",
+        "instructions": []
+      }
+    ],
+    "fallback": true,
+    "instructions_explicit": true,
+    "requires": {
+      "modalities": [],
+      "min_context": 0,
+      "structured_output": true,
+      "data_handling": [],
+      "floor": "",
+      "approved": [],
+      "directory_cleanup": false,
+      "delegation_only": false,
+      "gated_launches": false
+    },
+    "denied": [],
+    "inherits": "",
+    "budget_usd": null,
+    "explicit_route": false,
+    "ab_name": "",
+    "ab_side": "",
+    "ab_arm": "",
+    "prompts": {
+      "plan": "plan",
+      "revise": "revise",
+      "repair": "repair",
+      "build": "build",
+      "fix": "fix",
+      "review_fix": "review_fix",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify_fix": "verify_fix",
+      "verify": "verify",
+      "grade": "grade",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
+    },
+    "schemas": {
+      "plan": "plan",
+      "revise": "revise",
+      "resolve": "resolve",
+      "ci_fix": "ci_fix",
+      "review": "review",
+      "verify": "verify",
+      "grade": "verify",
+      "learn": "learn",
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/check_repair": {
@@ -20641,7 +21819,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20652,7 +21831,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/review_repair": {
@@ -20728,7 +21908,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20739,7 +21920,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/ci_repair": {
@@ -20815,7 +21997,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20826,7 +22009,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/eval_grade": {
@@ -20899,7 +22083,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20910,7 +22095,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "kind override/fix/orchestrate": {
@@ -20973,7 +22159,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -20984,7 +22171,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "arm//build": {
@@ -21060,7 +22248,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -21071,7 +22260,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "arm/feat/build": {
@@ -21147,7 +22337,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -21158,7 +22349,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   },
   "arm/fix/build": {
@@ -21234,7 +22426,8 @@
       "verify": "verify",
       "grade": "grade",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     },
     "schemas": {
       "plan": "plan",
@@ -21245,7 +22438,8 @@
       "verify": "verify",
       "grade": "verify",
       "learn": "learn",
-      "uat": "uat"
+      "uat": "uat",
+      "intake_extract": "intake_extract"
     }
   }
 }

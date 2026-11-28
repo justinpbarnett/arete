@@ -326,6 +326,9 @@ def _validate_content(
     *,
     staged_targets: dict[str, object] | None = None,
     extra_adws: set[str] | None = None,
+    extra_sources: set[str] | None = None,
+    extra_prompts: set[str] | None = None,
+    extra_schemas: set[str] | None = None,
 ) -> None:
     classified = configkinds.classify(rel)
     if classified is not None and classified[0] == "library":
@@ -370,13 +373,27 @@ def _validate_content(
             except ValueError as e:
                 raise ConfigRepoError(str(e)) from e
         elif kind == "rule":
-            from . import outbox_config
+            from . import intake_rules, outbox_config
 
+            domain = parsed.get("domain")
             try:
-                targets = outbox_config.load_targets(root)
-                if staged_targets:
-                    targets.update(staged_targets)
-                outbox_config.validate_rule(item_name, parsed, targets=targets, where=rel)
+                if domain == "intake":
+                    intake_rules.validate_rule(
+                        item_name,
+                        parsed,
+                        config_dir=root,
+                        extra_sources=extra_sources,
+                        extra_prompts=extra_prompts,
+                        extra_schemas=extra_schemas,
+                        where=rel,
+                    )
+                elif domain == "outbox":
+                    targets = outbox_config.load_targets(root)
+                    if staged_targets:
+                        targets.update(staged_targets)
+                    outbox_config.validate_rule(item_name, parsed, targets=targets, where=rel)
+                else:
+                    raise ValueError(f"{rel}.domain must be one of outbox, intake")
             except ValueError as e:
                 raise ConfigRepoError(str(e)) from e
         elif kind == "adw":
@@ -404,6 +421,21 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
         for rel, raw in files.items()
         if raw is not None and (classified := configkinds.classify(rel)) is not None and classified[0] == "adw"
     }
+    extra_sources: set[str] = {
+        classified[1]
+        for rel, raw in files.items()
+        if raw is not None and (classified := configkinds.classify(rel)) is not None and classified[0] == "source"
+    }
+    extra_prompts: set[str] = {
+        classified[1]
+        for rel, raw in files.items()
+        if raw is not None and (classified := configkinds.classify(rel)) is not None and classified[0] == "prompt"
+    }
+    extra_schemas: set[str] = {
+        classified[1]
+        for rel, raw in files.items()
+        if raw is not None and (classified := configkinds.classify(rel)) is not None and classified[0] == "schema"
+    }
     deferred_rules: list[tuple[str, bytes]] = []
     deferred_routes: list[tuple[str, bytes]] = []
     for rel in sorted(files):
@@ -424,7 +456,15 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
                 classified[1], parsed, level="config", raw=raw, where=rel
             )
     for rel, raw in deferred_rules:
-        _validate_content(rel, raw, root, staged_targets=staged_targets)
+        _validate_content(
+            rel,
+            raw,
+            root,
+            staged_targets=staged_targets,
+            extra_sources=extra_sources,
+            extra_prompts=extra_prompts,
+            extra_schemas=extra_schemas,
+        )
     for rel, raw in deferred_routes:
         _validate_content(rel, raw, root, extra_adws=extra_adws)
 

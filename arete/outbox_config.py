@@ -213,6 +213,8 @@ def load_rules(root: Path | None = None, *, targets: dict[str, OutboxTarget] | N
         for file in sorted(defaults_dir.glob("*.toml")):
             name = file.stem
             data, raw = _parse_toml_file(file, f"rule/{name}")
+            if data.get("domain") != "outbox":
+                continue
             found[name] = _rule_from_data(name, data, targets=target_map, level="engine", raw=raw, where=f"rule/{name}")
     cfg_root = (root or paths.CONFIG_DIR).resolve()
     user_dir = cfg_root / "rules"
@@ -222,6 +224,8 @@ def load_rules(root: Path | None = None, *, targets: dict[str, OutboxTarget] | N
                 continue
             name = file.stem
             data, raw = _parse_toml_file(file, f"rules/{file.name}")
+            if data.get("domain") != "outbox":
+                continue
             found[name] = _rule_from_data(
                 name, data, targets=target_map, level="config", raw=raw, where=f"rules/{file.name}"
             )

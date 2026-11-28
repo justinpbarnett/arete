@@ -16,11 +16,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import config, cron, events, factory_control, gh, jira, paths, util
+from . import config, configrepo, cron, events, factory_control, gh, jira, paths, util
 from .loops import Loop, as_list, blank, github_remote
 from .store import db as foundation
+from .store import intake as intake_store
 from .store import loops as loop_store
 from .store import sources as source_store
+
+
+class PollCrashed(RuntimeError):
+    """Raised when both the poll transaction and its error-recording path fail."""
+
+
+class _PollStale(Exception):
+    """Internal rollback signal when cursor version or source binding changed during fetch."""
 
 SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 DEFAULT_EVERY = 300
@@ -488,7 +497,10 @@ def _backfill_on_conn(c, cfg: config.Config, loop_list: list[Loop]) -> int:
                     break
             if matched_old is None:
                 continue
-            for tbl in ("cursors", "seen", "source_owners"):
+            tables_to_move = ["cursors", "source_owners"]
+            if intake_store.available(c):
+                tables_to_move.append("intake_items")
+            for tbl in tables_to_move:
                 c.execute(f"UPDATE OR REPLACE {tbl} SET source = ? WHERE source = ?", (sid, matched_old))  # noqa: S608
             row = c.execute("SELECT polled, ok, last_ok FROM cursors WHERE source = ?", (sid,)).fetchone()
             last_ok = row["last_ok"] or (row["polled"] if row["ok"] else None)
@@ -501,6 +513,143 @@ def _backfill_on_conn(c, cfg: config.Config, loop_list: list[Loop]) -> int:
                 owners[sid] = owners.pop(matched_old)
             moved += 1
     return moved
+
+
+def canonical_external_key(origin_id: str, kind: str, driver_key: str) -> str:
+    """Collision-safe encoding of (canonical upstream origin, event kind, driver event key)."""
+    return json.dumps([origin_id, kind, driver_key], separators=(",", ":"), ensure_ascii=False)
+
+
+def _command_producer(src: Src | None, sid: str) -> str:
+    if src is not None:
+        raw_cmd = src.definition.get("command")
+        if isinstance(raw_cmd, str) and raw_cmd.strip():
+            try:
+                argv = shlex.split(raw_cmd)
+            except ValueError:
+                argv = raw_cmd.split()
+            if argv:
+                return argv[0]
+        elif isinstance(raw_cmd, list) and raw_cmd:
+            return str(raw_cmd[0])
+    return sid or "command"
+
+
+def _github_repo_from_key(raw_key: str) -> str:
+    text = raw_key.removeprefix("advisory:")
+    if "#" in text:
+        head = text.split("#", 1)[0].strip()
+        if "/" in head:
+            return head
+    return ""
+
+
+def intake_identity_for_event(
+    src: Src | None,
+    cfg: config.Config | None,
+    ev: dict,
+    *,
+    source_id: str = "",
+) -> tuple[str, str, str, str]:
+    """Return (origin_id, external_key, external_rev, kind) for a fetched event."""
+    sid = src.id if src is not None else source_id
+    kind = str(ev.get("type") or "command")
+    raw_key = str(ev.get("key") or "")
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    stype = str(src.definition.get("type") or "") if src is not None else ""
+
+    if sid.endswith("#webhook") or kind == "webhook":
+        origin_id = f"webhook:{sid}"
+        return origin_id, raw_key, str(ev.get("rev") or ""), kind
+
+    if kind.startswith("github.") or stype == "github" or (stype == "closed-specs" and src and src.definition.get("tracker") == "github"):
+        repo = str(ev.get("repo") or _github_repo_from_key(raw_key)).strip().lower()
+        origin_id = f"github:https://github.com:{repo}"
+        ext_rev = str(ev.get("rev") or "")
+        return origin_id, canonical_external_key(origin_id, kind, raw_key), ext_rev, kind
+
+    if kind.startswith("jira.") or stype == "jira" or (stype == "closed-specs" and src and src.definition.get("tracker") == "jira"):
+        endpoint = ((cfg.jira.base_url or "").strip().rstrip("/").lower()) if cfg is not None else ""
+        origin_id = f"jira:{endpoint}"
+        if "@" in raw_key:
+            base_key, ext_rev = raw_key.split("@", 1)
+        else:
+            base_key = str(data.get("key") or raw_key)
+            ext_rev = str(ev.get("rev") or "")
+        return origin_id, canonical_external_key(origin_id, kind, base_key), ext_rev, kind
+
+    if kind.startswith("log.") or stype == "log":
+        file_path = str(data.get("file") or "")
+        origin_id = f"log:{file_path}"
+        return origin_id, canonical_external_key(origin_id, kind, raw_key), str(ev.get("rev") or ""), kind
+
+    explicit_origin = ev.get("origin") or data.get("origin")
+    if isinstance(explicit_origin, str) and explicit_origin.strip():
+        origin_id = explicit_origin.strip()
+    else:
+        origin_id = f"command:{_command_producer(src, sid)}"
+    return origin_id, canonical_external_key(origin_id, kind, raw_key), str(ev.get("rev") or ""), kind
+
+
+def legacy_seen_identity(
+    src: Src | None,
+    cfg: config.Config | None,
+    sid: str,
+    raw_key: str,
+) -> tuple[str, str, str, str]:
+    """Return (external_key, external_rev, kind, shape) when backfilling pre-expand seen rows."""
+    if sid.endswith("#webhook"):
+        return raw_key, "", "webhook", "legacy"
+
+    if src is None:
+        return f"legacy-unresolved:{raw_key}", "", "legacy", "legacy_unresolved"
+
+    stype = str(src.definition.get("type") or "")
+    if stype == "github":
+        if raw_key.startswith("advisory:") and "#" in raw_key:
+            repo = _github_repo_from_key(raw_key).lower()
+            origin_id = f"github:https://github.com:{repo}"
+            return canonical_external_key(origin_id, "github.advisory", raw_key), "", "github.advisory", "legacy"
+        if "#" in raw_key and "/" in raw_key.split("#", 1)[0]:
+            repo = _github_repo_from_key(raw_key).lower()
+            origin_id = f"github:https://github.com:{repo}"
+            return canonical_external_key(origin_id, "github.issue", raw_key), "", "github.issue", "legacy"
+        if raw_key.isdigit() and cfg is not None:
+            gh_kind = SOURCES["github"]
+            repos = gh_kind.repos(src.definition, src.repo) if isinstance(gh_kind, GitHub) else []
+            if len(repos) == 1:
+                try:
+                    resolved = (github_name(cfg, repos[0]) or repos[0]).strip().lower()
+                except config.UnknownRepo:
+                    resolved = repos[0].strip().lower()
+                origin_id = f"github:https://github.com:{resolved}"
+                return canonical_external_key(origin_id, "github.ci_red", raw_key), "", "github.ci_red", "legacy"
+        return f"legacy-unresolved:{raw_key}", "", "legacy", "legacy_unresolved"
+
+    if stype == "jira":
+        endpoint = ((cfg.jira.base_url or "").strip().rstrip("/").lower()) if cfg is not None else ""
+        if not endpoint:
+            return f"legacy-unresolved:{raw_key}", "", "legacy", "legacy_unresolved"
+        origin_id = f"jira:{endpoint}"
+        if "@" in raw_key:
+            base_key, ext_rev = raw_key.split("@", 1)
+        else:
+            base_key, ext_rev = raw_key, ""
+        return canonical_external_key(origin_id, "jira.issue", base_key), ext_rev, "jira.issue", "legacy"
+
+    if stype == "command":
+        origin_id = f"command:{_command_producer(src, sid)}"
+        return canonical_external_key(origin_id, "command", raw_key), "", "command", "legacy"
+
+    if stype == "log":
+        raw_path = str(src.definition.get("path") or "")
+        if raw_path and not any(ch in raw_path for ch in "*?["):
+            resolved_path = str(paths.expand(raw_path))
+            origin_id = f"log:{resolved_path}"
+            return canonical_external_key(origin_id, "log.error", raw_key), "", "log.error", "legacy"
+        return f"legacy-unresolved:{raw_key}", "", "legacy", "legacy_unresolved"
+
+    return f"legacy-unresolved:{raw_key}", "", "legacy", "legacy_unresolved"
 
 
 def backfill_conn(c, cfg: config.Config | None = None, loop_list: list[Loop] | None = None) -> int:
@@ -534,6 +683,47 @@ def _source_limit(src: Src) -> int:
     return 50
 
 
+def _revalidate_source_under_fence(src: Src) -> bool:
+    """Revalidate fetched source scope/effective binding against authoritative config under the instance fence."""
+    cfg_now, problem = config.load_or_problem()
+    if problem:
+        return True
+    try:
+        from . import loops as loops_mod
+
+        live_loops = loops_mod.load_all(cfg_now, check=False)
+        live_by_id = {s.id: s for s in load_all(cfg_now, live_loops, include_derived=False)}
+    except Exception:
+        return True
+    live_src = live_by_id.get(src.id)
+    if live_src is None:
+        return src.origin != "file"
+    return bool(live_src.enabled) and live_src.scope_sha == src.scope_sha
+
+
+def _event_author(ev: dict) -> str:
+    data = ev.get("data")
+    if isinstance(data, dict):
+        for key in ("author", "reporter"):
+            if isinstance(data.get(key), str) and data[key].strip():
+                return data[key].strip()
+    return ""
+
+
+def _resolve_target_loops(src: Src, cfg: config.Config, fire_loops: dict[str, Loop] | None) -> list[Loop]:
+    from . import loops as loops_mod
+
+    if not src.loops:
+        return []
+    if fire_loops is not None:
+        targets = fire_loops
+    elif src.loop_objects:
+        targets = {loop.name: loop for loop in src.loop_objects if loop.enabled and not loop.error}
+    else:
+        targets = {loop.name: loop for loop in loops_mod.load_all(cfg) if loop.enabled and not loop.error}
+    return [targets[name] for name in src.loops if name in targets]
+
+
 def poll(
     src: Src,
     cfg: config.Config,
@@ -542,7 +732,6 @@ def poll(
     fire_loops: dict[str, Loop] | None = None,
 ) -> tuple[list[dict], list[int]]:
     from . import inbox
-    from . import loops as loops_mod
     from .store import factory
 
     version = factory.admit()
@@ -550,6 +739,7 @@ def poll(
     kind = SOURCES[stype]
     started = util.iso()
     known = source_store.cursor(src.id)
+    expected_version = int(known["version"]) if known and known.get("version") is not None else None
     first = known is None or known.get("last_ok") is None
     changed = not first and known.get("scope_sha") != src.scope_sha
     cursor = None if first else kind.rescope(src.definition, known["value"]) if changed else known["value"]
@@ -563,90 +753,226 @@ def poll(
         rate = _extract_rate(rate_box, e)
         next_streak = (int(known["error_streak"]) if known and known.get("error_streak") is not None else 0) + 1
         backoff_s = compute_backoff(every(src.definition), next_streak, rate.get("retry_after") if rate else None)
-        with foundation.tx() as c:
+        try:
+            with foundation.tx() as c:
+                factory.admit(c, version=version)
+                row = source_store.source_poll(c, src, started, False, 0, 0, err_text, rate, backoff_s)
+                events.emit(
+                    "source.failed",
+                    f"source:{src.id}",
+                    cls="notice",
+                    ver=row["version"],
+                    data={
+                        "source": src.id,
+                        "error": err_text,
+                        "error_streak": int(row["error_streak"] or 0),
+                        "backoff_s": backoff_s,
+                        "backoff_until": row["backoff_until"],
+                    },
+                    connection=c,
+                )
+        except Exception as err2:
+            raise PollCrashed(f"{err_text} (error path failed: {type(err2).__name__}: {err2})") from err2
+        raise
+
+    rate = _extract_rate(rate_box)
+    prepared: list[tuple[dict, str, str, str, str, str | None, str | None, str, int]] = []
+    seen_batch_identities: set[tuple[str, str]] = set()
+    for ev in found:
+        origin_id, ext_key, ext_rev, ev_kind = intake_identity_for_event(src, cfg, ev)
+        ident = (ext_key, ext_rev)
+        if ident in seen_batch_identities:
+            continue
+        seen_batch_identities.add(ident)
+        raw_obj = {**ev, "origin": origin_id}
+        raw_bytes = json.dumps(raw_obj, sort_keys=True, default=str).encode("utf-8")
+        raw_text, raw_blob, raw_sha = intake_store.prepare_raw(raw_bytes)
+        prepared.append((ev, origin_id, ext_key, ext_rev, ev_kind, raw_text, raw_blob, raw_sha, len(raw_bytes)))
+
+    target_loops = _resolve_target_loops(src, cfg, fire_loops)
+    forwarded: list[dict] = []
+    older: list[dict] = []
+    items: list[int] = []
+    rescope_item: dict | None = None
+
+    try:
+        with configrepo.maybe_instance_fence(), foundation.tx() as c:
             factory.admit(c, version=version)
-            row = source_store.source_poll(c, src, started, False, 0, 0, err_text, rate, backoff_s)
+            if not _revalidate_source_under_fence(src):
+                raise _PollStale("source scope or binding changed during fetch")
+            cur_now = c.execute("SELECT * FROM cursors WHERE source = ?", (src.id,)).fetchone()
+            if expected_version is None:
+                if cur_now is not None:
+                    raise _PollStale("cursor created concurrently during fetch")
+            elif cur_now is None or int(cur_now["version"]) != expected_version:
+                raise _PollStale("cursor version moved during fetch")
+
+            poll_id = source_store.begin_poll_row(c, src.id, started)
+            fresh_records: list[tuple[int, dict, str, str, str]] = []
+            for ev, origin_id, ext_key, ext_rev, ev_kind, raw_text, raw_blob, raw_sha, raw_len in prepared:
+                intake_store.record_raw_blob(c, raw_blob, raw_len)
+                item_num, created = intake_store.insert_item(
+                    c,
+                    source=src.id,
+                    source_version=src.version,
+                    poll_id=poll_id,
+                    external_key=ext_key,
+                    external_rev=ext_rev,
+                    kind=ev_kind,
+                    title=str(ev.get("title") or ""),
+                    author=_event_author(ev),
+                    origin_url=str(ev.get("url") or ""),
+                    trust=str(ev.get("trust") or "untrusted"),
+                    raw=raw_text,
+                    raw_blob=raw_blob,
+                    raw_sha256=raw_sha,
+                    status="new",
+                    shape="event",
+                    received=started,
+                )
+                if created and item_num is not None:
+                    fresh_records.append((item_num, ev, origin_id, ext_key, ext_rev))
+
+            fresh_events = [rec[1] for rec in fresh_records]
+            if first:
+                forwarded, older = kind.baseline(fresh_events)
+            elif changed:
+                forwarded, older = kind.catch_up(fresh_events, last_good_poll(known))
+            else:
+                forwarded, older = fresh_events, []
+
+            older_ids = {id(ev) for ev in older}
+            forwarded_records = [rec for rec in fresh_records if id(rec[1]) not in older_ids]
+            older_records = [rec for rec in fresh_records if id(rec[1]) in older_ids]
+
+            if first:
+                for item_num, _, _, _, _ in older_records:
+                    c.execute("UPDATE intake_items SET status = 'dismissed' WHERE id = ?", (item_num,))
+            elif changed and older_records:
+                limit = _source_limit(src)
+                held_payloads: list[dict] = []
+                for idx, (item_num, ev, origin_id, ext_key, ext_rev) in enumerate(older_records):
+                    if idx < limit:
+                        c.execute("UPDATE intake_items SET status = 'held' WHERE id = ?", (item_num,))
+                        held_payloads.append({
+                            **ev,
+                            "intake_item": intake_store.format_id(item_num),
+                            "origin": origin_id,
+                            "external_key": ext_key,
+                            "external_rev": ext_rev,
+                            "source_version": src.version,
+                        })
+                    else:
+                        c.execute("UPDATE intake_items SET status = 'dismissed' WHERE id = ?", (item_num,))
+                if held_payloads:
+                    rescope_item = inbox.raise_rescope(c, src, held_payloads)
+
+            refused_count = 0
+            if forwarded_records and target_loops:
+                accepted_nums: set[int] = set()
+                refusal_by_num: dict[int, str] = {}
+                for loop_obj in target_loops:
+                    batches: dict[str, list[dict]] = {}
+                    for item_num, ev, _, _, _ in forwarded_records:
+                        try:
+                            reason = loop_obj.trigger.refusal(ev)
+                            if reason:
+                                if item_num not in accepted_nums:
+                                    refusal_by_num.setdefault(item_num, reason)
+                                continue
+                            grp = loop_obj.trigger.group_of(ev)
+                        except Exception as err:
+                            if item_num not in accepted_nums:
+                                refusal_by_num.setdefault(item_num, f"{type(err).__name__}: {err}")
+                            continue
+                        accepted_nums.add(item_num)
+                        refusal_by_num.pop(item_num, None)
+                        loop_store.add_event(loop_obj.name, ev, connect=lambda: nullcontext(c))
+                        batches.setdefault(grp, []).append(ev)
+                    for grp, batch in batches.items():
+                        qid = loop_store.enqueue(loop_obj.name, loop_obj.queue_name, grp, "event", batch, c=c)
+                        if qid:
+                            items.append(qid)
+                for item_num, reason in refusal_by_num.items():
+                    c.execute(
+                        "UPDATE intake_items SET status = 'refused', refuse_reason = ? WHERE id = ?",
+                        (reason, item_num),
+                    )
+                    refused_count += 1
+
+            prev_value = known.get("value") if known else None
+            advanced = bool(fresh_records) or (value != prev_value)
+            detail = f"{len(found)} read, {len(fresh_records)} new"
+            if first:
+                detail += " (baseline)"
+            elif changed:
+                detail += f", scope changed, {len(older)} older skipped"
+            ended_ts = util.iso()
+            row = source_store.upsert_cursor_ok(
+                c,
+                src,
+                started,
+                value=value,
+                advanced=advanced,
+                detail=detail,
+                ended=ended_ts,
+            )
+            source_store.finish_poll_row(
+                c,
+                poll_id,
+                ended=ended_ts,
+                ok=True,
+                read=len(found),
+                new=len(fresh_records),
+                refused=refused_count,
+                rate=rate,
+            )
+            for item_num, _ev, _, ext_key, ext_rev in fresh_records:
+                item_row = intake_store.get_item_conn(c, item_num)
+                if item_row is not None:
+                    events.emit(
+                        "intake.created",
+                        f"intake:{item_row['id']}",
+                        cls="durable",
+                        ver=item_row["version"],
+                        data={
+                            "item": item_row["id"],
+                            "source": src.id,
+                            "poll_id": poll_id,
+                            "external_key": ext_key,
+                            "external_rev": ext_rev,
+                            "kind": item_row["kind"],
+                            "status": item_row["status"],
+                        },
+                        connection=c,
+                    )
             events.emit(
-                "source.failed",
+                "source.polled",
                 f"source:{src.id}",
                 cls="notice",
                 ver=row["version"],
                 data={
                     "source": src.id,
-                    "error": err_text,
-                    "error_streak": int(row["error_streak"] or 0),
-                    "backoff_s": backoff_s,
-                    "backoff_until": row["backoff_until"],
+                    "read": len(found),
+                    "new": len(fresh_records),
+                    "refused": refused_count,
+                    "forwarded": len(forwarded),
+                    "mode": "baseline" if first else "rescope" if changed else "poll",
                 },
                 connection=c,
             )
+    except _PollStale:
+        return [], []
+    except Exception as e:
+        if isinstance(e, factory.Off):
+            raise
+        err_text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
+        try:
+            with foundation.tx() as c:
+                source_store.record_poll_error(c, src.id, started, err_text, rate=rate)
+        except Exception as err2:
+            raise PollCrashed(f"{err_text} (error path failed: {type(err2).__name__}: {err2})") from err2
         raise
-
-    rate = _extract_rate(rate_box)
-    unique = {e["key"]: e for e in found}
-    with foundation.tx() as c:
-        factory.admit(c, version=version)
-        claimed = set(source_store.claim_seen(src.id, list(unique), connect=lambda: nullcontext(c)))
-        fresh = [e for k, e in unique.items() if k in claimed]
-        if first:
-            forwarded, older = kind.baseline(fresh)
-        elif changed:
-            forwarded, older = kind.catch_up(fresh, last_good_poll(known))
-        else:
-            forwarded, older = fresh, []
-        prev_value = known.get("value") if known else None
-        advanced = bool(fresh) or (value != prev_value)
-        detail = f"{len(found)} read, {len(fresh)} new"
-        if first:
-            detail += " (baseline)"
-        elif changed:
-            detail += f", scope changed, {len(older)} older skipped"
-        row = source_store.source_poll(
-            c,
-            src,
-            started,
-            True,
-            len(found),
-            len(fresh),
-            None,
-            rate,
-            None,
-            value=value,
-            advanced=advanced,
-            detail=detail,
-        )
-        events.emit(
-            "source.polled",
-            f"source:{src.id}",
-            cls="notice",
-            ver=row["version"],
-            data={
-                "source": src.id,
-                "read": len(found),
-                "new": len(fresh),
-                "forwarded": len(forwarded),
-                "mode": "baseline" if first else "rescope" if changed else "poll",
-            },
-            connection=c,
-        )
-
-    rescope_item: dict | None = None
-    if changed and older:
-        held = older[:_source_limit(src)]
-        with foundation.tx() as c:
-            rescope_item = inbox.raise_rescope(c, src, held)
-
-    items: list[int] = []
-    if forwarded and src.loops:
-        if fire_loops is not None:
-            targets = fire_loops
-        elif src.loop_objects:
-            targets = {loop.name: loop for loop in src.loop_objects if loop.enabled and not loop.error}
-        else:
-            targets = {loop.name: loop for loop in loops_mod.load_all(cfg) if loop.enabled and not loop.error}
-        for loop_name in src.loops:
-            if (loop_obj := targets.get(loop_name)) is not None:
-                items.extend(fire(loop_obj, "event", forwarded))
 
     if first:
         say(
@@ -694,7 +1020,7 @@ def dry_run(src: Src, cfg: config.Config) -> dict:
             "check": check_result,
         }
     known = source_store.cursor(src.id)
-    seen_keys = source_store.source_seen(src.id)
+    known_identities = intake_store.item_identities(src.id)
     first = known is None or known.get("last_ok") is None
     would_rescope = not first and known.get("scope_sha") != src.scope_sha
     cursor = None if first else kind.rescope(src.definition, known["value"]) if would_rescope else known["value"]
@@ -710,7 +1036,10 @@ def dry_run(src: Src, cfg: config.Config) -> dict:
             "would_rescope": would_rescope,
             "check": None,
         }
-    items = [{**e, "seen": e["key"] in seen_keys} for e in found]
+    items = []
+    for e in found:
+        _, ext_key, ext_rev, _ = intake_identity_for_event(src, cfg, e)
+        items.append({**e, "seen": (ext_key, ext_rev) in known_identities})
     return {
         "source": src.id,
         "dry_run": True,

@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1162,14 +1162,30 @@ class Server:
             if now_mono - self.tried.get(sid, -1e9) < sources.every(src.definition):
                 continue
             self.tried[sid] = now_mono
+            started_iso = util.iso()
             self.polls[sid] = future = self.pool.submit(self.poll_source, src)
-            future.add_done_callback(lambda done, sid=sid: self.poll_ended(sid, done))
+            future.add_done_callback(lambda done, sid=sid, started=started_iso: self.poll_ended(sid, done, started=started))
 
-    def poll_ended(self, sid: str, done: Future) -> None:
-        if done.cancelled():
-            return
-        if error := done.exception():
-            self.say(f"{sid}: poll failed: {type(error).__name__}: {util.first_line(str(error), 300)}")
+    def poll_ended(self, sid: str, done: Future, *, started: str | None = None) -> None:
+        with suppress(Exception):
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is None:
+                return
+            self.tried.pop(sid, None)
+            err_text = f"{type(error).__name__}: {util.first_line(str(error), 300)}"
+            self.say(f"{sid}: poll crashed: {err_text}")
+            with suppress(Exception):
+                started_ts = started or util.iso()
+                with foundation.tx() as c:
+                    if source_store.has_durable_sources(c):
+                        wrote = c.execute(
+                            "SELECT 1 FROM source_polls WHERE source = ? AND started >= ? LIMIT 1",
+                            (sid, started_ts),
+                        ).fetchone()
+                        if wrote is None:
+                            source_store.record_poll_error(c, sid, started_ts, err_text)
 
     def forget_unpolled_errors(self, live: list[Loop]) -> None:
         polled = {
@@ -1238,6 +1254,8 @@ class Server:
         live_by_name = {loop.name: loop for loop in self.live} if self.live else None
         try:
             found, items = sources.poll(src, self.cfg, say=self.say, fire_loops=live_by_name)
+        except sources.PollCrashed:
+            raise
         except Exception as e:
             if isinstance(e, factory_state.Off):
                 return

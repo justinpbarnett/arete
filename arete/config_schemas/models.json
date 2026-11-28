@@ -23,7 +23,8 @@
     "explain": {"type": "string"},
     "document": {"type": "string"},
     "capture_evidence": {"type": "string"},
-    "config_ask": {"type": "string"}
+    "config_ask": {"type": "string"},
+    "intake_extract": {"type": "string"}
   },
   "additionalProperties": false
 }

@@ -1169,7 +1169,13 @@ def view(task_id: str, repo_name: str = "") -> dict:
     if tracker.is_task_id(tid):
         if (row := task_store.task_get(tid, connect=foundation.reader)) is None:
             raise control.NotFound(f"no task {tid}")
-        item = {**row, "comments": task_store.task_comments(row["id"], connect=foundation.reader)}
+        sources_rows = list(row.get("refs") or ())
+        item = {
+            **row,
+            "sources": sources_rows,
+            "intake": list(row.get("intake") or ()),
+            "comments": task_store.task_comments(row["id"], connect=foundation.reader),
+        }
         repo = row["repo"]
         refs = [row["id"]]
         runs = (
@@ -1179,6 +1185,8 @@ def view(task_id: str, repo_name: str = "") -> dict:
         )
     else:
         item, repo = tracker_item(config.load(), tid, repo_name.strip())
+        item.setdefault("sources", [])
+        item.setdefault("intake", [])
         refs = [item["id"], item["ref"]]
         runs = run_store.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
     paid = run_store.paid_by_run([r["id"] for r in runs], connect=foundation.reader)

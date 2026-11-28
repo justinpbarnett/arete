@@ -50,6 +50,7 @@ ROLES = (
     Role("document", read_only=True, keeps_session=False),
     Role("capture_evidence", "sonnet", read_only=True, keeps_session=False),
     Role("config_ask", "sonnet", read_only=True, keeps_session=False),
+    Role("intake_extract", "sonnet", read_only=True, keeps_session=False),
     Role("check_repair", inherits="build"),
     Role("review_repair", inherits="build"),
     Role("ci_repair", inherits="build"),
@@ -452,6 +453,7 @@ class Config:
     max_parallel: int = 1
     max_parallel_checks: int = 2
     dashboard_port: int = paths.DASHBOARD_PORT
+    dashboard_hook_port: int = 0
     server_url: str = ""
     dashboard_owner: str = ""
     dashboard_https: bool = False
@@ -541,6 +543,8 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
                         del repo[key]
             if not data.get("automation_payer"):
                 data.pop("automation_payer", None)
+            if not data.get("dashboard_hook_port"):
+                data.pop("dashboard_hook_port", None)
     if "orchestration" in data and data["orchestration"].get("max_builders") is None:
         data["orchestration"].pop("max_builders", None)
     if "orchestration" in data and not data["orchestration"].get("private_worker_model"):
@@ -1514,6 +1518,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         max_parallel=max(1, int(data.get("max_parallel", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
+        dashboard_hook_port=int(data.get("dashboard", {}).get("hook_port", 0) or 0),
         server_url=server_url(data),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),

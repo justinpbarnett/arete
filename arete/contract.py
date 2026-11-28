@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 35
+MINOR = 36
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -60,6 +60,7 @@ REF = obj({
     "remote_actor": NULL_TEXT,
     "fetched_at": NULL_TEXT,
     "sync": {**STRING, "enum": ["local", "synced", "ahead", "behind", "conflict", "off"]},
+    "intake_item": NULL_TEXT,
     "fields": array(REF_FIELD),
     "version": INTEGER,
     "created": STRING,
@@ -81,6 +82,8 @@ TASK_REF = obj({
     "source_rev": STRING,
     "linked_by": STRING,
     "confidence": NULL_NUM,
+    "intake_item": NULL_TEXT,
+    "intake_n": NULL_INT,
     "version": INTEGER,
     "created": STRING,
     "updated": STRING,
@@ -136,6 +139,7 @@ TASK = obj({
     "refs": array(TASK_REF),
     "primary_ref": {"anyOf": [REF, {"type": "null"}]},
     "links": array(TASK_LINK),
+    "intake": array(STRING),
     "needs_you": INTEGER,
     "needs_you_ids": array(STRING),
 }, _TASK_REQUIRED)
@@ -170,7 +174,7 @@ FACTORY_STATE = obj({"enabled": BOOLEAN, "phase": STRING, "version": INTEGER, "a
 LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
             "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
             "prompt": STRING, "model": STRING, "state": mapping(JSON), "runs": array(RUN),
-            "webhook_path": STRING, "secret_present": BOOLEAN},
+            "webhook_path": STRING, "hook_port": INTEGER, "secret_present": BOOLEAN},
            ["name", "enabled"])
 INCIDENT = obj({**dict.fromkeys(("state", "phase", "waiting", "class", "source", "repo", "signature", "first_seen",
                                "last_seen", "decision", "reason", "decided", "retry_at", "recovery", "closed",
@@ -639,7 +643,10 @@ for _name, _shape in RESOURCE.items():
     _get_envelope = (
         envelope({_name: _shape, "steps": array(RUN_STEP_SUMMARY),
                   "eta": NULL_TEXT, "eta_partial": BOOLEAN}, ["seq", _name])
-        if _name == "run" else envelope({_name: _shape})
+        if _name == "run"
+        else envelope({_name: _shape, "sources": array(TASK_REF)}, ["seq", _name])
+        if _name == "task"
+        else envelope({_name: _shape})
     )
     OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
                              _list_inputs, dict.fromkeys(_selectors, "example")),
@@ -1575,6 +1582,97 @@ SOURCE_POLL_RESULT = {"anyOf": [SOURCE_POLL_DONE, SOURCE_POLL_ACCEPTED]}
 
 LOOP["properties"]["sources"] = {"type": "array", "items": {"anyOf": [SOURCE, STRING]}}
 
+INTAKE_ITEM = obj({
+    "id": STRING,
+    "source": STRING,
+    "source_version": NULL_TEXT,
+    "poll_id": NULL_INT,
+    "external_key": STRING,
+    "external_rev": STRING,
+    "kind": STRING,
+    "title": STRING,
+    "author": STRING,
+    "origin_url": STRING,
+    "trust": {**STRING, "enum": ["untrusted", "internal", "owner"]},
+    "quarantined": BOOLEAN,
+    "raw": NULL_TEXT,
+    "raw_blob": NULL_TEXT,
+    "raw_sha256": STRING,
+    "rule": NULL_TEXT,
+    "rule_version": NULL_TEXT,
+    "status": {**STRING, "enum": ["new", "held", "extracted", "linked", "dismissed", "refused"]},
+    "refuse_reason": NULL_TEXT,
+    "shape": STRING,
+    "received": STRING,
+    "version": INTEGER,
+})
+INTAKE_CANDIDATE = obj({
+    "item": STRING,
+    "n": INTEGER,
+    "kind": STRING,
+    "action": {**STRING, "enum": ["create", "link", "ignore"]},
+    "title": STRING,
+    "quote_start": NULL_INT,
+    "quote_end": NULL_INT,
+    "fields": mapping(JSON),
+    "match_task": NULL_TEXT,
+    "match_confidence": NULL_NUM,
+    "state": {**STRING, "enum": ["proposed", "accepted", "linked", "dismissed"]},
+    "task_id": NULL_TEXT,
+    "extracted_by": NULL_INT,
+    "version": INTEGER,
+})
+INTAKE_ADD_INPUT = obj({
+    "text": STRING,
+    "blob": STRING,
+    "kind": STRING,
+    "title": STRING,
+    "author": STRING,
+    "origin_url": STRING,
+    "source": STRING,
+    "shape": STRING,
+}, [])
+INTAKE_ACCEPT_CANDIDATE = obj({
+    "n": {**INTEGER, "minimum": 1},
+    "action": {**STRING, "enum": ["create", "link"]},
+    "task": STRING,
+    "role": {**STRING, "enum": ["primary", "origin", "related", "parent"]},
+    "repo": STRING,
+    "title": STRING,
+    "body": STRING,
+    "kind": STRING,
+    "interpretation": STRING,
+    "project": NULL_TEXT,
+    "line": NULL_TEXT,
+    "fields": mapping(JSON),
+}, ["n"])
+INTAKE_ACCEPT_INPUT = obj({
+    "item": STRING,
+    "base_version": {**INTEGER, "minimum": 1},
+    "candidates": {**array(INTAKE_ACCEPT_CANDIDATE), "minItems": 1},
+    "role": {**STRING, "enum": ["primary", "origin", "related", "parent"]},
+    "repo": STRING,
+    "project": NULL_TEXT,
+    "line": NULL_TEXT,
+}, ["item", "base_version", "candidates"])
+INTAKE_DISMISS_INPUT = obj({
+    "item": STRING,
+    "base_version": {**INTEGER, "minimum": 1},
+    "candidates": array({**INTEGER, "minimum": 1}),
+    "reason": STRING,
+}, ["item"])
+INTAKE_EXTRACT_DONE = envelope({
+    "item": INTAKE_ITEM,
+    "candidates": array(INTAKE_CANDIDATE),
+    "step_id": NULL_INT,
+}, ["seq", "item", "candidates"])
+INTAKE_EXTRACT_ACCEPTED = envelope({
+    "accepted": BOOLEAN,
+    "watch": STRING,
+    "item": STRING,
+}, ["seq", "accepted", "watch", "item"])
+INTAKE_EXTRACT_RESULT = {"anyOf": [INTAKE_EXTRACT_DONE, INTAKE_EXTRACT_ACCEPTED]}
+
 OPERATIONS += [
     operation("source.list", "sources", envelope({"sources": array(SOURCE)})),
     operation("source.get", "sources/{source}", envelope({"source": SOURCE}),
@@ -1583,6 +1681,49 @@ OPERATIONS += [
                  obj({"source": STRING, "dry_run": BOOLEAN}, ["source"]),
                  {"source": "pipeline", "dry_run": True}, "POST", errors=("invalid_state",)),
      "scope": "run:start"},
+    operation("intake.list", "intake", envelope({"items": array(INTAKE_ITEM)}),
+              obj({"source": STRING, "status": STRING, "kind": STRING, "limit": STRING}, [])),
+    operation("intake.get", "intake/{item}",
+              envelope({"item": INTAKE_ITEM, "candidates": array(INTAKE_CANDIDATE)}),
+              obj({"item": STRING}), {"item": "IN-1"}),
+    operation("intake.history", "intake/{item}/history", envelope({"events": array(INBOX_EVENT)}),
+              obj({"item": STRING}), {"item": "IN-1"}),
+    {**operation("intake.add", "intake", envelope({"item": INTAKE_ITEM}),
+                 INTAKE_ADD_INPUT, {"text": "Follow up on login fix.", "kind": "paste"}, "POST",
+                 success_status=201),
+     "scope": "intake:write"},
+    {**operation("intake.extract", "intake/{item}/extract", INTAKE_EXTRACT_RESULT,
+                 obj({"item": STRING}), {"item": "IN-1"}, "POST",
+                 errors=("invalid_state", "config_invalid", "upstream_failed")),
+     "scope": "intake:write"},
+    {**operation("intake.accept", "intake/{item}/accept",
+                 envelope({
+                     "item": INTAKE_ITEM,
+                     "candidates": array(INTAKE_CANDIDATE),
+                     "ref": REF,
+                     "tasks": array(TASK),
+                     "links": array(TASK_REF),
+                 }),
+                 INTAKE_ACCEPT_INPUT,
+                 {"item": "IN-1", "base_version": 2, "candidates": [{"n": 1, "action": "create"}]},
+                 "POST", errors=("invalid_state", "invalid_fields", "forbidden")),
+     "scope": "intake:write"},
+    {**operation("intake.dismiss", "intake/{item}/dismiss",
+                 envelope({"item": INTAKE_ITEM, "candidates": array(INTAKE_CANDIDATE)}),
+                 INTAKE_DISMISS_INPUT,
+                 {"item": "IN-1", "base_version": 1, "reason": "not actionable"},
+                 "POST", errors=("invalid_state",)),
+     "scope": "intake:write"},
+    operation("task_screen.get", "screens/task",
+              envelope({
+                  "task": TASK,
+                  "sources": array(TASK_REF),
+                  "runs": array(mapping(JSON)),
+                  "children": array(mapping(JSON)),
+                  "comments": array(TASK_COMMENT),
+              }),
+              obj({"task": STRING}, ["task"]),
+              {"task": "T-1"}),
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):

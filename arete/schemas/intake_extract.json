@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["feat", "fix", "chore", "research", "bug", "task", "decision", "action_item"]
+          },
+          "action": {
+            "type": "string",
+            "enum": ["create", "link", "ignore"]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "quote_start": {
+            "type": ["integer", "null"],
+            "minimum": 0
+          },
+          "quote_end": {
+            "type": ["integer", "null"],
+            "minimum": 0
+          },
+          "fields": {
+            "type": "object"
+          },
+          "match_task": {
+            "type": ["string", "null"]
+          },
+          "match_confidence": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "kind",
+          "action",
+          "title",
+          "quote_start",
+          "quote_end",
+          "fields",
+          "match_task",
+          "match_confidence"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["candidates"],
+  "additionalProperties": false
+}

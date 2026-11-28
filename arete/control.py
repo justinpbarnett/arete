@@ -265,6 +265,7 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
                      for i in loop_store.dead_items(connect) if i["loop"] == loop.name],
             "sources": sources.views_for_loop(cfg, loop, connect=connect),
             "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
+            "hook_port": cfg.dashboard_hook_port if (loop.trigger.webhook and cfg.dashboard_hook_port > 0) else 0,
             "secret_present": bool(loop.trigger.webhook and webhooks.present(loop.name)),
             "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
