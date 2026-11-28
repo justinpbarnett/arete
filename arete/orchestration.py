@@ -622,8 +622,20 @@ class Controller(worker_turns.WorkerTurns):
         run_dir = getattr(self.run, "dir", None)
         if run_dir is not None and hasattr(self.run.tracker, "save_images"):
             attachments, attachment_dirs, manifest = pipeline.collect_ticket_attachments(
-                self.run.tracker, ticket, Path(run_dir), log=getattr(self.run, "log", None),
+                self.run.tracker,
+                ticket,
+                Path(run_dir),
+                log=getattr(self.run, "log", None),
+                repo_name=self.run.repo.name,
+                run_id=self.run.id,
+                record_missing=not getattr(self.run, "dry_run", False),
             )
+            if missing := manifest.get("needs_private_help"):
+                from . import private_evidence
+
+                summary = private_evidence.waiting_summary(missing)
+                run_lines.write(self.run.id, "private_evidence", ticket=ticket.ref, missing=missing)
+                return "needs-info", summary, ""
             if attachments or manifest["media"] or manifest["external"]:
                 prepared["attachments"] = attachments
                 existing_dirs = list(prepared.get("add_dirs") or [])

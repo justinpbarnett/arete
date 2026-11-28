@@ -298,7 +298,7 @@ paths.LOG_DIR = old_state / "logs"
 paths.SERVER_FILE = old_state / "server.json"
 paths.SERVE_BEAT_FILE = old_state / "serve.json"
 db._CHECKED.clear()
-db.migrate(through=38)
+db.migrate(through=39)
 with db.tx() as c:
     c.execute("INSERT INTO runs (id, kind, status, started) VALUES ('r-pre', 'pipeline', 'done', '2026-01-01T00:00:00Z')")
 db.migrate()
@@ -946,7 +946,7 @@ from arete.store import approvals as approvals_store, db, outbox as outbox_store
 from tests.test_outbox import FakeGitHubLedger
 
 # Seed DB at m0037 with 5 approvals rows (one per status).
-db.migrate(through=38)
+db.migrate(through=39)
 decided_ts = "2026-11-01T12:00:00Z"
 with db.tx() as c:
     c.execute("INSERT INTO runs (id, kind, repo, status, started) VALUES ('r1', 'pipeline', 'o/r', 'done', '2026-11-01T10:00:00Z')")

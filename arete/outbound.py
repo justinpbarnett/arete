@@ -138,11 +138,20 @@ def registered(text: str) -> str:
     return re.sub(re.escape(PRIVATE_ADDRESS) + "|" + pattern, PRIVATE_ADDRESS, text, flags=re.IGNORECASE)
 
 
+PRIVATE_EVIDENCE = "[private evidence]"
+PRIVATE_EVIDENCE_REF = re.compile(
+    r"(?:(?:/api(?:/v1)?/inbox/[^/\s)\"']+/evidence\b[^\s)\"']*)"
+    r"|(?:[^\s`\"'()]*private-evidence/ev-[a-f0-9]+[^\s`\"'()]*))",
+    re.IGNORECASE,
+)
+
+
 def screen(text: str, *, subject: str = "outbound") -> str:
     text = scrub.text(text, "outbound", subject)
     keep_configured_private()
     text = ORIGIN.sub(screen_origin, text)
     text = BARE_PRIVATE.sub(screen_bare, text)
+    text = PRIVATE_EVIDENCE_REF.sub(PRIVATE_EVIDENCE, text)
     return HOME_PATH.sub("~", registered(text))
 
 

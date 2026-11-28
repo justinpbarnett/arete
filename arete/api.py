@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from urllib.parse import unquote
 
 from . import (
     api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, events,
-    inbox, outbox, pi, record, refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks, webpush,
+    inbox, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage, util,
+    webhooks, webpush,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -179,6 +181,33 @@ def set_secret(handler, op, target):
 
     return handler.keyed_action(op["method"], op["path"], target, change, atomic=True, status=op["success_status"],
                                 hash_body={"fingerprint": fp})
+
+
+def upload_inbox_evidence(handler, op, target):
+    item_id = target["item"]
+    raw_name = (handler.headers.get("X-Evidence-Filename") or "").strip()
+    content_type = (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    data = api_http.read_body(handler.rfile, handler.content_size, ticket_media.MAX_VIDEO_BYTES)
+    digest = hashlib.sha256(data).hexdigest()
+
+    def change():
+        return with_seq(inbox.upload_evidence(
+            item_id,
+            data,
+            filename=raw_name,
+            content_type=content_type,
+            actor=principals.current(),
+        ))
+
+    return handler.keyed_action(
+        op["method"],
+        op["path"],
+        target,
+        change,
+        atomic=False,
+        status=op["success_status"],
+        hash_body={"sha256": digest, "filename": raw_name, "size": len(data)},
+    )
 
 
 def prepare(name, values):
@@ -383,7 +412,7 @@ def dispatch(handler, op, path_values, query):
     values = {**query, **identity}
     write = contract.keyed_write(op)
     if method != "GET":
-        body = {} if name == "secret.set" else handler.body()
+        body = {} if name in ("secret.set", "inbox.upload_evidence") else handler.body()
         if write and (query or identity.keys() & body.keys()):
             raise contract.Problem("invalid_input", "Send the target in the URL and writable fields in the body")
         values = {**body, **identity}
@@ -411,6 +440,8 @@ def dispatch(handler, op, path_values, query):
                         rev=values.get("rev"),
                     ),
                 )
+            if name == "inbox.upload_evidence":
+                return upload_inbox_evidence(handler, op, identity)
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])

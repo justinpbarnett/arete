@@ -428,9 +428,13 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, cohorts, contract, dashboard, outbox, paths, principals, record, replay, secretstore, triage
+        from . import (
+            agent, cohorts, contract, dashboard, outbox, paths, principals, private_evidence, record, replay,
+            secretstore, triage,
+        )
         from .sighting import Sighting
         from .store import chats, db, incidents, insights, push, runs, tokens
+        from .store import evidence as evidence_store
         from .store import inbox as inbox_store
         from .store import triage as triage_store
 
@@ -464,6 +468,24 @@ class Check:
             "outbox.retry": f"OB-{ob_retry}",
             "outbox.discard": f"OB-{ob_discard}",
         }
+        ev_id = private_evidence.request_id(replay.SAMPLE_REPO, self.task, "jira:attachment:fixture-1")
+        evidence_store.upsert_missing(
+            ev_id,
+            repo=replay.SAMPLE_REPO,
+            ticket=self.task,
+            ticket_ref=self.task,
+            tracker="jira",
+            run_id=self.run,
+            ref_key="jira:attachment:fixture-1",
+            ref_kind="jira_attachment",
+            source="body",
+            name="fixture.png",
+            attachment_id="fixture-1",
+            media_kind="image",
+            failure_status="inaccessible",
+            failure_detail="HTTP 403 access denied",
+        )
+        fixture_evidence_item = inbox_store.get_open_by_subject(f"evidence:{ev_id}")
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
@@ -523,6 +545,26 @@ class Check:
                 if name == "serve.install":
                     with patch.object(dashboard, "install_serve", return_value={"restarting": True}):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "inbox.upload_evidence":
+                    import struct
+                    import zlib
+
+                    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+                    idat = zlib.compress(b"\x00\xff\x00\x00")
+                    png = (
+                        b"\x89PNG\r\n\x1a\n"
+                        + struct.pack(">I", len(ihdr)) + b"IHDR" + ihdr + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF)
+                        + struct.pack(">I", len(idat)) + b"IDAT" + idat + struct.pack(">I", zlib.crc32(b"IDAT" + idat) & 0xFFFFFFFF)
+                        + struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+                    )
+                    ev_path = f"/api/v1/inbox/{quote(fixture_evidence_item['id'], safe='')}/evidence"
+                    ev_headers = {
+                        **(key or {}),
+                        "Content-Type": "application/octet-stream",
+                        "X-Evidence-Filename": "fixture.png",
+                    }
+                    with patch.object(private_evidence, "resume_ticket", return_value={"state": "queued", "why": "fixture"}):
+                        headers, raw = self.request(method, ev_path, png, headers=ev_headers, status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 data = json.loads(raw)

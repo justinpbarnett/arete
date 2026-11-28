@@ -9841,8 +9841,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 98)
-        self.assertEqual(len({op["name"] for op in operations}), 98)
+        self.assertEqual(len(operations), 99)
+        self.assertEqual(len({op["name"] for op in operations}), 99)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -13231,7 +13231,7 @@ class InboxTests(_InboxCase):
 
             self.assertEqual(self.http(server1, "GET", "/api/sidebar", cookie=cookie)[0]["needs_you"], 1)
             live, _ = self.http(server1, "GET", "/api/live", cookie=cookie)
-            self.assertEqual(set(live["needs_you"]), {"approvals", "skipped", "proposals", "ready", "draft"})
+            self.assertEqual(set(live["needs_you"]), {"approvals", "evidence", "skipped", "proposals", "ready", "draft"})
             self.assertEqual([a["id"] for a in live["needs_you"]["approvals"]["rows"]], [a2])
             self.assertEqual(live["needs_you"]["proposals"]["rows"], {"memory": [], "hand": [], "approve": []})
 
