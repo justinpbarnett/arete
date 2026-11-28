@@ -45,8 +45,10 @@ def listener(proc, origin, configured, attempt=None):
                and url.hostname in ("127.0.0.1", "::1") and url.port and url.port not in paths.dashboard_ports(),
                "the observer requires the running verification server on numeric loopback")
     endpoint = f"[::1]:{url.port}" if url.hostname == "::1" else f"127.0.0.1:{url.port}"
+    from . import environment
+
     result = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", f"-iTCP:{url.port}", "-sTCP:LISTEN", "-Fpn"],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, env=environment.build(()))
     lines = result.stdout.splitlines()
     owners = {int(line[1:]) for line in lines if line.startswith("p") and line[1:].isdigit()}
     root = proc.pid

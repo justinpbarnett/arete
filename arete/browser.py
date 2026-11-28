@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
-from . import paths, sandbox, scratch, util
+from . import environment, paths, sandbox, scratch, util
 
 REGISTRY = "https://registry.npmjs.org/"
 PIN = scratch.PIN
@@ -349,7 +349,7 @@ def listen_port(a: scratch.Attempt, app: int, avoid: frozenset[int] = frozenset(
 
 def listens(argv: list[str], port: int, folder: Path) -> bool:
     proc = subprocess.Popen(argv, cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.DEVNULL, start_new_session=True, env=environment.build(()))
     try:
         deadline = time.monotonic() + LISTEN_PROBE_SECONDS
         while proc.poll() is None and time.monotonic() < deadline:
@@ -517,7 +517,7 @@ def stop_browser(data: dict) -> None:
     def writers() -> list[int]:
         try:
             rows = subprocess.run(["/bin/ps", "-U", str(os.getuid()), "-o", "pid=,pgid="], check=False,
-                                  capture_output=True, text=True, timeout=30).stdout.split("\n")
+                                  capture_output=True, text=True, timeout=30, env=environment.build(())).stdout.split("\n")
         except (OSError, subprocess.SubprocessError):
             return []
         found = []

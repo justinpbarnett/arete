@@ -62,8 +62,8 @@ class WorkerLease(ExitStack):
     def command(self, argv, descriptors=()):
         if not self.active:
             return argv
-        entry = (f"import os, sys; env = os.environ.copy(); sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
-                 "from arete.sandbox import linux_worker_relay; sys.exit(linux_worker_relay(env, *sys.argv[1:]))")
+        entry = (f"import os, sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                 "from arete.sandbox import linux_worker_relay; sys.exit(linux_worker_relay(os.environ, *sys.argv[1:]))")
         return [sys.executable, "-I", "-c", entry, str(os.getpid()), str(paths.STATE_DIR.resolve()),
                 ",".join(map(str, descriptors)), *argv]
 

@@ -213,12 +213,12 @@ def devices_probe(args) -> int:
 
 
 def cmd_webhook(args) -> int:
-    from .. import api, tailnet
+    from .. import api, scrub, tailnet
 
     path = f"/api/v1/loops/{quote(args.name, safe='')}"
     if args.rotate:
         reply = client.call("POST", path + "/webhook/rotate")
-        print(client.field(reply, "text", kind=str))
+        print(client.field(reply, "text", kind=str), file=scrub.raw_stream(sys.stdout))
         return 0
     if remote := client.configured_server():
         reply = client.call("GET", path)

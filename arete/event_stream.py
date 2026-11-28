@@ -4,7 +4,7 @@ import json
 import math
 import time
 
-from . import control, events
+from . import control, events, scrub
 from .credential_http import problem
 from .store import db as foundation
 
@@ -60,7 +60,7 @@ def stream(handler, query, code):
                 else:
                     data = None
             if data is not None:
-                block = json.dumps(data).encode()
+                block = scrub.text(json.dumps(data), "api", "/api/v1/events").encode()
                 start("application/json", instance, meta["head"], len(block))
                 handler.stream_write(block)
                 return
@@ -76,13 +76,14 @@ def stream(handler, query, code):
         start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
 
         def message(kind, data, ident=None):
+            payload = scrub.text(json.dumps(data), "api", "/api/v1/events")
             if fmt == "ndjson":
-                handler.stream_write((json.dumps(data) + "\n").encode())
+                handler.stream_write((payload + "\n").encode())
             else:
                 frame = (f"id: {ident}\n" if ident is not None else "")
                 if kind in ("reset", "serve.beat") or query.get("named"):
                     frame += f"event: {kind}\n"
-                handler.stream_write((frame + "data: " + json.dumps(data) + "\n\n").encode())
+                handler.stream_write((frame + "data: " + payload + "\n\n").encode())
 
         beat = started + 15
         try:

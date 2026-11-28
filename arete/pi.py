@@ -431,9 +431,10 @@ def select(model: str, passing=None, providers=None, *, held=lambda auth, model:
     exact = [n for n in names if isinstance(n, str) and re.fullmatch(r"[A-Za-z_]\w*", n) and n not in context]
     wanted = {*exact, *context, *key_references(raw)} - SERVICE_KEYS
     fingerprints = {}
+    exposed_pi = environment.build((), role="runner:pi")
     read_keys = secretstore.env_status if metadata_only else secretstore.env
     keys = read_keys(wanted, source=source, fingerprints=fingerprints, legacy=legacy)
-    available = {**source, **keys}
+    available = {**exposed_pi, **source, **keys}
     resolved_key = configured_key(raw, available)
     token_error = (plan_token_error(source.items()) or plan_token_error(key_addresses(legacy)) or
                    plan_token_error(key_addresses(keys)) or
@@ -813,7 +814,7 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
         kw["max_budget_usd"] = None
     started = time.monotonic()
     error = ((selected.token_error or route_token_error(selected) or selected.error) if selected else
-             plan_token_error(os.environ.items()))
+             plan_token_error(environment.build((), role="runner:pi").items()))
     if error:
         result = Result(ok=False, error=error, runner="pi", model=kw.get("model", ""),
                         session=kw.get("resume", NO_SESSION))

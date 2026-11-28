@@ -911,9 +911,12 @@ def key_pipe_sign(key, data, timeout):
 
     writer = threading.Thread(target=feed, name="app-key-pipe")
     writer.start()
+    from . import environment
+
     try:
         return subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_fd}"], input=data,
-                              pass_fds=(read_fd,), capture_output=True, timeout=timeout, check=False)
+                              pass_fds=(read_fd,), capture_output=True, timeout=timeout, check=False,
+                              env=environment.build(()))
     finally:
         os.close(read_fd)
         writer.join()
@@ -959,9 +962,11 @@ def app_jwt(app: config.GithubApp, *, timeout: float = 30, key=None, key_file=No
     if key_file is not None:
         if paths.ISOLATED and paths.confined(key_file) is None:
             raise GhError(paths.ISOLATED_LOGINS)
+        from . import environment
+
         signature = sign_result(lambda: subprocess.run(
             ["openssl", "dgst", "-sha256", "-sign", str(key_file)], input=signed.encode(), capture_output=True,
-            timeout=timeout, check=False), "the release supervisor App key")
+            timeout=timeout, check=False, env=environment.build(())), "the release supervisor App key")
     else:
         signature = key_signature(app, signed.encode(), timeout=timeout, **({"key": key} if key is not None else {}))
     return f"{signed}.{base64url(signature)}"
