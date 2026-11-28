@@ -1130,10 +1130,25 @@ def app_jwt(app: config.GithubApp, *, timeout: float = 30, key=None, key_file=No
     return f"{signed}.{base64url(signature)}"
 
 
-def clone_token(app: config.GithubApp, repo: str) -> str:
+def require_local_if_isolated(url: str) -> None:
+    if paths.ISOLATED and urlsplit(url).hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise GhError(paths.ISOLATED_LOGINS)
+
+
+def _schemes_for_endpoint(endpoint: str) -> tuple[str, ...]:
+    parts = urlsplit(endpoint)
+    if parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1", "localhost"):
+        return ("http", "https")
+    return ("https",)
+
+
+def clone_token(app: config.GithubApp, repo: str, *, endpoint: str = GITHUB_API,
+                key_bytes: bytes | None = None, record_account: bool = True) -> str:
     where = f"for {repo} from [github_app] installation {app.installation_id}"
     try:
-        reply = token_reply(app, repo, retry=True)
+        reply = token_reply(
+            app, repo, retry=True, endpoint=endpoint, key_bytes=key_bytes, record_account=record_account
+        )
     except urllib.error.HTTPError as e:
         raise GhError(f"GitHub gave no token {where}: HTTP {e.code}: {http_message(e)}") from None
     except OSError as e:
@@ -1161,24 +1176,33 @@ def token_overreach(reply: dict, repo: str) -> str:
     return ""
 
 
-def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+def token_reply(app: config.GithubApp, repo: str, retry: bool, *, endpoint: str = GITHUB_API,
+                key_bytes: bytes | None = None, record_account: bool = True) -> dict:
     if not (isinstance(app.installation_id, str) and app.installation_id.isascii() and app.installation_id.isdigit()):
         raise GhError("invalid GitHub App installation_id")
-    if not paths.ISOLATED and (key := os.environ.get(APP_KEY)):
+    if key_bytes is not None:
+        row = None
+        jwt = app_jwt(app, key=key_bytes)
+    elif not paths.ISOLATED and (key := os.environ.get(APP_KEY)):
         row = None
         jwt = app_jwt(app, key=key.encode())
     else:
         row, key = secretstore.lookup("global", APP_KEY)
         jwt = app_jwt(app, key=key.encode()) if row is not None else app_jwt(app)
+    base = endpoint.rstrip("/") or GITHUB_API
+    schemes = _schemes_for_endpoint(base)
+    url = f"{base}/app/installations/{app.installation_id}/access_tokens"
+    if base != GITHUB_API:
+        require_local_if_isolated(url)
     body = {"repositories": [_safe_repo(repo).rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
     request = util.http_request(
-        f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
+        url, data=json.dumps(body).encode(),
         method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
                                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"},
-        schemes=("https",))
+        schemes=schemes)
     try:
         open_fn = (_token_opener.open if urllib.request.urlopen is _STDLIB_URLOPEN
-                   else lambda req, timeout=30: util.urlopen_http(req, timeout=timeout, schemes=("https",)))
+                   else lambda req, timeout=30: util.urlopen_http(req, timeout=timeout, schemes=schemes))
         with open_fn(request, timeout=30) as res:
             reply = json.loads(res.read())
     except urllib.error.HTTPError:
@@ -1186,14 +1210,123 @@ def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
     except OSError:
         if not (retry and util.wait_for_network()):
             raise
-        return token_reply(app, repo, retry=False)
+        return token_reply(
+            app, repo, retry=False, endpoint=endpoint, key_bytes=key_bytes, record_account=record_account
+        )
     except ValueError:
         return {}
     if not isinstance(reply, dict):
         return {}
-    if reply.get("token"):
+    if reply.get("token") and record_account:
         accounts.record_workspace(row, "github", "app")
     return reply
+
+
+class Client:
+    """Connector-backed GitHub driver client preserving implicit default execution."""
+
+    def __init__(
+        self,
+        endpoint: str = GITHUB_API,
+        token: str = "",
+        *,
+        connector_id: str = "github",
+        account_id: str = "",
+        mode: str = "token",
+        app: config.GithubApp | None = None,
+        app_key_bytes: bytes | None = None,
+    ):
+        self.endpoint = (endpoint or GITHUB_API).rstrip("/")
+        self.connector_id = connector_id
+        self.account_id = account_id
+        self.mode = mode
+        self._token = token
+        self._app = app
+        self._app_key_bytes = app_key_bytes
+
+    @classmethod
+    def from_connector(
+        cls,
+        connector_id: str | None = None,
+        cfg: config.GithubApp | None = None,
+        *,
+        caller: str | None = None,
+        config_dir=None,
+    ) -> Client:
+        from . import connectors
+
+        return connectors.github_client(connector_id, cfg, caller=caller, config_dir=config_dir)
+
+    def _auth_header(self) -> str:
+        if self.mode == "app":
+            if self._app is None:
+                raise GhError(f"connector {self.connector_id!r} has no GitHub App configuration")
+            jwt = app_jwt(self._app, key=self._app_key_bytes)
+            return f"Bearer {jwt}"
+        if not self._token:
+            raise GhError(f"connector {self.connector_id!r} has no GitHub token")
+        return f"Bearer {self._token}"
+
+    def clone_token(self, repo: str) -> str:
+        if self.mode == "default":
+            app = self._app if self._app is not None else config.load().github_app
+            return clone_token(app, repo)
+        if self.mode != "app" or self._app is None:
+            raise GhError(f"connector {self.connector_id!r} mode {self.mode!r} cannot mint GitHub App clone tokens")
+        return clone_token(
+            self._app,
+            repo,
+            endpoint=self.endpoint,
+            key_bytes=self._app_key_bytes,
+            record_account=False,
+        )
+
+    def request(self, method: str, path: str, params: dict | None = None, body=None):
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+            raise GhError(f"invalid GitHub API path: {path!r}")
+        from .store import factory
+
+        factory.check_worker()
+        url = self.endpoint + path + ("?" + urlencode(params) if params else "")
+        require_local_if_isolated(url)
+        schemes = _schemes_for_endpoint(self.endpoint)
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {
+            "Authorization": self._auth_header(),
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "arete",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = util.http_request(url, data=data, method=method, headers=headers, schemes=schemes)
+        open_fn = (_token_opener.open if urllib.request.urlopen is _STDLIB_URLOPEN
+                   else lambda r, timeout=30: util.urlopen_http(r, timeout=timeout, schemes=schemes))
+        try:
+            with open_fn(req, timeout=30) as res:
+                raw = res.read()
+        except urllib.error.HTTPError as e:
+            raise GhError(f"github {method} {path}: HTTP {e.code}: {http_message(e)}") from None
+        except OSError as e:
+            raise GhError(f"github {method} {path}: {getattr(e, 'reason', None) or e}") from None
+        return json.loads(raw) if raw.strip() else None
+
+    def get(self, path: str, **params):
+        return self.request("GET", path, params or None)
+
+    def viewer(self) -> dict:
+        if self.mode == "default":
+            return {"login": me()}
+        if self.mode == "app":
+            return self.get("/app") or {}
+        return self.get("/user") or {}
+
+    def issues(self, repo: str, **params) -> list[dict]:
+        slug = _safe_repo(repo)
+        if self.mode == "default":
+            return api_list(f"repos/{slug}/issues", params or None, strict=True)
+        res = self.request("GET", f"/repos/{slug}/issues", params or None)
+        return res if isinstance(res, list) else []
 
 
 def http_message(e: urllib.error.HTTPError) -> str:

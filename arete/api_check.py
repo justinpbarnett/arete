@@ -567,7 +567,8 @@ class Check:
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
-                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
+                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"],
+                      "connector": "github"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()

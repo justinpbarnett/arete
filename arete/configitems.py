@@ -84,7 +84,7 @@ def _engine_items(kind: str) -> dict[str, dict]:
                 "engine": str(target),
             }),
         }
-    if kind not in ("target", "rule"):
+    if kind not in ("target", "rule", "connector"):
         return {}
     folder = paths.DEFAULTS_DIR / f"{kind}s"
     if not folder.is_dir():
@@ -163,7 +163,7 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 **_enrich({"kind": kind, "name": name, "path": "arete/defaults/devices/local.toml", "engine": str(target)}),
                 "_engine_file": str(target),
             }
-    if kind in ("target", "rule") and re.fullmatch(configkinds.NAME_PATTERN, name):
+    if kind in ("target", "rule", "connector") and re.fullmatch(configkinds.NAME_PATTERN, name):
         target = paths.DEFAULTS_DIR / f"{kind}s" / f"{name}.toml"
         if target.is_file():
             return {

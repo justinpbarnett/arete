@@ -423,6 +423,26 @@ def read(name, values, handler):
     if name == "account.list":
         with foundation.reader() as c:
             return {"accounts": credentials.account_rows(c)}
+    if name == "account.status":
+        from . import connectors
+
+        return {
+            "accounts": connectors.discover_accounts(
+                caller=_config_actor(handler),
+                service=values.get("service"),
+                connector_id=values.get("connector"),
+                endpoint=values.get("endpoint"),
+            )
+        }
+    if name == "connector.list":
+        from . import connectors
+
+        return {"connectors": connectors.list_connector_views(caller=_config_actor(handler))}
+    if name == "connector.get":
+        from . import connectors
+
+        found = connectors.get_connector_view(values["id"], caller=_config_actor(handler))
+        return {"connector": needed(found, values["id"])}
     if name == "token.list":
         return {"tokens": tokens.listing(handler.person)}
     if name == "token.get":
@@ -588,9 +608,9 @@ def _resolve_activate_draft_id(values: dict) -> str:
     return found[0]["id"]
 
 
-def _needs_config_presence(name: str, values: dict) -> dict | None:
+def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None:
     """Return extra_detail dict if this config/settings write requires Gate C presence, else None."""
-    actor = principals.current()
+    actor = _config_actor(handler) if handler is not None else principals.current()
     root = paths.CONFIG_DIR.resolve()
     if name == "config.activate":
         draft_id = _resolve_activate_draft_id(values)
@@ -712,7 +732,7 @@ def dispatch(handler, op, path_values, query):
                 return put_blob(handler, op, identity)
             if (name in ("config.activate", "config.rollback", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values)
+                extra_detail = _needs_config_presence(name, values, handler)
                 if extra_detail is not None:
                     if handler.credential is None or "Idempotency-Key" not in handler.headers:
                         credential_http.require_presence(handler.credential)

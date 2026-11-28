@@ -162,7 +162,7 @@ def require_tls(op):
 
 
 def registry_operation(name):
-    return isinstance(name, str) and (name.startswith("secret.") or name in ("account.list", "webhook.rotate"))
+    return isinstance(name, str) and (name.startswith("secret.") or name in ("account.list", "account.status", "webhook.rotate"))
 
 
 def origin_of(scheme, host):

@@ -191,6 +191,33 @@ def account_rows(c):
         """)]
 
 
+def account_detail_rows(c):
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts'").fetchone() is None:
+        return []
+    return [dict(row) for row in c.execute("""
+        SELECT a.id, a.provider AS service, a.mode, a.usage, a.holder, a.usage_scope,
+               a.secret_id, a.version, a.created,
+               s.scope AS secret_scope, s.name AS secret_name, s.kind AS secret_kind,
+               s.provider AS secret_provider, s.status AS secret_status, s.store AS secret_store,
+               s.reference AS secret_reference, s.fingerprint AS secret_fingerprint
+        FROM accounts a LEFT JOIN secrets s ON s.id = a.secret_id ORDER BY a.id
+        """)]
+
+
+def account_detail(c, account_id):
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts'").fetchone() is None:
+        return None
+    row = c.execute("""
+        SELECT a.id, a.provider AS service, a.mode, a.usage, a.holder, a.usage_scope,
+               a.secret_id, a.version, a.created,
+               s.scope AS secret_scope, s.name AS secret_name, s.kind AS secret_kind,
+               s.provider AS secret_provider, s.status AS secret_status, s.store AS secret_store,
+               s.reference AS secret_reference, s.fingerprint AS secret_fingerprint
+        FROM accounts a LEFT JOIN secrets s ON s.id = a.secret_id WHERE a.id = ?
+        """, (account_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def reconcile_logins(c, provider, mode, identities, holder):
     rows = c.execute("""
         SELECT id, identity, fingerprint, version FROM accounts WHERE provider = ? AND mode = ? AND secret_id IS NULL

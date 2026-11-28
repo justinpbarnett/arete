@@ -7570,9 +7570,16 @@ class ConfigKindRegistryTests(unittest.TestCase):
         for name in ("capture", "ask", "dashboard"):
             assert not config.root_schema(name).get("x-arete-reach")
         test = unittest.TestCase()
-        for name in ("connector",):
+        for name in ("sync",):
             with test.assertRaisesRegex(ValueError, "unavailable for writes"):
                 configschema.validate(name, {})
+        configschema.validate("connector", {
+            "schema": 1, "id": "gh-work", "service": "github", "account": "github:token",
+            "enabled": True, "endpoint": "https://api.github.com",
+            "secrets": {"api_token": "secret:global/GITHUB_TOKEN"},
+        })
+        with test.assertRaisesRegex(ValueError, "unknown key extra"):
+            configschema.validate("connector", {"schema": 1, "id": "gh-work", "service": "github", "extra": True})
         configschema.validate("device", {"kind": "ssh", "host": "box.test", "note": "build box"})
         with test.assertRaisesRegex(ValueError, "unknown key extra"):
             configschema.validate("device", {"kind": "ssh", "host": "box.test", "extra": True})
@@ -9722,8 +9729,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 137)
-        self.assertEqual(len({op["name"] for op in operations}), 137)
+        self.assertEqual(len(operations), 140)
+        self.assertEqual(len({op["name"] for op in operations}), 140)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

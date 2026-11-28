@@ -16,7 +16,9 @@ SOURCE = "arete/contract.py"
 REGISTRY_INPUTS = (SOURCE, "arete/refusals.py")
 REQUIRED_PRODUCERS = (*REGISTRY_INPUTS, "arete/contract_evolution.py")
 CONFIG_REGISTRY = "arete/configkinds.py"
-PRODUCERS = (*REQUIRED_PRODUCERS, CONFIG_REGISTRY)
+CONNECTOR_SCHEMA = "arete/config_schemas/connector.json"
+OPTIONAL_PRODUCERS = (CONFIG_REGISTRY, CONNECTOR_SCHEMA)
+PRODUCERS = (*REQUIRED_PRODUCERS, *OPTIONAL_PRODUCERS)
 OPENAPI = "docs/openapi.json"
 BOOTSTRAP = "arete/contract_v1_baseline.json"
 BOOTSTRAP_SOURCES = {
@@ -102,9 +104,10 @@ def registry_problems(registry):
 
 
 def openapi(registry, minor, source_hashes, oldest_client):
-    from . import credential_http
+    from . import configschema, credential_http
 
     schemas, paths, errors, problems = {}, {}, {}, {}
+    schemas["config.connector"] = configschema.schema("connector")
     for error in registry["errors"]:
         code = error["code"]
         schemas[f"problem.{code}"] = error["schema"]
@@ -226,8 +229,12 @@ def baseline(root, revision):
         return commit, {**json.loads(frozen)["registry"], "oldest_client": BOOTSTRAP_OLDEST_CLIENT}
     try:
         document = json.loads(read(OPENAPI))
-        source_hashes = sources(read, PRODUCERS if CONFIG_REGISTRY in tracked else REQUIRED_PRODUCERS)
         saved = document["x-arete-contract-sources-sha256"]
+        baseline_producers = (
+            *REQUIRED_PRODUCERS,
+            *(p for p in OPTIONAL_PRODUCERS if p in tracked and p in saved),
+        )
+        source_hashes = sources(read, baseline_producers)
         if saved != source_hashes:
             changed = sorted(path for path in source_hashes if saved.get(path) != source_hashes[path])
             raise ValueError(f"{OPENAPI} is stale at {commit}: {', '.join(changed) or 'producer list changed'}")

@@ -117,8 +117,10 @@ def require_local_if_isolated(url):
 
 
 class Client:
-    def __init__(self, base_url: str, email: str, token: str):
+    def __init__(self, base_url: str, email: str, token: str, *, connector_id: str = "", account_id: str = ""):
         self.base = checked_base(base_url)
+        self.connector_id = connector_id
+        self.account_id = account_id
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
         self._secret_row: dict | None = None
         self._me: dict | None = None
@@ -127,9 +129,16 @@ class Client:
     @classmethod
     def from_env(cls, cfg: config.JiraConfig) -> Client:
         values, row = credential_source(cfg)
-        found = cls(*values)
+        found = cls(*values, connector_id="jira")
         found._secret_row = row
         return found
+
+    @classmethod
+    def from_connector(cls, connector_id: str | None = None, cfg: config.JiraConfig | None = None,
+                       *, caller: str | None = None, config_dir=None) -> Client:
+        from . import connectors
+
+        return connectors.jira_client(connector_id, cfg, caller=caller, config_dir=config_dir)
 
     def browse_url(self, key: str) -> str:
         return f"{self.base}/browse/{_path_segment(key)}"

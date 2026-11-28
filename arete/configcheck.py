@@ -199,6 +199,8 @@ def _is_reach_change(kind: str, dotted: str, old_val: object, new_val: object) -
     # Rule kind with approve/remember/audience
     if kind == "rule" and parts[0] in ("action", "audience", "drafter", "target", "kinds"):
         return True
+    if kind == "connector" and parts[0] in ("service", "driver", "account", "endpoint", "secrets", "options"):
+        return True
     return kind == "target" and parts[0] in ("audience", "posts_as", "connector", "kinds")
 
 
@@ -276,6 +278,19 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
     schema_name = _schema_name_for(kind, path, name)
     where = path or f"{kind}/{name}"
     problems: list[str] = []
+    if kind == "connector" and isinstance(parsed, dict):
+        from . import connectors
+
+        try:
+            connectors.validate_structure(
+                name,
+                parsed,
+                where=where,
+                raw_text=raw_bytes.decode("utf-8", errors="replace"),
+            )
+        except ValueError as error:
+            problems.append(str(error))
+        return problems
     try:
         configschema.validate(schema_name, parsed, where=where, allow_read_only=(kind == "schema"))
     except (ValueError, FileNotFoundError) as error:
@@ -314,9 +329,22 @@ def _validate_references(
     *,
     staged_targets: dict[str, object] | None = None,
     extra_adws: set[str] | None = None,
+    caller: str | None = None,
 ) -> list[str]:
     where = path or f"{kind}/{name}"
     problems: list[str] = []
+    if kind == "connector" and isinstance(parsed, dict):
+        from . import connectors
+
+        try:
+            conn_obj = connectors.validate_structure(name, parsed, where=where)
+        except ValueError as error:
+            problems.append(str(error))
+            return problems
+        _, bind_problems = connectors.validate_account_binding(conn_obj, caller=caller)
+        for prob in bind_problems:
+            problems.append(f"{where}: {prob}")
+        return problems
     if kind == "rule" and isinstance(parsed, dict):
         try:
             targets = outbox_config.load_targets(config_dir)
@@ -616,6 +644,7 @@ def check(
     body: str | bytes,
     *,
     author: str = "hand",
+    caller: str | None = None,
     config_dir: Path | None = None,
     old_bytes: bytes | None = None,
     stop_after: int = 6,
@@ -653,7 +682,14 @@ def check(
 
     # Stage 3: references
     ref_problems = _validate_references(
-        kind, name, path, parsed, root, staged_targets=staged_targets, extra_adws=extra_adws
+        kind,
+        name,
+        path,
+        parsed,
+        root,
+        staged_targets=staged_targets,
+        extra_adws=extra_adws,
+        caller=author if caller is None else caller,
     )
     stages.append(_stage("references", not ref_problems, ref_problems))
     if ref_problems or stop_after <= 3:

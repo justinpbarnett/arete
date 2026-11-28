@@ -1,0 +1,7 @@
+schema = 1
+id = "github"
+name = "GitHub (default)"
+service = "github"
+driver = "github"
+enabled = true
+endpoint = "https://api.github.com"

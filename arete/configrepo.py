@@ -325,6 +325,7 @@ def _validate_content(
     *,
     staged_targets: dict[str, object] | None = None,
     extra_adws: set[str] | None = None,
+    actor: str | None = None,
 ) -> None:
     classified = configkinds.classify(rel)
     if classified is not None and classified[0] == "library":
@@ -387,6 +388,19 @@ def _validate_content(
                 raise ConfigRepoError(
                     f"{rel} failed validation: name {parsed.get('name')!r} does not match {item_name!r}"
                 )
+        elif kind == "connector":
+            from . import connectors
+
+            try:
+                connectors.validate_connector(
+                    item_name,
+                    parsed,
+                    where=rel,
+                    caller=actor,
+                    raw_text=raw.decode("utf-8", errors="replace"),
+                )
+            except ValueError as e:
+                raise ConfigRepoError(str(e)) from e
         elif kind == "routes":
             from . import adw
 
@@ -394,7 +408,7 @@ def _validate_content(
                 raise ConfigRepoError(f"{rel} failed validation: {'; '.join(errors)}")
 
 
-def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
+def _validate_batch(files: dict[str, bytes | None], root: Path, *, actor: str | None = None) -> None:
     from . import outbox_config
 
     staged_targets: dict[str, outbox_config.OutboxTarget] = {}
@@ -416,7 +430,7 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
         if classified is not None and classified[0] == "routes":
             deferred_routes.append((rel, raw))
             continue
-        _validate_content(rel, raw, root, extra_adws=extra_adws)
+        _validate_content(rel, raw, root, extra_adws=extra_adws, actor=actor)
         if classified is not None and classified[0] == "target":
             parsed = tomllib.loads(raw.decode("utf-8"))
             staged_targets[classified[1]] = outbox_config._target_from_data(
@@ -425,7 +439,7 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
     for rel, raw in deferred_rules:
         _validate_content(rel, raw, root, staged_targets=staged_targets)
     for rel, raw in deferred_routes:
-        _validate_content(rel, raw, root, extra_adws=extra_adws)
+        _validate_content(rel, raw, root, extra_adws=extra_adws, actor=actor)
 
 
 def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> None:
@@ -1166,7 +1180,7 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
             if norm_base[rel] != live_blob:
                 raise StaleBase(rel, norm_base[rel], live_blob)
         # Validate every new file BEFORE touching the working tree.
-        _validate_batch(normalized, root)
+        _validate_batch(normalized, root, actor=actor)
         return _commit_files_locked(
             root,
             normalized,

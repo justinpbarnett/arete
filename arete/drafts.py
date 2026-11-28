@@ -710,9 +710,14 @@ def create_and_check(
     base_str = str(live_ver if base_version is None else base_version)
     ev = evidence if evidence is not None else []
 
-    if run_check:
-        report = configcheck.check(kind, name, rel, body, author=actor, config_dir=root, old_bytes=old_bytes)
+    if run_check or kind == "connector":
+        report = configcheck.check(
+            kind, name, rel, body, author=actor, caller=actor, config_dir=root, old_bytes=old_bytes
+        )
         gate = report["gate"]
+        if kind == "connector" and not report["ok"]:
+            problems = [p for st in report["stages"] for p in st.get("problems", ())]
+            raise contract.Problem("validation", "; ".join(problems) or f"Connector {name!r} failed validation.")
     else:
         report = None
         entry = configkinds.REGISTRY[kind]
@@ -890,16 +895,18 @@ def _validate_base_and_check_for_activation(
         rel,
         draft["body"],
         author=draft["author"],
+        caller=actor,
         config_dir=root,
         old_bytes=old_bytes,
     )
     if not report["ok"]:
-        with foundation.tx() as c:
-            _update_check_row(c, draft["numeric_id"], report)
-            if draft["state"] in ("draft", "valid"):
-                move(c, draft["numeric_id"], draft["state"], "invalid", sync_inbox=False)
-            _sync_inbox(c)
         problems = [p for st in report["stages"] for p in st.get("problems", ())]
+        if draft["kind"] != "connector":
+            with foundation.tx() as c:
+                _update_check_row(c, draft["numeric_id"], report)
+                if draft["state"] in ("draft", "valid"):
+                    move(c, draft["numeric_id"], draft["state"], "invalid", sync_inbox=False)
+                _sync_inbox(c)
         raise contract.Problem("validation", "; ".join(problems) or f"Draft {draft['id']} failed configcheck.")
 
     if report["gate"] == "C" and draft["author"].startswith("run:"):
@@ -941,11 +948,10 @@ def activate(
             raise contract.Problem("not_found", f"No config draft {draft_id}")
         report, _ = _validate_base_and_check_for_activation(draft, actor, base_version, root=root)
         gate = report["gate"]
+        if gate == "C" and not presence_passed:
+            raise PresenceRequired(draft, report)
         with foundation.tx() as c:
             _update_check_row(c, draft["numeric_id"], report)
-        if gate == "C" and not presence_passed:
-            refreshed = get(draft["numeric_id"]) or draft
-            raise PresenceRequired(refreshed, report)
 
         rel = draft["path"] or default_path(draft["kind"], draft["name"])
         live_blob = configrepo._live_blob(root, rel)
