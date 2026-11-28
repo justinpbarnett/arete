@@ -312,8 +312,8 @@ def validate_actor(actor: str) -> str:
     return actor
 
 
-def _validate_content(rel: str, raw: bytes, root: Path) -> None:
-    parsed = None
+def _validate_content(rel: str, raw: bytes, root: Path, *, staged_targets: dict[str, object] | None = None) -> None:
+    parsed: dict | None = None
     if rel.endswith(".toml"):
         try:
             text = raw.decode("utf-8")
@@ -328,20 +328,64 @@ def _validate_content(rel: str, raw: bytes, root: Path) -> None:
                 config.load(draft, strict=True, base_dir=root)
             except Exception as e:
                 raise ConfigRepoError(f"config.toml failed validation: {e}") from e
-    elif rel == retention.FILENAME:
+        return
+    if rel == retention.FILENAME:
         try:
             retention.parse_bytes(raw)
         except Exception as e:
             raise ConfigRepoError(f"{retention.FILENAME} failed validation: {e}") from e
+        return
     classified = configkinds.classify(rel)
-    if classified is not None and classified[0] == "device" and isinstance(parsed, dict):
-        from . import configschema, devices
+    if classified is not None and isinstance(parsed, dict):
+        kind, item_name = classified
+        if kind == "device":
+            from . import configschema, devices
 
-        try:
-            configschema.validate("device", parsed, where=rel)
-            devices.parse_device(classified[1], parsed)
-        except (ValueError, devices.DeviceError) as e:
-            raise ConfigRepoError(f"{rel} failed validation: {e}") from e
+            try:
+                configschema.validate("device", parsed, where=rel)
+                devices.parse_device(item_name, parsed)
+            except (ValueError, devices.DeviceError) as e:
+                raise ConfigRepoError(f"{rel} failed validation: {e}") from e
+        elif kind == "target":
+            from . import outbox_config
+
+            try:
+                outbox_config.validate_target(item_name, parsed, where=rel)
+            except ValueError as e:
+                raise ConfigRepoError(str(e)) from e
+        elif kind == "rule":
+            from . import outbox_config
+
+            try:
+                targets = outbox_config.load_targets(root)
+                if staged_targets:
+                    targets.update(staged_targets)
+                outbox_config.validate_rule(item_name, parsed, targets=targets, where=rel)
+            except ValueError as e:
+                raise ConfigRepoError(str(e)) from e
+
+
+def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
+    from . import outbox_config
+
+    staged_targets: dict[str, outbox_config.OutboxTarget] = {}
+    deferred_rules: list[tuple[str, bytes]] = []
+    for rel in sorted(files):
+        raw = files[rel]
+        if raw is None:
+            continue
+        classified = configkinds.classify(rel)
+        if classified is not None and classified[0] == "rule":
+            deferred_rules.append((rel, raw))
+            continue
+        _validate_content(rel, raw, root)
+        if classified is not None and classified[0] == "target":
+            parsed = tomllib.loads(raw.decode("utf-8"))
+            staged_targets[classified[1]] = outbox_config._target_from_data(
+                classified[1], parsed, level="config", raw=raw, where=rel
+            )
+    for rel, raw in deferred_rules:
+        _validate_content(rel, raw, root, staged_targets=staged_targets)
 
 
 def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> None:
@@ -455,6 +499,7 @@ def verify_pre_commit_hook() -> int:
         if not status or not rel:
             continue
         staged.append(rel)
+    staged_blobs: dict[str, bytes] = {}
     for rel in staged:
         if _is_secret_rel(rel):
             print(f"configrepo pre-commit hook: refused secret file {rel}", file=sys.stderr)
@@ -463,11 +508,12 @@ def verify_pre_commit_hook() -> int:
         if blob.returncode != 0:
             print(f"configrepo pre-commit hook: could not read staged {rel}", file=sys.stderr)
             return 1
-        try:
-            _validate_content(rel, blob.stdout, root)
-        except ConfigRepoError as e:
-            print(str(e), file=sys.stderr)
-            return 1
+        staged_blobs[rel] = blob.stdout
+    try:
+        _validate_batch(staged_blobs, root)
+    except ConfigRepoError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     branch = _git(["symbolic-ref", "--short", "HEAD"], root, check=False).stdout.strip()
     if branch == BRANCH:
         token = os.environ.get(FENCE_ENV, "")
@@ -992,9 +1038,7 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
             if norm_base[rel] != live_blob:
                 raise StaleBase(rel, norm_base[rel], live_blob)
         # Validate every new file BEFORE touching the working tree.
-        for rel in sorted(normalized):
-            if normalized[rel] is not None:
-                _validate_content(rel, normalized[rel], root)
+        _validate_batch(normalized, root)
         return _commit_files_locked(
             root,
             normalized,

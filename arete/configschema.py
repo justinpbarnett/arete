@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from functools import cache
 from pathlib import Path
 
@@ -87,6 +88,18 @@ def check(value, shape: dict, folder: Path, filename: str, where: str) -> None:
             raise ValueError(f"{where} must be {' or '.join(types)}")
     if "enum" in shape and not any(type(value) is type(choice) and value == choice for choice in shape["enum"]):
         raise ValueError(f"{where} must be one of {', '.join(map(repr, shape['enum']))}")
+    if isinstance(value, str):
+        if "minLength" in shape and len(value) < shape["minLength"]:
+            raise ValueError(f"{where} must be at least {shape['minLength']} characters")
+        if "maxLength" in shape and len(value) > shape["maxLength"]:
+            raise ValueError(f"{where} must be at most {shape['maxLength']} characters")
+        if "pattern" in shape and not re.fullmatch(shape["pattern"], value):
+            raise ValueError(f"{where} does not match pattern {shape['pattern']!r}")
+    elif type(value) in (int, float):
+        if "minimum" in shape and value < shape["minimum"]:
+            raise ValueError(f"{where} must be >= {shape['minimum']}")
+        if "maximum" in shape and value > shape["maximum"]:
+            raise ValueError(f"{where} must be <= {shape['maximum']}")
     if isinstance(value, dict):
         properties = shape.get("properties", {})
         additional = shape.get("additionalProperties", True)
@@ -98,6 +111,15 @@ def check(value, shape: dict, folder: Path, filename: str, where: str) -> None:
             field = properties.get(key, additional)
             if isinstance(field, dict):
                 check(entry, field, folder, filename, f"{where}.{key}")
-    elif isinstance(value, (list, tuple)) and "items" in shape:
-        for index, item in enumerate(value):
-            check(item, shape["items"], folder, filename, f"{where}[{index}]")
+    elif isinstance(value, (list, tuple)):
+        if "minItems" in shape and len(value) < shape["minItems"]:
+            raise ValueError(f"{where} must contain at least {shape['minItems']} items")
+        if shape.get("uniqueItems"):
+            seen_items: list[object] = []
+            for item in value:
+                if any(type(prev) is type(item) and prev == item for prev in seen_items):
+                    raise ValueError(f"{where} must not contain duplicate items")
+                seen_items.append(item)
+        if "items" in shape:
+            for index, item in enumerate(value):
+                check(item, shape["items"], folder, filename, f"{where}[{index}]")

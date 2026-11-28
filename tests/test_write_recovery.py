@@ -23,9 +23,9 @@ class GithubWriteLedger:
     def __init__(self, error=RESET, apply=True, lookup_fails=False, fail_twice=False):
         self.error, self.apply = error, apply
         self.lookup_fails, self.fail_twice = lookup_fails, fail_twice
-        self.issues, self.comments, self.prs, self.calls, self.payloads = [], [], [], [], []
+        self.issues, self.comments, self.replies, self.prs, self.calls, self.payloads = [], [], [], [], [], []
+        self.labels = set()
         self.writes = 0
-        self.close_comment_only = False
 
     def sh(self, command, **kw):
         args = command[1:]
@@ -37,95 +37,161 @@ class GithubWriteLedger:
         def failure():
             return subprocess.CompletedProcess(command, 1, stdout="", stderr=self.error)
 
-        write = args[:2] in (["issue", "create"], ["issue", "comment"], ["pr", "comment"],
-                            ["pr", "create"], ["issue", "close"]) or "POST" in args
+        if args[:2] == ["label", "create"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        is_api_post = args[0] == "api" and ("POST" in args)
+        write = args[:2] in (["pr", "create"], ["issue", "close"], ["issue", "reopen"], ["issue", "edit"]) or is_api_post
         if write:
             self.writes += 1
             failing = self.writes == 1 or self.fail_twice
             payload = kw.get("input", "")
-            if args[0] == "api":
-                payload = json.loads(payload)["body"]
-            if "--comment" in args:
-                payload = args[args.index("--comment") + 1]
             self.payloads.append(payload)
             if failing and not self.apply:
                 return failure()
-            url = "https://github.com/fixture/repo/issues/1"
-            if args[:2] == ["issue", "create"]:
-                self.issues.append({"number": 1, "body": payload, "state": "OPEN", "title": "fixture"})
-            elif args[:2] == ["pr", "create"]:
+            if args[:2] == ["pr", "create"]:
                 url = "https://github.com/fixture/repo/pull/1"
                 self.prs.append({"url": url})
-            elif args[:2] == ["issue", "close"]:
-                if self.issues[0]["state"] == "OPEN":
-                    if payload:
-                        self.comments.append({"body": payload})
-                    if not (failing and self.close_comment_only):
-                        self.issues[0]["state"] = "CLOSED"
-            else:
-                self.comments.append({"body": payload})
-            return failure() if failing else subprocess.CompletedProcess(command, 0, stdout=url, stderr="")
+                return failure() if failing else subprocess.CompletedProcess(command, 0, stdout=url, stderr="")
+            if args[:2] == ["issue", "close"]:
+                if self.issues:
+                    self.issues[0]["state"] = "CLOSED"
+                return failure() if failing else subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if args[:2] == ["issue", "reopen"]:
+                if self.issues:
+                    self.issues[0]["state"] = "OPEN"
+                return failure() if failing else subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if args[:2] == ["issue", "edit"]:
+                for idx, a in enumerate(args):
+                    if a == "--add-label" and idx + 1 < len(args):
+                        self.labels.add(args[idx + 1])
+                    elif a == "--remove-label" and idx + 1 < len(args):
+                        self.labels.discard(args[idx + 1])
+                if "--body-file" in args and self.issues:
+                    self.issues[0]["body"] = str(payload)
+                return failure() if failing else subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            body_obj = json.loads(payload)
+            endpoint = next(a for i, a in enumerate(args[1:], 1) if not a.startswith("-") and args[i - 1] not in ("--method", "-X", "--input"))
+            if endpoint.endswith("/issues"):
+                num = len(self.issues) + 1
+                row = {"id": num, "number": num, "title": body_obj.get("title", ""), "body": body_obj.get("body", ""),
+                       "state": "OPEN", "html_url": f"https://github.com/fixture/repo/issues/{num}"}
+                self.issues.append(row)
+                return failure() if failing else result(row)
+            if endpoint.endswith("/replies"):
+                rid = len(self.replies) + 1
+                row = {"id": rid, "body": body_obj.get("body", ""), "html_url": f"https://github.com/fixture/repo/pull/1#discussion_r{rid}"}
+                self.replies.append(row)
+                return failure() if failing else result(row)
+            cid = len(self.comments) + 1
+            row = {"id": cid, "body": body_obj.get("body", ""), "html_url": f"https://github.com/fixture/repo/issues/1#issuecomment-{cid}"}
+            self.comments.append(row)
+            return failure() if failing else result(row)
         if self.lookup_fails:
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="lookup unavailable")
-        if args[:2] == ["issue", "list"]:
-            return result(self.issues)
         if args[:2] == ["pr", "list"]:
             return result(self.prs)
         if args[:2] == ["issue", "view"]:
-            return result({"state": self.issues[0]["state"]})
-        if args[0] == "api" and "/comments?" in args[1]:
-            return result([self.comments])
+            issue = self.issues[0] if self.issues else {"state": "OPEN", "body": ""}
+            return result(issue)
+        if args[0] == "api":
+            endpoint = args[1]
+            if "/labels" in endpoint:
+                return result([[{"name": lb} for lb in sorted(self.labels)]])
+            if "/pulls/" in endpoint and "/comments" in endpoint:
+                return result([self.replies])
+            if "/issues/" in endpoint and "/comments" in endpoint:
+                return result([self.comments])
+            if "/issues?" in endpoint:
+                return result([self.issues])
         raise AssertionError(f"unknown GitHub request: {command}")
 
 
 class GithubWriteRecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.wait = mock.patch.object(util, "wait_for_network", return_value=True)
-        self.wait.start()
-        self.addCleanup(self.wait.stop)
+        import tempfile
+        from pathlib import Path
+        from arete import outbox, send_github
+        from arete.store import db
+        from tests import support
 
-    def invoke(self, name):
-        if name == "issue_create":
-            return gh.issue_create("fixture/repo", "fixture", "body")
-        if name == "issue_comment":
-            return gh.issue_comment("fixture/repo", 1, "body")
-        if name == "pr_comment":
-            return gh.pr_comment("https://github.com/fixture/repo/pull/1", "body")
-        return gh.pr_reply("https://github.com/fixture/repo/pull/1", 2, "body")
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(support.workspace_state(root))
+        db.migrate()
+        send_github.clear_label_cache()
+        self.enterContext(mock.patch.object(util, "wait_for_network", return_value=True))
+        self.enterContext(mock.patch.object(outbox, "RETRY_SECONDS", 0))
+        self.outbox = outbox
 
-    def test_lost_replies_reconcile_all_keyed_helpers(self):
-        for name in ("issue_create", "issue_comment", "pr_comment", "pr_reply"):
-            for error in (GithubWriteLedger.RESET, "HTTP 502"):
-                with self.subTest(name=name, error=error):
+    def _draft_for(self, kind: str, slot: str):
+        if kind == "issue":
+            return self.outbox.draft(
+                target="github", kind="issue", object="github:fixture/repo",
+                body=json.dumps({"title": "fixture", "body": "body", "labels": []}),
+                drafted_by="arete", slot=slot,
+            )
+        if kind == "comment":
+            return self.outbox.draft(
+                target="github", kind="comment", object="github:fixture/repo#1",
+                body="body", drafted_by="arete", slot=slot,
+            )
+        if kind == "reply":
+            return self.outbox.draft(
+                target="github", kind="reply", object="github:fixture/repo#1/r2",
+                body="body", drafted_by="arete", slot=slot,
+            )
+        if kind == "label":
+            return self.outbox.draft(
+                target="github", kind="label", object="github:fixture/repo#1",
+                body=json.dumps({"add": ["agent:pr"], "remove": ["agent:running"], "family": "state"}),
+                drafted_by="arete", slot=slot,
+            )
+        return self.outbox.draft(
+            target="github", kind="status", object="github:fixture/repo#1",
+            body=json.dumps({"state": "closed"}), drafted_by="arete", slot=slot,
+        )
+
+    def test_lost_replies_reconcile_all_sender_kinds(self):
+        for kind in ("issue", "comment", "reply", "label", "status"):
+            for idx, error in enumerate((GithubWriteLedger.RESET, "HTTP 502")):
+                with self.subTest(kind=kind, error=error):
                     ledger = GithubWriteLedger(error)
+                    if kind in ("label", "status"):
+                        ledger.issues = [{"number": 1, "state": "OPEN", "body": ""}]
+                        ledger.labels = {"agent:running"}
+                    item_id = self._draft_for(kind, f"reconcile-{kind}-{idx}")
                     with mock.patch.object(util, "sh", side_effect=ledger.sh):
-                        returned = self.invoke(name)
-                    self.assertEqual(returned, 1 if name == "issue_create" else None)
+                        self.outbox.send_due()
+                        self.outbox.send_due()
+                    detail = self.outbox.get(item_id)
+                    self.assertEqual(detail["item"]["state"], "sent")
+                    self.assertEqual([a["outcome"] for a in detail["attempts"]], ["unknown", "found"])
                     self.assertEqual(ledger.writes, 1)
-                    stored = ledger.issues if name == "issue_create" else ledger.comments
-                    self.assertEqual(len(stored), 1)
-                    self.assertRegex(stored[0]["body"], r"<!-- arete:key=[0-9a-f]{32} -->$")
 
-    def test_failed_lookup_never_resends_and_empty_lookup_resends_only_once(self):
-        for name in ("issue_create", "issue_comment", "pr_comment", "pr_reply"):
-            with self.subTest(name=name):
+    def test_failed_lookup_never_resends_and_empty_lookup_resends_once(self):
+        for kind in ("issue", "comment", "reply"):
+            with self.subTest(kind=kind):
                 ledger = GithubWriteLedger(lookup_fails=True)
-                with mock.patch.object(util, "sh", side_effect=ledger.sh), self.assertRaises(gh.GhUnsure) as raised:
-                    self.invoke(name)
-                self.assertIsInstance(raised.exception, gh.GhError)
+                item_id = self._draft_for(kind, f"lookup-fail-{kind}")
+                with mock.patch.object(util, "sh", side_effect=ledger.sh):
+                    self.outbox.send_due()
+                    self.outbox.send_due()
+                detail = self.outbox.get(item_id)
+                self.assertEqual(detail["item"]["state"], "approved")
+                self.assertEqual([a["outcome"] for a in detail["attempts"]], ["unknown", "unknown"])
                 self.assertEqual(ledger.writes, 1)
-                self.assertEqual(len(ledger.issues) + len(ledger.comments), 1)
-                for fail_twice in (False, True):
-                    ledger = GithubWriteLedger(apply=False, fail_twice=fail_twice)
-                    with mock.patch.object(util, "sh", side_effect=ledger.sh):
-                        if fail_twice:
-                            with self.assertRaises(gh.GhUnsure):
-                                self.invoke(name)
-                        else:
-                            self.invoke(name)
-                    self.assertEqual(ledger.writes, 2)
-                    self.assertEqual(ledger.payloads[0], ledger.payloads[1])
-                    self.assertTrue(ledger.calls[1][0] in ("api", "issue"))
+                self.outbox.reject(item_id, reason="cleanup")
+
+                ledger2 = GithubWriteLedger(apply=False, fail_twice=False)
+                item_id2 = self._draft_for(kind, f"empty-lookup-{kind}")
+                with mock.patch.object(util, "sh", side_effect=ledger2.sh):
+                    self.outbox.send_due()
+                    self.outbox.send_due()
+                detail2 = self.outbox.get(item_id2)
+                self.assertEqual(detail2["item"]["state"], "sent")
+                self.assertEqual([a["outcome"] for a in detail2["attempts"]], ["unknown", "sent"])
+                self.assertEqual(ledger2.writes, 2)
+                self.assertEqual(ledger2.payloads[0], ledger2.payloads[1])
 
     def test_pr_recovery_and_already_exists(self):
         for error in (GithubWriteLedger.RESET, "HTTP 502", "already exists"):
@@ -140,18 +206,27 @@ class GithubWriteRecoveryTests(unittest.TestCase):
                 gh.pr_create("fixture/repo", "head", "main", "title", "body")
             self.assertEqual(ledger.writes, 1)
 
-    def test_close_recovers_comment_only_and_full_close(self):
-        for comment_only in (True, False):
-            ledger = GithubWriteLedger()
-            ledger.issues = [{"number": 1, "state": "OPEN"}]
-            ledger.close_comment_only = comment_only
-            with mock.patch.object(util, "sh", side_effect=ledger.sh):
-                gh.issue_close("fixture/repo", 1, "recovered")
-                gh.issue_close("fixture/repo", 1, "recovered again")
-            self.assertEqual(ledger.issues[0]["state"], "CLOSED")
-            self.assertEqual(len(ledger.comments), 1)
-            if comment_only:
-                self.assertNotIn("--comment", ledger.calls[3])
+    def test_comment_before_close_never_passes_per_object_order(self):
+        ledger = GithubWriteLedger(apply=False)
+        ledger.issues = [{"number": 1, "state": "OPEN", "body": ""}]
+        c_id = self.outbox.draft(
+            target="github", kind="comment", object="github:fixture/repo#1",
+            body="Recovered.", drafted_by="arete", slot="order-comment",
+        )
+        s_id = self.outbox.draft(
+            target="github", kind="status", object="github:fixture/repo#1",
+            body=json.dumps({"state": "closed"}), drafted_by="arete", slot="order-close",
+        )
+        with mock.patch.object(util, "sh", side_effect=ledger.sh):
+            self.outbox.send_due()
+            # Comment failed transiently, so close MUST NOT have run yet!
+            self.assertEqual(ledger.issues[0]["state"], "OPEN")
+            self.assertEqual(self.outbox.get(s_id)["item"]["state"], "approved")
+            self.outbox.send_due()
+        self.assertEqual(self.outbox.get(c_id)["item"]["state"], "sent")
+        self.assertEqual(self.outbox.get(s_id)["item"]["state"], "sent")
+        self.assertEqual(ledger.issues[0]["state"], "CLOSED")
+        self.assertEqual(len(ledger.comments), 1)
 
 
 class JiraWriteLedger:

@@ -156,8 +156,10 @@ def reconsider(cfg: config.Config, source: tracker.GitHubTracker, layer: config.
         return None
     lock = run_store.run_lock("pipeline", repo.name, issue)
     with (nullcontext(not util.lock_is_held(lock)) if dry_run else util.lock(lock)) as free:
+        from .store import outbox as outbox_store
+
         if (not free or tasks.pending_start(repo.name, issue) or run_store.issue_running(repo.name, issue)
-                or run_store.pending_label(repo.name, issue)):
+                or outbox_store.pending_label_item(f"github:{source.repo.github}#{int(issue)}")):
             return None
         run = run_store.newest_live_whole_run(repo.name, issue)
         if (not run or run["status"] != "failed" or run.get("pr_url") or not (failure := recorded_failure(run))

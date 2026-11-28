@@ -604,7 +604,7 @@ def command(handler, op, values, path_values, *, claim=None):
                                 atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
                                                                       "settings.update", "loop.enable", "loop.disable",
                                                                       "device.probe", "outbox.approve",
-                                                                      "outbox.retry", "outbox.reject"),
+                                                                      "outbox.retry", "outbox.reject", "chat.file"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
@@ -657,6 +657,30 @@ def mutation(name, values, handler):
         result = {"id": identity}
     elif name == "chat.drop":
         result = {"chat": dashboard.drop_chat(values["chat"])}
+    elif name == "chat.file":
+        from . import chat as chat_mod
+
+        raw_chat = str(values["chat"]).strip()
+        if not (raw_chat.isascii() and raw_chat.isdigit()) or int(raw_chat) <= 0:
+            raise contract.Problem("validation", "Chat id must be a positive whole number.")
+        draft_fp = values.get("draft")
+        if draft_fp is not None and not isinstance(draft_fp, str):
+            raise contract.Problem("validation", "draft must be a string.")
+        try:
+            item = chat_mod.file_draft(
+                int(raw_chat),
+                draft=draft_fp,
+                repo=values.get("repo"),
+                title=values.get("title"),
+                return_item=True,
+            )
+        except chat_mod.NoChat as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except chat_mod.NoDraft as error:
+            raise contract.Problem("invalid_state", str(error)) from None
+        except refusals.Invalid as error:
+            raise contract.Problem("validation", str(error)) from None
+        result = {"item": item}
     elif name == "serve.install":
         result = dashboard.install_serve(handler.server.inside_serve)
     elif name == "hook.ingest":

@@ -632,10 +632,13 @@ def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
 
 
 def pending_label(repo: str, issue: int | str) -> str:
+    raw = str(issue or "").strip()
+    if raw.isascii() and raw.isdigit():
+        return ""
     with reader() as c:
         r = c.execute(f"SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                       f"AND label_pending IS NOT NULL ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1",
-                      (repo, issue)).fetchone()
+                      (repo, raw)).fetchone()
         return r["label_pending"] if r else ""
 
 

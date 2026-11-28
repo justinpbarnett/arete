@@ -180,11 +180,18 @@ class ConfiguredTickets(unittest.TestCase):
             self.item()
 
     def test_legacy_github_emits_keep_existing_create_semantics(self):
+        from arete import outbox
+        from arete.store import db
+
+        db.migrate()
         self.spec = {"type": "ticket", "repo": "app"}
         item = self.item()
         self.assertNotIn("destination", item)
-        self.enterContext(mock.patch.object(gh, "ensure_label"))
-        create = self.enterContext(mock.patch.object(gh, "issue_create", return_value=3))
-        url = delivery.send({"type": "ticket", "item": item}, self.loop.name, "r-fixture", self.cfg)
-        self.assertEqual(url, gh.issue_url("team/app", 3))
-        create.assert_called_once_with("team/app", item["title"], item["body"], ["agent"], single_attempt=False)
+        ob_id = delivery.send({"type": "ticket", "item": item}, self.loop.name, "r-fixture", self.cfg)
+        self.assertTrue(ob_id.startswith("OB-"), ob_id)
+        detail = outbox.get(ob_id)
+        self.assertEqual(detail["item"]["kind"], "issue")
+        self.assertEqual(detail["item"]["object"], "github:team/app")
+        self.assertEqual(detail["item"]["state"], "approved")
+        payload = json.loads(detail["revisions"][-1]["body"])
+        self.assertEqual((payload["title"], payload["body"], payload["labels"]), (item["title"], item["body"], ["agent"]))

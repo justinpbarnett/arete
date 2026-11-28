@@ -196,6 +196,7 @@ class DirectPushDelivery(unittest.TestCase):
         with (mock.patch.object(tracker, "for_ticket", return_value=tk),
               mock.patch.object(tk, "get", side_effect=lambda tid: open_ticket),
               mock.patch.object(tk, "require_ordinary"),
+              mock.patch.object(gh, "issue_comment"),
               mock.patch.object(gh, "issue_close", side_effect=close_issue)):
             # 1) Partial deploy: production still serves old revision -> ticket stays open.
             proof.advance(self.cfg)

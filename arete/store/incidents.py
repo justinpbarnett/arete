@@ -174,14 +174,15 @@ def alert_get(key: str) -> dict | None:
         return dict(r) if r else None
 
 
-def alert_set(key: str, issue: int | None, repo: str = "") -> None:
+def alert_set(key: str, issue: int | None = None, repo: str = "", *, opened: str | None = None) -> None:
+    now = util.iso()
     with db() as c:
         prev = c.execute("SELECT * FROM alerts WHERE key = ?", (key,)).fetchone()
-        opened = prev["opened"] if prev else util.iso()
+        opened_at = opened if opened is not None else (prev["opened"] if prev else now)
         repo_name = repo or (prev["repo"] if prev else "") or ""
         c.execute(
             "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
-            (key, issue, opened, util.iso(), repo_name),
+            (key, issue, opened_at, now, repo_name),
         )
         _sync_inbox(c, "alerts")
 

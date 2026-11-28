@@ -1,1 +1,37 @@
-{"type": "object", "x-arete-read-only": true}
+{
+  "type": "object",
+  "properties": {
+    "connector": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "kinds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["issue", "comment", "reply", "label", "status"]
+      }
+    },
+    "audience": {
+      "type": "string",
+      "enum": ["self", "team", "client", "public"]
+    },
+    "posts_as": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_@.-]*$"
+    },
+    "send_window": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400
+    }
+  },
+  "additionalProperties": false,
+  "required": ["connector", "kinds", "audience", "posts_as", "send_window"]
+}

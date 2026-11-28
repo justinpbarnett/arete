@@ -11,9 +11,9 @@ from . import (
     config,
     control,
     factory_control,
-    gh,
     paths,
     pipeline,
+    principals,
     prompt_loader,
     record,
     refusals,
@@ -422,46 +422,54 @@ def reply_and_draft(result: Result) -> tuple[str, dict | None]:
 
 
 @factory_control.work
-def file_draft(chat_id: int, publication=None, *, draft=None) -> dict:
+def file_draft(chat_id: int, publication=None, *, draft=None, repo: str | None = None,
+               title: str | None = None, return_item: bool = False) -> dict:
+    from . import outbox
+    from .store import outbox as outbox_store
+
     with filing:
-        if publication and publication.pending and "result" in publication.pending:
-            return view(chat_id)
-        if publication and publication.pending:
-            target = publication.pending
+        row = chat_row(chat_id)
+        if not row["draft_title"]:
+            raise NoDraft("There is no drafted issue to file.")
+        if publication and draft is None:
+            raise NoDraft("A keyed filing needs the current draft fingerprint. Read the draft and try again.")
+        if draft is not None and draft != draft_fingerprint(row):
+            raise NoDraft("The draft changed. Read the current draft and try again.")
+        cfg = config.load()
+        if repo is not None and repo.strip():
+            wanted = repo.strip()
+            matched = next((r for r in cfg.repos if r.name == wanted or r.github == wanted), None)
+            if matched is None or not matched.github:
+                raise refusals.Invalid(f"Repo {wanted!r} is not a configured repo with a GitHub name.")
+            github = matched.github
         else:
-            row = chat_row(chat_id)
-            if not row["draft_title"]:
-                raise NoDraft("There is no drafted issue to file.")
-            if publication and draft is None:
-                raise NoDraft("A keyed filing needs the current draft fingerprint. Read the draft and try again.")
-            if draft is not None and draft != draft_fingerprint(row):
-                raise NoDraft("The draft changed. Read the current draft and try again.")
-            github = arete_repo(config.load()).github
+            github = arete_repo(cfg).github
             if not github:
                 raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
-            target = {"repo": github, "title": row["draft_title"], "body": row["draft_body"]}
+        issue_title = title.strip() if isinstance(title, str) and title.strip() else row["draft_title"]
+        issue_body = row["draft_body"]
+        actor = principals.current()
+        digest = hashlib.sha256(f"{issue_title}\0{issue_body}".encode()).hexdigest()[:24]
+        slot = f"chat:{chat_id}:{digest}"
+        payload = json.dumps({"title": issue_title, "body": issue_body, "labels": []})
+        with foundation.tx() as c:
+            item_id = outbox.draft(
+                c,
+                target="github",
+                kind="issue",
+                object=f"github:{github}",
+                body=payload,
+                drafted_by=actor,
+                slot=slot,
+                summary=f"file issue on {github}: {issue_title}",
+                hold_as_draft=True,
+            )
+            chats_store.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
+            chats_store.chat_say(chat_id, "arete", f"Drafted OB-{item_id}; it waits in the outbox for approval.")
+            item = outbox_store.decode_on(c, outbox_store.get_row(c, item_id))
             if publication:
-                publication.remember(target)
-        github, title, body = (target[k] for k in ("repo", "title", "body"))
-        url = gh.find_issue_marker(github, publication.marker) if publication else ""
-        if not url:
-            if publication:
-                with foundation.tx():
-                    if not publication.pending.get("send_started"):
-                        current = chat_row(chat_id)
-                        if (current["draft_title"], current["draft_body"]) != (title, body):
-                            raise NoDraft("The draft changed. Read the current draft and try again.")
-                    publication.begin_send()
-                number = gh.issue_create(github, title, publication.text(body), single_attempt=True)
-            else:
-                number = gh.issue_create(github, title, body)
-            url = gh.issue_url(github, number)
-        with foundation.tx():
-            chats_store.chat_drop_draft(chat_id, title, body)
-            chats_store.chat_say(chat_id, "arete", f"Filed {url}")
-            if publication:
-                publication.record(f"chat:{chat_id}", url, url)
-    return view(chat_id)
+                publication.record(f"chat:{chat_id}", f"OB-{item_id}", f"OB-{item_id}")
+    return item if return_item else view(chat_id)
 
 
 def drop_draft(chat_id: int) -> dict:

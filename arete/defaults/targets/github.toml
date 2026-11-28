@@ -1,0 +1,5 @@
+connector = "github"
+kinds = ["issue", "comment", "reply", "label", "status"]
+audience = "self"
+posts_as = "gh"
+send_window = 60

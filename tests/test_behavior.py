@@ -7558,7 +7558,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         for name in ("capture", "ask", "dashboard"):
             assert not config.root_schema(name).get("x-arete-reach")
         test = unittest.TestCase()
-        for name in ("connector", "target"):
+        for name in ("connector",):
             with test.assertRaisesRegex(ValueError, "unavailable for writes"):
                 configschema.validate(name, {})
         configschema.validate("device", {"kind": "ssh", "host": "box.test", "note": "build box"})
@@ -9527,230 +9527,101 @@ class VersionedApiTests(unittest.TestCase):
               mock.patch.object(gh, "pr_create", side_effect=pull),
               mock.patch.object(util, "git", side_effect=push)):
                 patches.enter_context(patch)
-            read = patches.enter_context(mock.patch.object(source, "ticket",
-                                                          return_value=triage.TicketText("", "Ticket", "", "old")))
+            patches.enter_context(mock.patch.object(source, "ticket",
+                                                    return_value=triage.TicketText("", "Ticket", "", "old")))
             post = self.publication_post
-            cases = [
-                ("triage", "/api/triage/fixture%237/send", "/api/triage/{ref}/send", {"ref": "fixture%237"},
-                 {"questions": ["What happened?"], "answers": ["It broke."], "repo": self.repo.name},
-                 "comments", comment_url, "triage:fixture#7"),
-                ("chat", f"/api/chats/{chat_id}/file", "/api/chats/{n}/file", {"n": str(chat_id)},
-                 {"draft": chat.draft_fingerprint(chat.chat_row(chat_id))}, "issues",
-                 gh.issue_url(self.repo.github, 20), f"chat:{chat_id}"),
-                ("approval", f"/api/approvals/{approval_id}", "/api/approvals/{id}", {"id": str(approval_id)},
-                 {"approve": True}, "issues", gh.issue_url(self.repo.github, 21), f"approval:{approval_id}"),
-                ("approval-pr", f"/api/approvals/{pr_id}", "/api/approvals/{id}", {"id": str(pr_id)},
-                 {"approve": True}, "pulls", pr_url, f"approval:{pr_id}"),
-            ]
-            for name, path, route, params, body, kind, url, subject in cases:
-                with self.subTest(publication=name):
-                    key = f"fixture-key-{name}"
-                    before = len(remote[kind])
-                    with (mock.patch.object(idempotency.Publication, "record", side_effect=RuntimeError("cut off")),
-                          mock.patch.object(approvals_store, "settle_approval", side_effect=settle_until_disconnect)):
-                        self.assertEqual(post(path, body, key)[0], 500)
-                    self.assertEqual(len(remote[kind]), before + 1)
-                    sha = idempotency.fingerprint("POST", route, params, body)
-                    tag = db.schema_metadata()["instance_tag"]
-                    self.assertIn(f"arete:{tag}:k-{sha[:8]}", remote[kind][-1]["body"].splitlines())
-                    self.assertEqual(claims.lookup(self.actor, key)["status"], 0)
-                    if name.startswith("approval"):
-                        self.assertEqual(approvals_store.approval(int(params["id"]))["status"], "approved")
-                    status, headers, answer = post(path, body, key)
-                    self.assertEqual(status, 200, answer)
-                    saved = claims.lookup(self.actor, key)
-                    self.assertEqual(headers["Arete-Seq"], claims.receipt(saved["last_seq"])["event_seq"])
-                    with db.reader() as conn:
-                        event = conn.execute("SELECT subject, data FROM events_log WHERE seq=?",
-                                             (saved["last_seq"],)).fetchone()
-                    self.assertEqual((event["subject"], json.loads(event["data"])["url"]), (subject, url))
-                    status, headers, again = post(path, body, key)
-                    self.assertEqual((status, headers["Idempotent-Replayed"], again), (200, "true", answer))
-                    self.assertEqual(len(remote[kind]), before + 1)
-
-            self.assertEqual(post(f"/api/approvals/{approval_id}", {"approve": False}, "fixture-key-approval")[0], 422)
-            self.assertEqual(read.call_count, 2)
-            self.assertEqual(labeled, [ticket.ref, ticket.ref])
-            self.assertEqual(pushed, [["push", "-u", "origin", "fixture/head"]])
-            self.assertEqual(searches, ["comments", "comments", "issues", "issues", "issues", "issues", "pulls", "pulls"])
-            self.assertIsNone(triage.board_row(ticket.ref))
-            self.assertEqual(triage_store.triage_approval(ticket.ref)["repo"], self.repo.name)
-            self.assertEqual([m["text"] for m in chats_store.chat_messages(chat_id)],
-                             ["Drafted", f"Filed {gh.issue_url(self.repo.github, 20)}"])
-            self.assertEqual(approvals_store.approval(approval_id)["result"], gh.issue_url(self.repo.github, 21))
-            self.assertEqual(approvals_store.approval(pr_id)["result"], pr_url)
-            with self.subTest(publication="triage drift before first confirmed publication"):
-                remote["comments"].clear()
-                triage_store.triage_put(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
-                                                 questions=["What happened?"]))
-                path = "/api/triage/fixture%237/send"
-                payload = {"questions": ["What happened?"], "answers": ["A different answer."], "repo": self.repo.name}
-                key = "fixture-triage-stale"
-                with mock.patch.object(gh, "issue_comment", side_effect=gh.GhError("could not reach fixture")):
-                    self.assertEqual(post(path, payload, key)[0], 502)
+            with self.subTest(publication="approval-pr"):
+                path, route, params = f"/api/approvals/{pr_id}", "/api/approvals/{id}", {"id": str(pr_id)}
+                body, key = {"approve": True}, "fixture-key-approval-pr"
+                before = len(remote["pulls"])
+                with (mock.patch.object(idempotency.Publication, "record", side_effect=RuntimeError("cut off")),
+                      mock.patch.object(approvals_store, "settle_approval", side_effect=settle_until_disconnect)):
+                    self.assertEqual(post(path, body, key)[0], 500)
+                self.assertEqual(len(remote["pulls"]), before + 1)
+                sha = idempotency.fingerprint("POST", route, params, body)
+                tag = db.schema_metadata()["instance_tag"]
+                self.assertIn(f"arete:{tag}:k-{sha[:8]}", remote["pulls"][-1]["body"].splitlines())
                 self.assertEqual(claims.lookup(self.actor, key)["status"], 0)
-                read.return_value = triage.TicketText("", "Edited", "", "new")
-                labels_before = labeled.copy()
-                self.assertEqual(post(path, payload, key)[0], 409)
-                self.assertEqual(remote["comments"], [])
-                self.assertEqual(labeled, labels_before)
-                self.assertIsNotNone(triage.board_row(ticket.ref))
-            with self.subTest(publication="label-only triage send recovers after its own timestamp change"):
-                triage_store.triage_put(triage.row(source, ticket, updated="old", ready=1, code=1, repo=self.repo.name))
-                path, key = "/api/triage/fixture%237/send", "fixture-triage-label-recovery"
-                payload = {"questions": [], "answers": [], "repo": self.repo.name}
-                read.return_value = triage.TicketText("", "Ticket", "", "old")
-                with mock.patch.object(idempotency.Publication, "record", side_effect=RuntimeError("cut off")):
-                    self.assertEqual(post(path, payload, key)[0], 500)
-                wanted = triage.labels_to_add(triage.board_row(ticket.ref))
-                read.return_value = triage.TicketText("", "Ticket", "", "after-labels", tuple(wanted))
-                labels_before = labeled.copy()
-                read.return_value.labels += ("agent:hold",)
-                status, _, answer = post(path, payload, key)
-                self.assertEqual(status, 409, answer)
-                self.assertIsNotNone(triage.board_row(ticket.ref))
-                read.return_value.labels = tuple(wanted)
-                status, _, answer = post(path, payload, key)
+                self.assertEqual(approvals_store.approval(pr_id)["status"], "approved")
+                status, headers, answer = post(path, body, key)
                 self.assertEqual(status, 200, answer)
-                self.assertEqual(labeled, labels_before)
+                saved = claims.lookup(self.actor, key)
+                self.assertEqual(headers["Arete-Seq"], claims.receipt(saved["last_seq"])["event_seq"])
+                with db.reader() as conn:
+                    event = conn.execute("SELECT subject, data FROM events_log WHERE seq=?",
+                                         (saved["last_seq"],)).fetchone()
+                self.assertEqual((event["subject"], json.loads(event["data"])["url"]), (f"approval:{pr_id}", pr_url))
+                status, headers, again = post(path, body, key)
+                self.assertEqual((status, headers["Idempotent-Replayed"], again), (200, "true", answer))
+                self.assertEqual(len(remote["pulls"]), before + 1)
+                self.assertEqual(pushed, [["push", "-u", "origin", "fixture/head"]])
+                self.assertEqual(approvals_store.approval(pr_id)["result"], pr_url)
+
+            from arete import outbox
+
+            with self.subTest(publication="triage drafts outbox items atomically"):
+                path = "/api/triage/fixture%237/send"
+                body = {"questions": ["What happened?"], "answers": ["It broke."], "repo": self.repo.name}
+                status, headers, answer = post(path, body, "fixture-key-triage")
+                self.assertEqual(status, 200, answer)
+                status, headers, again = post(path, body, "fixture-key-triage")
+                self.assertEqual((status, headers["Idempotent-Replayed"], again), (200, "true", answer))
                 self.assertIsNone(triage.board_row(ticket.ref))
-            with self.subTest(publication="found comment cannot resume on a newer triage entry"):
-                triage_store.triage_put(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
-                                                 questions=["What happened?"]))
-                read.return_value = triage.TicketText("", "Ticket", "", "old")
-                payload = {"questions": ["What happened?"], "answers": ["Preserve the new row."], "repo": self.repo.name}
-                path, key = "/api/triage/fixture%237/send", "fixture-triage-revised-board"
-                with mock.patch.object(source, "approve", side_effect=gh.GhError("cannot add labels")):
-                    self.assertEqual(post(path, payload, key)[0], 502)
-                triage_store.triage_put(triage.row(source, ticket, updated="new", ready=0, code=1, repo=self.repo.name,
-                                                 questions=["New question"]))
-                labels_before = labeled.copy()
-                status, _, answer = post(path, payload, key)
-                self.assertEqual(status, 409, answer)
-                self.assertEqual(labeled, labels_before)
-                self.assertEqual(triage.board_row(ticket.ref)["questions"], ["New question"])
-            with self.subTest(publication="upstream tracker failure is kept and redacted"):
-                ident = approvals_store.add_approval("fixture", "", approval_emit, "File again")
-                marker = "synthetic provider diagnostic should stay private"
-                with mock.patch.object(gh, "gh_json", side_effect=gh.GhError(marker)):
-                    status, _, failure = post(f"/api/approvals/{ident}", {"approve": True}, "fixture-approval-upstream")
-                self.assertNotIn(marker.encode(), failure)
-                self.assertEqual(status, 502)
-                self.assertIs(json.loads(failure)["kept"], True)
-                saved = approvals_store.approval(ident)
-                self.assertEqual(saved["status"], "failed")
-                self.assertNotIn(marker, saved["result"])
-            with self.subTest(publication="identical chat content under a new key"):
-                chats_store.chat_say(chat_id, "arete", "Drafted again", draft_title="Draft", draft_body="Chat issue body")
-                before = len(remote["issues"])
+                self.assertEqual(triage_store.triage_approval(ticket.ref)["repo"], self.repo.name)
+                triage_items = [it for it in outbox.list_items() if it["slot"].startswith("triage:fixture#7:")]
+                self.assertEqual({it["kind"] for it in triage_items}, {"comment", "label"})
+                self.assertTrue(all(it["state"] == "approved" and it["approved_by"] for it in triage_items))
+
+            with self.subTest(publication="chat file drafts into outbox"):
                 path = f"/api/chats/{chat_id}/file"
                 body = {"draft": chat.draft_fingerprint(chat.chat_row(chat_id))}
-                status, _, answer = post(path, body, "fixture-distinct-chat-key")
+                status, headers, answer = post(path, body, "fixture-key-chat")
                 self.assertEqual(status, 200, answer)
-                self.assertEqual(len(remote["issues"]), before + 1)
-                self.assertNotEqual(remote["issues"][-1]["body"], remote["issues"][0]["body"])
-            with self.subTest(publication="chat reply lost before the marked issue is visible"):
-                chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Delayed draft", draft_body="Delayed body")
-                body = {"draft": chat.draft_fingerprint(chat.chat_row(chat_id))}
-                path, key = f"/api/chats/{chat_id}/file", "fixture-lost-chat-reply"
-                before = len(remote["issues"])
-                hidden = []
+                status, headers, again = post(path, body, "fixture-key-chat")
+                self.assertEqual((status, headers["Idempotent-Replayed"], again), (200, "true", answer))
+                self.assertEqual(remote["issues"], [])
+                chat_items = [it for it in outbox.list_items() if it["slot"].startswith(f"chat:{chat_id}:")]
+                self.assertEqual(len(chat_items), 1)
+                self.assertEqual(chat_items[0]["state"], "draft")
+                self.assertIn(f"Drafted {chat_items[0]['id']}", chats_store.chat_messages(chat_id)[-1]["text"])
 
-                def lost_reply(*args, **kwargs):
-                    issue(*args, **kwargs)
-                    hidden.append(remote["issues"].pop())
-                    raise gh.GhUnsure("synthetic lost reply")
+            with self.subTest(publication="legacy ticket approval drafts into outbox"):
+                path = f"/api/approvals/{approval_id}"
+                status, headers, answer = post(path, {"approve": True}, "fixture-key-approval")
+                self.assertEqual(status, 200, answer)
+                self.assertEqual(post(path, {"approve": False}, "fixture-key-approval")[0], 422)
+                self.assertTrue(approvals_store.approval(approval_id)["result"].startswith("OB-"))
 
-                with mock.patch.object(gh, "issue_create", side_effect=lost_reply) as outbound:
-                    self.assertEqual(post(path, body, key)[0], 502)
-                    retry_status, _, retry = post(path, body, key)
-                    self.assertIn(retry_status, (409, 502), retry)
-                    self.assertEqual(outbound.call_count, 1)
-                self.assertEqual(len(hidden), 1)
-                self.assertEqual(chat.chat_row(chat_id)["draft_title"], "Delayed draft")
-                remote["issues"].extend(hidden)
-                self.assertEqual(post(path, body, key)[0], 200)
-                self.assertEqual(len(remote["issues"]), before + 1)
-            with self.subTest(publication="approval prerequisites fail before the create attempt"):
-                retry_pr = {"type": "pr", "item": {**pr_item, "branch": "fixture/retry"}}
-                for item, kind, adapter, prerequisite in ((approval_emit, "issues", gh, "ensure_label"),
-                                                          (retry_pr, "pulls", util, "git")):
-                    item = {**item, "item": {**item["item"], "labels": ["fixture-label"]}}
-                    ident = approvals_store.add_approval("fixture", "", item, "Recover the prerequisite failure")
-                    path, key = f"/api/approvals/{ident}", f"fixture-prerequisite-{ident}"
-                    before = len(remote[kind])
-                    with mock.patch.object(gh, "ensure_label", return_value=""), \
-                            mock.patch.object(adapter, prerequisite, side_effect=gh.GhError("prerequisite failed")):
-                        status, _, failure = post(path, {"approve": True}, key)
-                        self.assertEqual(status, 502, failure)
-                    self.assertEqual(approvals_store.approval(ident)["status"], "failed")
-                    self.assertEqual(len(remote[kind]), before)
-                    with mock.patch.object(gh, "ensure_label", return_value=""):
-                        status, _, answer = post(path, {"approve": True}, key)
-                    self.assertEqual(status, 200, answer)
-                    self.assertEqual(len(remote[kind]), before + 1)
-                    self.assertEqual(approvals_store.approval(ident)["status"], "done")
-            with self.subTest(publication="lost approval reply cannot authorize another send under a fresh key"):
-                ident = approvals_store.add_approval("fixture", "", approval_emit, "Send once")
-                path, key = f"/api/approvals/{ident}", "fixture-approval-lost-reply"
-                hidden = []
-
-                def lost_issue(*args, **kwargs):
-                    issue(*args, **kwargs)
-                    hidden.append(remote["issues"].pop())
-                    raise gh.GhUnsure("reply not received")
-
-                with mock.patch.object(gh, "issue_create", side_effect=lost_issue):
-                    self.assertEqual(post(path, {"approve": True}, key)[0], 502)
+            with self.subTest(publication="pr approval prerequisite failure is kept"):
+                retry_pr = {"type": "pr", "item": {**pr_item, "branch": "fixture/retry", "labels": ["fixture-label"]}}
+                ident = approvals_store.add_approval("fixture", "", retry_pr, "Recover the prerequisite failure")
+                path, key = f"/api/approvals/{ident}", f"fixture-prerequisite-{ident}"
+                before = len(remote["pulls"])
+                with mock.patch.object(gh, "ensure_label", return_value=""), \
+                        mock.patch.object(util, "git", side_effect=gh.GhError("prerequisite failed")):
+                    status, _, failure = post(path, {"approve": True}, key)
+                    self.assertEqual(status, 502, failure)
                 self.assertEqual(approvals_store.approval(ident)["status"], "failed")
-                before = len(remote["issues"])
-                self.assertEqual(post(path, {"approve": True}, "fixture-fresh-approval-key")[0], 409)
-                self.assertEqual(self.publication_post(path, {"approve": True}, None)[0], 409)
-                self.assertEqual(len(remote["issues"]), before)
-                remote["issues"].extend(hidden)
-                self.assertEqual(post(path, {"approve": True}, key)[0], 200)
-                self.assertEqual(len(remote["issues"]), before + 1)
-            with self.subTest(publication="discarded chat draft cannot be sent after an initial lookup failure"):
-                chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Discarded", draft_body="Old body")
-                body = {"draft": chat.draft_fingerprint(chat.chat_row(chat_id))}
-                path, key = f"/api/chats/{chat_id}/file", "fixture-chat-discarded"
-                with mock.patch.object(gh, "find_issue_marker", side_effect=gh.GhError("lookup not available")):
-                    self.assertEqual(post(path, body, key)[0], 502)
-                chat.drop_draft(chat_id)
-                before = len(remote["issues"])
-                self.assertEqual(post(path, body, key)[0], 409)
-                self.assertEqual(len(remote["issues"]), before)
-            with self.subTest(publication="chat discard wins while prior publication is being looked up"):
-                chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Will discard", draft_body="Pending body")
-                body = {"draft": chat.draft_fingerprint(chat.chat_row(chat_id))}
-                path, key = f"/api/chats/{chat_id}/file", "fixture-chat-discard-at-lookup"
-                before = len(remote["issues"])
+                self.assertEqual(len(remote["pulls"]), before)
+                with mock.patch.object(gh, "ensure_label", return_value=""):
+                    status, _, answer = post(path, {"approve": True}, key)
+                self.assertEqual(status, 200, answer)
+                self.assertEqual(len(remote["pulls"]), before + 1)
+                self.assertEqual(approvals_store.approval(ident)["status"], "done")
 
-                def discard(*unused):
-                    chat.drop_draft(chat_id)
-                    return ""
-
-                with mock.patch.object(gh, "find_issue_marker", side_effect=discard):
-                    self.assertEqual(post(path, body, key)[0], 409)
-                saved = claims.lookup(self.actor, key)
-                self.assertFalse(json.loads(saved["response"]).get("send_started"))
-                self.assertEqual(len(remote["issues"]), before)
             with self.subTest(publication="chat without a bound draft"):
                 chats_store.chat_say(chat_id, "arete", "Drafted again", draft_title="New draft", draft_body="Different body")
                 path = f"/api/chats/{chat_id}/file"
-                before = len(remote["issues"])
                 status, _, _ = post(path, {}, "fixture-chat-without-draft")
                 self.assertIn(status, (409, 422))
-                self.assertEqual(len(remote["issues"]), before)
                 self.assertEqual(chat.chat_row(chat_id)["draft_title"], "New draft")
                 self.assertIsNone(claims.lookup(self.actor, "fixture-chat-without-draft"))
-            with self.subTest(publication="legacy unkeyed filing without representation headers"):
+
+            with self.subTest(publication="legacy unkeyed chat filing drafts into outbox"):
                 chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Legacy draft", draft_body="Legacy body")
-                before = len(remote["issues"])
                 status, _, answer = self.publication_post(f"/api/chats/{chat_id}/file", None, None)
                 self.assertEqual(status, 200, answer)
-                self.assertEqual(len(remote["issues"]), before + 1)
-                self.assertEqual(remote["issues"][-1]["body"], "Legacy body")
+                self.assertIn("Drafted OB-", chats_store.chat_messages(chat_id)[-1]["text"])
 
     def test_keyed_tracker_adapters_send_at_most_once(self):
         marker = "arete:fixture:k-12345678.234567890abcdef1234567890abcdef1"
@@ -9844,8 +9715,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 108)
-        self.assertEqual(len({op["name"] for op in operations}), 108)
+        self.assertEqual(len(operations), 109)
+        self.assertEqual(len({op["name"] for op in operations}), 109)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10098,11 +9969,15 @@ class VersionedApiTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         responses = []
 
+        from arete import outbox
+
+        real_draft = outbox.draft
+
         def publish(*args, **kwargs):
             entered.set()
             if not release.wait(3):
                 raise AssertionError("the fixture did not release the admitted request")
-            return 42
+            return real_draft(*args, **kwargs)
 
         sender = threading.Thread(target=lambda: responses.append(request(path, body, key)))
         replacement = frozenset({("fixture.py", 2)})
@@ -10136,8 +10011,7 @@ class VersionedApiTests(unittest.TestCase):
               mock.patch.object(util, "sh", return_value=SimpleNamespace(returncode=0)),
               mock.patch.object(serve.os, "execv", side_effect=forbidden),
               mock.patch.object(gh, "gh", side_effect=forbidden),
-              mock.patch.object(gh, "find_issue_marker", return_value=""),
-              mock.patch.object(gh, "issue_create", side_effect=publish) as sends,
+              mock.patch.object(outbox, "draft", side_effect=publish) as sends,
               mock.patch.object(accounts, "read", side_effect=forbidden),
               mock.patch.object(chat.routing, "metered", return_value=False)):
             try:
@@ -16350,3 +16224,1045 @@ assert len(device_store.open_waits_for_subject("config:loop/prox-job")) == 1
 secretstore.put("global", "WAIT_KEY", "valid-secret-value-123456", "api_key", owner)
 assert device_store.open_waits_for_subject("config:loop/prox-job") == []
 """)
+
+
+FAKE_GITHUB_PREAMBLE = r"""
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from arete import gh, outbound, outbox, paths, send_github, util
+from arete.store import db, outbox as outbox_store
+
+db.migrate()
+send_github.clear_label_cache()
+gh.clear_mark_cache()
+
+
+class FakeGitHub:
+    RESET = 'Post "https://api.github.com/graphql": read tcp 127.0.0.1:1->140.82.114.6:443: read: connection reset by peer'
+    ERR_502 = "gh api: HTTP 502 Bad Gateway"
+
+    def __init__(self, login="owner"):
+        self.login = login
+        self.issues = {}
+        self.comments = {}
+        self.replies = {}
+        self.labels = {}
+        self.faults = {}
+        self.events = []
+
+    def seed_issue(self, repo, number, *, title="Issue", body="", labels=(), state="OPEN", updated_at="2026-11-28T00:00:00Z"):
+        bucket = self.issues.setdefault(repo, {})
+        row = {
+            "id": number,
+            "number": number,
+            "title": title,
+            "body": body,
+            "state": state,
+            "url": f"https://github.com/{repo}/issues/{number}",
+            "html_url": f"https://github.com/{repo}/issues/{number}",
+            "labels": [{"name": lb} for lb in labels],
+            "author": {"login": self.login},
+            "updatedAt": updated_at,
+        }
+        bucket[number] = row
+        self.labels.setdefault((repo, number), set()).update(labels)
+        return row
+
+    def add_fault(self, op, mode):
+        self.faults.setdefault(op, []).append(mode)
+
+    def _pop_fault(self, op):
+        q = self.faults.get(op)
+        return q.pop(0) if q else None
+
+    def _next_issue_number(self, repo):
+        bucket = self.issues.setdefault(repo, {})
+        return (max(bucket) + 1) if bucket else 1
+
+    def __call__(self, args, cwd=None, timeout=120, input=None, write=False, *, retry=True):
+        if args[:2] == ["repo", "view"]:
+            return json.dumps({"isPrivate": True})
+        if args[:2] == ["label", "create"]:
+            return ""
+        if args[:2] == ["issue", "edit"]:
+            repo = args[args.index("--repo") + 1]
+            number = int(args[2])
+            if "--body-file" in args:
+                fault = self._pop_fault("issue_edit_body")
+                if fault == "fail_502":
+                    raise gh.GhUnsure(self.ERR_502)
+                row = self.issues.setdefault(repo, {}).setdefault(
+                    number, {"id": number, "number": number, "title": "", "body": "", "state": "OPEN",
+                             "html_url": f"https://github.com/{repo}/issues/{number}", "labels": []}
+                )
+                row["body"] = str(input or "")
+                self.events.append(("edit_body", repo, number))
+                if fault == "store_and_reset":
+                    raise gh.GhUnsure(self.RESET)
+                return ""
+            fault = self._pop_fault("label")
+            if fault == "fail_502":
+                raise gh.GhUnsure(self.ERR_502)
+            cur = self.labels.setdefault((repo, number), set())
+            for idx, a in enumerate(args):
+                if a == "--add-label" and idx + 1 < len(args):
+                    cur.add(args[idx + 1])
+                elif a == "--remove-label" and idx + 1 < len(args):
+                    cur.discard(args[idx + 1])
+            if number in self.issues.get(repo, {}):
+                self.issues[repo][number]["labels"] = [{"name": lb} for lb in sorted(cur)]
+            self.events.append(("label", repo, number, sorted(cur)))
+            if fault == "store_and_reset":
+                raise gh.GhUnsure(self.RESET)
+            return ""
+        if args[:2] == ["issue", "close"]:
+            repo = args[args.index("--repo") + 1]
+            number = int(args[2])
+            fault = self._pop_fault("close")
+            if fault == "fail_502":
+                raise gh.GhUnsure(self.ERR_502)
+            if number in self.issues.get(repo, {}):
+                self.issues[repo][number]["state"] = "CLOSED"
+            self.events.append(("close", repo, number))
+            if fault == "store_and_reset":
+                raise gh.GhUnsure(self.RESET)
+            return ""
+        if args[:2] == ["issue", "reopen"]:
+            repo = args[args.index("--repo") + 1]
+            number = int(args[2])
+            fault = self._pop_fault("reopen")
+            if fault == "fail_502":
+                raise gh.GhUnsure(self.ERR_502)
+            if number in self.issues.get(repo, {}):
+                self.issues[repo][number]["state"] = "OPEN"
+            self.events.append(("reopen", repo, number))
+            if fault == "store_and_reset":
+                raise gh.GhUnsure(self.RESET)
+            return ""
+        if args[:2] == ["issue", "view"]:
+            repo = args[args.index("--repo") + 1]
+            number = int(args[2])
+            row = self.issues.get(repo, {}).get(number)
+            if row is None:
+                raise gh.GhError(f"issue {repo}#{number} not found")
+            return json.dumps({**row, "labels": [{"name": lb} for lb in sorted(self.labels.get((repo, number), set()))]})
+        if args[:2] == ["issue", "list"]:
+            repo = args[args.index("--repo") + 1]
+            want_label = args[args.index("--label") + 1] if "--label" in args else None
+            rows = []
+            for num, row in sorted(self.issues.get(repo, {}).items()):
+                cur = self.labels.get((repo, num), set())
+                if row.get("state") != "OPEN":
+                    continue
+                if want_label and want_label not in cur:
+                    continue
+                rows.append({**row, "labels": [{"name": lb} for lb in sorted(cur)]})
+            return json.dumps(rows)
+        if args[:1] == ["api"] and "POST" in args:
+            endpoint = next(a for i, a in enumerate(args[1:], 1)
+                            if not a.startswith("-") and args[i - 1] not in ("--method", "-X", "--input"))
+            payload = json.loads(str(input or "{}"))
+            m_issue = re.fullmatch(r"repos/([^/]+/[^/]+)/issues", endpoint)
+            if m_issue:
+                repo = m_issue.group(1)
+                fault = self._pop_fault("issue")
+                if fault == "fail_502":
+                    raise gh.GhUnsure(self.ERR_502)
+                num = self._next_issue_number(repo)
+                labels = list(payload.get("labels") or [])
+                row = {
+                    "id": num,
+                    "number": num,
+                    "title": payload.get("title", ""),
+                    "body": payload.get("body", ""),
+                    "state": "OPEN",
+                    "html_url": f"https://github.com/{repo}/issues/{num}",
+                    "labels": [{"name": lb} for lb in labels],
+                    "author": {"login": self.login},
+                }
+                self.issues.setdefault(repo, {})[num] = row
+                self.labels.setdefault((repo, num), set()).update(labels)
+                self.events.append(("issue", repo, num))
+                if fault == "store_and_reset":
+                    raise gh.GhUnsure(self.RESET)
+                return json.dumps(row)
+            m_comment = re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)/comments", endpoint)
+            if m_comment:
+                repo, num = m_comment.group(1), int(m_comment.group(2))
+                fault = self._pop_fault("comment")
+                if fault == "fail_502":
+                    raise gh.GhUnsure(self.ERR_502)
+                bucket = self.comments.setdefault((repo, num), [])
+                cid = len(bucket) + 1
+                row = {
+                    "id": cid,
+                    "body": payload.get("body", ""),
+                    "user": {"login": self.login},
+                    "html_url": f"https://github.com/{repo}/issues/{num}#issuecomment-{cid}",
+                    "created_at": util.iso(),
+                }
+                bucket.append(row)
+                self.events.append(("comment", repo, num, cid))
+                if fault == "store_and_reset":
+                    raise gh.GhUnsure(self.RESET)
+                return json.dumps(row)
+            m_reply = re.fullmatch(r"repos/([^/]+/[^/]+)/pulls/(\d+)/comments/(\d+)/replies", endpoint)
+            if m_reply:
+                repo, num, parent_id = m_reply.group(1), int(m_reply.group(2)), int(m_reply.group(3))
+                fault = self._pop_fault("reply")
+                if fault == "fail_502":
+                    raise gh.GhUnsure(self.ERR_502)
+                bucket = self.replies.setdefault((repo, num), [])
+                rid = 1000 + len(bucket) + 1
+                row = {
+                    "id": rid,
+                    "in_reply_to_id": parent_id,
+                    "body": payload.get("body", ""),
+                    "user": {"login": self.login},
+                    "path": "app.py",
+                    "line": 10,
+                    "html_url": f"https://github.com/{repo}/pull/{num}#discussion_r{rid}",
+                    "created_at": util.iso(),
+                }
+                bucket.append(row)
+                self.events.append(("reply", repo, num, rid))
+                if fault == "store_and_reset":
+                    raise gh.GhUnsure(self.RESET)
+                return json.dumps(row)
+        if args[:1] == ["api"]:
+            endpoint = args[1]
+            if endpoint == "user":
+                return json.dumps({"login": self.login})
+            base = endpoint.split("?", 1)[0]
+            if m := re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)/labels", base):
+                repo, num = m.group(1), int(m.group(2))
+                return json.dumps([[{"name": lb} for lb in sorted(self.labels.get((repo, num), set()))]])
+            if m := re.fullmatch(r"repos/([^/]+/[^/]+)/pulls/(\d+)/comments", base):
+                repo, num = m.group(1), int(m.group(2))
+                return json.dumps([list(self.replies.get((repo, num), []))])
+            if m := re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)/comments", base):
+                repo, num = m.group(1), int(m.group(2))
+                return json.dumps([list(self.comments.get((repo, num), []))])
+            if m := re.fullmatch(r"repos/([^/]+/[^/]+)/issues", base):
+                repo = m.group(1)
+                return json.dumps([list(self.issues.get(repo, {}).values())])
+            if m := re.fullmatch(r"repos/([^/]+/[^/]+)/pulls/(\d+)/reviews", base):
+                return json.dumps([[]])
+        raise AssertionError(f"FakeGitHub unexpected gh call: {args}")
+
+
+_clock = [datetime.now(timezone.utc) + timedelta(minutes=10)]
+
+
+def sender_pass(step_seconds=600):
+    _clock[0] = _clock[0] + timedelta(seconds=step_seconds)
+    return outbox.send_due(now=_clock[0])
+
+
+def all_items():
+    with db.reader() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM outbox ORDER BY id ASC").fetchall()]
+
+
+def item_row(item_id):
+    num = outbox_store.parse_id(item_id) if isinstance(item_id, str) else int(item_id)
+    with db.reader() as c:
+        return outbox_store.get_row(c, num)
+
+
+def item_attempts(item_id):
+    num = outbox_store.parse_id(item_id) if isinstance(item_id, str) else int(item_id)
+    with db.reader() as c:
+        return [a["outcome"] for a in outbox_store.attempts(c, num)]
+
+
+def emit_result(data):
+    print("BEHAVIOR_RESULT=" + json.dumps(data))
+"""
+
+
+class _GitHubOutboxChildCase(unittest.TestCase):
+    def run_outbox_child(self, script):
+        root, env = isolated_behavior_environment(self)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        command = api_check.child_command(api_check.SOURCE, FAKE_GITHUB_PREAMBLE + "\n" + script)
+        done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        lines = [line for line in done.stdout.splitlines() if line.startswith("BEHAVIOR_RESULT=")]
+        self.assertTrue(lines, f"missing BEHAVIOR_RESULT in stdout:\n{done.stdout}\nstderr:\n{done.stderr}")
+        return json.loads(lines[-1].removeprefix("BEHAVIOR_RESULT="))
+
+
+class GitHubOutboxContractTests(_GitHubOutboxChildCase):
+    def test_ast_scan_finds_no_github_write_helpers_outside_send_github_and_allow_list(self):
+        result = self.run_outbox_child(r"""
+import ast
+from pathlib import Path
+import arete
+
+HELPERS = {
+    "issue_create", "issue_comment", "issue_close", "issue_labels",
+    "issue_edit_body", "issue_reopen", "ensure_label", "pr_comment", "pr_reply",
+}
+MIGRATED_CLEAN = {
+    "alerts.py", "capture.py", "chat.py", "triage.py", "intake.py",
+    "tasks.py", "senders.py", "loop_run.py", "delivery.py", "poll.py",
+}
+# #302 PR/Jira/post-outbox allow list; send_github.py is the sole outbox caller.
+ALLOWED_HELPER_FILES = {
+    "gh.py", "send_github.py",
+    "emits.py", "miner.py", "tracker.py",
+    "environment_gaps.py", "orchestration.py", "outcomes.py", "pr_recovery.py",
+    "release_promotion.py", "release_proof.py", "requeue.py", "serve.py",
+    "spec_delivery.py", "spec_tracker.py", "ticket_feedback.py",
+    "ticket_followups.py", "ticket_publication.py", "unblock.py",
+}
+ALLOWED_GH_FILES = {
+    "gh.py", "pipeline.py", "release_promotion.py", "spec_tracker.py", "ticket_followups.py",
+}
+
+pkg = Path(arete.__file__).parent
+bad_helpers = []
+bad_gh = []
+migrated_hits = []
+for path in sorted(pkg.rglob("*.py")):
+    rel = path.relative_to(pkg).as_posix()
+    tree = ast.parse(path.read_text(), filename=rel)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else (fn.id if isinstance(fn, ast.Name) else "")
+            if name in HELPERS:
+                if rel in MIGRATED_CLEAN:
+                    migrated_hits.append([rel, node.lineno, name])
+                if rel not in ALLOWED_HELPER_FILES:
+                    bad_helpers.append([rel, node.lineno, name])
+            if isinstance(fn, ast.Attribute) and fn.attr == "gh" and isinstance(fn.value, ast.Name) and fn.value.id == "gh":
+                if rel in MIGRATED_CLEAN:
+                    migrated_hits.append([rel, node.lineno, "gh.gh"])
+                if rel not in ALLOWED_GH_FILES:
+                    bad_gh.append([rel, node.lineno, "gh.gh"])
+
+emit_result({"bad_helpers": bad_helpers, "bad_gh": bad_gh, "migrated_hits": migrated_hits})
+""")
+        self.assertEqual(result["bad_helpers"], [])
+        self.assertEqual(result["bad_gh"], [])
+        self.assertEqual(result["migrated_hits"], [])
+
+    def test_capture_contract_removes_legacy_marker_and_resumed_branch(self):
+        result = self.run_outbox_child(r"""
+import ast
+from pathlib import Path
+import arete
+
+pkg = Path(arete.__file__).parent
+forbidden_tokens = []
+for path in sorted(pkg.rglob("*.py")):
+    rel = path.relative_to(pkg).as_posix()
+    text = path.read_text()
+    if "<!-- arete-capture:" in text:
+        forbidden_tokens.append([rel, "<!-- arete-capture:"])
+    tree = ast.parse(text, filename=rel)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "found_marker":
+            forbidden_tokens.append([rel, "def found_marker"])
+        if rel == "capture.py" and isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "MARK":
+                    forbidden_tokens.append([rel, "MARK"])
+        if rel == "capture.py" and isinstance(node, ast.FunctionDef) and node.name == "deliver":
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id == "resumed":
+                    forbidden_tokens.append([rel, "deliver.resumed"])
+
+emit_result({"forbidden": forbidden_tokens})
+""")
+        self.assertEqual(result["forbidden"], [])
+
+    def test_owner_feedback_ignores_sender_marked_comments_and_replies_but_keeps_owner(self):
+        result = self.run_outbox_child(r"""
+from arete import outcomes
+
+fake = FakeGitHub(login="owner")
+repo = "acme/app"
+pr_url = f"https://github.com/{repo}/pull/12"
+fake.seed_issue(repo, 12, title="PR 12")
+fake.replies[(repo, 12)] = [{
+    "id": 50,
+    "body": "Owner review note",
+    "user": {"login": "owner"},
+    "path": "app.py",
+    "line": 10,
+    "html_url": f"{pr_url}#discussion_r50",
+    "created_at": util.iso(),
+}]
+fake.comments[(repo, 12)] = [{
+    "id": 1,
+    "body": "Owner top-level note",
+    "user": {"login": "owner"},
+    "html_url": f"{pr_url}#issuecomment-1",
+    "created_at": util.iso(),
+}]
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(gh, "me", return_value="owner"), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    outbox.draft(target="github", kind="comment", object=f"github:{repo}#12",
+                 body="Arete sender comment", drafted_by="pipeline", slot="test:pr-comment:12")
+    outbox.draft(target="github", kind="reply", object=f"github:{repo}#12/r50",
+                 body="Arete sender reply", drafted_by="pipeline", slot="test:pr-reply:50")
+    sender_pass()
+    rows = outcomes.owner_feedback(pr_url, "OPEN", "app", "12")
+
+emit_result({
+    "bodies": [r["body"] for r in rows],
+    "comments_count": len(fake.comments[(repo, 12)]),
+    "replies_count": len(fake.replies[(repo, 12)]),
+})
+""")
+        self.assertEqual(result["comments_count"], 2)
+        self.assertEqual(result["replies_count"], 2)
+        self.assertEqual(sorted(result["bodies"]), ["Owner review note", "Owner top-level note"])
+
+
+class GitHubOutboxAlertsAndFindingsTests(_GitHubOutboxChildCase):
+    def test_alert_raise_and_clear_recover_across_reset_and_order_comment_before_close(self):
+        result = self.run_outbox_child(r"""
+from arete import alerts
+from arete.store import incidents as incident_store
+
+fake = FakeGitHub(login="owner")
+fake.add_fault("issue", "store_and_reset")
+repo = "acme/ops"
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    for _ in range(3):
+        alerts.raise_alert(repo, "disk-full", "Disk full", "95% full")
+        sender_pass()
+    open_issues = list(fake.issues.get(repo, {}).values())
+    alert_row = incident_store.alert_get("disk-full")
+    alert_items = [it for it in all_items() if it["slot"].startswith("alert:disk-full:")]
+    raise_item = next(it for it in alert_items if it["kind"] == "issue")
+    raise_attempts = item_attempts(raise_item["id"])
+
+    alerts.clear_alert(repo, "disk-full")
+    sender_pass()
+    sender_pass()
+
+    final_issue = fake.issues[repo][1]
+    final_comments = fake.comments.get((repo, 1), [])
+    event_kinds = [e[0] for e in fake.events if e[0] in ("comment", "close")]
+
+emit_result({
+    "issue_count": len(open_issues),
+    "alert_issue": alert_row["issue"] if alert_row else None,
+    "raise_slot_prefix": raise_item["slot"].startswith("alert:disk-full:"),
+    "raise_attempts": raise_attempts,
+    "final_state": final_issue["state"],
+    "recovered_comments": [c["body"] for c in final_comments if "Recovered at" in c["body"]],
+    "event_kinds": event_kinds,
+})
+""")
+        self.assertEqual(result["issue_count"], 1)
+        self.assertEqual(result["alert_issue"], 1)
+        self.assertTrue(result["raise_slot_prefix"])
+        self.assertEqual(result["raise_attempts"], ["unknown", "found"])
+        self.assertEqual(result["final_state"], "CLOSED")
+        self.assertEqual(len(result["recovered_comments"]), 1)
+        self.assertEqual(result["event_kinds"], ["comment", "close"])
+
+    def test_command_loop_hunt_drafts_finding_before_deliver_and_respects_approve(self):
+        result = self.run_outbox_child(r"""
+from arete import config, delivery, loop_run, record
+from arete.store import loops as loop_store
+
+fake = FakeGitHub(login="owner")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+(paths.CONFIG_DIR / "config.toml").write_text(
+    f'arete_repo = "sample"\n[[repo]]\nname = "sample"\npath = "{repo_dir}"\ngithub = "acme/sample"\n'
+)
+loop_dir = paths.CONFIG_DIR / "loops" / "hunt"
+loop_dir.mkdir(parents=True)
+(loop_dir / "check.py").write_text(
+    'import json\n'
+    'print(json.dumps({"title": "Stale cache", "summary": "Cache never expires", "fingerprint": "cache-1"}))\n'
+)
+(loop_dir / "loop.toml").write_text(
+    'kind = "command"\n'
+    'repo = "sample"\n'
+    '[run]\n'
+    'command = ["python3", "check.py"]\n'
+    '[[emit]]\n'
+    'type = "ticket"\n'
+    'repo = "sample"\n'
+    'tracker = "github"\n'
+)
+cfg = config.load_required()
+cfg.jev.enabled = False
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    with mock.patch.object(delivery, "deliver", side_effect=record.Stopped("stop before deliver")):
+        r1 = loop_run.launch("hunt", detach=False, cfg=cfg)
+    findings_after_stop = loop_store.findings("hunt")
+    finding_items = [it for it in all_items() if it["slot"].startswith("finding:")]
+    state_before_send = finding_items[0]["state"]
+
+    sender_pass()
+    findings_after_send = loop_store.findings("hunt")
+    issues_after_first_send = len(fake.issues.get("acme/sample", {}))
+
+    r2 = loop_run.launch("hunt", detach=False, cfg=cfg)
+    log2 = (paths.RUNS_DIR / r2["id"] / "run.log").read_text()
+    items_after_second_hunt = [it for it in all_items() if it["slot"].startswith("finding:")]
+    sender_pass()
+    issues_after_second_send = len(fake.issues.get("acme/sample", {}))
+
+    # Now test approve = true on a separate loop finding
+    loop2_dir = paths.CONFIG_DIR / "loops" / "hunt-approve"
+    loop2_dir.mkdir(parents=True)
+    (loop2_dir / "check.py").write_text(
+        'import json\n'
+        'print(json.dumps({"title": "Needs review", "summary": "Hold first", "fingerprint": "hold-1"}))\n'
+    )
+    (loop2_dir / "loop.toml").write_text(
+        'kind = "command"\n'
+        'repo = "sample"\n'
+        '[run]\n'
+        'command = ["python3", "check.py"]\n'
+        '[[emit]]\n'
+        'type = "ticket"\n'
+        'repo = "sample"\n'
+        'tracker = "github"\n'
+        'approve = true\n'
+    )
+    loop_run.launch("hunt-approve", detach=False, cfg=cfg)
+    held_item = next(it for it in all_items() if it["loop"] == "hunt-approve")
+    held_state = held_item["state"]
+    sender_pass()
+    issues_while_held = len(fake.issues.get("acme/sample", {}))
+    outbox.approve(held_item["id"], approved_by="owner")
+    sender_pass()
+    issues_after_approve = len(fake.issues.get("acme/sample", {}))
+
+emit_result({
+    "r1_status": r1["status"],
+    "findings_count": len(findings_after_stop),
+    "finding_items_count": len(finding_items),
+    "state_before_send": state_before_send,
+    "finding_url": findings_after_send[0]["url"],
+    "issues_after_first_send": issues_after_first_send,
+    "seen_before_logged": "seen before" in log2,
+    "items_after_second_hunt": len(items_after_second_hunt),
+    "issues_after_second_send": issues_after_second_send,
+    "held_state": held_state,
+    "issues_while_held": issues_while_held,
+    "issues_after_approve": issues_after_approve,
+})
+""")
+        self.assertEqual(result["r1_status"], "stopped")
+        self.assertEqual(result["findings_count"], 1)
+        self.assertEqual(result["finding_items_count"], 1)
+        self.assertEqual(result["state_before_send"], "approved")
+        self.assertEqual(result["finding_url"], "https://github.com/acme/sample/issues/1")
+        self.assertEqual(result["issues_after_first_send"], 1)
+        self.assertTrue(result["seen_before_logged"])
+        self.assertEqual(result["items_after_second_hunt"], 1)
+        self.assertEqual(result["issues_after_second_send"], 1)
+        self.assertEqual(result["held_state"], "draft")
+        self.assertEqual(result["issues_while_held"], 1)
+        self.assertEqual(result["issues_after_approve"], 2)
+
+
+class GitHubOutboxPipelineLabelsAndCommentsTests(_GitHubOutboxChildCase):
+    def test_pipeline_final_label_recovers_from_502_and_clears_running(self):
+        result = self.run_outbox_child(r"""
+from arete import config, pipeline, record, tracker
+
+fake = FakeGitHub(login="owner")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+repo = config.Repo("sample", repo_dir, github="acme/sample", tracker="github")
+cfg = config.Config(repos=[repo])
+fake.seed_issue("acme/sample", 7, title="Fix thing", labels=("agent",))
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    rid = record.start("pipeline", repo="sample", issue="7")
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="7")
+    run.enter("running")
+    sender_pass()
+    labels_running = sorted(fake.labels[("acme/sample", 7)])
+
+    fake.add_fault("label", "fail_502")
+    fake.add_fault("label", "fail_502")
+    run.enter("pr")
+    sender_pass()
+    sender_pass()
+    final_item = [it for it in all_items() if it["kind"] == "label"][-1]
+    attempts_after_two = item_attempts(final_item["id"])
+
+    sender_pass()
+    labels_final = sorted(fake.labels[("acme/sample", 7)])
+    final_state = item_row(final_item["id"])["state"]
+
+emit_result({
+    "labels_running": labels_running,
+    "attempts_after_two": attempts_after_two,
+    "labels_final": labels_final,
+    "final_state": final_state,
+})
+""")
+        self.assertIn("agent:running", result["labels_running"])
+        self.assertEqual(result["attempts_after_two"], ["unknown", "unknown"])
+        self.assertIn("agent:pr", result["labels_final"])
+        self.assertNotIn("agent:running", result["labels_final"])
+        self.assertEqual(result["final_state"], "sent")
+
+    def test_superseded_start_label_discarded_and_next_ticket_skips_unsent_labels(self):
+        result = self.run_outbox_child(r"""
+from arete import config, pipeline, poll, record, tracker
+
+fake = FakeGitHub(login="acme")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+repo = config.Repo("sample", repo_dir, github="acme/sample", tracker="github", parts=[config.Part("", "acme/sample")])
+cfg = config.Config(repos=[repo])
+fake.seed_issue("acme/sample", 9, title="Fix label order", labels=("agent",))
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    rid = record.start("pipeline", repo="sample", issue="9")
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    tk = tracker.GitHubTracker(repo)
+    run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tk, tid="9")
+
+    # Part 1: start label fails (unknown), final label lands (sent) -> next pass discards start label.
+    fake.add_fault("label", "fail_502")
+    run.enter("running")
+    sender_pass()
+    start_item = all_items()[0]
+    run.enter("pr")
+    final_item = all_items()[-1]
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'approved', send_at = ? WHERE id = ?", ("2000-01-01T00:00:00Z", start_item["id"]))
+        c.execute("UPDATE outbox SET state = 'sent', sent_ref = 'label:agent:pr', sent_at = ? WHERE id = ?", (util.iso(), final_item["id"]))
+    fake.labels[("acme/sample", 9)] = {"agent", "agent:pr"}
+    sender_pass()
+    start_after = item_row(start_item["id"])["state"]
+    labels_after_discard = sorted(fake.labels[("acme/sample", 9)])
+
+    # Part 2: finished run with unsent label items -> poll.next_ticket skips naming OB-<id>
+    fake.seed_issue("acme/sample", 10, title="Waiting ticket", labels=("agent",))
+    rid2 = record.start("pipeline", repo="sample", issue="10")
+    rdir2 = paths.RUNS_DIR / rid2
+    rdir2.mkdir(parents=True, exist_ok=True)
+    run2 = pipeline.Run(rid2, repo, rdir2, cfg=cfg, tracker=tk, tid="10")
+    run2.enter("running")
+    run2.enter("failed")
+    record.settle(rid2, "failed", "done")
+    pending = outbox_store.pending_label_item("github:acme/sample#10")
+    skips_before = pipeline.SkipLog({})
+    picked_before = poll.next_ticket(repo, tk, skips_before)
+    skip_lines_before = [v["why"] for v in skips_before.current.values()]
+
+    sender_pass()
+    sender_pass()
+    skips_after = pipeline.SkipLog({})
+    picked_after = poll.next_ticket(repo, tk, skips_after)
+    skip_lines_after = [v["why"] for v in skips_after.current.values()]
+
+emit_result({
+    "start_after": start_after,
+    "labels_after_discard": labels_after_discard,
+    "pending_id": outbox_store.format_id(pending) if pending else "",
+    "picked_before": picked_before.tid if picked_before else None,
+    "skip_lines_before": skip_lines_before,
+    "picked_after": picked_after.tid if picked_after else None,
+    "skip_lines_after": skip_lines_after,
+})
+""")
+        self.assertEqual(result["start_after"], "discarded")
+        self.assertEqual(result["labels_after_discard"], ["agent", "agent:pr"])
+        self.assertIsNone(result["picked_before"])
+        self.assertTrue(any(result["pending_id"] in line for line in result["skip_lines_before"]), result["skip_lines_before"])
+        self.assertFalse(any("not sent yet" in line for line in result["skip_lines_after"]), result["skip_lines_after"])
+
+    def test_run_say_feedback_prs_and_store_answer_route_through_outbox(self):
+        result = self.run_outbox_child(r"""
+from arete import config, pipeline, record, tasks, tracker
+
+fake = FakeGitHub(login="owner")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+repo = config.Repo("sample", repo_dir, github="acme/sample", tracker="github")
+cfg = config.Config(repos=[repo])
+fake.seed_issue("acme/sample", 15, title="Main ticket", labels=("agent", "agent:needs-info"))
+fake.seed_issue("acme/sample", 21, title="PR 21")
+fake.seed_issue("acme/sample", 22, title="PR 22")
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    rid = record.start("pipeline", repo="sample", issue="15")
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="15")
+
+    fake.add_fault("comment", "store_and_reset")
+    run.say("Status update on issue 15")
+    sender_pass()
+    sender_pass()
+    say_item = next(it for it in all_items() if it["object"] == "github:acme/sample#15")
+    say_attempts = item_attempts(say_item["id"])
+
+    run.feedback = [
+        {"pr_url": "https://github.com/acme/sample/pull/21", "kind": "comment", "gh_id": "1", "body": "fix"},
+        {"pr_url": "https://github.com/acme/sample/pull/22", "kind": "comment", "gh_id": "2", "body": "fix"},
+    ]
+    fake.add_fault("comment", "store_and_reset")
+    fake.add_fault("comment", "store_and_reset")
+    run.say("Feedback reply")
+    sender_pass()
+    sender_pass()
+    pr_items = [it for it in all_items() if it["object"] in ("github:acme/sample#21", "github:acme/sample#22")]
+    pr_attempts = {it["object"]: item_attempts(it["id"]) for it in pr_items}
+
+    fake.add_fault("comment", "fail_502")
+    fake.add_fault("label", "fail_502")
+    tasks.store_answer(cfg, repo, "15", "Here is the answer")
+    answer_items = [it for it in all_items() if it["slot"].startswith("answer:")]
+
+emit_result({
+    "issue_comments": len(fake.comments.get(("acme/sample", 15), [])),
+    "say_run_id": say_item["run_id"],
+    "expected_run_id": rid,
+    "say_attempts": say_attempts,
+    "pr21_comments": len(fake.comments.get(("acme/sample", 21), [])),
+    "pr22_comments": len(fake.comments.get(("acme/sample", 22), [])),
+    "pr_attempts": pr_attempts,
+    "answer_kinds": sorted(it["kind"] for it in answer_items),
+})
+""")
+        self.assertEqual(result["issue_comments"], 1)
+        self.assertEqual(result["say_run_id"], result["expected_run_id"])
+        self.assertEqual(result["say_attempts"], ["unknown", "found"])
+        self.assertEqual(result["pr21_comments"], 1)
+        self.assertEqual(result["pr22_comments"], 1)
+        self.assertEqual(result["pr_attempts"], {
+            "github:acme/sample#21": ["unknown", "found"],
+            "github:acme/sample#22": ["unknown", "found"],
+        })
+        self.assertEqual(result["answer_kinds"], ["comment", "label"])
+
+
+class GitHubOutboxCallersTests(_GitHubOutboxChildCase):
+    def test_capture_submit_recovers_from_reset_without_duplicate(self):
+        result = self.run_outbox_child(r"""
+from arete import capture, config, principals
+from arete.store import insights as insights_store
+
+fake = FakeGitHub(login="owner")
+fake.add_fault("issue", "store_and_reset")
+repo_dir = Path.cwd() / "arete-repo"
+repo_dir.mkdir()
+repo = config.Repo("arete", repo_dir, github="acme/arete")
+cfg = config.Config(repos=[repo], arete_repo="arete")
+owner = principals.seed_owner("owner@example.test")
+
+insights_store.capture_save(kind="bug", text="Clicking save fails", expected="Saves", actual="Errors", steps="Click save")
+draft = insights_store.capture_draft(db.reader)
+draft_id = draft["id"]
+insights_store.capture_written(draft_id, "fp1", "Broken button", "Clicking save fails when editing.", "ready")
+insights_store.capture_move(draft_id, draft["revision"], "draft", "filing")
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    capture.deliver(draft_id, draft["revision"], cfg, submitted_by=owner)
+    sender_pass()
+    sender_pass()
+    item = next(it for it in all_items() if it["slot"] == f"capture:{draft_id}")
+    attempts = item_attempts(item["id"])
+    filed = insights_store.capture_filed_row(draft_id, db.reader)
+
+emit_result({
+    "issues_count": len(fake.issues.get("acme/arete", {})),
+    "slot": item["slot"],
+    "attempts": attempts,
+    "filed_status": filed["status"] if filed else None,
+    "filed_number": filed["issue"] if filed else None,
+})
+""")
+        self.assertEqual(result["issues_count"], 1)
+        self.assertEqual(result["attempts"], ["unknown", "found"])
+        self.assertEqual(result["filed_status"], "filed")
+        self.assertEqual(result["filed_number"], 1)
+
+    def test_chat_file_v1_and_web_routes_draft_then_send_on_approve(self):
+        result = self.run_outbox_child(r"""
+import http.client
+import threading
+from http.server import ThreadingHTTPServer
+from types import SimpleNamespace
+from arete import chat, config, dashboard, principals, tailnet
+from arete.store import chats as chats_store, tokens as token_store
+
+fake = FakeGitHub(login="owner")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+(paths.CONFIG_DIR / "config.toml").write_text(
+    f'[[repo]]\nname = "arete"\npath = "{repo_dir}"\ngithub = "acme/sample"\n'
+)
+owner = principals.seed_owner("owner@example.test")
+with db.tx() as c:
+    token_store.ensure_key(c)
+    _, raw_token = token_store.issue(owner, "test", ["*"])
+bearer = "Bearer " + raw_token
+
+chat_id1 = chats_store.chat_add("arete")
+chats_store.chat_say(chat_id1, "arete", "Draft ready", draft_title="Add outbox button", draft_body="Make it draft first.")
+chat_id2 = chats_store.chat_add("arete")
+chats_store.chat_say(chat_id2, "arete", "Draft ready", draft_title="Web chat file", draft_body="Draft via web.")
+
+with mock.patch("socket.getfqdn", return_value="127.0.0.1"), \
+        mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    server.node = SimpleNamespace(name="127.0.0.1", names=frozenset({"127.0.0.1"}))
+    server.logins = tailnet.Logins(SimpleNamespace(whois=lambda _addr: ("owner@example.test", None)))
+    server.tls = object()
+    server.inside_serve = False
+    server.pending_secrets = {}
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", f"/api/v1/chats/{chat_id1}/file", body="{}",
+                     headers={"Authorization": bearer, "Content-Type": "application/json", "Idempotency-Key": "k-chat-1"})
+        r1 = conn.getresponse()
+        body1 = json.loads(r1.read().decode())
+        assert r1.status == 201, (r1.status, body1)
+        issues_after_v1 = len(fake.issues.get("acme/sample", {}))
+
+        conn.request("POST", f"/api/chats/{chat_id2}/file", body="{}",
+                     headers={"Authorization": bearer, "Content-Type": "application/json"})
+        r2 = conn.getresponse()
+        body2 = json.loads(r2.read().decode())
+        assert r2.status == 200, (r2.status, body2)
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    item1 = body1["item"]
+    outbox.approve(item1["id"], approved_by=owner)
+    sender_pass()
+    issues_after_approve = len(fake.issues.get("acme/sample", {}))
+    msgs1 = [m["text"] for m in chats_store.chat_messages(chat_id1)]
+    msgs2 = [m["text"] for m in body2.get("messages", [])]
+
+emit_result({
+    "v1_status": r1.status,
+    "v1_state": item1["state"],
+    "issues_after_v1": issues_after_v1,
+    "web_status": r2.status,
+    "web_has_drafted": any("Drafted OB-" in m for m in msgs2),
+    "issues_after_approve": issues_after_approve,
+    "chat1_has_filed": any("Filed https://github.com/acme/sample/issues/1" in m for m in msgs1),
+})
+""")
+        self.assertEqual(result["v1_status"], 201)
+        self.assertEqual(result["v1_state"], "draft")
+        self.assertEqual(result["issues_after_v1"], 0)
+        self.assertEqual(result["web_status"], 200)
+        self.assertTrue(result["web_has_drafted"])
+        self.assertEqual(result["issues_after_approve"], 1)
+        self.assertTrue(result["chat1_has_filed"])
+
+    def test_triage_send_and_board_publish_route_through_outbox(self):
+        result = self.run_outbox_child(r"""
+from arete import config, principals, triage
+from arete.store import triage as triage_store
+
+fake = FakeGitHub(login="acme")
+repo_dir = Path.cwd() / "sample-repo"
+repo_dir.mkdir()
+repo = config.Repo("sample", repo_dir, github="acme/sample", tracker="github", pipeline=True, parts=[config.Part("", "acme/sample")])
+cfg = config.Config(repos=[repo], arete_repo="sample", alert_repo="acme/sample")
+cfg.jev.enabled = False
+src_name = triage.sources(cfg)[0].name
+fake.seed_issue("acme/sample", 30, title="Triage item", labels=("triage",), updated_at="2026-11-28T00:00:00Z")
+owner = principals.seed_owner("owner@example.test")
+
+triage_store.triage_put({
+    "ref": "gh:acme/sample#30",
+    "source": src_name,
+    "tracker": "github",
+    "repo": "sample",
+    "route": "",
+    "title": "Triage item",
+    "url": "https://github.com/acme/sample/issues/30",
+    "updated": "2026-11-28T00:00:00Z",
+    "ready": 0,
+    "code": "",
+    "size": "small",
+    "questions": ["What scope?"],
+    "plan": ["Fix button"],
+    "why": "Needs scope",
+    "cost": 0.0,
+    "ts": util.iso(),
+    "kind": "bug",
+    "repos": ["sample"],
+    "assumptions": [],
+    "in_sprint": 0,
+    "parent": "",
+    "closed": "",
+    "checks": [],
+})
+
+with mock.patch.object(gh, "gh", side_effect=fake), \
+        mock.patch.object(outbound, "keep_configured_private"), \
+        mock.patch.object(outbound, "own_hosts", []), \
+        mock.patch.object(outbound, "extra_hosts", set()), \
+        principals.acting(owner):
+    triage.send(cfg, "gh:acme/sample#30", ["What scope?"], ["Just the button."], "sample")
+    items_before = [it for it in all_items() if it["object"] == "github:acme/sample#30"]
+    approved_bys = [it["approved_by"] for it in items_before]
+    kinds = sorted(it["kind"] for it in items_before)
+    sender_pass()
+    sender_pass()
+    comments_30 = [c["body"] for c in fake.comments.get(("acme/sample", 30), [])]
+    labels_30 = sorted(fake.labels.get(("acme/sample", 30), set()))
+
+    view = triage.view()
+    triage.publish(cfg, view, {})
+    sender_pass()
+    board_issue_count = len([row for row in fake.issues.get("acme/sample", {}).values() if row["number"] != 30])
+
+emit_result({
+    "kinds": kinds,
+    "approved_bys": approved_bys,
+    "owner": owner,
+    "comments_30": comments_30,
+    "labels_30": labels_30,
+    "board_issue_count": board_issue_count,
+})
+""")
+        self.assertEqual(result["kinds"], ["comment", "label"])
+        self.assertEqual(result["approved_bys"], [result["owner"], result["owner"]])
+        self.assertEqual(len(result["comments_30"]), 1)
+        self.assertIn("Just the button.", result["comments_30"][0])
+        self.assertIn("agent", result["labels_30"])
+        self.assertEqual(result["board_issue_count"], 1)
+
+
+class OutboxTargetAndRuleSchemaTests(_GitHubOutboxChildCase):
+    def test_strict_target_and_rule_schemas_refuse_invalid_configs(self):
+        result = self.run_outbox_child(r"""
+from arete import outbox_config
+
+targets = outbox_config.load_targets()
+
+
+def refused(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+cases = {
+    "bad_connector": refused(lambda: outbox_config.validate_target("bad", {"connector": "unknown", "kinds": ["comment"], "audience": "self", "posts_as": "gh", "send_window": 60})),
+    "unsupported_kind": refused(lambda: outbox_config.validate_target("bad", {"connector": "github", "kinds": ["bogus"], "audience": "self", "posts_as": "gh", "send_window": 60})),
+    "bad_audience": refused(lambda: outbox_config.validate_target("bad", {"connector": "github", "kinds": ["comment"], "audience": "everyone", "posts_as": "gh", "send_window": 60})),
+    "window_too_low": refused(lambda: outbox_config.validate_target("bad", {"connector": "github", "kinds": ["comment"], "audience": "self", "posts_as": "gh", "send_window": -1})),
+    "window_too_high": refused(lambda: outbox_config.validate_target("bad", {"connector": "github", "kinds": ["comment"], "audience": "self", "posts_as": "gh", "send_window": 99999})),
+    "rule_no_domain": refused(lambda: outbox_config.validate_rule("bad", {"target": "github", "audience": "self", "drafter": "non-person", "action": "approve"}, targets=targets)),
+    "rule_intake_domain": refused(lambda: outbox_config.validate_rule("bad", {"domain": "intake", "target": "github"}, targets=targets)),
+    "rule_unknown_target": refused(lambda: outbox_config.validate_rule("bad", {"domain": "outbox", "target": "missing", "audience": "self", "drafter": "non-person", "action": "approve"}, targets=targets)),
+    "rule_non_self_auto_approve": refused(lambda: outbox_config.validate_rule("bad", {"domain": "outbox", "target": "github", "audience": "team", "drafter": "non-person", "action": "approve"}, targets=targets)),
+}
+
+emit_result(cases)
+""")
+        for name, was_refused in result.items():
+            self.assertTrue(was_refused, f"expected refusal for {name}")
+
+    def test_github_defaults_load_and_audience_override_holds_drafts(self):
+        result = self.run_outbox_child(r"""
+from arete import outbox_config
+
+targets = outbox_config.load_targets()
+rules = outbox_config.load_rules(targets=targets)
+gh_target = targets.get("github")
+gh_rule = rules.get("github-own")
+
+default_id = outbox.draft(
+    target="github",
+    kind="comment",
+    object="github:acme/app#1",
+    body="Agent note under self audience",
+    drafted_by="pipeline",
+    slot="test:default-self",
+)
+default_state = item_row(default_id)["state"]
+
+(paths.CONFIG_DIR / "targets").mkdir(parents=True, exist_ok=True)
+(paths.CONFIG_DIR / "targets" / "github.toml").write_text(
+    'connector = "github"\n'
+    'kinds = ["issue", "comment", "reply", "label", "status"]\n'
+    'audience = "team"\n'
+    'posts_as = "gh"\n'
+    'send_window = 60\n'
+)
+team_id = outbox.draft(
+    target="github",
+    kind="comment",
+    object="github:acme/app#2",
+    body="Agent note under team audience",
+    drafted_by="pipeline",
+    slot="test:override-team",
+)
+team_state = item_row(team_id)["state"]
+
+emit_result({
+    "gh_connector": gh_target.connector if gh_target else None,
+    "gh_audience": gh_target.audience if gh_target else None,
+    "gh_rule_action": gh_rule.action if gh_rule else None,
+    "gh_rule_audience": gh_rule.audience if gh_rule else None,
+    "default_state": default_state,
+    "team_state": team_state,
+})
+""")
+        self.assertEqual(result["gh_connector"], "github")
+        self.assertEqual(result["gh_audience"], "self")
+        self.assertEqual(result["gh_rule_action"], "approve")
+        self.assertEqual(result["gh_rule_audience"], "self")
+        self.assertEqual(result["default_state"], "approved")
+        self.assertEqual(result["team_state"], "draft")

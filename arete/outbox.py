@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import shutil
 from datetime import datetime, timedelta
 
-from . import contract, delivery, gh, jira, principals, scrub, senders, util
+from . import contract, delivery, gh, jira, outbox_config, principals, scrub, senders, util
+from .store import chats as chats_store
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import outbox as outbox_store
 
 RETRY_SECONDS = 30
@@ -35,10 +40,35 @@ def _extract_retry_after(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _send_at_for(audience: str, now: datetime) -> str:
+def agent_slot(run_id: str, node: str, kind: str, obj: str, slot_name: str) -> str:
+    digest = hashlib.sha256(json.dumps([run_id, node, kind, obj, slot_name]).encode()).hexdigest()
+    return f"run:{digest}"
+
+
+def is_person_drafter(drafted_by: str) -> bool:
+    actor = (drafted_by or "").strip()
+    if not actor:
+        return False
+    if actor in ("hand", "owner") or actor.startswith("u:") or "@" in actor:
+        return True
+    try:
+        return bool(principals.is_person(actor))
+    except Exception:
+        return False
+
+
+def _target_window(target: str) -> int:
+    try:
+        return outbox_config.target_for(target).send_window
+    except ValueError:
+        return HOLD_WINDOW_SECONDS
+
+
+def _send_at_for(audience: str, now: datetime, *, send_window: int | None = None) -> str:
     if audience == "self":
         return util.iso(now)
-    return util.iso(now + timedelta(seconds=HOLD_WINDOW_SECONDS))
+    window = HOLD_WINDOW_SECONDS if send_window is None else send_window
+    return util.iso(now + timedelta(seconds=window))
 
 
 def _backoff_send_at(attempt_n: int, now: datetime) -> str:
@@ -79,7 +109,7 @@ def draft(
     body: str,
     drafted_by: str,
     slot: str,
-    audience: str = "self",
+    audience: str | None = None,
     task_id: str | None = None,
     ref_id: str | None = None,
     run_id: str | None = None,
@@ -88,22 +118,58 @@ def draft(
     posts_as: str | None = None,
     base_remote_updated: str | None = None,
     summary: str = "",
+    review: str = "",
+    on_conflict_ignore: bool = False,
+    hold_as_draft: bool = False,
+    approved_by: str | None = None,
+    opened_at: str | None = None,
 ) -> int:
-    if audience not in outbox_store.AUDIENCES:
-        raise ValueError(f"unsupported outbox audience {audience!r}")
+    target_cfg = outbox_config.target_for(target)
+    resolved_audience = target_cfg.audience if audience is None else audience
+    resolved_posts_as = target_cfg.posts_as if posts_as is None else posts_as
+    if resolved_audience not in outbox_store.AUDIENCES:
+        raise ValueError(f"unsupported outbox audience {resolved_audience!r}")
+    if kind not in target_cfg.kinds:
+        raise ValueError(f"outbox target {target!r} does not allow kind {kind!r}")
     if not isinstance(slot, str) or not slot.strip():
         raise ValueError("outbox draft requires a non-empty slot")
     if not isinstance(drafted_by, str) or not drafted_by.strip():
         raise ValueError("outbox draft requires drafted_by")
-    senders.resolve(target, kind, object)
+    senders.resolve(target_cfg.connector, kind, object)
     cleaned, spans = scrub.text(body, "outbox", f"slot:{slot}", spans=True)
-    now = util.iso()
+    now_dt = util.now()
+    now = util.iso(now_dt)
+
+    init_state = "draft"
+    init_opened_at: str | None = None
+    init_approved_by: str | None = None
+    init_approved_rule: str | None = None
+    init_approved_rule_version: str | None = None
+    init_send_at: str | None = None
+    if approved_by is not None:
+        init_state = "approved"
+        init_opened_at = opened_at or now
+        init_approved_by = approved_by
+        init_send_at = _send_at_for(resolved_audience, now_dt, send_window=target_cfg.send_window)
+    elif not hold_as_draft:
+        rule = outbox_config.match_auto_approve(
+            target,
+            kind,
+            resolved_audience,
+            drafted_by=drafted_by,
+            person_drafted=is_person_drafter(drafted_by),
+        )
+        if rule is not None:
+            init_state = "approved"
+            init_approved_rule = rule.name
+            init_approved_rule_version = rule.content_version
+            init_send_at = now
 
     def _write(conn) -> int:
         existing = outbox_store.get_by_slot(conn, slot)
         if existing is not None:
             item_id = int(existing["id"])
-            if existing["state"] in ("draft", "edited"):
+            if not on_conflict_ignore and existing["state"] in ("draft", "edited"):
                 latest = outbox_store.latest_revision(conn, item_id, existing["rev"])
                 if latest is None or latest["body"] != cleaned:
                     outbox_store.append_revision(
@@ -123,8 +189,8 @@ def draft(
             target=target,
             kind=kind,
             object=object,
-            audience=audience,
-            posts_as=posts_as,
+            audience=resolved_audience,
+            posts_as=resolved_posts_as,
             task_id=task_id,
             ref_id=ref_id,
             run_id=run_id,
@@ -137,9 +203,21 @@ def draft(
             body=cleaned,
             spans=spans,
             now=now,
+            review=review,
+            state=init_state,
+            opened_at=init_opened_at,
+            approved_by=init_approved_by,
+            approved_rule=init_approved_rule,
+            approved_rule_version=init_approved_rule_version,
+            send_at=init_send_at,
         )
+        item_id = int(row["id"])
+        if kind == "label" and outbox_store.is_state_label_body(cleaned):
+            outbox_store.discard_older_state_labels(conn, object, item_id, now)
+        elif kind == "issue" and slot.startswith("board:"):
+            outbox_store.discard_older_board_items(conn, object, item_id, now)
         _sync_inbox(conn)
-        return int(row["id"])
+        return item_id
 
     return outbox_store.run_with_tx(c, _write)
 
@@ -387,7 +465,7 @@ def approve(
                 "approved_by": actor,
                 "approved_rule": approved_rule,
                 "approved_rule_version": approved_rule_version,
-                "send_at": _send_at_for(cur_row["audience"], now),
+                "send_at": _send_at_for(cur_row["audience"], now, send_window=_target_window(cur_row["target"])),
                 "error": None,
                 "updated": now_s,
             },
@@ -503,7 +581,7 @@ def release(item_id: str | int, *, base_version: int | None = None, c=None) -> d
             expected_states=("held",),
             fields={
                 "state": "approved",
-                "send_at": _send_at_for(row["audience"], now),
+                "send_at": _send_at_for(row["audience"], now, send_window=_target_window(row["target"])),
                 "error": None,
                 "updated": now_s,
             },
@@ -592,7 +670,7 @@ def retry(item_id: str | int, *, base_version: int | None = None, c=None) -> dic
             expected_states=("failed",),
             fields={
                 "state": "approved",
-                "send_at": _send_at_for(cur_row["audience"], now),
+                "send_at": _send_at_for(cur_row["audience"], now, send_window=_target_window(cur_row["target"])),
                 "error": None,
                 "updated": now_s,
             },
@@ -639,6 +717,78 @@ def discard(item_id: str | int, *, base_version: int | None = None, c=None) -> d
     return outbox_store.run_with_tx(c, _write)
 
 
+def _parse_json_body(body: str) -> dict | None:
+    stripped = (body or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _apply_sent_effects(c, row: dict, body: str) -> list[int]:
+    cleanup_captures: list[int] = []
+    kind = row["kind"]
+    slot = row["slot"] or ""
+    sent_ref = row.get("sent_ref")
+    sent_url = row.get("sent_url") or ""
+    payload = _parse_json_body(body) if kind == "issue" else None
+
+    if kind == "issue" and payload is not None:
+        finding = payload.get("finding")
+        if isinstance(finding, dict) and finding.get("loop") and finding.get("fingerprint") and sent_url:
+            c.execute(
+                "UPDATE findings SET url = ? WHERE loop = ? AND fingerprint = ?",
+                (sent_url, str(finding["loop"]), str(finding["fingerprint"])),
+            )
+
+    if kind == "issue" and slot.startswith("alert:") and sent_ref and str(sent_ref).isdigit():
+        repo = (row.get("object") or "").removeprefix("github:")
+        for alert_row in c.execute("SELECT key, opened FROM alerts").fetchall():
+            if f"alert:{alert_row['key']}:{alert_row['opened']}" == slot:
+                c.execute(
+                    "UPDATE alerts SET issue = ?, repo = ? WHERE key = ? AND opened = ?",
+                    (int(sent_ref), repo, alert_row["key"], alert_row["opened"]),
+                )
+                from . import inbox
+
+                inbox.sync(c, "alerts")
+                break
+
+    if kind == "issue" and slot.startswith("chat:") and sent_url:
+        parts = slot.split(":", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            chats_store.chat_say(int(parts[1]), "arete", f"Filed {sent_url}")
+
+    if kind == "issue" and slot.startswith("capture:") and sent_ref and str(sent_ref).isdigit():
+        draft_part = slot.removeprefix("capture:")
+        if draft_part.isdigit():
+            draft_id = int(draft_part)
+            title = str((payload or {}).get("title") or "")
+            insights_store.capture_filed(draft_id, int(sent_ref), sent_url, title)
+            cleanup_captures.append(draft_id)
+
+    return cleanup_captures
+
+
+def _note_capture_retry(c, row: dict, event_kind: str) -> None:
+    slot = row.get("slot") or ""
+    if row.get("kind") != "issue" or not slot.startswith("capture:"):
+        return
+    draft_part = slot.removeprefix("capture:")
+    if not draft_part.isdigit():
+        return
+    ob_id = outbox_store.format_id(int(row["id"]))
+    err = util.first_line(str(row.get("error") or ""), 160)
+    if event_kind == "outbox.failed":
+        note = f"Filing in outbox {ob_id} failed ({err}); retry it from the outbox."
+    else:
+        note = f"Filing in outbox {ob_id} had a temporary error ({err}); it stays in the outbox and retries automatically."
+    c.execute("UPDATE captures SET delivery = ? WHERE id = ? AND status = 'queued'", (note, int(draft_part)))
+
+
 def _settle_tx(
     item_id: int,
     claimed_version: int,
@@ -647,8 +797,10 @@ def _settle_tx(
     item_fields: dict[str, object],
     attempt_fields: dict[str, object],
     event_kind: str,
+    body: str = "",
 ) -> dict | None:
     now_s = util.iso()
+    cleanup_captures: list[int] = []
     with foundation.tx() as c:
         after = outbox_store.settle_sending(
             c,
@@ -661,8 +813,18 @@ def _settle_tx(
             now_iso=now_s,
         )
         if after is not None:
+            if event_kind == "outbox.sent":
+                cleanup_captures = _apply_sent_effects(c, after, body)
+            else:
+                _note_capture_retry(c, after, event_kind)
             _sync_inbox(c)
-        return after
+    if cleanup_captures:
+        from . import capture
+
+        with capture.FILES:
+            for draft_id in cleanup_captures:
+                shutil.rmtree(capture.CAPTURES_DIR / str(draft_id), ignore_errors=True)
+    return after
 
 
 def _settle_unknown(
@@ -710,6 +872,15 @@ def _settle_unknown(
 
 def _deliver_one(item_id: int, expected_version: int, now_iso: str) -> None:
     with foundation.tx() as c:
+        peek = outbox_store.get_row(c, item_id)
+        if peek is None or peek["state"] != "approved":
+            return
+        if outbox_store._row_is_state_label(c, peek):
+            if outbox_store.has_newer_active_state_label(c, peek["object"], item_id):
+                outbox_store.discard_item(c, item_id, now_iso)
+                _sync_inbox(c)
+                return
+            outbox_store.discard_older_state_labels(c, peek["object"], item_id, now_iso)
         claimed_pair = outbox_store.claim_due(c, item_id, expected_version, now_iso)
         if claimed_pair is None:
             return
@@ -739,7 +910,7 @@ def _deliver_one(item_id: int, expected_version: int, now_iso: str) -> None:
     if prev_attempt is not None and prev_attempt.get("outcome") == "unknown":
         since_iso = util.iso(util.parse_iso(first_started) - timedelta(seconds=60))
         try:
-            look_result = sender.look(claimed, since_iso)
+            look_result = sender.look({**claimed, "body": latest_body}, since_iso)
         except Exception as err:
             first_err = util.first_line(str(err), 300)
             _settle_unknown(
@@ -773,6 +944,7 @@ def _deliver_one(item_id: int, expected_version: int, now_iso: str) -> None:
                     "lookup": lookup_note,
                 },
                 event_kind="outbox.sent",
+                body=latest_body,
             )
             return
 
@@ -876,6 +1048,7 @@ def _deliver_one(item_id: int, expected_version: int, now_iso: str) -> None:
         },
         attempt_fields=attempt_fields,
         event_kind="outbox.sent",
+        body=latest_body,
     )
 
 

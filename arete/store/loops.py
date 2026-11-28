@@ -61,6 +61,14 @@ def finding_seen(loop: str, fingerprint: str) -> bool:
             is not None
 
 
+def finding_settled(loop: str, fingerprint: str) -> bool:
+    with reader() as c:
+        return c.execute(
+            "SELECT 1 FROM findings WHERE loop = ? AND fingerprint = ? AND (emitted != '' OR COALESCE(url, '') != '')",
+            (loop, fingerprint),
+        ).fetchone() is not None
+
+
 def record_finding(loop: str, fingerprint: str, fingerprint_text: str, title: str, url: str, run_id: str) -> bool:
     with db() as c:
         before = c.total_changes

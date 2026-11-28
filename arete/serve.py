@@ -267,9 +267,9 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
                     excerpt = startup_excerpt.redacted(excerpt, str(src), frozenset(tracked), (tip, previous))
                 body = (f"Arete rolled back self-deploy code from `{tip[:12]}` to `{previous[:12]}` because "
                         f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
-                        f"Redacted serve.log tail\n\n```text\n{excerpt}\n```")
+                        f"Redacted serve.log tail\n\n```text\n{excerpt}\n```\n\n{gh.key_mark(key)}")
                 issue = gh.issue_create(repo, f"{tracker.ARETE_TAG} Serve self-deploy {tip[:12]} rolled back",
-                                        body, [tracker.LABEL], key=key)
+                                        body, [tracker.LABEL])
             serve_guard.write(path, {**held, "issue": issue})
             say(f"deploy: reported rollback of {tip} in {gh.issue_url(repo, issue)}")
         except (OSError, RuntimeError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:

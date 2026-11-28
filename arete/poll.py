@@ -143,7 +143,18 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
             if owned := spec_graph.queue_blocker(source, tid):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, owned, repo.name)
                 continue
-            if owed := run_store.pending_label(repo.name, t.id):
+            if isinstance(source, tracker.GitHubTracker):
+                from .store import outbox as outbox_store
+
+                if item_id := outbox_store.pending_label_item(f"github:{source.repo.github}#{int(t.id)}"):
+                    skips.note(
+                        tracker.ticket_name(repo.name, t.ref),
+                        t,
+                        f"its label item OB-{item_id} is not sent yet",
+                        repo.name,
+                    )
+                    continue
+            elif owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
             if feedback_store.has_open_clarification(repo.name, tid):
@@ -503,7 +514,14 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         if not held_feedback:
             queued = (tracker.task_state(tid) == "todo" if isinstance(source, tracker.LocalTracker)
                       else tracker.item_state(source, ticket) == "open")
-            if (not queued or run_store.pending_label(repo.name, tid) or not unblock.recovery_changed(
+            from .store import outbox as outbox_store
+
+            pending_label = (
+                bool(outbox_store.pending_label_item(f"github:{source.repo.github}#{int(tid)}"))
+                if isinstance(source, tracker.GitHubTracker)
+                else bool(run_store.pending_label(repo.name, tid))
+            )
+            if (not queued or pending_label or not unblock.recovery_changed(
                     held, unblock.pr_recovery_observation(repo, source, ticket, newest, held))):
                 skips.note(name, ticket, unblock.HELD_REPLY_RETRY, repo.name)
                 return "skipped"

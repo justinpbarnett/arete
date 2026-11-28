@@ -702,27 +702,89 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
     return twins
 
 
-def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
-    from . import mergecheck
+def _prepare_ticket_drafts(run: LoopRun, finding: dict, trust: str) -> list[tuple[int, str, dict, str]]:
+    ticket_emit = delivery.EMITS["ticket"]
+    outcome = {"trust": trust}
+    prepared: list[tuple[int, str, dict, str]] = []
+    for idx, spec in enumerate(run.loop.emits):
+        if spec.get("type") != "ticket" or spec.get("tracker", "github") != "github":
+            continue
+        target = ticket_emit.resolve(spec, [finding], outcome, run.cfg)
+        rendered = ticket_emit.render(run.loop, run.id, target, [finding], outcome)
+        github_repo = sources.github_name(run.cfg, rendered["repo"])
+        held_reason = ticket_emit.held(spec, rendered, run.cfg)
+        prepared.append((idx, github_repo, rendered, held_reason))
+    return prepared
+
+
+def new_findings(run: LoopRun, found: list[dict], *, trust: str | None = None) -> list[dict]:
+    from . import mergecheck, outbox
 
     fresh = []
     for f in found:
         f["fingerprint_key"] = fingerprint_key(run.loop, f)
     twins = known_twins(run, [f for f in found if not loop_store.finding_seen(run.loop.name, f["fingerprint_key"])])
+    resolved_trust = weakest_trust(getattr(run, "events", ())) if trust is None else trust
+    has_gh_ticket = any(
+        spec.get("type") == "ticket" and spec.get("tracker", "github") == "github"
+        for spec in run.loop.emits
+    )
+    prepared_by_finding: dict[int, list[tuple[int, str, dict, str]]] = {}
+    if not run.trial and has_gh_ticket:
+        for f in found:
+            if twins.get(id(f)):
+                continue
+            if loop_store.finding_settled(run.loop.name, f["fingerprint_key"]):
+                continue
+            prepared_by_finding[id(f)] = _prepare_ticket_drafts(run, f, resolved_trust)
+
+    ticket_emit = delivery.EMITS["ticket"]
     for f in found:
         if twin := twins.get(id(f)):
             if run.trial:
                 continue
             f["fingerprint_key"] = twin["fingerprint"]
             is_new = loop_store.record_finding(run.loop.name, twin["fingerprint"], twin.get("fingerprint_text") or "",
-                                          twin["title"], twin.get("url") or "", run.id)
+                                               twin["title"], twin.get("url") or "", run.id)
             if not is_new:
                 continue
         elif run.trial:
             is_new = mergecheck.builtin(run.loop) or not loop_store.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
-            is_new = loop_store.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
-                                          outbound.plain(f.get("title"), 200), "", run.id)
+            prepared = prepared_by_finding.get(id(f), [])
+            with foundation.tx() as c:
+                is_new = loop_store.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
+                                                   outbound.plain(f.get("title"), 200), "", run.id)
+                if is_new and prepared:
+                    for spec_idx, github_repo, rendered, held_reason in prepared:
+                        slot_sha = hashlib.sha256(
+                            json.dumps([run.loop.name, f["fingerprint_key"], spec_idx]).encode()
+                        ).hexdigest()[:24]
+                        payload = {
+                            "title": rendered["title"],
+                            "body": rendered["body"],
+                            "labels": list(rendered["labels"]),
+                            "finding": {"loop": run.loop.name, "fingerprint": f["fingerprint_key"]},
+                        }
+                        item_id = outbox.draft(
+                            c,
+                            target="github",
+                            kind="issue",
+                            object=f"github:{github_repo}",
+                            body=json.dumps(payload),
+                            drafted_by=f"loop:{run.loop.name}",
+                            slot=f"finding:{slot_sha}",
+                            run_id=run.id,
+                            loop=run.loop.name,
+                            summary=ticket_emit.describe(rendered),
+                            review=held_reason,
+                            hold_as_draft=bool(held_reason),
+                            on_conflict_ignore=True,
+                        )
+                        if held_reason:
+                            run.log("emit", f"drafted OB-{item_id} ({held_reason}): {ticket_emit.describe(rendered)}")
+                        else:
+                            run.log("emit", f"drafted OB-{item_id}: {ticket_emit.describe(rendered)}")
         run.log("finding", f"{'new' if is_new else 'seen before'}: {outbound.plain(f.get('title'), 200)}")
         if is_new:
             fresh.append(f)
@@ -849,7 +911,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
         return "failed", ("the agent ended without its JSON answer: "
                           + (util.first_line(res.text, 200) or "its last reply held no text"))
     found = [f for f in answer.get("findings") or [] if isinstance(f, dict) and f.get("title")]
-    fresh = new_findings(run, found)
+    fresh = new_findings(run, found, trust=weakest_trust(events))
     if not run.trial and isinstance(answer.get("state"), dict):
         loop_store.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
@@ -864,7 +926,8 @@ def spec_retro_loop(run: LoopRun, events: list[dict]) -> tuple[str, str]:
         if e.get("source") not in ("mine#github-specs", "mine#jira-specs") or e["type"] != "spec.closed":
             raise ValueError("A spec retrospective requires a closed parent from its configured tracker")
         found.extend(spec_retro.review(run, e, agent_dir(run), WATCH_SCHEMA))
-    return finish_watch(run, events, found, new_findings(run, found), f"Reviewed {util.count(len(events), 'closed spec')}")
+    return finish_watch(run, events, found, new_findings(run, found, trust=weakest_trust(events)),
+                        f"Reviewed {util.count(len(events), 'closed spec')}")
 
 
 def finish_watch(run: LoopRun, events: list[dict], found: list[dict], fresh: list[dict], summary: str) -> tuple[str, str]:

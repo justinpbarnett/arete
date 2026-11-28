@@ -1947,6 +1947,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         api = support.parentless_github_issue(repo.github, self.run.tid, issue)
         self.enterContext(mock.patch.multiple(gh, issue=issue, issue_labels=edit_labels, issue_comment=mock.DEFAULT,
+                                              api_create_comment=mock.Mock(return_value=("1", "url")),
                                               gh_json=mock.Mock(side_effect=api),
                                               find_issue_comment_marker=mock.Mock(return_value=""),
                                               ensure_label=mock.Mock(return_value=""),
@@ -1982,6 +1983,9 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.dispatch.assert_not_called()
         self.saved.assert_not_called()
         pipeline.settle_run(self.run, *ending, restarting=False, flow=None)
+        from arete import outbox
+
+        outbox.send_due()
         failed = pipeline.run_store.newest_live_whole_run(repo.name, self.run.tid)
         self.assertEqual((failed["summary"], failed["engine_sha"]), (why, codebase.STAMP))
         self.assertEqual([row["pr_url"] for row in pipeline.run_store.open_runs(repo.name, self.run.tid)], [c.pr])
@@ -2079,6 +2083,10 @@ class PublicationFixture(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        state_root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(state_root))
+        paths.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        db.migrate()
         self.file = self.root / "file.txt"
         shutil.copytree(self._seed_repo, self.root, dirs_exist_ok=True)
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
@@ -2527,6 +2535,10 @@ class AutomaticCIRerunFixture:
     hold_reason = "GitHub has no fully passing CI result for the verified head"
 
     def setUp(self):
+        state_root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(state_root))
+        paths.LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+        db.migrate()
         root = Path(".")
         self.checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
                                            "https://github.com/fixture/repo/pull/7", "original-head")
@@ -2566,6 +2578,31 @@ class AutomaticCIRerunFixture:
         self.enterContext(mock.patch.object(gh, "pr_body", return_value="Fixture PR"))
         self.body = self.enterContext(mock.patch.object(gh, "pr_edit_body"))
         self.comment = self.enterContext(mock.patch.object(gh, "pr_comment"))
+        self.enterContext(mock.patch.object(
+            gh,
+            "api_create_comment",
+            side_effect=lambda repo, number, body: (
+                self.comment(f"https://github.com/{repo}/pull/{number}", body),
+                ("1", f"https://github.com/{repo}/pull/{number}#issuecomment-1"),
+            )[1],
+        ))
+        from arete import outbox
+
+        real_report = pipeline.report_automerge
+        real_catch_up_comment = pipeline.comment_catch_up_ci
+
+        def report_and_flush(*a, **kw):
+            res = real_report(*a, **kw)
+            outbox.send_due()
+            return res
+
+        def catch_up_comment_and_flush(*a, **kw):
+            res = real_catch_up_comment(*a, **kw)
+            outbox.send_due()
+            return res
+
+        self.enterContext(mock.patch.object(pipeline, "report_automerge", side_effect=report_and_flush))
+        self.enterContext(mock.patch.object(pipeline, "comment_catch_up_ci", side_effect=catch_up_comment_and_flush))
         self.enterContext(mock.patch.object(gh, "find_own_pr_comment", return_value=None))
         self.enterContext(mock.patch.object(ci, "SETTLE_SECONDS", 0))
         self.sleep = mock.Mock(side_effect=self.wait_for_attempt)
@@ -3893,10 +3930,15 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
 
         stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [checkout],
                                           report, "", self.link)
+        from arete import outbox
+
+        outbox.send_due()
 
         self.assertEqual(stopped, [checkout])
         self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
-        self.comment.assert_called_once_with(checkout.pr, f"Pushed more work for #7.\n\n{report}")
+        self.comment.assert_called_once()
+        self.assertEqual(self.comment.call_args.args[0], checkout.pr)
+        self.assertTrue(self.comment.call_args.args[1].startswith(f"Pushed more work for #7.\n\n{report}"))
 
     def test_same_head_ci_retry_updates_the_disclosure_before_finishing_publication(self):
         self.verdicts = {}
@@ -4665,11 +4707,15 @@ class PublicationDiffTests(PublicationFixture):
               mock.patch.object(gh, "pr_discussion", return_value=gh.Discussion([], [], [])),
               mock.patch.object(gh, "pr_body", return_value="Saved draft"),
               mock.patch.object(gh, "pr_edit_body"),
-              mock.patch.object(gh, "pr_comment") as comment,
+              mock.patch.object(gh, "api_create_comment",
+                                return_value=("1", f"{c.pr}#issuecomment-1")) as comment,
               mock.patch.object(gh, "pr_draft_and_head", return_value=(True, head)),
               mock.patch.object(gh, "pr_set_draft") as draft):
+            from arete import outbox
+
             controller.dispatch(rerun)
             controller.dispatch(publish)
+            outbox.send_due()
         action_state = self.transition.call_args.args
         self.assertEqual(action_state[:3], (controller.lease, publish["id"], "succeeded"), action_state[-1])
         self.assertEqual(controller.ending[0], "pr")
@@ -4678,7 +4724,7 @@ class PublicationDiffTests(PublicationFixture):
         self.assertEqual(watch.call_args.args[0].sha, head)
         draft.assert_called_once_with(c.pr, False)
         comment.assert_called_once()
-        self.assertIn("Verified and reviewed #7 again; nothing new was pushed.", comment.call_args.args[1])
+        self.assertIn("Verified and reviewed #7 again; nothing new was pushed.", comment.call_args.args[2])
         push.assert_not_called()
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
@@ -5924,6 +5970,12 @@ class CatchUpRepairFixture(PublicationFixture):
                      "merge_readiness": mock.Mock(return_value=("", "")), "pr_merge_auto": mock.Mock(side_effect=merge),
                      "issue_labels": mock.Mock(side_effect=label), "issue_comment": mock.Mock(
                          side_effect=lambda _repo, _number, body: self.comments.append(body)),
+                     "api_create_comment": mock.Mock(
+                         side_effect=lambda repo, number, body: (
+                             self.comments.append(body),
+                             (str(len(self.comments)), f"https://github.com/{repo}/issues/{number}#issuecomment-{len(self.comments)}"),
+                         )[1]),
+                     "ensure_label": mock.Mock(return_value=""),
                      "issue": mock.Mock(return_value={"labels": []})},
         }
         for module, replacements in patches.items():
@@ -6028,6 +6080,9 @@ class CatchUpRepairFixture(PublicationFixture):
         if readiness_hold:
             gh.merge_readiness.return_value = "", readiness_hold
         delivered = self.action_result("publication.request")
+        from arete import outbox
+
+        outbox.send_due()
         self.assertEqual(len(self.pushes), 2)
         self.assertEqual(self.git("merge-base", candidate, self.pushes[-1]), candidate)
         if last_catch_up or readiness_hold:
@@ -6080,6 +6135,7 @@ class CatchUpCleanupTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         self.enterContext(support.workspace_state(root))
+        db.migrate()
         self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "verification-authority"))
         self.enterContext(mock.patch.object(sandbox, "can_confine", return_value=False))
         self.wt = root / "worktree"
@@ -6136,14 +6192,20 @@ class CatchUpCleanupTests(unittest.TestCase):
                                          build_summary="", branch="fixture", slot=None, goal="", plan_text="",
                                          with_left=str, verified=verify.Verified("pass"), review=self.prior,
                                          check_publication_targets=None, recovery_publication=None)
+        from arete import outbox
+
         with (mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
-              mock.patch.object(gh, "pr_comment") as comment):
+              mock.patch.object(gh, "api_create_comment",
+                                return_value=("1", f"{checkout.pr}#issuecomment-1")) as comment):
             self.assertIsNone(controller.automerge([checkout]))
+            outbox.send_due()
 
         hold = f"could not catch up to `main` at `new-base`: {reason}"
         self.assertEqual(b.run.facts["merge_held"], hold)
-        comment.assert_called_once_with(checkout.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
+        comment.assert_called_once()
+        self.assertEqual(comment.call_args.args[:2], ("fixture/repo", 7))
+        self.assertTrue(comment.call_args.args[2].startswith(f"Automerge stays off for this PR: {hold}. A person merges it."))
         controller.hold_catch_up.assert_not_called()
         self.assertFalse(b.run.owner_questions_blocked)
         self.push.assert_not_called()
@@ -6241,7 +6303,8 @@ class CatchUpCleanupTests(unittest.TestCase):
             original,
             f"automerge: catch-up cleanup could not remove {blocked_name!r}: fixture removal denied",
         ])
-        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(messages), 4)
+        self.assertTrue(messages[-1].startswith("drafted OB-"))
 
     def test_stop_during_path_removal_propagates(self):
         stray = self.scratch / "stray"
@@ -6323,7 +6386,8 @@ class CatchUpCleanupTests(unittest.TestCase):
             "automerge: catch-up failed: the layer's local checks failed",
             "automerge: catch-up cleanup could not remove 'stray': fixture removal denied",
         ])
-        self.assertEqual(len(messages), 4)
+        self.assertEqual(len(messages), 5)
+        self.assertTrue(messages[-1].startswith("drafted OB-"))
 
     def test_failing_check_preserves_the_contents_of_an_existing_ignored_checkout(self):
         self.init_repo()
@@ -6998,6 +7062,9 @@ class CatchUpParkingTests(CatchUpRepairFixture):
     def test_checks_hold_with_no_repair_cycles_parks_and_drafts(self):
         self.prepare_publication("checks", spent=True)
         self.publish_held("checks")
+        from arete import outbox
+
+        outbox.send_due()
         self.assertEqual(self.controller.ending[0], "failed")
         self.assertEqual(self.labels, {"agent:failed"})
         self.assertTrue(self.draft)
@@ -7102,6 +7169,7 @@ class MovedBasePublicationFixture:
     def setUp(self):
         temp = TemporaryDirectory(dir=paths.scratch_root(paths.STATE_DIR), ignore_cleanup_errors=True)
         self.enterContext(support.workspace_state(Path(self.enterContext(temp))))
+        db.migrate()
 
     def controller(self, *, resources: ExitStack | None = None):
         root = Path(".")
@@ -7146,8 +7214,10 @@ class MovedBasePublicationFixture:
 class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
     def setUp(self):
         self.state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(self.state))
+        db.migrate()
         locks = self.state / "locks"
-        locks.mkdir()
+        locks.mkdir(exist_ok=True)
         self.enterContext(mock.patch.multiple(paths, LOCKS_DIR=locks, ensure_dirs=mock.DEFAULT))
         self.running = []
         self.enterContext(mock.patch.object(slots.run_store, "runs_marked_running", return_value=self.running))
@@ -7264,6 +7334,8 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
         self.sleep.assert_called_once()
 
     def test_classic_drafts_failed_catch_up_only_for_the_watched_head(self):
+        from arete import outbox
+
         controller, checkout = self.controller()
         job, run = controller.job, controller.run
         job.slot = mock.Mock(spec=slots.RunSlot)
@@ -7277,6 +7349,8 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
             ("unread", ValueError("malformed PR state")),
         ):
             with self.subTest(ci=result, head=live_head):
+                with db.tx() as conn:
+                    conn.execute("DELETE FROM outbox")
                 checkout.note_pushed_head("previous-head")
                 job.b.catch_ups = 0
                 refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
@@ -7304,14 +7378,16 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                       mock.patch.object(gh, "pr_draft_and_head", return_value=(False, live_head),
                                         side_effect=live_head if isinstance(live_head, Exception) else None) as state,
                       mock.patch.object(gh, "pr_set_draft") as draft,
-                      mock.patch.object(gh, "pr_comment") as comment):
+                      mock.patch.object(gh, "api_create_comment",
+                                        return_value=("1", f"{checkout.pr}#issuecomment-1")) as comment):
                     summary = pipeline.automerge(job.b, None, "", job.verified, job.review, [checkout], "",
                                                  slot=job.slot, branch="run", goal="", plan="")
+                    outbox.send_due()
                 watch_ci.assert_called_once()
                 state.assert_called_once_with(checkout.pr)
                 hold.assert_called_once()
                 self.assertEqual(run.facts["merge_held"], f"catch-up CI held: {summary}")
-                self.assertIn("A person merges it.", comment.call_args.args[1])
+                self.assertIn("A person merges it.", comment.call_args.args[2])
                 if live_head == "caught-up":
                     draft.assert_called_once_with(checkout.pr, True)
                 else:
@@ -7728,6 +7804,8 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
             db.migrate()
 
     def setUp(self):
+        with db.tx() as conn:
+            conn.execute("DELETE FROM outbox")
         self.ctrl, self.checkout = self.controller()
         job, c = self.ctrl.job, self.checkout
         self.repo = config.Repo(self._testMethodName, self.state, github=c.github, parts=[config.Part("", c.github)])
@@ -7752,7 +7830,27 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
                  "labels": [{"name": tracker.LABEL}], "state": "OPEN"}
         self.enterContext(mock.patch.object(gh, "issue", return_value=issue))
         self.enterContext(mock.patch.object(gh, "issue_labels", return_value=""))
+        self.enterContext(mock.patch.object(gh, "ensure_label", return_value=""))
         self.comment = self.enterContext(mock.patch.object(gh, "issue_comment", return_value=""))
+        self.enterContext(mock.patch.object(
+            gh,
+            "api_create_comment",
+            side_effect=lambda repo, number, body: (
+                self.comment(repo, number, body),
+                ("1", f"https://github.com/{repo}/issues/{number}#issuecomment-1"),
+            )[1],
+        ))
+        real_drive = self.ctrl.drive
+
+        def drive_and_flush(*a, **kw):
+            from arete import outbox
+
+            try:
+                return real_drive(*a, **kw)
+            finally:
+                outbox.send_due()
+
+        self.ctrl.drive = drive_and_flush
         self.push = self.enterContext(mock.patch.object(pipeline, "commit_and_push"))
         self.enterContext(mock.patch.object(pipeline, "git", side_effect=AssertionError("unexpected git call")))
         self.enterContext(mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")))
@@ -8001,7 +8099,10 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
             self.ctrl.last_progress = 0
             worker = self.start_writing_worker()
             def close():
+                from arete import outbox
+
                 self.assertTrue(self.draft)
+                outbox.send_due()
                 self.comment.assert_called_once()
                 raise error
 
@@ -8518,8 +8619,11 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (False, checkout.lease)),
               mock.patch.object(pipeline, "set_draft") as draft,
               mock.patch.object(gh, "find_own_pr_comment", return_value=None),
-              mock.patch.object(gh, "pr_comment") as comment):
+              mock.patch.object(gh, "api_create_comment", return_value=("1", "url")) as comment):
+            from arete import outbox
+
             result = controller.publish()
+            outbox.send_due()
         self.assertEqual(result["failures"], orchestration.CI_FAILURES)
         self.assertTrue(controller.data["ci_failed"])
         self.assertEqual(controller.data["publication"]["heads"][checkout.github], "new-head")
@@ -8530,8 +8634,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
         gate.assert_called_once()
         report.assert_called_once()
         comment.assert_called_once()
-        self.assertIn("head `new-head`", comment.call_args.args[1])
-        self.assertIn("Failed", comment.call_args.args[1])
+        self.assertIn("head `new-head`", comment.call_args.args[2])
+        self.assertIn("Failed", comment.call_args.args[2])
 
     def test_next_poll_reconciles_only_the_recorded_catch_up_push(self):
         first, checkout = self.controller()
@@ -12011,12 +12115,38 @@ class MinerLifecycleTests(unittest.TestCase):
         self.behind = False
         self.merged = False
         self.during_merge = lambda: None
-        self.calls = []
+
+        class _ResettingCalls(list):
+            def clear(self):
+                super().clear()
+                with db.tx() as conn:
+                    conn.execute("DELETE FROM outbox")
+
+        self.calls = _ResettingCalls()
         self.comments = {}
         self.ci_reads = []
         self.prs = []
         self.stored = []
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(support.workspace_state(self.root))
+        db.migrate()
+        from arete import outbox
+
+        real_post_feedback = miner.post_eval_feedback
+        real_eval_pr = miner.eval_pr
+
+        def post_feedback_and_flush(*a, **kw):
+            res = real_post_feedback(*a, **kw)
+            outbox.send_due()
+            return res
+
+        def eval_pr_and_flush(*a, **kw):
+            res = real_eval_pr(*a, **kw)
+            outbox.send_due()
+            return res
+
+        self.enterContext(mock.patch.object(miner, "post_eval_feedback", side_effect=post_feedback_and_flush))
+        self.enterContext(mock.patch.object(miner, "eval_pr", side_effect=eval_pr_and_flush))
         self.layer = config.RepoLayer(self.root, trust_level="automerge")
         self.load_layer = config.load_layer
         self.enterContext(mock.patch.object(config, "load_layer", return_value=self.layer))
@@ -12062,6 +12192,15 @@ class MinerLifecycleTests(unittest.TestCase):
         self.fail(f"Unexpected GitHub read {args}")
 
     def github_write(self, args, **kwargs):
+        if args == ["api", "--method", "POST", f"repos/{self.repo.github}/issues/8/comments", "--input", "-"]:
+            self.assertTrue(kwargs["write"])
+            raw = kwargs["input"]
+            self.assertIsInstance(raw, gh.Outgoing)
+            body = json.loads(raw)["body"]
+            comment_id = len(self.comments) + 1
+            self.comments[comment_id] = {"id": comment_id, "user": {"login": "operator"}, "body": body}
+            self.calls.append(("comment", self.url, body))
+            return json.dumps({"id": comment_id, "html_url": f"{self.url}#issuecomment-{comment_id}"})
         if args == ["pr", "comment", self.url, "--body-file", "-"]:
             self.assertTrue(kwargs["write"])
             body = kwargs["input"]
@@ -12118,7 +12257,11 @@ class MinerLifecycleTests(unittest.TestCase):
         self.fail(f"Unexpected Git command {args}")
 
     def decide(self):
-        return miner.decide_pr(self.cfg, "min-test", self.repo, self.url)
+        from arete import outbox
+
+        res = miner.decide_pr(self.cfg, "min-test", self.repo, self.url)
+        outbox.send_due()
+        return res
 
     def run_miner(self, *, proposals=(), dry_run=False, apply=True, apply_repo=None, jev_ready=False):
         self.enterContext(mock.patch.multiple(
@@ -12139,7 +12282,11 @@ class MinerLifecycleTests(unittest.TestCase):
         )))
         self.enterContext(mock.patch.object(miner.record, "settle"))
         now = util.now()
-        return miner._run(self.cfg, "min-test", now - timedelta(days=1), now, True, "", dry_run, apply)
+        from arete import outbox
+
+        res = miner._run(self.cfg, "min-test", now - timedelta(days=1), now, True, "", dry_run, apply)
+        outbox.send_due()
+        return res
 
     def test_fresh_pr_merges_at_the_checked_head_without_moving_checkout_or_blocking_admission(self):
         class ReachedPipelineStart(Exception):
@@ -12494,18 +12641,19 @@ class MinerLifecycleTests(unittest.TestCase):
     def test_lowered_trust_after_comment_prevents_the_next_pr_write(self):
         self.repo.layer = self.root
         trust_file = self.root / "config.toml"
-        post = gh.pr_comment
+        post = gh.api_create_comment
 
         def comment(*args):
-            post(*args)
+            res = post(*args)
             trust_file.write_text('[trust]\nlevel = "pr"\n')
+            return res
 
         for report, verdict in (
             (evals.Comparison("eval table", complete=True), None),
             (evals.Comparison("eval table", regressions=["`regressed-task`"]), None),
             (evals.Comparison("Not measured.", unmeasured=["build.md"], complete=True), False),
         ):
-            with self.subTest(report=report), mock.patch.object(gh, "pr_comment", side_effect=comment) as posted, \
+            with self.subTest(report=report), mock.patch.object(gh, "api_create_comment", side_effect=comment) as posted, \
                     mock.patch.object(miner, "judge_prompts", return_value=(verdict, "JEV verdict")), \
                     mock.patch.object(config, "load_layer", wraps=self.load_layer):
                 self.comments.clear()
@@ -13108,6 +13256,8 @@ class MinerLifecycleTests(unittest.TestCase):
                     tasks = []
                 for verdict in (None, False, True):
                     with self.subTest(prompt=prompt, suite_state=suite_state, mixed=mixed, verdict=verdict):
+                        with db.tx() as conn:
+                            conn.execute("DELETE FROM outbox")
                         self.calls.clear()
                         self.comments.clear()
                         self.labels.discard(miner.REVIEW_LABEL)
