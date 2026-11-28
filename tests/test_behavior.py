@@ -22026,3 +22026,532 @@ assert any(r["id"] == "run-local-old" for r in rep_runs), rep_runs
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class PrRefTests(_TaskIdentityChildCase):
+    _FAKE_GH_HELPER = r"""
+class FakeGhPrTracker:
+    def __init__(self, owner="owner"):
+        self.owner = owner
+        self.prs = {}
+        self.next_num = 1
+        self.comments = {}
+        self.reviews = {}
+        self.line_comments = {}
+        self.faults = {}
+        self.calls = []
+
+    def add_pr(self, repo, head, *, number=None, state="OPEN", base="main", body=""):
+        num = number if number is not None else self.next_num
+        self.next_num = max(self.next_num, num + 1)
+        url = f"https://github.com/{repo}/pull/{num}"
+        self.prs[url] = {
+            "repo": repo, "head": head, "base": base, "number": num, "url": url,
+            "state": state, "body": body, "draft": False,
+            "updatedAt": "2026-01-01T00:00:00Z", "mergedAt": None, "closedAt": None,
+        }
+        return url
+
+    def set_merged(self, url, at="2026-01-02T00:00:00Z"):
+        pr = self.prs[url]
+        pr["state"] = "MERGED"
+        pr["mergedAt"] = at
+        pr["closedAt"] = at
+        pr["updatedAt"] = at
+
+    def add_comment(self, url, *, gh_id, body, created_at="2026-01-01T00:00:00Z", login=None):
+        self.comments.setdefault(url, []).append({
+            "id": gh_id,
+            "user": {"login": login or self.owner},
+            "body": body,
+            "created_at": created_at,
+        })
+        self.prs[url]["updatedAt"] = created_at
+
+    def handle(self, args, cwd=None, input=None, write=False, retry=True, **kw):
+        self.calls.append((list(args), str(input) if input is not None else None))
+        if args[:2] == ["label", "create"]:
+            return ""
+        if args[:2] == ["pr", "create"]:
+            repo = args[args.index("--repo") + 1]
+            head = args[args.index("--head") + 1]
+            base = args[args.index("--base") + 1]
+            existing = next((p for p in self.prs.values() if p["repo"] == repo and p["head"] == head and p["state"] == "OPEN"), None)
+            if existing is not None:
+                if q := self.faults.get("pr_create"):
+                    raise q.pop(0)
+                raise gh.GhError(f"a pull request for branch {head!r} into branch {base!r} already exists")
+            url = self.add_pr(repo, head, base=base, body=str(input or ""))
+            if q := self.faults.get("pr_create"):
+                raise q.pop(0)
+            return url
+        if args[:2] == ["pr", "list"]:
+            repo = args[args.index("--repo") + 1]
+            head = args[args.index("--head") + 1] if "--head" in args else ""
+            matches = [
+                p for p in self.prs.values()
+                if p["repo"] == repo and p["state"] == "OPEN" and (not head or p["head"] == head)
+            ]
+            return json.dumps([{"url": p["url"], "number": p["number"], "headRefName": p["head"]} for p in matches])
+        if args[:2] == ["pr", "view"]:
+            url = args[2]
+            found = self.prs.get(url)
+            if found is None:
+                raise gh.GhError(f"no PR {url}")
+            return json.dumps({
+                "number": found["number"],
+                "state": found["state"],
+                "mergedAt": found["mergedAt"],
+                "mergeCommit": {"oid": "deadbeef"} if found["mergedAt"] else None,
+                "closedAt": found["closedAt"],
+                "updatedAt": found["updatedAt"],
+                "url": found["url"],
+                "headRefName": found["head"],
+                "headRefOid": "head-sha",
+                "baseRefName": found["base"],
+            })
+        if args[0] == "api":
+            path = args[1].split("?", 1)[0]
+            slurp = "--slurp" in args
+            if path == "user":
+                return json.dumps({"login": self.owner})
+            for url, pr in self.prs.items():
+                repo, num = pr["repo"], pr["number"]
+                if path == f"repos/{repo}/pulls/{num}/reviews":
+                    rows = self.reviews.get(url, [])
+                    return json.dumps([rows] if slurp else rows)
+                if path == f"repos/{repo}/pulls/{num}/comments":
+                    rows = self.line_comments.get(url, [])
+                    return json.dumps([rows] if slurp else rows)
+                if path == f"repos/{repo}/issues/{num}/comments":
+                    rows = self.comments.get(url, [])
+                    return json.dumps([rows] if slurp else rows)
+            raise AssertionError(f"unexpected gh api request: {args}")
+        raise AssertionError(f"unexpected gh request: {args}")
+"""
+
+    def test_four_runs_sender_refs_found_reassignment_merge_and_ask_retire(self):
+        res = self.run_identity_child(self._FAKE_GH_HELPER + r"""
+import signal
+from arete import outcomes, outbox, owner_asks, send_github
+
+paths.ensure_dirs()
+db.migrate()
+send_github.register_all()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+_, bearer = token_store.issue(owner, "cli", ["*"])
+
+sample_dir = ROOT / "sample"
+replay.sample(sample_dir, adw=True)
+repo_dir = sample_dir / "repo"
+paths.CONFIG_FILE.write_text(
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    'github = "acme/sample"\ntracker = "local"\n',
+    encoding="utf-8",
+)
+cfg = config.load()
+
+# Legacy discovery helpers must be removed.
+assert not hasattr(run_store, "OPEN_PR_RUN")
+assert not hasattr(run_store, "open_runs")
+assert not hasattr(run_store, "runs_reading_pr_comments")
+
+fake = FakeGhPrTracker(owner="owner")
+
+with live_dashboard() as (_, port):
+    task_ids = []
+    for idx in range(1, 5):
+        st, body = http_json(port, "POST", "/api/v1/tasks", token=bearer, key=f"pr-t-{idx}",
+                             body={"repo": "sample", "title": f"Task {idx}", "body": f"Body {idx}", "kind": "feat"})
+        assert st == 200, (st, body)
+        task_ids.append(body["task"]["id"])
+
+    with (mock.patch.object(gh, "gh", side_effect=fake.handle),
+          mock.patch.object(gh, "me", return_value="owner"),
+          mock.patch.object(outcomes, "PR_SEEN_FILE", paths.STATE_DIR / "pr_seen.json")):
+        runs = []
+        urls = []
+        for idx, tid in enumerate(task_ids, start=1):
+            tnum = int(tid.removeprefix("T-"))
+            rid = record.start("pipeline", repo="sample", issue=tid, task_id=tnum, issue_key=tid)
+            res_pr = outbox.publish_pr(
+                action="create",
+                repo="acme/sample",
+                name="sample",
+                base="main",
+                branch=f"arete/t-{idx}",
+                title=f"PR for {tid}",
+                body=f"Closes {tid}",
+                run_id=rid,
+                drafted_by=f"run:{rid}",
+                retry_unknown=True,
+            )
+            url = res_pr["sent_url"]
+            assert url, res_pr
+            runs.append(rid)
+            urls.append(url)
+
+        r_stopped, r_killed, r_parked, r_failed = runs
+
+        # Verify sent receipt, run URL, PR ref, related task_ref, and durable events committed together.
+        with db.reader() as c:
+            for tid, rid, url in zip(task_ids, runs, urls, strict=True):
+                tnum = int(tid.removeprefix("T-"))
+                rrow = run_store.run_get(rid)
+                assert url in (rrow["pr_url"] or "").split(), (rid, rrow)
+                ref = c.execute("SELECT * FROM refs WHERE system = 'github' AND kind = 'pr' AND url = ?", (url,)).fetchone()
+                assert ref is not None and ref["ext_state"] == "open" and ref["run_id"] == rid, dict(ref) if ref else None
+                tr = c.execute("SELECT * FROM task_refs WHERE task_id = ? AND ref_id = ?", (tnum, ref["id"])).fetchone()
+                assert tr is not None and tr["role"] == "related", dict(tr) if tr else None
+                ref_ev = c.execute(
+                    "SELECT kind FROM events_log WHERE subject = ? AND class = 'durable'", (f"ref:{ref['id']}",)
+                ).fetchall()
+                assert any(e["kind"] == "ref.changed" for e in ref_ev), ref_ev
+                tr_ev = c.execute(
+                    "SELECT kind FROM events_log WHERE subject = ? AND class = 'durable'", (f"task_ref:{tr['id']}",)
+                ).fetchall()
+                assert any(e["kind"] == "task_ref.changed" for e in tr_ev), tr_ev
+
+        # Verify open_branch, supersede_older_runs, and pending_feedback use open PR refs.
+        sample_repo = cfg.repo("sample")
+        fake_run = SimpleNamespace(id="check-run", repo=sample_repo, tid=task_ids[0], log=lambda *a: None)
+        assert pipeline.open_branch(fake_run) == "arete/t-1"
+
+        # 1. Stop run 1, then test a 'found' create from a newer run moves ref.run_id to the newer run.
+        record.settle(r_stopped, "stopped", summary="stopped by request")
+        t1_num = int(task_ids[0].removeprefix("T-"))
+        r_stopped_newer = record.start("pipeline", repo="sample", issue=task_ids[0], task_id=t1_num, issue_key=task_ids[0])
+        fake.faults["pr_create"] = [gh.GhUnsure("network lost after create")]
+        found_res = outbox.publish_pr(
+            action="create",
+            repo="acme/sample",
+            name="sample",
+            base="main",
+            branch="arete/t-1",
+            title="PR for T-1 retry",
+            body="Found retry",
+            run_id=r_stopped_newer,
+            drafted_by=f"run:{r_stopped_newer}",
+            retry_unknown=True,
+        )
+        assert found_res["sent_url"] == urls[0], found_res
+        with db.reader() as c:
+            ref1 = c.execute("SELECT * FROM refs WHERE url = ?", (urls[0],)).fetchone()
+            assert ref1["run_id"] == r_stopped_newer, dict(ref1)
+            link_cnt = c.execute(
+                "SELECT count(*) FROM task_refs WHERE task_id = ? AND ref_id = ?", (t1_num, ref1["id"])
+            ).fetchone()[0]
+            assert link_cnt == 1, link_cnt
+            attempts = c.execute(
+                "SELECT outcome FROM delivery_attempts WHERE item = ? ORDER BY n",
+                (int(found_res["id"].removeprefix("OB-")),),
+            ).fetchall()
+            assert [a["outcome"] for a in attempts] == ["unknown", "found"], [dict(a) for a in attempts]
+        record.settle(r_stopped_newer, "stopped", summary="stopped after found")
+
+        # 2. SIGKILL a real child process for run 2 and reap it with record.interrupt.
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            record.note(r_killed, pid=victim.pid)
+            os.kill(victim.pid, signal.SIGKILL)
+            victim.wait(timeout=5)
+        finally:
+            if victim.poll() is None:
+                victim.kill()
+                victim.wait(timeout=5)
+        reaped = record.interrupt(run_store.run_get(r_killed))
+        assert reaped is not None and reaped["status"] == "interrupted", reaped
+
+        # 3. Park run 3 in needs-info with an open ask.
+        ask_store.ask_add(
+            "ask-parked-3", r_parked, "sample", task_ids[2], "publish", "clarify",
+            "Need confirmation", "", [owner_asks.text_ask("Proceed?")], {},
+        )
+        record.settle(r_parked, "needs-info", summary="waiting on owner")
+        assert len(ask_store.asks_of(r_parked, "open")) == 1
+
+        # 4. Fail run 4 in publish.
+        record.settle(r_failed, "failed", summary="publish failed after opening PR")
+
+        # Verify public API /api/v1/refs lists all 4 PR refs with expected run_ids.
+        st_r, refs_resp = http_json(port, "GET", "/api/v1/refs?kind=pr", token=bearer)
+        assert st_r == 200, (st_r, refs_resp)
+        by_url = {r["url"]: r for r in refs_resp["refs"]}
+        assert by_url[urls[0]]["run_id"] == r_stopped_newer
+        assert by_url[urls[1]]["run_id"] == r_killed
+        assert by_url[urls[2]]["run_id"] == r_parked
+        assert by_url[urls[3]]["run_id"] == r_failed
+
+        # Report every PR merged -> sync_outcomes updates every ref to merged, moves all 4 runs to merged,
+        # and retires the parked run's open ask.
+        for u in urls:
+            fake.set_merged(u)
+        outcomes.sync_outcomes(cfg)
+
+        for rid, url in zip((r_stopped_newer, r_killed, r_parked, r_failed), urls, strict=True):
+            rrow = run_store.run_get(rid)
+            assert rrow["status"] == "merged", (rid, rrow["status"])
+            with db.reader() as c:
+                ref = c.execute("SELECT * FROM refs WHERE url = ?", (url,)).fetchone()
+                assert ref["ext_state"] == "merged", (url, dict(ref))
+                assert ref["fetched_at"], dict(ref)
+                facts = json.loads(ref["facts"])
+                assert facts.get("state") == "MERGED" and facts.get("merged_at"), facts
+        assert ask_store.asks_of(r_parked, "open") == []
+        retired = ask_store.ask_get("ask-parked-3")
+        assert retired is not None and retired["status"] == "merged", retired
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_stopped_run_owner_feedback_due_and_suppressed_by_newer_needs_info(self):
+        res = self.run_identity_child(self._FAKE_GH_HELPER + r"""
+from arete import outcomes, outbox, send_github
+
+paths.ensure_dirs()
+db.migrate()
+send_github.register_all()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+
+sample_dir = ROOT / "sample"
+replay.sample(sample_dir, adw=True)
+repo_dir = sample_dir / "repo"
+paths.CONFIG_FILE.write_text(
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    'github = "acme/sample"\ntracker = "local"\n',
+    encoding="utf-8",
+)
+cfg = config.load()
+fake = FakeGhPrTracker(owner="owner")
+
+tid = task_store.task_add("sample", "Fix stopped PR feedback", title="Stopped PR")
+tnum = int(tid.removeprefix("T-"))
+
+with (mock.patch.object(gh, "gh", side_effect=fake.handle),
+      mock.patch.object(gh, "me", return_value="owner"),
+      mock.patch.object(outcomes, "PR_SEEN_FILE", paths.STATE_DIR / "pr_seen.json")):
+    r_stopped = record.start("pipeline", repo="sample", issue=tid, task_id=tnum, issue_key=tid)
+    created = outbox.publish_pr(
+        action="create",
+        repo="acme/sample",
+        name="sample",
+        base="main",
+        branch="arete/stopped-pr",
+        title="Stopped PR",
+        body="Body",
+        run_id=r_stopped,
+        drafted_by=f"run:{r_stopped}",
+        retry_unknown=True,
+    )
+    pr_url = created["sent_url"]
+    record.settle(r_stopped, "stopped", summary="stopped by request")
+
+    # Owner posts a review comment on the stopped run's PR.
+    fake.add_comment(pr_url, gh_id=101, body="Please adjust the error message.", created_at="2026-01-01T00:00:00Z")
+    outcomes.sync_outcomes(cfg)
+
+    fb = pipeline.pending_feedback("sample", tid)
+    assert len(fb) == 1 and fb[0]["gh_id"] == 101 and fb[0]["task_id"] == tnum, fb
+    # Not due before quiet period; due once quiet.
+    assert insights_store.feedback_due("sample", "2025-12-31T23:59:59Z") == []
+    assert insights_store.feedback_due("sample", "2026-01-01T00:10:00Z") == [tid]
+
+    # A newer whole run of that task parked in needs-info suppresses feedback_due.
+    r_parked = record.start("pipeline", repo="sample", issue=tid, task_id=tnum, issue_key=tid)
+    record.settle(r_parked, "needs-info", summary="waiting on owner")
+    assert insights_store.feedback_due("sample", "2026-01-01T00:10:00Z") == []
+
+    # A newer whole run in interrupted also suppresses feedback_due.
+    r_interrupted = record.start("pipeline", repo="sample", issue=tid, task_id=tnum, issue_key=tid)
+    record.settle(r_interrupted, "interrupted", summary="interrupted")
+    assert insights_store.feedback_due("sample", "2026-01-01T00:10:00Z") == []
+
+    # A newer whole run in failed makes it due again, and supersede_older_runs supersedes r_stopped via PR ref.
+    r_revise = record.start("pipeline", repo="sample", issue=tid, task_id=tnum, issue_key=tid)
+    fake_run = SimpleNamespace(id=r_revise, repo=cfg.repo("sample"), tid=tid, log=lambda *a: None)
+    pipeline.supersede_older_runs(fake_run, [pr_url])
+    assert run_store.run_get(r_stopped)["status"] == "superseded"
+    record.settle(r_revise, "failed", summary="revise failed")
+    assert insights_store.feedback_due("sample", "2026-01-01T00:10:00Z") == [tid]
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_post_schema_reconciliation_found_receipt_continuation_and_idempotence(self):
+        res = self.run_identity_child(self._FAKE_GH_HELPER + r"""
+from arete import outcomes, owner_asks
+
+paths.ensure_dirs()
+# Seed isolated DB before #303's PR-ref reconciliation contract (after #584/#585 schema phase).
+pre_schema = db.PR_REFS_RECONCILE_SCHEMA - 1
+db.migrate(through=pre_schema)
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+_, bearer = token_store.issue(owner, "cli", ["*"])
+
+sample_dir = ROOT / "sample"
+replay.sample(sample_dir, adw=True)
+repo_dir = sample_dir / "repo"
+paths.CONFIG_FILE.write_text(
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    'github = "acme/sample"\ntracker = "local"\n',
+    encoding="utf-8",
+)
+cfg = config.load()
+
+t1_id = task_store.task_add("sample", "Reconcile continuation PR", title="Task 1")
+t2_id = task_store.task_add("sample", "Reconcile found-only PR", title="Task 2")
+t1_num = int(t1_id.removeprefix("T-"))
+t2_num = int(t2_id.removeprefix("T-"))
+t1_before = task_store.task_get(t1_id)
+t2_before = task_store.task_get(t2_id)
+
+pr_url_1 = "https://github.com/acme/sample/pull/41"
+pr_url_2 = "https://github.com/acme/sample/pull/42"
+
+# Simulate PRs opened after m0059 but before #303's continuous PR-ref hook (direct SQL, no refs rows yet):
+# - run-a (stopped) has a durable outbox 'found' receipt for pull/41 (and no pr_url on runs).
+# - run-b (continuation, newer, parked in needs-info with an open ask) has continuation-copied pr_url for pull/41.
+# - run-c (stopped) has only a durable outbox 'found' receipt for pull/42.
+# - run-legacy-live (running, schema_version=59) tests the normal writer gate before m0060 runs.
+with db.tx() as c:
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, branch, schema_version, task_id, issue_key, version) "
+        "VALUES ('run-a', 'pipeline', 'sample', ?, 'stopped', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', '', 'arete/r41', 59, ?, ?, 1)",
+        (t1_id, t1_num, t1_id),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, branch, continues, schema_version, task_id, issue_key, version) "
+        "VALUES ('run-b', 'pipeline', 'sample', ?, 'needs-info', '2026-01-01T00:05:00Z', '2026-01-01T00:06:00Z', ?, 'arete/r41', 'run-a', 59, ?, ?, 1)",
+        (t1_id, pr_url_1, t1_num, t1_id),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, branch, schema_version, task_id, issue_key, version) "
+        "VALUES ('run-c', 'pipeline', 'sample', ?, 'stopped', '2026-01-01T00:02:00Z', '2026-01-01T00:03:00Z', '', 'arete/r42', 59, ?, ?, 1)",
+        (t2_id, t2_num, t2_id),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pid, pr_url, schema_version, task_id, issue_key, version) "
+        "VALUES ('run-legacy-live', 'pipeline', 'sample', ?, 'running', '2026-01-01T00:07:00Z', NULL, ?, '', 59, ?, ?, 1)",
+        (t2_id, os.getpid(), t2_num, t2_id),
+    )
+    for item_id, run_id, tid, url, branch in (
+        (1001, "run-a", t1_id, pr_url_1, "arete/r41"),
+        (1002, "run-c", t2_id, pr_url_2, "arete/r42"),
+    ):
+        c.execute(
+            "INSERT INTO outbox (id, marker, target, kind, object, audience, task_id, run_id, drafted_by, slot, rev, state, "
+            "sent_at, sent_ref, sent_url, summary, shape, version, created, updated) "
+            "VALUES (?, ?, 'github', 'pr', 'github:acme/sample', 'self', ?, ?, ?, ?, 1, 'sent', "
+            "'2026-01-01T00:00:30Z', ?, ?, 'pr create', 1, 2, '2026-01-01T00:00:10Z', '2026-01-01T00:00:30Z')",
+            (item_id, f"arete:test:ob-{item_id}", tid, run_id, f"run:{run_id}", f"slot-{item_id}",
+             url.rsplit("/", 1)[-1], url),
+        )
+        c.execute(
+            "INSERT INTO outbox_revisions (item, rev, base_rev, by, body, at) VALUES (?, 1, NULL, ?, ?, '2026-01-01T00:00:10Z')",
+            (item_id, f"run:{run_id}", json.dumps({"action": "create", "repo": "acme/sample", "branch": branch})),
+        )
+        c.execute(
+            "INSERT INTO delivery_attempts (item, n, started, ended, outcome, external_id, external_url, lookup) "
+            "VALUES (?, 1, '2026-01-01T00:00:15Z', '2026-01-01T00:00:20Z', 'unknown', NULL, NULL, NULL)",
+            (item_id,),
+        )
+        c.execute(
+            "INSERT INTO delivery_attempts (item, n, started, ended, outcome, external_id, external_url, lookup) "
+            "VALUES (?, 2, '2026-01-01T00:00:25Z', '2026-01-01T00:00:30Z', 'found', ?, ?, 'open_pr_url found')",
+            (item_id, url.rsplit("/", 1)[-1], url),
+        )
+
+ask_store.ask_add(
+    "ask-reconcile-b", "run-b", "sample", t1_id, "publish", "clarify",
+    "Need answer", "", [owner_asks.text_ask("Confirm?")], {},
+)
+
+# Confirm zero PR refs exist yet before reconciliation.
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM refs WHERE kind = 'pr'").fetchone()[0] == 0
+
+# Writer gate blocks m0061 while run-legacy-live (schema_version=59) is still live.
+assert db.migrate() is True
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == pre_schema
+    assert "run-legacy-live" in db.contract_blockers(c, db.PR_REFS_RECONCILE_SCHEMA)
+
+# Once old live writer finishes, m0061 final reconciliation succeeds!
+with db.tx() as c:
+    c.execute("UPDATE runs SET status = 'done', finished = '2026-01-01T00:08:00Z' WHERE id = 'run-legacy-live'")
+assert db.migrate() is False
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+    ref1 = dict(c.execute("SELECT * FROM refs WHERE system = 'github' AND key = 'acme/sample#41'").fetchone())
+    ref2 = dict(c.execute("SELECT * FROM refs WHERE system = 'github' AND key = 'acme/sample#42'").fetchone())
+    assert ref1["run_id"] == "run-b" and ref1["ext_state"] == "open", ref1
+    assert ref2["run_id"] == "run-c" and ref2["ext_state"] == "open", ref2
+    links1 = c.execute("SELECT * FROM task_refs WHERE task_id = ? AND ref_id = ?", (t1_num, ref1["id"])).fetchall()
+    links2 = c.execute("SELECT * FROM task_refs WHERE task_id = ? AND ref_id = ?", (t2_num, ref2["id"])).fetchall()
+    assert len(links1) == 1 and links1[0]["role"] == "related"
+    assert len(links2) == 1 and links2[0]["role"] == "related"
+
+# Preserved numeric identities and task versions.
+t1_after = task_store.task_get(t1_id)
+t2_after = task_store.task_get(t2_id)
+assert t1_after["num"] == t1_before["num"] and t1_after["version"] == t1_before["version"]
+assert t2_after["num"] == t2_before["num"] and t2_after["version"] == t2_before["version"]
+
+# Repeating reconciliation changes NO versions and emits NO events!
+with db.tx() as c:
+    snap_before = (
+        [(r["id"], r["version"], r["run_id"], r["ext_state"]) for r in c.execute("SELECT id, version, run_id, ext_state FROM refs ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM task_refs ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM tasks ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM runs ORDER BY id")],
+        c.execute("SELECT COALESCE(MAX(seq), 0) FROM events_log").fetchone()[0],
+    )
+    stats = task_store.reconcile_pr_refs(c)
+    assert stats == {"refs": 0, "updated": 0, "links": 0}, stats
+    snap_after = (
+        [(r["id"], r["version"], r["run_id"], r["ext_state"]) for r in c.execute("SELECT id, version, run_id, ext_state FROM refs ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM task_refs ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM tasks ORDER BY id")],
+        [(r["id"], r["version"]) for r in c.execute("SELECT id, version FROM runs ORDER BY id")],
+        c.execute("SELECT COALESCE(MAX(seq), 0) FROM events_log").fetchone()[0],
+    )
+    assert snap_before == snap_after, (snap_before, snap_after)
+
+# Owner feedback reaches Task 1 via reconciled PR ref, and a later merge settles ref/run and retires parked ask.
+fake = FakeGhPrTracker(owner="owner")
+fake.add_pr("acme/sample", "arete/r41", number=41, state="OPEN")
+fake.add_pr("acme/sample", "arete/r42", number=42, state="OPEN")
+fake.add_comment(pr_url_1, gh_id=201, body="Reconciled feedback comment", created_at="2026-01-01T00:00:00Z")
+
+with (mock.patch.object(gh, "gh", side_effect=fake.handle),
+      mock.patch.object(gh, "me", return_value="owner"),
+      mock.patch.object(outcomes, "PR_SEEN_FILE", paths.STATE_DIR / "pr_seen.json")):
+    outcomes.sync_outcomes(cfg)
+    fb = pipeline.pending_feedback("sample", t1_id)
+    assert len(fb) == 1 and fb[0]["task_id"] == t1_num and fb[0]["gh_id"] == 201, fb
+    # Task 1's newest whole run is run-b (needs-info), so feedback_due suppresses it while parked.
+    assert insights_store.feedback_due("sample", "2026-01-01T00:10:00Z") == []
+
+    fake.set_merged(pr_url_1)
+    fake.set_merged(pr_url_2)
+    outcomes.sync_outcomes(cfg)
+
+assert run_store.run_get("run-b")["status"] == "merged"
+assert run_store.run_get("run-c")["status"] == "merged"
+assert ask_store.asks_of("run-b", "open") == []
+assert ask_store.ask_get("ask-reconcile-b")["status"] == "merged"
+with db.reader() as c:
+    assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_1,)).fetchone()[0] == "merged"
+    assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_2,)).fetchone()[0] == "merged"
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])

@@ -1997,7 +1997,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         outbox.send_due()
         failed = pipeline.run_store.newest_live_whole_run(repo.name, self.run.tid)
         self.assertEqual((failed["summary"], failed["engine_sha"]), (why, codebase.STAMP))
-        self.assertEqual([row["pr_url"] for row in pipeline.run_store.open_runs(repo.name, self.run.tid)], [c.pr])
+        self.assertEqual([row["pr_url"] for row in pipeline.task_store.open_pr_runs(repo.name, self.run.tid)], [c.pr])
         self.assertEqual(pipeline.pending_feedback(repo.name, self.run.tid), [])
         self.assertIn(self.run.tracker.label_name("failed"), labels)
         preview = support.start_pipeline(run_id="newer-preview", repo=repo.name, issue=self.run.tid, dry_run=True)
