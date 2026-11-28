@@ -336,7 +336,6 @@ def linux_repository_roots(checkouts: tuple[Path, ...]) -> set[Path]:
 
 
 def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path], session_checkout) -> set[Path]:
-    from . import config
     from .store import db, workspaces
 
     base = paths.WORKTREES_DIR.resolve()
@@ -363,7 +362,9 @@ def linux_checkout_metadata(checkouts: tuple[Path, ...], repositories: set[Path]
     # A configured linked checkout can also be selected directly.
     linked = {repo for repo in repositories if (repo / ".git").is_file()}
     if linked:
-        configured = {Path(os.path.abspath(repo.path / part)) for repo in config.load().repos
+        from . import pins
+
+        configured = {Path(os.path.abspath(repo.path / part)) for repo in pins.active_config().repos
                       for part in ["", *(p.dir for p in repo.parts)]}
         selected.update((repo, repo) for repo in linked & configured)
     metadata = set()

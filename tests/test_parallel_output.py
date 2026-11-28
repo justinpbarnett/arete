@@ -159,7 +159,8 @@ class RunnerOutputTests(unittest.TestCase):
                   "remove_reports = parallel.shutil.rmtree; "
                   "parallel.shutil = SimpleNamespace(rmtree=lambda path: remove_reports(path, ignore_errors=True)); "
                   "raise SystemExit(parallel.main())")
-        done = subprocess.run([sys.executable, "-c", runner, "-s", str(self.suite), *names],
+        job_args = () if ("-j" in names or "--jobs" in names) else ("-j", "2")
+        done = subprocess.run([sys.executable, "-c", runner, "-s", str(self.suite), *job_args, *names],
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         return done.returncode, done.stdout + done.stderr
@@ -357,6 +358,11 @@ class RunnerLoadTests(unittest.TestCase):
             ("Assertion", "1.alone", 3), ("Error", "2.alone", 3),
         ])
         self.assertIn("Failed classes: Assertion, Error, TimedOut", output)
+
+    def test_default_jobs_matches_small_hosts_without_oversubscribing(self):
+        for cpus, expected in ((1, 2), (2, 2), (3, 3), (4, 4), (14, 12), (None, 4)):
+            with self.subTest(cpus=cpus), patch.object(parallel.os, "cpu_count", return_value=cpus):
+                self.assertEqual(parallel.default_jobs(), expected)
 
 
 class RunnerFailureSummaryTests(unittest.TestCase):

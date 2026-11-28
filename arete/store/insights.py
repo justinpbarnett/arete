@@ -56,6 +56,7 @@ def verdicts_since(since: str, connect=reader) -> list[dict]:
 
 EVAL_LINEAGE = ("engine_sha", "prompts_sha", "prompts_from", "context_sha", "settings", "base_commit",
                 "after_step", "last_step")
+EVAL_INTERIM = frozenset(("engine_sha", "prompts_sha", "prompts_from", "settings"))
 
 
 def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "",
@@ -66,7 +67,8 @@ def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, co
             f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "  # noqa: S608
             f"VALUES ({','.join('?' * 16)})",
             (run_id, repo, task, int(passed), seconds, cost, util.iso(), source,
-             *(lineage.get(k, 0 if k in ("after_step", "last_step") else "") for k in EVAL_LINEAGE)),
+             *("" if k in EVAL_INTERIM else lineage.get(k, 0 if k in ("after_step", "last_step") else "")
+               for k in EVAL_LINEAGE)),
         )
 
 
@@ -75,7 +77,7 @@ BASELINE_SOURCE = "worktree"
 
 def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[dict]:
     with reader() as c:
-        rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "  # noqa: S608
+        rows = c.execute(f"SELECT run_id, passed, {', '.join(EVAL_LINEAGE)} FROM evals "  # noqa: S608
                          "WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))
         return [{**dict(r), "passed": bool(r["passed"])} for r in rows]

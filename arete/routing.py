@@ -562,15 +562,20 @@ def paid_key(found: Candidate) -> tuple:
     return (total is None, total or 0.0, not found.requested, found.position, rank)
 
 
+_UNSET = object()
+
+
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
-                 connect=foundation.reader, priced: bool = True, layer: config.RepoLayer | None = None):
+                 connect=foundation.reader, priced: bool = True, layer: config.RepoLayer | None = None,
+                 payer: str | None | object = _UNSET):
         self.declared = config.routing_for(cfg, layer).capabilities
         self.cfg = cfg
         self.repo = repo
         self.device = devices.resolve(device)
         self.connect = connect
         self.priced = priced
+        self.payer = payer
         self.modes = modes_for(cfg, repo)
         self.paid = paid_for(cfg, repo, layer)
         self.passing = environment.passed(cfg, repo)
@@ -734,12 +739,42 @@ class Discovery:
             take(self.declared.get(key, {}), "config")
         return {**found, "source": sources}
 
+    def auth_for_way(self, way: Way) -> accounts.Auth:
+        if way.runner == REPLAY or way.credential == "local":
+            return accounts.Auth()
+        if way.runner == "pi":
+            return self.probe(way.model, way.mode).auth
+        if way.credential == "cli_key" and way.mode == "api_key":
+            return self.cli_key_auth(way)
+        if way.runner == "codex":
+            return self.codex_auth()
+        if way.runner == "claude":
+            return self.claude_auth()
+        return accounts.Auth()
+
+    def payer_refusal(self, way: Way) -> str:
+        if self.payer is _UNSET or way.runner == REPLAY or way.credential == "local":
+            return ""
+        auth = self.auth_for_way(way)
+        if not auth.mode or not (auth.identity or auth.credential):
+            return ""
+        acct = accounts.account_for(auth, connect=self.connect)
+        if acct is None or acct.get("usage") != "personal":
+            return ""
+        if not self.payer:
+            return "uses a personal account; runs without a payer may use workspace accounts only"
+        if acct.get("holder") != self.payer:
+            return f"uses a personal account held by {acct.get('holder')}, not payer {self.payer}"
+        return ""
+
     def unmet(self, way: Way, settings, request_tokens: int = 0) -> str:
+        reasons = []
+        if holder_why := self.payer_refusal(way):
+            reasons.append(holder_why)
         need = settings.requires
         if not need.declared:
-            return ""
+            return "; ".join(reasons)
         have = self.capabilities(way)
-        reasons = []
         if need.floor and not way.link.requested:
             approved = {identity(*route(m)) for m in need.approved}
             if way_identity(way) not in approved:

@@ -32,7 +32,8 @@
         "budget_usd": {"type": "number"},
         "daily_budget_usd": {"type": "number"},
         "queue": {"type": "string"},
-        "stale_hours": {"type": "number"}
+        "stale_hours": {"type": "number"},
+        "payer": {"type": "string"}
       },
       "additionalProperties": false
     },

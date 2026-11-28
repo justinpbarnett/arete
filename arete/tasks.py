@@ -621,7 +621,7 @@ def parked_with_answers(row: dict) -> bool:
 def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
     tid = str(row["issue"])
     path = script_path(row) or ("revise" if pipeline.pending_feedback(repo.name, tid) else "feature")
-    return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"])
+    return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"], "--restart", "answer")
 
 
 def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None,

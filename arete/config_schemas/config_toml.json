@@ -86,6 +86,13 @@
       },
       "additionalProperties": false
     },
+    "automation": {
+      "type": "object",
+      "properties": {
+        "payer": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
     "repo": {
       "type": "array",
       "items": {
@@ -109,6 +116,7 @@
           "mine": {"type": "boolean"},
           "public": {"type": "boolean"},
           "jev": {"type": "boolean"},
+          "payer": {"type": "string"},
           "tracker": {"type": "string", "enum": ["github", "jira", "local"]},
           "part": {
             "type": "array",

@@ -90,6 +90,7 @@ class Loop:
     daily_budget_usd: float | None = None
     queue: str = ""
     stale_hours: float | None = None
+    payer: str = ""
     classify: dict = field(default_factory=dict)
     emits: list[dict] = field(default_factory=list)
     spec: dict = field(default_factory=dict)
@@ -312,7 +313,10 @@ def folders(cfg: config.Config) -> list[tuple[str, str, Path]]:
 
 
 def load_all(cfg: config.Config | None = None) -> list[Loop]:
-    cfg = cfg or config.load()
+    if cfg is None:
+        from . import pins
+
+        cfg = pins.active_config()
     loops: dict[str, Loop] = {}
     switched = switch_overrides(cfg)
     for origin, repo, folder in folders(cfg):
@@ -381,6 +385,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         daily_budget_usd=float(run["daily_budget_usd"]) if run.get("daily_budget_usd") else None,
         queue=str(run.get("queue", "")),
         stale_hours=float(run["stale_hours"]) if run.get("stale_hours") else None,
+        payer=str(run.get("payer", "") or "").strip(),
         classify=dict(data.get("classify", {})),
         emits=[dict(e) for e in data.get("emit", [])],
         spec=dict(data.get(known.table, {})) if known and known.table else {},

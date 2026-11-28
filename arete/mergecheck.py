@@ -355,9 +355,13 @@ class ReplayResult:
 
 
 def execute(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
-    record.start("merge-check", run_id=run_id, repo=p.repo.name)
+    from . import configrepo, pins
+
+    pin_res = pins.resolve("merge-check", repo=p.repo, cfg=cfg if not configrepo.is_repo() else None)
+    record.start("merge-check", run_id=run_id, repo=p.repo.name, resolution=pin_res)
     try:
-        result = execute_attempt(cfg, p, run_id)
+        with pins.use(pin_res):
+            result = execute_attempt(pin_res.cfg, p, run_id)
     except BaseException:
         record.settle(run_id, "failed", summary="merge-check blocked; evidence retained locally")
         raise

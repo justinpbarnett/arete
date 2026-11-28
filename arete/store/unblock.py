@@ -5,6 +5,7 @@ import time
 import uuid
 
 from .. import util
+from . import runs as run_store
 from ._rows import json_dict
 from .db import db, reader, tx
 
@@ -25,11 +26,11 @@ def queue(repo: str) -> dict:
 
 def candidates(repo: str, limit: int, offset: int) -> list[dict]:
     with reader() as c:
-        return [dict(row) for row in c.execute("""SELECT r.* FROM runs r WHERE r.repo=? AND r.kind='pipeline'
+        return [dict(row) for row in c.execute(f"""SELECT r.* FROM runs r WHERE r.repo=? AND r.kind='pipeline'
             AND r.status IN ('failed','pr','needs-info') AND r.dry_run=0 AND COALESCE(r.only_step,'')=''
             AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.repo=r.repo AND later.issue=r.issue
-              AND later.kind='pipeline' AND later.dry_run=0 AND COALESCE(later.only_step,'')='' AND later.rowid>r.rowid)
-            ORDER BY (r.status='needs-info') DESC, r.rowid DESC LIMIT ? OFFSET ?""", (repo, limit, offset))]
+              AND later.kind='pipeline' AND later.dry_run=0 AND COALESCE(later.only_step,'')='' AND {run_store.later_than(c, 'later', 'r')})
+            ORDER BY (r.status='needs-info') DESC, {run_store.seq_col(c, 'r')} DESC LIMIT ? OFFSET ?""", (repo, limit, offset))]  # noqa: S608
 
 
 def encoded(value) -> str:

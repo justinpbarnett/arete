@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 14
+MINOR = 17
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -38,9 +38,10 @@ TASK = obj({**dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "pa
 RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
             "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
-            "engine_sha", "label_pending", "wait_minutes")
+            "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
+            "restart", "started_by", "payer")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
-               "repair_calls", "schema_version", "attempts", "version")
+               "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
            **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
@@ -81,7 +82,11 @@ RESOURCE = {
     "line": obj({"id": STRING, "kind": STRING, "repo": STRING, "enabled": BOOLEAN}),
     "view": obj({"id": STRING, "label": STRING, "data": mapping(JSON)}, ["id", "label"]),
     "step": obj({"id": INTEGER, "run_id": STRING, "name": STRING, "model": STRING, "runner": STRING,
-                 "cost_usd": NUMBER, "seconds": NUMBER}),
+                 "cost_usd": NUMBER, "seconds": NUMBER,
+                 "settings_sha": NULL_TEXT,
+                 "settings": {"type": ["object", "null"], "additionalProperties": JSON},
+                 "inputs": {"type": ["array", "null"], "items": mapping(JSON)}},
+                ["id", "run_id", "name", "model", "runner", "cost_usd", "seconds"]),
     "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
     "incident": obj({"id": STRING, "detail": INCIDENT}),
     "triage": obj({"id": STRING, "detail": TRIAGE}),
@@ -115,6 +120,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("factory_version_conflict", 409, "Read the current factory setting before retrying."),
     ("task_version_conflict", 409, "The task was updated since the requested base version."),
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
+    ("lease_fenced", 410, "This lease has been fenced by a newer epoch or release."),
+    ("lease_expired", 410, "This lease has expired."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
     ("uri_too_long", 414, "The request target is too long."),
     ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
@@ -148,14 +155,14 @@ AUTH_ERRORS = {"unauthenticated", "ambiguous_credential", "token_expired", "toke
 
 def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=(), success_status=200):
     shown = sample(result)
-    if "seq" in result.get("properties", {}):
+    if isinstance(shown, dict) and "seq" in shown:
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "secret_internal", "already_resolved", "validation",
-                       "gate_refused", "presence_expired"}
-    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push") and name != "session.end":
+                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired"}
+    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -184,11 +191,38 @@ INBOX_ITEM = obj({
     "detail": mapping(JSON),
     "verbs": array(STRING),
     "options": array(JSON),
-})
+    "outbox_id": NULL_TEXT,
+}, [
+    "id", "kind", "subject", "task_id", "run_id", "line", "title", "state", "snooze_until",
+    "snooze_watch", "shelve_reason", "shelve_until", "answer", "answered_by", "answered_at",
+    "resolution", "reminded", "raised", "resolved", "priority", "snooze_watch_ver", "shelves",
+    "version", "detail", "verbs", "options",
+])
 INBOX_EVENT = obj({
     "id": STRING, "seq": INTEGER, "epoch": STRING, "at": STRING, "kind": STRING, "subject": STRING,
     "ver": {"type": ["integer", "null"]}, "actor": STRING, "actor_name": NULL_TEXT, "data": mapping(JSON),
 }, ["id", "seq", "at", "kind", "subject", "actor", "data"], additional=JSON)
+NULL_INT = {"type": ["integer", "null"]}
+OUTBOX_ITEM = obj({
+    **dict.fromkeys(("id", "target", "kind", "object", "audience", "drafted_by", "slot", "state",
+                     "summary", "plain_summary", "review", "created", "updated"), STRING),
+    **dict.fromkeys(("marker", "posts_as", "task_id", "ref_id", "run_id", "step", "loop", "opened_at",
+                     "approved_by", "approved_rule", "approved_rule_version", "send_at", "base_remote_updated",
+                     "sent_at", "sent_ref", "sent_url", "error", "reject_reason", "sending_since"), NULL_TEXT),
+    **dict.fromkeys(("rev", "attempts", "shape", "version"), INTEGER),
+    "legacy_approval": NULL_INT,
+})
+OUTBOX_REVISION = obj({
+    "item": INTEGER, "rev": INTEGER, "base_rev": NULL_INT, "by": STRING, "body": STRING, "at": STRING,
+})
+OUTBOX_REDACTION = obj({
+    "item": INTEGER, "rev": INTEGER, "n": INTEGER, "kind": STRING, "start": INTEGER, "end": INTEGER, "why": STRING,
+})
+DELIVERY_ATTEMPT = obj({
+    "item": INTEGER, "n": INTEGER, "started": STRING, "ended": NULL_TEXT, "outcome": NULL_TEXT,
+    "http_status": NULL_INT, "retry_after": NULL_INT, "external_id": NULL_TEXT, "external_url": NULL_TEXT,
+    "lookup": NULL_TEXT, "error": NULL_TEXT,
+})
 PUSH_SUBSCRIPTION = obj({
     **dict.fromkeys(("id", "endpoint_host", "label", "created"), STRING),
     "last_success": NULL_TEXT,
@@ -205,6 +239,7 @@ for _error in ERRORS:
                 "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
+                "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
@@ -220,10 +255,12 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
-                 "features": obj({"inbox": BOOLEAN}),
+                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN}, ["inbox"]),
                  "push": obj({"vapid_public_key": STRING})})
 META["required"] = [k for k in META["required"] if k not in ("features", "push")]
 ROLE_ENUM = {**STRING, "enum": list(configkinds.ROLE_NAMES)}
+ROLE_LEVEL = {"type": ["string", "null"],
+              "enum": ["inherit", "engine", "config", "config kind", "layer", "layer kind", "arm", "run", None]}
 ROLE_STEP_OVERRIDES = obj({"runner": STRING, "model": STRING, "effort": STRING}, [], additional=False)
 ROLE_OVERRIDES = obj({
     "models": {**mapping(STRING), "maxProperties": 1},
@@ -234,9 +271,20 @@ ROLE_VIEW = obj({
     "runner": NULL_TEXT,
     "model": NULL_TEXT,
     "effort": NULL_TEXT,
-    "level": NULL_TEXT,
+    "level": ROLE_LEVEL,
     "overrides": ROLE_OVERRIDES,
 })
+BLOB_SHA = {**STRING, "pattern": "^[0-9a-f]{64}$"}
+BLOB_META = obj({"sha256": STRING, "kind": STRING, "bytes": INTEGER})
+BLOB_DATA = obj({"sha256": STRING, "kind": STRING, "bytes": INTEGER, "data": STRING,
+                 "encoding": {**STRING, "enum": ["utf-8", "base64"]}})
+RESOLVED_LEVEL_ENTRY = obj({"level": ROLE_LEVEL, "from": NULL_TEXT})
+RESOLVED_SETTINGS = envelope({
+    "values": mapping(mapping(JSON)),
+    "levels": mapping(mapping(RESOLVED_LEVEL_ENTRY)),
+    "roles": array(ROLE_VIEW),
+    "config_commit": NULL_TEXT,
+}, ["seq", "values", "levels", "config_commit"])
 SETTINGS_VALUES = obj({
     "max_parallel": INTEGER,
     "max_parallel_per_repo": INTEGER,
@@ -412,9 +460,17 @@ OPERATIONS += [
     operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
               obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
+    operation("settings.resolved", "settings/resolved", RESOLVED_SETTINGS,
+              obj({"repo": STRING, "task_kind": STRING, "node": STRING}, [])),
     {**operation("settings.update", "settings", envelope({"settings": SETTINGS}),
                  SETTINGS_PATCH, {"base_version": 1, "values": {"max_parallel": 2}}, "PATCH"),
      "scope": "config:activate"},
+    operation("blob.get", "blobs/{sha256}", envelope({"blob": BLOB_DATA}),
+              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}),
+    {**operation("blob.put", "blobs/{sha256}", envelope({"blob": BLOB_META}),
+                 obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, "PUT",
+                 errors=("validation",), success_status=201),
+     "scope": "intake:write", "body_media": "application/octet-stream"},
     {**operation("loop.enable", "loops/{loop}/enable", envelope({"loop": LOOP}),
                  obj({"loop": STRING}), {"loop": "poll"}, "POST"),
      "scope": "config:activate"},
@@ -496,12 +552,133 @@ OPERATIONS += [
               envelope({"items": array(INBOX_ITEM),
                         "by_priority": obj({"high": array(INBOX_ITEM), "med": array(INBOX_ITEM), "low": array(INBOX_ITEM)}),
                         "counts": mapping(INTEGER)})),
+]
+DEVICE_PROBE = obj({
+    "at": STRING,
+    "ok": BOOLEAN,
+    "seconds": NUMBER,
+    "device_version": STRING,
+    "system": STRING,
+    "home": STRING,
+    "tools": array(STRING),
+    "gpus": array(STRING),
+    "detail": STRING,
+}, ["at", "ok", "seconds", "device_version", "detail"])
+DEVICE = obj({
+    "id": STRING,
+    "subject": STRING,
+    "version": STRING,
+    "kind": {**STRING, "enum": ["local", "ssh", "exe", "proxmox"]},
+    "pool": NULL_TEXT,
+    "status": {**STRING, "enum": ["ok", "fault", "unprobed"]},
+    "last_probe": {**DEVICE_PROBE, "type": ["object", "null"]},
+    "leases": array(STRING),
+    "runners": array(STRING),
+    "spec": NULL_TEXT,
+    "tools": {**array(STRING), "type": ["array", "null"]},
+    "host": STRING,
+    "note": STRING,
+})
+DEVICE_PROBE_RESULT = {"anyOf": [
+    envelope({"device": DEVICE, "probe": DEVICE_PROBE}),
+    envelope({"accepted": BOOLEAN, "watch": STRING, "device": STRING}),
+]}
+LEASE = obj({
+    "id": STRING,
+    "subject": STRING,
+    "run_id": NULL_TEXT,
+    "device": STRING,
+    "device_version": STRING,
+    "epoch": INTEGER,
+    "created": STRING,
+    "renewed": STRING,
+    "expires": STRING,
+    "released": NULL_TEXT,
+    "outcome": STRING,
+    "kept_reason": STRING,
+    "vm_name": STRING,
+    "vmid": {"type": ["integer", "null"]},
+    "ready": STRING,
+    "address": STRING,
+    "host_key_fingerprint": STRING,
+    "sweep_attempts": INTEGER,
+    "last_sweep": STRING,
+    "last_sweep_error": STRING,
+    "version": INTEGER,
+    "streams": array(mapping(JSON)),
+})
+RUN_SANDBOX = envelope({
+    "device": STRING,
+    "lease": NULL_TEXT,
+    "address": STRING,
+    "facts": {**mapping(JSON), "type": ["object", "null"]},
+})
+
+OPERATIONS += [
+    operation("device.list", "devices", envelope({"devices": array(DEVICE)})),
+    operation("device.get", "devices/{device}", envelope({"device": DEVICE}),
+              obj({"device": STRING}), {"device": "local"}),
+    {**operation("device.probe", "devices/{device}/probe", DEVICE_PROBE_RESULT,
+                 obj({"device": STRING}), {"device": "local"}, "POST"),
+     "scope": "run:start"},
+    operation("lease.list", "leases", envelope({"leases": array(LEASE)}),
+              obj({"run": STRING, "device": STRING, "open": STRING}, [])),
+    operation("lease.get", "leases/{lease}", envelope({"lease": LEASE}),
+              obj({"lease": STRING}), {"lease": "L-1"}, errors=("lease_fenced", "lease_expired")),
+    operation("run.sandbox", "runs/{run}/sandbox", RUN_SANDBOX,
+              obj({"run": STRING}), {"run": "pip-demo-1"}),
     operation("push.list", "push/subscriptions", envelope({"subscriptions": array(PUSH_SUBSCRIPTION)})),
     operation("push.subscribe", "push/subscriptions", envelope({"subscription": PUSH_SUBSCRIPTION}), PUSH_SUBSCRIBE,
               {"endpoint": "http://127.0.0.1:9999/push", "keys": {"p256dh": "examplekey", "auth": "exampleauth"}, "label": "Phone"},
               "POST", errors=("validation",), success_status=201),
     operation("push.remove", "push/subscriptions/{subscription}", envelope({"id": STRING, "removed": BOOLEAN}),
               obj({"subscription": STRING}), {"subscription": "PS-1"}, "DELETE"),
+    operation("outbox.list", "outbox", envelope({"items": array(OUTBOX_ITEM)}),
+              obj({"state": STRING, "task": STRING, "run": STRING}, [])),
+    operation("outbox.get", "outbox/{item}",
+              envelope({"item": OUTBOX_ITEM, "revisions": array(OUTBOX_REVISION),
+                        "redactions": array(OUTBOX_REDACTION), "attempts": array(DELIVERY_ATTEMPT),
+                        "sending_since": NULL_TEXT}),
+              obj({"item": STRING}), {"item": "OB-1"}),
+    operation("outbox.edit", "outbox/{item}", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "base_rev": {**INTEGER, "minimum": 1}, "body": STRING}),
+              {"item": "OB-1", "base_version": 1, "base_rev": 1, "body": "Edited body"}, "PATCH",
+              errors=("invalid_state", "validation")),
+    operation("outbox.preview", "outbox/{item}/preview",
+              envelope({"item": STRING, "rev": INTEGER, "marker": NULL_TEXT, "body": STRING}),
+              obj({"item": STRING}), {"item": "OB-1"}),
+    operation("outbox.open", "outbox/{item}/open", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.approve", "outbox/{item}/approve", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "rev": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1, "rev": 1}, "POST",
+              errors=("invalid_state", "validation", "gate_refused", "presence_expired")),
+    operation("outbox.undo", "outbox/{item}/undo", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.hold", "outbox/{item}/hold", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.release", "outbox/{item}/release", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.reject", "outbox/{item}/reject", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "reason": STRING},
+                  ["item", "base_version"]),
+              {"item": "OB-1", "base_version": 1, "reason": "Not needed"}, "POST",
+              errors=("invalid_state", "validation", "gate_refused", "presence_expired")),
+    operation("outbox.retry", "outbox/{item}/retry", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST",
+              errors=("invalid_state", "gate_refused", "presence_expired")),
+    operation("outbox.discard", "outbox/{item}/discard", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.history", "outbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
+              obj({"item": STRING}), {"item": "OB-1"}),
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):

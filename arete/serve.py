@@ -35,9 +35,11 @@ from . import (
     gh,
     hold_review,
     install,
+    leases,
     loop_run,
     loops,
     oncall,
+    outbox,
     paths,
     pilot,
     principals,
@@ -453,6 +455,8 @@ class Server:
         self.contracts_waiting = False
         self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
+        self.outbox_pool = factory_control.WorkPool(1, thread_name_prefix="outbox")
+        self.outbox_job: Future | None = None
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -555,6 +559,7 @@ class Server:
             self.schedule_resumed = state["version"]
         self.guard("stage:secret-move", self.move_secrets_when_due)
         self.guard("stage:secret-check", self.check_secrets_when_due)
+        self.guard("stage:leases", self.lapse_leases)
         self.guard("stage:reap", self.reap)
         self.guard("stage:claims", self.release_claims)
         states = self.guard("stage:states", loop_store.loop_states)
@@ -579,7 +584,7 @@ class Server:
         for name, action, args in stages:
             factory_state.admit()
             self.guard(f"stage:{name}", action, *args)
-        tick_stages = {"stage:reap", "stage:claims", "stage:secret-move", "stage:secret-check",
+        tick_stages = {"stage:leases", "stage:reap", "stage:claims", "stage:secret-move", "stage:secret-check",
                        *(f"stage:{name}" for name, _, _ in stages)}
         return states is not None and not any(key in tick_stages or key.startswith(("loop:", "secret-check:"))
                                               for key in self.failing)
@@ -634,6 +639,11 @@ class Server:
             self.guard(f"secret-check:{row['id']}", secretstore.check, row["scope"], row["name"])
         self.secrets_checked_at = now
 
+    def lapse_leases(self) -> None:
+        lapsed = leases.lapse()
+        if lapsed:
+            self.say(f"lapsed {util.count(len(lapsed), 'expired lease')}")
+
     def reap(self) -> None:
         for row in record.reap(tickets=False, release_claims=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
@@ -676,6 +686,7 @@ class Server:
         for released in delivery.release_lapsed():
             self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
         self.start_approval_jobs()
+        self.start_outbox_job()
 
     def rotate_when_due(self) -> None:
         if time.monotonic() - self.rotated > ROTATE_SECONDS:
@@ -1141,6 +1152,7 @@ class Server:
     def sweep_vms(self) -> None:
         try:
             devices.sweep(self.sweep_log)
+            devices.probe_waiting_devices(self.say)
         except Exception as e:
             self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
@@ -1222,6 +1234,11 @@ class Server:
             self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
 
     def dispatch_item(self, item: dict, loop: Loop, slots: QueueSlots) -> str | None:
+        from .store import devices as device_store
+
+        if open_waits := device_store.open_waits_for_subject(f"config:loop/{loop.name}"):
+            blockers = ", ".join(w["blocker"].removeprefix("device:") for w in open_waits)
+            return f"waiting on {blockers}"
         if why := slots.why_full(item, loop, self.cfg):
             return why
         if spent := loop_run.spent_limit(loop, self.cfg):
@@ -1275,6 +1292,20 @@ class Server:
             self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
+    def start_outbox_job(self) -> None:
+        if self.outbox_job is not None and not self.outbox_job.done():
+            return
+        self.outbox_job = None
+        with foundation.tx() as c:
+            outbox.sweep(c, self.started)
+        self.outbox_job = self.outbox_pool.submit(self.do_outbox_job)
+
+    def do_outbox_job(self) -> None:
+        try:
+            outbox.send_due()
+        except Exception as e:
+            self.say(f"outbox send failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
     def retry_once(self, item: dict, why: str) -> None:
         self.say(f"{item['loop']}: queue item {item['id']} failed to start, {why}; "
                  "the recovery sweep handles its claim")
@@ -1293,6 +1324,8 @@ class Server:
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
+        if (job := getattr(self, "outbox_job", None)) and not job.done():
+            return "an outbox delivery is still running"
         if self.oncall and not self.oncall.done():
             return "an on-call scan is still running"
         if self.sweeping():
@@ -1539,12 +1572,13 @@ def run(with_dashboard: bool = True) -> NoReturn:
             server.say(note)
         server.report_config()
         if not server.contracts_waiting:
-            from . import configrepo
+            from . import configrepo, pins
 
             if not server.config_problem:
                 server.guard("stage:secret-move", server.move_secrets_when_due)
             try:
                 configrepo.init()
+                pins.ensure_automation_payer()
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()

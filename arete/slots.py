@@ -63,7 +63,9 @@ def freed_slot_for_ci(run_id: str) -> bool:
 
 def live_max_parallel(last_read: int) -> int:
     try:
-        return config.load().max_parallel
+        from . import pins
+
+        return pins.active_config().max_parallel
     except (OSError, ValueError):
         return last_read
 

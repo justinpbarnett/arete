@@ -7558,9 +7558,12 @@ class ConfigKindRegistryTests(unittest.TestCase):
         for name in ("capture", "ask", "dashboard"):
             assert not config.root_schema(name).get("x-arete-reach")
         test = unittest.TestCase()
-        for name in ("connector", "target", "device"):
+        for name in ("connector", "target"):
             with test.assertRaisesRegex(ValueError, "unavailable for writes"):
                 configschema.validate(name, {})
+        configschema.validate("device", {"kind": "ssh", "host": "box.test", "note": "build box"})
+        with test.assertRaisesRegex(ValueError, "unknown key extra"):
+            configschema.validate("device", {"kind": "ssh", "host": "box.test", "extra": True})
         with test.assertRaisesRegex(ValueError, "directory_cleanup must be boolean"):
             configschema.validate("step_settings", {"schema": 1, "defaults": {"tools": [], "mcp": [],
                                   "session": "fresh"}, "steps": {"verify": {"directory_cleanup": 1}}})
@@ -9841,8 +9844,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 86)
-        self.assertEqual(len({op["name"] for op in operations}), 86)
+        self.assertEqual(len(operations), 108)
+        self.assertEqual(len({op["name"] for op in operations}), 108)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10428,9 +10431,9 @@ class CredentialMcpHttpTests(_CredentialMcpCase):
             issued = self.issue(server, self.pair(server), scopes=("read", "task:write", "run:write"))
             post, session = self.mcp(server, issued["text"])
             names = {tool["name"] for tool in post("tools/list", 2)[0]["result"]["tools"]}
-            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "task__list", "task__get",
-                                     "task__create", "comment__create", "run__list", "run__get", "run__stop",
-                                     "run__steer"})
+            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "outbox__list", "outbox__get",
+                                     "task__list", "task__get", "task__create", "comment__create", "run__list",
+                                     "run__get", "run__stop", "run__steer"})
             post("tools/call", 3, {"name": "token__issue"}, status=403, code="scope_missing")
             create = {"name": "task__create", "arguments": {"repo": "fixture", "body": "Work </untrusted>"}}
             answer, _ = post("tools/call", 4, create)
@@ -12378,8 +12381,11 @@ with api_server(scopes=('read', 'config:activate')) as (api, _):
     assert isinstance(got['values'], dict)
     roles = got['values']['roles']
     assert [r['role'] for r in roles] == [r.name for r in config.ROLES]
-    assert all(r['level'] is None for r in roles)
     by_role = {r['role']: r for r in roles}
+    assert by_role['build']['level'] == 'config'
+    assert by_role['plan']['level'] in ('engine', 'config', 'inherit')
+    assert by_role['check_repair']['level'] in ('inherit', 'engine')
+    assert all(r['level'] in (None, 'inherit', 'engine', 'config', 'config kind', 'layer', 'layer kind', 'arm', 'run') for r in roles)
     assert by_role['build']['overrides'] == {
         'models': {'build': 'sonnet'},
         'steps': {'implement': {'runner': 'claude', 'model': 'opus', 'effort': 'high'}},
@@ -14434,3 +14440,1913 @@ print("BEHAVIOR_RESULT=" + json.dumps({
         self.assertTrue(res["ten_day_record_kept"])
         self.assertTrue(res["validator_rejected_all"])
 
+
+class _PinnedRunCase(unittest.TestCase):
+    def run_pinned(self, body: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-pinned-") as directory:
+            root = Path(directory).resolve()
+            env = api_check.isolated_env(root)
+            preamble = (
+                "import hashlib, json, os, shutil, sqlite3, subprocess, sys, tempfile, threading, tomllib\n"
+                "from contextlib import contextmanager, redirect_stderr, redirect_stdout\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "from arete import (\n"
+                "    accounts, api, api_check, api_http, auditor, board, chat, client, codebase, config,\n"
+                "    configrepo, contract, control, dashboard, doctor, evals, factory, flows, loop_run,\n"
+                "    loops, paths, pins, pipeline, poll, principals, prompt_loader, record,\n"
+                "    replay, routing, run_lines, runner, serve, settings, steps, tailnet, tasks, util,\n"
+                ")\n"
+                "from arete.commands import costs as costs_cmd\n"
+                "from arete.lab import experiment, optimize\n"
+                "from arete.store import (\n"
+                "    asks as ask_store, blobs as blob_store, chats as chat_store, db, insights as insights_store,\n"
+                "    loops as loop_store, runs as run_store, tasks as task_store, tokens as token_store,\n"
+                ")\n"
+                "root = Path.cwd()\n"
+                "GIT_ENV = {\n"
+                "    **{k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'TMPDIR', 'USER', 'LANG', 'LC_ALL', 'TZ')},\n"
+                "    'GIT_AUTHOR_NAME': 'hand', 'GIT_AUTHOR_EMAIL': 'hand',\n"
+                "    'GIT_COMMITTER_NAME': 'hand', 'GIT_COMMITTER_EMAIL': 'hand',\n"
+                "}\n"
+                "def git_run(args, cwd):\n"
+                "    return subprocess.run(['git', *args], cwd=cwd, env=GIT_ENV, check=True, capture_output=True, text=True)\n"
+                "def init_sample_repo(name='sample', check_cmd='true'):\n"
+                "    origin_dir = root / 'origins' / f'{name}.git'\n"
+                "    origin_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    git_run(['init', '--bare', '-q', '-b', 'main'], origin_dir)\n"
+                "    repo_dir = root / 'repos' / name\n"
+                "    repo_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    git_run(['init', '-q', '-b', 'main'], repo_dir)\n"
+                "    (repo_dir / 'README.md').write_text('# sample\\n')\n"
+                "    (repo_dir / 'app.txt').write_text('hello\\n')\n"
+                "    git_run(['add', '.'], repo_dir)\n"
+                "    git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'init'], repo_dir)\n"
+                "    git_run(['remote', 'add', 'origin', str(origin_dir)], repo_dir)\n"
+                "    git_run(['push', '-q', '-u', 'origin', 'main'], repo_dir)\n"
+                "    layer_dir = paths.CONFIG_DIR / 'layers' / name\n"
+                "    layer_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    (layer_dir / 'config.toml').write_text(\n"
+                "        f'[checks]\\nunit = {json.dumps(check_cmd)}\\n'\n"
+                "    )\n"
+                "    (layer_dir / 'expertise.md').write_text('initial expertise\\n')\n"
+                "    return repo_dir, layer_dir\n"
+                "def commit_cfg(rel_path, text, note='edit'):\n"
+                "    _, base = configrepo.read(rel_path)\n"
+                "    return configrepo.commit({rel_path: text}, {rel_path: base}, actor='hand', source='hand', note=note)\n"
+                "@contextmanager\n"
+                "def api_server(scopes=('read', 'config:activate')):\n"
+                "    owner = principals.seed_owner(api_check.LOGIN)\n"
+                "    with db.tx() as c:\n"
+                "        token_store.ensure_key(c)\n"
+                "        _, tok = token_store.issue(owner, 'Pinned test', list(scopes))\n"
+                "    node = SimpleNamespace(names={api_check.ADDRESS})\n"
+                "    logins = tailnet.Logins(tailnet.ScratchHost())\n"
+                "    logins.of = lambda _: api_check.LOGIN\n"
+                "    with mock.patch('socket.getfqdn', return_value=api_check.ADDRESS):\n"
+                "        srv = tailnet.Server(api_check.ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)\n"
+                "    with srv:\n"
+                "        t = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)\n"
+                "        t.start()\n"
+                "        try:\n"
+                "            yield api_check.Check(srv.server_port, root, [], token=tok), owner\n"
+                "        finally:\n"
+                "            srv.shutdown()\n"
+                "            t.join(timeout=5)\n"
+                "codebase.load()\n"
+                "with redirect_stdout(StringIO()):\n"
+                "    db.migrate()\n"
+                "with api_check.offline():\n"
+            )
+            indented = indent(body.lstrip("\n"), "    ")
+            script = preamble + indented + "\n    print('BEHAVIOR_RESULT=' + json.dumps(result))\n"
+            command = api_check.child_command(api_check.SOURCE, script)
+            done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+            self.assertEqual(done.returncode, 0, done.stdout + "\n" + done.stderr)
+            lines = [line for line in done.stdout.splitlines() if line.startswith("BEHAVIOR_RESULT=")]
+            self.assertEqual(len(lines), 1, done.stdout + "\n" + done.stderr)
+            return json.loads(lines[0].partition("=")[2])
+
+
+class PinnedRunTests(_PinnedRunCase):
+    def test_pins_resume_ab_resolved_roles_and_api_blobs(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='false')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\n'
+    'all = true\n'
+    '[steps.plan]\n'
+    'runner = "replay"\n'
+    'model = "sonnet"\n'
+    'effort = "medium"\n'
+    '[steps.build]\n'
+    'runner = "replay"\n'
+    'model = "sonnet"\n'
+    'effort = "high"\n'
+    'timeout_minutes = 11\n'
+    '[ab.build-exp]\n'
+    'step = "build"\n'
+    'share = 0.5\n'
+    '[ab.build-exp.arm]\n'
+    'effort = "low"\n'
+    '[[repo]]\n'
+    'name = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+commit1 = configrepo.live_sha()
+tid = task_store.task_add('sample', 'Pinned run ticket', 'Do the work')
+state = {'commit2': ''}
+seen_prompts = {}
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    seen_prompts.setdefault(step_name, []).append(prompt)
+    if step_name == 'plan':
+        # Mutate config.toml timeout and layer check mid-run BEFORE build runs (once on run 1)!
+        if not state['commit2']:
+            new_cfg = paths.CONFIG_FILE.read_text().replace('timeout_minutes = 11', 'timeout_minutes = 7')
+            commit_cfg('config.toml', new_cfg, 'change timeout')
+            state['commit2'] = commit_cfg('layers/sample/config.toml', '[checks]\nunit = "true"\n', 'fix check')
+        return runner.Result(ok=True, runner='replay', model='sonnet', text='{"plan":"do it","verify":"ok"}',
+                             structured={'plan': 'do it', 'verify': 'ok', 'estimated_lines': 5}, turns=1)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='built', turns=1)
+
+def flow_fn(flow):
+    run = flow.ctx.run
+    brief = prompt_loader.Brief('sample', 'ws', tid, 'Pinned run ticket', 'Do the work')
+    plan_text = brief.prompt('plan', paths.PROMPTS_DIR, triage='', checks='unit')
+    p_res = run.agent('plan', plan_text, flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    assert p_res.ok
+    build_text = brief.prompt('build', paths.PROMPTS_DIR, plan='do it', checks='unit', estimate=5, verify='ok')
+    b_res = run.agent('build', build_text, flow.ctx.ws, role='build')
+    assert b_res.ok
+    chk = flow.ctx.run.layer.checks['unit']
+    if chk == 'false':
+        return 'failed', 'old check failed', ''
+    return 'done', 'new check passed', ''
+
+script1 = pipeline.Script('feature', flow_fn)
+with (mock.patch.object(steps, 'in_arm', return_value=True),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc1 = pipeline.run_issue('sample', tid, force=True, script=script1)
+assert rc1 == 1, rc1
+
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['status'] == 'failed', r1
+assert r1['config_commit'] == commit1, (r1['config_commit'], commit1)
+assert r1['resolved_sha']
+resolved_file = paths.RUNS_DIR / r1['id'] / 'resolved.json'
+assert resolved_file.is_file()
+assert blob_store.read(r1['resolved_sha']) == resolved_file.read_bytes()
+resolved_doc = json.loads(resolved_file.read_bytes())
+assert resolved_doc['config_commit'] == commit1
+assert resolved_doc['settings']['build']['timeout_minutes']['value'] == 11
+assert resolved_doc['settings']['build']['effort']['level'] == 'arm'
+assert resolved_doc['settings']['build']['effort']['from'] == 'ab:build-exp'
+
+steps1 = run_store.steps(r1['id'])
+assert [s['step'] for s in steps1] == ['plan', 'build'], steps1
+by_step1 = run_store.step_inputs_by_run(r1['id'])
+for s in steps1:
+    assert s['settings_sha']
+    snap = run_store.settings_snapshot(s['settings_sha'])
+    assert snap is not None
+    roles_present = {i['role'] for i in by_step1[s['id']]}
+    assert {'prompt', 'inputs', 'rendered'} <= roles_present, (s['step'], roles_present)
+    rendered_item = next(i for i in by_step1[s['id']] if i['role'] == 'rendered')
+    assert blob_store.read(rendered_item['sha256']).decode('utf-8') == seen_prompts[s['step']][0]
+    if s['step'] == 'plan':
+        assert 'schema' in roles_present, roles_present
+    if s['step'] == 'build':
+        assert snap['timeout_minutes']['value'] == 11
+        assert snap['timeout_minutes']['level'] == 'config'
+        assert snap['timeout_minutes']['from'] == f'config.toml@{commit1}'
+
+# Verify tasks.resume builds argv and running via factory.main picks up commit2, timeout 7, passing check,
+# and preserves A/B placement without mutating first run.
+ab1_before = run_store.ab_held(r1['id'])
+assert 'build' in ab1_before, ab1_before
+resume_argv = []
+def capture_launch(cmd, log):
+    resume_argv.extend(cmd)
+    return r1['id']
+with (mock.patch.object(pipeline, 'run_refusal', return_value=(True, '')),
+      mock.patch.object(tasks, 'spawned', side_effect=lambda repo, tid, spawn: (spawn(), 'done')),
+      mock.patch.object(tasks.control, 'launch', side_effect=capture_launch)):
+    tasks.resume(r1['id'])
+assert '--continue' in resume_argv and r1['id'] in resume_argv, resume_argv
+
+script2 = pipeline.Script('feature', flow_fn, continues=r1['id'], restart='resume')
+with (mock.patch.object(steps, 'in_arm', return_value=False),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc2 = pipeline.run_issue('sample', tid, force=True, script=script2)
+assert rc2 == 0, rc2
+r2 = run_store.newest_whole_run('sample', tid)
+assert r2['id'] != r1['id'] and r2['status'] == 'done'
+assert r2['config_commit'] == state['commit2']
+r2_doc = json.loads(blob_store.read(r2['resolved_sha']))
+assert r2_doc['settings']['build']['timeout_minutes']['value'] == 7
+assert r2_doc['settings']['build']['effort']['level'] == 'arm'
+assert run_store.ab_held(r2['id']) == ab1_before
+assert run_store.run_get(r1['id'])['config_commit'] == commit1
+assert run_store.ab_held(r1['id']) == ab1_before
+
+# Verify API surface: GET/PUT blobs, GET settings (RoleView.level), GET settings/resolved (ETag/304), Run/Step fields, arete steps.
+with api_server(scopes=('*',)) as (api_client, owner):
+    # Blob GET
+    got_blob = api_client.read(f"/api/v1/blobs/{r1['resolved_sha']}")
+    assert got_blob['blob']['sha256'] == r1['resolved_sha']
+    assert got_blob['blob']['kind'] == 'resolved'
+    # Blob PUT mismatch -> 422
+    bad_sha = '0' * 64
+    _, raw_bad = api_client.request('PUT', f'/api/v1/blobs/{bad_sha}', b'hello',
+                                    headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-bad-1'},
+                                    status=422)
+    assert json.loads(raw_bad)['code'] == 'validation', raw_bad
+    # Blob PUT valid -> 201 and idempotent 201
+    good_body = b'pinned-blob-payload'
+    good_sha = hashlib.sha256(good_body).hexdigest()
+    _, raw1 = api_client.request('PUT', f'/api/v1/blobs/{good_sha}', good_body,
+                                 headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-good-1'},
+                                 status=201)
+    _, raw2 = api_client.request('PUT', f'/api/v1/blobs/{good_sha}', good_body,
+                                 headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-good-2'},
+                                 status=201)
+    assert json.loads(raw1)['blob']['sha256'] == good_sha
+    assert json.loads(raw2)['blob']['sha256'] == good_sha
+    # Settings RoleView.level + overrides preserved
+    s_resp = api_client.read('/api/v1/settings')['settings']
+    roles_view = {r['role']: r for r in s_resp['values']['roles']}
+    assert list(roles_view) == [r.name for r in config.ROLES]
+    assert roles_view['build']['level'] == 'config'
+    assert roles_view['build']['overrides']['steps']['build']['effort'] == 'high'
+    assert roles_view['check_repair']['level'] in ('inherit', 'engine')
+    # Null provenance when steps.resolve fails / yields empty provenance
+    assert steps.role_level(steps.resolve(config.load(), None, 'build', ''), {}) is None
+    # settings.resolved with repo & ETag / 304
+    res_hdrs, res_raw = api_client.request('GET', '/api/v1/settings/resolved?repo=sample', status=200)
+    res_data = json.loads(res_raw)
+    assert res_data['config_commit'] == state['commit2'], res_data
+    assert res_data['values']['build']['timeout_minutes'] == 7
+    assert res_data['levels']['build']['timeout_minutes']['level'] == 'config'
+    res_roles = {r['role']: r for r in res_data['roles']}
+    assert res_roles['build']['level'] == 'config'
+    etag = res_hdrs.get('ETag')
+    assert etag, res_hdrs
+    api_client.request('GET', '/api/v1/settings/resolved?repo=sample', headers={'If-None-Match': etag}, status=304)
+    # Run & Step API fields
+    run_api = api_client.read(f"/api/v1/runs/{r1['id']}")['run']
+    assert run_api['config_commit'] == commit1 and run_api['resolved_sha'] == r1['resolved_sha']
+    assert run_api['chain'] == r1['id'] and run_api['started_by']
+    steps_api = api_client.read(f"/api/v1/steps?run={r1['id']}")['steps']
+    assert steps_api and all(st['settings_sha'] and st['inputs'] for st in steps_api), steps_api
+
+# Verify `arete steps` uses settings.resolved cleanly
+buf = StringIO()
+with redirect_stdout(buf):
+    assert costs_cmd.cmd_steps(SimpleNamespace(repo='sample', kind='', json=True)) == 0
+steps_out = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+assert any(item['step'] == 'build' for item in steps_out), steps_out
+result = {'ok': True, 'commit1': commit1, 'commit2': state['commit2']}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_new_names_mid_run_never_reloads_config(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\nall = true\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[steps.build]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Mid-run unknown names', 'Body')
+orig_load = config.load
+orig_load_layer = config.load_layer
+orig_resolve = pins.resolve
+resolve_done = {'v': False}
+load_calls_after_resolve = []
+
+def strict_load(*a, **kw):
+    if resolve_done['v']:
+        load_calls_after_resolve.append((a, kw))
+    cfg = orig_load(*a, **kw)
+    if 'future_step' in cfg.steps:
+        raise ValueError('unknown step future_step')
+    return cfg
+
+def strict_load_layer(*a, **kw):
+    layer = orig_load_layer(*a, **kw)
+    if 'future_step' in layer.steps:
+        raise ValueError('unknown layer step future_step')
+    return layer
+
+def wrapped_resolve(*a, **kw):
+    res = orig_resolve(*a, **kw)
+    resolve_done['v'] = True
+    return res
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    if step_name == 'plan':
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text() + '\n[routing]\nfuture_key = true\n[steps.future_step]\nmodel = "sonnet"\n')
+        (layer_dir / 'config.toml').write_text((layer_dir / 'config.toml').read_text() + '\n[steps.future_step]\nmodel = "sonnet"\n')
+        git_run(['add', 'config.toml', 'layers/sample/config.toml'], paths.CONFIG_DIR)
+        git_run(['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-qm', 'newer engine unknown keys'], paths.CONFIG_DIR)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='ok', turns=1)
+
+def flow_fn(flow):
+    run = flow.ctx.run
+    assert run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan').ok
+    assert run.agent('build', 'build prompt', flow.ctx.ws, role='build').ok
+    return 'done', 'finished cleanly', ''
+
+with (mock.patch.object(pins, 'resolve', side_effect=wrapped_resolve),
+      mock.patch.object(config, 'load', side_effect=strict_load),
+      mock.patch.object(config, 'load_layer', side_effect=strict_load_layer),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('mid-run', flow_fn))
+assert rc == 0, rc
+assert load_calls_after_resolve == [], load_calls_after_resolve
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_engine_stamp_reaper_and_child_dirty(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Engine stamp test', 'Body')
+
+def flow_fn(flow):
+    flow.ctx.run.write_line('step_end', step='plan', result='pass')
+    return 'done', 'ok', ''
+
+rc = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('eng', flow_fn))
+assert rc == 0
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['engine_sha'] == codebase.STAMP
+doc = json.loads((paths.RUNS_DIR / r1['id'] / 'resolved.json').read_text())
+assert doc['engine_sha'] == codebase.STAMP
+lines = run_lines.read(r1['id'])
+assert lines and all(ln.get('engine') == codebase.STAMP for ln in lines), lines
+
+# Reaper with patched codebase.STAMP = 'reaper' writes error and report lines with engine = 'reaper'
+dead_id = record.start('pipeline', repo='sample', issue=tid, pid=999999999)
+with db.tx() as c:
+    c.execute("UPDATE runs SET started = '2020-01-01T00:00:00Z' WHERE id = ?", (dead_id,))
+with (mock.patch.object(codebase, 'STAMP', 'reaper'),
+      mock.patch.object(util, 'pid_alive', return_value=False)):
+    pipeline.settle_abandoned_runs(config.load())
+reaped_lines = run_lines.read(dead_id)
+by_ev = {ln['event']: ln for ln in reaped_lines}
+assert 'error' in by_ev and by_ev['error']['engine'] == 'reaper', reaped_lines
+assert 'report' in by_ev and by_ev['report']['engine'] == 'reaper', reaped_lines
+
+# Child started through control.command from a copied git repo after 2nd commit and dirty edit
+copied = root / 'arete-copy'
+copied.mkdir()
+git_run(['init', '-q', '-b', 'main'], copied)
+shutil.copytree(paths.PACKAGE_DIR, copied / 'arete', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+(copied / 'adws').mkdir()
+git_run(['add', '.'], copied)
+git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'first'], copied)
+sha1 = git_run(['rev-parse', '--short=12', 'HEAD'], copied).stdout.strip()
+(copied / 'arete' / '_marker.py').write_text('X = 1\n')
+git_run(['add', '.'], copied)
+git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'second'], copied)
+sha2 = git_run(['rev-parse', '--short=12', 'HEAD'], copied).stdout.strip()
+assert sha1 != sha2
+
+child_env = {**os.environ, 'PYTHONPATH': str(copied)}
+child_cmd = [sys.executable, '-c', 'from arete import codebase; print(codebase.load())']
+out_clean = subprocess.run(child_cmd, cwd=copied, env=child_env, check=True, capture_output=True, text=True).stdout.strip()
+assert out_clean == sha2, (out_clean, sha2)
+(copied / 'arete' / '_marker.py').write_text('X = 2\n')
+out_dirty = subprocess.run(child_cmd, cwd=copied, env=child_env, check=True, capture_output=True, text=True).stdout.strip()
+assert out_dirty.startswith(sha2 + '+dirty.'), out_dirty
+result = {'ok': True, 'sha2': sha2, 'dirty': out_dirty}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_stored_steps_schema_and_contract_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\nall = true\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[steps.build]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Stored step schema test', 'Body')
+calls = []
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    calls.append(step_name)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='{"plan":"p"}',
+                         structured={'plan': 'p', 'verify': 'v'}, turns=1)
+
+def do_plan(flow):
+    res = flow.ctx.run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    return factory.Outcome(data={'plan': res.structured['plan']}, result='pass')
+
+def parked_flow(flow):
+    flow.step('plan')
+    if not flow.continues:
+        return 'needs-info', 'parked waiting', ''
+    return 'done', 'continued done', ''
+
+# Run 1: executes plan and parks
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc1 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow))
+assert rc1 == 0
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['status'] == 'needs-info' and calls == ['plan']
+
+# Run 2: PLAN_SCHEMA gains one property -> plan runs again under continuation!
+extended_schema = {
+    **pipeline.PLAN_SCHEMA,
+    'properties': {**pipeline.PLAN_SCHEMA['properties'], 'extra_field': {'type': 'string'}},
+}
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(pipeline, 'PLAN_SCHEMA', extended_schema),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc2 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow, continues=r1['id'], restart='resume'))
+assert rc2 == 0
+r2 = run_store.newest_whole_run('sample', tid)
+assert calls == ['plan', 'plan'], calls
+assert any(s['step'] == 'plan' for s in run_store.steps(r2['id']))
+
+# Run 3: contract migration added above r1.schema_version -> takes no stored step even with same schema!
+calls.clear()
+with db.tx() as c:
+    c.execute(
+        "INSERT INTO schema_migrations (n, name, area, phase, sha256, applied) VALUES (?, 'm9999_future_contract.py', 'runs', 'contract', '0', ?)",
+        (r1['schema_version'] + 10, util.iso()),
+    )
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc3 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow, continues=r1['id'], restart='resume'))
+assert rc3 == 0
+assert calls == ['plan'], calls
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PinnedRunLineageTests(_PinnedRunCase):
+    def test_lineage_restarts_chain_and_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Lineage ticket', 'Body')
+
+# 1. Fresh run: restart='', chain == id
+def finish_flow(status='done'):
+    def _fn(flow):
+        return status, status, ''
+    return _fn
+
+assert pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', finish_flow('needs-info'))) == 0
+r_fresh = run_store.newest_whole_run('sample', tid)
+assert r_fresh['restart'] == '' and r_fresh['chain'] == r_fresh['id'] and r_fresh['continues'] is None
+
+# 2. tasks.continuing passes --restart answer; factory.main parses it and records restart='answer'
+ask_store.ask_add('ask-1', r_fresh['id'], 'sample', tid, 'plan', 'ask', 'why', 'tried',
+                  [{'q': 'which?'}], {}, recovery_route='owner')
+ask_store.ask_close('ask-1', 'answered', [{'text': 'yes'}])
+cfg_now = config.load()
+cont_argv = tasks.continuing(cfg_now, cfg_now.repo('sample'), r_fresh)
+assert '--restart' in cont_argv and cont_argv[cont_argv.index('--restart') + 1] == 'answer', cont_argv
+
+assert pipeline.run_issue('sample', tid, force=True,
+                          script=pipeline.Script('feature', finish_flow('failed'), continues=r_fresh['id'], restart='answer')) == 1
+r_answer = run_store.newest_whole_run('sample', tid)
+assert r_answer['continues'] == r_fresh['id'] and r_answer['restart'] == 'answer' and r_answer['chain'] == r_fresh['id']
+
+# 3. tasks.resume -> restart='resume'
+assert pipeline.run_issue('sample', tid, force=True,
+                          script=pipeline.Script('feature', finish_flow('done'), continues=r_answer['id'], restart='resume')) == 0
+r_resume = run_store.newest_whole_run('sample', tid)
+assert r_resume['continues'] == r_answer['id'] and r_resume['restart'] == 'resume' and r_resume['chain'] == r_fresh['id']
+
+# 4. factory.earlier (--only) -> restart='step'
+def only_plan_flow(flow):
+    flow.step('plan')
+    return 'done', 'done', ''
+with mock.patch.dict(factory.STEPS, {'plan': lambda fl: factory.Outcome(data={}, result='pass')}):
+    assert pipeline.run_issue('sample', tid, force=True,
+                              script=pipeline.Script('feature', only_plan_flow, continues=r_resume['id'], only='plan', restart='step')) == 0
+r_step = run_store.runs(kind='pipeline', limit=1)[0]
+assert r_step['continues'] == r_resume['id'] and r_step['restart'] == 'step' and r_step['chain'] == r_fresh['id']
+
+# 5. Interrupted restart -> restart='interrupted'
+int_id = record.start('pipeline', repo='sample', issue=tid)
+record.interrupt(run_store.run_get(int_id))
+assert pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', finish_flow('done'))) == 0
+r_int = run_store.newest_whole_run('sample', tid)
+assert r_int['continues'] == int_id and r_int['restart'] == 'interrupted' and r_int['chain'] == int_id
+
+# 6. Deleting all route lines from run.jsonl still walks factory.chain via runs.continues
+for rid in (r_fresh['id'], r_answer['id'], r_resume['id'], r_step['id']):
+    p = paths.RUNS_DIR / rid / 'run.jsonl'
+    if p.exists():
+        kept = [ln for ln in p.read_text().splitlines() if '"route"' not in ln]
+        p.write_text('\n'.join(kept) + ('\n' if kept else ''))
+chain_ids = [lines[0]['run'] for lines in factory.chain(r_step['id'])]
+assert chain_ids == [r_step['id'], r_resume['id'], r_answer['id'], r_fresh['id']], chain_ids
+
+# 7. Loop retry with last_run (#289 + #868) sets continues=last_run and restart='interrupted'
+loop_dir = paths.CONFIG_DIR / 'loops' / 'ping'
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / 'loop.toml').write_text('kind = "command"\n[run]\ncommand = "true"\n')
+configrepo.commit_hand_edits()
+prev_loop = record.start('loop', loop='ping', loop_kind='command')
+record.settle(prev_loop, 'interrupted', summary='interrupted')
+with db.tx() as c:
+    qid = c.execute(
+        "INSERT INTO queue (loop, queue, trigger, grp, payload, enqueued, last_run) VALUES ('ping', 'ping', 'manual', '', '[]', ?, ?)",
+        (util.iso(), prev_loop),
+    ).lastrowid
+launched = loop_run.launch('ping', item=qid, detach=False)
+assert launched['continues'] == prev_loop and launched['restart'] == 'interrupted' and launched['chain'] == prev_loop
+
+# 8. Migration m0040 backfill on a seeded schema-39 DB
+mig_root = root / 'mig-lineage'
+mig_state = mig_root / 'state'
+mig_state.mkdir(parents=True)
+with mock.patch.multiple(paths, STATE_DIR=mig_state, DB_FILE=mig_state / 'arete.db',
+                         RUNS_DIR=mig_state / 'runs', LOCKS_DIR=mig_state / 'locks'):
+    chain44 = [m for m in db.migrations.load() if m.n <= 44]
+    with mock.patch.object(db.migrations, 'load', return_value=chain44):
+        db.migrate()
+    owner_id = principals.seed_owner('owner@mig.test')
+    with db.tx() as c:
+        for idx, rid in enumerate(('r-fresh', 'r-step', 'r-ans', 'r-int', 'r-res'), 1):
+            c.execute("INSERT INTO runs (id, kind, status, started, repo, issue) VALUES (?, 'pipeline', 'done', ?, 'sample', '1')",
+                      (rid, f'2026-01-01T00:00:0{idx}Z'))
+        c.execute("INSERT INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, status, taken_by) "
+                  "VALUES ('a1', 'r-fresh', 'sample', '1', 'plan', 'ask', 'w', 't', '[]', '2026-01-01T00:00:01Z', 'answered', 'r-ans')")
+    (mig_state / 'runs' / 'r-step').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-step' / 'run.jsonl').write_text(json.dumps({'event': 'route', 'continues': 'r-fresh', 'only': 'plan'}) + '\n')
+    (mig_state / 'runs' / 'r-ans').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-ans' / 'run.jsonl').write_text(json.dumps({'event': 'route', 'continues': 'r-fresh'}) + '\n')
+    (mig_state / 'runs' / 'r-int').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-int' / 'run.log').write_text('restarting after run r-fresh was interrupted\n')
+    (mig_state / 'runs' / 'r-res').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-res' / 'run.jsonl').write_text(json.dumps({'event': 'repair', 'source': 'r-ans'}) + '\n')
+    db.migrate()
+    with db.reader() as c:
+        rows = {r['id']: dict(r) for r in c.execute('SELECT rowid AS rid_num, * FROM runs')}
+    assert rows['r-fresh']['restart'] == '' and rows['r-fresh']['chain'] == 'r-fresh'
+    assert rows['r-step']['restart'] == 'step' and rows['r-step']['continues'] == 'r-fresh' and rows['r-step']['chain'] == 'r-fresh'
+    assert rows['r-ans']['restart'] == 'answer' and rows['r-ans']['continues'] == 'r-fresh' and rows['r-ans']['chain'] == 'r-fresh'
+    assert rows['r-int']['restart'] == 'interrupted' and rows['r-int']['continues'] == 'r-fresh' and rows['r-int']['chain'] == 'r-fresh'
+    assert rows['r-res']['restart'] == 'resume' and rows['r-res']['continues'] == 'r-ans' and rows['r-res']['chain'] == 'r-fresh'
+    assert all(r['payer'] == owner_id and r['seq'] == r['rid_num'] for r in rows.values())
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_payer_resolution_and_routing_enforcement(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+owner = principals.seed_owner('owner@example.test')
+with db.tx() as c:
+    c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('multi_user', 'ready')")
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-a', 'human', 'member', 'active', 'A', ?)", (util.iso(),))
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-b', 'human', 'member', 'active', 'B', ?)", (util.iso(),))
+
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[automation]\n'
+    f'payer = {json.dumps(owner)}\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+
+# 1. Person A -> started_by = payer = A
+with principals.acting('u:person-a'):
+    r_a = run_store.run_get(record.start('pipeline', repo='sample', issue='1'))
+assert r_a['started_by'] == 'u:person-a' and r_a['payer'] == 'u:person-a'
+
+# 2. Poller with automation.payer -> started_by = rule:poll, payer = owner
+with principals.acting('rule:poll'):
+    r_poll = run_store.run_get(record.start('pipeline', repo='sample', issue='2'))
+assert r_poll['started_by'] == 'rule:poll' and r_poll['payer'] == owner
+
+# 3. Poller without automation.payer -> payer = NULL
+commit_cfg('config.toml', paths.CONFIG_FILE.read_text().replace(f'[automation]\npayer = {json.dumps(owner)}\n', ''), 'drop auto payer')
+with principals.acting('rule:poll'):
+    r_null = run_store.run_get(record.start('pipeline', repo='sample', issue='3'))
+assert r_null['started_by'] == 'rule:poll' and r_null['payer'] is None
+
+# 4. Loop [run] payer = A
+loop_dir = paths.CONFIG_DIR / 'loops' / 'paid-loop'
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / 'loop.toml').write_text('kind = "command"\n[run]\ncommand = "true"\npayer = "u:person-a"\n')
+configrepo.commit_hand_edits()
+r_loop = loop_run.launch('paid-loop', detach=False)
+assert r_loop['payer'] == 'u:person-a'
+
+# 5. Interrupted restart keeps continued run's payer; resume as person B has payer B
+with principals.acting('rule:poll'):
+    r_int = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='interrupted'))
+assert r_int['payer'] == 'u:person-a'
+with principals.acting('u:person-b'):
+    r_res_b = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='resume'))
+assert r_res_b['started_by'] == 'u:person-b' and r_res_b['payer'] == 'u:person-b'
+
+# 6. routing.select personal vs workspace account enforcement
+personal_auth = accounts.Auth(provider='anthropic', mode='subscription', identity='acct-personal', credential='cred-p')
+work_auth = accounts.Auth(provider='anthropic', mode='api-key', identity='acct-work', credential='cred-w')
+with db.tx() as c:
+    now = util.iso()
+    c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES ('acct-personal', 'anthropic', 'acct-personal', 'subscription', 'u:person-a', 'personal', 'fp-p', ?)", (now,))
+    c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES ('acct-work', 'anthropic', 'acct-work', 'api-key', 'workspace', 'workspace', 'fp-w', ?)", (now,))
+
+from dataclasses import replace as dc_replace
+cfg = config.load()
+link_personal = routing.Link('sonnet', 'claude', 'anthropic', 't1', 0, True, '', ())
+link_work = routing.Link('sonnet', 'pi', 'anthropic', 't1', 1, False, '', ())
+step_s = dc_replace(steps.resolve(cfg, None, 'build', ''), runner='claude', model='sonnet', provider='anthropic',
+                    chain=(link_personal, link_work), fallback=True)
+way_personal = routing.Way(link_personal, 'claude', 'sonnet', 'cred-p', 'free', 'subscription')
+way_work = routing.Way(link_work, 'pi', 'sonnet', 'cred-w', 'paid', 'api_key')
+
+def fake_auth_for(self, way):
+    return personal_auth if way.runner == 'claude' else work_auth
+
+def fake_ways(self, link):
+    return [way_personal] if link.runner == 'claude' else [way_work]
+
+def fake_probe(self, model, mode=''):
+    return SimpleNamespace(token_error='', login_available=True, key_available=True, error='',
+                           auth=work_auth, model='sonnet', provider='anthropic', hidden=(), models={})
+
+with (mock.patch.object(routing.Discovery, 'auth_for_way', fake_auth_for),
+      mock.patch.object(routing.Discovery, 'ways', fake_ways),
+      mock.patch.object(routing.Discovery, 'probe', fake_probe)):
+    sel_a = routing.select(routing.Discovery(cfg, payer='u:person-a'), step_s)
+    sel_b = routing.select(routing.Discovery(cfg, payer='u:person-b'), step_s)
+    sel_null = routing.select(routing.Discovery(cfg, payer=None), step_s)
+assert sel_a.kept is True, sel_a
+assert sel_b.kept is False and sel_b.route is not None and sel_b.route.runner == 'pi', sel_b
+assert sel_null.kept is False and sel_null.route is not None and sel_null.route.runner == 'pi', sel_null
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_run_order_seq_and_rebuild_invariance(self):
+        result = self.run_pinned(r"""
+# 1. Static check: no rowid reference against runs in arete/
+bad_hits = []
+for py in paths.PACKAGE_DIR.rglob('*.py'):
+    text = py.read_text()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        low = line.lower()
+        if 'rowid' in low and ('runs' in low or 'later.rowid' in low or 'r.rowid' in low or 'r2.rowid' in low):
+            if 'step_inputs' not in low and 'runs_seq' not in low and 'task_comments' not in low:
+                bad_hits.append(f'{py.name}:{lineno}:{line.strip()}')
+assert bad_hits == [], bad_hits
+
+# 2. Insert whole runs A then B with an open ask on A
+id_a = record.start('pipeline', run_id='pip-z-first', repo='sample', issue='42')
+record.settle(id_a, 'needs-info', summary='waiting')
+ask_store.ask_add('ask-a', id_a, 'sample', '42', 'plan', 'ask', 'why', 'tried', [{'q': 'q'}], {})
+id_b = record.start('pipeline', run_id='pip-a-second', repo='sample', issue='42')
+record.settle(id_b, 'done', summary='finished')
+
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM runs WHERE seq IS NULL').fetchone()[0] == 0
+
+# 3. Rebuild runs table copying rows in REVERSE id/seq order (which swaps rowids)
+with db.tx() as c:
+    rows = [dict(r) for r in c.execute('SELECT * FROM runs ORDER BY seq DESC')]
+    c.execute('DELETE FROM runs')
+    cols = list(rows[0].keys())
+    ph = ','.join('?' for _ in cols)
+    for row in rows:
+        c.execute(f"INSERT INTO runs ({', '.join(cols)}) VALUES ({ph})", [row[k] for k in cols])
+    rowids = {r['id']: r['rid'] for r in c.execute('SELECT id, rowid AS rid FROM runs')}
+assert rowids[id_b] < rowids[id_a], rowids
+
+# 4. later_run and open_asks still follow seq order, NOT rowid order!
+later_a = run_store.later_run('sample', '42', id_a)
+assert later_a is not None and later_a['id'] == id_b, later_a
+assert run_store.later_run('sample', '42', id_b) is None
+assert all(a['id'] != 'ask-a' for a in ask_store.open_asks())
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PinnedRunChatEvalTests(_PinnedRunCase):
+    def test_chat_runs_exclusions_and_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    'arete_repo = "sample"\n'
+    '[replay]\nall = true\n'
+    '[steps.chat]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+with db.tx() as c:
+    c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('multi_user', 'ready')")
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-a', 'human', 'member', 'active', 'A', ?)", (util.iso(),))
+
+cid = chat_store.chat_add('sample')
+mid = chat_store.chat_claim(cid, 'Hello chat', 'Hello chat')
+fake_res = runner.Result(ok=True, runner='replay', model='sonnet', text='{"reply":"Hi back","notes":[]}',
+                         structured={'reply': 'Hi back', 'notes': []}, cost_usd=0.05, tokens_in=10, tokens_out=5, turns=1)
+with (principals.acting('u:person-a'),
+      mock.patch.object(replay, 'run', return_value=fake_res)):
+    chat.reply_to(cid, 'Hello chat', mid, 'sample')
+
+chat_runs = run_store.runs(kind='chat', limit=10)
+assert len(chat_runs) == 1, chat_runs
+cr = chat_runs[0]
+assert cr['started_by'] == 'u:person-a' and cr['payer'] == 'u:person-a' and cr['resolved_sha'], cr
+assert cr['status'] == 'done', cr
+chat_steps = run_store.steps(cr['id'])
+assert len(chat_steps) == 1, chat_steps
+assert run_store.steps('chat') == []
+
+# Excluded from runs(), board.snapshot, auditor.run_stats
+assert all(r['kind'] != 'chat' for r in run_store.runs(limit=50))
+snap = board.snapshot()
+assert all(r['kind'] != 'chat' for r in snap['recent']['rows']), snap['recent']
+assert all(r['kind'] != 'chat' for r in snap['live']['rows']['runs']), snap['live']
+stats = auditor.run_stats()
+assert all(r.get('kind') != 'chat' for r in stats), stats
+
+# Migration m0041 backfills seeded 'chat' steps into one 'chat' run row and doctor reports no 'chat' line and no orphan
+mig_state = root / 'mig-chat' / 'state'
+mig_state.mkdir(parents=True)
+with mock.patch.multiple(paths, STATE_DIR=mig_state, DB_FILE=mig_state / 'arete.db',
+                         RUNS_DIR=mig_state / 'runs', LOCKS_DIR=mig_state / 'locks'):
+    chain45 = [m for m in db.migrations.load() if m.n <= 45]
+    with mock.patch.object(db.migrations, 'load', return_value=chain45):
+        db.migrate()
+    owner_id = principals.seed_owner('owner@chatmig.test')
+    with db.tx() as c:
+        c.execute("INSERT INTO steps (run_id, step, runner, model, ok, cost_usd, tokens_in, tokens_out, ts) "
+                  "VALUES ('chat', 'chat', 'replay', 'sonnet', 1, 0.10, 100, 50, '2026-01-01T00:00:01Z')")
+        c.execute("INSERT INTO steps (run_id, step, runner, model, ok, cost_usd, tokens_in, tokens_out, ts) "
+                  "VALUES ('chat', 'chat', 'replay', 'sonnet', 1, 0.20, 200, 80, '2026-01-01T00:00:02Z')")
+    db.migrate()
+    backfilled = run_store.run_get('chat')
+    assert backfilled is not None and backfilled['kind'] == 'chat' and backfilled['payer'] == owner_id
+    assert abs(backfilled['cost_usd'] - 0.30) < 1e-6
+    doc_results = doctor.run()
+    assert 'chat' not in doctor.NAMES
+    assert not any(r.name == 'chat' for r in doc_results)
+    orphans = next(r for r in doc_results if r.name == 'orphans')
+    assert orphans.count == 0, orphans
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_evals_pin_regression_and_legacy_fallback(self):
+        result = self.run_pinned(r"""
+sample_dir = root / 'opt-sample'
+sample_lines = optimize.sample(sample_dir)
+layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO
+shutil.copytree(sample_dir / 'layer', layer_dest)
+rewritten = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line
+             for line in sample_lines if not line.startswith('#')]
+cfg_text = optimize.edited('\n'.join(rewritten) + '\n', 'models', {'build': 'scratch-a'})
+paths.CONFIG_FILE.write_text(cfg_text)
+configrepo.init()
+
+# Run 3 passing evals
+with redirect_stdout(StringIO()):
+    for _ in range(3):
+        assert evals.run(replay.SAMPLE_REPO, 'word-train') == 0
+
+runs_before = run_store.runs(kind='eval', limit=10)
+assert len(runs_before) == 3
+for r in runs_before:
+    assert r['resolved_sha'] and r['engine_sha'] == codebase.STAMP
+
+# Mutate build model -> scratch-b, add a line to build.md in --prompts dir, and change overlaid harness file (CLAUDE.md)
+commit_cfg('config.toml', cfg_text.replace('scratch-a', 'scratch-b'), 'bump build model')
+custom_prompts = root / 'custom-prompts'
+shutil.copytree(paths.PROMPTS_DIR, custom_prompts)
+(custom_prompts / 'build.md').write_text((custom_prompts / 'build.md').read_text() + '\n# extra line\n')
+repo_obj = config.load().repo(replay.SAMPLE_REPO)
+(repo_obj.path / 'CLAUDE.md').write_text('# changed harness\n')
+
+# 4th run fails -> REGRESSED names build model, prompts, and harness
+orig_run_task = evals.run_task
+def failing_fourth(cfg, src, task, prompts_arg, run_obj):
+    res = orig_run_task(cfg, src, task, prompts_arg, run_obj)
+    res.passed = False
+    res.why = 'forced regression'
+    return res
+
+buf = StringIO()
+with mock.patch.object(evals, 'run_task', side_effect=failing_fourth), redirect_stdout(buf):
+    assert evals.run(replay.SAMPLE_REPO, 'word-train', prompts=evals.Prompts(custom_prompts, 'custom')) == 0
+
+out = buf.getvalue()
+assert 'REGRESSED:' in out, out
+reg_line = next(ln for ln in out.splitlines() if 'REGRESSED:' in ln)
+assert 'build model' in reg_line and 'prompts' in reg_line and 'harness' in reg_line, reg_line
+
+runs_after = run_store.runs(kind='eval', limit=10)
+assert runs_after[0]['resolved_sha'] != runs_before[0]['resolved_sha']
+assert runs_after[0]['engine_sha'] == codebase.STAMP
+
+# Each evals row joins only its own step range's step_inputs, and pre-pin evals row still reads interim values
+hist = insights_store.task_history(replay.SAMPLE_REPO, 'word-train', 4)
+assert len(hist) == 3 and all(h['run_id'] for h in hist), hist
+hist_custom = insights_store.task_history(replay.SAMPLE_REPO, 'word-train', 4, source='worktree with prompts custom')
+assert len(hist_custom) == 1 and hist_custom[0]['run_id'] == runs_after[0]['id'], hist_custom
+raw_eval = insights_store.eval_rows(runs_after[0]['id'])[0]
+assert raw_eval['engine_sha'] == '' and raw_eval['prompts_sha'] == '' and raw_eval['settings'] == ''
+step_ids_4 = [s['id'] for s in run_store.steps(runs_after[0]['id'])]
+assert step_ids_4 and all(raw_eval['after_step'] < sid <= raw_eval['last_step'] for sid in step_ids_4)
+
+legacy_row = {
+    'run_id': 'legacy-unpinned-eval',
+    'engine_sha': 'old-engine',
+    'prompts_sha': 'old-prompts',
+    'base_commit': 'abc',
+    'context_sha': 'old-ctx',
+    'settings': json.dumps({'models': {'build': 'old-model'}}),
+}
+assert evals.has_lineage(legacy_row)
+diff_legacy = evals.lineage_changes(legacy_row, hist_custom[0])
+assert any('old-model' in d for d in diff_legacy) and 'prompts' in diff_legacy, diff_legacy
+result = {'ok': True, 'reg_line': reg_line}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_trials_pin_prompts_and_harness(self):
+        result = self.run_pinned(r"""
+sample_dir = root / 'opt-sample'
+sample_lines = optimize.sample(sample_dir)
+layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO
+shutil.copytree(sample_dir / 'layer', layer_dest)
+rewritten = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line
+             for line in sample_lines if not line.startswith('#')]
+paths.CONFIG_FILE.write_text('\n'.join(rewritten) + '\n')
+configrepo.init()
+
+cfg = config.load()
+repo_obj = cfg.repo(replay.SAMPLE_REPO)
+arm_prompts = root / 'arm-prompts'
+shutil.copytree(paths.PROMPTS_DIR, arm_prompts)
+(repo_obj.path / 'CLAUDE.md').write_text('# original harness\n')
+
+base_sha = git_run(['rev-parse', 'HEAD'], repo_obj.path).stdout.strip()
+exp = experiment.designed({
+    'name': 'sample-trial',
+    'repo': replay.SAMPLE_REPO,
+    'atom': 'build',
+    'repeats': 1,
+    'arms': {'base': {'effort': 'medium'}, 'trial': {'effort': 'low', 'prompts': str(arm_prompts)}},
+    'tasks': {'word-train': {'split': 'train', 'base': base_sha}},
+    'accept': {'baseline': 'base', 'split': 'train'},
+    'limits': {'spend_usd': 10.0, 'minutes': 10, 'calls': 50, 'tokens': 100000},
+})
+trail = root / 'trail.jsonl'
+trail.write_text('')
+
+orig_prepare = evals.prepare
+overlay_claude_seen = []
+
+def wrapped_prepare(repo_arg, src_arg, wt_arg, run_arg):
+    # Edit harness file on disk right BEFORE evals.prepare; pinned blob overlay must ignore this edit!
+    (repo_obj.path / 'CLAUDE.md').write_text('# mutated mid-trial harness\n')
+    layer_out = orig_prepare(repo_arg, src_arg, wt_arg, run_arg)
+    overlay_claude_seen.append((wt_arg / 'CLAUDE.md').read_text())
+    return layer_out
+
+orig_run = runner.run
+def wrapped_runner(prompt_text, cwd, **kw):
+    step_name = kw.get('trace', ('', ''))[1]
+    if step_name == 'plan':
+        # Append to arm's build.md AFTER plan; build's rendered prompt must NOT include this line!
+        (arm_prompts / 'build.md').write_text((arm_prompts / 'build.md').read_text() + '\nMUTATED_AFTER_PLAN\n')
+    return orig_run(prompt_text, cwd, **kw)
+
+with (mock.patch.object(evals, 'prepare', side_effect=wrapped_prepare),
+      mock.patch.object(runner, 'run', side_effect=wrapped_runner)):
+    experiment.run_trial(exp, trail, 'word-train', 'trial', 1, experiment.Totals(), {})
+
+trial_runs = run_store.runs(kind='experiment', limit=5)
+assert len(trial_runs) == 1, trial_runs
+tr = trial_runs[0]
+assert tr['resolved_sha'] and tr['engine_sha'] == codebase.STAMP
+steps_tr = run_store.steps(tr['id'])
+assert steps_tr
+inputs_tr = run_store.step_inputs_by_run(tr['id'])
+build_step = next(s for s in steps_tr if s['step'] == 'build')
+rendered_build = next(i for i in inputs_tr[build_step['id']] if i['role'] == 'rendered')
+build_text = blob_store.read(rendered_build['sha256']).decode('utf-8')
+assert 'MUTATED_AFTER_PLAN' not in build_text
+assert overlay_claude_seen == ['# original harness\n'], overlay_claude_seen
+result = {'ok': True, 'run_id': tr['id']}
+""")
+        self.assertTrue(result["ok"])
+
+
+DEVICE_LEASE_HELPER = r"""
+import concurrent.futures
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import timedelta
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from arete import (
+    accounts,
+    api,
+    cli,
+    config,
+    configrepo,
+    control,
+    dashboard,
+    devices,
+    exedev,
+    gh,
+    inbox,
+    leases,
+    loop_run,
+    loops,
+    outbound,
+    paths,
+    principals,
+    proxmox,
+    record,
+    replay,
+    retention,
+    secretstore,
+    serve,
+    ssh,
+    tailnet,
+    util,
+)
+from arete.store import config as config_store
+from arete.store import db as foundation
+from arete.store import devices as device_store
+from arete.store import loops as loop_store
+from arete.store import migrations
+from arete.store import retention as retention_store
+from arete.store import runs as run_store
+from arete.store import tokens as token_store
+
+
+def _forbid(*args, **kwargs):
+    raise AssertionError("forbidden external call")
+
+
+def install_offline_guards():
+    urllib.request.urlopen = _forbid
+    accounts.read = _forbid
+    gh.gh = _forbid
+
+
+def setup_scratch(migrate_through=None, *, include_devices=True):
+    install_offline_guards()
+    paths.ensure_dirs()
+    sample_dir = Path(os.environ["TMPDIR"]) / "replay-sample"
+    if not sample_dir.exists():
+        sample_lines = replay.sample(sample_dir)
+    else:
+        sample_lines = []
+    cfg_file = paths.CONFIG_DIR / "config.toml"
+    if not cfg_file.exists():
+        import shutil as _shutil
+
+        local_layer = paths.CONFIG_DIR / "layers" / "replay-sample"
+        if (sample_dir / "layer").is_dir() and not local_layer.exists():
+            local_layer.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copytree(sample_dir / "layer", local_layer)
+        rewritten = [
+            f'layer = {json.dumps(str(local_layer))}' if line.strip().startswith("layer =") else line
+            for line in sample_lines
+        ]
+        store_dir = Path(os.environ["TMPDIR"]) / "secret-store"
+        store_dir.mkdir(mode=0o700, exist_ok=True)
+        cfg_file.write_text(
+            "\n".join(rewritten)
+            + f'\n[secrets]\nstore = "pve_store"\nstore_dir = {json.dumps(str(store_dir))}\n',
+            encoding="utf-8",
+        )
+    if include_devices:
+        dev_dir = paths.CONFIG_DIR / "devices"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        (dev_dir / "prox.toml").write_text(
+            'kind = "proxmox"\nhost = "root@prox.test"\ntemplate = "9000"\nnote = "proxmox host"\n',
+            encoding="utf-8",
+        )
+        (dev_dir / "box.toml").write_text(
+            'kind = "ssh"\nhost = "box@box.test"\nnote = "build box"\n',
+            encoding="utf-8",
+        )
+        (dev_dir / "sand.toml").write_text(
+            'kind = "exe"\nnote = "exe sandbox"\n',
+            encoding="utf-8",
+        )
+    if migrate_through is None:
+        foundation.migrate()
+    else:
+        foundation.migrate(through=migrate_through)
+    principals.seed_owner("owner@example.test")
+    with foundation.tx(fenced=False) as c:
+        token_store.ensure_key(c)
+    configrepo.init()
+    configrepo.reconcile()
+
+
+class FakeProxmoxHost:
+    def __init__(self, root: Path, *, always_collide=False, storage_exists=False,
+                 fail_destroy=False, nextid_timeout=False, nextid_barrier_dir: Path | None = None):
+        self.root = root
+        self.vms_dir = root / "pve-vms"
+        self.vms_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = root / "pve-calls.log"
+        self.always_collide = always_collide
+        self.storage_exists = storage_exists
+        self.fail_destroy = fail_destroy
+        self.nextid_timeout = nextid_timeout
+        self.nextid_barrier_dir = nextid_barrier_dir
+        self.exe_vms: set[str] = set()
+        self.ssh_calls: list[list[str]] = []
+
+    def _log(self, line: str):
+        with self.log_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def calls(self) -> list[str]:
+        if not self.log_file.exists():
+            return []
+        return self.log_file.read_text(encoding="utf-8").splitlines()
+
+    def sh(self, argv, *, timeout=None, **kwargs):
+        cmd = argv if isinstance(argv, list) else [str(argv)]
+        self.ssh_calls.append(cmd)
+        if not cmd or cmd[0] != "ssh":
+            return subprocess.CompletedProcess(cmd, 0, "Linux x86_64\n/home/local\nhas:claude\n", "")
+        dest = cmd[-2]
+        remote = cmd[-1]
+        self._log(f"{dest}: {remote}")
+
+        if "root@prox.test" in dest:
+            if remote.startswith("pvesh get /cluster/nextid"):
+                if self.nextid_timeout:
+                    return subprocess.CompletedProcess(cmd, util.TIMED_OUT, "", "timed out")
+                vmid = 100
+                while (self.vms_dir / f"{vmid}.conf").exists():
+                    vmid += 1
+                if self.nextid_barrier_dir is not None and not (self.nextid_barrier_dir / "released").exists():
+                    self.nextid_barrier_dir.mkdir(parents=True, exist_ok=True)
+                    mine = self.nextid_barrier_dir / f"pid-{os.getpid()}"
+                    mine.write_text("ready", encoding="utf-8")
+                    deadline = time.monotonic() + 5
+                    while len(list(self.nextid_barrier_dir.glob("pid-*"))) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    (self.nextid_barrier_dir / "released").write_text("go", encoding="utf-8")
+                else:
+                    time.sleep(0.01)
+                return subprocess.CompletedProcess(cmd, 0, f"{vmid}\n", "")
+            if m := re.match(r"qm clone (\d+) (\d+) --name (\S+) --full 0", remote):
+                _, vmid_s, name = m.groups()
+                if self.storage_exists:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"lvcreate failed: storage volume vm-{vmid_s}-disk-0 already exists"
+                    )
+                if self.always_collide:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"unable to create VM {vmid_s}: config file already exists"
+                    )
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                try:
+                    fd = os.open(conf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"unable to create VM {vmid_s}: config file already exists"
+                    )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"name: {name}\n")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if m := re.match(r"qm config (\d+)\b", remote):
+                vmid_s = m.group(1)
+                if "grep" in remote:
+                    return subprocess.CompletedProcess(cmd, 0, "name: tpl\ntemplate: 1\nmemory: 4096\ncores: 2\n", "")
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                if not conf.exists():
+                    return subprocess.CompletedProcess(cmd, 2, "", f"Configuration file 'nodes/pve/qemu-server/{vmid_s}.conf' does not exist")
+                return subprocess.CompletedProcess(cmd, 0, conf.read_text(encoding="utf-8"), "")
+            if m := re.match(r"qm start (\d+)", remote):
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if m := re.match(r"qm stop (\d+).*qm destroy (\d+)", remote):
+                vmid_s = m.group(2)
+                if self.fail_destroy:
+                    return subprocess.CompletedProcess(cmd, 1, "", "host unreachable")
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                if conf.exists():
+                    conf.unlink()
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        if "box@box.test" in dest:
+            if "uname -sm" in remote:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "Linux x86_64\n/home/box\nhas:claude\nhas:pi\ngpu:RTX 4090, 24564 MiB\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        if ssh.EXE_LOBBY in dest:
+            if remote.startswith("new "):
+                m = re.search(r"--name=(\S+)", remote)
+                name = m.group(1) if m else "arete-sand"
+                self.exe_vms.add(name)
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"ssh_dest": f"{name}{ssh.EXE_VM_DOMAIN}"}), "")
+            if remote.startswith("integrations ls"):
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            if remote.startswith("rm "):
+                parts = remote.split()
+                name = parts[1]
+                if self.fail_destroy:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"errors": {name: "rm failed"}}), "")
+                if name in self.exe_vms:
+                    self.exe_vms.discard(name)
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"deleted": [name]}), "")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"not_found": [name]}), "")
+            return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+        if ssh.is_exe_vm(dest):
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    @contextmanager
+    def patched(self):
+        def fake_address(boot):
+            return f"10.0.0.{boot.vmid}"
+
+        def fake_trusted(boot, address, known_hosts):
+            known_hosts.write_text(f"{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTestOnly\n", encoding="utf-8")
+            return replace(boot.proxmox, name=f"{boot.proxmox.name} clone", kind="ssh",
+                           host=f"{boot.proxmox.user}@{address}", port=None, jump="",
+                           via=boot.proxmox, known_hosts=str(known_hosts))
+
+        with (
+            mock.patch.object(util, "sh", side_effect=self.sh),
+            mock.patch.object(devices, "clone_address", side_effect=fake_address),
+            mock.patch.object(devices, "trusted_clone", side_effect=fake_trusted),
+        ):
+            yield
+"""
+
+
+class DeviceLeaseTests(unittest.TestCase):
+    class_timeout = 30
+
+    def _run_child(self, code: str, *, env_extra: dict[str, str] | None = None, timeout: float = 25) -> subprocess.CompletedProcess:
+        root = Path(tempfile.mkdtemp(prefix="arete-devlease-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        env = {
+            k: os.environ[k]
+            for k in ("PATH", "LANG", "LC_ALL", "ARETE_TEST_FAST_SYNC", "ARETE_DRIVE_FLUSH")
+            if k in os.environ
+        }
+        for var, name in (
+            ("HOME", "home"),
+            ("ARETE_CONFIG_DIR", "config"),
+            ("ARETE_STATE_DIR", "state"),
+            ("ARETE_LOG_DIR", "logs"),
+            ("ARETE_WORKTREES_DIR", "worktrees"),
+            ("TMPDIR", "tmp"),
+            ("XDG_STATE_HOME", "xdg"),
+        ):
+            folder = root / name
+            folder.mkdir(exist_ok=True)
+            env[var] = str(folder)
+        env.update(env_extra or {})
+        repo_root = Path(__file__).resolve().parent.parent
+        helper_file = root / "tmp" / "device_lease_helper.py"
+        helper_file.write_text(DEVICE_LEASE_HELPER, encoding="utf-8")
+        script = (
+            f"import sys; sys.path.insert(0, {str(repo_root)!r}); sys.path.insert(0, {str(helper_file.parent)!r})\n"
+            "from device_lease_helper import *\n"
+            + code
+        )
+        proc = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script],
+            cwd=str(repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode != 0:
+            self.fail(f"child exited {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        return proc
+
+    def test_lapse_fence_renew_sleep_exe_and_prune(self):
+        self._run_child(r"""
+setup_scratch()
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+
+# 1. Lapse and fence in a real child process + cli.main exit 3 + run.log append.
+run_id = record.start("loop", loop="demo", device="box")
+child_ready = Path(os.environ["TMPDIR"]) / "child-ready"
+child_go = Path(os.environ["TMPDIR"]) / "child-go"
+child_code = (
+    f"import sys, time\nsys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r})\n"
+    "from pathlib import Path\n"
+    "from arete import cli, devices, leases, loop_run, record\n"
+    f"def _carry(rid):\n"
+    f"    with devices.lease('box', rid):\n"
+    f"        leases.current().pause_renewer()\n"
+    f"        Path({str(child_ready)!r}).write_text(str(leases.current().id))\n"
+    f"        while not Path({str(child_go)!r}).exists():\n"
+    f"            time.sleep(0.02)\n"
+    f"        record.note(rid, summary='should be fenced')\n"
+    f"    return 'done'\n"
+    "loop_run.carry_opened = _carry\n"
+    f"raise SystemExit(cli.main(['loop', 'exec', '--run-id', {run_id!r}]))\n"
+)
+child_env = {**{k: os.environ[k] for k in os.environ}, control.WORKER_ENV: "loop exec"}
+child = subprocess.Popen(
+    [sys.executable, "-I", "-B", "-c", child_code],
+    env=child_env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+try:
+    deadline = time.monotonic() + 10
+    while not child_ready.exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert child_ready.exists(), f"child never became ready: rc={child.poll()} stderr={child.stderr.read()}"
+    lease_id = int(child_ready.read_text().strip())
+
+    # Set expires 1s in the past and run leases.lapse().
+    past = util.iso(util.now() - timedelta(seconds=1))
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (past, lease_id))
+    lapsed = leases.lapse()
+    assert lapsed == [lease_id], lapsed
+
+    row = device_store.lease_get(lease_id)
+    assert row["epoch"] == 2 and row["released"] is not None and row["outcome"] == "expired", row
+    run_before = run_store.run_get(run_id)
+    assert run_before["status"] == "interrupted", run_before
+    with foundation.reader() as c:
+        evs = [dict(r) for r in c.execute(
+            "SELECT * FROM events_log WHERE kind = 'lease.changed' AND subject = ? ORDER BY seq",
+            (f"lease:{lease_id}",),
+        )]
+        assert evs and evs[-1]["ver"] == row["version"], (evs, row["version"])
+        toks = [dict(r) for r in c.execute("SELECT * FROM lease_tokens WHERE lease_id = ?", (lease_id,))]
+        assert toks and all(t["dead_at"] is not None for t in toks), toks
+
+    # Unblock child -> its record.note raises LeaseFenced("lease_fenced") -> cli.main exits 3, writes run.log, run unchanged.
+    child_go.write_text("go")
+    out, err = child.communicate(timeout=10)
+    assert child.returncode == 3, (child.returncode, out, err)
+    run_after = run_store.run_get(run_id)
+    assert run_after == run_before, (run_before, run_after)
+    log_text = (paths.RUNS_DIR / run_id / "run.log").read_text(encoding="utf-8")
+    assert f"L-{lease_id}" in log_text and "epoch 2" in log_text and "lease_fenced" in log_text, log_text
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+
+# 2. Expired lease with no epoch bump gives LeaseFenced("lease_expired").
+run_exp = record.start("loop", loop="exp", device="box")
+active = leases.claim("box", devices.version_of("box"), run_id=run_exp, start_renewer=False)
+try:
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=2)), active.id))
+    try:
+        record.note(run_exp, summary="should expire")
+        raise AssertionError("expected LeaseFenced(lease_expired)")
+    except leases.LeaseFenced as e:
+        assert e.code == "lease_expired", e.code
+finally:
+    active.close("", fenced=False)
+
+# 3. Barrier between lapse read and its tx(): renewal landing first wins and nothing lapses.
+run_race = record.start("loop", loop="race", device="box")
+active_race = leases.claim("box", devices.version_of("box"), run_id=run_race, start_renewer=False)
+try:
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=1)), active_race.id))
+    barrier_hit = []
+    def renew_in_between(cand):
+        barrier_hit.append(cand["id"])
+        future = util.iso(util.now() + timedelta(seconds=120))
+        with foundation.tx(fenced=False) as c:
+            c.execute("UPDATE leases SET renewed = ?, expires = ? WHERE id = ?", (util.iso(), future, cand["id"]))
+    assert leases.lapse(before_lapse=renew_in_between) == []
+    assert barrier_hit == [active_race.id]
+    assert device_store.lease_get(active_race.id)["released"] is None
+    assert run_store.run_get(run_race)["status"] == "running"
+finally:
+    active_race.close("", fenced=False)
+
+# 4. RENEW_SECONDS patched to 0.1 -> renewed moves and events_log count does not.
+run_ren = record.start("loop", loop="renew", device="box")
+with mock.patch.object(leases, "RENEW_SECONDS", 0.1):
+    active_ren = leases.claim("box", devices.version_of("box"), run_id=run_ren, start_renewer=True)
+    try:
+        with foundation.reader() as c:
+            before_count = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if device_store.lease_get(active_ren.id)["renewed"]:
+                break
+            time.sleep(0.05)
+        after_row = device_store.lease_get(active_ren.id)
+        with foundation.reader() as c:
+            after_count = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        assert after_row["renewed"], after_row
+        assert after_count == before_count, (before_count, after_count)
+    finally:
+        active_ren.close("", fenced=False)
+
+# 5. Serve previous tick 300s back -> expired lease gets new expires, nothing interrupted, no event.
+run_sleep = record.start("loop", loop="sleep", device="box")
+active_sleep = leases.claim("box", devices.version_of("box"), run_id=run_sleep, start_renewer=False)
+try:
+    old_exp = util.iso(util.now() - timedelta(seconds=5))
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (old_exp, active_sleep.id))
+    with foundation.reader() as c:
+        ev_before = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+    assert leases.lapse(prev_tick=util.now() - timedelta(seconds=300)) == []
+    row_sleep = device_store.lease_get(active_sleep.id)
+    assert row_sleep["released"] is None and row_sleep["expires"] > old_exp, row_sleep
+    assert run_store.run_get(run_sleep)["status"] == "running"
+    with foundation.reader() as c:
+        assert c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0] == ev_before
+finally:
+    active_sleep.close("", fenced=False)
+
+# 6. exe kind takes the same lease, renew, and sweep path with faked sandbox calls.
+with host.patched():
+    run_exe = record.start("loop", loop="exe-test", device="sand")
+    with devices.lease("sand", run_exe) as vm:
+        assert vm.host.endswith(ssh.EXE_VM_DOMAIN), vm
+        exe_lease = device_store.latest_lease_for_run(run_exe)
+        assert exe_lease["device"] == "sand" and exe_lease["vm_name"] in host.exe_vms and exe_lease["ready"]
+    done_exe = device_store.lease_get(exe_lease["id"])
+    assert done_exe["outcome"] == "deleted" and exe_lease["vm_name"] not in host.exe_vms
+
+# 7. Retention prune: device_probes 90d, lease_tokens 7d after lease released, cleared waits 90d, leases stay.
+old_91 = util.iso(util.now() - timedelta(days=91))
+old_8 = util.iso(util.now() - timedelta(days=8))
+with foundation.tx(fenced=False) as c:
+    device_store.insert_device_probe(c, device="box", device_version="device/box@000000000000",
+                                     at=old_91, ok=True, seconds=0.1, home="/home/old")
+    lid = device_store.insert_lease(c, run_id=None, device="box", device_version="", created=old_8, expires=old_8)
+    device_store.set_lease_token(c, lid, "oldhash", old_8)
+    c.execute("UPDATE leases SET released = ?, outcome = 'deleted' WHERE id = ?", (old_8, lid))
+    c.execute("INSERT INTO waits (subject, blocker, reason, opened, cleared) VALUES ('config:loop/x', 'device:box', 'old', ?, ?)",
+              (old_91, old_91))
+retention_store.prune_rows(retention.load(), retention_store.measure())
+with foundation.reader() as c:
+    assert c.execute("SELECT COUNT(*) FROM device_probes WHERE at = ?", (old_91,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM lease_tokens WHERE lease_id = ?", (lid,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM waits WHERE cleared = ?", (old_91,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM leases WHERE id = ?", (lid,)).fetchone()[0] == 1
+""")
+
+    def test_probes_as_rows_split_and_contract(self):
+        self._run_child(r"""
+# Part A: Probes as rows + devices.home cached by device_version + split devices.toml.
+setup_scratch()
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+with host.patched():
+    p_box = devices.probe("box")
+    p_prox = devices.probe("prox")
+    assert p_box["ok"] and p_prox["ok"]
+    assert not (paths.STATE_DIR / "devices.json").exists()
+
+    for name in ("box", "prox"):
+        row = device_store.latest_device_probe(name)
+        idx = config_store.live_item("device", name)
+        assert row is not None and idx is not None
+        assert row["device_version"] == idx["version"], (row["device_version"], idx["version"])
+
+    calls_before = len(host.ssh_calls)
+    assert devices.home("box") == "/home/box"
+    assert len(host.ssh_calls) == calls_before, "devices.home made an unexpected ssh call"
+    assert "box.test" in outbound.machine_hosts()
+
+# Split devices.toml with two devices in ONE configrepo commit, devices.load() equals old parse().
+legacy_toml = (
+    '[device.alpha]\nkind = "ssh"\nhost = "u@alpha.test"\nnote = "a"\n\n'
+    '[device.beta]\nkind = "proxmox"\nhost = "root@beta.test"\ntemplate = "9001"\n'
+)
+old_parsed = devices.parse(__import__("tomllib").loads(legacy_toml))
+for existing in (paths.CONFIG_DIR / "devices").glob("*.toml"):
+    existing.unlink()
+(paths.CONFIG_DIR / "devices.toml").write_text(legacy_toml, encoding="utf-8")
+configrepo.commit_hand_edits()
+before_commits = subprocess.run(
+    ["git", "rev-list", "--count", "HEAD"],
+    cwd=paths.CONFIG_DIR, capture_output=True, text=True, check=True, env={"PATH": os.environ["PATH"]},
+).stdout.strip()
+sha = devices.split_devices_toml()
+assert sha
+after_commits = subprocess.run(
+    ["git", "rev-list", "--count", "HEAD"],
+    cwd=paths.CONFIG_DIR, capture_output=True, text=True, check=True, env={"PATH": os.environ["PATH"]},
+).stdout.strip()
+assert int(after_commits) == int(before_commits) + 1
+assert not (paths.CONFIG_DIR / "devices.toml").exists()
+assert (paths.CONFIG_DIR / "devices" / "alpha.toml").is_file()
+assert (paths.CONFIG_DIR / "devices" / "beta.toml").is_file()
+loaded_remote = [d for d in devices.load() if d.name != "local"]
+assert loaded_remote == old_parsed, (loaded_remote, old_parsed)
+""")
+
+        # Part B: Contract migration gate, copy of two vms rows, view, lapse + sweep, and refusal on unmatched device.
+        self._run_child(r"""
+setup_scratch(migrate_through=41)
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+prox_dev = devices.get("prox")
+created_ts = util.iso(util.now() - timedelta(minutes=5))
+# Create fake VM conf files on Proxmox host + insert two legacy vms rows + older running run holding gate.
+for vmid, vname in ((101, "arete-legacy-1"), (102, "arete-legacy-2")):
+    (host.vms_dir / f"{vmid}.conf").write_text(f"name: {vname}\n", encoding="utf-8")
+with foundation.tx(fenced=False) as c:
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-legacy-1", None, json.dumps(__import__("dataclasses").asdict(prox_dev)), 101, created_ts),
+    )
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-legacy-2", None, json.dumps(__import__("dataclasses").asdict(prox_dev)), 102, created_ts),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, status, started, pid, schema_version) VALUES (?, 'loop', 'running', ?, ?, 41)",
+        ("old-blocker", created_ts, os.getpid()),
+    )
+
+# Contract waits while old running run holds the gate (expand m0042 applies, contract m0043 waits).
+waiting = foundation.migrate()
+assert waiting is True
+with foundation.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 42
+
+# Release gate -> contract runs and copies both vms rows into open leases + creates vms view.
+with foundation.tx(fenced=False) as c:
+    c.execute("UPDATE runs SET status = 'done' WHERE id = 'old-blocker'")
+waiting = foundation.migrate()
+assert waiting is False
+with foundation.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == foundation.LATEST
+    assert c.execute("SELECT 1 FROM schema_migrations WHERE n = 43").fetchone() is not None
+    view_rows = [(r["name"], r["vmid"]) for r in c.execute("SELECT name, vmid FROM vms ORDER BY vmid")]
+    assert view_rows == [("arete-legacy-1", 101), ("arete-legacy-2", 102)], view_rows
+
+# Next lapse pass + sweep past LAPSE_GRACE_MINUTES delete both VMs and view reads empty.
+lapsed = leases.lapse()
+assert len(lapsed) == 2
+future_now = util.now() + timedelta(minutes=11)
+with host.patched(), mock.patch.object(util, "now", return_value=future_now):
+    devices.sweep(lambda rid: lambda text: None)
+with foundation.reader() as c:
+    assert c.execute("SELECT name, vmid FROM vms").fetchall() == []
+assert not (host.vms_dir / "101.conf").exists() and not (host.vms_dir / "102.conf").exists()
+""")
+
+        # Part C: Unmatched vms row refuses the contract naming row + delete_command().
+        self._run_child(r"""
+setup_scratch(migrate_through=42)
+ghost = devices.Device("ghost", "proxmox", host="root@ghost.test", template="9000")
+with foundation.tx(fenced=False) as c:
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-orphan-vm", None, json.dumps(__import__("dataclasses").asdict(ghost)), 777, util.iso()),
+    )
+try:
+    foundation.migrate()
+    raise AssertionError("expected contract refusal")
+except migrations.Refused as e:
+    msg = str(e)
+    assert "arete-orphan-vm" in msg and "qm destroy 777" in msg and "root@ghost.test" in msg, msg
+""")
+
+    def test_vmid_retry_sweep_by_lease_and_outside_release(self):
+        self._run_child(r"""
+setup_scratch()
+tmp = Path(os.environ["TMPDIR"])
+
+# 1. Two processes lease prox and both read one nextid: both get a VM, vmids differ, one lease collided, every destroy names own vmid.
+barrier_dir = tmp / "nextid-barrier"
+host = FakeProxmoxHost(tmp, nextid_barrier_dir=barrier_dir)
+r1 = record.start("loop", loop="p1", device="prox")
+r2 = record.start("loop", loop="p2", device="prox")
+leased_dir = tmp / "leased-barrier"
+worker_script = (
+    f"import json, os, sys, time; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+    f"sys.path.insert(0, {str(tmp)!r}); "
+    "from device_lease_helper import *\n"
+    "run_id = sys.argv[1]\n"
+    f"host = FakeProxmoxHost(Path({str(tmp)!r}), nextid_barrier_dir=Path({str(barrier_dir)!r}))\n"
+    f"ldir = Path({str(leased_dir)!r}); ldir.mkdir(parents=True, exist_ok=True)\n"
+    "with host.patched():\n"
+    "    with devices.lease('prox', run_id) as vm:\n"
+    "        row = device_store.latest_lease_for_run(run_id)\n"
+    "        (ldir / f'up-{os.getpid()}').write_text(str(row['vmid']), encoding='utf-8')\n"
+    "        deadline = time.monotonic() + 8\n"
+    "        while len(list(ldir.glob('up-*'))) < 2 and time.monotonic() < deadline:\n"
+    "            time.sleep(0.02)\n"
+    "        print(json.dumps({'run': run_id, 'vmid': row['vmid'], 'host': vm.host}))\n"
+)
+env = {k: os.environ[k] for k in os.environ}
+p1 = subprocess.Popen([sys.executable, "-I", "-B", "-c", worker_script, r1], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p2 = subprocess.Popen([sys.executable, "-I", "-B", "-c", worker_script, r2], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+o1, e1 = p1.communicate(timeout=15)
+o2, e2 = p2.communicate(timeout=15)
+assert p1.returncode == 0 and p2.returncode == 0, (p1.returncode, e1, p2.returncode, e2)
+res1, res2 = json.loads(o1.strip().splitlines()[-1]), json.loads(o2.strip().splitlines()[-1])
+assert res1["vmid"] != res2["vmid"], (res1, res2)
+all_leases = device_store.leases_list(device="prox")
+assert any(r["outcome"] == "collided" for r in all_leases), all_leases
+destroy_lines = [line for line in host.calls() if "qm destroy" in line]
+assert len(destroy_lines) == 2, destroy_lines
+destroyed_ids = {int(re.search(r"qm destroy (\d+)", line).group(1)) for line in destroy_lines}
+assert destroyed_ids == {res1["vmid"], res2["vmid"]}, (destroyed_ids, res1, res2)
+
+# 2. Always colliding host fails after exactly 5 qm clone calls with exact error.
+host_collide = FakeProxmoxHost(tmp / "c5", always_collide=True)
+r5 = record.start("loop", loop="c5", device="prox")
+with host_collide.patched(), mock.patch.object(time, "sleep"):
+    try:
+        with devices.lease("prox", r5):
+            raise AssertionError("expected collision failure")
+    except devices.DeviceError as e:
+        assert "vmid collision on prox after 5 tries" in str(e), str(e)
+clone_calls = [line for line in host_collide.calls() if "qm clone " in line]
+assert len(clone_calls) == 5, clone_calls
+
+# 3. Storage volume already exists fails after 1 qm clone call.
+host_storage = FakeProxmoxHost(tmp / "storage", storage_exists=True)
+rs = record.start("loop", loop="st", device="prox")
+with host_storage.patched():
+    try:
+        with devices.lease("prox", rs):
+            raise AssertionError("expected storage failure")
+    except devices.DeviceError as e:
+        assert "already exists" in str(e)
+assert len([line for line in host_storage.calls() if "qm clone " in line]) == 1
+
+# 4. Sweep by lease:
+#    - Renewed lease whose run is set to interrupted survives sweep (no qm destroy).
+#    - Lapsed lease whose run is set back to running is destroyed once after 11 minutes and reads deleted.
+#    - Delete that keeps failing counts sweep_attempts; at +8 days raises ONE inbox item with VM + delete_command, no second one.
+host_sweep = FakeProxmoxHost(tmp / "sweep")
+r_keep_alive = record.start("loop", loop="alive", device="prox")
+with host_sweep.patched():
+    a_live = leases.claim("prox", devices.version_of("prox"), run_id=r_keep_alive, start_renewer=False)
+    (host_sweep.vms_dir / "201.conf").write_text("name: arete-live\n", encoding="utf-8")
+    a_live.update(vm_name="arete-live", vmid=201)
+    # Mark run interrupted, keep lease open & renewed -> sweep must NOT destroy it.
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE runs SET status = 'interrupted' WHERE id = ?", (r_keep_alive,))
+    devices.sweep(lambda rid: lambda text: None)
+    assert not any("qm destroy 201" in line for line in host_sweep.calls())
+    assert (host_sweep.vms_dir / "201.conf").exists()
+    a_live.abort_fenced()
+
+    # Lapsed lease whose run is set back to running -> destroyed once at +11 min -> outcome deleted.
+    r_lapsed = record.start("loop", loop="lapsed", device="prox")
+    a_lapsed = leases.claim("prox", devices.version_of("prox"), run_id=r_lapsed, start_renewer=False)
+    (host_sweep.vms_dir / "202.conf").write_text("name: arete-lapsed\n", encoding="utf-8")
+    a_lapsed.update(vm_name="arete-lapsed", vmid=202)
+    a_lapsed.abort_fenced()
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=5)), a_lapsed.id))
+    assert a_lapsed.id in leases.lapse()
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE runs SET status = 'running' WHERE id = ?", (r_lapsed,))
+    t11 = util.now() + timedelta(minutes=11)
+    with mock.patch.object(util, "now", return_value=t11):
+        devices.sweep(lambda rid: lambda text: None)
+    assert device_store.lease_get(a_lapsed.id)["outcome"] == "deleted"
+    assert sum("qm destroy 202" in line for line in host_sweep.calls()) == 1
+
+# Failing delete counts sweep_attempts, raises ONE inbox item at +8 days, no second on later sweep.
+host_fail = FakeProxmoxHost(tmp / "faildel", fail_destroy=True)
+r_fail = record.start("loop", loop="faildel", device="prox")
+with host_fail.patched():
+    a_fail = leases.claim("prox", devices.version_of("prox"), run_id=r_fail, start_renewer=False)
+    (host_fail.vms_dir / "203.conf").write_text("name: arete-stuck\n", encoding="utf-8")
+    a_fail.update(vm_name="arete-stuck", vmid=203)
+    a_fail.close("delete_failed", sweep_attempts=1, failing_since=util.iso(), last_sweep=util.iso(),
+                 last_sweep_error="boom", fenced=False)
+    assert devices.left_up(r_fail) and "203" in devices.with_left_up("failed", r_fail)
+    devices.sweep(lambda rid: lambda text: None)
+    assert device_store.lease_get(a_fail.id)["sweep_attempts"] == 2
+    t8d = util.now() + timedelta(days=8)
+    with mock.patch.object(util, "now", return_value=t8d):
+        devices.sweep(lambda rid: lambda text: None)
+        items = [it for it in inbox.list(state="open") if it["subject"] == f"lease:{a_fail.id}"]
+        assert len(items) == 1, items
+        detail_str = json.dumps(items[0])
+        assert "arete-stuck" in detail_str and "qm destroy 203" in detail_str, detail_str
+        attempts_at_giveup = device_store.lease_get(a_fail.id)["sweep_attempts"]
+        devices.sweep(lambda rid: lambda text: None)
+        assert device_store.lease_get(a_fail.id)["sweep_attempts"] == attempts_at_giveup
+        items2 = [it for it in inbox.list(state="open") if it["subject"] == f"lease:{a_fail.id}"]
+        assert len(items2) == 1
+
+# Release from outside bumps epoch + sets released in one tx and deletes VM.
+host_rel = FakeProxmoxHost(tmp / "rel")
+r_rel = record.start("loop", loop="rel", device="prox")
+with host_rel.patched():
+    a_rel = leases.claim("prox", devices.version_of("prox"), run_id=r_rel, start_renewer=False)
+    (host_rel.vms_dir / "204.conf").write_text("name: arete-rel\n", encoding="utf-8")
+    a_rel.update(vm_name="arete-rel", vmid=204)
+    a_rel.abort_fenced()
+    devices.release(r_rel)
+    rel_row = device_store.lease_get(a_rel.id)
+    assert rel_row["epoch"] == 2 and rel_row["released"] is not None and rel_row["outcome"] == "deleted", rel_row
+    assert not (host_rel.vms_dir / "204.conf").exists()
+""")
+
+    def test_api_token_resolver_device_projection_and_waits(self):
+        self._run_child(r"""
+setup_scratch()
+tmp = Path(os.environ["TMPDIR"])
+host = FakeProxmoxHost(tmp)
+owner = principals.owner()
+_, owner_token = token_store.issue(owner, "Device API test", ["*"])
+
+@contextmanager
+def live_server():
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "127.0.0.1")
+    logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "owner@example.test"))
+    with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    httpd.node = node
+    httpd.logins = logins
+    httpd.inside_serve = True
+    httpd.front = tailnet.Front("http", [])
+    httpd.pending_secrets = {}
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+def req(port, method, path, body=None, *, token=owner_token, headers=None):
+    conn = HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        hdrs = {"Authorization": f"Bearer {token}", **(headers or {})}
+        raw = None
+        if body is not None:
+            raw = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/json")
+            hdrs["Content-Length"] = str(len(raw))
+        conn.request(method, path, body=raw, headers=hdrs)
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        return resp.status, data
+    finally:
+        conn.close()
+
+with host.patched(), live_server() as port:
+    # 1. device.list & device.get before probe -> unprobed, spec=None, tools=None, host & note present.
+    st, listed = req(port, "GET", "/api/v1/devices")
+    assert st == 200
+    by_id = {d["id"]: d for d in listed["devices"]}
+    assert by_id["box"]["status"] == "unprobed" and by_id["box"]["spec"] is None and by_id["box"]["tools"] is None
+    assert by_id["box"]["host"] == "box@box.test" and by_id["box"]["note"] == "build box"
+
+    st, got = req(port, "GET", "/api/v1/devices/box")
+    assert st == 200 and got["device"]["status"] == "unprobed" and got["device"]["spec"] is None
+
+    # 2. device.probe with Prefer: wait=10 -> 200; device.get now ok with non-null spec & tools!
+    st, probed = req(port, "POST", "/api/v1/devices/box/probe", {},
+                     headers={"Idempotency-Key": "probe-fast-1", "Prefer": "wait=10"})
+    assert st == 200 and probed["probe"]["ok"] is True, (st, probed)
+    st, got_after = req(port, "GET", "/api/v1/devices/box")
+    assert st == 200 and got_after["device"]["status"] == "ok"
+    assert "Linux x86_64" in got_after["device"]["spec"] and "RTX 4090" in got_after["device"]["spec"]
+    assert got_after["device"]["tools"] == ["claude", "pi"]
+    assert got_after["device"]["runners"] == ["claude", "pi"]
+
+    # 3. Legacy alias POST /api/devices/box/probe still answers.
+    st, legacy = req(port, "POST", "/api/devices/box/probe", {})
+    assert st == 200 and legacy["ok"] is True, (st, legacy)
+
+    # 4. Slow probe (sleeps 3s) under Prefer: wait=1 -> 202 accepted with watch in <2s, event arrives under idem!
+    orig_probe = devices.probe
+    def slow_probe(device, timeout=20, *, idem=None):
+        time.sleep(3.0)
+        return orig_probe(device, timeout=timeout, idem=idem)
+
+    with mock.patch.object(devices, "probe", side_effect=slow_probe):
+        t0 = time.monotonic()
+        st, acc = req(port, "POST", "/api/v1/devices/box/probe", {},
+                      headers={"Idempotency-Key": "probe-slow-1", "Prefer": "wait=1"})
+        elapsed = time.monotonic() - t0
+        assert st == 202 and elapsed < 2.0, (st, elapsed, acc)
+        assert acc["accepted"] is True and acc["watch"] == "/api/v1/events?idem=probe-slow-1", acc
+        st_ev, ev_data = req(port, "GET", acc["watch"] + "&timeout=10",
+                             headers={"Accept": "application/json"})
+        assert st_ev == 200
+        assert any(e["kind"] == "device.changed" and e["idem"] == "probe-slow-1" for e in ev_data["events"]), ev_data
+
+    # 5. run.sandbox + lease.list version == last lease.changed ver + lease token auth (200, 410, 401, 403).
+    devices.probe("prox")
+    r_prox = record.start("loop", loop="sbx", device="prox")
+    r_other = record.start("loop", loop="other", device="box")
+    active = leases.claim("prox", devices.version_of("prox"), run_id=r_prox, start_renewer=False)
+    active.update(vm_name="arete-sbx", vmid=301, ready=util.iso(), address="10.0.0.301")
+    lease_tok = active.token
+    active.abort_fenced()
+
+    st, sbx = req(port, "GET", f"/api/v1/runs/{r_prox}/sandbox")
+    assert st == 200 and sbx["device"] == "prox" and sbx["lease"] == active.label and sbx["address"] == "10.0.0.301", sbx
+    assert isinstance(sbx["facts"], dict) and sbx["facts"]["ok"] is True
+
+    st, llist = req(port, "GET", f"/api/v1/leases?run={r_prox}&open=true")
+    assert st == 200 and len(llist["leases"]) == 1
+    with foundation.reader() as c:
+        last_ver = c.execute(
+            "SELECT ver FROM events_log WHERE kind = 'lease.changed' AND subject = ? ORDER BY seq DESC LIMIT 1",
+            (f"lease:{active.id}",),
+        ).fetchone()[0]
+    assert llist["leases"][0]["version"] == last_ver and llist["leases"][0]["streams"] == []
+
+    # Lease token with X-Arete-Lease: L-<id>.1 -> 200 on own lease.get & own run.get, 403 on other run.get.
+    st, lget = req(port, "GET", f"/api/v1/leases/{active.label}", token=lease_tok,
+                   headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 200 and lget["lease"]["epoch"] == 1, (st, lget)
+
+    st, rget_own = req(port, "GET", f"/api/v1/runs/{r_prox}", token=lease_tok,
+                       headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 200 and rget_own["run"]["id"] == r_prox, (st, rget_own)
+
+    st, rget_other = req(port, "GET", f"/api/v1/runs/{r_other}", token=lease_tok,
+                         headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 403 and rget_other["code"] == "forbidden", (st, rget_other)
+
+    # Forged token with same ar_<tag>_L<id>_ prefix -> 401.
+    prefix = "_".join(lease_tok.split("_", 3)[:3])
+    forged = f"{prefix}_forged_secret_value"
+    st, bad = req(port, "GET", f"/api/v1/leases/{active.label}", token=forged,
+                  headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 401, (st, bad)
+
+    # Lapse the lease -> same lease token answers 410 lease_fenced with epoch 2 (NOT 401).
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=2)), active.id))
+    assert active.id in leases.lapse()
+    st, fenced = req(port, "GET", f"/api/v1/leases/{active.label}", token=lease_tok,
+                     headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 410 and fenced["code"] == "lease_fenced" and fenced["epoch"] == 2, (st, fenced)
+
+    # CLI `arete devices` and `arete devices --probe box` go through serve.
+    from arete import credential_files
+    credential_files.write_client(foundation.schema_metadata()["instance_tag"], owner_token)
+    cli_env = {**{k: os.environ[k] for k in os.environ}, "ARETE_SERVER": f"http://127.0.0.1:{port}"}
+    cli_list = subprocess.run(
+        [sys.executable, "-I", "-B", "-c",
+         f"import sys; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+         "from arete.cli import main; raise SystemExit(main(['devices']))"],
+        env=cli_env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert cli_list.returncode == 0 and "box" in cli_list.stdout and "prox" in cli_list.stdout, (cli_list.returncode, cli_list.stdout, cli_list.stderr)
+    cli_probe = subprocess.run(
+        [sys.executable, "-I", "-B", "-c",
+         f"import sys; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+         "from arete.cli import main; raise SystemExit(main(['devices', '--probe', 'box']))"],
+        env=cli_env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert cli_probe.returncode == 0 and json.loads(cli_probe.stdout)["ok"] is True, (cli_probe.returncode, cli_probe.stdout, cli_probe.stderr)
+
+# 6. Waits: loop on prox whose nextid times out settles failed + opens one wait (config:loop/<name>, device:prox);
+#    dispatch starts no run and why names prox; ok probe clears wait in its tx; next dispatch starts it.
+loop_dir = paths.CONFIG_DIR / "loops" / "prox-job"
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / "loop.toml").write_text(
+    'kind = "command"\ndescription = "prox wait test"\nenabled = true\n'
+    '[run]\ncommand = "true"\ndevice = "prox"\n',
+    encoding="utf-8",
+)
+cfg_path = paths.CONFIG_DIR / "config.toml"
+cfg_path.write_text(cfg_path.read_text(encoding="utf-8") + f'\n[serve]\nloop_dirs = [{json.dumps(str(paths.CONFIG_DIR / "loops"))}]\n', encoding="utf-8")
+cfg = config.load()
+loop_obj = loops.find("prox-job", cfg)
+q1 = loop_store.enqueue("prox-job", "", "", "manual", [])
+run_w = record.start("loop", loop="prox-job", loop_kind="command", trigger="manual", device="prox")
+with foundation.tx(fenced=False) as c:
+    c.execute("UPDATE queue SET run_id = ? WHERE id = ?", (run_w, q1))
+
+host_timeout = FakeProxmoxHost(tmp / "to", nextid_timeout=True)
+with host_timeout.patched():
+    status = loop_run.carry(loop_run.LoopRun(loop_obj, run_w, cfg, trigger="manual"))
+assert status == "failed"
+assert run_store.run_get(run_w)["status"] == "failed"
+waits = device_store.open_waits_for_subject("config:loop/prox-job")
+assert len(waits) == 1 and waits[0]["blocker"] == "device:prox", waits
+
+q2 = loop_store.enqueue("prox-job", "", "", "manual-2", [])
+srv = serve.Server()
+srv.cfg = cfg
+with mock.patch.object(loop_run, "launch") as mock_launch:
+    srv.dispatch({"prox-job": loop_obj})
+    mock_launch.assert_not_called()
+    assert "prox" in srv.waiting.get(q2, ""), srv.waiting
+
+# Ok probe of prox clears the wait in its own tx, next dispatch starts it.
+with host.patched():
+    assert devices.probe("prox")["ok"] is True
+assert device_store.open_waits_for_subject("config:loop/prox-job") == []
+with mock.patch.object(loop_run, "launch", return_value={"id": "started-1"}) as mock_launch:
+    srv.dispatch({"prox-job": loop_obj})
+    mock_launch.assert_called_once()
+
+# 7. secret.set clears open wait with blocker secret:global/<name> in its tx; failed set leaves it open.
+with foundation.tx(fenced=False) as c:
+    device_store.open_wait(c, "config:loop/prox-job", "secret:global/WAIT_KEY", "missing secret")
+assert len(device_store.open_waits_for_subject("config:loop/prox-job")) == 1
+try:
+    secretstore.put("global", "WAIT_KEY", "x", "api_key", owner)  # too short -> fails validation
+    raise AssertionError("expected validation error")
+except ValueError:
+    pass
+assert len(device_store.open_waits_for_subject("config:loop/prox-job")) == 1
+
+secretstore.put("global", "WAIT_KEY", "valid-secret-value-123456", "api_key", owner)
+assert device_store.open_waits_for_subject("config:loop/prox-job") == []
+""")

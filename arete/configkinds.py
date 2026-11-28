@@ -65,7 +65,7 @@ REGISTRY = {
     "rule": kind("rule", "review", Home("rules/{name}.toml")),
     "sync": kind("sync", "review", Home("sync/{name}.toml")),
     "vocabularies": kind("vocabularies", "check", Home("vocabularies/{name}.toml")),
-    "device": kind("device", "review", Home("devices.toml", "defaults")),
+    "device": kind("device", "review", Home("devices/{name}.toml")),
     "loop": kind("loop", "review", Home("loops/{name}/loop.toml"),
                  Home("layers/{repo}/loops/{name}/loop.toml", "{repo}.{name}", escape_repo=True)),
     "attention": kind("attention", "check", Home("config.toml", "defaults")),

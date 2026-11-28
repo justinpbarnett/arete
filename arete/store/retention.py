@@ -10,9 +10,10 @@ from datetime import timedelta
 from pathlib import Path
 
 from .. import paths, record, retention, run_lines, util
-from . import approvals, events, idempotency, incidents, loops, orchestration, runs, writes
+from . import approvals, devices, events, idempotency, incidents, loops, orchestration, runs, writes
 from .db import (
     RUN_RETENTION_SCHEMA,
+    RUNS_LINEAGE_SCHEMA,
     SPEC_DELIVERY_SCHEMA,
     WORKER_EXCHANGE_SCHEMA,
     migration_applied,
@@ -179,6 +180,22 @@ def _chain_kept(c, recent_runs: set[str], continues_edges: dict[str, str]) -> se
             for other in members_list[1:]:
                 adj[anchor].add(other)
                 adj[other].add(anchor)
+    if migration_applied(RUNS_LINEAGE_SCHEMA, c):
+        by_chain: dict[str, list[str]] = defaultdict(list)
+        for row in c.execute("SELECT id, chain, continues FROM runs WHERE COALESCE(chain, '') != '' OR COALESCE(continues, '') != ''"):
+            rid = str(row["id"])
+            if row["chain"]:
+                by_chain[str(row["chain"])].append(rid)
+            if row["continues"]:
+                parent = str(row["continues"])
+                adj[rid].add(parent)
+                adj[parent].add(rid)
+        for members_list in by_chain.values():
+            if len(members_list) > 1:
+                anchor = members_list[0]
+                for other in members_list[1:]:
+                    adj[anchor].add(other)
+                    adj[other].add(anchor)
     visited = set(recent_runs)
     queue = deque(recent_runs)
     while queue:
@@ -408,6 +425,7 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             notes_days=policy.incidents.notes_days,
             keep_days=policy.incidents.keep_days,
         )
+        rows_removed += devices.prune(c)
 
     return RowsPruned(
         rows=rows_removed,

@@ -321,10 +321,13 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         if not got:
             print("an eval mine is already running")
             return 0
+        from . import pins
+
+        pin_res = pins.resolve("eval", repo=repo_name or None, cfg=cfg if not configrepo.is_repo() else None)
         run_id = record.start("eval", tag="-".join(filter(None, ["mine", repo_name])), lock=lock,
-                              repo=repo_name or None)
+                              repo=repo_name or None, resolution=pin_res)
         tally = {}
-        with record.failed_on_crash(run_id):
+        with record.failed_on_crash(run_id), pins.use(pin_res):
             for c in picked:
                 job = EvalRun(id=run_id, repo=c.repo, dir=paths.RUNS_DIR / run_id / c.job, task=c.job)
                 try:

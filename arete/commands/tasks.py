@@ -108,37 +108,75 @@ def cmd_reject_rule(args) -> int:
     return 0
 
 
-def approval_notes(a: dict) -> list[str]:
-    failed = [a["failed"], f"`arete approve {a['id']}` tries again, `--reject` drops it"]
-    review = a["review"]
-    return [*(failed if a["failed"] else []),
-            *(note for note in (f"held: {a['held']}" if a["held"] else "",
-                                f"review by {review['by']}: {review['said']}" if review else "") if note)]
+def outbox_notes(item: dict) -> list[str]:
+    notes: list[str] = []
+    if item["state"] == "failed":
+        if item.get("error"):
+            notes.append(str(item["error"]))
+        notes.append(f"`arete approve {item['id']}` tries again, `--reject` drops it")
+    if item.get("review"):
+        notes.append(f"review: {item['review']}")
+    return notes
+
+
+def _print_outbox_item(item: dict) -> None:
+    cols = shutil.get_terminal_size().columns
+    source = item.get("loop") or item.get("target") or "outbox"
+    where = item.get("object") or "none"
+    summary = item.get("plain_summary") or item.get("summary") or f"{item['kind']} on {where}"
+    print(textwrap.fill(f"{item['id']:<6} {source:<20} {where:<24} {when(item['created'])}  {summary}",
+                        cols, subsequent_indent=" " * 7, break_on_hyphens=False, max_lines=4, placeholder=" …"))
+    for line in outbox_notes(item):
+        print(textwrap.fill(line, cols, initial_indent=" " * 7, subsequent_indent=" " * 9, break_on_hyphens=False))
+
+
+def _decide_outbox(item_id: str, *, reject: bool, reason: str) -> int:
+    detail = client.call("GET", f"/api/v1/outbox/{quote(item_id, safe='')}")
+    item = client.field(detail, "item")
+    oid = quote(item["id"], safe="")
+    if reject:
+        body: dict[str, object] = {"base_version": item["version"]}
+        if reason:
+            body["reason"] = reason
+        return client.say("POST", f"/api/v1/outbox/{oid}/reject", body)
+    if item["state"] == "failed":
+        return client.say("POST", f"/api/v1/outbox/{oid}/retry", {"base_version": item["version"]})
+    if item["audience"] != "self" and not item.get("opened_at") and item.get("legacy_approval") is None:
+        opened = client.call("POST", f"/api/v1/outbox/{oid}/open", {"base_version": item["version"]})
+        item = client.field(opened, "item")
+    return client.say("POST", f"/api/v1/outbox/{oid}/approve", {"base_version": item["version"], "rev": item["rev"]})
 
 
 def cmd_approve(args) -> int:
-    from .. import delivery
+    from .. import outbox
 
     if args.id is None:
-        pending = delivery.waiting(connect=foundation.reader)
-        for a in pending:
-            print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
-                                f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
-                                subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
-            for line in approval_notes(a):
-                print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
-                                    subsequent_indent=" " * 8, break_on_hyphens=False))
-        if not pending:
+        pending = outbox.list_items(state=("draft", "edited"), connect=foundation.reader)
+        failed = outbox.list_items(state="failed", connect=foundation.reader)
+        for item in (*pending, *failed):
+            _print_outbox_item(item)
+        if not pending and not failed:
             print("nothing waiting for approval")
         return 0
-    return client.say("POST", f"/api/approvals/{args.id}", {"approve": not args.reject})
+    raw_id = str(args.id).strip()
+    if raw_id.upper().startswith("OB-"):
+        return _decide_outbox(raw_id.upper(), reject=args.reject, reason=args.reason)
+    if raw_id.isascii() and raw_id.isdecimal():
+        try:
+            return client.say("POST", f"/api/approvals/{int(raw_id)}", {"approve": not args.reject})
+        except client.Failed as err:
+            if err.code == 404:
+                return _decide_outbox(f"OB-{int(raw_id)}", reject=args.reject, reason=args.reason)
+            raise
+    return _decide_outbox(raw_id, reject=args.reject, reason=args.reason)
 
 
 def register(sub) -> None:
     p = sub.add_parser("approve", help="list emits waiting for approval, or approve one by id; "
                                        "approving a failed one tries the delivery again")
-    p.add_argument("id", type=int, nargs="?", default=None)
+    p.add_argument("id", nargs="?", default=None)
     p.add_argument("--reject", action="store_true")
+    p.add_argument("--reason", default="", help="reason when rejecting an outbox item")
     p.set_defaults(fn=cmd_approve, local_read=lambda args: args.id is None)
 
     p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them; "

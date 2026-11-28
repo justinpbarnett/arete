@@ -4012,7 +4012,7 @@ class AnswerContinuationBudgetTests(OwnerAnswerBudgetFixture):
             return "interrupted", "stopped before the answer was consumed", ""
 
         def launch(command, log):
-            self.assertEqual(command[-3:], ["--force", "--continue", asked.id])
+            self.assertEqual(command[-5:], ["--force", "--continue", asked.id, "--restart", "answer"])
             script = pipeline.Script("feature", work, continues=asked.id)
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
             return run_store.newest_whole_run(self.repo.name, self.ticket)["id"]

@@ -160,6 +160,7 @@ def log_file(r: dict) -> Path:
 
 
 def live(running: list[dict]) -> dict:
+    running = [r for r in running if r.get("kind") != "chat"]
     in_slots = {r["id"] for r in slots.runs_in_slots(running)}
     waiting_for_slot = {r["id"] for r in slots.holding(running, "slot-wait")}
     paid = run_store.paid_by_run([r["id"] for r in running], connect=foundation.reader)

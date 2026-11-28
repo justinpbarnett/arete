@@ -109,7 +109,7 @@ function drawHealth(h) {
     s.at ? el("dl", { class: "w" }, fact("Process", String(s.pid)), fact("Last beat", [liveAgo(s.at), ` (${clock(s.at)})`]),
       fact("Ticks", `${s.ticks}, one every ${s.tick_seconds} s`), fact("Started", clock(s.started))) : null,
     heading(3, titles[2]),
-    el("p", { text: "Loops and sessions run on these. A probe checks the device answers and lists its tools; devices.toml in the config folder adds one." }),
+    el("p", { text: "Loops and sessions run on these. A probe checks the device answers and lists its tools; devices/<name>.toml in the config folder adds one." }),
     saidLine("devices"),
     panelParts(h.devices, "The devices", (devices) => table("", [["Device", "c-device"], ["State", "c-status"], ["System", "wide-only"], ["", "c-probe"]], devices.map(deviceRow), { stack: true })),
     heading(4, titles[3]),

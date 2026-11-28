@@ -184,11 +184,13 @@ def exclude_retained(c, run_column):
 def held_tickets(repo):
     if not available():
         return set()
+    from . import runs as run_store
+
     with db.reader() as c:
-        rows = c.execute("SELECT r.issue FROM factory_targets f JOIN runs r ON r.id=f.id "
+        rows = c.execute("SELECT r.issue FROM factory_targets f JOIN runs r ON r.id=f.id "  # noqa: S608
                          "WHERE r.repo=? AND r.kind='pipeline' AND (f.cancelled OR f.phase IN ('paused','starting','held')) "
                          "AND NOT EXISTS (SELECT 1 FROM runs newer WHERE newer.repo=r.repo AND newer.issue=r.issue "
-                         "AND newer.kind='pipeline' AND newer.rowid>r.rowid)", (repo,))
+                         f"AND newer.kind='pipeline' AND {run_store.later_than(c, 'newer', 'r')})", (repo,))
         return {str(row[0]) for row in rows}
 
 

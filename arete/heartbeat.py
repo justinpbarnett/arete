@@ -76,7 +76,7 @@ def unfinished_resumes(statuses: tuple[str, ...], account_prefix: str) -> list[t
             ) AS legacy FROM runs r
             WHERE r.kind = 'pipeline' AND {run_store.WHOLE_RUN} AND r.status IN ({','.join('?' * len(statuses))})
             AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline'
-                            AND later.repo = r.repo AND later.issue = r.issue AND later.rowid > r.rowid
+                            AND later.repo = r.repo AND later.issue = r.issue AND {run_store.later_than(c, 'later', 'r')}
                             AND COALESCE(later.only_step, '') = '')
             """, (pattern, pattern, *statuses))]  # noqa: S608
 

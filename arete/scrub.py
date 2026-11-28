@@ -166,24 +166,54 @@ class Redactions:
         return combined
 
     def apply(self, text: str) -> tuple[str, dict[int, tuple[dict, int]], Counter[str]]:
+        cleaned, secret_hits, token_hits, _ = self.apply_with_spans(text)
+        return cleaned, secret_hits, token_hits
+
+    def apply_with_spans(
+        self, text: str,
+    ) -> tuple[str, dict[int, tuple[dict, int]], Counter[str], list[dict[str, int | str]]]:
         secret_hits: dict[int, tuple[dict, int]] = {}
         token_hits: Counter[str] = Counter()
+        spans: list[dict[str, int | str]] = []
         labelled = self.labelled
+        parts: list[str] = []
+        cursor = 0
+        out_pos = 0
 
-        def replace(match: re.Match) -> str:
+        for match in self.pattern().finditer(text):
+            prefix = text[cursor:match.start()]
+            if prefix:
+                parts.append(prefix)
+                out_pos += len(prefix)
             if token_id := match.group("token_id"):
                 token_hits[token_id] += 1
-                return f"[token:{token_id}]"
-            matched = match.group(0)
-            if info := labelled.get(matched):
-                marker, row = info
-                sid = row["id"]
-                _, count = secret_hits.get(sid, (row, 0))
-                secret_hits[sid] = (row, count + 1)
-                return marker
-            return vault.REDACTED
+                replacement = f"[token:{token_id}]"
+                kind = "token"
+                why = f"token:{token_id}"
+            else:
+                matched = match.group(0)
+                if info := labelled.get(matched):
+                    marker, row = info
+                    sid = row["id"]
+                    _, count = secret_hits.get(sid, (row, 0))
+                    secret_hits[sid] = (row, count + 1)
+                    replacement = marker
+                    kind = "secret"
+                    why = secretstore.address(row["scope"], row["name"])
+                else:
+                    replacement = vault.REDACTED
+                    kind = "secret"
+                    why = "private_key" if PRIVATE_KEY_START.match(matched) else "secret"
+            parts.append(replacement)
+            spans.append({"kind": kind, "start": out_pos, "end": out_pos + len(replacement), "why": why})
+            out_pos += len(replacement)
+            cursor = match.end()
 
-        return self.pattern().sub(replace, text), secret_hits, token_hits
+        if cursor == 0:
+            return text, secret_hits, token_hits, spans
+        if cursor < len(text):
+            parts.append(text[cursor:])
+        return "".join(parts), secret_hits, token_hits, spans
 
 
 def _stat_sig(path: Path) -> tuple | None:
@@ -335,20 +365,24 @@ def _record_hits(channel: str, subject: str, secret_hits: dict[int, tuple[dict, 
         write()
 
 
-def _apply_json_safe(s: str, redactions: Redactions) -> tuple[str, dict[int, tuple[dict, int]], Counter[str]]:
-    plain, secret_hits, token_hits = redactions.apply(s)
+def _apply_json_safe(
+    s: str, redactions: Redactions,
+) -> tuple[str, dict[int, tuple[dict, int]], Counter[str], list[dict[str, int | str]]]:
+    plain, secret_hits, token_hits, spans = redactions.apply_with_spans(s)
     if plain == s or parses(plain) or not parses(s):
-        return plain, secret_hits, token_hits
+        return plain, secret_hits, token_hits, spans
     secret_hits.clear()
     token_hits.clear()
+    found_spans: list[dict[str, int | str]] = []
 
     def walk(item):
         if isinstance(item, str):
-            cleaned, sh, th = redactions.apply(item)
+            cleaned, sh, th, sp = redactions.apply_with_spans(item)
             for sid, (row, count) in sh.items():
                 _, prev = secret_hits.get(sid, (row, 0))
                 secret_hits[sid] = (row, prev + count)
             token_hits.update(th)
+            found_spans.extend(sp)
             return cleaned
         if isinstance(item, list):
             return [walk(x) for x in item]
@@ -356,17 +390,24 @@ def _apply_json_safe(s: str, redactions: Redactions) -> tuple[str, dict[int, tup
             return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
         return item
 
-    return json.dumps(walk(json.loads(s)), ensure_ascii=False), secret_hits, token_hits
+    return json.dumps(walk(json.loads(s)), ensure_ascii=False), secret_hits, token_hits, found_spans
 
 
-def text(s: str, channel: str, subject: str = "", extra: Iterable[str] | Redactions = ()) -> str:
+def text(
+    s: str,
+    channel: str,
+    subject: str = "",
+    extra: Iterable[str] | Redactions = (),
+    *,
+    spans: bool = False,
+) -> str | tuple[str, list[dict[str, int | str]]]:
     if not isinstance(s, str) or not s:
-        return s
+        return (s, []) if spans else s
     redactions = _resolve_redactions(extra)
-    cleaned, secret_hits, token_hits = _apply_json_safe(s, redactions)
+    cleaned, secret_hits, token_hits, found_spans = _apply_json_safe(s, redactions)
     if secret_hits or token_hits:
         _record_hits(channel, subject, secret_hits, token_hits, redactions)
-    return cleaned
+    return (cleaned, found_spans) if spans else cleaned
 
 
 def value(v, channel: str, subject: str = "", extra: Iterable[str] | Redactions = ()):
@@ -381,7 +422,7 @@ def value(v, channel: str, subject: str = "", extra: Iterable[str] | Redactions 
 
     def walk(item):
         if isinstance(item, str):
-            cleaned, sh, th = _apply_json_safe(item, redactions)
+            cleaned, sh, th, _ = _apply_json_safe(item, redactions)
             for sid, (row, count) in sh.items():
                 _, prev = total_secrets.get(sid, (row, 0))
                 total_secrets[sid] = (row, prev + count)
