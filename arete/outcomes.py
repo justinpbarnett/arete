@@ -160,6 +160,9 @@ def sync_outcomes(cfg: config.Config) -> None:
                          for pr in prs if pr.get("closedAt")), default=util.iso())
         record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
     util.write_json(PR_SEEN_FILE, fresh)
+    from . import ticket_feedback
+
+    ticket_feedback.sync(cfg)
     for repo in cfg.repos:
         if repo.pipeline and repo.github and not repo.layer:
             try:
