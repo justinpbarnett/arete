@@ -774,22 +774,42 @@ def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: l
 
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
                    copies: list[str], *, preview_of: str = "",
-                   excluded: Collection[Path] = ()) -> tuple[Path, list[Checkout]]:
+                   excluded: Collection[Path] = (),
+                   extra_repos: Collection[config.Repo] = ()) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
-    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
-                          repo.target_branch or base or gh.default_branch(p.github))
-                 for p in repo.parts if ws / p.dir not in excluded]
-    require_target_branch(repo, checkouts, work_branch=branch)
+    if extra_repos:
+        checkouts = []
+        repo_groups = []
+        for target_repo in (repo, *extra_repos):
+            group = []
+            for p in target_repo.parts or [config.Part("", target_repo.github or target_repo.name)]:
+                subdir = f"{target_repo.name}/{p.dir}" if p.dir else target_repo.name
+                wt = ws / subdir
+                if wt in excluded:
+                    continue
+                c = Checkout(subdir, p.github, target_repo.path / p.dir, wt,
+                             target_repo.target_branch or base or gh.default_branch(p.github))
+                group.append(c)
+                checkouts.append(c)
+            require_target_branch(target_repo, group, work_branch=branch)
+            repo_groups.append((target_repo, group))
+    else:
+        checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
+                              repo.target_branch or base or gh.default_branch(p.github))
+                     for p in repo.parts if ws / p.dir not in excluded]
+        require_target_branch(repo, checkouts, work_branch=branch)
+        repo_groups = [(repo, checkouts)]
     if any(wt.resolve().is_relative_to(c.wt.resolve()) or c.wt.resolve().is_relative_to(wt.resolve())
            for c in checkouts for wt in excluded):
         raise worktree_failure("an active worktree overlaps a closed PR worktree", ws, branch)
     kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch, excluded=excluded)
+    owner_by_wt = {c.wt: target_repo for target_repo, group in repo_groups for c in group}
 
     def resumes_for(c: Checkout) -> bool:
         if preview_of:
             return bool(remote_head(c.src, preview_of))
         c.pr = gh.open_pr_url(c.github, branch)
-        require_target_branch(repo, [c])
+        require_target_branch(owner_by_wt.get(c.wt, repo), [c])
         c.lease = remote_head(c.src, branch)
         return bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
 

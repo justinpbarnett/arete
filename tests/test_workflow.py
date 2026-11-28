@@ -355,13 +355,13 @@ class ParallelClassDeadlineTests(unittest.TestCase):
 
 
 class ParallelDeadlineExtensionTests(unittest.TestCase):
-    def sleeper(self, seconds):
+    def sleeper(self, seconds, *, class_timeout=0.4):
         folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         (folder / "deadline_extension_worker.py").write_text(
             "import time\n"
             "import unittest\n\n"
             "class Sleeper(unittest.TestCase):\n"
-            "    class_timeout = 0.4\n\n"
+            f"    class_timeout = {class_timeout}\n\n"
             "    def test_sleep(self):\n"
             f"        time.sleep({seconds})\n"
         )
@@ -372,9 +372,9 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
         return runner, "deadline_extension_worker.Sleeper"
 
     def test_pool_timeout_passes_alone_with_triple_deadline(self):
-        # At load factor 1, the 1.0s sleep exceeds both the pool's 0.4s deadline
-        # and the old 2x rerun deadline. Allow headroom for worker overhead on the rerun.
-        runner, identifier = self.sleeper(1.0)
+        # At load factor 1, the 1.0s sleep exceeds the pool's 0.8s deadline while
+        # leaving generous headroom for cold Python worker startup within the 2.4s (3x) solo rerun.
+        runner, identifier = self.sleeper(1.0, class_timeout=0.8)
         self.addCleanup(sys.modules.pop, "deadline_extension_worker", None)
 
         def remove_reports(path):
@@ -388,7 +388,7 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
             code = runner.run([], [identifier])
         self.addCleanup(shutil.rmtree, runner.folder, ignore_errors=True)
         self.assertEqual(code, 0, output.getvalue())
-        self.assertIn("class exceeded 0.4s", runner.first_failures[identifier]["timeout"].splitlines())
+        self.assertIn("class exceeded 0.8s", runner.first_failures[identifier]["timeout"].splitlines())
         self.assertEqual(runner.crowded, [identifier])
         self.assertIn(f"{identifier}: ran past its deadline on its first run, "
                       "then passed alone within three times its deadline", output.getvalue())
