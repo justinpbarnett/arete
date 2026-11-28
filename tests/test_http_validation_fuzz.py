@@ -20,12 +20,14 @@ from arete import (
     credential_http,
     dashboard,
     event_stream,
+    inbox,
     tailnet,
     webhooks,
     webpush,
 )
 from arete.refusals import Stated
 from arete.store import events as event_store
+from arete.store import inbox as inbox_store
 from arete.store import tokens
 
 
@@ -448,6 +450,26 @@ class WebhookSseAndWebpushFuzzTests(unittest.TestCase):
         dashboard.Redirect.answer(fake_redirect, "GET")
         headers_map = {k: v for k, v in recorded if k not in ("status", "end")}
         self.assertEqual(headers_map["Location"], "https://node.ts.net:8443/")
+
+    def test_inbox_and_webpush_id_overflow_and_reserved_manual_subjects(self):
+        self.assertEqual(inbox_store.parse_id("TR-42"), 42)
+        self.assertEqual(inbox_store.parse_id(42), 42)
+        for bad_id in ("TR-0", "TR-" + "9" * 19, "TR-١٢", 0, -1, 2**63, True, None):
+            self.assertIsNone(inbox_store.parse_id(bad_id), bad_id)
+
+        self.assertEqual(webpush.parse_subscription_id("PS-7"), 7)
+        for bad_sub in ("PS-0", "PS-" + "9" * 19, "PS-١", "7", None):
+            self.assertIsNone(webpush.parse_subscription_id(bad_sub), bad_sub)
+
+        for prefix in ("presence:owner/k", "approval:1", "APPROVAL:1", "ask:a1", "workspace:1", "proposal:5", "chat:1/draft"):
+            with self.assertRaises(contract.Problem) as ctx:
+                inbox.raise_manual({"subject": prefix, "kind": "freeform", "verbs": ["approve"]})
+            self.assertEqual(ctx.exception.code, "validation")
+
+        for bad_prio in (True, "not-int", 0, 4, None):
+            with self.assertRaises(contract.Problem) as ctx:
+                inbox.raise_manual({"subject": "alert:test", "kind": "alert", "priority": bad_prio})
+            self.assertEqual(ctx.exception.code, "validation")
 
 
 if __name__ == "__main__":
