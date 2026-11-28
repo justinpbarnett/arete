@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from arete import launchd, paths, poll, scratch, workspace
+from arete import environment, launchd, paths, poll, scratch, workspace
 from arete.lab import experiment, optimize
 from arete.store import workspaces
 from tests import support
@@ -331,7 +331,8 @@ if sys.argv[1] == "double":
         monitors = {}
         with scratch.producing(attempt):
             if modern:
-                proc = scratch.spawn(command, actor_confined=True, cwd=attempt.workspace, stdout=subprocess.PIPE)
+                proc = scratch.spawn(command, actor_confined=True, cwd=attempt.workspace, stdout=subprocess.PIPE,
+                                     env=environment.build(()))
                 monitors = scratch.monitors(self.record(attempt))
                 for monitor in monitors.values():
                     self.register_cleanup(monitor)

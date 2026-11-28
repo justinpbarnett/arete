@@ -150,7 +150,9 @@ def acquiring(repo: str, tid: str):
 
 
 def child_environment(keep: tuple[int, ...]) -> tuple[tuple[int, ...], dict]:
-    env = dict(os.environ)
+    from . import environment
+
+    env = environment.build(environment.INTERNAL_ARETE)
     env.pop(ENV, None)
     env.pop(POLL, None)
     env.pop(READMISSION, None)

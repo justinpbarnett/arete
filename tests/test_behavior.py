@@ -11071,3 +11071,390 @@ class CredentialInstanceTests(_CredentialCase):
             self.assertEqual(foreign, self.request(server, "GET", self.TASKS, bearer=unknown, status=401)[0])
             digest.assert_not_called()
             compare.assert_not_called()
+
+
+SECRET_SCRUB_FIXTURE = r"""
+import gzip
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import subprocess
+import sys
+import urllib.request
+
+from arete import devices, environment, gh, jev, jira, loop_run, outbound, pipeline, record, run_lines, scrub, util, vault
+from arete.agent import Result
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
+from arete.store import tokens as token_store
+
+PLANTED = secrets.token_urlsafe(24)[:32]
+MARKER = '[secret:global/PLANTED_VALUE]'
+util.github_token = mock.Mock(return_value='')
+
+
+def forbid_network(*args, **kwargs):
+    raise AssertionError('unexpected network request')
+
+
+def planted_secret(*, expose=None):
+    return secretstore.put('global', 'PLANTED_VALUE', PLANTED, 'api_key', 'hand', expose=expose)
+
+
+def secret_event_channels(name='PLANTED_VALUE', event='found_in_output'):
+    rows = [e for e in secretstore.history('global', name) if e['event'] == event]
+    channels = []
+    for row in rows:
+        detail = row.get('detail') or ''
+        assert PLANTED not in detail, detail
+        data = json.loads(detail)
+        channels.append((data.get('channel'), data.get('subject'), data.get('count')))
+    return rows, channels
+
+
+def assert_tree_clean(value):
+    escaped_u = json.dumps(value, ensure_ascii=False)[1:-1]
+    escaped_a = json.dumps(value, ensure_ascii=True)[1:-1]
+    needles = {value.encode(), escaped_u.encode(), escaped_a.encode()}
+    for root in (paths.STATE_DIR, paths.LOG_DIR):
+        if not root.exists():
+            continue
+        for file in root.rglob('*'):
+            if not file.is_file():
+                continue
+            raw = file.read_bytes()
+            if file.suffix == '.gz':
+                raw = gzip.decompress(raw)
+            for needle in needles:
+                assert needle not in raw, f'leaked secret in {file}'
+"""
+
+
+class SecretScrubRecordsTests(_SecretChildCase):
+    def test_records_run_lines_command_output_and_state_never_leak_planted_value(self):
+        self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
+with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
+    planted_secret()
+    run_id = record.start('pipeline', repo='demo', issue='1')
+    with record.Recorder(run_id, 'build', {'runner': 'claude', 'model': 'fixture'}) as rec:
+        rec.line(json.dumps({'type': 'message', 'text': f'line {PLANTED}'}))
+        call = Result(ok=False, error=f'call err {PLANTED}', runner='claude', model='fixture')
+        res = Result(ok=False, error=f'top err {PLANTED}', text=f'reply {PLANTED}',
+                     structured={'note': f'struct {PLANTED}'}, calls=[call], runner='claude', model='fixture')
+        res.error = scrub.text(res.error, 'record', f'{run_id}/build')
+        res.text = scrub.text(res.text, 'record', f'{run_id}/build')
+        res.structured = scrub.value(res.structured, 'record', f'{run_id}/build')
+        call.error = scrub.text(call.error, 'record', f'{run_id}/build')
+        rec.finish(res, 0.2)
+    record.step(run_id, 'build', res, 0.2)
+    run_lines.write(run_id, 'error', detail=f'runline {PLANTED}')
+    output_file = paths.RUNS_DIR / run_id / 'check.log'
+    code, text = loop_run.run_command(
+        [sys.executable, '-c', f'print("cmd " + {PLANTED!r})'],
+        Path.cwd(), timeout=10, env={}, device=devices.LOCAL, output=output_file,
+    )
+    assert code == 0 and MARKER in text and PLANTED not in text, text
+    gh_calls = []
+    def fake_gh(args, **kw):
+        gh_calls.append((list(args), kw.get('input')))
+        return 'https://github.com/fixture/repo/issues/1#issuecomment-1'
+    with mock.patch.object(gh, 'gh', side_effect=fake_gh):
+        gh.pr_comment('https://github.com/fixture/repo/pull/1', f'outbound {PLANTED}')
+    for args, stdin in gh_calls:
+        assert all(PLANTED not in str(a) for a in args), args
+        assert PLANTED not in str(stdin or ''), stdin
+        assert MARKER in str(stdin or ''), stdin
+    assert_tree_clean(PLANTED)
+    rec_text = gzip.decompress(record.find_record(run_id, 'build').read_bytes()).decode()
+    assert MARKER in rec_text and PLANTED not in rec_text
+    assert MARKER in run_lines.path(run_id).read_text()
+    assert MARKER in output_file.read_text()
+    rows, channels = secret_event_channels()
+    by_channel = {}
+    for ch, subj, cnt in channels:
+        by_channel[ch] = by_channel.get(ch, 0) + 1
+        assert cnt >= 1
+    assert {'record', 'command_output', 'outbound'} <= set(by_channel), channels
+    assert by_channel['record'] == 1, channels
+""")
+
+    def test_outbound_private_repo_and_jev_scrub_planted_value(self):
+        self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
+from types import SimpleNamespace
+
+planted_secret()
+gh_calls = []
+def fake_gh(args, **kw):
+    gh_calls.append((list(args), str(kw.get('input') or '')))
+    return 'https://github.com/fixture/private/issues/42'
+
+jira_calls = []
+def fake_jira_request(self, method, path, params=None, body=None, **kw):
+    jira_calls.append((method, path, body))
+    return {'id': '99'}
+
+with (mock.patch.object(gh, 'gh', side_effect=fake_gh),
+      mock.patch.object(jira.Client, 'request', fake_jira_request),
+      mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network)):
+    gh.pr_create('fixture/private', 'branch', 'main', f'PR {PLANTED}', f'PR body {PLANTED}')
+    gh.pr_comment('https://github.com/fixture/private/pull/7', f'PR comment {PLANTED}')
+    gh.issue_create('fixture/private', f'Issue {PLANTED}', f'Issue body {PLANTED}')
+    client = jira.Client('https://jira.example.invalid', 'user@example.invalid', 'fixture-jira-auth-token')
+    client.comment('APP-1', f'Jira comment {PLANTED}')
+    private_run = SimpleNamespace(repo=SimpleNamespace(name='private', public=False))
+    assert pipeline.public_text(private_run, f'report {PLANTED}') == f'report {MARKER}'
+
+assert len(gh_calls) == 3
+for args, body in gh_calls:
+    joined = ' '.join(map(str, args)) + '\n' + body
+    assert PLANTED not in joined and MARKER in joined, joined
+assert len(jira_calls) == 1
+jira_payload = json.dumps(jira_calls[0][2])
+assert PLANTED not in jira_payload and MARKER in jira_payload, jira_payload
+
+jev_bodies = []
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self, n=-1):
+        return self.payload
+
+def capture_jev(req, timeout=None):
+    jev_bodies.append(req.data.decode())
+    return FakeResponse(json.dumps({
+        'model': 'fixture', 'usage': {'input_tokens': 10},
+        'answers': {'secrets': {'noul': 0.1}},
+    }).encode())
+
+secretstore.put('global', 'OPENROUTER_API_KEY', 'fixture-openrouter-key-1234', 'api_key', 'hand', provider='openrouter')
+cfg = config.load()
+with mock.patch.object(urllib.request, 'urlopen', side_effect=capture_jev):
+    reply = jev.ask({'command': f'echo {PLANTED}', 'diff': f'+secret={PLANTED}'},
+                    {'secrets': jev.yes_no('holds secret?')}, cfg, note=False)
+assert not reply.error, reply.error
+assert len(jev_bodies) == 1 and PLANTED not in jev_bodies[0] and MARKER in jev_bodies[0]
+_, channels = secret_event_channels()
+assert any(ch == 'jev' for ch, _, _ in channels), channels
+""")
+
+
+class SecretScrubApiAndTokensTests(_SecretChildCase):
+    def test_api_and_run_events_stream_scrub_raw_database_and_log_values(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + SECRET_SCRUB_FIXTURE + r"""
+with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
+    planted_secret()
+    tid = task_store.task_add('demo', 'initial body', 'secret task')
+    run_id = record.start('pipeline', repo='demo', issue=str(tid))
+    record.step(run_id, 'build', Result(ok=False, error='initial', runner='claude', model='fixture'), 0.1)
+    # Plant raw values directly via sqlite3 and run.jsonl, bypassing write-time scrubbing.
+    raw_conn = sqlite3.connect(paths.DB_FILE)
+    try:
+        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'db task {PLANTED}', tid))
+        raw_conn.execute('UPDATE steps SET error = ? WHERE run_id = ?', (f'db step {PLANTED}', run_id))
+        raw_conn.execute('UPDATE runs SET summary = ? WHERE id = ?', (f'db run {PLANTED}', run_id))
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    log_path = run_lines.path(run_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps({'ts': util.iso(), 'run': run_id, 'seq': 1, 'event': 'report',
+                                    'detail': f'raw log {PLANTED}'}) + '\n')
+
+    _, task_resp = request('GET', f'/api/v1/tasks/{tid}', token=bearer)
+    _, run_resp = request('GET', f'/api/v1/runs/{run_id}', token=bearer)
+    headers = {'Connection': 'close', 'Authorization': 'Bearer ' + bearer}
+    st1, _, events_raw = VersionedApiTests.wire_exchange('GET', f'/api/runs/{run_id}/events', headers, b'',
+                                                         server=server, handler=dashboard.Handler)
+    st2, _, follow_raw = VersionedApiTests.wire_exchange('GET', f'/api/runs/{run_id}/events?follow=1', headers, b'',
+                                                         server=server, handler=dashboard.Handler)
+    assert st1 == 200 and st2 == 200, (st1, st2)
+    for label, payload in [('task', json.dumps(task_resp)), ('run', json.dumps(run_resp)),
+                           ('events', events_raw.decode()), ('follow', follow_raw.decode())]:
+        assert PLANTED not in payload, (label, payload)
+        assert MARKER in payload, (label, payload)
+""")
+
+    def test_tokens_become_token_id_and_emit_event_while_plain_identifiers_stay(self):
+        self.run_secret_child(SECRET_HTTP_FIXTURE + SECRET_SCRUB_FIXTURE + r"""
+with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
+    issued, full_token = token_store.issue(actor, 'Leak fixture', ['read'])
+    tid_hex = issued['id']
+    token_marker = f'[token:{tid_hex}]'
+    safe_ident = 'car_tag_1_x'
+
+    run_id = record.start('pipeline', repo='demo', issue='2')
+    with record.Recorder(run_id, 'plan', {'runner': 'claude', 'model': 'fixture'}) as rec:
+        rec.line(json.dumps({'text': f'tok={full_token} id={safe_ident}'}))
+    rec_text = gzip.decompress(record.find_record(run_id, 'plan').read_bytes()).decode()
+    assert token_marker in rec_text and safe_ident in rec_text and full_token not in rec_text
+
+    sent = []
+    with mock.patch.object(gh, 'gh', side_effect=lambda args, **kw: sent.append(str(kw.get('input') or '')) or 'ok'):
+        gh.pr_comment('https://github.com/fixture/repo/pull/2', f'body {full_token} {safe_ident}')
+    assert len(sent) == 1 and token_marker in sent[0] and safe_ident in sent[0] and full_token not in sent[0]
+
+    task_id = task_store.task_add('demo', 'clean', 'token task')
+    raw_conn = sqlite3.connect(paths.DB_FILE)
+    try:
+        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'api {full_token} {safe_ident}', task_id))
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    api_text = json.dumps(request('GET', f'/api/v1/tasks/{task_id}', token=bearer))
+    assert token_marker in api_text and safe_ident in api_text and full_token not in api_text
+
+    with db.reader() as c:
+        hits = [dict(r) for r in c.execute(
+            "SELECT subject, data FROM events_log WHERE kind = 'token.found_in_output'")]
+    assert hits and all(h['subject'] == f'token:{tid_hex}' and full_token not in h['data'] for h in hits), hits
+""")
+
+
+class SecretScrubLogsAndEnvTests(_SecretChildCase):
+    def test_control_launch_cli_logs_and_hook_events_scrub_planted_value(self):
+        self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
+from arete import control, tool_events
+
+planted_secret()
+script = (
+    f"import sys\nsys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r})\n"
+    "from arete import cli\n"
+    "from arete.commands import setup\n"
+    f"val = {PLANTED!r}\n"
+    "def leaky(_args):\n"
+    "    print('stdout ' + val, flush=True)\n"
+    "    raise RuntimeError('crash ' + val)\n"
+    "setup.cmd_status = leaky\n"
+    "cli.main(['status', '--offline'])\n"
+)
+proc = control.launch([sys.executable, '-I', '-c', script], log_name='runs.log')
+assert proc.wait(timeout=8) != 0
+log_text = (paths.LOG_DIR / 'runs.log').read_text()
+assert PLANTED not in log_text, log_text
+assert log_text.count(MARKER) == 2, log_text
+
+tool_events.append_hook_event({'ts': util.iso(), 'hook': 'PostToolUse', 'tool': 'Bash', 'session': 's1',
+                               'cwd': str(Path.cwd()), 'agent': True, 'kind': 'bash', 'cls': 'interrupted',
+                               'detail': f'echo {PLANTED}'})
+hook_text = paths.EVENTS_FILE.read_text()
+assert MARKER in hook_text and PLANTED not in hook_text, hook_text
+""")
+
+    def test_env_per_role_isolates_secrets_across_runners_commands_and_launch(self):
+        self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
+from arete import claude, control, device_turns
+
+planted_secret(expose=[{'env': 'PLANTED_VALUE', 'roles': ['step:check']}])
+sample_token = 'sample-ambient-token-' + secrets.token_hex(8)
+oauth_token = 'claude-oauth-registry-' + secrets.token_hex(8)
+repo_secret = 'repo-only-secret-val-' + secrets.token_hex(8)
+secretstore.put('repo:demo', 'REPO_ONLY', repo_secret, 'repo_answer', 'hand')
+expected_sha = hashlib.sha256(PLANTED.encode()).hexdigest()
+probe = (
+    'import hashlib, json, os; '
+    'pv = os.environ.get("PLANTED_VALUE", ""); '
+    'print(json.dumps({"planted_sha": hashlib.sha256(pv.encode()).hexdigest() if pv else "", '
+    '"has_sample": "SAMPLE_API_TOKEN" in os.environ, "has_repo": "REPO_ONLY" in os.environ}))'
+)
+cfg = config.load()
+with mock.patch.dict(os.environ, {'PLANTED_VALUE': PLANTED, 'SAMPLE_API_TOKEN': sample_token,
+                                  'CLAUDE_CODE_OAUTH_TOKEN': oauth_token}):
+    res_check = environment.sh([sys.executable, '-c', probe], cfg, role='step:check')
+    assert res_check.returncode == 0, res_check.stderr
+    seen_check = json.loads(res_check.stdout)
+    assert seen_check == {'planted_sha': expected_sha, 'has_sample': False, 'has_repo': False}, seen_check
+
+    demo_repo = config.Repo(name='demo', path=Path.cwd(), github='fixture/demo')
+    res_repo = environment.sh([sys.executable, '-c', probe], cfg, demo_repo, role='step:check')
+    assert json.loads(res_repo.stdout)['has_repo'] is True
+
+    res_sh = util.sh([sys.executable, '-c', probe])
+    assert json.loads(res_sh.stdout) == {'planted_sha': '', 'has_sample': False, 'has_repo': False}
+
+    code, out = loop_run.run_command([sys.executable, '-c', probe], Path.cwd(), timeout=10, env={},
+                                     device=devices.LOCAL, role='loop:other')
+    assert code == 0 and json.loads(out) == {'planted_sha': '', 'has_sample': False, 'has_repo': False}
+
+    launch_out = Path.cwd() / 'launch-probe.json'
+    proc = control.launch([sys.executable, '-I', '-c',
+                           f'import json, os; from pathlib import Path; '
+                           f'Path({str(launch_out)!r}).write_text(json.dumps('
+                           f'{{"p": "PLANTED_VALUE" in os.environ, "s": "SAMPLE_API_TOKEN" in os.environ}}))'],
+                          log_name='probe.log')
+    assert proc.wait(timeout=8) == 0
+    assert json.loads(launch_out.read_text()) == {'p': False, 's': False}
+
+    fake_device = devices.Device(name='remote-box', kind='ssh', host='box.example.invalid', dir='/srv/work')
+    captured_remote = {}
+    def fake_remote(dev, cmd, cwd, env, prompt, **kw):
+        captured_remote['env'] = dict(env)
+        done = subprocess.CompletedProcess(cmd, 0, '{"type":"result","subtype":"success","result":"ok"}\n', '')
+        done.started = True
+        return done
+    with mock.patch.object(device_turns, 'run', side_effect=fake_remote):
+        claude._run('hi', '/srv/work', remote=fake_device)
+    assert 'PLANTED_VALUE' not in captured_remote['env'] and 'SAMPLE_API_TOKEN' not in captured_remote['env']
+
+    local_claude_env = claude.agent_env(passing=[])
+    assert 'PLANTED_VALUE' not in local_claude_env and 'SAMPLE_API_TOKEN' not in local_claude_env
+    assert 'CLAUDE_CODE_OAUTH_TOKEN' not in local_claude_env
+    secretstore.put('global', 'CLAUDE_CODE_OAUTH_TOKEN', oauth_token, 'api_key', 'hand',
+                    expose=[{'env': 'CLAUDE_CODE_OAUTH_TOKEN', 'roles': ['runner:claude']}])
+    assert claude.agent_env(passing=[]).get('CLAUDE_CODE_OAUTH_TOKEN') == oauth_token
+""")
+
+    def test_below_floor_secret_is_refused_and_source_check_holds(self):
+        self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
+import ast
+import inspect
+import re
+
+from arete import scratch
+
+row = secretstore.put('global', 'SHORT_SECRET', 'initial-long-value-1234', 'api_key', 'hand',
+                      expose=[{'env': 'SHORT_SECRET', 'roles': ['step:check']}])
+settings = config.secret_settings()
+ref = secretstore.parse_reference(row['reference'], db.schema_metadata()['instance_tag'])
+short_val = '1234567'
+secretstore.write_item(ref, settings, short_val.encode())
+with db.tx() as c:
+    c.execute('UPDATE secrets SET fingerprint = ? WHERE id = ?', (secretstore.fingerprint(short_val), row['id']))
+
+cfg = config.load()
+res = environment.sh([sys.executable, '-c', 'import os; print("SHORT_SECRET" in os.environ)'], cfg, role='step:check')
+assert res.returncode == 0 and res.stdout.strip() == 'False', res.stdout
+refused = [e for e in secretstore.history('global', 'SHORT_SECRET') if e['event'] == 'refused']
+assert len(refused) == 1 and short_val not in (refused[0].get('detail') or ''), refused
+
+with case.assertRaises(ValueError):
+    scratch.spawn([sys.executable, '-c', 'pass'])
+
+assert 'inherit' not in inspect.signature(util.sh).parameters
+bad = []
+for p in sorted(paths.PACKAGE_DIR.rglob('*.py')):
+    src = p.read_text()
+    if p.name not in ('environment.py', 'scrub.py'):
+        for pat in (r'\{\s*\*\*os\.environ\b', r'\bos\.environ\.items\s*\(', r'\bos\.environ\.copy\s*\('):
+            if m := re.search(pat, src):
+                bad.append(f'{p.name}: {m.group(0)}')
+    if m := re.search(r'len\([^)]+\)\s*>=\s*8\b', src):
+        bad.append(f'{p.name}: {m.group(0)}')
+    tree = ast.parse(src, filename=str(p))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            name = f'{node.func.value.id}.{node.func.attr}'
+            if name in ('subprocess.run', 'subprocess.Popen', 'scratch.spawn'):
+                if p.name == 'scratch.py' and name == 'subprocess.Popen' and any(kw.arg is None for kw in node.keywords):
+                    continue
+                kws = {kw.arg: kw.value for kw in node.keywords}
+                if 'env' not in kws or (isinstance(kws['env'], ast.Constant) and kws['env'].value is None):
+                    bad.append(f'{p.name}:{node.lineno}: {name} without env=')
+assert not bad, '\n'.join(bad)
+""")
+

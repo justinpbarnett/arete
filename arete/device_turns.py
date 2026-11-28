@@ -48,8 +48,10 @@ def folder(device, leaf=""):
 
 
 def control(device, script, stdin="", timeout=CONTROL_SECONDS):
+    from . import environment
+
     proc = scratch.spawn([*ssh.ssh_argv(device), script], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment.build(()))
     try:
         out, err = proc.communicate(stdin.encode(), timeout=max(.01, timeout))
         return subprocess.CompletedProcess(proc.args, proc.returncode, out.decode(errors="replace"),
@@ -382,8 +384,10 @@ def run(device: ssh.Device, argv: list[str], cwd, env: dict[str, str], stdin: st
             header = b""
             acknowledged = False
             try:
+                from . import environment
+
                 proc = scratch.spawn([*ssh.ssh_argv(device), attach_script(path, offset + len(pending))], stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment.build(()))
             except OSError:
                 reconnect()
                 continue

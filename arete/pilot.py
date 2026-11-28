@@ -114,7 +114,10 @@ def git(repo: Path, *args: str, until: float | None = None) -> str:
 def readme(repo: Path, ref: str, *, until: float | None = None) -> str:
     args = ("show", f"{ref}:{DOC}")
     if until is None:
-        result = subprocess.run(["git", *args], cwd=repo, capture_output=True, timeout=10, check=False)
+        from . import environment
+
+        result = subprocess.run(["git", *args], cwd=repo, capture_output=True, timeout=10, check=False,
+                                env=environment.build(()))
     else:
         result = candidate_git(repo, args, until, 10)
     require(result.returncode == 0, "the approved README blob is unavailable")

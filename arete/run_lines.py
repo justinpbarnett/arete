@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
-from . import codebase, events, paths, principals, util
+from . import codebase, events, paths, principals, scrub, util
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -141,7 +141,7 @@ def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
             first = (os.getpid(), run_id) not in _named
             if first:
                 line["engine"] = codebase.STAMP
-            text = json.dumps(line, ensure_ascii=False, default=str)
+            text = scrub.text(json.dumps(line, ensure_ascii=False, default=str), "run_lines", f"{run_id}/{event}")
             append_bytes(f, text.encode() + b"\n", check)
             if event_id:
                 os.fsync(f.fileno())
@@ -150,7 +150,7 @@ def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
     except OSError as e:
         if check or event_id:
             raise
-        text = json.dumps(line, ensure_ascii=False, default=str)
+        text = scrub.text(json.dumps(line, ensure_ascii=False, default=str), "run_lines", f"{run_id}/{event}")
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
         step, attempt = str(fields.get("step", "")), fields.get("try", 1)
