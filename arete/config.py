@@ -282,14 +282,6 @@ class AskConfig:
 
 
 @dataclass(frozen=True)
-class Retention:
-    days: float = 30
-    max_gb: float = 20
-    lines_days: float = 90
-    db_max_mb: float = 500
-
-
-@dataclass(frozen=True)
 class BackupConfig:
     copy_to: str = ""
 
@@ -355,7 +347,6 @@ class OncallConfig:
     incident_budget_usd: float = 5.0
     daily_budget_usd: float = 10.0
     cooldown_minutes: float = 30.0
-    keep_days: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -440,7 +431,6 @@ class Config:
     mcp: dict[str, dict] = field(default_factory=dict)
     research: ResearchConfig = field(default_factory=ResearchConfig)
     ask: AskConfig = field(default_factory=AskConfig)
-    retention: Retention = field(default_factory=Retention)
     backup: BackupConfig = field(default_factory=BackupConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
@@ -916,20 +906,6 @@ def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
-def retention_table(data, ignored: list[str] | None = None) -> Retention:
-    table = only(table_of(data, "retention"), root_schema("retention"), "[retention]", ignored=ignored)
-    found = {}
-    for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days),
-                        ("db_max_mb", Retention.db_max_mb)):
-        value = table.get(key, default)
-        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"[retention] {key} must be a number above 0, not {value!r}")
-        found[key] = value
-    if found["lines_days"] < found["days"]:
-        raise ValueError("[retention] lines_days must be at least days")
-    return Retention(**found)
-
-
 def backup_table(data, ignored: list[str] | None = None) -> BackupConfig:
     table = only(table_of(data, "backup"), root_schema("backup"), "[backup]", ignored=ignored)
     copy_to = table.get("copy_to", BackupConfig.copy_to)
@@ -1102,8 +1078,7 @@ def oncall_source(entry, repos: list[Repo], *, problems: list[Problem] | None = 
 
 
 ONCALL_BOUNDS = {"max_repairs": (int, 0), "wakes_per_hour": (int, 0), "max_attempts": (int, 1),
-                 "incident_budget_usd": (float, 0), "daily_budget_usd": (float, 0), "cooldown_minutes": (float, 0),
-                 "keep_days": (float, 0)}
+                 "incident_budget_usd": (float, 0), "daily_budget_usd": (float, 0), "cooldown_minutes": (float, 0)}
 
 
 def oncall_bounds(table: dict) -> dict:
@@ -1122,7 +1097,10 @@ def oncall_bounds(table: dict) -> dict:
 
 
 def oncall_table(data, repos: list[Repo], *, problems: list[Problem] | None = None, path: str = "") -> OncallConfig:
-    table = only(table_of(data, "oncall"), root_schema("oncall"), "[oncall]",
+    raw = table_of(data, "oncall")
+    if "keep_days" in raw:
+        raise ValueError("[oncall] keep_days moved to [incidents] keep_days in retention.toml")
+    table = only(raw, root_schema("oncall"), "[oncall]",
                  problems=problems, path=path, scope="oncall")
     enabled = flag(table, "enabled", False, "[oncall]")
     entries = table.get("source", [])
@@ -1540,7 +1518,8 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.research = research_table(data.get("research") or {}, ignored)
     cfg.ask = ask_table(data.get("ask", {}) if strict else data.get("ask") or {}, ignored)
     cfg.triage = triage_table(data.get("triage", {}), ignored)
-    cfg.retention = retention_table(data.get("retention") or {}, ignored)
+    if "retention" in data:
+        raise ValueError("[retention] moved to retention.toml")
     cfg.backup = backup_table(data.get("backup") or {}, ignored)
     secrets_table(data.get("secrets", {}), anchor_file, repo_paths=(repo.path for repo in cfg.repos), ignored=ignored)
     cfg.chat = chat_table(data.get("chat") or {}, ignored)

@@ -197,18 +197,20 @@ def alerts(connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM alerts ORDER BY opened")]
 
 
-def prune(c, days: float = 14, keep_days: float = 30) -> None:
-    since = util.iso(util.now() - timedelta(days=days))
-    old = util.iso(util.now() - timedelta(days=days * 4))
+def prune(c, *, days: float = 56, notes_days: float = 14, keep_days: float = 30) -> int:
+    notes_since = util.iso(util.now() - timedelta(days=notes_days))
+    old = util.iso(util.now() - timedelta(days=days))
     kept = util.iso(util.now() - timedelta(days=keep_days))
     done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"  # noqa: S608
-    c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (since, f"{SEEN_AGAIN}:%"))
-    c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))  # noqa: S608
+    removed = 0
+    removed += c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (notes_since, f"{SEEN_AGAIN}:%")).rowcount
+    removed += c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,)).rowcount  # noqa: S608
     c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))  # noqa: S608
-    c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))  # noqa: S608
-    c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)")
-    c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
-    c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
+    removed += c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept)).rowcount  # noqa: S608
+    removed += c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)").rowcount
+    removed += c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)").rowcount
+    removed += c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)").rowcount
+    return removed
 
 
 def write_alias(c, fingerprint: str, incident_id: int, note: str) -> None:

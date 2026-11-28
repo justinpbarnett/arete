@@ -1,0 +1,36 @@
+[firings]
+days = 14
+
+[queue]
+days = 14
+
+[records]
+days = 30
+max_gb = 20
+
+[folders]
+days = 90
+
+[events_log]
+notice_days = 7
+derived_days = 90
+
+[idempotency]
+days = 30
+
+[loop_events]
+days = 56
+
+[incidents]
+days = 56
+notes_days = 14
+keep_days = 30
+
+[dead_letters]
+days = 56
+
+[events_file]
+days = 90
+
+[db]
+max_mb = 500

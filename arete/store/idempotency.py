@@ -84,6 +84,9 @@ def receipt(seq):
         return {"event_seq": f"{epoch}.{seq}", **dict(event)}
 
 
-def prune():
-    with tx() as c:
-        c.execute("DELETE FROM idempotency WHERE at < ?", (util.iso(util.now() - timedelta(days=30)),))
+def prune(c=None, *, days: float = 30) -> int:
+    cutoff = util.iso(util.now() - timedelta(days=days))
+    if c is not None:
+        return c.execute("DELETE FROM idempotency WHERE at < ?", (cutoff,)).rowcount
+    with tx() as conn:
+        return conn.execute("DELETE FROM idempotency WHERE at < ?", (cutoff,)).rowcount

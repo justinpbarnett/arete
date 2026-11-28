@@ -10401,30 +10401,33 @@ class DBStatsRetentionTests(unittest.TestCase):
                                   "transactions_by_kind": {"cli": 1}})
 
     def test_serve_reports_dbstats_prune_and_continues_after_failure(self):
-        limits = SimpleNamespace(lines_days=3, days=30, max_gb=1)
-        cfg = SimpleNamespace(retention=limits, oncall=SimpleNamespace(keep_days=7))
+        policy = serve.retention.default_policy()
+        measured = serve.retention_store.Measured(0, {}, {}, {}, {})
+        rows_plan = serve.retention_store.RowsPruned(0, 0, 0, False)
+        files_plan = serve.retention_store.FilesPruned(0, 0, 0, 0, ())
         for result, error, messages in (
             (2, None, [mock.call("dbstats: removed 2 files")]),
             (0, None, []),
             (None, OSError("cannot unlink"), [mock.call("dbstats prune failed: OSError: cannot unlink")]),
         ):
             with self.subTest(result=result, error=error):
-                server = mock.Mock(cfg=cfg)
+                server = mock.Mock(cfg=SimpleNamespace(), pool=None)
                 with (
                     mock.patch.object(serve.backup, "snapshot", return_value=None),
+                    mock.patch.object(serve.retention, "load", return_value=policy),
                     mock.patch.object(dbstats, "prune", return_value=result, side_effect=error) as prune,
-                    mock.patch.object(serve.store, "prune") as state_prune,
-                    mock.patch.object(record, "purge_folders", return_value=record.Purged(0, 0, ())) as purge,
-                    mock.patch.object(record, "prune", return_value=SimpleNamespace(removed=[], over=False)) as records,
+                    mock.patch.object(serve.retention_store, "measure", return_value=measured) as measure,
+                    mock.patch.object(serve.retention_store, "prune_rows", return_value=rows_plan) as prune_rows,
+                    mock.patch.object(serve.retention_store, "prune_files", return_value=files_plan) as prune_files,
                     mock.patch.object(serve.tool_events, "rotate_events") as rotate,
                 ):
                     serve.Server.prune_data(server)
 
                 prune.assert_called_once_with()
-                state_prune.assert_called_once_with(lines_days=3, keep_days=7)
-                purge.assert_called_once_with()
-                records.assert_called_once_with(30, 1)
-                rotate.assert_called_once_with(3)
+                measure.assert_called_once_with()
+                prune_rows.assert_called_once_with(policy, measured)
+                prune_files.assert_called_once_with()
+                rotate.assert_called_once_with(policy.events_file.days)
                 self.assertEqual(server.say.call_args_list, messages)
 
 

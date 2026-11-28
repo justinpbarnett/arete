@@ -322,7 +322,38 @@ def batch_io(op, operations):
     return inputs, result
 
 
+def _config_kinds_enum(operations):
+    enum = operations.get("config.list", {}).get("input", {}).get("properties", {}).get("kind", {}).get("enum")
+    return list(enum) if isinstance(enum, list) else None
+
+
+def config_result(name, op, operations):
+    result = op["result"]
+    kinds = _config_kinds_enum(operations)
+    if not kinds:
+        return result
+    props = result.get("properties", {})
+    if name == "config.kinds":
+        kind_schema = props.get("kinds", {}).get("items", {}).get("properties", {}).get("kind", {})
+        if kind_schema.get("enum") == kinds:
+            result = deepcopy(result)
+            result["properties"]["kinds"]["items"]["properties"]["kind"].pop("enum")
+    elif name == "config.list":
+        kind_schema = props.get("items", {}).get("items", {}).get("properties", {}).get("kind", {})
+        if kind_schema.get("enum") == kinds:
+            result = deepcopy(result)
+            result["properties"]["items"]["items"]["properties"]["kind"].pop("enum")
+    elif name == "config.read":
+        kind_schema = props.get("item", {}).get("properties", {}).get("kind", {})
+        if kind_schema.get("enum") == kinds:
+            result = deepcopy(result)
+            result["properties"]["item"]["properties"]["kind"].pop("enum")
+    return result
+
+
 def compare(old, new):
+    old_kinds, new_kinds = _config_kinds_enum(old["operations"]), _config_kinds_enum(new["operations"])
+    additive_config_kinds = bool(old_kinds and new_kinds and set(old_kinds) <= set(new_kinds))
     for name, before in sorted(old["operations"].items()):
         after = new["operations"].get(name)
         identity = f"{name} ({route(before)})"
@@ -334,6 +365,9 @@ def compare(old, new):
         if name == "batch.run":
             old_input, old_result = batch_io(before, old["operations"])
             new_input, new_result = batch_io(after, new["operations"])
+        elif additive_config_kinds and name in ("config.kinds", "config.list", "config.read"):
+            old_result = config_result(name, before, old["operations"])
+            new_result = config_result(name, after, new["operations"])
         changes = [*schema_breaks(old_input, new_input, "input"),
                    *schema_breaks(old_result, new_result, "result", result=True)]
         if before.get("body_media") != after.get("body_media"):

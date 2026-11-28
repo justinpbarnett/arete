@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, configkinds, events, paths, principals, refusals, util
+from . import config, configkinds, events, paths, principals, refusals, retention, util
 from .store import config as config_store
 from .store import db as foundation
 
@@ -328,6 +328,11 @@ def _validate_content(rel: str, raw: bytes, root: Path) -> None:
                 config.load(draft, strict=True, base_dir=root)
             except Exception as e:
                 raise ConfigRepoError(f"config.toml failed validation: {e}") from e
+    elif rel == retention.FILENAME:
+        try:
+            retention.parse_bytes(raw)
+        except Exception as e:
+            raise ConfigRepoError(f"{retention.FILENAME} failed validation: {e}") from e
     classified = configkinds.classify(rel)
     if classified is not None and classified[0] == "device" and isinstance(parsed, dict):
         from . import configschema, devices
@@ -573,6 +578,53 @@ def _live_bytes(root: Path, rel: str) -> bytes | None:
     return done.stdout if done.returncode == 0 else None
 
 
+def live_bytes(path: str | Path, root: Path | None = None) -> bytes | None:
+    return _live_bytes(root or _root(), _normalize_rel(path))
+
+
+def _migrate_retention_locked(root: Path, fence: Fence) -> str:
+    live_cfg = _live_bytes(root, "config.toml")
+    if live_cfg is None or (b"retention" not in live_cfg and b"keep_days" not in live_cfg):
+        return ""
+    try:
+        text = live_cfg.decode("utf-8")
+        data = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return ""
+    if not retention.has_legacy_settings(data):
+        return ""
+    cfg_path = root / "config.toml"
+    if cfg_path.is_file() and _git_blob_sha(cfg_path.read_bytes()) != _git_blob_sha(live_cfg):
+        return ""
+    moved = retention.legacy_values(data)
+    new_cfg = retention.strip_legacy_config_toml(text).encode("utf-8")
+    changes: dict[str, bytes] = {"config.toml": new_cfg}
+    if moved:
+        changes[retention.FILENAME] = retention.merge_toml(_live_bytes(root, retention.FILENAME), moved)
+    for rel in sorted(changes):
+        _validate_content(rel, changes[rel], root)
+    return _commit_files_locked(
+        root,
+        changes,
+        "engine",
+        "engine",
+        note="move retention settings from config.toml to retention.toml",
+        fence=fence,
+        modes={"config.toml": 0o600},
+        write_files=True,
+    )
+
+
+def migrate_retention(*, fence: Fence | None = None) -> str:
+    root = _root()
+    if not is_repo(root):
+        return ""
+    with writer_lock(fence) as owned:
+        if paths.DB_FILE.exists() and config_store.available():
+            _reconcile_locked(root, owned)
+        return _migrate_retention_locked(root, owned)
+
+
 def read(path: str | Path) -> tuple[str, str]:
     rel = _normalize_rel(path)
     root = _root()
@@ -586,9 +638,10 @@ def read(path: str | Path) -> tuple[str, str]:
 def init(*, fence: Fence | None = None) -> None:
     root = _root()
     if is_repo(root):
-        if paths.DB_FILE.exists() and config_store.available():
-            with writer_lock(fence) as owned:
+        with writer_lock(fence) as owned:
+            if paths.DB_FILE.exists() and config_store.available():
                 _reconcile_locked(root, owned)
+            _migrate_retention_locked(root, owned)
         return
     if bad := _forbidden_secret_entries(root):
         raise ConfigRepoError(f"cannot initialize config repo while secret files remain: {', '.join(bad)}")
@@ -700,6 +753,7 @@ def init(*, fence: Fence | None = None) -> None:
         _install_hook(root)
         if paths.DB_FILE.exists() and config_store.available():
             _reconcile_locked(root, owned)
+        _migrate_retention_locked(root, owned)
 
 
 def _fold_layers_history(root: Path, staged_layers: Path) -> None:

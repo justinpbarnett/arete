@@ -775,9 +775,9 @@ with mock.patch.object(pi.sandbox, 'can_confine', return_value=False):
 
     def test_settlement_moves_an_hour_old_done_record_and_prunes_its_sealed_evidence(self):
         self.run_secret_child(AUTHORITY_FIXTURE + r"""
-with paths.CONFIG_FILE.open('a') as out:
-    out.write('\n[retention]\ndays = 2\n')
-days = config.load().retention.days
+from arete import retention
+retention.policy_file().write_text('[records]\ndays = 2\n')
+days = retention.load().records.days
 with engine():
     a = make('a')
     (Path(a.root) / 'out/output.txt').write_text('fixture evidence')
@@ -6439,7 +6439,8 @@ class ConfigRegistryTests(unittest.TestCase):
         "oncall flag": "[oncall]\nenabled = 1",
         "oncall whole": "[oncall]\nmax_attempts = true",
         "oncall amount": "[oncall]\nincident_budget_usd = 0",
-        "oncall inclusive amount": "[oncall]\nkeep_days = nan",
+        "oncall inclusive amount": "[oncall]\ncooldown_minutes = nan",
+        "oncall keep_days moved": "[oncall]\nkeep_days = 30",
         "oncall source keys": "[[oncall.source]]\nz = 1",
         "oncall source path": "[[oncall.source]]\npath = true",
         "replay keys": "[replay]\nz = 1",
@@ -6461,8 +6462,7 @@ class ConfigRegistryTests(unittest.TestCase):
         "triage auto": "[triage]\nauto = 1",
         "triage route fixes": "[triage]\nroute_fixes = 1",
         "triage count": "[triage]\nauto_per_refresh = true",
-        "retention keys": "[retention]\nz = 1",
-        "retention number": "[retention]\ndays = nan",
+        "retention moved": "[retention]\ndays = 5",
         "backup keys": "[backup]\nz = 1",
         "backup destination": "[backup]\ncopy_to = false",
         "chat keys": "[chat]\nz = 1",
@@ -6529,7 +6529,7 @@ floor = "global"
 [kinds.fix.steps.review]
 tries = 2
 [oncall]
-keep_days = inf
+cooldown_minutes = inf
 daily_budget_usd = inf
 """
     settings_layer = """
@@ -7128,7 +7128,7 @@ timeout_minutes = 40
             "payment_modes": config.allowed_payment_modes(cfg, layer),
             "capabilities": routing.Discovery(cfg, layer=layer).declared,
             "paid": asdict(config.allowed_paid_routes(cfg, layer)),
-            "oncall_accepts_inf": cfg.oncall.keep_days == cfg.oncall.daily_budget_usd == float("inf"),
+            "oncall_accepts_inf": cfg.oncall.cooldown_minutes == cfg.oncall.daily_budget_usd == float("inf"),
         }
 
     def assert_observation(self, case):
@@ -7278,7 +7278,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
 
         kinds = ("prompt", "schema", "adw", "routes", "step_settings", "models", "prices", "budgets", "connector",
                  "source", "target", "rule", "sync", "vocabularies", "device", "loop", "attention", "sound",
-                 "experiment")
+                 "experiment", "retention")
         assert tuple(configkinds.REGISTRY) == kinds
         assert all((paths.PACKAGE_DIR.parent / entry.schema).is_file() and entry.home and entry.gate
                    and entry.verbs == ("list", "read", "versions", "diff") for entry in configkinds.REGISTRY.values())
@@ -12306,7 +12306,7 @@ assert keyed_after == keyed_before
 
 with api_server(scopes=('read', 'config:activate', 'settings:write')) as (api, _):
     kinds_resp = api.read('/api/v1/config')['kinds']
-    assert [k['kind'] for k in kinds_resp] == list(configkinds.REGISTRY) and len(kinds_resp) == 19
+    assert [k['kind'] for k in kinds_resp] == list(configkinds.REGISTRY) and len(kinds_resp) == 20
     for row in kinds_resp:
         assert row['verbs'] == ['list', 'read', 'versions', 'diff']
         api.read(f"/api/v1/config/{row['kind']}")
@@ -13893,6 +13893,554 @@ with scratch_records():
 """)
 
 
+RETENTION_CHILD_PRELUDE = r"""
+import json
+import os
+import time
+from datetime import timedelta
+from pathlib import Path
+from unittest import mock
+
+from arete import agent, backup, config, configrepo, control, inbox, paths, principals, record, refusals, retention, run_lines, serve, tasks, util
+from arete.store import asks as asks_store
+from arete.store import db as foundation
+from arete.store import events as event_store
+from arete.store import idempotency as idem_store
+from arete.store import incidents as incident_store
+from arete.store import loops as loop_store
+from arete.store import retention as retention_store
+from arete.store import runs as run_store
+
+paths.ensure_dirs()
+foundation.migrate()
+principals.seed_owner("owner@example.test")
+
+
+def backdate_run(run_id: str, days: float, *, record_mtime_days: float | None = None) -> str:
+    ts = util.iso(util.now() - timedelta(days=days))
+    with foundation.tx() as c:
+        c.execute("UPDATE runs SET started = ?, finished = CASE WHEN finished IS NOT NULL THEN ? ELSE NULL END WHERE id = ?",
+                  (ts, ts, run_id))
+    mtime_days = days if record_mtime_days is None else record_mtime_days
+    mtime = time.time() - mtime_days * 86400
+    rec_dir = paths.RUNS_DIR / run_id / "record"
+    if rec_dir.is_dir():
+        for root, _, names in os.walk(rec_dir):
+            for name in names:
+                os.utime(Path(root) / name, (mtime, mtime))
+        os.utime(rec_dir, (mtime, mtime))
+    return ts
+
+
+def seed_run(kind: str, status: str, days: float, *, with_record: bool = True, record_bytes: int = 64,
+             record_mtime_days: float | None = None, with_step: bool = False, with_feed: bool = False,
+             session_dir: bool = False, **fields) -> str:
+    rid = record.start(kind, **fields)
+    folder = paths.RUNS_DIR / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "run.log").write_text("log line\n", encoding="utf-8")
+    if with_record:
+        rec = folder / "record"
+        rec.mkdir(parents=True, exist_ok=True)
+        (rec / "steps.jsonl.gz").write_bytes(b"x" * record_bytes)
+    if session_dir:
+        sdir = paths.STATE_DIR / "sessions" / rid
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "session.log").write_text("session line\n", encoding="utf-8")
+    if with_step:
+        record.step(rid, "build", agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic",
+                                               cost_usd=0.0 if fields.get("loop_kind") == "command" else 0.1), 1.0)
+    if with_feed:
+        run_store.add_feed(rid, "note", "feed line")
+    if status != "running":
+        record.settle(rid, status, summary=f"ended {status}")
+    backdate_run(rid, days, record_mtime_days=record_mtime_days)
+    return rid
+
+
+def quiet_server():
+    server = serve.Server()
+    said = []
+    server.say = said.append
+    return server, said
+"""
+
+
+class _RetentionChildCase(unittest.TestCase):
+    def run_retention_child(self, script: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-ret-test-") as tmp:
+            root = Path(tmp).resolve()
+            env = {
+                **os.environ,
+                "ARETE_CONFIG_DIR": str(root / "config"),
+                "ARETE_STATE_DIR": str(root / "state"),
+                "ARETE_LOG_DIR": str(root / "logs"),
+                "ARETE_WORKTREES_DIR": str(root / "worktrees"),
+                "TMPDIR": str(root / "tmp"),
+                "HOME": str(root / "home"),
+                "ARETE_TEST_FAST_SYNC": "1",
+            }
+            for sub in ("config", "state", "logs", "worktrees", "tmp", "home", "repo-app"):
+                (root / sub).mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.toml").write_text(
+                'alert_repo = "org/alerts"\n\n'
+                '[[repo]]\n'
+                'name = "app"\n'
+                f'path = {json.dumps(str(root / "repo-app"))}\n'
+                'tracker = "local"\n',
+                encoding="utf-8",
+            )
+            done = subprocess.run(
+                [sys.executable, "-c", RETENTION_CHILD_PRELUDE + script],
+                cwd=Path(__file__).resolve().parent.parent,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            if done.returncode != 0:
+                self.fail(f"retention child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+            for line in reversed(done.stdout.splitlines()):
+                if line.startswith("BEHAVIOR_RESULT="):
+                    return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            self.fail(f"missing BEHAVIOR_RESULT= line in stdout:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+
+
+class RunRetentionPassTests(_RetentionChildCase):
+    def test_replay_set_leaves_exactly_what_retention_toml_names(self):
+        res = self.run_retention_child(r"""
+retention.policy_file().write_text(
+    "[firings]\ndays = 14\n"
+    "[queue]\ndays = 14\n"
+    "[records]\ndays = 30\nmax_gb = 20\n"
+    "[folders]\ndays = 90\n"
+    "[events_log]\nnotice_days = 7\nderived_days = 90\n"
+    "[idempotency]\ndays = 30\n"
+    "[loop_events]\ndays = 56\n"
+    "[incidents]\ndays = 56\nnotes_days = 14\nkeep_days = 30\n"
+    "[dead_letters]\ndays = 56\n"
+    "[events_file]\ndays = 90\n"
+    "[db]\nmax_mb = 500\n",
+    encoding="utf-8",
+)
+
+old_firing = seed_run("loop", "done", 15, loop="ping", loop_kind="command", with_step=True, with_feed=True)
+young_firing = seed_run("loop", "done", 13, loop="ping", loop_kind="command", with_step=True, with_feed=True)
+rec_only = seed_run("pipeline", "done", 31, repo="app", issue="10", with_step=True, with_feed=True)
+old_pipe = seed_run("pipeline", "done", 91, repo="app", issue="11", with_step=True, with_feed=True)
+
+# Unrecorded folders that must never be removed.
+chat_dir = paths.RUNS_DIR / "chat"
+chat_dir.mkdir(parents=True, exist_ok=True)
+(chat_dir / "note.txt").write_text("keep chat\n", encoding="utf-8")
+eva_dir = paths.RUNS_DIR / "eva-x-prompts"
+eva_dir.mkdir(parents=True, exist_ok=True)
+(eva_dir / "prompt.txt").write_text("keep eva\n", encoding="utf-8")
+old_100 = time.time() - 100 * 86400
+os.utime(eva_dir / "prompt.txt", (old_100, old_100))
+os.utime(eva_dir, (old_100, old_100))
+
+# Monthly events.jsonl archive older than 90 days vs recent archive.
+old_archive = paths.STATE_DIR / "events-202501.jsonl"
+old_archive.write_text('{"ts":"2025-01-01T00:00:00Z"}\n', encoding="utf-8")
+old_91 = time.time() - 91 * 86400
+os.utime(old_archive, (old_91, old_91))
+fresh_archive = paths.STATE_DIR / "events-202611.jsonl"
+fresh_archive.write_text('{"ts":"2026-11-01T00:00:00Z"}\n', encoding="utf-8")
+
+# Seed events_log (notice > 7d, durable > 200d), idempotency (> 30d), dead queue (> 56d),
+# settled run queue (> 14d), loop event (> 56d), and closed incident (> keep_days = 30d, < days = 56d).
+with foundation.tx() as c, principals.acting("hand"):
+    notice_seq = event_store.emit("notice.test", "run:x", cls="notice", data={})
+    durable_seq = event_store.emit("durable.test", "run:x", cls="durable", data={})
+    c.execute("UPDATE events_log SET at = ? WHERE seq = ?", (util.iso(util.now() - timedelta(days=8)), notice_seq))
+    c.execute("UPDATE events_log SET at = ? WHERE seq = ?", (util.iso(util.now() - timedelta(days=200)), durable_seq))
+
+    old_31 = util.iso(util.now() - timedelta(days=31))
+    c.execute("INSERT INTO idempotency (actor, key, route, request_sha, status, response, at) VALUES (?,?,?,?,?,?,?)",
+              ("hand", "old-key", "POST /api/v1/x", "abc", 200, b"{}", old_31))
+    c.execute("INSERT INTO idempotency (actor, key, route, request_sha, status, response, at) VALUES (?,?,?,?,?,?,?)",
+              ("hand", "new-key", "POST /api/v1/x", "def", 200, b"{}", util.iso()))
+
+    old_57 = util.iso(util.now() - timedelta(days=57))
+    old_15 = util.iso(util.now() - timedelta(days=15))
+    dead_id = loop_store.enqueue("l1", "l1", "", "event", [{"k": 1}], c=c)
+    c.execute("UPDATE queue SET dead_at = ?, dead_reason = 'boom', enqueued = ? WHERE id = ?", (old_57, old_57, dead_id))
+    run_q_id = loop_store.enqueue("l2", "l2", "", "event", [{"k": 2}], c=c)
+    c.execute("UPDATE queue SET run_id = ?, enqueued = ? WHERE id = ?", (rec_only, old_15, run_q_id))
+    c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, ts) VALUES (?,?,?,?,?,?,?,?,?)",
+              ("l1", "t", "s", "k", "app", "old", "", "internal", old_57))
+
+    cur = c.execute(
+        "INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, last_seen, count, evidence, state, closed) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("fp-closed", "unexpected", "s", "app", "sig", old_31, old_31, 1, "secret evidence", "resolved", old_31),
+    )
+    inc_id = cur.lastrowid
+    c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (inc_id, old_31, "closed note"))
+
+# Snapshot run.changed count for old_pipe before prune.
+with foundation.reader() as c:
+    changed_before = c.execute(
+        "SELECT COUNT(*) FROM events_log WHERE kind = 'run.changed' AND subject = ?",
+        (f"run:{old_pipe}",),
+    ).fetchone()[0]
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+with foundation.reader() as c:
+    old_f_row = c.execute("SELECT 1 FROM runs WHERE id = ?", (old_firing,)).fetchone()
+    old_f_steps = c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ?", (old_firing,)).fetchone()[0]
+    old_f_feed = c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (old_firing,)).fetchone()[0]
+    old_f_purge = c.execute("SELECT 1 FROM run_purges WHERE run_id = ?", (old_firing,)).fetchone()
+
+    yng_f_row = c.execute("SELECT 1 FROM runs WHERE id = ?", (young_firing,)).fetchone()
+    yng_f_feed = c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (young_firing,)).fetchone()[0]
+
+    rec_row = dict(c.execute("SELECT * FROM runs WHERE id = ?", (rec_only,)).fetchone())
+    old_p_row = dict(c.execute("SELECT * FROM runs WHERE id = ?", (old_pipe,)).fetchone())
+    old_p_steps = c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ?", (old_pipe,)).fetchone()[0]
+    old_p_feed = c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (old_pipe,)).fetchone()[0]
+    changed_after = c.execute(
+        "SELECT COUNT(*) FROM events_log WHERE kind = 'run.changed' AND subject = ?",
+        (f"run:{old_pipe}",),
+    ).fetchone()[0]
+
+    notice_left = c.execute("SELECT 1 FROM events_log WHERE seq = ?", (notice_seq,)).fetchone()
+    durable_left = c.execute("SELECT 1 FROM events_log WHERE seq = ?", (durable_seq,)).fetchone()
+    idem_keys = sorted(r[0] for r in c.execute("SELECT key FROM idempotency"))
+    queue_ids = [r[0] for r in c.execute("SELECT id FROM queue")]
+    loop_events_left = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    inc_row = dict(c.execute("SELECT id, evidence, state FROM incidents WHERE id = ?", (inc_id,)).fetchone())
+    inc_notes = c.execute("SELECT COUNT(*) FROM incident_notes WHERE incident = ?", (inc_id,)).fetchone()[0]
+
+# Purged run refusals on tasks.resume, tasks.repair, tasks.run_step and record.pin.
+refusals_seen = {}
+for label, fn in (
+    ("resume", lambda: tasks.resume(old_pipe)),
+    ("repair", lambda: tasks.repair(old_pipe)),
+    ("run_step", lambda: tasks.run_step(old_pipe, "build", {})),
+    ("pin", lambda: record.pin(old_pipe)),
+):
+    try:
+        fn()
+    except (control.Refused, refusals.Conflict) as e:
+        refusals_seen[label] = str(e)
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "old_firing_gone": old_f_row is None and old_f_steps == 0 and old_f_feed == 0 and old_f_purge is None
+    and not (paths.RUNS_DIR / old_firing).exists(),
+    "young_firing_kept": yng_f_row is not None and yng_f_feed == 1 and (paths.RUNS_DIR / young_firing).is_dir(),
+    "rec_only": {
+        "folder": (paths.RUNS_DIR / rec_only).is_dir(),
+        "record": (paths.RUNS_DIR / rec_only / "record").exists(),
+        "records_purged": bool(rec_row["records_purged"]),
+        "files_purged": rec_row["files_purged"],
+    },
+    "old_pipe": {
+        "folder": (paths.RUNS_DIR / old_pipe).exists(),
+        "steps": old_p_steps,
+        "feed": old_p_feed,
+        "files_purged": bool(old_p_row["files_purged"]),
+        "records_purged": bool(old_p_row["records_purged"]),
+        "run_changed_delta": changed_after - changed_before,
+    },
+    "old_archive_gone": not old_archive.exists() and fresh_archive.exists(),
+    "notice_gone_durable_kept": notice_left is None and durable_left is not None,
+    "idem_keys": idem_keys,
+    "queue_empty": queue_ids == [],
+    "loop_events_left": loop_events_left,
+    "incident_cleaned": inc_row["state"] == "resolved" and inc_row["evidence"] == "" and inc_notes == 0,
+    "unrecorded_kept": (chat_dir / "note.txt").is_file() and (eva_dir / "prompt.txt").is_file(),
+    "refusals_name_date": all(old_p_row["files_purged"] in refusals_seen.get(k, "") for k in ("resume", "repair", "run_step", "pin")),
+}))
+""")
+        self.assertTrue(res["old_firing_gone"])
+        self.assertTrue(res["young_firing_kept"])
+        self.assertEqual(res["rec_only"], {"folder": True, "record": False, "records_purged": True, "files_purged": None})
+        self.assertEqual(
+            res["old_pipe"],
+            {"folder": False, "steps": 1, "feed": 0, "files_purged": True, "records_purged": True, "run_changed_delta": 1},
+        )
+        self.assertTrue(res["old_archive_gone"])
+        self.assertTrue(res["notice_gone_durable_kept"])
+        self.assertEqual(res["idem_keys"], ["new-key"])
+        self.assertTrue(res["queue_empty"])
+        self.assertEqual(res["loop_events_left"], 0)
+        self.assertTrue(res["incident_cleaned"])
+        self.assertTrue(res["unrecorded_kept"])
+        self.assertTrue(res["refusals_name_date"])
+
+    def test_phase_failures_preserve_atomicity_and_retry_cleanly(self):
+        res = self.run_retention_child(r"""
+old_pipe = seed_run("pipeline", "done", 91, repo="app", issue="20", with_feed=True)
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        # 1. Snapshot fails -> nothing changes.
+        with mock.patch.object(backup, "snapshot", side_effect=RuntimeError("disk full")):
+            server.prune_data()
+        snap_unchanged = (
+            (paths.RUNS_DIR / old_pipe).is_dir()
+            and run_store.run_get(old_pipe)["files_purged"] is None
+            and run_store.purge_queue() == []
+        )
+
+        # 2. Rows transaction raises -> no row, mark, or file changes.
+        orig_trim = retention_store.events.trim
+        with mock.patch.object(retention_store.events, "trim", side_effect=RuntimeError("tx boom")):
+            server.prune_data()
+        rows_unchanged = (
+            (paths.RUNS_DIR / old_pipe).is_dir()
+            and run_store.run_get(old_pipe)["files_purged"] is None
+            and run_store.purge_queue() == []
+            and len(run_store.feed(old_pipe)) == 1
+        )
+        assert orig_trim is not None
+
+        # 3. File phase raises after rows tx commits -> folder & run_purges stay with files_purged set;
+        #    record.pin refuses due to waiting run_purges; next pass removes both.
+        with mock.patch.object(retention_store, "prune_files", side_effect=OSError("io fail")):
+            server.prune_data()
+        after_file_fail = {
+            "folder": (paths.RUNS_DIR / old_pipe).is_dir(),
+            "files_purged": bool(run_store.run_get(old_pipe)["files_purged"]),
+            "queued": [(q["run_id"], q["reason"]) for q in run_store.purge_queue()],
+        }
+        pin_refused = False
+        try:
+            record.pin(old_pipe)
+        except refusals.Conflict:
+            pin_refused = True
+
+        # Next pass completes file removal and clears run_purges.
+        server.prune_data()
+        after_retry = {
+            "folder": (paths.RUNS_DIR / old_pipe).exists(),
+            "queued": run_store.purge_queue(),
+        }
+finally:
+    server.pool.shutdown(wait=True)
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "snap_unchanged": snap_unchanged,
+    "rows_unchanged": rows_unchanged,
+    "after_file_fail": after_file_fail,
+    "pin_refused": pin_refused,
+    "after_retry": after_retry,
+}))
+""")
+        self.assertTrue(res["snap_unchanged"])
+        self.assertTrue(res["rows_unchanged"])
+        self.assertEqual(res["after_file_fail"]["folder"], True)
+        self.assertEqual(res["after_file_fail"]["files_purged"], True)
+        self.assertEqual(res["after_file_fail"]["queued"][0][1], "lines")
+        self.assertTrue(res["pin_refused"])
+        self.assertEqual(res["after_retry"], {"folder": False, "queued": []})
+
+    def test_records_max_gb_prunes_oldest_first_keeps_pinned_and_reports_over(self):
+        res = self.run_retention_child(r"""
+# 2.1 MB cap (0.0021 decimal GB = 2,100,000 bytes).
+retention.policy_file().write_text("[records]\ndays = 30\nmax_gb = 0.0021\n[folders]\ndays = 90\n", encoding="utf-8")
+one_mb = 1_000_000
+r1 = seed_run("pipeline", "done", 10, repo="app", issue="1", record_bytes=one_mb)
+r2 = seed_run("pipeline", "done", 8, repo="app", issue="2", record_bytes=one_mb)
+r3 = seed_run("pipeline", "done", 6, repo="app", issue="3", record_bytes=one_mb)
+r4 = seed_run("pipeline", "done", 4, repo="app", issue="4", record_bytes=one_mb)
+record.pin(r2)
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+        after_pass1 = {
+            "r1_rec": (paths.RUNS_DIR / r1 / "record").exists(),
+            "r2_rec": (paths.RUNS_DIR / r2 / "record").exists(),
+            "r3_rec": (paths.RUNS_DIR / r3 / "record").exists(),
+            "r4_rec": (paths.RUNS_DIR / r4 / "record").exists(),
+            "runs_bytes": record.runs_bytes(),
+        }
+        # Pin r4 and add another pinned 1.5 MB run so kept runs alone exceed max_gb.
+        record.pin(r4)
+        r5 = seed_run("pipeline", "done", 2, repo="app", issue="5", record_bytes=1_500_000)
+        record.pin(r5)
+        said.clear()
+        server.prune_data()
+        over_logged = any("is over max_gb" in line for line in said)
+        pinned_all_kept = all((paths.RUNS_DIR / rid / "record").is_dir() for rid in (r2, r4, r5))
+finally:
+    server.pool.shutdown(wait=True)
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "after_pass1": after_pass1,
+    "over_logged": over_logged,
+    "pinned_all_kept": pinned_all_kept,
+}))
+""")
+        self.assertFalse(res["after_pass1"]["r1_rec"])
+        self.assertTrue(res["after_pass1"]["r2_rec"])
+        self.assertFalse(res["after_pass1"]["r3_rec"])
+        self.assertTrue(res["after_pass1"]["r4_rec"])
+        self.assertLessEqual(res["after_pass1"]["runs_bytes"], 2_100_000)
+        self.assertTrue(res["over_logged"])
+        self.assertTrue(res["pinned_all_kept"])
+
+
+class RunRetentionPolicyAndMigrationTests(_RetentionChildCase):
+    def test_session_folder_chain_and_pipeline_keep_rules(self):
+        res = self.run_retention_child(r"""
+# 1. Standalone 91-day session run -> loses sessions/<id> & runs/<id>, row kept.
+old_ses = seed_run("session", "done", 91, session_dir=True, with_feed=True)
+
+# 2. 91-day session run whose chain holds a run started 10 days ago -> keeps sessions/<id>.
+chained_ses = seed_run("session", "done", 91, session_dir=True)
+recent_child = seed_run("session", "done", 10, session_dir=True)
+run_lines.write(recent_child, "route", continues=chained_ses)
+
+# 3. 91-day pipeline runs kept by: pin, open ask, answered untaken ask, status=pr, recent (repo, issue).
+pinned_pipe = seed_run("pipeline", "done", 91, repo="app", issue="101")
+record.pin(pinned_pipe)
+
+ask_pipe = seed_run("pipeline", "done", 91, repo="app", issue="102")
+asks_store.ask_add("ask-1", ask_pipe, "app", "102", "build", "c1", "need input", "", [{"question": "proceed?"}], {})
+
+pr_pipe = seed_run("pipeline", "pr", 91, repo="app", issue="103")
+
+ticket_old = seed_run("pipeline", "done", 91, repo="app", issue="104")
+ticket_new = seed_run("pipeline", "done", 10, repo="app", issue="104")
+
+# 4. 31-day pipeline run whose record was written within the last hour stays.
+recent_rec_pipe = seed_run("pipeline", "done", 31, repo="app", issue="105", record_mtime_days=0.0)
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "old_ses_purged": not (paths.STATE_DIR / "sessions" / old_ses).exists()
+    and not (paths.RUNS_DIR / old_ses).exists()
+    and bool(run_store.run_get(old_ses)["files_purged"]),
+    "chained_ses_kept": (paths.STATE_DIR / "sessions" / chained_ses).is_dir()
+    and run_store.run_get(chained_ses)["files_purged"] is None,
+    "pinned_kept": (paths.RUNS_DIR / pinned_pipe).is_dir(),
+    "ask_kept": (paths.RUNS_DIR / ask_pipe).is_dir(),
+    "pr_kept": (paths.RUNS_DIR / pr_pipe).is_dir(),
+    "same_ticket_kept": (paths.RUNS_DIR / ticket_old).is_dir() and (paths.RUNS_DIR / ticket_new).is_dir(),
+    "recent_record_kept": (paths.RUNS_DIR / recent_rec_pipe / "record").is_dir()
+    and run_store.run_get(recent_rec_pipe)["records_purged"] is None,
+}))
+""")
+        self.assertTrue(res["old_ses_purged"])
+        self.assertTrue(res["chained_ses_kept"])
+        self.assertTrue(res["pinned_kept"])
+        self.assertTrue(res["ask_kept"])
+        self.assertTrue(res["pr_kept"])
+        self.assertTrue(res["same_ticket_kept"])
+        self.assertTrue(res["recent_record_kept"])
+
+    def test_config_move_commit_hand_edit_inbox_and_validator(self):
+        res = self.run_retention_child(r"""
+import tomllib
+
+# Start with legacy config.toml containing [retention] and [oncall] keep_days.
+paths.CONFIG_FILE.write_text(
+    'alert_repo = "org/alerts"\n\n'
+    "[oncall]\n"
+    "enabled = false\n"
+    "keep_days = 15\n\n"
+    "[retention]\n"
+    "days = 20\n"
+    "max_gb = 12\n"
+    "lines_days = 75\n"
+    "db_max_mb = 256\n",
+    encoding="utf-8",
+)
+configrepo.init()
+
+live_cfg = tomllib.loads(configrepo.live_bytes("config.toml").decode("utf-8"))
+live_ret = tomllib.loads(configrepo.live_bytes("retention.toml").decode("utf-8"))
+loaded = retention.load()
+
+with foundation.reader() as c:
+    ret_events = c.execute("SELECT kind, subject FROM events_log WHERE kind = 'config.retention.changed'").fetchall()
+
+# Seed a 10-day run (kept under live days = 20, would be pruned if invalid days = 5 took effect).
+ten_day = seed_run("pipeline", "done", 10, repo="app", issue="200")
+
+# Hand-edit config.toml to re-add [retention] days = 5.
+paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text(encoding="utf-8") + "\n[retention]\ndays = 5\n", encoding="utf-8")
+committed_hand = configrepo.commit_hand_edits()
+live_cfg_after = tomllib.loads(configrepo.live_bytes("config.toml").decode("utf-8"))
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        tick_ok = server.tick()
+        items = inbox.list(state="open", kind="config_invalid")
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+# Validator checks: unknown table, unknown key, non-positive / bool, records.days > folders.days.
+validator_errors = {}
+for name, body in (
+    ("unknown_table", b"[bogus]\ndays = 1\n"),
+    ("unknown_key", b"[firings]\nextra = 1\n"),
+    ("zero", b"[firings]\ndays = 0\n"),
+    ("bool", b"[firings]\ndays = true\n"),
+    ("records_gt_folders", b"[records]\ndays = 100\n[folders]\ndays = 90\n"),
+):
+    try:
+        retention.parse_bytes(body)
+    except ValueError as e:
+        validator_errors[name] = str(e)
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "cfg_clean": "retention" not in live_cfg and "keep_days" not in (live_cfg.get("oncall") or {}),
+    "live_ret": live_ret,
+    "loaded_records_days": loaded.records.days,
+    "loaded_folders_days": loaded.folders.days,
+    "loaded_db_max_mb": loaded.db.max_mb,
+    "loaded_incidents_keep": loaded.incidents.keep_days,
+    "ret_event_count": len(ret_events),
+    "committed_hand": committed_hand,
+    "live_stayed_clean": "retention" not in live_cfg_after,
+    "tick_ok": tick_ok,
+    "inbox_count": len(items),
+    "inbox_names_retention": bool(items) and "retention.toml" in json.dumps(items[0]["detail"]),
+    "ten_day_record_kept": (paths.RUNS_DIR / ten_day / "record").is_dir()
+    and run_store.run_get(ten_day)["records_purged"] is None,
+    "validator_rejected_all": len(validator_errors) == 5,
+}))
+""")
+        self.assertTrue(res["cfg_clean"])
+        self.assertEqual(
+            res["live_ret"],
+            {"records": {"days": 20, "max_gb": 12}, "folders": {"days": 75}, "incidents": {"keep_days": 15}, "db": {"max_mb": 256}},
+        )
+        self.assertEqual(res["loaded_records_days"], 20.0)
+        self.assertEqual(res["loaded_folders_days"], 75.0)
+        self.assertEqual(res["loaded_db_max_mb"], 256.0)
+        self.assertEqual(res["loaded_incidents_keep"], 15.0)
+        self.assertGreaterEqual(res["ret_event_count"], 1)
+        self.assertEqual(res["committed_hand"], [])
+        self.assertTrue(res["live_stayed_clean"])
+        self.assertFalse(res["tick_ok"])
+        self.assertEqual(res["inbox_count"], 1)
+        self.assertTrue(res["inbox_names_retention"])
+        self.assertTrue(res["ten_day_record_kept"])
+        self.assertTrue(res["validator_rejected_all"])
+
+
 class _PinnedRunCase(unittest.TestCase):
     def run_pinned(self, body: str) -> dict:
         with tempfile.TemporaryDirectory(prefix="arete-pinned-") as directory:
@@ -14891,10 +15439,10 @@ from arete import (
     proxmox,
     record,
     replay,
+    retention,
     secretstore,
     serve,
     ssh,
-    store,
     tailnet,
     util,
 )
@@ -14903,6 +15451,7 @@ from arete.store import db as foundation
 from arete.store import devices as device_store
 from arete.store import loops as loop_store
 from arete.store import migrations
+from arete.store import retention as retention_store
 from arete.store import runs as run_store
 from arete.store import tokens as token_store
 
@@ -15323,7 +15872,7 @@ with foundation.tx(fenced=False) as c:
     c.execute("UPDATE leases SET released = ?, outcome = 'deleted' WHERE id = ?", (old_8, lid))
     c.execute("INSERT INTO waits (subject, blocker, reason, opened, cleared) VALUES ('config:loop/x', 'device:box', 'old', ?, ?)",
               (old_91, old_91))
-store.prune()
+retention_store.prune_rows(retention.load(), retention_store.measure())
 with foundation.reader() as c:
     assert c.execute("SELECT COUNT(*) FROM device_probes WHERE at = ?", (old_91,)).fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM lease_tokens WHERE lease_id = ?", (lid,)).fetchone()[0] == 0

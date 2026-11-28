@@ -6282,7 +6282,6 @@ class EnvironmentRequeueTests(Isolated):
         self.assertIn("verification scratch settled", self.comments[-1])
 
     def test_pruned_scratch_requires_an_authenticated_receipt_when_tracker_returns(self):
-        self.cfg.retention = config.Retention(days=0)
         selector = "b" * 64
         name = selector + ".json"
         data = {"version": 2, "state": "retained", "source_mutations": False, "diagnostic": {},

@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from .. import __version__, client, config, configrepo, paths, principals, routing, steps
+from .. import __version__, client, config, configrepo, paths, principals, retention, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -153,7 +153,7 @@ def print_status(cfg, problem, views, snap, records, server_url):
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
-    show(records, "the record store", lambda s: print_records(s, None if server_url else cfg.retention))
+    show(records, "the record store", lambda s: print_records(s, None if server_url else retention.load_live().records))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     if recovery := snap.get("recovery"):
