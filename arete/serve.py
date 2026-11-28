@@ -1671,6 +1671,10 @@ def run(with_dashboard: bool = True) -> NoReturn:
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()
+            if not server.config_problem:
+                from . import lines as lines_mod
+
+                server.guard("stage:lines-ensure", lambda: lines_mod.ensure(server.cfg))
             server.guard("stage:derived-start", server.start_derived)
             if not server.config_problem:
                 server.guard("stage:secret-move", server.move_secrets_when_due)

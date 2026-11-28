@@ -206,9 +206,11 @@ TASK_IDENTITY_BACKFILL_SCHEMA = 58
 TASK_IDENTITY_CONTRACT_SCHEMA = 59
 BLOBS_RETENTION_SCHEMA = 60
 PR_REFS_RECONCILE_SCHEMA = 61
-CONFIG_DRAFT_NULL_BODY_SCHEMA = 62
+PROJECTS_SCHEMA = 62
+CONFIG_DRAFT_NULL_BODY_SCHEMA = 63
 TASK_ADMISSION_CAPABILITY = "task_admission_v1"
-PROCESS_CAPABILITIES = (TASK_ADMISSION_CAPABILITY,)
+ACTIVE_LINE_VALIDATOR_CAPABILITY = "active_line_validator_v1"
+PROCESS_CAPABILITIES = (TASK_ADMISSION_CAPABILITY, ACTIVE_LINE_VALIDATOR_CAPABILITY)
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -228,7 +230,7 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
                              TRIAGE_VERSION_SCHEMA, OUTBOX_BACKFILL_SCHEMA,
                              STEPS_LIFECYCLE_SCHEMA, RECORD_TURNS_SCHEMA, DERIVED_SCHEMA, CONFIG_DRAFTS_SCHEMA,
                              TASK_IDENTITY_EXPAND_SCHEMA, TASK_IDENTITY_BACKFILL_SCHEMA,
-                             BLOBS_RETENTION_SCHEMA, CONFIG_DRAFT_NULL_BODY_SCHEMA))
+                             BLOBS_RETENTION_SCHEMA, PROJECTS_SCHEMA, CONFIG_DRAFT_NULL_BODY_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -321,6 +323,43 @@ def _task_identity_process_blockers(beat: dict, n: int) -> list[str]:
     if isinstance(server, dict) and util.pid_alive(server.get("pid")):
         if not _has_capability(server.get("capabilities"), TASK_ADMISSION_CAPABILITY):
             blockers.append(f"dashboard {server.get('pid')} lacks {TASK_ADMISSION_CAPABILITY}")
+    return blockers
+
+
+def incompatible_line_writers(conn) -> list[str]:
+    from .. import control, record
+
+    blockers: list[str] = []
+    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+    has_caps = "capabilities" in run_cols
+    cap_expr = "capabilities" if has_caps else "NULL AS capabilities"
+    for row in conn.execute(
+        f"SELECT id, pid, lock, started, finished, status, kind, schema_version, {cap_expr} "  # noqa: S608
+        "FROM runs WHERE status IN ('running', 'queued')"
+    ):
+        row = dict(row)
+        if _has_capability(row.get("capabilities"), ACTIVE_LINE_VALIDATOR_CAPABILITY):
+            continue
+        if row["status"] == "running":
+            with record.dead(row) as gone:
+                if not gone:
+                    blockers.append(f"run {row['id']} lacks {ACTIVE_LINE_VALIDATOR_CAPABILITY}")
+        else:
+            blockers.append(f"queued run {row['id']} lacks {ACTIVE_LINE_VALIDATOR_CAPABILITY}")
+    beat = control.database_beat()
+    if not isinstance(beat, dict):
+        beat = {}
+    if util.lock_is_held("serve"):
+        if not _has_capability(beat.get("capabilities"), ACTIVE_LINE_VALIDATOR_CAPABILITY):
+            pid = beat.get("pid") or "lock"
+            blockers.append(f"serve {pid} lacks {ACTIVE_LINE_VALIDATOR_CAPABILITY}")
+    elif util.pid_alive(beat.get("pid")):
+        if not _has_capability(beat.get("capabilities"), ACTIVE_LINE_VALIDATOR_CAPABILITY):
+            blockers.append(f"serve {beat.get('pid')} lacks {ACTIVE_LINE_VALIDATOR_CAPABILITY}")
+    server = util.read_json(paths.DB_FILE.with_name(paths.SERVER_FILE.name), {})
+    if isinstance(server, dict) and util.pid_alive(server.get("pid")):
+        if not _has_capability(server.get("capabilities"), ACTIVE_LINE_VALIDATOR_CAPABILITY):
+            blockers.append(f"dashboard {server.get('pid')} lacks {ACTIVE_LINE_VALIDATOR_CAPABILITY}")
     return blockers
 
 

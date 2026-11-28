@@ -40,7 +40,7 @@ model = "gpt-5.4"
         self.launch = self.request(cfg, layer)
 
         full = asdict(cfg)
-        del full["max_parallel"], full["max_parallel_per_repo"]
+        del full["max_parallel"]
         del full["jev"]["risk_hold"], full["jev"]["irreversible_hold"], full["jev"]["secrets_hold"]
         self.full_launch = {**self.launch, "config_sha": digest(json.loads(json.dumps(full, default=str)))}
 

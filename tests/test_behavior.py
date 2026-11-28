@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 153)
-        self.assertEqual(len({op["name"] for op in operations}), 153)
+        self.assertEqual(len(operations), 167)
+        self.assertEqual(len({op["name"] for op in operations}), 167)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -22111,6 +22111,13 @@ with live_dashboard() as (_, port):
     assert st_rs == 200 and rs["task"]["state"] == "ready", (st_rs, rs)
 
     # Round-trip EVERY added writable Task field through create -> update -> get.
+    for pid, lid in (("alpha", "core"), ("beta", "edge")):
+        st_p, _ = http_json(port, "POST", "/api/v1/projects", token=bearer, key=f"pr-{pid}",
+                            body={"id": pid, "name": pid.title(), "repo": "sample"})
+        assert st_p == 201, st_p
+        st_l, _ = http_json(port, "POST", "/api/v1/lines", token=bearer, key=f"ln-{lid}",
+                            body={"id": lid, "project": pid, "name": lid.title(), "kind": "pipeline", "repo": "sample"})
+        assert st_l == 201, st_l
     st_cr, cr = http_json(port, "POST", "/api/v1/tasks", token=bearer, key="wr-1", body={
         "repo": "sample", "title": "Full fields", "body": "body", "kind": "feat",
         "project": "alpha", "line": "core", "priority": 2, "rank": 1.5,
@@ -22537,7 +22544,7 @@ with db.reader() as c:
 paths.SERVER_FILE.unlink()
 
 # 5. Once every live process meets task_admission_v1, final catch-up + contract succeeds!
-assert db.migrate() is False
+assert db.migrate(through=59) is False
 with db.reader() as c:
     assert c.execute("PRAGMA user_version").fetchone()[0] >= db.TASK_IDENTITY_CONTRACT_SCHEMA
     tinfo = {r[1]: r[2] for r in c.execute("PRAGMA table_info(tasks)")}
@@ -23113,6 +23120,743 @@ assert ask_store.ask_get("ask-reconcile-b")["status"] == "merged"
 with db.reader() as c:
     assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_1,)).fetchone()[0] == "merged"
     assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_2,)).fetchone()[0] == "merged"
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class ProjectsLinesViewsTests(_TaskIdentityChildCase):
+    def test_two_browsers_restore_backfill_and_task_validation(self):
+        res = self.run_identity_child(r"""
+from arete import configrepo, lines as lines_mod, viewfilter
+from arete.store import events as event_store, projects as projects_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo1_dir = sample_dir / "repo"
+    repo2_dir = ROOT / "repo-two"
+    repo2_dir.mkdir()
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n'
+        'max_parallel_per_repo = 3\n\n'
+        '[[repo]]\n'
+        'name = "My_Repo"\n'
+        f'path = "{repo1_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = true\n\n'
+        '[[repo]]\n'
+        'name = "docs-only"\n'
+        f'path = "{repo2_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = false\n'
+    )
+
+    # Backfill test: migrate through m0059, seed two tasks and one finished run, then migrate to m0060.
+    db.migrate(through=59)
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, write_token = token_store.issue(owner, "write-client", ["read", "task:write"])
+
+    with principals.acting(owner):
+        t1 = task_store.task_add("My_Repo", "Task one body", "Task one", "feat")
+        t2 = task_store.task_add("My_Repo", "Task two body", "Task two", "fix")
+        r1 = record.start("pipeline", repo="My_Repo", issue=t1, task_id=1)
+        record.settle(r1, "done")
+
+    assert db.migrate() is False
+    with db.reader() as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+        projs = {r["id"]: r for r in projects_store.list_projects(c)}
+        assert set(projs) == {"my-repo", "docs-only"}, projs
+        lns = {r["id"]: r for r in projects_store.list_lines(c)}
+        assert set(lns) == {"my-repo-pipeline"}, lns
+        pl = lns["my-repo-pipeline"]
+        assert pl["kind"] == "pipeline" and pl["concurrency"] == 3 and pl["wip_limit"] is None, pl
+        for tid in (t1, t2):
+            trow = task_store.task_get(tid)
+            assert trow["project"] == "my-repo" and trow["line"] == "my-repo-pipeline", trow
+        rrow = run_store.run_get(r1)
+        assert rrow["line"] == "my-repo-pipeline", rrow
+        for subj in ("project:my-repo", "project:docs-only", "line:my-repo-pipeline"):
+            evs = c.execute(
+                "SELECT ver, kind, class FROM events_log WHERE subject = ? ORDER BY seq", (subj,)
+            ).fetchall()
+            assert len(evs) == 1 and evs[0]["ver"] == 1 and evs[0]["class"] == "durable", (subj, evs)
+        max_seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+
+    # Second migrate() writes nothing.
+    assert db.migrate() is False
+    with db.reader() as c:
+        assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == max_seq_before
+
+    # Clamping max_parallel_per_repo = 20 -> concurrency 8 in a fresh DB.
+    clamp_db = ROOT / "clamp.db"
+    clamp_ws = ROOT / "clamp-ws"
+    clamp_ws.mkdir()
+    old_cfg = paths.CONFIG_FILE.read_text()
+    paths.CONFIG_FILE.write_text(old_cfg.replace("max_parallel_per_repo = 3", "max_parallel_per_repo = 20"))
+    with mock.patch.object(paths, "DB_FILE", clamp_db):
+        db._CHECKED.clear()
+        assert db.migrate(workspace_snapshots=clamp_ws) is False
+        with db.reader() as c:
+            clamped = projects_store.get_line(c, "my-repo-pipeline")
+            assert clamped["concurrency"] == 8, clamped
+    paths.CONFIG_FILE.write_text(old_cfg)
+    db._CHECKED.clear()
+
+    # lines.ensure(cfg) creates project+line for new pipeline repo and skips archived project.
+    repo3_dir = ROOT / "repo-three"
+    repo3_dir.mkdir()
+    repo4_dir = ROOT / "repo-four"
+    repo4_dir.mkdir()
+    paths.CONFIG_FILE.write_text(
+        old_cfg +
+        '\n[[repo]]\nname = "new-pipe"\n' + f'path = "{repo3_dir}"\ntracker = "local"\npipeline = true\n' +
+        '\n[[repo]]\nname = "archived-pipe"\n' + f'path = "{repo4_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    with principals.acting(owner):
+        lines_mod.create_project({"id": "archived-pipe", "name": "archived-pipe", "repo": "archived-pipe", "archived": True})
+        lines_mod.ensure(config.load())
+    assert lines_mod.get_line("new-pipe-pipeline")["concurrency"] == 1
+    assert lines_mod.get_line("archived-pipe-pipeline") is None
+
+    # Live dashboard checks: Two browsers SSE/events, version conflict, View Restore, Canonical task validation.
+    with live_dashboard() as (_, port):
+        with db.reader() as c:
+            head_cursor = event_store.metadata(c)["head"]
+        sse_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        sse_conn.request(
+            "GET",
+            "/api/v1/events?subject=line:my-repo-pipeline",
+            headers={
+                "Accept": "text/event-stream",
+                "Authorization": f"Bearer {write_token}",
+                "Last-Event-ID": head_cursor,
+            },
+        )
+        sse_resp = sse_conn.getresponse()
+        assert sse_resp.status == 200
+        assert sse_resp.readline() == b"retry: 2000\n"
+        assert sse_resp.readline() == b"\n"
+        try:
+            st_p, patched = http_json(
+                port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-1",
+                body={"base_version": 1, "wip_limit": 3},
+            )
+            assert st_p == 200, (st_p, patched)
+            assert patched["data"]["wip_limit"] == 3 and patched["ver"] == 2 and patched["replayed"] is False
+            assert patched["subject"] == "line:my-repo-pipeline" and patched["vers"] == {"line:my-repo-pipeline": 2}
+            sse_id = sse_resp.readline().removeprefix(b"id: ").strip().decode()
+            sse_ev = json.loads(sse_resp.readline().removeprefix(b"data: "))
+            assert sse_resp.readline() == b"\n"
+            assert sse_id == sse_ev["id"]
+            assert sse_ev["kind"] == "line.changed" and sse_ev["subject"] == "line:my-repo-pipeline"
+            assert sse_ev["ver"] == 2 and sse_ev["data"]["fields"]["wip_limit"] == {"old": None, "new": 3}
+        finally:
+            sse_resp.close()
+            sse_conn.close()
+
+        st_rep, replayed = http_json(
+            port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-1",
+            body={"base_version": 1, "wip_limit": 3},
+        )
+        assert st_rep == 200 and replayed["replayed"] is True and replayed["ver"] == 2
+        st_lg, lg = http_json(port, "GET", "/api/v1/lines/my-repo-pipeline", token=write_token)
+        assert st_lg == 200 and lg["line"]["wip_limit"] == 3
+        st_conf, conf = http_json(
+            port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-stale",
+            body={"base_version": 1, "wip_limit": 5},
+        )
+        assert st_conf == 409 and conf["code"] == "version_conflict", (st_conf, conf)
+        assert conf["current"]["version"] == 2 and conf["current"]["wip_limit"] == 3
+
+        # Restore: view created -> filter changed -> renamed -> restored to create seq.
+        st_vc, vc = http_json(
+            port, "POST", "/api/v1/views", token=write_token, key="view-cr-1",
+            body={"id": "ops-view", "name": "Ops", "filter": "state = ready"},
+        )
+        assert st_vc == 201, (st_vc, vc)
+        v1_filter_sql = vc["data"]["filter_sql"]
+        st_vh0, vh0 = http_json(port, "GET", "/api/v1/views/ops-view/history", token=write_token)
+        create_seq = vh0["events"][0]["seq"]
+        st_vu1, vu1 = http_json(
+            port, "PATCH", "/api/v1/views/ops-view", token=write_token, key="view-up-1",
+            body={"base_version": 1, "filter": "state = running"},
+        )
+        assert st_vu1 == 200 and vu1["ver"] == 2
+        st_vu2, vu2 = http_json(
+            port, "PATCH", "/api/v1/views/ops-view", token=write_token, key="view-up-2",
+            body={"base_version": 2, "name": "Ops Renamed"},
+        )
+        assert st_vu2 == 200 and vu2["ver"] == 3
+        st_vr, vr = http_json(
+            port, "POST", "/api/v1/views/ops-view/restore", token=write_token, key="view-rs-1",
+            body={"seq": create_seq, "base_version": 3},
+        )
+        assert st_vr == 200 and vr["ver"] == 4, (st_vr, vr)
+        st_vg, vg = http_json(port, "GET", "/api/v1/views/ops-view", token=write_token)
+        assert st_vg == 200 and vg["view"]["version"] == 4
+        assert vg["view"]["name"] == "Ops" and vg["view"]["filter"] == "state = ready"
+        assert vg["view"]["filter_sql"] == v1_filter_sql
+        st_vh, vh = http_json(port, "GET", "/api/v1/views/ops-view/history", token=write_token)
+        assert st_vh == 200 and len(vh["events"]) == 4
+        assert vh["events"][-1]["data"]["restored_from"] == create_seq
+        other_seq = sse_ev["seq"]
+        st_bad_r, bad_r = http_json(
+            port, "POST", "/api/v1/views/ops-view/restore", token=write_token, key="view-rs-bad",
+            body={"seq": other_seq, "base_version": 4},
+        )
+        assert st_bad_r == 422 and bad_r["code"] == "validation", (st_bad_r, bad_r)
+
+        # Canonical task validation (create, update, internal TaskStore.create) + rollback without event.
+        with db.reader() as c:
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_tbad1, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-1",
+            body={"repo": "My_Repo", "body": "bad proj", "project": "no-such-proj"},
+        )
+        assert st_tbad1 == 422
+        st_tbad2, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-2",
+            body={"repo": "My_Repo", "body": "bad line", "project": "my-repo", "line": "no-such-line"},
+        )
+        assert st_tbad2 == 422
+        st_tbad3, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-3",
+            body={"repo": "My_Repo", "body": "mismatch", "project": "docs-only", "line": "my-repo-pipeline"},
+        )
+        assert st_tbad3 == 422
+        t1_cur = task_store.task_get(t1)
+        st_tbad4, _ = http_json(
+            port, "PATCH", f"/api/v1/tasks/{t1}", token=write_token, key="t-bad-4",
+            body={"base_version": t1_cur["version"], "project": "docs-only"},
+        )
+        assert st_tbad4 == 422
+        try:
+            with db.tx() as c:
+                task_store.TaskStore.create(
+                    c, {"repo": "My_Repo", "body": "internal bad", "project": "my-repo", "line": "ghost-line"}, owner,
+                )
+            raise AssertionError("expected ValidationError")
+        except lines_mod.ValidationError:
+            pass
+        with db.reader() as c:
+            seq_after = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        assert seq_after == seq_before, (seq_before, seq_after)
+        st_tnull, tnull = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-null-1",
+            body={"repo": "My_Repo", "body": "unset ok", "project": None, "line": None},
+        )
+        assert st_tnull == 200 and tnull["task"]["project"] is None and tnull["task"]["line"] is None
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_view_filters_and_board_reads(self):
+        res = self.run_identity_child(r"""
+from arete import lines as lines_mod, viewfilter
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n\n[[repo]]\nname = "demo"\n'
+        f'path = "{repo_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "view-client", ["read", "task:write"])
+
+    assert viewfilter.compile("") == "1=1"
+    sql_prec = viewfilter.compile('state = ready or state = running and label = "o\'brien"')
+    assert "OR" in sql_prec and "AND" in sql_prec and "'o''brien'" in sql_prec, sql_prec
+
+    with principals.acting(owner):
+        t_a = task_store.task_add("demo", "Ready UI task A", "A", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 2.0})
+        t_b = task_store.task_add("demo", "Running UI task B", "B", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 1.0})
+        t_c = task_store.task_add("demo", "Done UI task C", "C", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 0.5})
+        t_d = task_store.task_add("demo", "Ready backend task D", "D", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 0.1})
+        task_store.task_set_state(t_b, "running")
+        task_store.task_set_state(t_c, "done")
+        with db.tx() as c:
+            for tid, lbl in ((t_a, "ui"), (t_b, "ui"), (t_c, "ui"), (t_d, "backend")):
+                num = task_store.parse_task_num(tid, c)
+                c.execute("INSERT INTO task_labels (task, label) VALUES (?, ?)", (num, lbl))
+
+    with live_dashboard() as (_, port):
+        with db.reader() as c:
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_bad, bad = http_json(
+            port, "POST", "/api/v1/views", token=token, key="vf-bad-1",
+            body={"id": "bad-view", "name": "Bad", "filter": "state = = ready"},
+        )
+        assert st_bad == 422 and bad["code"] == "validation" and "position" in bad["detail"], (st_bad, bad)
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_before
+            assert lines_mod.get_view("bad-view") is None
+
+        st_ok, created = http_json(
+            port, "POST", "/api/v1/views", token=token, key="vf-ok-1",
+            body={
+                "id": "ui-active",
+                "name": "UI Active",
+                "project": "demo",
+                "filter": "state in (ready, running) and label = ui",
+                "sort": "rank",
+                "layout": "board",
+                "columns": ["state", "priority", "label"],
+            },
+        )
+        assert st_ok == 201, (st_ok, created)
+        st_tl, tl = http_json(port, "GET", "/api/v1/tasks?view=ui-active", token=token)
+        assert st_tl == 200, (st_tl, tl)
+        st_sb, sb = http_json(port, "GET", "/api/v1/screen?view=board&id=ui-active", token=token)
+        assert st_sb == 200, (st_sb, sb)
+        ids_tasks = [t["id"] for t in tl["tasks"]]
+        ids_board = [t["id"] for t in sb["view"]["tasks"]]
+        assert ids_tasks == [t_b, t_a], ids_tasks
+        assert ids_board == ids_tasks, (ids_board, ids_tasks)
+        board_lines = sb["view"]["lines"]
+        assert len(board_lines) == 1 and board_lines[0]["id"] == "demo-pipeline"
+        assert board_lines[0]["concurrency"] == 1 and board_lines[0]["tasks_in_progress"] == 1
+        st_all, all_board = http_json(port, "GET", "/api/v1/screen?view=board", token=token)
+        assert st_all == 200 and len(all_board["view"]["tasks"]) == 4
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_line_limits_poll_start_paused_inbox_and_one_limit(self):
+        res = self.run_identity_child(r"""
+import arete
+from arete import lines as lines_mod, pins, poll
+from arete.store import inbox as inbox_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n'
+        'max_parallel_per_repo = 1\n\n'
+        '[[repo]]\n'
+        'name = "demo"\n'
+        f'path = "{repo_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = true\n\n'
+        '[replay]\n'
+        'all = true\n'
+    )
+    loaded_cfg = config.load()
+    assert not hasattr(loaded_cfg, "max_parallel_per_repo")
+
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "limits-client", ["*"])
+
+    with live_dashboard() as (_, port):
+        st_l2, l2 = http_json(
+            port, "POST", "/api/v1/lines", token=token, key="l2-create",
+            body={"id": "demo-fast", "project": "demo", "name": "Fast", "kind": "pipeline", "repo": "demo", "concurrency": 2},
+        )
+        assert st_l2 == 201, (st_l2, l2)
+
+        with principals.acting(owner):
+            t1 = task_store.task_add("demo", "Line 1 task", "L1", "feat", extra={"project": "demo", "line": "demo-pipeline"})
+            t2 = task_store.task_add("demo", "Line 2 task", "L2", "feat", extra={"project": "demo", "line": "demo-pipeline"})
+        t2_row = task_store.task_get(t2)
+        st_tu, tu = http_json(
+            port, "PATCH", f"/api/v1/tasks/{t2}", token=token, key="tu-line2",
+            body={"base_version": t2_row["version"], "line": "demo-fast"},
+        )
+        assert st_tu == 200 and tu["task"]["line"] == "demo-fast"
+
+        def run_poll_capture(cfg_obj, live_runs):
+            started = []
+            buf = StringIO()
+            with (
+                mock.patch.object(config, "load", return_value=cfg_obj),
+                mock.patch.object(poll, "runnable", return_value=True),
+                mock.patch.object(poll, "network_up_or_skip", return_value=True),
+                mock.patch.object(poll, "live_pipeline_runs", return_value=live_runs),
+                mock.patch.object(pipeline, "live_pipeline_runs", return_value=live_runs),
+                mock.patch.object(poll, "slots_free_to_start", return_value=max(0, cfg_obj.max_parallel - len(live_runs))),
+                mock.patch.object(slots, "slots_free_to_start", return_value=max(0, cfg_obj.max_parallel - len(live_runs))),
+                mock.patch.object(poll, "settle_abandoned_runs"),
+                mock.patch.object(poll, "retry_scratch"),
+                mock.patch.object(poll, "mark_loop"),
+                mock.patch.object(poll.outcomes, "sync_outcomes"),
+                mock.patch.object(poll.outcomes, "sync_moves"),
+                mock.patch.object(poll.outcomes, "sync_landings"),
+                mock.patch.object(poll, "spawn_unparked", side_effect=lambda r, tid, *_a, line="", **_kw: started.append((r, str(tid), line)) or True),
+                mock.patch.object(pipeline, "SKIPPED_FILE", ROOT / "skipped.json"),
+                redirect_stdout(buf),
+            ):
+                rc = poll.poll()
+            return rc, started, buf.getvalue()
+
+        cfg_4 = config.load()
+        fake_live_l1 = [{"id": "pip-live-1", "repo": "demo", "line": "demo-pipeline", "status": "running"}]
+
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0, out
+        assert "demo-pipeline" in out and "concurrency 1" in out, out
+        assert started == [("demo", t2, "demo-fast")], (started, out)
+
+        st_wl, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-wip1",
+            body={"base_version": 1, "wip_limit": 1},
+        )
+        assert st_wl == 200
+        with principals.acting(owner):
+            t_rev = task_store.task_add("demo", "In review", "Rev", "feat", extra={"project": "demo", "line": "demo-fast"})
+            task_store.task_set_state(t_rev, "review")
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+        assert "demo-fast" in out and "wip_limit 1" in out, out
+
+        st_ps, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-pause",
+            body={"base_version": 2, "paused": 1, "paused_why": "release freeze"},
+        )
+        assert st_ps == 200
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+        assert "demo-fast" in out and "release freeze" in out, out
+
+        with (
+            mock.patch.object(pipeline, "live_pipeline_runs", return_value=fake_live_l1),
+            mock.patch.object(slots, "slots_free_to_start", return_value=3),
+            mock.patch.object(pipeline, "run_refusal", return_value=(False, "")),
+        ):
+            st_q, qres = http_json(
+                port, "POST", "/api/tasks", token=token, key="post-task-held",
+                body={"repo": "demo", "ticket": t2},
+            )
+        assert st_q == 200 and qres["state"] == "queued" and "release freeze" in qres["why"], (st_q, qres)
+
+        st_unp, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-unpause",
+            body={"base_version": 3, "paused": 0, "wip_limit": None},
+        )
+        assert st_unp == 200
+        cfg_1 = config.Config(repos=cfg_4.repos, max_parallel=1, replay=cfg_4.replay)
+        rc, started, out = run_poll_capture(cfg_1, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+
+        l2_now = lines_mod.get_line("demo-fast")
+        pin_res = pins.resolve("pipeline", repo="demo", cfg=cfg_4, line=l2_now)
+        resolved_json = json.loads(pin_res.resolved_bytes.decode("utf-8"))
+        assert resolved_json["line"] == {
+            "id": "demo-fast",
+            "version": l2_now["version"],
+            "concurrency": l2_now["concurrency"],
+            "wip_limit": l2_now["wip_limit"],
+        }, resolved_json["line"]
+
+        with db.tx() as c, principals.acting(owner):
+            it1, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-1", title="One", line="demo-fast")
+            it2, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-2", title="Two", line="demo-fast")
+        st_p2, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-pause-inbox",
+            body={"base_version": l2_now["version"], "paused": 1, "paused_why": "maintenance"},
+        )
+        assert st_p2 == 200
+        assert inbox_store.get(it1["id"])["state"] == "paused"
+        assert inbox_store.get(it2["id"])["state"] == "paused"
+        st_il, il = http_json(port, "GET", "/api/v1/inbox", token=token)
+        assert st_il == 200 and not any(x["id"] in (it1["id"], it2["id"]) for x in il["items"])
+        with db.tx() as c, principals.acting(owner):
+            it3, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-3", title="Three", line="demo-fast")
+        assert it3["state"] == "paused"
+        st_u2, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-unpause-inbox",
+            body={"base_version": l2_now["version"] + 1, "paused": 0},
+        )
+        assert st_u2 == 200
+        for iid in (it1["id"], it2["id"], it3["id"]):
+            assert inbox_store.get(iid)["state"] == "open"
+
+        st_sg, sg = http_json(port, "GET", "/api/v1/settings", token=token)
+        assert st_sg == 200
+        assert "max_parallel_per_repo" not in sg["settings"]
+        assert "max_parallel_per_repo" not in sg["settings"]["values"]
+        st_su, su = http_json(
+            port, "PATCH", "/api/v1/settings", token=token, key="settings-bad-limit",
+            body={"base_version": max(1, sg["settings"]["version"]), "values": {"max_parallel_per_repo": 2}},
+        )
+        assert st_su == 422 and su["code"] == "unknown_field", (st_su, su)
+        st_al, al = http_json(
+            port, "POST", "/api/settings", token=token, key="alias-bad-limit",
+            body={"max_parallel_per_repo": 2},
+        )
+        assert st_al == 422 and al["code"] == "unknown_field", (st_al, al)
+
+    pkg_dir = Path(arete.__file__).resolve().parent
+    hits = [
+        p.relative_to(pkg_dir).as_posix()
+        for p in sorted(pkg_dir.rglob("*.py"))
+        if "max_parallel_per_repo" in p.read_text(encoding="utf-8")
+    ]
+    assert hits == ["store/projects.py"], hits
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_line_removal_gates_references_concurrency_and_undo(self):
+        res = self.run_identity_child(r"""
+from arete import configrepo, lines as lines_mod
+from arete.store import projects as projects_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n\n[[repo]]\nname = "demo"\n'
+        f'path = "{repo_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "delete-client", ["read", "task:write"])
+    with principals.acting(owner):
+        configrepo.init()
+
+    with db.tx():
+        try:
+            with configrepo.instance_fence():
+                raise AssertionError("expected ConfigRepoError inside SQLite write tx")
+        except configrepo.ConfigRepoError:
+            pass
+
+    with live_dashboard() as (_, port):
+        st_c, created = http_json(
+            port, "POST", "/api/v1/lines", token=token, key="del-cr-1",
+            body={"id": "demo-extra", "project": "demo", "name": "Extra", "kind": "pipeline", "repo": "demo"},
+        )
+        assert st_c == 201, (st_c, created)
+        with principals.acting(owner):
+            t_hist = task_store.task_add("demo", "Historical task", "Hist", "feat", extra={"project": "demo", "line": "demo-extra"})
+            task_store.task_set_state(t_hist, "done")
+            with db.reader() as c:
+                t_hist_num = task_store.parse_task_num(t_hist, c)
+            hist_run = record.start("pipeline", repo="demo", issue=t_hist, task_id=t_hist_num, line="demo-extra")
+            record.settle(hist_run, "done")
+
+        st_arch_up, arch_up = http_json(
+            port, "PATCH", "/api/v1/lines/demo-extra", token=token, key="del-arch-up",
+            body={"base_version": 1, "archived": False},
+        )
+        assert st_arch_up == 422, (st_arch_up, arch_up)
+
+        with db.tx() as c:
+            c.execute(
+                "INSERT INTO runs (id, kind, repo, issue, task_id, status, started, schema_version, capabilities) "
+                "VALUES ('old-queued-writer', 'pipeline', 'demo', ?, ?, 'queued', ?, 59, ?)",
+                (t_hist, t_hist_num, util.iso(), json.dumps(["task_admission_v1"])),
+            )
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_iw, iw = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-incompat-1",
+            body={"base_version": 1},
+        )
+        assert st_iw == 409 and iw["code"] == "incompatible_writers", (st_iw, iw)
+        assert any("old-queued-writer" in b for b in iw.get("blockers", [])), iw
+        assert iw.get("retry_guidance")
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_before
+            assert lines_mod.get_line("demo-extra")["archived"] is False
+
+        with db.tx() as c:
+            c.execute("UPDATE runs SET status = 'done', finished = ? WHERE id = 'old-queued-writer'", (util.iso(),))
+
+        with principals.acting(owner):
+            t_ref = task_store.task_add("demo", "Active task", "Active", "feat", extra={"project": "demo", "line": "demo-extra"})
+        st_inuse_t, inuse_t = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-task",
+            body={"base_version": 1},
+        )
+        assert st_inuse_t == 409 and inuse_t["code"] == "line_in_use"
+        assert any(b.get("kind") == "task" and b.get("id") == t_ref for b in inuse_t.get("blockers", [])), inuse_t
+        task_store.task_set_state(t_ref, "done")
+
+        with principals.acting(owner):
+            q_run = pipeline.queue_run("demo", t_ref, line="demo-extra")
+        st_inuse_r, inuse_r = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-run",
+            body={"base_version": 1},
+        )
+        assert st_inuse_r == 409 and inuse_r["code"] == "line_in_use"
+        assert any(b.get("kind") == "run" and b.get("id") == q_run for b in inuse_r.get("blockers", [])), inuse_r
+        record.settle(q_run, "done")
+
+        _, base_blob = configrepo.read("loops/check.toml")
+        loop_text = 'name = "check"\nline = "demo-extra"\n'
+        configrepo.commit({"loops/check.toml": loop_text}, {"loops/check.toml": base_blob}, owner, "dashboard", note="ref line")
+        st_inuse_c, inuse_c = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-cfg",
+            body={"base_version": 1},
+        )
+        assert st_inuse_c == 409 and inuse_c["code"] == "line_in_use"
+        assert any(b.get("kind") == "config" and b.get("path") == "loops/check.toml" for b in inuse_c.get("blockers", [])), inuse_c
+        _, blob_c = configrepo.read("loops/check.toml")
+        configrepo.commit({"loops/check.toml": None}, {"loops/check.toml": blob_c}, owner, "dashboard", note="drop ref")
+
+        lines_mod.register_reference_reader("failing_reader", lambda _r, _l: (_ for _ in ()).throw(RuntimeError("corrupt source")))
+        try:
+            st_fc, fc = http_json(
+                port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-fail-closed",
+                body={"base_version": 1},
+            )
+            assert st_fc == 409 and fc["code"] == "line_in_use", (st_fc, fc)
+        finally:
+            lines_mod.unregister_reference_reader("failing_reader")
+
+        st_stale, stale = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-stale",
+            body={"base_version": 99},
+        )
+        assert st_stale == 409 and stale["code"] == "version_conflict"
+
+        st_del, deleted = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-1",
+            body={"base_version": 1},
+        )
+        assert st_del == 200, (st_del, deleted)
+        assert deleted["data"]["archived"] is True and deleted["ver"] == 2 and deleted["replayed"] is False
+        pre_seq = deleted["pre_removal_seq"]
+        assert isinstance(pre_seq, int) and pre_seq >= 1
+        tomb_seq = int(deleted["event_seq"].rsplit(".", 1)[1])
+
+        assert run_store.run_get(hist_run)["line"] == "demo-extra"
+
+        with db.reader() as c:
+            seq_after_del = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_del_rep1, del_rep1 = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-1",
+            body={"base_version": 1},
+        )
+        assert st_del_rep1 == 200 and del_rep1["replayed"] is True and del_rep1["event_seq"] == deleted["event_seq"]
+        st_del_rep2, del_rep2 = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-2-fresh-key",
+            body={"base_version": 2},
+        )
+        assert st_del_rep2 == 200 and del_rep2["replayed"] is True and del_rep2["event_seq"] == deleted["event_seq"]
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_after_del
+
+        st_ll, ll = http_json(port, "GET", "/api/v1/lines", token=token)
+        assert st_ll == 200 and [x["id"] for x in ll["lines"]] == ["demo-pipeline"]
+        st_ll_all, ll_all = http_json(port, "GET", "/api/v1/lines?include_archived=true", token=token)
+        assert st_ll_all == 200 and {x["id"] for x in ll_all["lines"]} == {"demo-pipeline", "demo-extra"}
+        st_bad_q, _ = http_json(port, "GET", "/api/v1/lines?include_archived=yes", token=token)
+        assert st_bad_q == 400
+        st_lg, lg = http_json(port, "GET", "/api/v1/lines/demo-extra", token=token)
+        assert st_lg == 200 and lg["line"]["archived"] is True
+        st_lh, lh = http_json(port, "GET", "/api/v1/lines/demo-extra/history", token=token)
+        assert st_lh == 200 and len(lh["events"]) == 2
+        st_sb, sb = http_json(port, "GET", "/api/v1/screen?view=board", token=token)
+        assert [x["id"] for x in sb["view"]["lines"]] == ["demo-pipeline"]
+        st_sb_all, sb_all = http_json(port, "GET", "/api/v1/screen?view=board&include_archived=true", token=token)
+        assert {x["id"] for x in sb_all["view"]["lines"]} == {"demo-pipeline", "demo-extra"}
+        with principals.acting(owner):
+            lines_mod.ensure(config.load())
+        assert lines_mod.get_line("demo-extra")["archived"] is True
+
+        st_last, last_ref = http_json(
+            port, "DELETE", "/api/v1/lines/demo-pipeline", token=token, key="del-last-pipe",
+            body={"base_version": 1},
+        )
+        assert st_last == 409 and last_ref["code"] == "line_in_use", (st_last, last_ref)
+        assert any(b.get("kind") == "last_pipeline_line" and b.get("repo") == "demo" for b in last_ref.get("blockers", [])), last_ref
+
+        st_t_arch, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=token, key="assign-arch-line",
+            body={"repo": "demo", "body": "should fail", "project": "demo", "line": "demo-extra"},
+        )
+        assert st_t_arch == 422
+        try:
+            with principals.acting(owner):
+                pipeline.queue_run("demo", "T-1", line="demo-extra")
+            raise AssertionError("expected archived line admission refusal")
+        except lines_mod.ValidationError:
+            pass
+        try:
+            _, b2 = configrepo.read("loops/late.toml")
+            configrepo.commit({"loops/late.toml": 'name = "late"\nline = "demo-extra"\n'}, {"loops/late.toml": b2}, owner, "dashboard")
+            raise AssertionError("expected configrepo refusal for archived line")
+        except configrepo.ConfigRepoError:
+            pass
+
+        st_r_tomb, r_tomb = http_json(
+            port, "POST", "/api/v1/lines/demo-extra/restore", token=token, key="restore-tomb",
+            body={"seq": tomb_seq, "base_version": 2},
+        )
+        assert st_r_tomb == 422 and r_tomb["code"] == "validation", (st_r_tomb, r_tomb)
+
+        st_undo, undo = http_json(
+            port, "POST", "/api/v1/lines/demo-extra/restore", token=token, key="restore-undo",
+            body={"seq": pre_seq, "base_version": 2},
+        )
+        assert st_undo == 200 and undo["ver"] == 3 and undo["data"]["archived"] is False, (st_undo, undo)
+        st_ll_back, ll_back = http_json(port, "GET", "/api/v1/lines", token=token)
+        assert {x["id"] for x in ll_back["lines"]} == {"demo-pipeline", "demo-extra"}
+
+        # Concurrent barrier tests under the shared instance fence in both orders.
+        fence_held = threading.Event()
+        del_outcome = {}
+
+        def _contend_delete():
+            fence_held.wait(timeout=5)
+            try:
+                with principals.acting(owner):
+                    del_outcome["ok"] = lines_mod.delete_line("demo-extra", 3)
+            except Exception as exc:
+                del_outcome["err"] = exc
+
+        th = threading.Thread(target=_contend_delete)
+        th.start()
+        with configrepo.instance_fence():
+            fence_held.set()
+            time.sleep(0.05)
+            with principals.acting(owner):
+                t_race = task_store.task_add("demo", "Race task", "Race", "feat", extra={"project": "demo", "line": "demo-extra"})
+        th.join(timeout=5)
+        assert isinstance(del_outcome.get("err"), lines_mod.LineInUse), del_outcome
+
+        task_store.task_set_state(t_race, "done")
+        fence_held2 = threading.Event()
+        admit_outcome = {}
+
+        def _contend_admit():
+            fence_held2.wait(timeout=5)
+            try:
+                with principals.acting(owner):
+                    admit_outcome["run"] = pipeline.queue_run("demo", t_race, line="demo-extra")
+            except Exception as exc:
+                admit_outcome["err"] = exc
+
+        th2 = threading.Thread(target=_contend_admit)
+        th2.start()
+        with configrepo.instance_fence():
+            fence_held2.set()
+            time.sleep(0.05)
+            with principals.acting(owner):
+                lines_mod.delete_line("demo-extra", 3)
+        th2.join(timeout=5)
+        assert isinstance(admit_outcome.get("err"), lines_mod.ValidationError), admit_outcome
 
 emit({"ok": True})
 """)

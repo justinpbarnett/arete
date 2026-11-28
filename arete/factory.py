@@ -619,6 +619,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--restart", default="", choices=("", "answer", "resume", "step"),
                    help="why this run restarts an earlier one")
     p.add_argument("--run-id", dest="run_id", default="", help=argparse.SUPPRESS)
+    p.add_argument("--line", dest="line", default="", help=argparse.SUPPRESS)
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
@@ -633,7 +634,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script,
-                                      run_id=args.run_id)
+                                      run_id=args.run_id, line=args.line)
     except config.UnknownRepo as e:
         raise SystemExit(str(e)) from None
     raise SystemExit(code)

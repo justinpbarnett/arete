@@ -56,10 +56,10 @@ def cmd_run(args) -> int:
         script = pipeline.Script("classic", flows.retry_environment, continues=args.continues, again="verify",
                                  environment_release=args.environment_release)
         return pipeline.run_issue(args.repo, args.issue, force=args.force, script=script,
-                                  run_id=getattr(args, "run_id", ""))
+                                  run_id=getattr(args, "run_id", ""), line=getattr(args, "line", ""))
     if args.local:
         return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force,
-                                  run_id=getattr(args, "run_id", ""))
+                                  run_id=getattr(args, "run_id", ""), line=getattr(args, "line", ""))
     if args.dry_run:
         return pipeline.run_issue(args.repo, args.issue, dry_run=True, force=args.force, persist_run=False)
     return client.steered(lambda: run_followed(client.start_task(
@@ -210,6 +210,7 @@ def register(sub) -> None:
     p.add_argument("--continue", dest="continues", default="", help=argparse.SUPPRESS)
     p.add_argument("--environment-release", default="", help=argparse.SUPPRESS)
     p.add_argument("--run-id", dest="run_id", default="", help=argparse.SUPPRESS)
+    p.add_argument("--line", dest="line", default="", help=argparse.SUPPRESS)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

@@ -126,7 +126,11 @@ class Isolated(unittest.TestCase):
         shutil.copyfile(self.template, paths.DB_FILE)
         self.repo = config.Repo(name="fixture", path=self.root / "repo", tracker="local", pipeline=True)
         self.repo.path.mkdir()
-        self.cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8)
+        self.cfg = config.Config(repos=[self.repo], max_parallel=8)
+        from arete import lines as lines_mod
+        lines_mod.ensure(self.cfg)
+        with foundation.db() as conn:
+            conn.execute("UPDATE lines SET concurrency = 8 WHERE repo = ?", (self.repo.name,))
         self.ticket = tasks_store.task_add(self.repo.name, "Fixture specification", "Fixture", "feat")
         self.local = tracker.LocalTracker(self.repo)
 
@@ -3283,7 +3287,7 @@ class PollFixture(Isolated):
             with launch_lease.acquiring(repo, tid):
                 return launch()
 
-        def wrap_spawn(repo, tid, *args, run_id="", **kwargs):
+        def wrap_spawn(repo, tid, *args, run_id="", line="", **kwargs):
             if run_id:
                 pending_run_id.append(run_id)
             try:
@@ -6215,8 +6219,12 @@ class QueueTests(PollFixture):
         for repo in (self.repo, second):
             for i in range(4):
                 tasks_store.task_add(repo.name, f"Task {i}", f"Task {i}", "feat")
-        cfg = config.Config(repos=[self.repo, second], max_parallel=3, max_parallel_per_repo=2,
+        cfg = config.Config(repos=[self.repo, second], max_parallel=3,
                             replay=config.ReplayConfig(all=True))
+        from arete import lines as lines_mod
+        lines_mod.ensure(cfg)
+        with foundation.db() as conn:
+            conn.execute("UPDATE lines SET concurrency = 2 WHERE repo IN (?, ?)", (self.repo.name, second.name))
         started = []
         self.assertEqual(self.poll_with(cfg, lambda repo, tid: started.append((repo, tid))), 0)
         self.assertEqual(len(started), 3)
@@ -6233,7 +6241,7 @@ class QueueTests(PollFixture):
         failed = tasks_store.task_add(self.repo.name, "Ordinary failure", "Ordinary failure", "feat")
         self.local.label(failed, add=["failed"])
         extra = tasks_store.task_add(self.repo.name, "Ready", "Ready", "feat")
-        cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8,
+        cfg = config.Config(repos=[self.repo], max_parallel=8,
                             replay=config.ReplayConfig(all=True))
         started = []
         self.assertEqual(self.poll_with(cfg, lambda repo, tid: started.append(tid)), 0)

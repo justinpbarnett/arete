@@ -44,6 +44,7 @@ from .agent import REPLAY
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import (
     held_back,
+    line_held_back,
     live_pipeline_runs,
     pending_feedback,
     retry_scratch,
@@ -392,9 +393,12 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
 
 
 def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None, *,
-                   spec: bool = False, source: tracker.Tracker | None = None, continues: str = "") -> bool | None:
+                   spec: bool = False, source: tracker.Tracker | None = None, continues: str = "",
+                   line: str = "") -> bool | None:
     """Return True for a spawn, None for existing work, False for an oncall refusal."""
-    from . import control, principals, tasks
+    from . import configrepo, control, principals, tasks
+    from . import lines as lines_mod
+    from .store import projects as projects_store
 
     with util.lock("oncall") as got:
         if not got or str(tid) in oncall.parked(repo_name):
@@ -411,15 +415,27 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     return None
                 command = pipeline.adw_command(repo_name, str(tid), "--continue", continues)
 
-            with principals.acting("rule:poll"):
-                run_id = pipeline.queue_run(
-                    repo_name,
-                    str(tid),
-                    continues=continues or None,
-                    restart="resume" if continues else "",
-                )
+            # Hold the instance fence across parent admission revalidation and queued-run insert,
+            # releasing both transaction and fence before child launch.
+            resolved_line = str(line or "").strip()
+            with configrepo.maybe_instance_fence(), db.tx() as c:
+                if projects_store.available(c):
+                    if not resolved_line:
+                        found_line = lines_mod.resolve_line_for_ticket(c, repo_name, tid)
+                        if found_line is not None:
+                            resolved_line = found_line["id"]
+                    if resolved_line:
+                        lines_mod.assert_line_active(c, resolved_line)
+                with principals.acting("rule:poll"):
+                    run_id = pipeline.queue_run(
+                        repo_name,
+                        str(tid),
+                        continues=continues or None,
+                        restart="resume" if continues else "",
+                        line=resolved_line,
+                    )
             if command:
-                full_command = [*command, "--run-id", run_id]
+                full_command = [*command, "--run-id", run_id, *(["--line", resolved_line] if resolved_line else [])]
                 record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
             else:
                 full_command = None
@@ -436,7 +452,14 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     return (
                         control.launch(full_command, pipeline.RUNS_LOG)
                         if full_command
-                        else spawn_run(repo_name, tid, **({"spec": True} if spec else {}), run_id=run_id)
+                        else pipeline.invoke_spawn(
+                            spawn_run,
+                            repo_name,
+                            tid,
+                            **({"spec": True} if spec else {}),
+                            run_id=run_id,
+                            line=resolved_line,
+                        )
                     )
 
             tasks.spawn_queued(repo_name, str(tid), spawn)
@@ -511,7 +534,8 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
 
 
 def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline.SkipLog,
-               dry_run: bool, going: Counter, slots: int) -> str:
+               dry_run: bool, going: Counter, slots: int, wip: Counter | None = None,
+               started_lines: list[str] | None = None) -> str:
     from . import tasks, unblock
 
     repo, layer = queue.repo, queue.layer
@@ -589,17 +613,28 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
                           **({"spec": True} if ticket.is_spec else {}))
     if not reply and claim and ask_store.asks_of(claim["run"], "open"):
         reply = "its asks are still waiting for an owner answer"
+    from . import lines as lines_mod
+
+    line_row = lines_mod.resolve_line_read(repo.name, str(tid), cfg=cfg)
+    line_id = line_row["id"] if line_row is not None else ""
     if why := config.repo_paused(cfg, repo.name, kind=ticket.kind):
         if not dry_run:
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {why}")
         return "held"
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
-    if answered is None and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
-        if not dry_run:
-            source_store.pass_over(repo.name, str(tid))
-        print(f"{util.iso()} {name}: waiting, {waiting}")
-        return "held"
+    if answered is None and not reply:
+        if line_waiting := line_held_back(line_row, going, wip):
+            if not dry_run:
+                source_store.pass_over(repo.name, str(tid))
+            skips.note(name, ticket, line_waiting, repo.name)
+            print(f"{util.iso()} {name}: waiting, {line_waiting}")
+            return "line_held"
+        if slot_waiting := held_back(cfg, None, going, slots, wip):
+            if not dry_run:
+                source_store.pass_over(repo.name, str(tid))
+            print(f"{util.iso()} {name}: waiting, {slot_waiting}")
+            return "held"
     fresh_feedback = False
     if (pick.from_feedback and (not held or held_feedback) and not dry_run
             and insights_store.has_fresh_feedback(pending_feedback(repo.name, tid))):
@@ -643,19 +678,28 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        spawned = spawn_unparked(repo.name, tid, readmission, source=source, **({"spec": True} if ticket.is_spec else {}),
-                                 **({"continues": continues} if continues else {}))
+        spawned = spawn_unparked(
+            repo.name,
+            tid,
+            readmission,
+            source=source,
+            **({"spec": True} if ticket.is_spec else {}),
+            **({"continues": continues} if continues else {}),
+            **({"line": line_id} if line_id else {}),
+        )
         if spawned is None:
             return "skipped"
         if not spawned:
             return "refused"
         evidence_store.mark_resumed(repo.name, str(tid))
+    if started_lines is not None:
+        started_lines.append(line_id or repo.name)
     return "started"
 
 
 def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.SkipLog, dry_run: bool,
-               errors: list[str], going: Counter, slots: int) -> bool:
-    examined, exhausted = 0, set()
+               errors: list[str], going: Counter, slots: int, wip: Counter | None = None) -> bool:
+    examined, exhausted, line_held_repos = 0, set(), set()
     selected_work = False
     while examined < MAX_STARTS_PER_POLL:
         progressed = False
@@ -680,14 +724,17 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 pick = next(candidates, None)
                 if not pick:
                     exhausted.add(repo.name)
-                    if not dry_run:
+                    if not dry_run and repo.name not in line_held_repos:
                         source_store.drop_passed_over(repo.name)
                     continue
                 queue.selected.add(str(pick.tid))
                 examined += 1
                 progressed = True
-                result = start_pick(cfg, queue, pick, skips, dry_run, going, slots)
-                if result in ("held", "refused"):
+                started_lines: list[str] = []
+                result = start_pick(cfg, queue, pick, skips, dry_run, going, slots, wip, started_lines)
+                if result == "line_held":
+                    line_held_repos.add(repo.name)
+                elif result in ("held", "refused"):
                     exhausted.add(repo.name)
                     if result == "held" and not dry_run:
                         for _ in candidates:
@@ -695,7 +742,10 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 elif result == "started":
                     selected_work = True
                     slots -= 1
-                    going[repo.name] += 1
+                    lid = started_lines[0] if started_lines else repo.name
+                    going[lid] += 1
+                    if wip is not None:
+                        wip[lid] += 1
             except Exception as e:
                 failed(errors, repo.name, e)
                 skips.keep_repo(repo.name)
@@ -706,7 +756,10 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
 
 
 def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_run: bool,
-                             errors: list[str], going: Counter, slots: int) -> int:
+                             errors: list[str], going: Counter, slots: int,
+                             wip: Counter | None = None) -> int:
+    from . import lines as lines_mod
+
     started = 0
     for queue in queues:
         repo = queue.repo
@@ -714,11 +767,17 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
             try:
                 if spec_graph.queue_blocker(queue.tracker, row["issue"], native=True):
                     continue
-                slot_blocker = config.repo_paused(cfg, repo.name) or held_back(cfg, repo.name, going, slots - started)
+                line_row = lines_mod.resolve_line_read(repo.name, str(row["issue"]), cfg=cfg)
+                slot_blocker = config.repo_paused(cfg, repo.name) or held_back(
+                    cfg, line_row, going, slots - started, wip,
+                )
                 can_start = started < MAX_STARTS_PER_POLL and not slot_blocker
                 if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start, slot_blocker=slot_blocker):
                     queue.selected.add(str(row["issue"]))
-                    going[repo.name] += 1
+                    lid = line_row["id"] if line_row is not None else repo.name
+                    going[lid] += 1
+                    if wip is not None:
+                        wip[lid] += 1
                     started += 1
             except Exception as error:
                 failed(errors, row["id"], error)
@@ -800,13 +859,19 @@ def poll_admitted(dry_run: bool) -> int:
             return 0
         errors: list[str] = []
         if not dry_run:
+            from . import lines as lines_mod
+
+            guard(errors, "ensuring repo lines", lambda: lines_mod.ensure(cfg))
             guard(errors, "capturing cohort arrivals", cohorts.sync)
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
             guard(errors, "observing draft status", lambda: observe_drafts(cfg))
             guard(errors, "syncing spec deliveries", lambda: spec_delivery.sync(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
-        going = Counter(r["repo"] for r in live_pipeline_runs())
+        from . import lines as lines_mod
+
+        going = lines_mod.live_runs_by_line(live_pipeline_runs())
+        wip = lines_mod.wip_counts_by_line()
         slots = slots_free_to_start(cfg.max_parallel)
         pipeline_repos = [r for r in cfg.repos if r.pipeline and runnable(r)]
         skips = pipeline.SkipLog({} if dry_run else util.read_json(pipeline.SKIPPED_FILE, {}))
@@ -817,10 +882,10 @@ def poll_admitted(dry_run: bool) -> int:
                   lambda queue=queue: requeue_failures(cfg, queue, dry_run, errors))
         resumed = 0
         try:
-            resumed = resume_environment_holds(cfg, queues, dry_run, errors, going, slots)
+            resumed = resume_environment_holds(cfg, queues, dry_run, errors, going, slots, wip)
         except Exception as error:
             failed(errors, "environment holds", error)
-        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots - resumed) or resumed > 0
+        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots - resumed, wip) or resumed > 0
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
             def finish_poll():
