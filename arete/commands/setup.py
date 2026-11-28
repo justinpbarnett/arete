@@ -268,7 +268,8 @@ def cmd_migrate(args) -> int:
 def cmd_doctor(args) -> int:
     from .. import doctor
 
-    results = doctor.run()
+    checks = getattr(args, "checks", None) or None
+    results = doctor.run(checks)
     for r in results:
         print(doctor.line(r))
     return 1 if any(r.failing for r in results) else 0
@@ -453,7 +454,9 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_prompts, local_read=True)
 
     p = sub.add_parser("doctor", help="read only check of arete's own state: cost drift, orphan rows, stray folders, "
-                                      "stuck work, the database and its backup; it reports and never repairs")
+                                      "stuck work, derived stores, the database and its backup; it reports and never repairs")
+    p.add_argument("checks", nargs="*", metavar="CHECK",
+                   help="optional check names (including derived:<name>); omit to run all checks")
     p.set_defaults(fn=cmd_doctor, local_read=True)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
