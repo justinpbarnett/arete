@@ -22,6 +22,8 @@ TABLE_ORDER = (
     "incidents",
     "dead_letters",
     "events_file",
+    "source_polls",
+    "sources",
     "db",
 )
 
@@ -51,6 +53,11 @@ class IncidentsLimit:
 
 
 @dataclass(frozen=True)
+class SourcesLimit:
+    unused_days: float
+
+
+@dataclass(frozen=True)
 class DbLimit:
     max_mb: float
 
@@ -67,6 +74,8 @@ class Policy:
     incidents: IncidentsLimit
     dead_letters: DaysLimit
     events_file: DaysLimit
+    source_polls: DaysLimit
+    sources: SourcesLimit
     db: DbLimit
 
 
@@ -142,6 +151,8 @@ def _build_policy(merged: dict[str, dict[str, float]]) -> Policy:
         ),
         dead_letters=DaysLimit(days=merged["dead_letters"]["days"]),
         events_file=DaysLimit(days=merged["events_file"]["days"]),
+        source_polls=DaysLimit(days=merged["source_polls"]["days"]),
+        sources=SourcesLimit(unused_days=merged["sources"]["unused_days"]),
         db=DbLimit(max_mb=merged["db"]["max_mb"]),
     )
 

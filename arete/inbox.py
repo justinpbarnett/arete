@@ -74,6 +74,7 @@ RESERVED_MANUAL_PREFIXES = (
     "project:",
     "line:",
     "view:",
+    "source:",
 )
 
 
@@ -2096,6 +2097,118 @@ def _resolve_presence(
     return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
 
 
+def raise_rescope(c, src, held_events: builtins.list[dict]) -> dict | None:
+    if not inbox_store.available(c) or not held_events:
+        return None
+    sid = src.id
+    subject = f"source:{sid}"
+    title = f"{sid}: {len(held_events)} older matches after a scope change"
+    detail = {
+        "source": sid,
+        "held": builtins.list(held_events),
+        "keys": [str(e.get("key", "")) for e in held_events],
+    }
+    item, _, created = inbox_store.raise_item(
+        c,
+        kind="rescope",
+        subject=subject,
+        priority=2,
+        title=title,
+        detail=detail,
+        verbs=["fire", "dismiss"],
+        options=[],
+        line=src.line or "",
+    )
+    if created or item is None:
+        return item
+    existing_detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    existing_held = builtins.list(existing_detail.get("held") or ())
+    seen_keys = {str(e.get("key", "")) for e in existing_held if isinstance(e, dict)}
+    merged = builtins.list(existing_held)
+    for ev in held_events:
+        k = str(ev.get("key", ""))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            merged.append(ev)
+    numeric = inbox_store.parse_id(item["id"])
+    if numeric is None:
+        return item
+    new_title = f"{sid}: {len(merged)} older matches after a scope change"
+    new_detail = {
+        **existing_detail,
+        "source": sid,
+        "held": merged,
+        "keys": [str(e.get("key", "")) for e in merged],
+    }
+    updated = inbox_store.update_item(
+        c,
+        numeric,
+        title=new_title,
+        detail=new_detail,
+        priority=2,
+        verbs=["fire", "dismiss"],
+        options=[],
+        task_id="",
+        run_id="",
+        line=src.line or str(item.get("line") or ""),
+    )
+    return updated[0] if updated is not None else item
+
+
+def _resolve_rescope(
+    item: dict,
+    *,
+    numeric_id: int,
+    base_version: int,
+    verb: str,
+) -> dict:
+    from . import loops as loops_mod
+    from . import sources as sources_mod
+
+    sid = item["subject"].removeprefix("source:")
+    actor = principals.current()
+    now = util.iso()
+    if verb == "fire":
+        held = builtins.list((item.get("detail") or {}).get("held") or ())
+        cfg = config.load_or_problem()[0]
+        all_loops = loops_mod.load_all(cfg)
+        live_by_name = {loop.name: loop for loop in all_loops if loop.enabled and not loop.error}
+        src = next((s for s in sources_mod.load_all(cfg, all_loops) if s.id == sid), None)
+        target_loops = [live_by_name[name] for name in src.loops if name in live_by_name] if src else []
+        queued: builtins.list[int] = []
+        with foundation.tx() as c:
+            updated, _, ok = inbox_store.resolve_item(
+                c,
+                numeric_id,
+                resolution="fired",
+                answer="fire",
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not ok:
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+            for loop_obj in target_loops:
+                if held:
+                    queued.extend(sources_mod.fire(loop_obj, "event", held))
+        return {"item": updated, "result": {"source": sid, "fired": len(held), "items": queued}}
+    if verb == "dismiss":
+        with foundation.tx() as c:
+            updated, _, ok = inbox_store.resolve_item(
+                c,
+                numeric_id,
+                resolution="dismissed",
+                answer="dismiss",
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not ok:
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+        return {"item": updated, "result": {"source": sid, "dismissed": True}}
+    raise contract.Problem("validation", f"Verb {verb!r} is not allowed on {item['id']}.")
+
+
 def _resolve_queue_dead(
     item: dict,
     *,
@@ -2276,6 +2389,13 @@ def resolve(
             numeric_id=numeric,
             base_version=base_version,
             actor=principals.current(),
+        )
+    if item["kind"] == "rescope" or subject.startswith("source:"):
+        return _resolve_rescope(
+            item,
+            numeric_id=numeric,
+            base_version=base_version,
+            verb=verb,
         )
 
     if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:

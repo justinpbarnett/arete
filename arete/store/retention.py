@@ -12,6 +12,7 @@ from pathlib import Path
 from .. import drafts, paths, record, retention, run_lines, util
 from . import blobs as blob_store
 from . import devices, events, idempotency, incidents, loops, orchestration, runs, writes
+from . import sources as sources_store
 from .db import (
     BLOBS_RETENTION_SCHEMA,
     RECORD_TURNS_SCHEMA,
@@ -477,6 +478,11 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             keep_days=policy.incidents.keep_days,
         )
         rows_removed += devices.prune(c)
+        rows_removed += sources_store.prune(
+            c,
+            polls_days=policy.source_polls.days,
+            unused_days=policy.sources.unused_days,
+        )
 
     return RowsPruned(
         rows=rows_removed,

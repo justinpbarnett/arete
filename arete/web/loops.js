@@ -149,12 +149,25 @@ function loopRuns(d) {
       cell(r.pr_url ? pullLinks(r.pr_url) : clampedSummary(r.summary), "muted-cell"))));
 }
 
+function sourceRateText(rl) {
+  if (!rl) return "";
+  const parts = [];
+  if (rl.remaining != null) parts.push(`${rl.remaining} left`);
+  if (rl.retry_after != null) parts.push(`retry ${rl.retry_after}s`);
+  return parts.join(", ");
+}
+
 function loopSources(d) {
-  return d.cursors.length
-    ? table("", [["Source"], ["Polled", "c-time"], ["State", "c-status"], ["Detail"]],
-      d.cursors.map((c) => el("tr", {}, cell(c.source, "muted-cell"), cell(liveAgo(c.polled), "nb"),
-        cell(stateChip(c.ok ? "ok" : "fault")), cell(c.detail || (c.ok ? "reading" : "")))))
-    : quiet(d.sources.length ? "Serve has not polled its sources yet." : "It has no source.");
+  const list = Array.isArray(d.sources) ? d.sources : [];
+  if (!list.length) return quiet("It has no source.");
+  return table("", [["Source"], ["Last ok", "c-time"], ["State", "c-status"], ["Errors", "num c-n"], ["Rate limit", "wide-only"], ["Note"]],
+    list.map((s) => el("tr", {},
+      cell(s.id || String(s), "muted-cell"),
+      cell(s.last_ok ? liveAgo(s.last_ok) : "never", "nb"),
+      cell(stateChip(s.error_streak ? "fault" : s.last_ok ? "ok" : "caution")),
+      cell(String(s.error_streak || 0), "num"),
+      cell(sourceRateText(s.rate_limit), "muted-cell wide-only"),
+      cell(s.note || "ok"))));
 }
 
 function subheading(title) {

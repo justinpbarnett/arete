@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 31
+MINOR = 32
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -325,7 +325,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
                        "secret_store_missing", "outbox_missing", "secret_internal", "already_resolved",
                        "still_missing", "validation", "gate_refused", "presence_expired", "lease_fenced",
                        "lease_expired", "files_purged", "line_in_use", "incompatible_writers"}
-    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
+    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease", "source") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -682,6 +682,7 @@ CHECK_REPORT = obj({
     "gate": {**STRING, "enum": ["A", "B", "C"]},
     "exposes": array(STRING),
     "warnings": array(CHECK_WARNING),
+    "dry_run": {"anyOf": [mapping(JSON), {"type": "null"}]},
 }, ["validator", "ok", "stages", "gate", "exposes"])
 CONFIG_DRAFT = obj({
     "id": STRING,
@@ -1352,6 +1353,84 @@ OPERATIONS += [
         obj({"view": STRING, "limit": STRING, "after": STRING}, ["view"]),
         {"view": "ready-view"},
     ),
+]
+SOURCE_RATE_LIMIT = obj({
+    "remaining": NULL_INT,
+    "retry_after": NULL_INT,
+    "at": STRING,
+})
+SOURCE_POLL = obj({
+    "id": INTEGER,
+    "source": STRING,
+    "started": STRING,
+    "ended": STRING,
+    "ok": BOOLEAN,
+    "read": INTEGER,
+    "new": INTEGER,
+    "refused": NULL_INT,
+    "error": NULL_TEXT,
+    "rate_remaining": NULL_INT,
+    "retry_after": NULL_INT,
+    "backoff_s": NULL_INT,
+})
+SOURCE_COUNTS = obj({
+    "polls": INTEGER,
+    "read": INTEGER,
+    "new": INTEGER,
+})
+SOURCE = obj({
+    "id": STRING,
+    "subject": STRING,
+    "version": INTEGER,
+    "source_version": NULL_TEXT,
+    "kind": NULL_TEXT,
+    "line": NULL_TEXT,
+    "feeds": NULL_TEXT,
+    "enabled": BOOLEAN,
+    "loops": array(STRING),
+    "last_ok": NULL_TEXT,
+    "polled": NULL_TEXT,
+    "advanced": NULL_TEXT,
+    "error_streak": INTEGER,
+    "backoff_until": NULL_TEXT,
+    "rate_limit": {"anyOf": [SOURCE_RATE_LIMIT, {"type": "null"}]},
+    "polls": array(SOURCE_POLL),
+    "note": STRING,
+    "every": {"type": ["string", "number", "null"]},
+    "counts": SOURCE_COUNTS,
+    "why": NULL_TEXT,
+})
+SOURCE_POLL_DONE = envelope({
+    "source": STRING,
+    "dry_run": BOOLEAN,
+    "ok": BOOLEAN,
+    "error": NULL_TEXT,
+    "items": array(mapping(JSON)),
+    "events": array(mapping(JSON)),
+    "queued": array(INTEGER),
+    "would_rescope": BOOLEAN,
+    "check": {"anyOf": [mapping(JSON), {"type": "null"}]},
+    "picks": array(STRING),
+    "op": NULL_TEXT,
+}, ["seq", "source", "dry_run", "ok"])
+SOURCE_POLL_ACCEPTED = envelope({
+    "accepted": BOOLEAN,
+    "watch": STRING,
+    "source": STRING,
+    "op": NULL_TEXT,
+}, ["seq", "accepted", "watch", "source"])
+SOURCE_POLL_RESULT = {"anyOf": [SOURCE_POLL_DONE, SOURCE_POLL_ACCEPTED]}
+
+LOOP["properties"]["sources"] = {"type": "array", "items": {"anyOf": [SOURCE, STRING]}}
+
+OPERATIONS += [
+    operation("source.list", "sources", envelope({"sources": array(SOURCE)})),
+    operation("source.get", "sources/{source}", envelope({"source": SOURCE}),
+              obj({"source": STRING}), {"source": "pipeline"}),
+    {**operation("source.poll", "sources/{source}/poll", SOURCE_POLL_RESULT,
+                 obj({"source": STRING, "dry_run": BOOLEAN}, ["source"]),
+                 {"source": "pipeline", "dry_run": True}, "POST", errors=("invalid_state",)),
+     "scope": "run:start"},
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):

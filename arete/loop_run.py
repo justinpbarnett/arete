@@ -560,6 +560,31 @@ def settle(run: LoopRun, status: str, summary: str) -> str:
     end_line = f"{status}: {summary} ({util.paid_note(record.metered_spent(run.id))})"
     run.write_log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary[:500])
+    if run.loop.name == "poll" and not run.trial:
+        from .store import sources as source_store
+
+        with foundation.tx() as c:
+            if source_store.has_durable_sources(c):
+                pipeline_src = next(
+                    (s for s in sources.load_all(run.cfg, [run.loop]) if s.id == "pipeline"),
+                    None,
+                )
+                if pipeline_src is not None:
+                    row = run_store.run_get(run.id, connect=lambda: nullcontext(c))
+                    started = (row.get("started") if row else None) or util.iso()
+                    ok = status == "done"
+                    source_store.source_poll(
+                        c,
+                        pipeline_src,
+                        started,
+                        ok,
+                        0,
+                        0,
+                        None if ok else summary[:500],
+                        None,
+                        None,
+                        detail="ok" if ok else summary[:500],
+                    )
     return status
 
 

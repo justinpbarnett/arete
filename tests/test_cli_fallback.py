@@ -233,6 +233,8 @@ class CliRouteFallbackTests(unittest.TestCase):
         loop = "GET /api/loops/example"
         webhook = "GET /api/v1/loops/example"
         rotate = "POST /api/v1/loops/example/webhook/rotate"
+        source_list = "GET /api/v1/sources"
+        source_poll = "POST /api/v1/sources/pipeline/poll"
         base = "https://serve.example.test:8796"
         hook_path = "/hook/example"
         ask = "GET /api/asks"
@@ -288,6 +290,8 @@ class CliRouteFallbackTests(unittest.TestCase):
             "GET /api/live": {"live": {"rows": {"runs": []}}},
             "GET /api/chats/1/sessions": {}, "POST /api/chats/1/sessions": {},
             "GET /api/chats/1/sessions/r1/report": {}, "POST /api/chats/1/sessions/r1/stop": {},
+            source_list: {"seq": seq, "sources": []},
+            source_poll: {"seq": seq, "ok": True, "dry_run": False, "op": "r1"},
         }
         canonical = {
             "GET /api/tasks": "GET /api/v1/tasks",
@@ -307,7 +311,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         }
         after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
                  "session start --attach work": [info, feed, info, feed, info]}
-        values = {"task": "t-1234", "run": "r1", "session": "r1", "id": 1, "step": "build", "name": "example", "chat": 1}
+        values = {"task": "t-1234", "run": "r1", "session": "r1", "id": 1, "step": "build", "name": "example", "chat": 1, "source": "pipeline"}
         command_values = {
             "webhook example": dict(values, id="example"),
             "webhook example --rotate": dict(values, loop="example"),
@@ -376,7 +380,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                         with self.subTest(historical=historical):
                             seen.clear()
                             result = self.cli(command)
-                            if primary in config_replies or primary in (webhook, rotate):
+                            if primary in config_replies or primary in (webhook, rotate, source_list, source_poll):
                                 code, lines, err = result
                                 self.assertEqual((code, len(lines), err), (1, 1, ""), result)
                                 self.assertEqual(json.loads(lines[0])["code"], "unknown_route")

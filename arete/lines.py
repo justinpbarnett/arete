@@ -111,9 +111,9 @@ def _extract_toml_line_refs(data: object, rel: str) -> list[dict]:
             for idx, item in enumerate(entries):
                 if isinstance(item, dict) and isinstance(item.get("line"), str) and item["line"].strip():
                     lid = item["line"].strip()
-                    name = item.get("name") or f"{section}[{idx}]"
+                    name = item.get("id") or item.get("name") or f"{section}[{idx}]"
                     refs.append({
-                        "kind": "config",
+                        "kind": "source" if section in ("source", "sources") else "config",
                         "path": rel,
                         "line": lid,
                         "detail": f"{rel} ({name}) references line '{lid}'",
@@ -179,7 +179,50 @@ def _read_inline_loop_references(root: Path, line_id: str) -> list[dict]:
     return matches
 
 
+def _read_source_file_references(root: Path, line_id: str) -> list[dict]:
+    matches: list[dict] = []
+    entries: list[tuple[str, bytes]] = []
+    seen_paths: set[str] = set()
+    if configrepo.is_repo(root):
+        tree = configrepo.live_tree_files(root)
+        for rel, raw in sorted(tree.items()):
+            if rel.startswith("sources/") and rel.endswith(".toml"):
+                seen_paths.add(rel)
+                entries.append((rel, raw))
+    sources_dir = root / "sources"
+    if sources_dir.is_dir():
+        for file in sorted(sources_dir.glob("*.toml")):
+            if not file.is_file():
+                continue
+            rel = f"sources/{file.name}"
+            if rel in seen_paths:
+                continue
+            try:
+                entries.append((rel, file.read_bytes()))
+            except OSError as error:
+                raise RuntimeError(f"unreadable source config {rel}: {error}") from error
+    for rel, raw in entries:
+        try:
+            parsed = tomllib.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+            raise RuntimeError(f"unreadable authoritative source config {rel}: {error}") from error
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"unreadable authoritative source config {rel}: expected a TOML table")
+        raw_line = parsed.get("line")
+        if isinstance(raw_line, str) and raw_line.strip() == line_id:
+            sid = Path(rel).stem
+            matches.append({
+                "kind": "source",
+                "id": sid,
+                "path": rel,
+                "line": line_id,
+                "detail": f"source '{sid}' ({rel}) references line '{line_id}'",
+            })
+    return matches
+
+
 register_reference_reader("inline_loops", _read_inline_loop_references)
+register_reference_reader("sources", _read_source_file_references)
 
 
 def validate_config_line_references(changes: Mapping[str, bytes | None], root: Path) -> None:
