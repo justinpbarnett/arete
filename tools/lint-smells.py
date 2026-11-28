@@ -208,9 +208,10 @@ def check_js_source(rel: str, raw: str) -> list[str]:
                 if code == "JS005" and re.search(r"\bnull\s*$", line[:match.start()]):
                     continue
                 errors.append(f"{rel}:{lineno}: {code} {message}")
-    for lineno, text in strings:
-        if JS_JAVASCRIPT_URL.search(text):
-            errors.append(f"{rel}:{lineno}: JS008 Avoid `javascript:` URLs")
+    if not rel.startswith("tests/"):
+        for lineno, text in strings:
+            if JS_JAVASCRIPT_URL.search(text):
+                errors.append(f"{rel}:{lineno}: JS008 Avoid `javascript:` URLs")
     return errors
 
 

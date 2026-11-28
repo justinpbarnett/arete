@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
-import json
 import random
 import string
 import unittest
@@ -287,9 +286,8 @@ class AuthOriginAndTokenFuzzTests(unittest.TestCase):
             server=SimpleNamespace(logins=logins),
         )
         with mock.patch("arete.credential_http.tokens.resolve", return_value=session_cred), \
-             mock.patch("arete.credential_http.principals.admit"):
-            with self.assertRaises(contract.Problem) as ctx:
-                credential_http.authenticate(csrf_handler, "POST", "/api/v1/batch")
+             mock.patch("arete.credential_http.principals.admit"), self.assertRaises(contract.Problem) as ctx:
+            credential_http.authenticate(csrf_handler, "POST", "/api/v1/batch")
         self.assertEqual(ctx.exception.code, "csrf")
 
     def test_token_resolve_and_note_use_boundaries(self):
