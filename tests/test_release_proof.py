@@ -14,7 +14,8 @@ from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 from arete import cli, codebase, config, paths, release_proof as proof, serve, serve_guard
 
-isolate_live_state()
+def setUpModule():
+    isolate_live_state()
 
 
 class RunningRelease(unittest.TestCase):
@@ -51,8 +52,9 @@ class RunningRelease(unittest.TestCase):
                 pass
 
         self.fixed = False
-        http = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), Route))
-        t = threading.Thread(target=http.serve_forever, daemon=True)
+        with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+            http = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), Route))
+        t = threading.Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         t.start()
         self.addCleanup(t.join, 5)
         self.addCleanup(http.shutdown)

@@ -1,11 +1,32 @@
+import os
+import shutil
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-from arete import config, dbstats, gh, paths, sandbox
+from arete import config, dbstats, gh, paths, sandbox, util
 from arete.store import db as foundation
+
+WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                          "-c", "commit.gpgsign=false"]
+
+
+def init_workspace_repo(src):
+    src.mkdir(parents=True)
+    util.git(["init", "-q", "-b", "main"], src)
+    (src / ".gitignore").write_text(".venv/\n")
+    (src / "notes.txt").write_text("original\n")
+    util.git(["add", "."], src)
+    util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qm", "sample"], src)
+
+
+def write_workspace_output(ws, content):
+    output = ws / ".venv/output"
+    output.parent.mkdir()
+    output.write_text(content)
+    return output
 
 
 @contextmanager
@@ -34,6 +55,24 @@ def parentless_github_issue(repo, number, issue_view):
     return api
 
 
+def seed_db(state_dir, *, db_file=None):
+    template_env = os.environ.get("ARETE_TEST_DB_TEMPLATE")
+    if template_env:
+        template = Path(template_env)
+        src_db = template / "state" / "arete.db"
+        src_instance = template / "state" / "backups" / "instance.json"
+        if src_db.is_file() and src_instance.is_file():
+            state = Path(state_dir)
+            target_db = Path(db_file) if db_file is not None else state / "arete.db"
+            for directory in (state / "backups", state / "locks", state / "runs", target_db.parent,
+                              paths.RUNS_DIR, paths.WORKTREES_DIR, paths.LOCKS_DIR, paths.LOG_DIR):
+                directory.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src_db, target_db)
+            shutil.copyfile(src_instance, target_db.parent / "backups" / "instance.json")
+            return
+    foundation.migrate()
+
+
 def isolate_live_state():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-", dir=Path("/tmp").resolve(), ignore_cleanup_errors=True)
     unittest.addModuleCleanup(folder.cleanup)
@@ -58,4 +97,4 @@ def isolate_live_state():
                     for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         patch.start()
         unittest.addModuleCleanup(patch.stop)
-    foundation.migrate()
+    seed_db(root / "state")
