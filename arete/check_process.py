@@ -112,7 +112,7 @@ def peek(channel):
 
 def posix_members(group, known, adopted_by):
     output = subprocess.check_output(["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
-                                     text=True, timeout=1, stderr=subprocess.DEVNULL)
+                                     text=True, timeout=1, stderr=subprocess.DEVNULL, env={"LC_ALL": "C"})
     live, children, pending = {}, defaultdict(list), []
     for line in output.splitlines():
         pid, parent, pgid, state, started = line.split(maxsplit=4)

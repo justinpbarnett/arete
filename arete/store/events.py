@@ -161,13 +161,13 @@ def scan(c, epoch, seq, selected):
         if not reason and any(seq < cursor(meta["trim"][cls])[1] for cls in classes):
             reason = "too_old"
         if not reason:
-            count = c.execute("SELECT COUNT(*) FROM (SELECT 1 FROM events_log e WHERE e.seq > ? AND e.seq <= ? AND " +
+            count = c.execute("SELECT COUNT(*) FROM (SELECT 1 FROM events_log e WHERE e.seq > ? AND e.seq <= ? AND " +  # noqa: S608
                               where + " LIMIT 10001)", (seq, top, *args)).fetchone()[0]
             if count > 10000:
                 reason = "too_far"
         rows, after = [], seq
         while not reason:
-            page = c.execute("SELECT e.* FROM events_log e WHERE e.seq > ? AND e.seq <= ? AND " + where +
+            page = c.execute("SELECT e.* FROM events_log e WHERE e.seq > ? AND e.seq <= ? AND " + where +  # noqa: S608
                              " ORDER BY e.seq LIMIT 500", (after, top, *args)).fetchall()
             rows.extend(dict(r) for r in page)
             if len(page) < 500:

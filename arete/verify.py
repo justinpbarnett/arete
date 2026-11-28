@@ -458,7 +458,7 @@ def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) 
         if proc.poll() is not None:
             raise ServerError(f"the start command exited {proc.returncode} before {url} answered{output(log)}")
         try:
-            with urllib.request.urlopen(url, timeout=5):
+            with util.urlopen_http(url, timeout=5):
                 return
         except urllib.error.HTTPError as e:
             if e.code < 500:

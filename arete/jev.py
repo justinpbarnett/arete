@@ -375,10 +375,11 @@ def worker_post(body: bytes, token: str) -> dict:
 def post(body: bytes, token: str) -> tuple[dict, str]:
     error = ""
     for attempt in range(TRIES):
-        req = urllib.request.Request(URL, data=body, method="POST", headers={
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "arete"})
+        req = util.http_request(URL, data=body, method="POST", headers={
+            "Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "arete"},
+            schemes=("https",))
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as r:
+            with util.urlopen_http(req, timeout=TIMEOUT_SECONDS, schemes=("https",)) as r:
                 return json.loads(r.read()), ""
         except urllib.error.HTTPError as e:
             error = f"HTTP {e.code}: {util.first_line(error_body(e), 200)}"

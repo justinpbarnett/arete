@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, paths, secretstore
+from . import config, paths, secretstore, util
 from .store import credentials, db, devices, principals
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -127,8 +127,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def profile(token: str) -> dict:
     if not isinstance(token, str) or not token or len(token) > MAX_METADATA:
         return {}
-    request = urllib.request.Request(PROFILE_URL, headers={"Authorization": f"Bearer {token}",
-                                      "anthropic-beta": "oauth-2025-04-20", "anthropic-version": "2023-06-01"})
+    request = util.http_request(PROFILE_URL, headers={"Authorization": f"Bearer {token}",
+                                "anthropic-beta": "oauth-2025-04-20", "anthropic-version": "2023-06-01"},
+                                schemes=("https",))
     try:
         with urllib.request.build_opener(NoRedirect).open(request, timeout=LOOKUP_TIMEOUT) as response:
             data = response.read(MAX_METADATA + 1)

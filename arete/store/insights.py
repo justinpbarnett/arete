@@ -37,7 +37,7 @@ def add_verdict(run_id: str, kind: str, subject: str, about: str, answers: dict,
 
 def settle_verdicts(run_id: str, outcome: str, approval: int | None = None, was: tuple[str, ...] = ("",)) -> None:
     with db() as c:
-        c.execute(f"UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = COALESCE(?, approval) "
+        c.execute(f"UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = COALESCE(?, approval) "  # noqa: S608
                   f"WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome IN ({','.join('?' * len(was))})",
                   (outcome, util.iso(), approval, run_id, *was))
 
@@ -63,7 +63,7 @@ def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, co
     lineage = lineage or {}
     with db() as c:
         c.execute(
-            f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "
+            f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "  # noqa: S608
             f"VALUES ({','.join('?' * 16)})",
             (run_id, repo, task, int(passed), seconds, cost, util.iso(), source,
              *(lineage.get(k, 0 if k in ("after_step", "last_step") else "") for k in EVAL_LINEAGE)),
@@ -75,7 +75,7 @@ BASELINE_SOURCE = "worktree"
 
 def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SOURCE) -> list[dict]:
     with reader() as c:
-        rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "
+        rows = c.execute(f"SELECT passed, {', '.join(EVAL_LINEAGE)} FROM evals "  # noqa: S608
                          "WHERE repo = ? AND task = ? AND source = ? ORDER BY ts DESC LIMIT ?",
                          (repo, task, source, limit))
         return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
@@ -114,7 +114,7 @@ def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
 def add_feedback(rows: list[dict]) -> int:
     with db() as c:
         before = c.total_changes
-        c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "
+        c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "  # noqa: S608
                       f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
                       [(*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), util.iso()) for r in rows])
         return c.total_changes - before
@@ -122,7 +122,7 @@ def add_feedback(rows: list[dict]) -> int:
 
 def feedback_due(repo: str, quiet_since: str) -> list[str]:
     with reader() as c:
-        rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
+        rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "  # noqa: S608
                          "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
                          f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
                          "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
@@ -149,7 +149,7 @@ def open_feedback(pr_urls: list[str]) -> list[dict]:
         return []
     with reader() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT * FROM feedback WHERE pr_url IN ({','.join('?' * len(pr_urls))}) "
+            f"SELECT * FROM feedback WHERE pr_url IN ({','.join('?' * len(pr_urls))}) "  # noqa: S608
             "AND status IN ('new', 'taken', 'failed') ORDER BY created", pr_urls)]
 
 
@@ -174,7 +174,7 @@ def take_feedback(rows: list[dict], run_id: str) -> list[dict]:
 def release_feedback(run_id: str, *, closed_prs: tuple[str, ...] = ()) -> None:
     with tx() as c:
         if closed_prs:
-            c.execute(f"UPDATE feedback SET status = 'recorded', previous_run_id = NULL "
+            c.execute(f"UPDATE feedback SET status = 'recorded', previous_run_id = NULL "  # noqa: S608
                       f"WHERE run_id = ? AND status = 'taken' AND pr_url IN ({','.join('?' * len(closed_prs))})",
                       (run_id, *closed_prs))
         # Runs launched before the migration saved the previous claim in the run log.
@@ -199,7 +199,7 @@ def release_interrupted_feedback(run_id: str) -> None:
 def settle_feedback(run_id: str, status: str, *, prs: tuple[str, ...] = ()) -> None:
     pr_filter = f" AND pr_url IN ({','.join('?' * len(prs))})" if prs else ""
     with db() as c:
-        c.execute(f"UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'"
+        c.execute(f"UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'"  # noqa: S608
                   f"{pr_filter}", (status, run_id, *prs))
 
 
@@ -238,9 +238,18 @@ def research_set(ref: str, **fields) -> None:
                   tuple(row.get(k) for k in RESEARCH_COLUMNS))
 
 
+RESEARCH_FIELDS = frozenset({"source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
+                             "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved",
+                             "delivered"})
+
+
 def research_keep(ref: str, **fields) -> None:
+    if unknown := set(fields) - RESEARCH_FIELDS:
+        raise ValueError(f"invalid research fields: {', '.join(sorted(unknown))}")
+    if not fields:
+        return
     with db() as c:
-        c.execute(f"UPDATE research SET {', '.join(f'{k} = ?' for k in fields)} WHERE ref = ? COLLATE NOCASE",
+        c.execute(f"UPDATE research SET {', '.join(f'{k} = ?' for k in fields)} WHERE ref = ? COLLATE NOCASE",  # noqa: S608
                   (*fields.values(), ref))
 
 
@@ -258,7 +267,7 @@ EDITABLE_CAPTURE = "status IN ('draft', 'checking')"
 
 def capture_draft(connect=reader) -> dict | None:
     with connect() as c:
-        r = c.execute(f"SELECT * FROM captures WHERE {OPEN_CAPTURE}").fetchone()
+        r = c.execute(f"SELECT * FROM captures WHERE {OPEN_CAPTURE}").fetchone()  # noqa: S608
         if not r:
             return None
         draft = dict(r)
@@ -273,7 +282,7 @@ def capture_move(draft_id: int, revision: int, was: str, to: str, delivery: str 
     with tx() as c:
         note = "" if delivery is None else ", delivery = ?"
         args = (to, *(() if delivery is None else (delivery,)), draft_id, was, revision)
-        return c.execute(f"UPDATE captures SET status = ?{note} WHERE id = ? AND status = ? AND revision = ?",
+        return c.execute(f"UPDATE captures SET status = ?{note} WHERE id = ? AND status = ? AND revision = ?",  # noqa: S608
                          args).rowcount == 1
 
 
@@ -300,7 +309,7 @@ def capture_linked(evidence_id: int, sha256: str, link: str) -> None:
 
 def capture_note(draft_id: int | None, text: str) -> None:
     with db() as c:
-        c.execute("UPDATE captures SET delivery = ? WHERE status = 'filing'" + ("" if draft_id is None else " AND id = ?"),
+        c.execute("UPDATE captures SET delivery = ? WHERE status = 'filing'" + ("" if draft_id is None else " AND id = ?"),  # noqa: S608
                   (text, *(() if draft_id is None else (draft_id,))))
 
 
@@ -356,9 +365,9 @@ def capture_inspected(evidence_id: int, sha256: str, inspection: dict, cost: flo
 def capture_end_checks(draft_id: int | None, reason: str) -> None:
     with tx() as c:
         args = () if draft_id is None else (draft_id,)
-        c.execute("UPDATE capture_checks SET result = 'interrupted', reason = ?, checked = ? WHERE result = 'running'"
+        c.execute("UPDATE capture_checks SET result = 'interrupted', reason = ?, checked = ? WHERE result = 'running'"  # noqa: S608
                   + ("" if draft_id is None else " AND capture = ?"), (reason, util.iso(), *args))
-        c.execute("UPDATE captures SET status = 'draft' WHERE status = 'checking'"
+        c.execute("UPDATE captures SET status = 'draft' WHERE status = 'checking'"  # noqa: S608
                   + ("" if draft_id is None else " AND id = ?"), args)
 
 
@@ -377,7 +386,7 @@ def capture_evidence(evidence_id: int, connect=reader) -> dict | None:
 def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
     now = util.iso()
     with tx() as c:
-        draft = c.execute(f"SELECT id, status FROM captures WHERE {OPEN_CAPTURE}").fetchone()
+        draft = c.execute(f"SELECT id, status FROM captures WHERE {OPEN_CAPTURE}").fetchone()  # noqa: S608
         draft_id = draft["id"] if draft else c.execute(
             "INSERT INTO captures (status, revision, created, updated) VALUES ('draft', 0, ?, ?)", (now, now)).lastrowid
         held = [dict(r) for r in c.execute("SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft_id,))]
@@ -404,25 +413,32 @@ def capture_drop_evidence(evidence_id: int) -> dict | None:
         return dict(r)
 
 
+CAPTURE_FIELDS = frozenset({"status", "kind", "text", "expected", "actual", "steps", "context", "revision",
+                            "created", "updated", "jev_cost_usd", "inspect_cost_usd", "written_title", "written_body",
+                            "written_print", "written_note", "delivery", "issue", "issue_url", "issue_title", "filed"})
+
+
 def capture_save(**fields) -> bool:
+    if unknown := set(fields) - CAPTURE_FIELDS:
+        raise ValueError(f"invalid capture fields: {', '.join(sorted(unknown))}")
     now = util.iso()
     names = list(fields)
     sets = "".join(f"{n} = ?, " for n in names)
     with tx() as c:
-        changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE {EDITABLE_CAPTURE}",
+        changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE {EDITABLE_CAPTURE}",  # noqa: S608
                             (*fields.values(), now)).rowcount
         if changed:
             return True
         if c.execute("SELECT 1 FROM captures WHERE status = 'filing'").fetchone():
             return False
-        c.execute(f"INSERT INTO captures ({', '.join(names)}, status, revision, created, updated) "
+        c.execute(f"INSERT INTO captures ({', '.join(names)}, status, revision, created, updated) "  # noqa: S608
                   f"VALUES ({', '.join('?' * len(names))}, 'draft', 1, ?, ?)", (*fields.values(), now, now))
         return True
 
 
 def capture_discard() -> int | None:
     with tx() as c:
-        draft = c.execute(f"SELECT id FROM captures WHERE {EDITABLE_CAPTURE}").fetchone()
+        draft = c.execute(f"SELECT id FROM captures WHERE {EDITABLE_CAPTURE}").fetchone()  # noqa: S608
         if not draft:
             return None
         c.execute("DELETE FROM capture_evidence WHERE capture = ?", (draft["id"],))

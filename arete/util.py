@@ -19,7 +19,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable
+import urllib.request
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -505,7 +506,7 @@ def git_error(text: str) -> str:
 @contextmanager
 def repo_lock(src: Path):
     paths.ensure_dirs()
-    name = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
+    name = hashlib.sha1(str(src.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
     with open(paths.LOCKS_DIR / f"git-{name}.lock", "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
@@ -912,6 +913,23 @@ class NamedTlsConnection(http.client.HTTPSConnection):
         except BaseException:
             sock.close()
             raise
+
+
+def http_request(url: str, *, data: bytes | None = None, headers: Mapping[str, str] | None = None,
+                 method: str | None = None, schemes: tuple[str, ...] = ("https", "http")) -> urllib.request.Request:
+    scheme = urlsplit(url).scheme.lower()
+    if scheme not in schemes:
+        raise ValueError(f"unsupported URL scheme {scheme!r}; expected {' or '.join(schemes)}")
+    return urllib.request.Request(url, data=data, headers=dict(headers or {}), method=method)  # noqa: S310
+
+
+def urlopen_http(target: str | urllib.request.Request, *, timeout: float,
+                 schemes: tuple[str, ...] = ("https", "http")):
+    url = target.full_url if isinstance(target, urllib.request.Request) else target
+    scheme = urlsplit(url).scheme.lower()
+    if scheme not in schemes:
+        raise ValueError(f"unsupported URL scheme {scheme!r}; expected {' or '.join(schemes)}")
+    return urllib.request.urlopen(target, timeout=timeout)  # noqa: S310
 
 
 def https_upgrade(resp: http.client.HTTPResponse, port: int | None) -> SplitResult | None:

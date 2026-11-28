@@ -514,7 +514,8 @@ def openrouter_prices() -> dict[str, dict]:
         pass
     if paths.ISOLATED:
         return {}
-    request = urllib.request.Request(OPENROUTER_URL, headers={"Accept": "application/json", "User-Agent": "arete"})
+    request = util.http_request(OPENROUTER_URL, headers={"Accept": "application/json", "User-Agent": "arete"},
+                                schemes=("https",))
     try:
         with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=PRICE_TIMEOUT_SECONDS) as response:
             data = response.read(PRICE_MAX_BYTES + 1)

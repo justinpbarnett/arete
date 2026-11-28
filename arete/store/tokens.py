@@ -256,7 +256,7 @@ def rotate(identity, person, grace_seconds):
 
 def flush_uses(c, pending, where="1", params=()):
     ref = db.metadata(c)["token_key_ref"]
-    c.executemany(f"UPDATE tokens SET last_used_at = ?, last_used_node = ? "
+    c.executemany(f"UPDATE tokens SET last_used_at = ?, last_used_node = ? "  # noqa: S608
                   f"WHERE id = ? AND revoked_at IS NULL AND ({where}) AND (last_used_at IS NULL OR last_used_at <= ?)",
                   ((at, node, identity, *params, at) for (key, identity), (at, node) in pending.items() if key == ref))
 
@@ -264,7 +264,7 @@ def flush_uses(c, pending, where="1", params=()):
 def mark_revoked(c, reason, where="1", params=()):
     with USE_LOCK:
         flush_uses(c, PENDING_USES, where, params)
-        rows = c.execute(f"UPDATE tokens SET revoked_at = ?, revoke_reason = ?, version = version + 1 "
+        rows = c.execute(f"UPDATE tokens SET revoked_at = ?, revoke_reason = ?, version = version + 1 "  # noqa: S608
                          f"WHERE revoked_at IS NULL AND ({where}) RETURNING *", (util.iso(), reason, *params)).fetchall()
     for row in rows:
         changed(c, row, "expiry" if reason == "expired" else "revoke")

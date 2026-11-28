@@ -43,7 +43,7 @@ def refuse(reason: str) -> sandbox.ConfinementUnavailable:
 
 
 def fetch(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=60) as reply:
+    with util.urlopen_http(url, timeout=60, schemes=("https",)) as reply:
         data = reply.read(MAX_DOWNLOAD + 1)
     if len(data) > MAX_DOWNLOAD:
         raise refuse("download too large")
@@ -415,8 +415,8 @@ def browser_digest(argv: list[str]) -> str:
 
 
 def browser_env(folder: Path, debug: bool = False) -> list[str]:
-    return ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder}/home", f"PLAYWRIGHT_SOCKETS_DIR={BROWSER_SOCKETS}",
-            f"CFFIXED_USER_HOME={folder}/home", f"TMPDIR={folder}/tmp", f"MAC_CHROMIUM_TMPDIR={folder}/tmp",
+    return ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", f"HOME={folder / 'home'}", f"PLAYWRIGHT_SOCKETS_DIR={BROWSER_SOCKETS}",
+            f"CFFIXED_USER_HOME={folder / 'home'}", f"TMPDIR={folder / 'tmp'}", f"MAC_CHROMIUM_TMPDIR={folder / 'tmp'}",
             *(["DEBUG=pw:browser*"] if debug else [])]
 
 

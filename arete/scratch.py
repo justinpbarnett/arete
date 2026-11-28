@@ -1150,10 +1150,10 @@ def evidence_path(run_dir: str) -> Path:
 
 
 def temp_grants() -> tuple[Path, ...]:
-    temp = os.getenv("TMPDIR", "/tmp")
+    temp = os.getenv("TMPDIR", "/tmp")  # noqa: S108
     if not os.path.isabs(temp) or ".." in Path(temp).parts:
         raise sandbox.ConfinementUnavailable(f"TMPDIR {temp!r} is not an absolute path free of '..'")
-    return (Path("/tmp").resolve(), Path("/private/tmp"), Path(temp).resolve())
+    return (Path("/tmp").resolve(), Path("/private/tmp"), Path(temp).resolve())  # noqa: S108
 
 
 def actor_grants(a: Attempt) -> dict[str, tuple[Path, ...]]:

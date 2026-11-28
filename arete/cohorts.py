@@ -262,7 +262,7 @@ def facts(repo, tickets):
         runs = [
             dict(r)
             for r in conn.execute(
-                f"SELECT id,started,status,pr_url FROM runs WHERE repo=? AND issue IN ({marks}) "
+                f"SELECT id,started,status,pr_url FROM runs WHERE repo=? AND issue IN ({marks}) "  # noqa: S608
                 "AND kind='pipeline' AND dry_run=0 ORDER BY started DESC,rowid DESC",
                 args,
             )
@@ -270,14 +270,14 @@ def facts(repo, tickets):
         answers = [
             dict(r)
             for r in conn.execute(
-                f"SELECT a.id,a.answered FROM asks a JOIN runs r ON a.run=r.id "
+                f"SELECT a.id,a.answered FROM asks a JOIN runs r ON a.run=r.id "  # noqa: S608
                 f"WHERE r.repo=? AND r.issue IN ({marks}) AND r.kind='pipeline' AND r.dry_run=0 "
                 "AND a.status='answered' AND a.recovery_route='owner' AND a.taken_by!='' ORDER BY a.answered",
                 args,
             )
         ]
         wait = conn.execute(
-            f"SELECT cause, phase FROM unblock_cases WHERE repo=? AND ticket IN ({marks}) "
+            f"SELECT cause, phase FROM unblock_cases WHERE repo=? AND ticket IN ({marks}) "  # noqa: S608
             "AND phase NOT IN ('resolved','cancelled') ORDER BY updated DESC LIMIT 1",
             args,
         ).fetchone()
@@ -303,7 +303,7 @@ def report(name):
             obs = [
                 dict(r)
                 for r in conn.execute(
-                    f"SELECT * FROM observations WHERE repo=? AND ticket IN ({marks}) "
+                    f"SELECT * FROM observations WHERE repo=? AND ticket IN ({marks}) "  # noqa: S608
                     "AND (destination='' OR destination=?) ORDER BY at,rowid",
                     (cohort["repo"], *ids, cohort["destination"]),
                 )

@@ -972,9 +972,8 @@ def record_refused(row: dict, role: str, env_name: str, reason: str = "below_flo
     detail = json.dumps({"role": role, "env": env_name, "reason": reason})
 
     def write():
-        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError):
-            with db.tx() as c:
-                credentials.secret_event(c, row, "refused", actor, util.iso(), ok=False, detail=detail)
+        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError), db.tx() as c:
+            credentials.secret_event(c, row, "refused", actor, util.iso(), ok=False, detail=detail)
 
     if db.transaction_mode() is not None:
         db.after_transaction(write)
@@ -1125,8 +1124,8 @@ def save_verification_key(c, row, ref, value: bytes, actor: str):
     if row and row["fingerprint"] == sha:
         return row
     return save_change(c, "global", VERIFICATION_KEY_NAME, row, ref,
-                       dict(id=secrets.token_hex(16), kind="signing_key", actor=actor,
-                            at=util.iso(), fingerprint=sha, provider=None, rotated=row is not None))
+                       {"id": secrets.token_hex(16), "kind": "signing_key", "actor": actor,
+                        "at": util.iso(), "fingerprint": sha, "provider": None, "rotated": row is not None})
 
 
 def register_verification_key(value: bytes, *, rotated: bool = False):

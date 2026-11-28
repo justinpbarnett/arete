@@ -26,13 +26,13 @@ def chat_add(project: str) -> int:
 
 def chat_get(chat_id: int) -> dict | None:
     with reader() as c:
-        r = c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        r = c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats WHERE id = ?", (chat_id,)).fetchone()  # noqa: S608
         return dict(r) if r else None
 
 
 def chats() -> list[dict]:
     with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats ORDER BY created DESC, id DESC")]
+        return [dict(r) for r in c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats ORDER BY created DESC, id DESC")]  # noqa: S608
 
 
 def chat_messages(chat_id: int) -> list[dict]:
@@ -52,8 +52,14 @@ def chat_claim(chat_id: int, text: str, title: str) -> int:
         return 0
 
 
+CHAT_FIELDS = frozenset({"title", "project", "created", "updated", "spent", "busy", "session",
+                         "session_spent", "runner", "draft_title", "draft_body", "summary", "summarized_to"})
+
+
 def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_usd: float | None = None,
              reported_cost: float | None = None, before: Sequence[tuple[str, str]] = (), **fields) -> None:
+    if unknown := set(fields) - CHAT_FIELDS:
+        raise ValueError(f"invalid chat fields: {', '.join(sorted(unknown))}")
     ts = util.iso()
     reported_cost = cost if reported_cost is None else reported_cost
     paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd
@@ -63,7 +69,7 @@ def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_us
                       (chat_id, kind, note, 0, 0, ts))
         c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
                   (chat_id, sender, text, reported_cost, paid_usd, ts))
-        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",
+        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",  # noqa: S608
                   (*fields.values(), ts, reported_cost, chat_id))
 
 
@@ -81,7 +87,7 @@ def chat_sessions(chat_id: int | None = None, connect=reader) -> list[dict]:
     where, args = ("WHERE l.chat_id = ?", (chat_id,)) if chat_id is not None else ("", ())
     with connect() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id {where} "
+            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id {where} "  # noqa: S608
             "ORDER BY l.linked DESC, l.rowid DESC", args)]
 
 
@@ -94,7 +100,7 @@ def chat_of_session(run_id: str, connect=reader) -> int | None:
 def chat_sessions_untold() -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "
+            f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "  # noqa: S608
             "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' "
             f"{factory.exclude_retained(c, 'l.run_id')} ORDER BY l.rowid")]
 

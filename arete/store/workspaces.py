@@ -109,7 +109,7 @@ def by_state(*states: str) -> list[dict]:
     with reader() as c:
         marks = ", ".join("?" for _ in states)
         return [_decode(row) for row in c.execute(
-            f"SELECT * FROM workspaces WHERE state IN ({marks}) ORDER BY released_at, id", states)]
+            f"SELECT * FROM workspaces WHERE state IN ({marks}) ORDER BY released_at, id", states)]  # noqa: S608
 
 
 def files(workspace_id: int) -> dict[str, str]:
@@ -157,7 +157,7 @@ def _insert(c, name: str, fields: dict, fingerprints: dict[str, str]) -> dict:
     _state_time(values)
     columns = ", ".join(values)
     marks = ", ".join("?" for _ in values)
-    row = c.execute(f"INSERT INTO workspaces ({columns}) VALUES ({marks}) RETURNING *",
+    row = c.execute(f"INSERT INTO workspaces ({columns}) VALUES ({marks}) RETURNING *",  # noqa: S608
                     tuple(values.values())).fetchone()
     _write_files(c, row["id"], fingerprints)
     _emit(c, None, row)
@@ -190,7 +190,7 @@ def _update(c, before, values: dict, fingerprints: dict[str, str] | None) -> dic
     elif not changed:
         return _decode(before)
     setters = ", ".join([*(f"{key} = ?" for key in changed), "version = version + 1"])
-    after = c.execute(f"UPDATE workspaces SET {setters} WHERE id = ? RETURNING *",
+    after = c.execute(f"UPDATE workspaces SET {setters} WHERE id = ? RETURNING *",  # noqa: S608
                       (*changed.values(), workspace_id)).fetchone()
     _emit(c, before, after)
     return _decode(after)

@@ -396,7 +396,7 @@ def fingerprint_text(f: dict) -> str:
 
 
 def fingerprint_key(loop: Loop, f: dict) -> str:
-    return hashlib.sha1(f"{loop.name}\n{fingerprint_text(f).lower()}".encode()).hexdigest()[:20]
+    return hashlib.sha1(f"{loop.name}\n{fingerprint_text(f).lower()}".encode(), usedforsecurity=False).hexdigest()[:20]
 
 
 def fenced(data) -> str:
@@ -698,7 +698,7 @@ def watch_input(run: LoopRun) -> list[dict]:
     if not text.strip():
         return []
     run.log("input", f"script printed {util.count(len(text.splitlines()), 'line')}")
-    return [sources.event("script", f"{loop.name}#script", hashlib.sha1(text.encode()).hexdigest()[:16],
+    return [sources.event("script", f"{loop.name}#script", hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest()[:16],
                           util.first_line(text, 200), trust="internal", data={"output": util.tail(text, OUTPUT_TAIL)})]
 
 

@@ -36,7 +36,7 @@ def validate_version(value):
 
 def current(c, table, identity):
     column = IDENTITY[table]
-    row = c.execute(f"SELECT {column}, * FROM {table} WHERE {column} = ?", (identity,)).fetchone()
+    row = c.execute(f"SELECT {column}, * FROM {table} WHERE {column} = ?", (identity,)).fetchone()  # noqa: S608
     return dict(row) if row else None
 
 
@@ -88,7 +88,7 @@ def insert(table, fields, identity=None, kind=None):
             from . import factory
 
             factory.admit(c)
-        cursor = c.execute(f"INSERT INTO {table} ({', '.join(values)}) VALUES ({','.join('?' for _ in values)})",
+        cursor = c.execute(f"INSERT INTO {table} ({', '.join(values)}) VALUES ({','.join('?' for _ in values)})",  # noqa: S608
                            tuple(values.values()))
         identity = identity if identity is not None else cursor.lastrowid
         row = current(c, table, identity)
@@ -119,13 +119,13 @@ def update(table, identity, fields, *, base_version=None, expect=(), increments=
             where += f" AND {status} IN ({','.join('?' for _ in expect)})"
             args.extend(expect)
         if delete:
-            c.execute(f"DELETE FROM {table} WHERE {where}", args)
+            c.execute(f"DELETE FROM {table} WHERE {where}", args)  # noqa: S608
             row = {**row, "version": row["version"] + 1}
         else:
             setters = [f"{key} = ?" for key in fields]
             setters += [f"{key} = COALESCE({key}, 0) + ?" for key in increments]
             setters.append("version = version + 1")
-            changed = c.execute(f"UPDATE {table} SET {', '.join(setters)} WHERE {where}",
+            changed = c.execute(f"UPDATE {table} SET {', '.join(setters)} WHERE {where}",  # noqa: S608
                                 (*fields.values(), *increments.values(), *args)).rowcount
             if not changed:
                 raise VersionConflict(current(c, table, identity))

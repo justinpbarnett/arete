@@ -338,7 +338,7 @@ class Command(Source):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            key = row.get("key") or row.get("title") or hashlib.sha1(line.strip().encode()).hexdigest()[:16]
+            key = row.get("key") or row.get("title") or hashlib.sha1(line.strip().encode(), usedforsecurity=False).hexdigest()[:16]
             out.append(event(row.get("type", "command"), sid, key,
                              str(row.get("title") or ""), repo=row.get("repo", loop.repo), url=row.get("url", ""),
                              trust=source.get("trust", "internal"), data=row.get("data") or {}))
@@ -398,7 +398,7 @@ class Log(Source):
                 if not pattern.search(raw):
                     continue
                 sig = signature(raw)
-                key = hashlib.sha1(sig.encode()).hexdigest()[:16]
+                key = hashlib.sha1(sig.encode(), usedforsecurity=False).hexdigest()[:16]
                 if key in out:
                     out[key]["data"]["count"] += 1
                     continue

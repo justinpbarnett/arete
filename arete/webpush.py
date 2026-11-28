@@ -126,8 +126,8 @@ def subject(cfg: config.Config, row: dict) -> str:
 
 
 def post(endpoint: str, headers: dict) -> int:
-    request = urllib.request.Request(endpoint, data=b"", headers=headers, method="POST")
     try:
+        request = util.http_request(endpoint, data=b"", headers=headers, method="POST")
         with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as reply:
             return reply.status
     except urllib.error.HTTPError as e:

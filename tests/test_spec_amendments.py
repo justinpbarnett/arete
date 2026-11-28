@@ -17,7 +17,6 @@ from arete import (
     loops,
     orchestration,
     orchestration_api,
-    release_proof,
     requirement_revision,
     spec_amendments,
     spec_delivery,
@@ -30,12 +29,11 @@ from arete import (
     webhooks,
 )
 from arete.refusals import Stated
-from arete.store import db, runs, specgraphs, specs
+from arete.store import db, specgraphs, specs
 from arete.store import orchestration as ledger
 from tests.test_spec_graph_delivery import (
     GITHUB_SLUG,
     REPO_NAME,
-    SCOPE,
     SHA_A,
     SHA_B,
     FakeGitHubSource,

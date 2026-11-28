@@ -117,7 +117,7 @@ def record_comment(row: dict) -> bool:
             return False
         before = c.total_changes
         c.execute(
-            f"INSERT OR IGNORE INTO ticket_comments ({', '.join(COMMENT_COLUMNS)}) "
+            f"INSERT OR IGNORE INTO ticket_comments ({', '.join(COMMENT_COLUMNS)}) "  # noqa: S608
             f"VALUES ({', '.join('?' * len(COMMENT_COLUMNS))})",
             values,
         )
@@ -144,7 +144,7 @@ def update_comment(repo: str, ticket: str, tracker: str, comment_id: str, **fiel
         if not installed(c):
             return False
         return bool(c.execute(
-            f"UPDATE ticket_comments SET {', '.join(sets)} "
+            f"UPDATE ticket_comments SET {', '.join(sets)} "  # noqa: S608
             "WHERE repo = ? AND ticket = ? AND tracker = ? AND comment_id = ?",
             args,
         ).rowcount)
@@ -402,7 +402,7 @@ def plan_followup(followup: dict, items: list[dict]) -> tuple[dict, list[dict]]:
             "data": json.dumps(followup.get("data") or {}, sort_keys=True),
         }
         c.execute(
-            f"INSERT INTO ticket_followups ({', '.join(FOLLOWUP_COLUMNS)}) "
+            f"INSERT INTO ticket_followups ({', '.join(FOLLOWUP_COLUMNS)}) "  # noqa: S608
             f"VALUES ({', '.join('?' * len(FOLLOWUP_COLUMNS))})",
             [f_payload.get(col, "") for col in FOLLOWUP_COLUMNS],
         )
@@ -417,7 +417,7 @@ def plan_followup(followup: dict, items: list[dict]) -> tuple[dict, list[dict]]:
                 "data": json.dumps(item.get("data") or {}, sort_keys=True),
             }
             c.execute(
-                f"INSERT INTO ticket_followup_items ({', '.join(FOLLOWUP_ITEM_COLUMNS)}) "
+                f"INSERT INTO ticket_followup_items ({', '.join(FOLLOWUP_ITEM_COLUMNS)}) "  # noqa: S608
                 f"VALUES ({', '.join('?' * len(FOLLOWUP_ITEM_COLUMNS))})",
                 [i_payload.get(col, "") for col in FOLLOWUP_ITEM_COLUMNS],
             )
@@ -450,7 +450,7 @@ def update_followup(followup_id: str, **fields) -> bool:
         if not followups_installed(c):
             return False
         return bool(c.execute(
-            f"UPDATE ticket_followups SET {', '.join(sets)} WHERE id = ?",
+            f"UPDATE ticket_followups SET {', '.join(sets)} WHERE id = ?",  # noqa: S608
             args,
         ).rowcount)
 
@@ -476,7 +476,7 @@ def update_followup_item(item_id: str, **fields) -> bool:
         if not followups_installed(c):
             return False
         return bool(c.execute(
-            f"UPDATE ticket_followup_items SET {', '.join(sets)} WHERE id = ?",
+            f"UPDATE ticket_followup_items SET {', '.join(sets)} WHERE id = ?",  # noqa: S608
             args,
         ).rowcount)
 

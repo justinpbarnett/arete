@@ -1011,12 +1011,13 @@ def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
         row, key = secretstore.lookup("global", APP_KEY)
         jwt = app_jwt(app, key=key.encode()) if row is not None else app_jwt(app)
     body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
-    request = urllib.request.Request(
+    request = util.http_request(
         f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
         method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
-                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
+                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"},
+        schemes=("https",))
     try:
-        with urllib.request.urlopen(request, timeout=30) as res:
+        with util.urlopen_http(request, timeout=30, schemes=("https",)) as res:
             reply = json.loads(res.read())
     except urllib.error.HTTPError:
         raise

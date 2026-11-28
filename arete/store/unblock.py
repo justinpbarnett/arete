@@ -38,7 +38,7 @@ def encoded(value) -> str:
 def cases(repo: str = "", *, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM unblock_cases WHERE phase NOT IN ('resolved', 'cancelled')"
+            "SELECT * FROM unblock_cases WHERE phase NOT IN ('resolved', 'cancelled')"  # noqa: S608
             + (" AND repo = ?" if repo else "") + " ORDER BY updated", (repo,) if repo else ())]
 
 

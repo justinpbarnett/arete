@@ -127,14 +127,14 @@ def explicit(source, key, token, names):
 def diff_checks(name: str, previous: list[str], latest: list[str]) -> list[dict]:
     changed = []
     if len(previous) == len(latest):
-        for before, after in zip(previous, latest):
+        for before, after in zip(previous, latest, strict=True):
             if before != after:
                 changed.append({"node": name, "before": before, "after": after})
         return changed
     old_set, new_set = set(previous), set(latest)
     removed = [c for c in previous if c not in new_set]
     added = [c for c in latest if c not in old_set]
-    for before, after in zip(removed, added):
+    for before, after in zip(removed, added, strict=False):
         changed.append({"node": name, "before": before, "after": after})
     for before in removed[len(added):]:
         changed.append({"node": name, "before": before, "after": ""})

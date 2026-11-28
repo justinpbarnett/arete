@@ -38,7 +38,7 @@ def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str,
             questions: list[dict], session: dict, *, recovery_route: str = "owner") -> bool:
     with db() as c:
         first = call != owner_asks.CHECK_RUNNER_CALL or c.execute(
-            f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {LATEST} LIMIT 1", (call,)).fetchone() is None
+            f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {LATEST} LIMIT 1", (call,)).fetchone() is None  # noqa: S608
         c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
                   "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
@@ -81,7 +81,7 @@ def carry_scope_ask(repo: str, ticket: str, call: str, run: str) -> dict | None:
 def asks_of(run: str, status: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         return [ask_row(r) for r in c.execute(
-            "SELECT * FROM asks WHERE run = ?" + (" AND status = ?" if status else "") + " ORDER BY asked, rowid",
+            "SELECT * FROM asks WHERE run = ?" + (" AND status = ?" if status else "") + " ORDER BY asked, rowid",  # noqa: S608
             (run, status) if status else (run,))]
 
 
@@ -90,7 +90,7 @@ def routes_of(runs: list[str], *, connect=reader) -> dict[str, str]:
         return {}
     places = ",".join("?" for _ in runs)
     with connect() as c:
-        rows = c.execute(f"SELECT run, MAX(CASE WHEN status<>'open' THEN 0 "
+        rows = c.execute(f"SELECT run, MAX(CASE WHEN status<>'open' THEN 0 "  # noqa: S608
                          f"WHEN recovery_route='unblock' THEN 1 ELSE 2 END) AS route "
                          f"FROM asks WHERE run IN ({places}) GROUP BY run", runs)
         return {r["run"]: ("closed", "unblock", "owner")[r["route"]] for r in rows}
@@ -99,7 +99,7 @@ def routes_of(runs: list[str], *, connect=reader) -> dict[str, str]:
 def open_asks(connect=reader, *, owner_only=False, group_runners=False) -> list[dict]:
     with connect() as c:
         rows = [ask_row(r) for r in c.execute(
-            "SELECT * FROM asks WHERE status = 'open' "
+            "SELECT * FROM asks WHERE status = 'open' "  # noqa: S608
             + ("AND recovery_route='owner' " if owner_only else "")
             + f"AND {LATEST} ORDER BY asked, rowid")]
     if group_runners:
@@ -117,7 +117,7 @@ def ready_runner_tickets(repo: str) -> list[str]:
                 WHERE asks.repo=? AND call=? AND asks.status='answered' AND taken_by=''
                   AND json_extract(asks.answers, '$[0].done')=1 AND runs.status='needs-info' AND {LATEST}
                   AND NOT EXISTS (SELECT 1 FROM asks other WHERE other.run=asks.run AND other.status='open')
-                ORDER BY asked, asks.rowid""", (repo, owner_asks.CHECK_RUNNER_CALL))]
+                ORDER BY asked, asks.rowid""", (repo, owner_asks.CHECK_RUNNER_CALL))]  # noqa: S608
 
 
 def stage(ask_id: str, answers: dict) -> bool:
@@ -138,7 +138,7 @@ def asks_due(run_ids) -> list[dict]:
         return []
     with reader() as c:
         return [ask_row(r) for r in c.execute(
-            f"SELECT * FROM asks WHERE status = 'answered' AND taken_by = '' AND run IN ({','.join('?' * len(ids))}) "
+            f"SELECT * FROM asks WHERE status = 'answered' AND taken_by = '' AND run IN ({','.join('?' * len(ids))}) "  # noqa: S608
             "ORDER BY asked, rowid", ids)]
 
 
@@ -151,7 +151,7 @@ def ask_close(ask_id: str, status: str, answers: list[dict] | None = None) -> bo
         c.execute("UPDATE asks SET status=?, answered=?, answers=? WHERE id=?", (status, now, encoded, ask_id))
         if (row["call"] == owner_asks.CHECK_RUNNER_CALL and status == "answered" and len(answers or []) == 1
                 and answers[0] == {"header": "macOS runner", "kind": "done", "done": True}):
-            c.execute(f"UPDATE asks SET status='answered', answered=?, answers=? "
+            c.execute(f"UPDATE asks SET status='answered', answered=?, answers=? "  # noqa: S608
                       f"WHERE status='open' AND call=? AND {LATEST}", (now, encoded, owner_asks.CHECK_RUNNER_CALL))
         return True
 

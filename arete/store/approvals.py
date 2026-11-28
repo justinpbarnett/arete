@@ -30,7 +30,7 @@ def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str =
 
 def approvals(connect=reader) -> list[dict]:
     with connect() as c:
-        return [approval_of(r) for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
+        return [approval_of(r) for r in c.execute("SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "  # noqa: S608
                                                  "LEFT JOIN runs r ON r.id = a.run_id "
                                                  f"WHERE a.status IN ({','.join('?' * len(DECIDABLE))}) "
                                                  "ORDER BY a.id DESC LIMIT 100", DECIDABLE)]
@@ -41,7 +41,7 @@ def set_approval_note(approval_id: int, note: str, value: str, while_in: tuple[s
         raise ValueError(f"an approval has no note {note}; it has {', '.join(APPROVAL_NOTES)}")
     with db() as c:
         before = c.total_changes
-        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(while_in))})",
+        c.execute(f"UPDATE approvals SET {note} = ? WHERE id = ? AND status IN ({','.join('?' * len(while_in))})",  # noqa: S608
                   (value, approval_id, *while_in))
         return c.total_changes > before
 
@@ -60,7 +60,7 @@ def claim_approval(approval_id: int, until: str, came_from: tuple[str, ...] = DE
     token = secrets.token_hex(8)
     with db() as c:
         before = c.total_changes
-        c.execute(f"UPDATE approvals SET status = 'approved', result = '', decided = ?, claimed_by = ?, "
+        c.execute(f"UPDATE approvals SET status = 'approved', result = '', decided = ?, claimed_by = ?, "  # noqa: S608
                   f"claimed_until = ? WHERE id = ? AND (status IN ({','.join('?' * len(came_from))}) "
                   "OR (status = 'approved' AND claimed_by = ? AND claimed_by != ''))",
                   (util.iso(), token, until, approval_id, *came_from, previous))
@@ -97,7 +97,7 @@ def settle_approval(approval_id: int, status: str, outcome: str, result: str = "
     args = [*came_from, *(a for a in (token, until) if a is not None)]
     with db() as c:
         before = c.total_changes
-        c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ?, claimed_by = '', claimed_until = '' "
+        c.execute(f"UPDATE approvals SET status = ?, result = ?, decided = ?, claimed_by = '', claimed_until = '' "  # noqa: S608
                   f"WHERE id = ? AND {' AND '.join(held)}", (status, result[:1000], util.iso(), approval_id, *args))
         if c.total_changes == before:
             return False
@@ -152,7 +152,7 @@ RELEASING_PROPOSALS = ("rejected", "skipped", "filed", "superseded")
 def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
     marks = ",".join("?" * len(RELEASING_PROPOSALS))
     with connect() as c:
-        rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",
+        rows = c.execute(f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",  # noqa: S608
                          RELEASING_PROPOSALS).fetchall()
     return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
 
@@ -176,7 +176,7 @@ def proposal(proposal_id: int, connect=reader) -> dict | None:
 
 def move_proposal(proposal_id: int, before: tuple[str, ...], after: str) -> bool:
     with db() as c:
-        return c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",
+        return c.execute(f"UPDATE proposals SET status = ? WHERE id = ? AND status IN ({','.join('?' * len(before))})",  # noqa: S608
                          (after, proposal_id, *before)).rowcount > 0
 
 

@@ -456,7 +456,7 @@ def run_cell(candidate: Candidate, spec: Spec, context: int, level: int) -> tupl
 
 
 def fetch_json(url: str, key: str = ""):
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
+    request = util.http_request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
     with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=SHORT_TIMEOUT) as response:
         return json.loads(response.read(1 << 20))
 

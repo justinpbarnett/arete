@@ -15,7 +15,7 @@ def digest(name: str, end: int) -> str | None:
     try:
         with open(name, "rb") as f:
             f.seek(max(0, end - TAIL_BYTES))
-            return hashlib.sha1(f.read(min(end, TAIL_BYTES))).hexdigest()
+            return hashlib.sha1(f.read(min(end, TAIL_BYTES)), usedforsecurity=False).hexdigest()
     except OSError:
         return None
 
@@ -50,7 +50,7 @@ def stamp(name: str) -> list | None:
 def whole_digest(name: str, end: int) -> str | None:
     try:
         with open(name, "rb") as f:
-            h, left = hashlib.sha1(), end
+            h, left = hashlib.sha1(usedforsecurity=False), end
             while left > 0 and (chunk := f.read(min(left, 1 << 20))):
                 h.update(chunk)
                 left -= len(chunk)

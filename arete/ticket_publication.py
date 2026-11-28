@@ -94,9 +94,9 @@ def follow_up(cfg: config.Config, repo: config.Repo, title: str, body: str, key:
         "body": gh.marked(body),
     }
     lock_key = hashlib.sha256(key.encode()).hexdigest()
-    with idempotency.owning("ticket.followup", key, sha, FOLLOWUP_ROUTE) as context:
-        with util.lock(f"followup-publish-{lock_key}", wait=True):
-            return publish(item, cfg, context, jira_client=jira_client)
+    with (idempotency.owning("ticket.followup", key, sha, FOLLOWUP_ROUTE) as context,
+          util.lock(f"followup-publish-{lock_key}", wait=True)):
+        return publish(item, cfg, context, jira_client=jira_client)
 
 
 def finding(item: dict, cfg: config.Config, approval) -> str:

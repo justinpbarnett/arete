@@ -855,7 +855,7 @@ def upload(draft: dict, repo: str, cfg: config.Config) -> str:
         for row in pending:
             path = f"feedback/{draft['id']}/{row['sha256']}.{EXTENSIONS[row['type']]}"
             data = (CAPTURES_DIR / str(draft["id"]) / row["sha256"]).read_bytes()
-            blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+            blob = hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
             held = gh.file_sha(repo, path, branch)
             commit = (gh.branch_sha(repo, branch) if held == blob else gh.put_file(
                 repo, path, data, branch, f"Feedback evidence for capture {draft['id']}", replaces=held))

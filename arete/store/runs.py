@@ -111,7 +111,7 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
 
 def run_facets(connect=reader) -> dict[str, list[str]]:
     with connect() as c:
-        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
+        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "  # noqa: S608
                                                  f"AND COALESCE({column}, '') != '' ORDER BY 1")]
                 for column in ("kind", "repo", "loop")}
 
@@ -125,7 +125,7 @@ def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dic
         local_providers = config.load().local_providers
     paid: dict[str, float] = {}
     with connect() as c:
-        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
+        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "  # noqa: S608
                          f"WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
         for r in rows:
             if billing_of(dict(r), local_providers) == "api_key":
@@ -136,7 +136,7 @@ def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dic
 def merged_runs(connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "  # noqa: S608
             "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
 
 
@@ -147,14 +147,14 @@ def runs_since(since: str, connect=reader) -> list[dict]:
 
 def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
     with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "
+        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "  # noqa: S608
                                            f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
                                            "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
 
 
 def open_runs(repo: str, issue: int | str) -> list[dict]:
     with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "
+        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "  # noqa: S608
                                            "ORDER BY started DESC", (repo, issue))]
 
 
@@ -174,11 +174,11 @@ def ticket_attention_runs(*, questions: bool = False) -> list[dict]:
                     SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
                       AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
                       AND (later.started, later.rowid) > (r.started, r.rowid)))) ORDER BY r.started DESC, r.rowid DESC
-        """, (DRAFT_READY, questions))]
+        """, (DRAFT_READY, questions))]  # noqa: S608
 
 def draft_review_at(run_id: str, receipt: str = DRAFT_READY) -> str | None:
     with reader() as c:
-        row = c.execute(f"SELECT ({DRAFT_RECEIPT} ORDER BY e.seq LIMIT 1) FROM runs r WHERE r.id = ?",
+        row = c.execute(f"SELECT ({DRAFT_RECEIPT} ORDER BY e.seq LIMIT 1) FROM runs r WHERE r.id = ?",  # noqa: S608
                         (receipt, run_id)).fetchone()
         return row[0] if row else None
 
@@ -204,7 +204,7 @@ def execution_finished(row: dict) -> tuple[str | None, str | None]:
 def note_draft_review(run_id: str, pr_url: str, *, ready: bool) -> None:
     kind = DRAFT_READY if ready else DRAFT_OBSERVED
     with tx() as c:
-        if c.execute(f"SELECT 1 FROM runs r WHERE id = ? AND status = 'pr' AND pr_url = ? "
+        if c.execute(f"SELECT 1 FROM runs r WHERE id = ? AND status = 'pr' AND pr_url = ? "  # noqa: S608
                      f"AND NOT EXISTS ({DRAFT_RECEIPT}) AND NOT EXISTS ({DRAFT_RECEIPT})",
                      (run_id, pr_url, DRAFT_READY, kind)).fetchone():
             events.emit(kind, f"run:{run_id}", cls="durable", data={"pr_url": pr_url})
@@ -244,7 +244,7 @@ def environment_holds(repo: str) -> list[dict]:
                OR (owner_review_ended_at IS NULL AND (release_state = 'owner-review'
                     OR (released = 1 AND released_at IS NULL AND retry_id IS NOT NULL)))
             ORDER BY started, id
-        """, (repo,))
+        """, (repo,))  # noqa: S608
         holds = (_restore_legacy_owner_review(dict(row), repo, row["issue"], row["id"]) for row in rows)
         return [hold for hold in holds if not hold["released"] or hold["release_state"] == "owner-review"]
 
@@ -297,7 +297,7 @@ def release_environment_hold(run_id: str, state: str = "inactive") -> None:
             return
         data = {"state": state}
         if state == "owner-review":
-            retry = c.execute(f"SELECT finished FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}",
+            retry = c.execute(f"SELECT finished FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}",  # noqa: S608
                               (run_id,)).fetchone()
             data["owner_review_started_at"] = (retry and retry["finished"]) or util.iso()
         events.emit(HOLD_RELEASED, f"run:{run_id}", cls="durable", data=data)
@@ -320,7 +320,7 @@ def environment_waits(repo: str, issue: str) -> list[tuple[str, int]]:
 
 def environment_retry(run_id: str) -> bool:
     with reader() as c:
-        return c.execute(f"SELECT 1 FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}", (run_id,)).fetchone() is not None
+        return c.execute(f"SELECT 1 FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}", (run_id,)).fetchone() is not None  # noqa: S608
 
 
 def claim_environment_gap(repo: str, signature: str, day: str) -> bool:
@@ -427,7 +427,7 @@ def runs_marked_running(connect=reader) -> list[dict]:
 def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False,
                 live: bool = False) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                                            + (f"AND {WHOLE_RUN} " if whole else "")
                                            + (f"AND {LIVE_RUN} " if live else "")
                                            + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
@@ -521,7 +521,7 @@ def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> l
 def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
     with connect() as c:
         labelled = [dict(r) for r in c.execute(
-            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
+            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "  # noqa: S608
             "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
             "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
         held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
@@ -546,7 +546,7 @@ def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -
 def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False,
               candidate: str = "") -> dict | None:
     with connect() as c:
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "  # noqa: S608
                       + (f"AND {LIVE_RUN} " if live else "")
                       + ("AND id = ? " if candidate else "")
                       + "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
@@ -556,7 +556,7 @@ def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live:
 
 def interrupted_tickets(repo: str) -> list[str]:
     with reader() as c:
-        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
+        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
                          "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
                          f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
                          "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
@@ -620,10 +620,10 @@ def prune(c, days: float = 14, lines_days: float = 90) -> None:
 def _prune(c, days, lines_days):
     since = util.iso(util.now() - timedelta(days=days))
     lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
-    c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
+    c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "  # noqa: S608
               f"WHERE {FIRINGS} AND started < ?", (now, since))
-    c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
-    for row in c.execute(f"SELECT id FROM runs WHERE {FIRINGS} AND started < ?", (since,)).fetchall():
+    c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))  # noqa: S608
+    for row in c.execute(f"SELECT id FROM runs WHERE {FIRINGS} AND started < ?", (since,)).fetchall():  # noqa: S608
         writes.update("runs", row["id"], {}, delete=True, kind="run.deleted")
     keep_workers = (
         "AND NOT EXISTS (SELECT 1 FROM orchestration_workers w JOIN orchestrations o ON o.root=w.root "
@@ -635,7 +635,7 @@ def _prune(c, days, lines_days):
         "AND s.state != 'complete') "
     ) if migration_applied(SPEC_DELIVERY_SCHEMA, c) else ""
     eligible = c.execute(
-        "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
+        "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "  # noqa: S608
         "AND status NOT IN ('running', 'pr', 'needs-info') "
         "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
         + keep_workers + keep_specs
@@ -686,9 +686,18 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                                                          "tokens_out": res.tokens_out})
 
 
+STEP_FIELDS = frozenset({"runner", "model", "provider", "auth_mode", "ok", "cost_usd", "tokens_in", "tokens_out",
+                         "turns", "seconds", "error", "ts", "first_context_tokens", "effort", "tier", "kind",
+                         "cache_read", "cache_write", "api_seconds", "atom", "ab", "ab_side"})
+
+
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
+    if unknown := set(labels) - STEP_FIELDS:
+        raise ValueError(f"invalid step fields: {', '.join(sorted(unknown))}")
+    if not labels:
+        return
     with db() as c:
-        c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",
+        c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",  # noqa: S608
                   (*labels.values(), run_id, step, try_no))
 
 

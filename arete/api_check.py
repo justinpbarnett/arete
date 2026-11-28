@@ -102,7 +102,8 @@ def launch():
     drained = False
     try:
         with ExitStack() as cleanup:
-            root = Path(tempfile.mkdtemp(prefix="arete-api-check-", dir=Path("/tmp").resolve()))
+            # Short resolved root keeps Unix socket paths within macOS 104-byte sun_path limit.
+            root = Path(tempfile.mkdtemp(prefix="arete-api-check-", dir=Path("/tmp").resolve()))  # noqa: S108
             read, write = os.pipe()
             cleanup.callback(os.close, read)
             cleanup.callback(os.close, write)

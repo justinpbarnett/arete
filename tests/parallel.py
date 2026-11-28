@@ -219,10 +219,8 @@ def run_fork_server(start, lifeline, req_fd, rep_fd, preload_arete):
         sys.path.insert(0, start)
     if preload_arete:
         for name in PRELOAD_MODULES:
-            try:
+            with contextlib.suppress(Exception):
                 import_module(name)
-            except Exception:
-                pass
     _write_all(rep_fd, b'{"ready":true}\n')
     buf = b""
     while True:
@@ -271,15 +269,11 @@ def run_fork_server(start, lifeline, req_fd, rep_fd, preload_arete):
                 traceback.print_exc()
                 code = 1
             finally:
-                try:
+                with contextlib.suppress(BaseException):
                     atexit._run_exitfuncs()
-                except BaseException:
-                    pass
-                try:
+                with contextlib.suppress(BaseException):
                     sys.stdout.flush()
                     sys.stderr.flush()
-                except BaseException:
-                    pass
                 os._exit(code)
         _write_all(rep_fd, (json.dumps({"pid": pid}) + "\n").encode())
         _, status = os.waitpid(pid, 0)
@@ -396,10 +390,8 @@ class ForkSlot:
             fd = getattr(self, fd_name, None)
             if fd is not None:
                 setattr(self, fd_name, None)
-                try:
+                with contextlib.suppress(OSError):
                     os.close(fd)
-                except OSError:
-                    pass
 
     def close(self, timeout=0.5):
         self.close_pipes()
@@ -407,10 +399,8 @@ class ForkSlot:
             try:
                 self.server.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                try:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(self.server.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
                 self.server.wait()
             self.server = None
 

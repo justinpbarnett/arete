@@ -305,15 +305,15 @@ def _record_hits(channel: str, subject: str, secret_hits: dict[int, tuple[dict, 
     def write() -> None:
         if busy():
             return
-        with _guard(), contextlib.suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError):
-            with db.tx() as c:
-                for row, count in secret_items:
-                    credentials.record_found_in_output(c, row, actor, channel, safe_subject, count, at)
-                for token_id, count in token_items:
-                    with principals.acting(actor):
-                        events.emit("token.found_in_output", f"token:{token_id}", cls="durable",
-                                    data={"token": token_id, "channel": channel, "subject": safe_subject,
-                                          "count": count}, connection=c)
+        with (_guard(), contextlib.suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError),
+              db.tx() as c):
+            for row, count in secret_items:
+                credentials.record_found_in_output(c, row, actor, channel, safe_subject, count, at)
+            for token_id, count in token_items:
+                with principals.acting(actor):
+                    events.emit("token.found_in_output", f"token:{token_id}", cls="durable",
+                                data={"token": token_id, "channel": channel, "subject": safe_subject,
+                                      "count": count}, connection=c)
 
     if db.transaction_mode() is not None:
         db.after_transaction(write)

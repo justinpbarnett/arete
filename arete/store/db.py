@@ -230,7 +230,7 @@ def contract_blockers(conn, n):
     workspace_contract = n == WORKSPACE_CONTRACT_SCHEMA
     blockers = [f"launch lease {name}" for name in launch_lease.held_launches()] if workspace_contract else []
     statuses = "(status = 'running' OR pid IS NOT NULL)" if workspace_contract else "status = 'running'"
-    for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "
+    for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "  # noqa: S608
                             "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
         row = dict(row)
         if row["status"] == "running":
@@ -904,7 +904,7 @@ def copy_database(target: Path) -> None:
 
 def table_counts(conn):
     names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
-    return {name: conn.execute(f"SELECT count(*) FROM {quoted(name)}").fetchone()[0] for name in names}
+    return {name: conn.execute(f"SELECT count(*) FROM {quoted(name)}").fetchone()[0] for name in names}  # noqa: S608
 
 
 def quick_check(conn):
