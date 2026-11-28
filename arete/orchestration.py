@@ -15,6 +15,7 @@ from . import (
     code_review,
     codebase,
     config,
+    cross_repo,
     delegation,
     diffguard,
     factory,
@@ -618,6 +619,18 @@ class Controller(worker_turns.WorkerTurns):
             job.pop(key, None)
         prepared["ticket"] = {key: getattr(ticket, key) for key in flows.TICKET_FIELDS}
         prepared["ticket"]["comments"] = ticket.owner_comments or ""
+        run_dir = getattr(self.run, "dir", None)
+        if run_dir is not None and hasattr(self.run.tracker, "save_images"):
+            attachments, attachment_dirs, manifest = pipeline.collect_ticket_attachments(
+                self.run.tracker, ticket, Path(run_dir), log=getattr(self.run, "log", None),
+            )
+            if attachments or manifest["media"] or manifest["external"]:
+                prepared["attachments"] = attachments
+                existing_dirs = list(prepared.get("add_dirs") or [])
+                for d in map(str, attachment_dirs):
+                    if d not in existing_dirs:
+                        existing_dirs.append(d)
+                prepared["add_dirs"] = existing_dirs
         prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
         self.data["goal_base"] = f"Check the current authorized ticket in use:\n{ticket.title}\n{ticket.body}"
         if feedback := self.data.get("feedback"):
@@ -677,8 +690,40 @@ class Controller(worker_turns.WorkerTurns):
             self.ending = ("failed", why, "")
             raise factory.Refused(why)
 
+    def authorized_spec_repos(self):
+        if not self.is_spec:
+            return [self.run.repo]
+        authorized, error = cross_repo.authorized_repos(self.job.cfg, self.run.repo, self.job.ticket)
+        return authorized if not error else [self.run.repo]
+
+    def linked_peer_context(self):
+        if not self.is_spec:
+            return []
+        return cross_repo.consumed_peers_context(self.job.cfg, self.run.repo, self.job.ticket)
+
+    def check_repo_scope(self, target_repos, *, why: str = "") -> str:
+        if not self.is_spec:
+            return ""
+        authorized, unauthorized = cross_repo.check_repo_scope(
+            self.job.cfg, self.run.repo, self.job.ticket, target_repos
+        )
+        if not unauthorized:
+            return ""
+        reason = (f"Repository expansion requires owner approval before touching "
+                  f"{', '.join(unauthorized)} (authorized: {', '.join(r.name for r in authorized)}).")
+        key = ledger.digest([self.lease.root, sorted(name.casefold() for name in unauthorized)])
+        call = f"repo-scope.{key}"
+        if (not self.run.dry_run and not self.run.alone and not self.run.owner_questions_blocked
+                and not ask_store.carry_scope_ask(self.run.repo.name, self.run.tid, call, self.run.id)):
+            request = cross_repo.expansion_ask_request(authorized, unauthorized, why=why)
+            self.atomic("orchestrate_ask", request=request, call=call)
+        self.ending = ("needs-info", reason, "")
+        return reason
+
     def acceptance_goal(self):
         goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        if self.is_spec and (peers := self.linked_peer_context()):
+            goal += "\n\n" + cross_repo.format_consumed_peers(peers)
         if self.is_spec and (done := self.data.get("definition")):
             goal += (f"\n\n{spec_delivery.describe(done)}\n\n"
                      f"Required in-use evidence: check the criterion and return its exact wording in 'what':\n"
@@ -1463,7 +1508,9 @@ class Controller(worker_turns.WorkerTurns):
                 "required_gates": self.required_gates(),
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
                 **({"resolved_pr_conflicts": receipt} if (receipt := self.resolved_pr_conflicts(all_actions)) else {}),
-                **({"spec": {"guide": spec_delivery.GUIDANCE, "definition": self.data.get("definition")}}
+                **({"spec": {"guide": spec_delivery.GUIDANCE, "definition": self.data.get("definition"),
+                             "authorized_repos": [r.name for r in self.authorized_spec_repos()],
+                             **({"linked_peers": peers} if (peers := self.linked_peer_context()) else {})}}
                    if self.is_spec else {}),
                 **({"recovery_guidance": direction} if (direction := self.run.recovery.get("direction")) else {}),
                 **({"triage": self.job.triage} if self.job.triage else {}),
@@ -1946,6 +1993,13 @@ class Controller(worker_turns.WorkerTurns):
                     or not self.job.b.focused_draft_hold(self.job.review)):
                 raise ValueError(f"publication needs current focused repair evidence: {pending}")
         if self.is_spec:
+            if scope_reason := self.check_repo_scope(
+                [c.github or self.run.repo.name for c in self.job.checkouts],
+                why="Publication targets a repository outside the spec's authorized repositories.",
+            ):
+                raise factory.Refused(scope_reason)
+            if peer_wait := cross_repo.peer_blocker(self.job.cfg, self.run.repo, self.job.ticket):
+                raise factory.Refused(peer_wait)
             if not (done := self.data.get("definition")) or self.job.left_for_a_person or unverified_measurement:
                 raise ValueError("a spec needs one complete definition of done and cannot ship a partial or unverified outcome")
             if spec_delivery.source_version(self.spec_ticket()) != self.data["spec_source"]:
@@ -2676,11 +2730,18 @@ class Controller(worker_turns.WorkerTurns):
         if (args.get("worker_id") in stale or any(dep in stale for dep in args.get("depends_on", []))):
             raise ValueError("the worker or dependency belongs to superseded ticket requirements")
         if op == "worker.start":
+            if self.is_spec and (targets := cross_repo.write_path_repos(self.job.cfg, args.get("write_paths") or ())):
+                if reason := self.check_repo_scope(targets, why="Worker write_paths target a repository outside the spec's authorized repositories."):
+                    return {"scope_expansion_requested": True, "error": reason}
             return self.worker_start(action, args)
         if self.exchanged and op == "worker.messages":
             page = self.worker_observation(**args)
             return {k: page[k] for k in ("messages", "message_cursor", "more_messages")}
         if self.exchanged and op in ("worker.reply", "worker.steer"):
+            if (self.is_spec and op == "worker.reply"
+                    and (targets := cross_repo.write_path_repos(self.job.cfg, args.get("write_paths") or ()))):
+                if reason := self.check_repo_scope(targets, why="Worker reply write_paths target a repository outside the spec's authorized repositories."):
+                    return {"scope_expansion_requested": True, "error": reason}
             return exchange.queue(self.lease, action, self.validate_scope)
         if op == "worker.continue" and args["worker_id"] in self.data.get("pr_recovery_stale_actions", ()):
             raise ValueError("the worker predates PR reconciliation; start a new worker against the reconciled tree")

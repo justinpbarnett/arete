@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 10
+MINOR = 11
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -132,8 +132,9 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
 )]
 
 
-def envelope(properties):
-    return obj({"seq": {"type": "string", "pattern": r"^\d+\.\d+$"}, **properties})
+def envelope(properties, required=None):
+    all_props = {"seq": {"type": "string", "pattern": r"^\d+\.\d+$"}, **properties}
+    return obj(all_props, list(all_props) if required is None else required)
 
 
 AUTH_ERRORS = {"unauthenticated", "ambiguous_credential", "token_expired", "token_rotated", "scope_missing",
@@ -188,8 +189,61 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)})})
-SETTINGS = obj({"max_parallel": INTEGER, "max_parallel_per_repo": INTEGER, "parallel_max": INTEGER,
-                "aliases": array(STRING), "models": mapping(STRING), "defaults": mapping(STRING)})
+ROLE_ENUM = {**STRING, "enum": list(configkinds.ROLE_NAMES)}
+ROLE_STEP_OVERRIDES = obj({"runner": STRING, "model": STRING, "effort": STRING}, [], additional=False)
+ROLE_OVERRIDES = obj({
+    "models": {**mapping(STRING), "maxProperties": 1},
+    "steps": {**mapping(ROLE_STEP_OVERRIDES), "maxProperties": 1},
+}, ["models", "steps"], additional=False)
+ROLE_VIEW = obj({
+    "role": ROLE_ENUM,
+    "runner": NULL_TEXT,
+    "model": NULL_TEXT,
+    "effort": NULL_TEXT,
+    "level": NULL_TEXT,
+    "overrides": ROLE_OVERRIDES,
+})
+SETTINGS_VALUES = obj({
+    "max_parallel": INTEGER,
+    "max_parallel_per_repo": INTEGER,
+    "parallel_max": INTEGER,
+    "aliases": array(STRING),
+    "models": mapping(STRING),
+    "defaults": mapping(STRING),
+    "roles": array(ROLE_VIEW),
+})
+SETTINGS = obj({
+    "max_parallel": INTEGER,
+    "max_parallel_per_repo": INTEGER,
+    "parallel_max": INTEGER,
+    "aliases": array(STRING),
+    "models": mapping(STRING),
+    "defaults": mapping(STRING),
+    "version": INTEGER,
+    "values": SETTINGS_VALUES,
+    "roles": array(ROLE_VIEW),
+}, ["max_parallel", "max_parallel_per_repo", "parallel_max", "aliases", "models", "defaults"])
+NORMAL_ROLE_PATCH = obj({
+    "role": ROLE_ENUM,
+    "runner": NULL_TEXT,
+    "model": NULL_TEXT,
+    "effort": NULL_TEXT,
+}, ["role"], additional=False)
+RESTORE_ROLE_PATCH = obj({
+    "role": ROLE_ENUM,
+    "restore": ROLE_OVERRIDES,
+}, ["role", "restore"], additional=False)
+ROLE_PATCH = {"anyOf": [NORMAL_ROLE_PATCH, RESTORE_ROLE_PATCH]}
+SETTINGS_PATCH_VALUES = obj({
+    "max_parallel": {"type": ["integer", "string"]},
+    "max_parallel_per_repo": {"type": ["integer", "string"]},
+    "models": mapping(STRING),
+    "roles": array(ROLE_PATCH),
+}, [], additional=False)
+SETTINGS_PATCH = obj({
+    "base_version": {**INTEGER, "minimum": 1},
+    "values": SETTINGS_PATCH_VALUES,
+}, ["base_version", "values"], additional=False)
 PANEL = obj({"rows": JSON, "error": STRING}, [])
 HEALTH = obj({"checks": PANEL, "alerts": PANEL, "incidents": PANEL, "now": STRING, "serve": mapping(JSON), "state": STRING,
               "devices": PANEL, "workspaces": PANEL})
@@ -251,6 +305,15 @@ CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkind
                               "layers/defaults/config.toml."}
 CONFIG_ID = {"kind": CONFIG_KIND, "name": CONFIG_NAME}
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
+CONFIG_ITEM_RICH = {**CONFIG_ITEM, "subject": STRING, "version": INTEGER, "content_version": STRING, "level": STRING}
+CONFIG_ITEM_SCHEMA = obj(CONFIG_ITEM_RICH, ["kind", "name", "path"])
+CONFIG_READ_ITEM_SCHEMA = obj({**CONFIG_ITEM_RICH, "content": {"type": ["string", "object"]}},
+                              ["kind", "name", "path", "content"])
+CONFIG_KIND_INFO = obj({"kind": CONFIG_KIND, "home": array(STRING), "schema": STRING, "gate": STRING,
+                        "verbs": array(STRING)})
+CONFIG_VERSION = obj({"version": INTEGER, "content_version": STRING, "commit_sha": STRING, "sha256": STRING,
+                      "origin": STRING, "path": STRING, "n": INTEGER, "author": STRING, "source": STRING,
+                      "note": STRING, "at": STRING, "live": BOOLEAN})
 CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
 SECRET = obj({**dict.fromkeys(("subject", "name", "scope", "reference_kind"), STRING),
               **dict.fromkeys(("service", "fingerprint", "last_checked", "rotated"), NULL_TEXT),
@@ -280,12 +343,15 @@ OPERATIONS += [
     operation("webhook.rotate", "loops/{loop}/webhook/rotate", envelope({"text": STRING}),
               obj({"loop": STRING}), {"loop": "example"}, "POST",
               errors=(*AUTH_ERRORS, "secret_store_missing", "secret_internal")),
-    operation("config.list", "config/{kind}", envelope({"items": array(obj(CONFIG_ITEM))}),
+    operation("config.kinds", "config", envelope({"kinds": array(CONFIG_KIND_INFO)})),
+    operation("config.list", "config/{kind}", envelope({"items": array(CONFIG_ITEM_SCHEMA)}),
               obj({"kind": CONFIG_KIND}), {"kind": "step_settings"}),
     operation("config.read", "config/{kind}/{name}",
-              envelope({"item": obj({**CONFIG_ITEM, "content": {"type": ["string", "object"]}})}),
-              obj(CONFIG_ID), CONFIG_EXAMPLE),
-    operation("config.versions", "config/{kind}/{name}/versions", envelope({"versions": array(STRING)}),
+              envelope({"item": CONFIG_READ_ITEM_SCHEMA}),
+              obj({**CONFIG_ID, "version": STRING, "level": STRING, "from": STRING, "file": STRING}, list(CONFIG_ID)),
+              CONFIG_EXAMPLE),
+    operation("config.versions", "config/{kind}/{name}/versions",
+              envelope({"versions": array(STRING), "entries": array(CONFIG_VERSION)}, required=["seq", "versions"]),
               obj(CONFIG_ID), CONFIG_EXAMPLE),
     operation("config.diff", "config/{kind}/{name}/diff", envelope({"diff": STRING}),
               obj({**CONFIG_ID, "from": STRING, "to": STRING}, list(CONFIG_ID)), CONFIG_EXAMPLE),
@@ -312,6 +378,15 @@ OPERATIONS += [
     operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
               obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
+    {**operation("settings.update", "settings", envelope({"settings": SETTINGS}),
+                 SETTINGS_PATCH, {"base_version": 1, "values": {"max_parallel": 2}}, "PATCH"),
+     "scope": "config:activate"},
+    {**operation("loop.enable", "loops/{loop}/enable", envelope({"loop": LOOP}),
+                 obj({"loop": STRING}), {"loop": "poll"}, "POST"),
+     "scope": "config:activate"},
+    {**operation("loop.disable", "loops/{loop}/disable", envelope({"loop": LOOP}),
+                 obj({"loop": STRING}), {"loop": "poll"}, "POST"),
+     "scope": "config:activate"},
     operation("health.get", "health", envelope({"health": HEALTH})),
     operation("status.get", "status", envelope({"snapshot": mapping(JSON), "loops": array(mapping(JSON)),
               "records": PANEL}), obj({"limit": STRING}, [])),
@@ -443,6 +518,8 @@ def validate(value, schema, path="input"):
     if isinstance(value, (list, tuple)) and not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
         raise Problem("invalid_input", f"{path} has an invalid number of items")
     if isinstance(value, dict):
+        if "maxProperties" in schema and len(value) > schema["maxProperties"]:
+            raise Problem("invalid_input", f"{path} has too many entries")
         if missing := set(schema.get("required", [])) - value.keys():
             raise Problem("invalid_input", f"{path} needs {', '.join(sorted(missing))}")
         for key, item in value.items():
@@ -474,7 +551,8 @@ ALIAS_INPUTS = {
     "post_task": fields("repo prompt title kind ticket force"),
     "post_usage": BY_NAME["usage.record"]["input"],
     "post_settings": obj({"max_parallel": JSON, "max_parallel_per_repo": JSON,
-                          "models": {**mapping(STRING), "type": ["object", "null"]}}, []),
+                          "models": {**mapping(STRING), "type": ["object", "null"]},
+                          "base_version": INTEGER}, []),
     "post_capture": fields("kind text expected actual steps"),
     "post_capture_context": obj({"view": JSON, "screen": JSON,
                                  "detail": {**fields("kind id"), "type": ["object", "null"]}}, []),

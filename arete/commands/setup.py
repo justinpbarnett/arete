@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from .. import __version__, client, config, paths, routing, steps
+from .. import __version__, client, config, configrepo, paths, principals, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -83,7 +83,15 @@ def cmd_init(args) -> int:
     if paths.CONFIG_FILE.exists() and not args.force:
         print(f"{paths.CONFIG_FILE} exists; pass --force to overwrite")
         return 1
-    paths.CONFIG_FILE.write_text(DEFAULT_CONFIG)
+    configrepo.init()
+    _, base_blob = configrepo.read("config.toml")
+    configrepo.commit(
+        {"config.toml": DEFAULT_CONFIG},
+        {"config.toml": base_blob},
+        actor=principals.current(),
+        source="engine",
+        note="arete init",
+    )
     print(f"wrote {paths.CONFIG_FILE}")
     print(f"state in {paths.STATE_DIR}, logs in {paths.LOG_DIR}")
     return 0
@@ -309,6 +317,14 @@ def cmd_repo(args) -> int:
                                      choose_project=choose_jira_project if sys.stdin.isatty() else None,
                                      staging_profile=args.staging_profile, commenters=args.commenter)
             cfg = config.load_required()
+        elif args.repo_action == "publish-pair":
+            cfg = config.load_required()
+            raw = sys.stdin.read() if args.spec_file == "-" else Path(args.spec_file).read_text()
+            payload = json.loads(raw)
+            entries = payload["specs"] if isinstance(payload, dict) and "specs" in payload else payload
+            result = ticket_publication.plan_pair(cfg, entries, args.key, ready_only=args.ready_only)
+            print(json.dumps(result, indent=None if args.json else 2))
+            return 0
         else:
             cfg = config.load_required()
             repo = cfg.repo(args.name)
@@ -389,6 +405,13 @@ def repo_commands(sub) -> None:
     p.add_argument("--draft", action="store_true", help="file a spec without authorizing pickup")
     p.add_argument("--parent", default="", help="child's parent in the same destination: GitHub number or Jira key")
     p.add_argument("--source", default="", help="follow-up's source issue URL")
+    p.set_defaults(fn=cmd_repo)
+
+    p = actions.add_parser("publish-pair", help="publish two linked specs together or only the ready one")
+    p.add_argument("--spec-file", required=True, help="JSON file describing the two specs, or - for stdin")
+    p.add_argument("--key", required=True, help="stable request key; reuse to reconcile a partial publish")
+    p.add_argument("--ready-only", default="", help="publish only the named role or repo from the pair")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_repo)
 
 
