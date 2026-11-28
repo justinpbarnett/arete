@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 from collections import Counter
@@ -540,7 +541,12 @@ class Problem(refusals.Stated):
         self.retry_after = details.get("retry_after", 0)
 
 
-def unknown(value, schema, path=""):
+_MAX_VALIDATION_DEPTH = 64
+
+
+def unknown(value, schema, path="", _depth=0):
+    if _depth > _MAX_VALIDATION_DEPTH:
+        raise Problem("invalid_json", f"{path or 'input'} exceeds maximum nesting depth")
     found = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -548,14 +554,14 @@ def unknown(value, schema, path=""):
         for key, item in value.items():
             at = f"{path}.{key}" if path else key
             if key in properties:
-                found.extend(unknown(item, properties[key], at))
+                found.extend(unknown(item, properties[key], at, _depth + 1))
             elif extra is False:
                 found.append(at)
             elif isinstance(extra, dict):
-                found.extend(unknown(item, extra, at))
+                found.extend(unknown(item, extra, at, _depth + 1))
     elif isinstance(value, list) and "items" in schema:
         for i, item in enumerate(value):
-            found.extend(unknown(item, schema["items"], f"{path}[{i}]"))
+            found.extend(unknown(item, schema["items"], f"{path}[{i}]", _depth + 1))
     return sorted(found)
 
 
@@ -564,11 +570,13 @@ def reject_unknown(value, schema, path=""):
         raise Problem("unknown_field", "Undeclared fields: " + ", ".join(fields), fields=fields)
 
 
-def validate(value, schema, path="input"):
+def validate(value, schema, path="input", _depth=0):
+    if _depth > _MAX_VALIDATION_DEPTH:
+        raise Problem("invalid_json", f"{path} exceeds maximum nesting depth")
     if "anyOf" in schema:
         for candidate in schema["anyOf"]:
             try:
-                validate(value, candidate, path)
+                validate(value, candidate, path, _depth + 1)
                 return
             except Problem:
                 pass
@@ -581,6 +589,8 @@ def validate(value, schema, path="input"):
             else "array" if isinstance(value, (list, tuple)) else "object" if isinstance(value, dict) else "unknown")
     if kinds and kind not in kinds and not (kind == "integer" and "number" in kinds):
         raise Problem("invalid_input", f"{path} must be {' or '.join(kinds)}")
+    if kind == "number" and not math.isfinite(value):
+        raise Problem("invalid_input", f"{path} must be a finite number")
     if "enum" in schema and value not in schema["enum"]:
         raise Problem("invalid_input", f"{path} is not a declared value")
     if isinstance(value, str) and "pattern" in schema and not re.fullmatch(schema["pattern"], value):
@@ -597,10 +607,10 @@ def validate(value, schema, path="input"):
         for key, item in value.items():
             child = schema.get("properties", {}).get(key, schema.get("additionalProperties"))
             if isinstance(child, dict):
-                validate(item, child, f"{path}.{key}")
+                validate(item, child, f"{path}.{key}", _depth + 1)
     if isinstance(value, (list, tuple)) and "items" in schema:
         for i, item in enumerate(value):
-            validate(item, schema["items"], f"{path}[{i}]")
+            validate(item, schema["items"], f"{path}[{i}]", _depth + 1)
 
 
 def match(method, path):

@@ -5,6 +5,7 @@ import time
 import uuid
 
 from .. import util
+from ._rows import json_dict
 from .db import db, reader, tx
 
 TABLES = {"unblock_cases": "kept", "unblock_attempts": "kept", "unblock_notices": "kept", "unblock_queue": "kept"}
@@ -18,7 +19,7 @@ def save_queue(repo: str, source: str, snapshot: dict) -> None:
 
 def queue(repo: str) -> dict:
     with reader() as c:
-        return {r["tracker"]: json.loads(r["snapshot"]) for r in c.execute(
+        return {r["tracker"]: json_dict(r["snapshot"]) for r in c.execute(
             "SELECT * FROM unblock_queue WHERE repo=?", (repo,))}
 
 
@@ -105,7 +106,7 @@ def decide(case: dict, attempt: str, decision: dict, grant: dict) -> None:
 
 
 def decode(row) -> dict:
-    return {**dict(row), "grant": json.loads(row["grant"]), "decision": json.loads(row["decision"])} if row else {}
+    return {**dict(row), "grant": json_dict(row["grant"]), "decision": json_dict(row["decision"])} if row else {}
 
 
 def attempt_of(attempt: str, *, connect=reader) -> dict:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import socket
@@ -117,7 +118,7 @@ def require_local_if_isolated(url):
 
 class Client:
     def __init__(self, base_url: str, email: str, token: str):
-        self.base = base_url.rstrip("/")
+        self.base = checked_base(base_url)
         self._auth = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
         self._secret_row: dict | None = None
         self._me: dict | None = None
@@ -131,7 +132,7 @@ class Client:
         return found
 
     def browse_url(self, key: str) -> str:
-        return f"{self.base}/browse/{key}"
+        return f"{self.base}/browse/{_path_segment(key)}"
 
     def request(self, method: str, path: str, params: dict | None = None, body=None, *, single_attempt=False):
         raw = self._send(method, path, params, body, **({"single_attempt": True} if single_attempt else {}))
@@ -142,6 +143,8 @@ class Client:
 
     def _send(self, method: str, path: str, params: dict | None = None, body=None,
               accept: str = "application/json", *, single_attempt=False) -> bytes:
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+            raise JiraError(f"invalid Jira API path: {path!r}")
         url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
         require_local_if_isolated(url)
         data = json.dumps(body).encode() if body is not None else None
@@ -187,12 +190,18 @@ class Client:
 
     def _paged(self, path: str, key: str = "values", **params) -> list[dict]:
         out: list[dict] = []
-        while True:
-            res = self.get(path, startAt=len(out), maxResults=100, **params) or {}
-            vals = res.get(key, [])
-            out += vals
-            if not vals or res.get("isLast") or len(out) >= res.get("total", len(out)):
+        for _ in range(1000):
+            res = self.get(path, startAt=len(out), maxResults=100, **params)
+            if not isinstance(res, dict):
                 return out
+            vals = res.get(key)
+            if not isinstance(vals, list) or not vals:
+                return out
+            out += vals
+            total = res.get("total", len(out))
+            if res.get("isLast") or (isinstance(total, int) and len(out) >= total):
+                return out
+        raise JiraError(f"Jira pagination exceeded maximum pages for {path}")
 
     def me(self) -> dict:
         if self._me is None:
@@ -249,9 +258,15 @@ class Client:
     def comments(self, key: str) -> list[dict]:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/comment", key="comments", orderBy="created")
 
-    def find_comment_marker(self, key: str, marker: str) -> str:
+    def find_comment_marker(self, key: str, marker: str, *, author: str = "") -> str:
         for row in self.comments(key):
-            if marker in (row.get("body") or "").splitlines():
+            if not isinstance(row, dict):
+                continue
+            if author and ((row.get("author") or {}).get("accountId") or "") != author:
+                continue
+            body = row.get("body")
+            text = body if isinstance(body, str) else ""
+            if marker in text.splitlines():
                 return self.comment_url(key, row["id"])
         return ""
 
@@ -444,9 +459,10 @@ def _path_segment(key: str) -> str:
 
 def _retry_after(e: urllib.error.HTTPError, attempt: int) -> float:
     try:
-        return max(0.0, float(e.headers.get("Retry-After", "")))
+        value = float(e.headers.get("Retry-After", ""))
     except (TypeError, ValueError):
         return float(2**attempt)
+    return max(0.0, value) if math.isfinite(value) else float(2**attempt)
 
 
 def _error_text(e: urllib.error.HTTPError) -> str:

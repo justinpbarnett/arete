@@ -4,7 +4,7 @@ import json
 from datetime import timedelta
 
 from .. import run_lines, util
-from ._rows import insert_sql
+from ._rows import insert_sql, json_dict, validate_columns
 from .db import db, reader, tx
 from .runs import OPEN_PR_RUN
 
@@ -50,7 +50,7 @@ def set_verdict_sha(run_id: str, sha: str) -> None:
 
 def verdicts_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
-        return [{**dict(r), "answers": json.loads(r["answers"] or "{}")}
+        return [{**dict(r), "answers": json_dict(r["answers"])}
                 for r in c.execute("SELECT * FROM verdicts WHERE at >= ? ORDER BY at", (since,))]
 
 
@@ -218,6 +218,16 @@ def feedback_between(since: str, until: str) -> list[dict]:
 
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
                     "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered")
+RESEARCH_UPDATABLE_FIELDS = frozenset(RESEARCH_COLUMNS) - {"ref"}
+CAPTURE_UPDATABLE_FIELDS = frozenset((
+    "kind", "text", "expected", "actual", "steps", "context", "jev_cost_usd", "inspect_cost_usd",
+    "written_title", "written_body", "written_print", "written_note", "delivery", "issue",
+    "issue_url", "issue_title", "filed",
+))
+CAPTURE_EVIDENCE_COLUMNS = frozenset((
+    "capture", "name", "kind", "type", "bytes", "sha256", "source", "seconds", "added",
+    "inspection", "link",
+))
 
 
 def research_rows(connect=reader) -> list[dict]:
@@ -238,14 +248,8 @@ def research_set(ref: str, **fields) -> None:
                   tuple(row.get(k) for k in RESEARCH_COLUMNS))
 
 
-RESEARCH_FIELDS = frozenset({"source", "title", "url", "updated", "status", "summary", "report", "error", "run_id",
-                             "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved",
-                             "delivered"})
-
-
 def research_keep(ref: str, **fields) -> None:
-    if unknown := set(fields) - RESEARCH_FIELDS:
-        raise ValueError(f"invalid research fields: {', '.join(sorted(unknown))}")
+    validate_columns(fields, RESEARCH_UPDATABLE_FIELDS, "research")
     if not fields:
         return
     with db() as c:
@@ -271,9 +275,9 @@ def capture_draft(connect=reader) -> dict | None:
         if not r:
             return None
         draft = dict(r)
-        draft["evidence"] = [{**dict(e), "inspection": json.loads(e["inspection"] or "{}")} for e in c.execute(
+        draft["evidence"] = [{**dict(e), "inspection": json_dict(e["inspection"])} for e in c.execute(
             "SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft["id"],))]
-        draft["checks"] = {k["name"]: {**dict(k), "detail": json.loads(k["detail"] or "{}")} for k in c.execute(
+        draft["checks"] = {k["name"]: {**dict(k), "detail": json_dict(k["detail"])} for k in c.execute(
             "SELECT * FROM capture_checks WHERE capture = ?", (draft["id"],))}
         return draft
 
@@ -396,6 +400,7 @@ def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
             return same, True
         keep(draft_id)
         row = {**row, "capture": draft_id, "added": now}
+        validate_columns(row, CAPTURE_EVIDENCE_COLUMNS, "capture_evidence")
         columns = tuple(row)
         row["id"] = c.execute(insert_sql("capture_evidence", columns), tuple(row[k] for k in columns)).lastrowid
         c.execute("UPDATE captures SET revision = revision + 1, updated = ? WHERE id = ?", (now, draft_id))
@@ -413,14 +418,8 @@ def capture_drop_evidence(evidence_id: int) -> dict | None:
         return dict(r)
 
 
-CAPTURE_FIELDS = frozenset({"status", "kind", "text", "expected", "actual", "steps", "context", "revision",
-                            "created", "updated", "jev_cost_usd", "inspect_cost_usd", "written_title", "written_body",
-                            "written_print", "written_note", "delivery", "issue", "issue_url", "issue_title", "filed"})
-
-
 def capture_save(**fields) -> bool:
-    if unknown := set(fields) - CAPTURE_FIELDS:
-        raise ValueError(f"invalid capture fields: {', '.join(sorted(unknown))}")
+    validate_columns(fields, CAPTURE_UPDATABLE_FIELDS, "captures")
     now = util.iso()
     names = list(fields)
     sets = "".join(f"{n} = ?, " for n in names)
@@ -431,8 +430,10 @@ def capture_save(**fields) -> bool:
             return True
         if c.execute("SELECT 1 FROM captures WHERE status = 'filing'").fetchone():
             return False
-        c.execute(f"INSERT INTO captures ({', '.join(names)}, status, revision, created, updated) "  # noqa: S608
-                  f"VALUES ({', '.join('?' * len(names))}, 'draft', 1, ?, ?)", (*fields.values(), now, now))
+        cols = f"{', '.join(names)}, " if names else ""
+        marks = f"{', '.join('?' * len(names))}, " if names else ""
+        c.execute(f"INSERT INTO captures ({cols}status, revision, created, updated) "  # noqa: S608
+                  f"VALUES ({marks}'draft', 1, ?, ?)", (*fields.values(), now, now))
         return True
 
 

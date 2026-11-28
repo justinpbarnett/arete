@@ -9,6 +9,8 @@ import re
 import sqlite3
 import sys
 import threading
+import urllib.parse
+import weakref
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
@@ -16,8 +18,11 @@ from pathlib import Path
 from . import config, events, paths, principals, secret_move, secretstore, util, vault
 from .store import credentials, db
 
-PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
-PRIVATE_KEY_BRANCH = r"(?s:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----)"
+_PEM_BODY = r"(?:[^-]|-(?!----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----))*"
+PRIVATE_KEY = re.compile(rf"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----{_PEM_BODY}-----END [A-Z0-9 ]*PRIVATE KEY-----")
+PRIVATE_KEY_BRANCH = rf"(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----{_PEM_BODY}-----END [A-Z0-9 ]*PRIVATE KEY-----)"
+PRIVATE_KEY_START = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 TOKEN_PATTERN = re.compile(r"\bar_[a-z0-9]+_([0-9a-f]{8})_[A-Za-z0-9_-]+")
 TOKEN_BRANCH = r"(?P<token>\bar_[a-z0-9]+_(?P<token_id>[0-9a-f]{8})_[A-Za-z0-9_-]+)"
 LARGEST_SECRET_FILE = 64 * 1024
@@ -72,7 +77,11 @@ def remember(*values: str) -> None:
 def _forms(value: str, escape: bool) -> set[str]:
     if not escape:
         return {value}
-    return {value, json.dumps(value, ensure_ascii=False)[1:-1], json.dumps(value, ensure_ascii=True)[1:-1]}
+    forms = {value, json.dumps(value, ensure_ascii=False)[1:-1], json.dumps(value, ensure_ascii=True)[1:-1]}
+    quoted = urllib.parse.quote(value, safe="")
+    if quoted != value:
+        forms.add(quoted)
+    return forms
 
 
 def _compile_pattern(literals: Iterable[str]) -> re.Pattern:
@@ -91,6 +100,7 @@ class Redactions:
         self._version = 0
         self._compiled_version = -1
         self._pattern: re.Pattern | None = None
+        self._merged_base_ref: weakref.ReferenceType[Redactions] | None = None
         self._merged_key: tuple | None = None
         self._merged_redactions: Redactions | None = None
         self.add(values)
@@ -140,8 +150,9 @@ class Redactions:
     def merged_with(self, base: Redactions) -> Redactions:
         if not self.held:
             return base
-        key = (id(base), base._version, self._version)
-        if self._merged_key == key and self._merged_redactions is not None:
+        key = (base._version, self._version)
+        if (self._merged_base_ref is not None and self._merged_base_ref() is base
+                and self._merged_key == key and self._merged_redactions is not None):
             return self._merged_redactions
         combined = Redactions(escape=False)
         combined.labelled = {**self.labelled, **base.labelled}
@@ -149,6 +160,7 @@ class Redactions:
         combined.held = combined.labelled.keys() | combined.unlabelled
         combined.values = tuple(sorted(combined.held, key=len, reverse=True))
         combined._version = 1
+        self._merged_base_ref = weakref.ref(base)
         self._merged_key = key
         self._merged_redactions = combined
         return combined
@@ -285,6 +297,8 @@ def _resolve_redactions(extra: Iterable[str] | Redactions = ()) -> Redactions:
         return base
     if isinstance(extra, Redactions):
         return extra.merged_with(base)
+    if isinstance(extra, str):
+        extra = (extra,)
     additions = [v for v in extra if isinstance(v, str) and len(v) >= vault.SHORTEST
                  and v not in base.held]
     if not additions:
@@ -339,7 +353,7 @@ def _apply_json_safe(s: str, redactions: Redactions) -> tuple[str, dict[int, tup
         if isinstance(item, list):
             return [walk(x) for x in item]
         if isinstance(item, dict):
-            return {k: walk(v) for k, v in item.items()}
+            return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
         return item
 
     return json.dumps(walk(json.loads(s)), ensure_ascii=False), secret_hits, token_hits
@@ -358,11 +372,12 @@ def text(s: str, channel: str, subject: str = "", extra: Iterable[str] | Redacti
 def value(v, channel: str, subject: str = "", extra: Iterable[str] | Redactions = ()):
     if isinstance(v, str):
         return text(v, channel, subject, extra=extra)
-    if not isinstance(v, (list, dict)):
+    if not isinstance(v, (list, tuple, dict)):
         return v
     redactions = _resolve_redactions(extra)
     total_secrets: dict[int, tuple[dict, int]] = {}
     total_tokens: Counter[str] = Counter()
+    active: set[int] = set()
 
     def walk(item):
         if isinstance(item, str):
@@ -372,10 +387,19 @@ def value(v, channel: str, subject: str = "", extra: Iterable[str] | Redactions 
                 total_secrets[sid] = (row, prev + count)
             total_tokens.update(th)
             return cleaned
-        if isinstance(item, list):
-            return [walk(x) for x in item]
-        if isinstance(item, dict):
-            return {k: walk(val) for k, val in item.items()}
+        if isinstance(item, (list, tuple, dict)):
+            oid = id(item)
+            if oid in active:
+                return "[circular]"
+            active.add(oid)
+            try:
+                if isinstance(item, list):
+                    return [walk(x) for x in item]
+                if isinstance(item, tuple):
+                    return tuple(walk(x) for x in item)
+                return {(walk(k) if isinstance(k, str) else k): walk(val) for k, val in item.items()}
+            finally:
+                active.discard(oid)
         return item
 
     cleaned = walk(v)
@@ -410,8 +434,13 @@ class LineScrubber:
     def _emit(self, chunk: str) -> None:
         if not chunk:
             return
-        if getattr(self._writing, "active", False) or busy():
-            self.stream.write(chunk)
+        if getattr(self._writing, "active", False):
+            self.stream.write(replaced(chunk, ()))
+            return
+        if busy():
+            with _cache_lock:
+                cached = _cached[3] if _cached is not None else None
+            self.stream.write(cached.apply(chunk)[0] if cached is not None else replaced(chunk, ()))
             return
         self._writing.active = True
         try:
@@ -419,14 +448,32 @@ class LineScrubber:
         finally:
             self._writing.active = False
 
+    def _pending_pem_start(self, text: str) -> int | None:
+        last_start = None
+        for match in PRIVATE_KEY_START.finditer(text):
+            last_start = match.start()
+        if last_start is None:
+            return None
+        if PRIVATE_KEY_END.search(text, last_start) is not None:
+            return None
+        return last_start
+
     def write(self, s: str) -> int:
         if not s:
             return 0
         with self._lock:
             self._buf += s
             if "\n" in self._buf:
-                complete, self._buf = self._buf.rsplit("\n", 1)
-                self._emit(complete + "\n")
+                complete, tail = self._buf.rsplit("\n", 1)
+                pem_at = self._pending_pem_start(complete)
+                if pem_at is not None and len(self._buf) - pem_at < LARGEST_SECRET_FILE:
+                    if pem_at > 0 and "\n" in complete[:pem_at]:
+                        prefix, rest = complete[:pem_at].rsplit("\n", 1)
+                        self._buf = rest + complete[pem_at:] + "\n" + tail
+                        self._emit(prefix + "\n")
+                else:
+                    self._buf = tail
+                    self._emit(complete + "\n")
         return len(s)
 
     def writelines(self, lines: Iterable[str]) -> None:
@@ -543,11 +590,22 @@ def parses(s: str) -> bool:
     return True
 
 
-def scrub_value(val, hidden: Sequence[str] | Redactions):
+def scrub_value(val, hidden: Sequence[str] | Redactions, _active: set[int] | None = None):
     if isinstance(val, str):
         return replaced(val, hidden)
-    if isinstance(val, list):
-        return [scrub_value(item, hidden) for item in val]
-    if isinstance(val, dict):
-        return {key: scrub_value(item, hidden) for key, item in val.items()}
+    if isinstance(val, (list, tuple, dict)):
+        active = set() if _active is None else _active
+        oid = id(val)
+        if oid in active:
+            return "[circular]"
+        active.add(oid)
+        try:
+            if isinstance(val, list):
+                return [scrub_value(item, hidden, active) for item in val]
+            if isinstance(val, tuple):
+                return tuple(scrub_value(item, hidden, active) for item in val)
+            return {(scrub_value(key, hidden, active) if isinstance(key, str) else key): scrub_value(item, hidden, active)
+                    for key, item in val.items()}
+        finally:
+            active.discard(oid)
     return val

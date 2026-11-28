@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from . import paths, scrub, util, vault
 
-SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]*[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
+SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]{0,64}[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
                        r"|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
 FENCE = re.compile(r"`{3,}")
 TAGS = re.compile(r"<[A-Za-z/!?][^>]{0,200}>")
@@ -59,11 +59,13 @@ def keep_configured_private() -> None:
     except (OSError, ValueError):
         return
     for repo in repos:
-        layer = paths.expand(repo["layer"]) if repo.get("layer") else paths.expand(repo["path"]) / ".agents"
+        if not isinstance(repo, dict):
+            continue
         try:
+            layer = paths.expand(repo["layer"]) if repo.get("layer") else paths.expand(repo["path"]) / ".agents"
             data = tomllib.loads((layer / "config.toml").read_text())
             keep_verify_private(data.get("verify", {}).get("url", ""))
-        except (OSError, ValueError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
 
 

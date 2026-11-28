@@ -22,10 +22,14 @@ def original(saved, key):
     data = saved["data"]
     if base := data.get("accepted_parent"):
         return base
-    claim = specs.find(saved["repo"], key.parent)
-    prepared = ledger.find(claim.get("run", "")).get("data", {}).get("prepared", {}).get("ticket")
-    if prepared:
-        ticket = tracker.Ticket(**prepared)
+    claim = specs.find(saved["repo"], key.parent) or {}
+    entry = ledger.find(claim.get("run", "")) or {}
+    prepared = (entry.get("data") or {}).get("prepared", {}).get("ticket")
+    if isinstance(prepared, dict):
+        try:
+            ticket = tracker.Ticket(**prepared)
+        except TypeError:
+            return {}
         if spec_delivery.source_version(ticket) == data["ticket_version"]:
             return snapshot(ticket)
     return {}
@@ -314,6 +318,6 @@ def reconcile(source, claim, ticket):
                    "changed_checks": update.get("changed_checks", []),
                    "unaffected": update.get("unaffected", []),
                }]}
-    updated.pop("pending_amendment")
+    updated.pop("pending_amendment", None)
     specgraphs.amend(key, data, updated, claim=claim)
     return False  # The next settlement reads the updated parent and child receipts together.

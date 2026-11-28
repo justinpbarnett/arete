@@ -2001,7 +2001,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         def worktree_git(args, cwd, *, check=True):
             if args[:2] == ["worktree", "remove"]:
-                self.assertEqual((args, cwd), (["worktree", "remove", "--force", str(c.wt)], c.src))
+                self.assertEqual((args, cwd), (["worktree", "remove", "--force", "--", str(c.wt)], c.src))
                 self.assertTrue(check)
                 (c.wt / ".git").unlink()
                 return ""

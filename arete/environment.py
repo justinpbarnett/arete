@@ -12,11 +12,23 @@ BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TZ", "TMPDI
         "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR",
         "ARETE_WORKTREES_DIR", "SSH_AUTH_SOCK", "ARETE_REPLAY_DIR", "ARETE_SERVER")
 SHELL_BOOKKEEPING = ("_", "PWD", "OLDPWD", "SHLVL", "ARETE_SERVE_RESTARTED_FOR_NEW_CODE")
-LOADER_HOOKS = ("LD_", "DYLD_", "PYTHON", "GIT_", "NPM_CONFIG_", "CLAUDE_CODE_", "CODEX_")
-SHELL_HOOKS = ("BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS",
-               "NODE_OPTIONS", "NODE_PATH", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL")
+EXECUTION_LOADER_HOOKS = ("LD_", "DYLD_", "PYTHON", "GIT_", "NPM_CONFIG_", "BASH_FUNC_")
+LOADER_HOOKS = (*EXECUTION_LOADER_HOOKS, "CLAUDE_CODE_", "CODEX_")
+SHELL_HOOKS = ("BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
+               "JAVA_TOOL_OPTIONS", "NODE_OPTIONS", "NODE_PATH", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL",
+               "BASHOPTS", "SHELLOPTS", "CDPATH", "FPATH", "IFS")
 INTERNAL_ARETE = ("ARETE_DRIVE_FLUSH", "ARETE_TEST_FAST_SYNC", "ARETE_VERIFY_SCRATCH", "ARETE_DESKTOP_NOTIFY",
                   "ARETE_DEVELOPMENT", "ARETE_TEST_STACK_PREFIX")
+
+
+def _valid_env_pair(name, value) -> bool:
+    return (isinstance(name, str) and isinstance(value, str) and bool(name)
+            and "\x00" not in name and "=" not in name and "\x00" not in value)
+
+
+def _is_execution_hook(name: str) -> bool:
+    upper = name.upper()
+    return upper in SHELL_HOOKS or upper.startswith(EXECUTION_LOADER_HOOKS)
 
 
 def passes(name: str, patterns: Iterable[str]) -> bool:
@@ -60,7 +72,8 @@ def role_secrets(role: str | None, *, repo: str | None = None, never: Iterable[s
                 if not matching:
                     continue
                 eligible = [env_name for env_name in matching
-                            if env_name not in excluded and not (scope.startswith("repo:") and reserved(env_name))]
+                            if env_name not in excluded and not _is_execution_hook(env_name)
+                            and not (scope.startswith("repo:") and reserved(env_name))]
                 if not eligible:
                     continue
                 value, reason = secretstore.read_for_expose(row)
@@ -80,13 +93,22 @@ def role_secrets(role: str | None, *, repo: str | None = None, never: Iterable[s
 def build(names: Iterable[str], sets: Mapping[str, str] | None = None, *, role: str | None = None,
           repo: str | None = None, never: Iterable[str] = (),
           source: Mapping[str, str] | None = None) -> dict[str, str]:
-    patterns, excluded = [*BASE, *names], set(never)
-    blocked = exposed_env_names()
+    patterns = [*BASE, *names]
+    explicit = {p for p in patterns if p != "*" and not p.endswith("*")}
+    excluded = set(never)
+    excluded_folded = {n.casefold() for n in excluded}
+    blocked_folded = {n.casefold() for n in exposed_env_names()}
     raw = os.environ if source is None else source
     kept = {k: v for k, v in raw.items()
-            if k not in excluded and k not in blocked and not paths.CREDENTIAL_NAME.search(k) and passes(k, patterns)}
+            if _valid_env_pair(k, v)
+            and k not in excluded and (not paths.ON_MAC or k.casefold() not in excluded_folded)
+            and k.casefold() not in blocked_folded
+            and not paths.CREDENTIAL_NAME.search(k)
+            and (k in explicit or not _is_execution_hook(k))
+            and passes(k, patterns)}
     exposed = role_secrets(role, repo=repo, never=excluded)
-    return util.foreground_maintenance({**kept, **exposed, **(sets or {})})
+    extra = {k: v for k, v in (sets or {}).items() if _valid_env_pair(k, v)}
+    return util.foreground_maintenance({**kept, **exposed, **extra})
 
 
 def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
@@ -100,8 +122,9 @@ def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
 
 
 def reserved(name: str) -> bool:
-    return (passes(name, BASE) or name in SHELL_BOOKKEEPING or name in SHELL_HOOKS or name.startswith("ARETE_")
-            or name.upper().startswith(LOADER_HOOKS))
+    upper = name.upper()
+    return (passes(name, BASE) or passes(upper, BASE) or upper in SHELL_BOOKKEEPING or upper in SHELL_HOOKS
+            or upper.startswith("ARETE_") or upper.startswith(LOADER_HOOKS))
 
 
 def stored(repo: config.Repo | None) -> dict[str, str]:

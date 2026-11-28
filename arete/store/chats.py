@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from .. import util
 from . import factory
+from ._rows import validate_columns
 from .db import db, reader
 
 TABLES = {
@@ -11,6 +12,11 @@ TABLES = {
     "chat_messages": "kept",
     "chat_sessions": "kept",
 }
+
+CHAT_UPDATABLE_FIELDS = frozenset((
+    "title", "project", "busy", "session", "session_spent", "runner",
+    "draft_title", "draft_body", "summary", "summarized_to",
+))
 
 
 CHAT_USAGE = ("(SELECT COALESCE(SUM(m.paid_usd), 0) FROM chat_messages m WHERE m.chat_id = chats.id) AS paid_usd, "
@@ -52,14 +58,9 @@ def chat_claim(chat_id: int, text: str, title: str) -> int:
         return 0
 
 
-CHAT_FIELDS = frozenset({"title", "project", "created", "updated", "spent", "busy", "session",
-                         "session_spent", "runner", "draft_title", "draft_body", "summary", "summarized_to"})
-
-
 def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_usd: float | None = None,
              reported_cost: float | None = None, before: Sequence[tuple[str, str]] = (), **fields) -> None:
-    if unknown := set(fields) - CHAT_FIELDS:
-        raise ValueError(f"invalid chat fields: {', '.join(sorted(unknown))}")
+    validate_columns(fields, CHAT_UPDATABLE_FIELDS, "chats")
     ts = util.iso()
     reported_cost = cost if reported_cost is None else reported_cost
     paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd

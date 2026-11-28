@@ -171,8 +171,17 @@ class ExternalEvidenceBundle:
         }
 
 
+def _safe_urlsplit(url: str) -> urllib.parse.SplitResult | None:
+    try:
+        return urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+
+
 def display_url(url: str) -> str:
-    parts = urllib.parse.urlsplit(url)
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return ""
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
@@ -189,7 +198,9 @@ def _format_slack_ts(raw_digits: str) -> str:
 
 
 def parse_slack_url(url: str) -> tuple[str, str, str] | None:
-    parts = urllib.parse.urlsplit(url)
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return None
     host = (parts.hostname or "").lower()
     if parts.scheme.lower() != "https" or not SLACK_HOST_RE.fullmatch(host):
         return None
@@ -210,7 +221,9 @@ def parse_slack_url(url: str) -> tuple[str, str, str] | None:
 
 
 def parse_dropbox_url(url: str) -> str | None:
-    parts = urllib.parse.urlsplit(url)
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return None
     host = (parts.hostname or "").lower()
     path = parts.path or ""
     if parts.scheme.lower() != "https" or host not in DROPBOX_HOSTS:
@@ -297,7 +310,10 @@ def _default_slack_api(method: str, params: dict[str, str], token: str) -> tuple
             raw = resp.read(MAX_TEXT_BYTES + 1)
             if len(raw) > MAX_TEXT_BYTES:
                 return resp.status, None, "Slack API response exceeded size limit"
-            return resp.status, json.loads(raw.decode("utf-8")), ""
+            decoded = json.loads(raw.decode("utf-8"))
+            if not isinstance(decoded, dict):
+                return resp.status, None, "Slack API returned non-object JSON"
+            return resp.status, decoded, ""
     except urllib.error.HTTPError as e:
         return e.code, None, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeDecodeError) as e:

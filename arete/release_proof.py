@@ -67,6 +67,10 @@ def goal(repo, ticket):
 def server_url(value):
     need(isinstance(value, str), "a destination URL is required")
     url = urlsplit(value)
+    try:
+        _ = url.port
+    except ValueError:
+        need(False, "use an HTTPS origin, or HTTP on numeric loopback for a disposable service")
     need(bool(url.hostname) and url.path in ("", "/") and not (url.query or url.fragment or url.username or url.password)
          and (url.scheme == "https" or url.scheme == "http" and url.hostname in ("127.0.0.1", "::1")),
          "use an HTTPS origin, or HTTP on numeric loopback for a disposable service")
@@ -193,7 +197,8 @@ def validate(data):
     if "revision" in data:
         need(isinstance(data["revision"], str) and serve_guard.SHA.fullmatch(data["revision"]), "invalid exact revision")
     if "observer_sha256" in data:
-        need(re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None, "invalid observer fingerprint")
+        need(isinstance(data["observer_sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None,
+             "invalid observer fingerprint")
     if "activations" in data:
         validate_activations(data["activations"])
     if data["destination"] == "arete-serve":
@@ -284,7 +289,7 @@ def install(repo, ticket, source, observer_file=None):
 def lookup(document, field):
     value = document
     for part in pointer(field):
-        if isinstance(value, list) and part.isdigit() and int(part) < len(value):
+        if isinstance(value, list) and part.isascii() and part.isdigit() and len(part) <= 9 and int(part) < len(value):
             value = value[int(part)]
         elif isinstance(value, dict) and part in value:
             value = value[part]
@@ -515,6 +520,7 @@ def for_delivery(repo, ticket, revision, environment):
 
 
 def enrolled(repo):
+    need(isinstance(repo, str) and NAME.fullmatch(repo), "invalid release goal identity")
     folder = paths.CONFIG_DIR / "release-checks" / repo
     return sorted(file.stem for file in folder.glob("*.json"))
 

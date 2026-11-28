@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -110,12 +111,14 @@ QUESTION_LEAD_RE = re.compile(
 AMBIGUITY_PATTERNS = (
     re.compile(r"\bnot\s+sure\s+(?:whether|if|which)\b", re.I),
     re.compile(r"\bunclear\s+(?:whether|if|which|what)\b", re.I),
-    re.compile(r"\beither\b.+\bor\b.+\b(?:whichever|not\s+sure|up\s+to\s+you|let\s+me\s+know|decide|which)\b", re.I),
     re.compile(r"\b(?:whichever|either\s+way|either\s+one)\b", re.I),
     re.compile(r"\b(?:tbd|to\s+be\s+decided|needs?\s+(?:a\s+)?product\s+decision|ambiguous)\b", re.I),
     re.compile(r"\bdecide\s+whether\b", re.I),
     re.compile(r"\bor\s+should\s+(?:it|we|this)\b", re.I),
 )
+_EITHER_RE = re.compile(r"\beither\b", re.I)
+_OR_RE = re.compile(r"\bor\b", re.I)
+_DECIDE_RE = re.compile(r"\b(?:whichever|not\s+sure|up\s+to\s+you|let\s+me\s+know|decide|which)\b", re.I)
 
 RELAY_BODY_RE = re.compile(
     r"^\s*(?:\[(?:slack|teams|discord|email|relay|zendesk|intercom|support|bridge)[^\]]*\]|"
@@ -326,11 +329,12 @@ def _comment_id_from_url(url: str) -> str:
 
 
 def _after_clarification(comment: ThreadComment, clarification: dict) -> bool:
-    if str(comment.comment_id) == str(clarification.get("source_comment_id") or ""):
+    raw_cid = str(comment.comment_id)
+    if raw_cid == str(clarification.get("source_comment_id") or ""):
         return False
     clarify_cid = _comment_id_from_url(clarification.get("comment_url", ""))
-    if clarify_cid.isdigit() and str(comment.comment_id).isdigit():
-        return int(comment.comment_id) > int(clarify_cid)
+    if clarify_cid.isascii() and clarify_cid.isdigit() and raw_cid.isascii() and raw_cid.isdigit():
+        return int(raw_cid) > int(clarify_cid)
     source_created = (clarification.get("data") or {}).get("source_created", "")
     comment_ts = parse_timestamp(comment.created)
     source_ts = parse_timestamp(source_created)
@@ -353,11 +357,20 @@ def _is_direct_question(text: str) -> bool:
     return bool(QUESTION_LEAD_RE.search(stripped)) and not ACTION_SIGNAL_RE.search(stripped)
 
 
+def _has_either_or_ambiguity(text: str) -> bool:
+    for line in text.splitlines():
+        if m1 := _EITHER_RE.search(line):
+            if m2 := _OR_RE.search(line, m1.end()):
+                if _DECIDE_RE.search(line, m2.end()):
+                    return True
+    return False
+
+
 def _detect_ambiguity(text: str) -> bool:
     stripped = _strip_relay_prefix(text)
     if not stripped:
         return False
-    return any(pattern.search(stripped) for pattern in AMBIGUITY_PATTERNS)
+    return _has_either_or_ambiguity(stripped) or any(pattern.search(stripped) for pattern in AMBIGUITY_PATTERNS)
 
 
 def build_clarifying_question(comment: ThreadComment, ctx: ThreadContext) -> str:
@@ -449,17 +462,19 @@ def classify_intent(comment: ThreadComment, ctx: ThreadContext, *,
 
 
 def normalize_github_comment(repo: config.Repo, tid: str, row: dict) -> ThreadComment:
-    actor = row.get("user") or row.get("author") or {}
-    login = (actor.get("login") or "").strip()
-    body = row.get("body") or ""
-    url = row.get("html_url") or row.get("url") or ""
+    raw_actor = row.get("user") or row.get("author")
+    actor = raw_actor if isinstance(raw_actor, dict) else {}
+    login = str(actor.get("login") or "").strip()
+    raw_body = row.get("body")
+    body = raw_body if isinstance(raw_body, str) else ""
+    url = str(row.get("html_url") or row.get("url") or "")
     cid = str(row.get("id") or _comment_id_from_url(url) or "")
     if not cid:
-        cid = "gh-" + digest([tid, login, row.get("created_at") or row.get("createdAt") or "", body])[:16]
-    if not url and cid.isdigit() and repo.github:
+        cid = "gh-" + digest([tid, login, str(row.get("created_at") or row.get("createdAt") or ""), body])[:16]
+    if not url and cid.isascii() and cid.isdigit() and repo.github:
         url = f"{gh.issue_url(repo.github, tid)}#issuecomment-{cid}"
-    created = row.get("created_at") or row.get("createdAt") or ""
-    updated = row.get("updated_at") or row.get("updatedAt") or ""
+    created = str(row.get("created_at") or row.get("createdAt") or "")
+    updated = str(row.get("updated_at") or row.get("updatedAt") or "")
     return ThreadComment(
         comment_id=cid,
         author=login,
@@ -473,19 +488,28 @@ def normalize_github_comment(repo: config.Repo, tid: str, row: dict) -> ThreadCo
 
 
 def normalize_jira_comment(tk: tracker.JiraTracker, tid: str, row: dict) -> ThreadComment:
-    author_obj = row.get("author") or {}
-    account_id = (author_obj.get("accountId") or author_obj.get("name") or "").strip()
-    display = (author_obj.get("displayName") or account_id or "").strip()
+    raw_author = row.get("author")
+    author_obj = raw_author if isinstance(raw_author, dict) else {}
+    account_id = str(author_obj.get("accountId") or author_obj.get("name") or "").strip()
+    display = str(author_obj.get("displayName") or account_id or "").strip()
     raw_body = row.get("body")
-    body = adf.to_text(raw_body) if isinstance(raw_body, dict) else (raw_body or "")
+    if isinstance(raw_body, dict):
+        try:
+            body = adf.to_text(raw_body)
+        except ValueError:
+            body = ""
+    elif isinstance(raw_body, str):
+        body = raw_body
+    else:
+        body = ""
     cid = str(row.get("id") or "")
     if not cid:
-        cid = "jira-" + digest([tid, account_id, row.get("created") or "", body])[:16]
+        cid = "jira-" + digest([tid, account_id, str(row.get("created") or ""), body])[:16]
     url = tk.client.comment_url(tid, cid) if cid else ""
     relayed_by = ""
     if row.get("relayed_by"):
         relayed_by = str(row["relayed_by"])
-    elif (author_obj.get("accountType") or "").casefold() == "app":
+    elif str(author_obj.get("accountType") or "").casefold() == "app":
         relayed_by = display or account_id or "jira-integration"
     elif RELAY_BODY_RE.match(body or ""):
         relayed_by = display or "team-relay"
@@ -495,8 +519,8 @@ def normalize_jira_comment(tk: tracker.JiraTracker, tid: str, row: dict) -> Thre
         author_display=display,
         body=body,
         url=url,
-        created=row.get("created") or "",
-        updated=row.get("updated") or "",
+        created=str(row.get("created") or ""),
+        updated=str(row.get("updated") or ""),
         relayed_by=relayed_by,
         is_bot=is_arete_comment(body),
     )
@@ -607,11 +631,35 @@ def _public_safe(repo: config.Repo, text: str) -> str:
     return outbound.redact(cleaned) if repo.public else cleaned
 
 
+def _is_trusted_marker_author(tk: tracker.Tracker, item: ThreadComment) -> bool:
+    """Only Arete's own tracker identity may reconcile a durable marker."""
+    actor = (item.author or "").strip()
+    if not actor:
+        return False
+    if isinstance(tk, tracker.LocalTracker):
+        return actor == "arete"
+    if isinstance(tk, tracker.JiraTracker):
+        try:
+            me = str((tk.client.me() or {}).get("accountId") or "").strip()
+        except (jira.JiraError, ValueError, OSError):
+            return False
+        return bool(me) and actor == me
+    if isinstance(tk, tracker.GitHubTracker):
+        if tk.owner and actor.casefold() == tk.owner.casefold():
+            return True
+        try:
+            me = gh.me()
+        except (gh.GhError, OSError):
+            return False
+        return bool(me) and actor.casefold() == me.casefold()
+    return False
+
+
 def _find_marker_url(repo: config.Repo, tk: tracker.Tracker, tid: str, marker: str,
                      comments: list[ThreadComment] | None = None) -> str:
     rows = comments if comments is not None else fetch_thread_comments(repo, tk, tid)
     for item in rows:
-        if marker in (item.body or "").splitlines() and item.url:
+        if _is_trusted_marker_author(tk, item) and marker in (item.body or "").splitlines() and item.url:
             return item.url
     return ""
 
@@ -621,7 +669,7 @@ def _post_clarification(repo: config.Repo, tk: tracker.Tracker, tid: str, commen
                         dry_run: bool = False) -> tuple[str, str]:
     """Post a focused product clarification question once, reconciling retries via a durable marker."""
     cid = "clarify-" + digest([repo.name, str(tid), tk.name, str(comment.comment_id)])[:16]
-    marker = f"{CLARIFY_MARKER_PREFIX}{cid}"
+    fresh_marker = f"{CLARIFY_MARKER_PREFIX}{cid}-{secrets.token_hex(12)}"
     saved = feedback_store.begin_clarification(
         cid,
         repo.name,
@@ -629,9 +677,10 @@ def _post_clarification(repo: config.Repo, tk: tracker.Tracker, tid: str, commen
         tk.name,
         str(comment.comment_id),
         question,
-        marker,
+        fresh_marker,
         data={"source_author": comment.author, "source_body": comment.body, "source_created": comment.created},
     )
+    marker = saved["marker"]
     if saved["status"] == "open" and saved.get("comment_url"):
         return cid, saved["comment_url"]
     if saved["status"] == "answered":

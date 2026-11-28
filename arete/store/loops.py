@@ -5,6 +5,7 @@ from datetime import timedelta
 
 from .. import util
 from . import factory
+from ._rows import json_dict, json_list, validate_columns
 from .db import db, reader
 
 TABLES = {
@@ -15,18 +16,22 @@ TABLES = {
     "findings": "kept",
 }
 
+LOOP_STATE_UPDATABLE_FIELDS = frozenset((
+    "data", "last_fire", "next_due", "metric_on", "updated", "mark_ok", "mark_detail", "mark_at",
+))
+
 
 def loop_state(name: str, connect=reader) -> dict:
     with connect() as c:
         r = c.execute("SELECT * FROM loop_state WHERE loop = ?", (name,)).fetchone()
     if not r:
         return {"loop": name, "data": {}, "last_fire": None, "next_due": None, "metric_on": 0}
-    return {**dict(r), "data": json.loads(r["data"] or "{}")}
+    return {**dict(r), "data": json_dict(r["data"])}
 
 
 def loop_states(connect=reader) -> dict[str, dict]:
     with connect() as c:
-        return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
+        return {r["loop"]: {**dict(r), "data": json_dict(r["data"])} for r in c.execute("SELECT * FROM loop_state")}
 
 
 def loop_marks(connect=reader) -> dict[str, dict]:
@@ -36,13 +41,8 @@ def loop_marks(connect=reader) -> dict[str, dict]:
             for r in rows if r.get("mark_at")}
 
 
-LOOP_STATE_FIELDS = frozenset({"data", "last_fire", "next_due", "metric_on", "updated",
-                               "mark_ok", "mark_detail", "mark_at"})
-
-
 def set_loop_state(name: str, **fields) -> None:
-    if unknown := set(fields) - LOOP_STATE_FIELDS:
-        raise ValueError(f"invalid loop_state fields: {', '.join(sorted(unknown))}")
+    validate_columns(fields, LOOP_STATE_UPDATABLE_FIELDS, "loop_state")
     if "data" in fields:
         fields["data"] = json.dumps(fields["data"], default=str)
     fields["updated"] = util.iso()
@@ -118,7 +118,7 @@ def pending(connect=reader) -> list[dict]:
 def queue_item(item_id: int) -> dict | None:
     with reader() as c:
         r = c.execute("SELECT * FROM queue WHERE id = ?", (item_id,)).fetchone()
-    return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
+    return {**dict(r), "payload": json_list(r["payload"])} if r else None
 
 
 def take_queue_item(item_id: int, run_id: str) -> bool:
@@ -138,8 +138,9 @@ def release_claimed_items(run_id: str) -> None:
 
 
 def finish_claim(c, row: dict, how: str, summary: str) -> None:
+    payload = json_list(row.get("payload"))
     if how == "retry":
-        duplicate = not json.loads(row["payload"] or "[]") and c.execute(
+        duplicate = not payload and c.execute(
             "SELECT 1 FROM queue WHERE loop = ? AND trigger = ? AND payload = '[]' AND run_id IS NULL",
             (row["loop"], row["trigger"])).fetchone()
         if duplicate:
@@ -149,7 +150,7 @@ def finish_claim(c, row: dict, how: str, summary: str) -> None:
             return
         else:
             how = "dead"
-    if how == "drop" or not json.loads(row["payload"] or "[]"):
+    if how == "drop" or not payload:
         c.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
     else:
         c.execute("UPDATE queue SET dead_at = ?, dead_reason = ? WHERE id = ?",
@@ -176,7 +177,7 @@ def release_settled_claims() -> None:
 def dead_items(connect=reader) -> list[dict]:
     with connect() as c:
         return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
-                 "events": len(json.loads(row["payload"] or "[]"))}
+                 "events": len(json_list(row["payload"]))}
                 for row in c.execute("SELECT * FROM queue WHERE dead_at IS NOT NULL ORDER BY id")]
 
 

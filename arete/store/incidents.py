@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from datetime import timedelta
 
 from .. import util
 from ..sighting import Sighting
+from ._rows import json_dict, validate_columns
 from .db import db, reader
 
 TABLES = {
@@ -14,6 +14,14 @@ TABLES = {
     "incident_aliases": "with incident",
     "alerts": "kept",
 }
+
+INCIDENT_UPDATABLE_FIELDS = frozenset((
+    "fingerprint", "class", "source", "repo", "signature", "state", "first_seen", "last_seen",
+    "count", "evidence", "decision", "confidence", "reason", "answers", "injection", "decided",
+    "tries", "retry_at", "decided_count", "shapes", "policies", "phase", "waiting", "rearmed",
+    "landed", "recovery", "alerted", "closed",
+))
+REPAIR_UPDATABLE_FIELDS = frozenset(("incident", "repo", "task", "started", "ended", "outcome"))
 
 
 SEEN_AGAIN = "seen again"
@@ -75,18 +83,6 @@ def known_fingerprints() -> dict[str, dict]:
         return held
 
 
-INCIDENT_FIELDS = frozenset({"fingerprint", "class", "source", "repo", "signature", "state", "first_seen",
-                             "last_seen", "count", "evidence", "decision", "confidence", "reason", "answers",
-                             "injection", "decided", "tries", "retry_at", "decided_count", "shapes", "policies",
-                             "phase", "waiting", "rearmed", "landed", "recovery", "alerted", "closed"})
-REPAIR_FIELDS = frozenset({"incident", "repo", "task", "started", "ended", "outcome"})
-
-
-def _check_fields(fields: dict, allowed: frozenset[str], label: str) -> None:
-    if unknown := set(fields) - allowed:
-        raise ValueError(f"invalid {label} fields: {', '.join(sorted(unknown))}")
-
-
 def _sync_inbox(c, source: str) -> None:
     from .. import inbox
 
@@ -94,7 +90,7 @@ def _sync_inbox(c, source: str) -> None:
 
 
 def update_incident(incident_id: int, note: str = "", **fields) -> None:
-    _check_fields(fields, INCIDENT_FIELDS, "incident")
+    validate_columns(fields, INCIDENT_UPDATABLE_FIELDS, "incidents")
     if fields.get("state", "open") != "open" and "closed" not in fields:
         fields["closed"] = util.iso()
     with db() as c:
@@ -126,7 +122,7 @@ def add_repair(incident_id: int, repo: str) -> int:
 
 
 def set_repair(repair_id: int, **fields) -> None:
-    _check_fields(fields, REPAIR_FIELDS, "incident_repairs")
+    validate_columns(fields, REPAIR_UPDATABLE_FIELDS, "incident_repairs")
     if not fields:
         return
     with db() as c:
@@ -140,7 +136,7 @@ def incident_repairs(connect=reader) -> list[dict]:
 
 
 def parsed(row: dict) -> dict:
-    return {**row, "answers": json.loads(row["answers"] or "{}")}
+    return {**row, "answers": json_dict(row.get("answers"))}
 
 
 def incidents(connect=reader, limit: int = 200, open_first: bool = False) -> list[dict]:
@@ -223,8 +219,9 @@ def write_alias(c, fingerprint: str, incident_id: int, note: str) -> None:
 
 
 def write_mark(c, incident_id: int, fields: dict, note: str) -> None:
-    _check_fields(fields, INCIDENT_FIELDS, "incident")
-    c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",  # noqa: S608
-              (*fields.values(), incident_id))
+    validate_columns(fields, INCIDENT_UPDATABLE_FIELDS, "incidents")
+    if fields:
+        c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",  # noqa: S608
+                  (*fields.values(), incident_id))
     c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
               (incident_id, util.iso(), note))

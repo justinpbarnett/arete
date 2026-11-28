@@ -17,7 +17,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from . import accounts, config, outbound, paths, secret_move, secretstore, util
 
@@ -27,6 +27,54 @@ GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
 _deployment_ci_deadline: ContextVar[float | None] = ContextVar("deployment_ci_deadline", default=None)
+_SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SAFE_DIGITS_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+class _AuthStaysOnHost(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+
+_token_opener = urllib.request.build_opener(_AuthStaysOnHost)
+_STDLIB_URLOPEN = urllib.request.urlopen
+
+
+def _safe_repo(repo: str) -> str:
+    if not isinstance(repo, str) or not _SAFE_REPO_RE.fullmatch(repo):
+        raise GhError(f"invalid GitHub repository slug: {repo!r}")
+    owner, name = repo.split("/", 1)
+    if owner in (".", "..") or name in (".", ".."):
+        raise GhError(f"invalid GitHub repository slug: {repo!r}")
+    return repo
+
+
+def _safe_ref_path(ref: str, *, allow_slash: bool = True) -> str:
+    if (not isinstance(ref, str) or not ref or ref.startswith(("-", "/")) or ref.endswith("/")
+            or any(c in ref for c in ("\0", "?", "#")) or re.search(r"[\x00-\x20\x7f]", ref)
+            or ".." in ref.split("/") or "." in ref.split("/")):
+        raise GhError(f"invalid Git ref: {ref!r}")
+    if not allow_slash and "/" in ref:
+        raise GhError(f"invalid Git ref: {ref!r}")
+    return quote(ref, safe="/" if allow_slash else "")
+
+
+def _safe_content_path(path: str) -> str:
+    if (not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
+            or any(c in path for c in ("\0", "?", "#", "\\"))
+            or any(part in ("", ".", "..") for part in path.split("/"))):
+        raise GhError(f"invalid repository content path: {path!r}")
+    return quote(path, safe="/")
+
+
+def _safe_target(value: str | int, label: str = "target") -> str:
+    text = str(value)
+    if not text or text.startswith("-") or re.search(r"[\x00-\x20\x7f]", text):
+        raise GhError(f"invalid GitHub {label}: {value!r}")
+    return text
 
 
 class GhError(RuntimeError):
@@ -105,9 +153,13 @@ def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = Tr
 
 
 def ensure_label(repo: str, name: str, color: str = "5319e7", description: str = "", restyle: bool = True) -> str:
-    args = ["label", "create", name, "--repo", repo, "--color", color, "--description", description]
+    _safe_repo(repo)
+    args = ["label", "create", "--repo", repo, "--color", color, "--description", description]
+    if restyle:
+        args.append("--force")
+    args += ["--", name]
     try:
-        gh([*args, "--force"] if restyle else args)
+        gh(args)
         return ""
     except GhError as e:
         if not restyle and "already exists" in str(e):
@@ -312,13 +364,17 @@ def issue_url(repo: str, number: int | str) -> str:
     return f"https://github.com/{repo}/issues/{number}"
 
 
-def publication_url(path: str, marker: str, **query) -> str:
+def publication_url(path: str, marker: str, *, author: str = "", **query) -> str:
     query = urlencode({"per_page": 100, **query})
     pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
         raise GhError("GitHub publication lookup returned no list")
     for page in pages:
         for row in page:
+            if not isinstance(row, dict):
+                continue
+            if author and ((row.get("user") or {}).get("login") or "").casefold() != author.casefold():
+                continue
             if "pull_request" not in row and marker in (row.get("body") or "").splitlines():
                 if not row.get("html_url"):
                     raise GhError("GitHub publication lookup returned no URL")
@@ -326,16 +382,18 @@ def publication_url(path: str, marker: str, **query) -> str:
     return ""
 
 
-def find_issue_marker(repo: str, marker: str) -> str:
-    return publication_url(f"repos/{repo}/issues", marker, state="all")
+def find_issue_marker(repo: str, marker: str, *, author: str = "") -> str:
+    return publication_url(f"repos/{_safe_repo(repo)}/issues", marker, author=author, state="all")
 
 
-def find_issue_comment_marker(repo: str, number: int, marker: str) -> str:
-    return publication_url(f"repos/{repo}/issues/{number}/comments", marker)
+def find_issue_comment_marker(repo: str, number: int, marker: str, *, author: str = "") -> str:
+    return publication_url(f"repos/{_safe_repo(repo)}/issues/{int(number)}/comments", marker, author=author)
 
 
-def find_pr_marker(repo: str, branch: str, marker: str) -> str:
-    return publication_url(f"repos/{repo}/pulls", marker, state="all", head=f"{repo.split('/')[0]}:{branch}")
+def find_pr_marker(repo: str, branch: str, marker: str, *, author: str = "") -> str:
+    repo = _safe_repo(repo)
+    return publication_url(f"repos/{repo}/pulls", marker, author=author, state="all",
+                           head=f"{repo.split('/')[0]}:{branch}")
 
 
 def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
@@ -530,11 +588,11 @@ def closed_pr_heads(repo: str, head: str) -> set[str]:
 
 
 def pr_body(url: str) -> str:
-    return ((gh_json(["pr", "view", url, "--json", "body"]) or {}).get("body") or "").replace("\r\n", "\n")
+    return ((gh_json(["pr", "view", _safe_target(url, "PR"), "--json", "body"]) or {}).get("body") or "").replace("\r\n", "\n")
 
 
 def pr_diff(url: str) -> str:
-    return gh(["pr", "diff", url])
+    return gh(["pr", "diff", _safe_target(url, "PR")])
 
 
 def pr_edit_body(url: str, body: str, link: str = "") -> None:
@@ -542,10 +600,11 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
 
 
 def pr_write_body(url: str, body: Outgoing) -> None:
-    gh(["pr", "edit", url, "--body-file", "-"], input=body)
+    gh(["pr", "edit", _safe_target(url, "PR"), "--body-file", "-"], input=body)
 
 
 def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
+    url = _safe_target(url, "PR")
     keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
                   f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
                   key=key, single_attempt=single_attempt)
@@ -574,8 +633,10 @@ def pr_reply(url: str, comment_id: int, body: str) -> None:
 
 
 def ensure_branch(repo: str, branch: str) -> None:
+    repo = _safe_repo(repo)
+    ref_path = _safe_ref_path(branch)
     try:
-        gh(["api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"])
+        gh(["api", f"repos/{repo}/git/ref/heads/{ref_path}", "--jq", ".object.sha"])
         return
     except GhError as e:
         if "HTTP 404" not in str(e):
@@ -590,8 +651,11 @@ def ensure_branch(repo: str, branch: str) -> None:
 
 
 def file_sha(repo: str, path: str, ref: str) -> str:
+    repo = _safe_repo(repo)
+    encoded_path = _safe_content_path(path)
+    query = urlencode({"ref": ref})
     try:
-        return gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".sha"]).strip()
+        return gh(["api", f"repos/{repo}/contents/{encoded_path}?{query}", "--jq", ".sha"]).strip()
     except GhError as e:
         if "HTTP 404" in str(e):
             return ""
@@ -599,15 +663,17 @@ def file_sha(repo: str, path: str, ref: str) -> str:
 
 
 def put_file(repo: str, path: str, data: bytes, branch: str, message: str, replaces: str = "") -> str:
+    repo = _safe_repo(repo)
+    encoded_path = _safe_content_path(path)
     payload = {"message": message, "content": base64.b64encode(data).decode(), "branch": branch,
                **({"sha": replaces} if replaces else {})}
-    out = gh(["api", "-X", "PUT", f"repos/{repo}/contents/{path}", "--input", "-"],
+    out = gh(["api", "-X", "PUT", f"repos/{repo}/contents/{encoded_path}", "--input", "-"],
              input=Outgoing(json.dumps(payload)), timeout=600)
     return json.loads(out)["commit"]["sha"]
 
 
 def blob_url(repo: str, commit: str, path: str) -> str:
-    return f"https://github.com/{repo}/blob/{commit}/{path}"
+    return f"https://github.com/{_safe_repo(repo)}/blob/{_safe_ref_path(commit)}/{_safe_content_path(path)}"
 
 
 def api_list(path: str) -> list[dict]:
@@ -647,24 +713,37 @@ def me() -> str:
 
 
 def pr_number(url: str) -> int:
-    return int(url.rstrip("/").rsplit("/", 1)[-1])
+    parts = [p for p in urlsplit(url).path.split("/") if p]
+    if len(parts) < 4 or parts[-2] not in ("pull", "pulls") or not _SAFE_DIGITS_RE.fullmatch(parts[-1]):
+        tail = url.rstrip("/").rsplit("/", 1)[-1]
+        if _SAFE_DIGITS_RE.fullmatch(tail):
+            return int(tail)
+        raise GhError(f"invalid GitHub PR URL: {url!r}")
+    return int(parts[-1])
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json",
+    args = ["pr", "view", _safe_target(url_or_number, "PR"), "--json",
             "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName,headRefOid,baseRefName"]
     if repo:
-        args += ["--repo", repo]
+        args += ["--repo", _safe_repo(repo)]
     return gh_json(args) or {}
 
 
 def pr_repo(url: str) -> str:
-    return "/".join(url.split("/")[3:5])
+    parts = [p for p in urlsplit(url).path.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    candidate = f"{parts[0]}/{parts[1]}"
+    return candidate if _SAFE_REPO_RE.fullmatch(candidate) and parts[0] not in (".", "..") and parts[1] not in (".", "..") else ""
 
 
 def branch_contains(repo: str, branch: str, sha: str) -> bool:
     try:
-        status = gh(["api", f"repos/{repo}/compare/{branch}...{sha}", "--jq", ".status"]).strip()
+        repo = _safe_repo(repo)
+        left = _safe_ref_path(branch)
+        right = _safe_ref_path(sha)
+        status = gh(["api", f"repos/{repo}/compare/{left}...{right}", "--jq", ".status"]).strip()
     except GhError:
         return False
     return status in ("identical", "behind")
@@ -680,15 +759,15 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
 
 
 def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = False) -> None:
-    gh(["pr", "ready", url, *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
+    gh(["pr", "ready", _safe_target(url, "PR"), *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
 
 
 def pr_close(url: str) -> None:
-    gh(["pr", "close", url], write=True)
+    gh(["pr", "close", _safe_target(url, "PR")], write=True)
 
 
 def pr_add_label(url: str, name: str) -> None:
-    gh(["pr", "edit", url, "--add-label", name], write=True)
+    gh(["pr", "edit", _safe_target(url, "PR"), "--add-label", name], write=True)
 
 
 def pr_update_branch(repo: str, number: int, head: str) -> None:
@@ -702,7 +781,7 @@ def pr_squash(repo: str, number: int, head: str) -> None:
 
 def actions_check_passed(repo: str, head: str, name: str) -> bool:
     query = urlencode({"check_name": name, "filter": "latest", "per_page": 100})
-    path = f"repos/{repo}/commits/{head}/check-runs?{query}"
+    path = f"repos/{_safe_repo(repo)}/commits/{_safe_ref_path(head, allow_slash=False)}/check-runs?{query}"
     reply = json.loads(gh(["api", path], retry=False) or "{}")
     rows = reply.get("check_runs", [])
     if reply.get("total_count", len(rows)) > len(rows):
@@ -713,7 +792,7 @@ def actions_check_passed(repo: str, head: str, name: str) -> bool:
 
 
 def pr_draft_and_head(url: str) -> tuple[bool, str]:
-    row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
+    row = gh_json(["pr", "view", _safe_target(url, "PR"), "--json", "isDraft,headRefOid"]) or {}
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
 
 
@@ -739,9 +818,9 @@ def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bo
         fields += ",url,headRefName,isCrossRepository"
     if watch_checks:
         fields += ",statusCheckRollup"
-    args = ["pr", "view", pr, "--json", fields]
+    args = ["pr", "view", _safe_target(pr, "PR"), "--json", fields]
     if repo:
-        args += ["--repo", repo]
+        args += ["--repo", _safe_repo(repo)]
     return gh_json(args, timeout=timeout, retry=retry) or {}
 
 
@@ -756,7 +835,7 @@ def merge_ref_hold(row: dict, head: str, base: str) -> str:
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None, stage_checks: dict | None = None) -> bool:
-    path = f"repos/{repo}/commits/{head}"
+    path = f"repos/{_safe_repo(repo)}/commits/{_safe_ref_path(head, allow_slash=False)}"
     checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
     statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
     if (not isinstance(checks, list) or not checks
@@ -997,27 +1076,31 @@ def token_overreach(reply: dict, repo: str) -> str:
     if reply.get("repository_selection") == "all":
         return "it reaches every repository of the installation"
     listed = reply.get("repositories")
-    if listed is not None and (not isinstance(listed, list) or
-                               [str(r.get("full_name", "")).lower() for r in listed if isinstance(r, dict)] != [repo.lower()]):
+    if listed is not None and (not isinstance(listed, list) or any(not isinstance(r, dict) for r in listed) or
+                               [str(r.get("full_name", "")).lower() for r in listed] != [repo.lower()]):
         return "it reaches repositories other than this one"
     return ""
 
 
 def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
+    if not (isinstance(app.installation_id, str) and app.installation_id.isascii() and app.installation_id.isdigit()):
+        raise GhError("invalid GitHub App installation_id")
     if not paths.ISOLATED and (key := os.environ.get(APP_KEY)):
         row = None
         jwt = app_jwt(app, key=key.encode())
     else:
         row, key = secretstore.lookup("global", APP_KEY)
         jwt = app_jwt(app, key=key.encode()) if row is not None else app_jwt(app)
-    body = {"repositories": [repo.rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
+    body = {"repositories": [_safe_repo(repo).rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
     request = util.http_request(
         f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
         method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
                                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"},
         schemes=("https",))
     try:
-        with util.urlopen_http(request, timeout=30, schemes=("https",)) as res:
+        open_fn = (_token_opener.open if urllib.request.urlopen is _STDLIB_URLOPEN
+                   else lambda req, timeout=30: util.urlopen_http(req, timeout=timeout, schemes=("https",)))
+        with open_fn(request, timeout=30) as res:
             reply = json.loads(res.read())
     except urllib.error.HTTPError:
         raise
@@ -1112,7 +1195,7 @@ def check_from_status(row: dict) -> Check:
 
 def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True,
                   red_workflows: set[int] | None = None, latest: bool = False) -> dict[CheckKey, Check]:
-    path = f"repos/{repo}/commits/{ref}"
+    path = f"repos/{_safe_repo(repo)}/commits/{_safe_ref_path(ref)}"
     filter_runs = "latest" if latest else "all"
     pages = gh_json(["api", f"{path}/check-runs?filter={filter_runs}&per_page=100", "--paginate", "--slurp"],
                     timeout=timeout, retry=retry)
@@ -1204,7 +1287,7 @@ def current_workflow_checks(repo: str, head: str, runs: list[Check], red_workflo
 
 
 def branch_sha(repo: str, branch: str) -> str:
-    return gh(["api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"]).strip()
+    return gh(["api", f"repos/{_safe_repo(repo)}/commits/{_safe_ref_path(branch)}", "--jq", ".sha"]).strip()
 
 
 def origin_project(url: str) -> str:
