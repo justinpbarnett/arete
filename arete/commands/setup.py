@@ -131,6 +131,8 @@ def print_status(cfg, problem, views, snap, records, server_url):
     print(f"arete {__version__}  local config {paths.CONFIG_FILE}")
     if problem:
         print(f"config does not load: {problem}")
+    elif cfg.problems:
+        print(f"config problems: {'; '.join(p.text() for p in cfg.problems)}")
     if cfg.ignored:
         print(f"config names this engine ignores: {', '.join(cfg.ignored)}")
     print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")

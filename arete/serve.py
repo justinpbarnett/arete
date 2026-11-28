@@ -94,7 +94,11 @@ def mergecheck_reset(loop: Loop, item: dict) -> str:
 
 
 IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; from arete import codebase; codebase.load()"
-CONFIG_CHECK = "from arete import config; config.load()"
+CONFIG_CHECK = (
+    "import json; from dataclasses import asdict, is_dataclass; from arete import config; "
+    "cfg = config.load(); "
+    "print(json.dumps([asdict(p) if is_dataclass(p) else str(p) for p in getattr(cfg, 'problems', ())], default=str))"
+)
 RESTARTED_FOR_NEW_CODE = foundation.INHERITED_SERVE_CHILDREN
 SERVE_LOCK = "serve"
 SERVE_LOCK_FD = serve_guard.LOCK_FD
@@ -326,12 +330,65 @@ class QueueSlots:
         self.per_queue[loop.queue_name] += 1
 
 
+def _problem_identity(entry: object) -> tuple[str, str]:
+    if isinstance(entry, config.Problem):
+        key = json.dumps([entry.path, entry.section, entry.name, entry.value, entry.scope],
+                         sort_keys=True, default=str)
+        return key, entry.text()
+    if isinstance(entry, dict):
+        problem = config.Problem(
+            str(entry.get("path", "")),
+            str(entry.get("section", "")),
+            str(entry.get("name", "")),
+            entry.get("value"),
+            str(entry.get("scope", "")),
+        )
+        key = json.dumps([problem.path, problem.section, problem.name, problem.value, problem.scope],
+                         sort_keys=True, default=str)
+        return key, problem.text()
+    text = str(entry)
+    return text, text
+
+
+def candidate_config_problem(candidate, running_cfg: config.Config, running_fatal: str) -> str:
+    if running_fatal:
+        return ""
+    stderr = getattr(candidate, "stderr", "") or ""
+    stdout = getattr(candidate, "stdout", "") or ""
+    if candidate.returncode != 0:
+        return ("new code cannot read config.toml, so serve keeps the code it started with: "
+                + util.last_line(stderr or stdout, 300))
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    try:
+        parsed = json.loads(lines[-1])
+    except ValueError:
+        return "new code returned unreadable config check output, so serve keeps the code it started with"
+    if not isinstance(parsed, list):
+        return "new code returned unreadable config check output, so serve keeps the code it started with"
+    running_problems = getattr(running_cfg, "problems", ())
+    running_ids = {_problem_identity(p)[0] for p in running_problems}
+    running_texts = {p.text() for p in running_problems}
+    added: list[str] = []
+    for entry in parsed:
+        key, text = _problem_identity(entry)
+        if key not in running_ids and text not in running_texts:
+            added.append(text)
+    if not added:
+        return ""
+    return ("new code reports config reach problems this engine does not have, "
+            "so serve keeps the code it started with: " + "; ".join(added))
+
+
 class Server:
     def __init__(self) -> None:
         self.cfg, self.config_problem = config.load_or_problem()
         self.code_problem = ""
         self.reported_problem = ""
+        self.reported_problems: tuple[config.Problem, ...] = ()
         self.reported_ignored: tuple[str, ...] = ()
+        self.lock: TextIO | None = None
         self.started = util.now()
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
@@ -414,6 +471,14 @@ class Server:
             else:
                 self.say("config.toml loads again")
             self.reported_problem = self.config_problem
+        cfg_problems = getattr(self.cfg, "problems", ())
+        if cfg_problems != self.reported_problems:
+            if cfg_problems and not self.config_problem:
+                self.say("config has reach problems, pausing affected launches: "
+                         + "; ".join(p.text() for p in cfg_problems))
+            elif self.reported_problems and not self.config_problem:
+                self.say("config reach problems cleared")
+            self.reported_problems = cfg_problems
         if self.cfg.ignored != self.reported_ignored:
             if self.cfg.ignored:
                 self.say(f"config.toml has names this engine does not know, so it ignores them: "
@@ -452,6 +517,7 @@ class Server:
             self.cfg = cfg
         self.report_config()
         if problem:
+            self.guard("stage:inbox-config", self.sync_config_inbox)
             raise ValueError(problem)
         every_loop = loops.load_all(cfg)
         self.every_loop = every_loop
@@ -640,6 +706,11 @@ class Server:
         from . import inbox
 
         inbox.tick()
+
+    def sync_config_inbox(self) -> None:
+        from . import inbox
+
+        inbox.sync_source("config")
 
     def remind(self) -> None:
         for note in webpush.remind_inbox(self.cfg):
@@ -1024,6 +1095,8 @@ class Server:
     def watch_oncall(self) -> None:
         if not self.cfg.oncall.enabled or (self.oncall and not self.oncall.done()):
             return
+        if self.code_problem or config.paused(self.cfg, oncall=True):
+            return
         self.oncall = self.pool.submit(self.scan_oncall, self.cfg)
 
     def scan_oncall(self, cfg: config.Config) -> None:
@@ -1091,6 +1164,8 @@ class Server:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
+        if self.code_problem:
+            return
         slots = QueueSlots(run_store.runs_marked_running())
         pending = loop_store.pending()
         ids = {item["id"] for item in pending}
@@ -1141,7 +1216,7 @@ class Server:
         except loop_run.NeverBegan as e:
             self.retry_once(item, str(e))
             return None
-        except (control.NotFound, control.Refused):
+        except (control.NotFound, control.Refused, config.Paused):
             return None
         slots.took(loop, item)
         self.say(f"{loop.name}: started {run['id']} ({item['trigger']})")
@@ -1250,13 +1325,14 @@ class Server:
                 self.note_once("new code does not import, so serve keeps the code it started with: " + problem)
             return
         candidate = util.sh([sys.executable, "-I", "-c", entrypoint + CONFIG_CHECK], timeout=120)
-        if candidate.returncode != 0 and not config.load_or_problem()[1]:
-            self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
-                                 + util.last_line(candidate.stderr or candidate.stdout, 300))
+        running_cfg, running_fatal = config.load_or_problem()
+        if problem := candidate_config_problem(candidate, running_cfg, running_fatal):
+            self.code_problem = problem
             self.note_once(self.code_problem)
             if receipt is not None:
                 self.record_failed_start(receipt, attempted_at)
             return
+        self.code_problem = ""
         if stamp != self.migration_stamp:
             migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
             self.migration_stamp = stamp
@@ -1289,18 +1365,19 @@ class Server:
             self.say(f"new code: serve {os.getpid()} restarts itself" + (
                 f"; it leaves {util.count(len(still_running), 'process', 'processes')} running" if still_running else ""))
             fields = foundation.workspace_child_fields(still_running)
-            fd = self.lock.fileno()
-            os.set_inheritable(fd, True)
-            os.environ[SERVE_LOCK_FD] = str(fd)
+            fd = self.lock.fileno() if self.lock is not None else None
+            if fd is not None:
+                os.set_inheritable(fd, True)
+                os.environ[SERVE_LOCK_FD] = str(fd)
             os.environ[RESTARTED_FOR_NEW_CODE] = ",".join(map(str, fields[foundation.WORKSPACE_CHILD_PIDS]))
             os.environ[foundation.INHERITED_SERVE_IDENTITIES] = json.dumps(fields[foundation.WORKSPACE_CHILD_IDENTITIES])
             try:
                 os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
-            except BaseException:
-                os.set_inheritable(fd, False)
+            finally:
+                if fd is not None:
+                    os.set_inheritable(fd, False)
                 for name in (SERVE_LOCK_FD, RESTARTED_FOR_NEW_CODE, foundation.INHERITED_SERVE_IDENTITIES):
                     os.environ.pop(name, None)
-                raise
         finally:
             dashboard.POSTS_IN_FLIGHT.reopen()
 
@@ -1332,6 +1409,8 @@ class Server:
         self.workspace_contract_children = foundation.live_serve_children(self.workspace_contract_children)
         authority_problem = "; ".join(dict.fromkeys(filter(None, (
             self.authority_problem, scratch.ignored_legacy_authority()))))
+        cfg_problems = getattr(self.cfg, "problems", ())
+        first_problem = self.config_problem or (cfg_problems[0].text() if cfg_problems else "")
         util.write_json(control.BEAT_FILE, {
             "release": codebase.RELEASE,
             "schema": foundation.LATEST,
@@ -1346,9 +1425,10 @@ class Server:
             "workspace_contract_waiting": self.contracts_waiting,
             **foundation.workspace_child_fields(self.workspace_contract_children),
             "config_ignored": list(self.cfg.ignored),
+            "config_problems": [p.text() for p in cfg_problems],
             **({"authority_problem": authority_problem} if authority_problem else {}),
             "secret_migration": self.secret_migration,
-            **({"config_problem": self.config_problem} if self.config_problem else {}),
+            **({"config_problem": first_problem} if first_problem else {}),
             **({"code_problem": self.code_problem} if self.code_problem else {}),
         })
 
@@ -1447,6 +1527,8 @@ def run(with_dashboard: bool = True) -> NoReturn:
             from . import inbox
 
             server.guard("stage:inbox-start", inbox.on_server_start)
+        elif not server.contracts_waiting:
+            server.guard("stage:inbox-config", server.sync_config_inbox)
         for note in start_notes(server.cfg):
             server.say(note)
         factory_control.notify()

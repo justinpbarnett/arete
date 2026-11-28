@@ -95,7 +95,9 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
     if prompt and ticket:
         raise control.Refused("Give a prompt or a ticket, not both.")
-    cfg = config.load()
+    cfg, problem = config.load_or_problem()
+    if problem:
+        raise control.Refused(problem)
     repo = repo_named(cfg, repo_name.strip())
     if refusal := pipeline.run_refusal(repo)[1]:
         raise control.Refused(refusal)
@@ -157,6 +159,8 @@ def run_ids(repo: str, tid: str) -> list[str]:
 
 
 def held(cfg: config.Config, repo: config.Repo) -> str:
+    if why := config.repo_paused(cfg, repo.name):
+        return why
     going = Counter(r["repo"] for r in pipeline.live_pipeline_runs())
     return pipeline.held_back(cfg, repo.name, going, slots.slots_free_to_start(cfg.max_parallel))
 
@@ -286,6 +290,8 @@ def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
 def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False) -> None:
     if run := live_run(repo.name, tid):
         raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
+    if why := config.repo_paused(cfg, repo.name):
+        raise control.Refused(why + after)
     if not ahead and (why := held(cfg, repo)):
         raise slots.NoFreeSlot(why + after)
     if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),

@@ -412,8 +412,15 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
     from .store import factory as factory_state
 
     factory_state.admit()
-    cfg = cfg or config.load()
+    if cfg is None:
+        cfg, problem = config.load_or_problem()
+        if problem:
+            raise control.Refused(problem)
     loop = control.working_loop(name, cfg)
+    if getattr(loop, "agent", False):
+        repo_name = loop.routing_repo(cfg).name if getattr(loop, "repo", "") else ""
+        if why := config.paused(cfg, repo=repo_name, role="loop", mcp=("*",)):
+            raise control.Refused(why)
     try:
         foundation.require_workspace_contract()
     except foundation.IncompatibleSchema as e:

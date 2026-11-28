@@ -53,7 +53,8 @@ function failures(h) {
   for (const c of h.checks.rows?.checks ?? []) if (c.state !== "ok") add(c.state, "Check", c.key, c.detail);
   for (const p of h.alerts.rows?.probes ?? []) if (!p.ok) add("fault", "Probe", p.name, p.detail);
   for (const l of h.checks.rows?.loops ?? []) if (!l.ok) add("fault", "Loop", l.name, l.detail);
-  if (h.serve.config_problem) add("fault", "Config", "config.toml", h.serve.config_problem);
+  const configProblems = h.serve.config_problems?.length ? h.serve.config_problems : (h.serve.config_problem ? [h.serve.config_problem] : []);
+  for (const text of configProblems) add("fault", "Config", "config.toml", text);
   if (h.serve.code_problem) add("fault", "Code", "new code", h.serve.code_problem);
   for (const [key, f] of Object.entries(h.serve.failing || {})) add(f.ticks >= 3 ? "fault" : "caution", "Serve tick", key, `${f.error} · since ${clock(f.since)}, ${count(f.ticks, "pass", "passes")}`);
   for (const [name, why] of Object.entries(h.serve.broken || {})) add("fault", "Loop file", name, why);

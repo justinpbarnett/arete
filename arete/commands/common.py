@@ -172,8 +172,9 @@ def serve_line(beat: dict) -> str:
         return "serve: never ran; `arete install` starts it"
     if not beat["alive"]:
         return f"serve: DOWN, {'its process is gone, ' if beat['process_gone'] else ''}last beat {when(beat.get('at'))}"
-    paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
-    paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
+    problems = beat.get("config_problems") or ([beat["config_problem"]] if beat.get("config_problem") else [])
+    paused = f"; config problems: {'; '.join(problems)}" if problems else ""
+    paused += f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
     code = serve_revisions(beat)
     running = "unknown loop runs" if beat["running"] is None else util.count(beat["running"], "loop run")

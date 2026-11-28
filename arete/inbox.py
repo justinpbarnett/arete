@@ -54,6 +54,7 @@ RESERVED_MANUAL_PREFIXES = (
     "chat:",
     "incident:",
     "workspace:",
+    "config:",
 )
 
 
@@ -431,6 +432,75 @@ def _workspaces_items(c) -> list[dict]:
     return items
 
 
+def _config_paused_lines(problem: config.Problem, cfg: config.Config) -> list[str]:
+    scope = problem.scope
+    if scope == "global":
+        repos = [r.name for r in cfg.repos]
+        return [*repos, "agent loops", "oncall"] if repos else ["all launches"]
+    if scope.startswith("layer:"):
+        return [scope.removeprefix("layer:")]
+    if scope.startswith("step:"):
+        return [scope]
+    if scope.startswith("mcp:"):
+        return [scope, "agent loops"]
+    if scope == "oncall":
+        return ["oncall"]
+    return [scope] if scope else ["all launches"]
+
+
+def _config_items(c) -> list[dict]:
+    cfg, _ = config.load_or_problem()
+    if not cfg.problems:
+        return []
+    grouped: dict[tuple[str, str], list[config.Problem]] = {}
+    for problem in cfg.problems:
+        if problem.scope.startswith("layer:"):
+            repo_name = problem.scope.removeprefix("layer:")
+            key = (f"config:step_settings/{repo_name}", repo_name)
+        else:
+            key = ("config:step_settings/defaults", "")
+        grouped.setdefault(key, []).append(problem)
+    items = []
+    for (subject, line), file_problems in grouped.items():
+        entries = [
+            {
+                "path": p.path,
+                "section": p.section,
+                "name": p.name,
+                "value": p.value,
+                "scope": p.scope,
+                "pauses": _config_paused_lines(p, cfg),
+                "text": p.text(),
+            }
+            for p in file_problems
+        ]
+        first = file_problems[0]
+        label = f"layer {line}" if line else "config.toml"
+        if first.section or first.name:
+            title = f"Invalid config in {label}: {f'{first.section} {first.name}'.strip()}"
+        else:
+            title = f"{label} does not load"
+        detail = {
+            "path": first.path,
+            "problems": entries,
+            "summary": "; ".join(p.text() for p in file_problems),
+            "stamp": util.digest(json.dumps(entries, sort_keys=True, default=str)),
+        }
+        items.append({
+            "kind": "config_invalid",
+            "subject": subject,
+            "task_id": "",
+            "run_id": "",
+            "line": line,
+            "priority": 1,
+            "title": title,
+            "detail": detail,
+            "verbs": ["continue"],
+            "options": [],
+        })
+    return items
+
+
 ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
@@ -442,6 +512,7 @@ ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "alerts": ("alert:%", _alerts_items),
     "incidents": ("incident:%", _incidents_items),
     "workspaces": ("workspace:%", _workspaces_items),
+    "config": ("config:%", _config_items),
 }
 
 
@@ -599,6 +670,8 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
         if kind == "ticket":
             view = triage.view(connect=lambda: nullcontext(c))
             return next((r for r in view["rows"] if r.get("ref") == ident), None)
+        if kind == "config":
+            return dict(item["detail"])
     return None
 
 
@@ -1169,7 +1242,7 @@ def resolve(
                 handler_result = chat.drop_draft(cid)
                 resolution = "declined"
             stored_answer = verb
-        elif prefix in ("alert", "push"):
+        elif prefix in ("alert", "push", "config"):
             handler_result = {"subject": subject, "continued": True}
             resolution = "continued"
             stored_answer = verb
@@ -1262,3 +1335,4 @@ def tick(pending_secrets=None) -> None:
         expire_pending(c, startup=False, pending_secrets=pending_secrets)
         sync(c, "skipped")
         sync(c, "ready")
+        sync(c, "config")
