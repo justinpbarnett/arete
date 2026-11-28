@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 25
+MINOR = 26
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -139,6 +139,7 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
     ("lease_fenced", 410, "This lease has been fenced by a newer epoch or release."),
     ("lease_expired", 410, "This lease has expired."),
+    ("files_purged", 410, "The retained files for this resource were purged."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
     ("uri_too_long", 414, "The request target is too long."),
     ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
@@ -179,7 +180,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "secret_internal", "already_resolved", "still_missing", "validation",
-                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired"}
+                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired", "files_purged"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
@@ -304,6 +305,7 @@ for _error in ERRORS:
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
+                "files_purged": {"purged_at": STRING},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
@@ -579,7 +581,7 @@ OPERATIONS += [
                  obj({**CONFIG_ID, "draft": STRING, "steps": array(JSON)},
                      [*CONFIG_ID, "draft", "steps"]),
                  {**CONFIG_EXAMPLE, "draft": "CD-1", "steps": ["plan"]}, "POST",
-                 errors=("validation", "invalid_state"), success_status=201),
+                 errors=("validation", "invalid_state", "files_purged"), success_status=201),
      "scope": "config:draft"},
     operation("draft.list", "drafts", envelope({"drafts": array(CONFIG_DRAFT)}),
               obj({"state": STRING, "kind": STRING, "name": STRING, "author": STRING}, [])),
@@ -610,7 +612,7 @@ OPERATIONS += [
               "author": STRING, "body": STRING, "ts": STRING})), "runs": array(RUN)}),
               obj({"id": STRING}), {"id": "example"}),
     operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
-              obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
+              obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}, errors=("files_purged",)),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
     operation("settings.resolved", "settings/resolved", RESOLVED_SETTINGS,
               obj({"repo": STRING, "task_kind": STRING, "node": STRING}, [])),
@@ -618,7 +620,7 @@ OPERATIONS += [
                  SETTINGS_PATCH, {"base_version": 1, "values": {"max_parallel": 2}}, "PATCH"),
      "scope": "config:activate"},
     operation("blob.get", "blobs/{sha256}", envelope({"blob": BLOB_DATA}),
-              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}),
+              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, errors=("files_purged",)),
     {**operation("blob.put", "blobs/{sha256}", envelope({"blob": BLOB_META}),
                  obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, "PUT",
                  errors=("validation",), success_status=201),
@@ -650,8 +652,10 @@ OPERATIONS += [
               {"run": "pip-demo-1", "base_version": 1}, "POST"),
     operation("run.steer", "runs/{run}/steer", envelope({"id": STRING, "queued": BOOLEAN}),
               obj({"run": STRING, "text": STRING}), {"run": "session-demo-1", "text": "Continue"}, "POST"),
-    *(operation(f"run.{action}", f"runs/{{run}}/{action}", envelope({"id": STRING}), obj({"run": STRING}),
-                {"run": "pip-demo-1"}, "POST") for action in ("pin", "unpin")),
+    operation("run.pin", "runs/{run}/pin", envelope({"id": STRING}), obj({"run": STRING}),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",)),
+    operation("run.unpin", "runs/{run}/unpin", envelope({"id": STRING}), obj({"run": STRING}),
+              {"run": "pip-demo-1"}, "POST"),
     operation("chat.drop", "chats/{chat}", envelope({"chat": mapping(JSON)}), obj({"chat": STRING}),
               {"chat": "1"}, "DELETE"),
     {**operation("chat.file", "chats/{chat}/file", envelope({"item": OUTBOX_ITEM}),
@@ -880,11 +884,11 @@ OPERATIONS += [
     operation("turn.list", "runs/{run}/steps/{node}/{try}/turns",
               envelope({"turns": array(TURN)}),
               obj({"run": STRING, "node": STRING, "try": STRING}),
-              {"run": "pip-demo-1", "node": "plan", "try": "1"}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1"}, errors=("files_purged",)),
     operation("turn.get", "runs/{run}/steps/{node}/{try}/turns/{n}",
               envelope({"turn": TURN_DETAIL}),
               obj({"run": STRING, "node": STRING, "try": STRING, "n": STRING}),
-              {"run": "pip-demo-1", "node": "plan", "try": "1", "n": "1"}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1", "n": "1"}, errors=("files_purged",)),
     operation("task.run", "tasks/{task}/run",
               envelope({"run": NULL_RUN, "task": STRING, "repo": STRING, "state": STRING, "why": STRING}, ["seq", "run"]),
               obj({"task": STRING, "repo": STRING, "force": BOOLEAN}, ["task"]),
@@ -898,16 +902,16 @@ OPERATIONS += [
     operation("run.resume", "runs/{run}/resume",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "step": STRING, "node": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
-              {"run": "pip-demo-1"}, "POST", success_status=201),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.repair", "runs/{run}/repair",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
-              {"run": "pip-demo-1"}, "POST", success_status=201),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.step", "runs/{run}/step",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "node": STRING, "set": mapping(JSON),
                    "base_version": {**INTEGER, "minimum": 1}}, ["run", "node"]),
-              {"run": "pip-demo-1", "node": "plan"}, "POST", success_status=201),
+              {"run": "pip-demo-1", "node": "plan"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.import", "runs",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"kind": STRING, "repo": STRING, "issue": {"type": ["integer", "string", "null"]},

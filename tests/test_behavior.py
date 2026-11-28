@@ -14033,7 +14033,7 @@ for label, fn in (
 ):
     try:
         fn()
-    except (control.Refused, refusals.Conflict) as e:
+    except refusals.Refusal as e:
         refusals_seen[label] = str(e)
 
 print("BEHAVIOR_RESULT=" + json.dumps({
@@ -14119,7 +14119,7 @@ try:
         pin_refused = False
         try:
             record.pin(old_pipe)
-        except refusals.Conflict:
+        except (refusals.Conflict, refusals.Gone):
             pin_refused = True
 
         # Next pass completes file removal and clears run_purges.
@@ -14342,6 +14342,810 @@ print("BEHAVIOR_RESULT=" + json.dumps({
         self.assertTrue(res["inbox_names_retention"])
         self.assertTrue(res["ten_day_record_kept"])
         self.assertTrue(res["validator_rejected_all"])
+
+
+class RunRetentionBlobsTurnsTests(_RetentionChildCase):
+    def test_blobs_step_inputs_turn_index_and_draft_keeps(self):
+        res = self.run_retention_child(r"""
+import gzip
+
+from arete import drafts
+from arete.store import blobs as blob_store
+
+retention.policy_file().write_text(
+    "[firings]\ndays = 14\n"
+    "[records]\ndays = 30\nmax_gb = 20\n"
+    "[folders]\ndays = 90\n",
+    encoding="utf-8",
+)
+
+
+def write_turn_record(run_id: str, step_id: int, step_name: str = "build") -> Path:
+    rec_dir = paths.RUNS_DIR / run_id / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    target = rec_dir / f"{step_name}.jsonl.gz"
+    header = {
+        "arete": "header",
+        "step": step_name,
+        "step_id": step_id,
+        "runner": "claude",
+        "model": "sonnet",
+        "started": "2026-01-01T00:00:00Z",
+    }
+    clock = {"arete": "clock", "seconds": 1.25}
+    turn_ev = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"worked on {run_id}"}],
+            "usage": {"input_tokens": 12, "cache_read_input_tokens": 0, "output_tokens": 8},
+        },
+    }
+    raw = (
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(turn_ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    target.write_bytes(raw)
+    return target
+
+
+def seed_rich(kind: str, days: float, *, issue: str = "", loop: str = "", loop_kind: str = "",
+              inputs_payload: bytes, rendered_payload: bytes, resolved_payload: bytes | None = None,
+              shared_sha: str = "") -> dict:
+    extra = {"repo": "app", "issue": issue} if issue else {"loop": loop, "loop_kind": loop_kind}
+    rid = record.start(kind, **extra)
+    folder = paths.RUNS_DIR / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "run.log").write_text("line\n", encoding="utf-8")
+    in_sha = blob_store.put(inputs_payload, "inputs")
+    ren_sha = blob_store.put(rendered_payload, "rendered")
+    res_sha = blob_store.put(resolved_payload, "resolved") if resolved_payload is not None else ""
+    snap_body = json.dumps({"run": rid}, sort_keys=True)
+    snap_sha = blob_store.digest(snap_body.encode("utf-8"))
+    step_inputs = [
+        {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+        {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+    ]
+    if shared_sha:
+        step_inputs.append({"role": "inputs", "name": "shared", "sha256": shared_sha, "call": 1})
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic",
+                       cost_usd=0.0 if loop_kind == "command" else 0.1), 1.0)],
+        inputs=step_inputs,
+        settings_sha=snap_sha,
+        settings_snapshots={snap_sha: snap_body},
+    )
+    sid = run_store.last_step_id(rid)
+    write_turn_record(rid, sid, "build")
+    run_store.add_feed(rid, "note", "feed")
+    record.settle(rid, "done", summary="done")
+    backdate_run(rid, days)
+    return {"id": rid, "step_id": sid, "inputs_sha": in_sha, "rendered_sha": ren_sha,
+            "resolved_sha": res_sha, "snap_sha": snap_sha}
+
+
+shared_sha = blob_store.put(b'{"shared":true}', "inputs")
+fresh = seed_rich("pipeline", 5, issue="1", inputs_payload=b'{"r":"fresh"}',
+                  rendered_payload=b"fresh prompt", resolved_payload=b'{"res":"fresh"}',
+                  shared_sha=shared_sha)
+firing_15 = seed_rich("loop", 15, loop="ping", loop_kind="command",
+                      inputs_payload=b'{"r":"firing"}', rendered_payload=b"firing prompt")
+run_31 = seed_rich("pipeline", 31, issue="2", inputs_payload=b'{"r":"31d"}',
+                   rendered_payload=b"31d prompt", resolved_payload=b'{"res":"31d"}',
+                   shared_sha=shared_sha)
+run_91 = seed_rich("pipeline", 91, issue="3", inputs_payload=b'{"r":"91d"}',
+                   rendered_payload=b"91d prompt", resolved_payload=b'{"res":"91d"}')
+run_40_active_ev = seed_rich("pipeline", 40, issue="4", inputs_payload=b'{"r":"40a"}',
+                             rendered_payload=b"40a prompt")
+run_40_active_author = seed_rich("pipeline", 40, issue="5", inputs_payload=b'{"r":"40auth"}',
+                                 rendered_payload=b"40auth prompt")
+run_40_active_legacy = seed_rich("pipeline", 40, issue="6", inputs_payload=b'{"r":"40leg"}',
+                                 rendered_payload=b"40leg prompt")
+run_40_declined = seed_rich("pipeline", 40, issue="7", inputs_payload=b'{"r":"40dec"}',
+                            rendered_payload=b"40dec prompt")
+run_40_discarded = seed_rich("pipeline", 40, issue="8", inputs_payload=b'{"r":"40disc"}',
+                             rendered_payload=b"40disc prompt")
+
+# Seed active, declined, and discarded drafts citing the 40-day runs via evidence, author, and legacy_proposal.
+drafts.add(kind="prompt", name="plan", body="ok", state="active", evidence={"run": run_40_active_ev["id"]})
+drafts.add(kind="prompt", name="build", body="ok", state="active", author=f"run:{run_40_active_author['id']}/build")
+with foundation.tx() as c:
+    c.execute(
+        "INSERT INTO proposals (id, run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created) "
+        "VALUES (901, ?, 'app', 'app', 'f.md', 'c', 'w', '[]', 0.9, 'rejected', '', ?)",
+        (run_40_active_legacy["id"], util.iso()),
+    )
+    c.execute("UPDATE config_drafts SET legacy_proposal = NULL WHERE id = 901")
+    drafts.add(c, kind="prompt", name="legacy-holder", body="ok", state="active", evidence={}, legacy_proposal=901)
+drafts.add(kind="prompt", name="plan", body="no", state="declined", evidence={"run": run_40_declined["id"]})
+drafts.add(kind="prompt", name="plan", body="no2", state="discarded", evidence={"run": run_40_discarded["id"]})
+
+record.rebuild_turn_index()
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+with foundation.reader() as c:
+    r31_row = dict(c.execute("SELECT files_purged, records_purged FROM runs WHERE id = ?", (run_31["id"],)).fetchone())
+    r31_turns = c.execute("SELECT COUNT(*) FROM turn_index WHERE run_id = ?", (run_31["id"],)).fetchone()[0]
+    r31_in_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["inputs_sha"],)).fetchone())
+    r31_ren_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["rendered_sha"],)).fetchone())
+    r31_res_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["resolved_sha"],)).fetchone())
+    r31_snap = c.execute("SELECT 1 FROM settings_snapshots WHERE sha256 = ?", (run_31["snap_sha"],)).fetchone()
+    shared_blob = dict(c.execute("SELECT purged_at, purge_reason FROM blobs WHERE sha256 = ?", (shared_sha,)).fetchone())
+
+    r91_row = dict(c.execute("SELECT files_purged, records_purged FROM runs WHERE id = ?", (run_91["id"],)).fetchone())
+    r91_si = c.execute("SELECT COUNT(*) FROM step_inputs WHERE step_id = ?", (run_91["step_id"],)).fetchone()[0]
+
+    f15_run = c.execute("SELECT 1 FROM runs WHERE id = ?", (firing_15["id"],)).fetchone()
+    f15_si = c.execute("SELECT COUNT(*) FROM step_inputs WHERE step_id = ?", (firing_15["step_id"],)).fetchone()[0]
+    f15_turns = c.execute("SELECT COUNT(*) FROM turn_index WHERE run_id = ?", (firing_15["id"],)).fetchone()[0]
+    f15_in_blob = dict(c.execute("SELECT purged_at, purge_reason FROM blobs WHERE sha256 = ?", (firing_15["inputs_sha"],)).fetchone())
+
+    r40_active_ev_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_ev["id"],)).fetchone()[0]
+    r40_active_auth_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_author["id"],)).fetchone()[0]
+    r40_active_leg_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_legacy["id"],)).fetchone()[0]
+    r40_dec_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_declined["id"],)).fetchone()[0]
+    r40_disc_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_discarded["id"],)).fetchone()[0]
+
+# Resurrection check: rewriting the purged inputs blob clears purged_at and purge_reason and restores file.
+blob_store.put(b'{"r":"31d"}', "inputs")
+resurrected = blob_store.meta(run_31["inputs_sha"])
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "r31_folder": (paths.RUNS_DIR / run_31["id"]).is_dir(),
+    "r31_record_gone": not (paths.RUNS_DIR / run_31["id"] / "record").exists(),
+    "r31_records_purged": bool(r31_row["records_purged"]),
+    "r31_files_purged": r31_row["files_purged"],
+    "r31_turns": r31_turns,
+    "r31_inputs_purged": bool(r31_in_blob["purged_at"]) and r31_in_blob["purge_reason"] == "retention",
+    "r31_rendered_purged": bool(r31_ren_blob["purged_at"]) and r31_ren_blob["purge_reason"] == "retention",
+    "r31_rendered_file_gone": not blob_store.blob_path(run_31["rendered_sha"]).exists(),
+    "r31_resolved_kept": r31_res_blob["purged_at"] is None and blob_store.blob_path(run_31["resolved_sha"]).is_file(),
+    "r31_snap_kept": r31_snap is not None,
+    "shared_blob_kept": shared_blob["purged_at"] is None and blob_store.blob_path(shared_sha).is_file(),
+    "r91_kept_si": bool(r91_row["files_purged"]) and r91_si == 2 and not (paths.RUNS_DIR / run_91["id"]).exists(),
+    "f15_purged": (f15_run is None and f15_si == 0 and f15_turns == 0
+                   and not (paths.RUNS_DIR / firing_15["id"]).exists()
+                   and bool(f15_in_blob["purged_at"]) and f15_in_blob["purge_reason"] == "retention"
+                   and not blob_store.blob_path(firing_15["inputs_sha"]).exists()),
+    "active_ev_kept": r40_active_ev_rp is None and (paths.RUNS_DIR / run_40_active_ev["id"] / "record").is_dir(),
+    "active_author_kept": r40_active_auth_rp is None and (paths.RUNS_DIR / run_40_active_author["id"] / "record").is_dir(),
+    "active_legacy_kept": r40_active_leg_rp is None and (paths.RUNS_DIR / run_40_active_legacy["id"] / "record").is_dir(),
+    "declined_gone": bool(r40_dec_rp) and not (paths.RUNS_DIR / run_40_declined["id"] / "record").exists(),
+    "discarded_gone": bool(r40_disc_rp) and not (paths.RUNS_DIR / run_40_discarded["id"] / "record").exists(),
+    "resurrected": (resurrected["purged_at"] is None and resurrected["purge_reason"] is None
+                    and blob_store.blob_path(run_31["inputs_sha"]).is_file()),
+}))
+""")
+        self.assertTrue(res["r31_folder"])
+        self.assertTrue(res["r31_record_gone"])
+        self.assertTrue(res["r31_records_purged"])
+        self.assertIsNone(res["r31_files_purged"])
+        self.assertEqual(res["r31_turns"], 0)
+        self.assertTrue(res["r31_inputs_purged"])
+        self.assertTrue(res["r31_rendered_purged"])
+        self.assertTrue(res["r31_rendered_file_gone"])
+        self.assertTrue(res["r31_resolved_kept"])
+        self.assertTrue(res["r31_snap_kept"])
+        self.assertTrue(res["shared_blob_kept"])
+        self.assertTrue(res["r91_kept_si"])
+        self.assertTrue(res["f15_purged"])
+        self.assertTrue(res["active_ev_kept"])
+        self.assertTrue(res["active_author_kept"])
+        self.assertTrue(res["active_legacy_kept"])
+        self.assertTrue(res["declined_gone"])
+        self.assertTrue(res["discarded_gone"])
+        self.assertTrue(res["resurrected"])
+
+    def test_turn_index_rebuild_matches_live_after_pass_and_between_phases(self):
+        res = self.run_retention_child(r"""
+import gzip
+
+retention.policy_file().write_text(
+    "[firings]\ndays = 14\n[records]\ndays = 30\nmax_gb = 20\n[folders]\ndays = 90\n",
+    encoding="utf-8",
+)
+
+
+def seed_with_turns(kind: str, days: float, **extra) -> str:
+    rid = record.start(kind, **extra)
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic",
+                       cost_usd=0.0 if extra.get("loop_kind") == "command" else 0.1), 1.0)],
+    )
+    sid = run_store.last_step_id(rid)
+    rec_dir = paths.RUNS_DIR / rid / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    header = {"arete": "header", "step": "build", "step_id": sid, "runner": "claude",
+              "model": "sonnet", "started": "2026-01-01T00:00:00Z"}
+    clock = {"arete": "clock", "seconds": 0.5}
+    ev = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": rid}],
+          "usage": {"input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 4}}}
+    (rec_dir / "build.jsonl.gz").write_bytes(
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    record.settle(rid, "done", summary="done")
+    backdate_run(rid, days)
+    return rid
+
+
+kept_5 = seed_with_turns("pipeline", 5, repo="app", issue="1")
+rec_31 = seed_with_turns("pipeline", 31, repo="app", issue="2")
+old_91 = seed_with_turns("pipeline", 91, repo="app", issue="3")
+fir_15 = seed_with_turns("loop", 15, loop="ping", loop_kind="command")
+record.rebuild_turn_index()
+
+
+def dump_turns() -> list[dict]:
+    with foundation.reader() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM turn_index ORDER BY step_id, n").fetchall()]
+
+
+before_count = len(dump_turns())
+policy = retention.load_live()
+measured = retention_store.measure()
+with principals.acting("hand"):
+    retention_store.prune_rows(policy, measured)
+
+# Between rows tx and file phase: record files still exist on disk, but rebuild adds no purged row back.
+files_still_present_between = (
+    (paths.RUNS_DIR / rec_31 / "record").is_dir()
+    and (paths.RUNS_DIR / old_91 / "record").is_dir()
+    and (paths.RUNS_DIR / fir_15 / "record").is_dir()
+)
+live_between = dump_turns()
+record.rebuild_turn_index()
+rebuilt_between = dump_turns()
+
+# Now run file phase and rebuild again.
+retention_store.prune_files()
+live_after = dump_turns()
+record.rebuild_turn_index()
+rebuilt_after = dump_turns()
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "before_count": before_count,
+    "files_still_present_between": files_still_present_between,
+    "live_between_runs": [r["run_id"] for r in live_between],
+    "between_equal": rebuilt_between == live_between,
+    "after_equal": rebuilt_after == live_after == live_between,
+    "kept_5": kept_5,
+}))
+""")
+        self.assertEqual(res["before_count"], 4)
+        self.assertTrue(res["files_still_present_between"])
+        self.assertEqual(res["live_between_runs"], [res["kept_5"]])
+        self.assertTrue(res["between_equal"])
+        self.assertTrue(res["after_equal"])
+
+    def test_failed_blob_unlink_retries_on_next_pass(self):
+        res = self.run_retention_child(r"""
+from arete.store import blobs as blob_store
+
+retention.policy_file().write_text("[records]\ndays = 30\nmax_gb = 20\n[folders]\ndays = 90\n", encoding="utf-8")
+rid = record.start("pipeline", repo="app", issue="50")
+in_sha = blob_store.put(b'{"retry":"blob"}', "inputs")
+ren_sha = blob_store.put(b"retry rendered", "rendered")
+run_store.insert_steps(
+    rid,
+    "build",
+    [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic", cost_usd=0.1), 1.0)],
+    inputs=[
+        {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+        {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+    ],
+)
+record.settle(rid, "done", summary="done")
+backdate_run(rid, 31)
+
+target_paths = {str(blob_store.blob_path(in_sha)), str(blob_store.blob_path(ren_sha))}
+real_unlink = os.unlink
+
+
+def failing_unlink(path, *args, **kwargs):
+    if str(path) in target_paths:
+        raise OSError("simulated unlink failure")
+    return real_unlink(path, *args, **kwargs)
+
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        with mock.patch("os.unlink", side_effect=failing_unlink):
+            server.prune_data()
+        after_fail = {
+            "in_purged_at": bool(blob_store.meta(in_sha)["purged_at"]),
+            "in_file_exists": blob_store.blob_path(in_sha).is_file(),
+            "ren_file_exists": blob_store.blob_path(ren_sha).is_file(),
+            "error_logged": any("file purge failed" in line for line in said),
+        }
+        server.prune_data()
+        after_retry = {
+            "in_purged_at": bool(blob_store.meta(in_sha)["purged_at"]),
+            "in_file_exists": blob_store.blob_path(in_sha).exists(),
+            "ren_file_exists": blob_store.blob_path(ren_sha).exists(),
+        }
+finally:
+    server.pool.shutdown(wait=True)
+
+print("BEHAVIOR_RESULT=" + json.dumps({"after_fail": after_fail, "after_retry": after_retry}))
+""")
+        self.assertEqual(
+            res["after_fail"],
+            {"in_purged_at": True, "in_file_exists": True, "ren_file_exists": True, "error_logged": True},
+        )
+        self.assertEqual(
+            res["after_retry"],
+            {"in_purged_at": True, "in_file_exists": False, "ren_file_exists": False},
+        )
+
+
+class RunRetentionGateAnd410Tests(_RetentionChildCase):
+    def test_retention_gate_c_a_hand_edit_pre_commit_and_config_routes(self):
+        res = self.run_retention_child(r"""
+import http.client
+import subprocess
+import threading
+import tomllib
+
+from arete import dashboard, drafts, tailnet
+from arete.store import tokens as token_store
+
+owner = principals.owner()
+with foundation.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.insert(c, owner, "owner-cli", ["*"])
+    _, session_token = token_store.insert(
+        c, owner, "owner-session", ["*"], kind="session",
+        expires=token_store.session_lifetime(util.now()),
+    )
+    _, run_token = token_store.insert(
+        c, owner, "run-step", ["read", "config:draft", "config:activate"], run_id="pip-99",
+    )
+cookie = f"{dashboard.credential_http.COOKIE}={session_token}"
+
+configrepo.init()
+run_70 = seed_run("pipeline", "done", 70, repo="app", issue="70", with_feed=True)
+run_10 = seed_run("pipeline", "done", 10, repo="app", issue="10", with_feed=True)
+
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+    def admit(self, method, path):
+        self.server.tls = object()
+        try:
+            return super().admit(method, path)
+        finally:
+            self.server.tls = None
+
+
+address = "127.0.0.1"
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, "of", return_value="owner@example.test"), \
+     mock.patch("socket.getfqdn", return_value=address):
+    http_srv = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    http_srv.daemon_threads = False
+    thread = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    server, said = quiet_server()
+    try:
+        def req(method, path, body=None, *, headers=None, expected=200):
+            conn = http.client.HTTPConnection(address, http_srv.server_port, timeout=10)
+            try:
+                hdrs = {"Content-Type": "application/json", **(headers or {})}
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        auth_owner = {"Authorization": f"Bearer {owner_token}"}
+        auth_sess = {"Cookie": cookie, "X-Arete": "1"}
+        auth_run = {"Authorization": f"Bearer {run_token}"}
+
+        # config.get (config.read) serves retention/defaults even before retention.toml exists.
+        read0 = req("GET", "/api/v1/config/retention/defaults", headers=auth_owner)["item"]
+        base_ver = read0["version"]
+
+        # 1. Lowering [folders] days to 60 gets gate C.
+        lower_res = req(
+            "PUT", "/api/v1/config/retention/defaults/draft",
+            {"body": "[folders]\ndays = 60\n", "why": "lower folders days"},
+            headers={**auth_owner, "Idempotency-Key": "ret-lower-60"},
+            expected=201,
+        )
+        d60 = lower_res["draft"]
+
+        # config.check serves retention.
+        chk60 = req(
+            "POST", "/api/v1/config/retention/defaults/check",
+            {"draft": d60["id"]},
+            headers={**auth_owner, "Idempotency-Key": "ret-chk-60"},
+        )["report"]
+
+        # Lowering [records] max_gb also gets gate C.
+        chk_gb = req(
+            "POST", "/api/v1/config/retention/defaults/check",
+            {"body": "[records]\nmax_gb = 10\n"},
+            headers={**auth_owner, "Idempotency-Key": "ret-chk-gb"},
+        )["report"]
+
+        # config.try on retention gets 422 validation.
+        try_err = req(
+            "POST", "/api/v1/config/retention/defaults/try",
+            {"draft": d60["id"], "steps": ["build"]},
+            headers={**auth_owner, "Idempotency-Key": "ret-try-1"},
+            expected=422,
+        )
+
+        # Pass while lowered draft is NOT active leaves 70-day folder untouched.
+        with principals.acting("hand"):
+            server.prune_data()
+        r70_before_activate = (paths.RUNS_DIR / run_70).is_dir() and run_store.run_get(run_70)["files_purged"] is None
+
+        # A run actor's activate gets 403 gate_refused.
+        run_act_err = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d60["id"], "base_version": base_ver},
+            headers={**auth_run, "Idempotency-Key": "ret-run-act"},
+            expected=403,
+        )
+
+        # Owner's activate requires presence (202), then approving presence activates it.
+        pend = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d60["id"], "base_version": base_ver},
+            headers={**auth_owner, "Idempotency-Key": "ret-owner-act"},
+            expected=202,
+        )
+        pres_item = req("GET", pend["watch"], headers=auth_sess)["item"]
+        req(
+            "POST", f"/api/v1/inbox/{pres_item['id']}/resolve",
+            {"verb": "approve", "base_version": pres_item["version"]},
+            headers={**auth_sess, "Idempotency-Key": "ret-pres-approve"},
+        )
+        d60_after = drafts.get(d60["id"])
+        live_after_60 = tomllib.loads(configrepo.live_bytes("retention.toml").decode("utf-8"))
+
+        # Pass now purges the 70-day folder!
+        with principals.acting("hand"):
+            server.prune_data()
+        r70_after_activate = not (paths.RUNS_DIR / run_70).exists() and bool(run_store.run_get(run_70)["files_purged"])
+
+        # 2. Raising [folders] days to 120 has gate A and activates immediately (200, no presence).
+        ver_60 = req("GET", "/api/v1/config/retention/defaults", headers=auth_owner)["item"]["version"]
+        raise_res = req(
+            "PUT", "/api/v1/config/retention/defaults/draft",
+            {"body": "[folders]\ndays = 120\n", "why": "raise folders days"},
+            headers={**auth_owner, "Idempotency-Key": "ret-raise-120"},
+            expected=201,
+        )
+        d120 = raise_res["draft"]
+        act120 = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d120["id"], "base_version": ver_60},
+            headers={**auth_owner, "Idempotency-Key": "ret-act-120"},
+            expected=200,
+        )
+        live_after_120 = tomllib.loads(configrepo.live_bytes("retention.toml").decode("utf-8"))
+
+        # config.retention.changed events were emitted.
+        with foundation.reader() as c:
+            changed_count = c.execute(
+                "SELECT COUNT(*) FROM events_log WHERE kind = 'config.retention.changed'"
+            ).fetchone()[0]
+
+        # 3. Hand edit lowering [records] days waits as a draft; live stays; pass does not prune 10-day run.
+        retention.policy_file().write_text("[records]\ndays = 5\n[folders]\ndays = 120\n", encoding="utf-8")
+        committed_hand = configrepo.commit_hand_edits()
+        hand_drafts = [
+            d for d in drafts.list_drafts(state="valid", kind="retention", author="hand")
+            if d["gate"] == "C"
+        ]
+        with principals.acting("hand"):
+            server.prune_data()
+        r10_kept_after_hand = (paths.RUNS_DIR / run_10 / "record").is_dir() and run_store.run_get(run_10)["records_purged"] is None
+
+        # Pre-commit hook refuses direct git commit without ARETE_ACTIVATE_C=1, allows with ARETE_ACTIVATE_C=1.
+        hook_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_") and k != "ARETE_ACTIVATE_C"}
+        hook_env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "hand",
+            "GIT_AUTHOR_EMAIL": "hand@local",
+            "GIT_COMMITTER_NAME": "hand",
+            "GIT_COMMITTER_EMAIL": "hand@local",
+        })
+        subprocess.run(["git", "add", "--", "retention.toml"], cwd=paths.CONFIG_DIR, env=hook_env, check=True, capture_output=True)
+        refused_commit = subprocess.run(
+            ["git", "-c", f"core.hooksPath={paths.CONFIG_DIR / '.git' / 'hooks'}", "commit", "-m", "lower records days"],
+            cwd=paths.CONFIG_DIR, env=hook_env, capture_output=True, text=True,
+        )
+        allowed_commit = subprocess.run(
+            ["git", "-c", f"core.hooksPath={paths.CONFIG_DIR / '.git' / 'hooks'}", "commit", "-m", "lower records days"],
+            cwd=paths.CONFIG_DIR, env={**hook_env, "ARETE_ACTIVATE_C": "1"}, capture_output=True, text=True,
+        )
+    finally:
+        server.pool.shutdown(wait=True)
+        http_srv.shutdown()
+        thread.join()
+        http_srv.server_close()
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "read0_kind": read0["kind"],
+    "d60_gate": d60["gate"],
+    "chk60_gate": chk60["gate"],
+    "chk_gb_gate": chk_gb["gate"],
+    "try_code": try_err["code"],
+    "r70_before_activate": r70_before_activate,
+    "run_act_code": run_act_err["code"],
+    "pend_state": pend["state"],
+    "d60_active": d60_after["state"] == "active" and bool(d60_after["activated_commit"]),
+    "live_60": live_after_60["folders"]["days"],
+    "r70_after_activate": r70_after_activate,
+    "d120_gate": d120["gate"],
+    "act120_active": act120["draft"]["state"] == "active",
+    "live_120": live_after_120["folders"]["days"],
+    "changed_count": changed_count,
+    "hand_waited": committed_hand == [] and len(hand_drafts) == 1,
+    "r10_kept_after_hand": r10_kept_after_hand,
+    "hook_refused": refused_commit.returncode != 0 and "ARETE_ACTIVATE_C=1" in refused_commit.stderr,
+    "hook_allowed": allowed_commit.returncode == 0,
+}))
+""")
+        self.assertEqual(res["read0_kind"], "retention")
+        self.assertEqual(res["d60_gate"], "C")
+        self.assertEqual(res["chk60_gate"], "C")
+        self.assertEqual(res["chk_gb_gate"], "C")
+        self.assertEqual(res["try_code"], "validation")
+        self.assertTrue(res["r70_before_activate"])
+        self.assertEqual(res["run_act_code"], "gate_refused")
+        self.assertEqual(res["pend_state"], "awaiting_presence")
+        self.assertTrue(res["d60_active"])
+        self.assertEqual(res["live_60"], 60)
+        self.assertTrue(res["r70_after_activate"])
+        self.assertEqual(res["d120_gate"], "A")
+        self.assertTrue(res["act120_active"])
+        self.assertEqual(res["live_120"], 120)
+        self.assertGreaterEqual(res["changed_count"], 2)
+        self.assertTrue(res["hand_waited"])
+        self.assertTrue(res["r10_kept_after_hand"])
+        self.assertTrue(res["hook_refused"])
+        self.assertTrue(res["hook_allowed"])
+
+    def test_410_files_purged_api_and_cli_refusals(self):
+        res = self.run_retention_child(r"""
+import gzip
+import http.client
+import subprocess
+import sys
+import threading
+
+from arete import credential_files, dashboard, drafts, tailnet
+from arete.store import blobs as blob_store
+from arete.store import tokens as token_store
+
+owner = principals.owner()
+with foundation.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.insert(c, owner, "owner-cli", ["*"])
+credential_files.write_client(foundation.schema_metadata()["instance_tag"], owner_token)
+
+configrepo.init()
+
+
+def seed_run_for_410(days: float, issue: str, in_payload: bytes) -> dict:
+    rid = record.start("pipeline", repo="app", issue=issue, adw="default")
+    folder = paths.RUNS_DIR / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "run.log").write_text("log\n", encoding="utf-8")
+    in_sha = blob_store.put(in_payload, "inputs")
+    ren_sha = blob_store.put(b"rendered-" + issue.encode("utf-8"), "rendered")
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic", cost_usd=0.1), 1.0)],
+        inputs=[
+            {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+            {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+        ],
+    )
+    sid = run_store.last_step_id(rid)
+    rec_dir = folder / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    header = {"arete": "header", "step": "build", "step_id": sid, "runner": "claude",
+              "model": "sonnet", "started": "2026-01-01T00:00:00Z"}
+    clock = {"arete": "clock", "seconds": 0.5}
+    ev = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": rid}],
+          "usage": {"input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 4}}}
+    (rec_dir / "build.jsonl.gz").write_bytes(
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    run_store.add_feed(rid, "note", "feed line")
+    record.settle(rid, "failed", summary="failed")
+    backdate_run(rid, days)
+    return {"id": rid, "step_id": sid, "inputs_sha": in_sha, "rendered_sha": ren_sha}
+
+
+r31 = seed_run_for_410(31, "31", b'{"run":31}')
+r91 = seed_run_for_410(91, "91", b'{"run":91}')
+record.rebuild_turn_index()
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+r31_row = run_store.run_get(r31["id"])
+r91_row = run_store.run_get(r91["id"])
+r31_blob = blob_store.meta(r31["inputs_sha"])
+runs_before = len(run_store.runs(limit=100))
+
+# Create a valid prompt draft for config.try against r31's build step.
+prompt_draft, _ = drafts.create_and_check("prompt", "plan", (paths.PROMPTS_DIR / "plan.md").read_text(encoding="utf-8"), author=owner)
+
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+
+address = "127.0.0.1"
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, "of", return_value="owner@example.test"), \
+     mock.patch("socket.getfqdn", return_value=address):
+    http_srv = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    http_srv.daemon_threads = False
+    thread = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        def req(method, path, body=None, *, headers=None, expected=200):
+            conn = http.client.HTTPConnection(address, http_srv.server_port, timeout=10)
+            try:
+                hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {owner_token}", **(headers or {})}
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        run31_api = req("GET", f"/api/v1/runs/{r31['id']}")["run"]
+        run91_api = req("GET", f"/api/v1/runs/{r91['id']}")["run"]
+
+        t_list = req("GET", f"/api/v1/runs/{r31['id']}/steps/build/1/turns", expected=410)
+        t_get = req("GET", f"/api/v1/runs/{r31['id']}/steps/build/1/turns/1", expected=410)
+        ls_read = req("GET", f"/api/v1/line-stream?run={r91['id']}", expected=410)
+        b_get = req("GET", f"/api/v1/blobs/{r31['inputs_sha']}", expected=410)
+
+        r91_resume = req(
+            "POST", f"/api/v1/runs/{r91['id']}/resume",
+            {"base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-resume"},
+            expected=410,
+        )
+        r91_repair = req(
+            "POST", f"/api/v1/runs/{r91['id']}/repair",
+            {"base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-repair"},
+            expected=410,
+        )
+        r91_step = req(
+            "POST", f"/api/v1/runs/{r91['id']}/step",
+            {"node": "build", "base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-step"},
+            expected=410,
+        )
+        r91_pin = req(
+            "POST", f"/api/v1/runs/{r91['id']}/pin",
+            {},
+            headers={"Idempotency-Key": "k-r91-pin"},
+            expected=410,
+        )
+        r31_step = req(
+            "POST", f"/api/v1/runs/{r31['id']}/step",
+            {"node": "build", "base_version": r31_row["version"]},
+            headers={"Idempotency-Key": "k-r31-step"},
+            expected=410,
+        )
+        r31_try = req(
+            "POST", "/api/v1/config/prompt/plan/try",
+            {"draft": prompt_draft["id"], "steps": [{"run": r31["id"], "step": "build"}]},
+            headers={"Idempotency-Key": "k-r31-try"},
+            expected=410,
+        )
+
+        # CLI resume, repair, and step refuse r91 naming the purge date.
+        cli_env = {
+            **os.environ,
+            "ARETE_SERVER": f"http://{address}:{http_srv.server_port}",
+        }
+        cli_out = {}
+        for label, argv in (
+            ("resume", ["resume", r91["id"]]),
+            ("repair", ["repair", r91["id"]]),
+            ("step", ["step", r91["id"], "build"]),
+        ):
+            done = subprocess.run(
+                [sys.executable, "-m", "arete.cli", *argv],
+                cwd=Path.cwd(),
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            cli_out[label] = {"rc": done.returncode, "text": done.stdout + done.stderr}
+    finally:
+        http_srv.shutdown()
+        thread.join()
+        http_srv.server_close()
+
+with foundation.reader() as c:
+    idem_410_stored = c.execute(
+        "SELECT COUNT(*) FROM idempotency WHERE key IN ('k-r91-resume','k-r91-repair','k-r91-step','k-r91-pin','k-r31-step','k-r31-try')"
+    ).fetchone()[0]
+    pins_after = c.execute("SELECT COUNT(*) FROM record_pins WHERE run_id = ?", (r91["id"],)).fetchone()[0]
+runs_after = len(run_store.runs(limit=100))
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "run31_fields": [run31_api["records_purged"] == r31_row["records_purged"], run31_api["files_purged"] is None],
+    "run91_fields": [run91_api["files_purged"] == r91_row["files_purged"], run91_api["records_purged"] == r91_row["records_purged"]],
+    "t_list": [t_list["code"], t_list["purged_at"] == r31_row["records_purged"]],
+    "t_get": [t_get["code"], t_get["purged_at"] == r31_row["records_purged"]],
+    "ls_read": [ls_read["code"], ls_read["purged_at"] == r91_row["files_purged"]],
+    "b_get": [b_get["code"], b_get["purged_at"] == r31_blob["purged_at"]],
+    "r91_resume": [r91_resume["code"], r91_resume["purged_at"] == r91_row["files_purged"]],
+    "r91_repair": [r91_repair["code"], r91_repair["purged_at"] == r91_row["files_purged"]],
+    "r91_step": [r91_step["code"], r91_step["purged_at"] == r91_row["files_purged"]],
+    "r91_pin": [r91_pin["code"], r91_pin["purged_at"] == r91_row["files_purged"]],
+    "r31_step": [r31_step["code"], r31_step["purged_at"] == r31_blob["purged_at"]],
+    "r31_try": [r31_try["code"], r31_try["purged_at"] == r31_blob["purged_at"]],
+    "idem_410_stored": idem_410_stored,
+    "started_or_pinned_nothing": runs_after == runs_before and pins_after == 0,
+    "cli_refused_with_date": all(
+        cli_out[k]["rc"] == 1 and r91_row["files_purged"] in cli_out[k]["text"]
+        for k in ("resume", "repair", "step")
+    ),
+}))
+""")
+        self.assertEqual(res["run31_fields"], [True, True])
+        self.assertEqual(res["run91_fields"], [True, True])
+        self.assertEqual(res["t_list"], ["files_purged", True])
+        self.assertEqual(res["t_get"], ["files_purged", True])
+        self.assertEqual(res["ls_read"], ["files_purged", True])
+        self.assertEqual(res["b_get"], ["files_purged", True])
+        self.assertEqual(res["r91_resume"], ["files_purged", True])
+        self.assertEqual(res["r91_repair"], ["files_purged", True])
+        self.assertEqual(res["r91_step"], ["files_purged", True])
+        self.assertEqual(res["r91_pin"], ["files_purged", True])
+        self.assertEqual(res["r31_step"], ["files_purged", True])
+        self.assertEqual(res["r31_try"], ["files_purged", True])
+        self.assertEqual(res["idem_410_stored"], 0)
+        self.assertTrue(res["started_or_pinned_nothing"])
+        self.assertTrue(res["cli_refused_with_date"])
 
 
 class _PinnedRunCase(unittest.TestCase):

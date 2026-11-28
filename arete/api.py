@@ -455,10 +455,18 @@ def read(name, values, handler):
         except ValueError as error:
             raise contract.Problem("invalid_input", str(error)) from None
     if name == "blob.get":
-        found = blobs.get(values["sha256"])
-        if found is None:
+        meta_row = blobs.meta(values["sha256"])
+        if meta_row is None:
             raise contract.Problem("not_found", f"No blob {values['sha256']}")
-        meta_row, raw = found
+        if purged := meta_row.get("purged_at"):
+            raise contract.Problem(
+                "files_purged",
+                f"blob {values['sha256']} was removed on {purged}",
+                purged_at=purged,
+            )
+        raw = blobs.read(values["sha256"])
+        if raw is None:
+            raise contract.Problem("not_found", f"No blob {values['sha256']}")
         try:
             encoded, encoding = raw.decode("utf-8"), "utf-8"
         except UnicodeDecodeError:
@@ -498,6 +506,12 @@ def read(name, values, handler):
         if not after.isascii() or not after.isdecimal() or len(after) > 18:
             raise contract.Problem("invalid_input", "after must be a nonnegative decimal cursor")
         found = control.feed(values["run"], int(after))
+        if purged := found["run"].get("files_purged"):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} files were removed on {purged}",
+                purged_at=purged,
+            )
         return {"lines": found["lines"], "after": max([int(after), *[r["id"] for r in found["lines"]]])}
     identity = values.get("id", "")
     if name == "run.diff":
@@ -515,6 +529,13 @@ def read(name, values, handler):
         raw_try = values["try"]
         if not raw_try.isascii() or not raw_try.isdecimal() or int(raw_try) < 1:
             raise contract.Problem("invalid_input", "try must be a positive integer")
+        run_row = runs.run_get(values["run"])
+        if run_row is not None and (purged := run_row.get("records_purged") or run_row.get("files_purged")):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} records were removed on {purged}",
+                purged_at=purged,
+            )
         matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
         if not matched_steps:
             raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
@@ -525,6 +546,13 @@ def read(name, values, handler):
             raise contract.Problem("invalid_input", "try must be a positive integer")
         if not raw_n.isascii() or not raw_n.isdecimal() or int(raw_n) < 1:
             raise contract.Problem("invalid_input", "n must be a positive integer")
+        run_row = runs.run_get(values["run"])
+        if run_row is not None and (purged := run_row.get("records_purged") or run_row.get("files_purged")):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} records were removed on {purged}",
+                purged_at=purged,
+            )
         matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
         if not matched_steps:
             raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
@@ -588,9 +616,9 @@ def _resolve_activate_draft_id(values: dict) -> str:
     return found[0]["id"]
 
 
-def _needs_config_presence(name: str, values: dict) -> dict | None:
+def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None:
     """Return extra_detail dict if this config/settings write requires Gate C presence, else None."""
-    actor = principals.current()
+    actor = _config_actor(handler)
     root = paths.CONFIG_DIR.resolve()
     if name == "config.activate":
         draft_id = _resolve_activate_draft_id(values)
@@ -712,7 +740,7 @@ def dispatch(handler, op, path_values, query):
                 return put_blob(handler, op, identity)
             if (name in ("config.activate", "config.rollback", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values)
+                extra_detail = _needs_config_presence(name, values, handler)
                 if extra_detail is not None:
                     if handler.credential is None or "Idempotency-Key" not in handler.headers:
                         credential_http.require_presence(handler.credential)
@@ -796,10 +824,14 @@ def _resolve_events_input(raw_events):
     if isinstance(raw_events, list):
         return raw_events
     if isinstance(raw_events, str):
-        found = blobs.get(raw_events)
-        if found is None:
+        meta_row = blobs.meta(raw_events)
+        if meta_row is None:
             raise contract.Problem("not_found", f"No blob {raw_events}")
-        _, raw = found
+        if purged := meta_row.get("purged_at"):
+            raise contract.Problem("files_purged", f"blob {raw_events} was removed on {purged}", purged_at=purged)
+        raw = blobs.read(raw_events)
+        if raw is None:
+            raise contract.Problem("not_found", f"No blob {raw_events}")
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as error:
@@ -830,7 +862,7 @@ def _config_actor(handler) -> str:
     if cred is not None:
         if cred.actor.startswith("run:"):
             return cred.actor
-        if cred.principal.startswith("u:"):
+        if cred.principal.startswith(("u:", "run:")):
             return cred.principal
         return cred.actor
     return principals.current()

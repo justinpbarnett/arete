@@ -142,7 +142,6 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
     blob_rows: tuple[tuple[str, str, int], ...] = ()
     if resolution is not None:
         resolution.payer = payer_val
-        blob_rows = resolution.write_blobs()
         row["config_commit"] = resolution.config_commit or None
         row["resolved_sha"] = resolution.resolved_sha
         if "adw" not in fields and resolution.adw is not None:
@@ -154,32 +153,35 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
     if kind in TICKET_KINDS:
         row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
                    measured_at=row["started"])
-    while True:
-        minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
-        row_with_chain = {**row, "chain": chain_val or minted}
-        try:
-            with foundation.tx() as c:
-                if run_store.has_pins(c):
-                    for sha, blob_kind, size in blob_rows:
-                        blob_store.record_row(c, sha, blob_kind, size)
-                    if resolution is not None and resolution.settings_snapshots:
-                        run_store.save_settings_snapshots(c, resolution.settings_snapshots)
-                run_store.insert_run(minted, row_with_chain)
-        except sqlite3.IntegrityError as e:
-            if run_id or "runs.id" not in str(e):
-                raise
-            continue
+    with (blob_store.lock() if resolution is not None else contextlib.nullcontext()):
         if resolution is not None:
-            resolved_file = paths.RUNS_DIR / minted / "resolved.json"
-            util.write_durably(resolved_file, resolution.resolved_bytes, 0o600)
-        # A nested writer has not committed yet; retain its lease until exit.
-        if kind in TICKET_KINDS and not nested:
-            launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
-        return minted
+            blob_rows = resolution.write_blobs()
+        while True:
+            minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
+            row_with_chain = {**row, "chain": chain_val or minted}
+            try:
+                with foundation.tx() as c:
+                    if run_store.has_pins(c):
+                        for sha, blob_kind, size in blob_rows:
+                            blob_store.record_row(c, sha, blob_kind, size)
+                        if resolution is not None and resolution.settings_snapshots:
+                            run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+                    run_store.insert_run(minted, row_with_chain)
+            except sqlite3.IntegrityError as e:
+                if run_id or "runs.id" not in str(e):
+                    raise
+                continue
+            break
+    if resolution is not None:
+        resolved_file = paths.RUNS_DIR / minted / "resolved.json"
+        util.write_durably(resolved_file, resolution.resolved_bytes, 0o600)
+    # A nested writer has not committed yet; retain its lease until exit.
+    if kind in TICKET_KINDS and not nested:
+        launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
+    return minted
 
 
 def attach_pin(run_id: str, resolution, *, pid: int | None = None) -> None:
-    blob_rows = resolution.write_blobs()
     fields = {
         "config_commit": resolution.config_commit or None,
         "resolved_sha": resolution.resolved_sha,
@@ -194,13 +196,15 @@ def attach_pin(run_id: str, resolution, *, pid: int | None = None) -> None:
         fields["adw_rule"] = resolution.adw_rule
     if pid is not None:
         fields["pid"] = pid
-    with foundation.tx() as c:
-        if run_store.has_pins(c):
-            for sha, blob_kind, size in blob_rows:
-                blob_store.record_row(c, sha, blob_kind, size)
-            if resolution.settings_snapshots:
-                run_store.save_settings_snapshots(c, resolution.settings_snapshots)
-        run_store.note(run_id, **run_store.filter_run_fields(c, fields))
+    with blob_store.lock():
+        blob_rows = resolution.write_blobs()
+        with foundation.tx() as c:
+            if run_store.has_pins(c):
+                for sha, blob_kind, size in blob_rows:
+                    blob_store.record_row(c, sha, blob_kind, size)
+                if resolution.settings_snapshots:
+                    run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+            run_store.note(run_id, **run_store.filter_run_fields(c, fields))
     existing = run_store.run_get(run_id)
     if existing is not None:
         resolution.payer = existing.get("payer")
@@ -216,7 +220,6 @@ def claim(run_id: str, *, pid: int | None = None, resolution=None, **fields) -> 
         parent = run_store.run_get(str(continues_val))
         update_fields["chain"] = (parent.get("chain") or str(continues_val)) if parent else str(continues_val)
     if resolution is not None:
-        blob_rows = resolution.write_blobs()
         update_fields.update(
             config_commit=resolution.config_commit or None,
             resolved_sha=resolution.resolved_sha,
@@ -229,18 +232,21 @@ def claim(run_id: str, *, pid: int | None = None, resolution=None, **fields) -> 
             update_fields["adw_version"] = resolution.adw_version
         if "adw_rule" not in fields and resolution.adw_rule is not None:
             update_fields["adw_rule"] = resolution.adw_rule
-    with foundation.tx() as c:
-        if run_store.has_pins(c):
-            for sha, blob_kind, size in blob_rows:
-                blob_store.record_row(c, sha, blob_kind, size)
-            if resolution is not None and resolution.settings_snapshots:
-                run_store.save_settings_snapshots(c, resolution.settings_snapshots)
-        filtered = run_store.filter_run_fields(c, update_fields)
-        moved = run_store.move(run_id, "running", ("queued", "running"), **filtered)
-        if moved and actual_pid:
-            from .store import factory
+    with (blob_store.lock() if resolution is not None else contextlib.nullcontext()):
+        if resolution is not None:
+            blob_rows = resolution.write_blobs()
+        with foundation.tx() as c:
+            if run_store.has_pins(c):
+                for sha, blob_kind, size in blob_rows:
+                    blob_store.record_row(c, sha, blob_kind, size)
+                if resolution is not None and resolution.settings_snapshots:
+                    run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+            filtered = run_store.filter_run_fields(c, update_fields)
+            moved = run_store.move(run_id, "running", ("queued", "running"), **filtered)
+            if moved and actual_pid:
+                from .store import factory
 
-            factory.register(c, run_id, actual_pid, "run")
+                factory.register(c, run_id, actual_pid, "run")
     if moved and resolution is not None:
         existing = run_store.run_get(run_id)
         if existing is not None:
@@ -1460,15 +1466,39 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
     return written
 
 
+def _purged_turn_runs() -> set[str]:
+    if not paths.DB_FILE.exists():
+        return set()
+    try:
+        with foundation.reader() as c:
+            if foundation.migration_applied(foundation.RUN_RETENTION_SCHEMA, c):
+                purged = {
+                    str(r[0])
+                    for r in c.execute("SELECT id FROM runs WHERE records_purged IS NOT NULL OR files_purged IS NOT NULL")
+                }
+            else:
+                purged = {
+                    str(r[0])
+                    for r in c.execute("SELECT id FROM runs WHERE files_purged IS NOT NULL")
+                }
+            queued = {str(r[0]) for r in c.execute("SELECT run_id FROM run_purges")}
+            return purged | queued
+    except (foundation.NoDatabase, sqlite3.Error):
+        return set()
+
+
 def rebuild_turn_index(run_id: str | None = None, *, step_id: int | None = None,
                        step_ids: set[int] | None = None, missing_only: bool = False) -> int:
     if step_id is not None:
         step_ids = {step_id}
     if not missing_only:
         run_store.clear_turn_index(run_id=run_id, step_id=step_id)
+    skip = _purged_turn_runs()
     run_ids = [run_id] if run_id is not None else [p.name for p in run_folders()]
     written = 0
     for rid in run_ids:
+        if rid in skip:
+            continue
         for path in record_files(rid):
             written += _rebuild_file_turns(path, step_ids=step_ids, missing_only=missing_only)
     return written

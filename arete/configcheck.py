@@ -379,6 +379,7 @@ def _compute_floor(
     name: str,
     path: str,
     parsed: object,
+    raw_bytes: bytes,
     old_bytes: bytes | None,
     author: str,
 ) -> tuple[str, list[str], list[str]]:
@@ -387,7 +388,18 @@ def _compute_floor(
     exposes: list[str] = []
     notes: list[str] = []
 
-    if kind == "prompt":
+    if kind == "retention":
+        try:
+            lowered = retention.lowered_keys(old_bytes, raw_bytes)
+        except (UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError):
+            lowered = []
+        if lowered:
+            exposes.extend(lowered)
+            gate = "C"
+            notes.append(f"retention limits lowered: {', '.join(lowered)}")
+        else:
+            gate = "A"
+    elif kind == "prompt":
         gate = "A"
         if isinstance(parsed, str):
             try:
@@ -665,7 +677,7 @@ def check(
             old_bytes = configrepo.live_bytes(path, root)
         elif (root / path).is_file():
             old_bytes = (root / path).read_bytes()
-    gate, exposes, floor_notes = _compute_floor(kind, name, path, parsed, old_bytes, author)
+    gate, exposes, floor_notes = _compute_floor(kind, name, path, parsed, raw_bytes, old_bytes, author)
     stages.append(_stage("floor", True, [], [f"gate {gate}", *floor_notes]))
     if stop_after <= 4:
         return {"validator": VALIDATOR, "ok": True, "stages": stages, "gate": gate, "exposes": exposes}

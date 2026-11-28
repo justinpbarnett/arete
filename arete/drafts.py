@@ -10,6 +10,7 @@ from difflib import unified_diff
 from pathlib import Path
 
 from . import configitems, configkinds, configrepo, contract, paths, pins, principals, record, util
+from .store import blobs as blob_store
 from .store import config as config_store
 from .store import db as foundation
 from .store import events as event_store
@@ -420,53 +421,93 @@ def _update_check_row(c: sqlite3.Connection, numeric_id: int, report: dict) -> N
     )
 
 
-def cited_runs(c: sqlite3.Connection | None, ids) -> set[str]:
-    """Allow-list: only drafts in 'draft' or 'valid' pin cited runs."""
+def _match_evidence(raw: str, candidate_ids: set[str], out: set[str]) -> None:
+    if not raw:
+        return
+    parsed = _parse_json(raw, None)
+    if isinstance(parsed, dict):
+        for key in ("run", "run_id"):
+            direct = parsed.get(key)
+            if isinstance(direct, str) and direct in candidate_ids:
+                out.add(direct)
+        cites = parsed.get("cites")
+        if cites:
+            cites_text = cites if isinstance(cites, str) else json.dumps(cites, default=str)
+            for rid in candidate_ids:
+                if rid in cites_text:
+                    out.add(rid)
+        for key in ("trial_runs", "runs"):
+            vals = parsed.get(key)
+            if isinstance(vals, list):
+                for item in vals:
+                    if isinstance(item, str) and item in candidate_ids:
+                        out.add(item)
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, str) and item in candidate_ids:
+                out.add(item)
+            elif item is not None:
+                text = str(item)
+                for rid in candidate_ids:
+                    if rid in text:
+                        out.add(rid)
+    else:
+        for rid in candidate_ids:
+            if rid in raw:
+                out.add(rid)
+
+
+def cited_runs(
+    c: sqlite3.Connection | None,
+    ids,
+    *,
+    states: tuple[str, ...] = ("draft", "valid"),
+) -> set[str]:
+    """Allow-list: return runs cited by config_drafts rows in the given states.
+
+    A draft cites a run via author ('run:<id>/<node>'), evidence, or the run_id/evidence
+    of the proposals row its legacy_proposal names.
+    """
     candidate_ids = {str(r) for r in ids if r}
-    if not candidate_ids:
+    allowed_states = tuple(s for s in states if s in STATES)
+    if not candidate_ids or not allowed_states:
         return set()
 
     def _query(conn: sqlite3.Connection) -> set[str]:
         if not available(conn):
             return set()
+        marks = ",".join("?" for _ in allowed_states)
         rows = conn.execute(
-            "SELECT evidence FROM config_drafts WHERE state IN ('draft', 'valid')"
+            f"SELECT author, evidence, legacy_proposal FROM config_drafts WHERE state IN ({marks})",  # noqa: S608
+            allowed_states,
         ).fetchall()
         cited: set[str] = set()
+        legacy_ids: set[int] = set()
         for row in rows:
-            raw = row["evidence"] or ""
-            if not raw:
-                continue
-            parsed = _parse_json(raw, None)
-            if isinstance(parsed, dict):
-                direct = parsed.get("run")
-                if isinstance(direct, str) and direct in candidate_ids:
-                    cited.add(direct)
-                cites = parsed.get("cites")
-                if cites:
-                    cites_text = cites if isinstance(cites, str) else json.dumps(cites, default=str)
-                    for rid in candidate_ids:
-                        if rid in cites_text:
-                            cited.add(rid)
-                for key in ("trial_runs", "runs"):
-                    vals = parsed.get(key)
-                    if isinstance(vals, list):
-                        for item in vals:
-                            if isinstance(item, str) and item in candidate_ids:
-                                cited.add(item)
-            elif isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, str) and item in candidate_ids:
-                        cited.add(item)
-                    elif item is not None:
-                        text = str(item)
-                        for rid in candidate_ids:
-                            if rid in text:
-                                cited.add(rid)
-            else:
-                for rid in candidate_ids:
-                    if rid in raw:
-                        cited.add(rid)
+            author = str(row["author"] or "")
+            if author.startswith("run:"):
+                run_part = author.removeprefix("run:").split("/", 1)[0]
+                if run_part in candidate_ids:
+                    cited.add(run_part)
+            _match_evidence(str(row["evidence"] or ""), candidate_ids, cited)
+            if row["legacy_proposal"] is not None:
+                legacy_ids.add(int(row["legacy_proposal"]))
+        if legacy_ids:
+            has_proposals = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = 'proposals'"
+            ).fetchone() is not None
+            if has_proposals:
+                id_list = sorted(legacy_ids)
+                pmarks = ",".join("?" for _ in id_list)
+                prop_rows = conn.execute(
+                    f"SELECT run_id, evidence FROM proposals WHERE id IN ({pmarks})",  # noqa: S608
+                    id_list,
+                ).fetchall()
+                for prow in prop_rows:
+                    prun = str(prow["run_id"] or "")
+                    if prun in candidate_ids:
+                        cited.add(prun)
+                    _match_evidence(str(prow["evidence"] or ""), candidate_ids, cited)
         return cited
 
     if c is not None:
@@ -861,12 +902,12 @@ def _validate_base_and_check_for_activation(
     from . import configcheck
 
     if actor.startswith("run:"):
-        raise contract.Problem("forbidden", f"Actor {actor!r} cannot activate config drafts.")
+        raise contract.Problem("gate_refused", f"Actor {actor!r} cannot activate config drafts.")
     if draft["kind"] == "miner":
         raise contract.Problem("invalid_state", f"Miner draft {draft['id']} cannot be activated via config.activate.")
     if draft["gate"] == "C" and draft["author"].startswith("run:"):
         raise contract.Problem(
-            "forbidden",
+            "gate_refused",
             f"Run-authored gate C draft {draft['id']} cannot be activated directly; accept it to create an owner draft.",
         )
     if draft["state"] not in ("draft", "valid"):
@@ -904,7 +945,7 @@ def _validate_base_and_check_for_activation(
 
     if report["gate"] == "C" and draft["author"].startswith("run:"):
         raise contract.Problem(
-            "forbidden",
+            "gate_refused",
             f"Run-authored gate C draft {draft['id']} cannot be activated directly.",
         )
     return report, live_ver
@@ -922,13 +963,13 @@ def activate(
     write_files: bool = True,
 ) -> dict:
     if actor.startswith("run:"):
-        raise contract.Problem("forbidden", f"Actor {actor!r} cannot activate config drafts.")
+        raise contract.Problem("gate_refused", f"Actor {actor!r} cannot activate config drafts.")
     draft = get(draft_id)
     if draft is None:
         raise contract.Problem("not_found", f"No config draft {draft_id}")
     if draft["gate"] == "C" and draft["author"].startswith("run:"):
         raise contract.Problem(
-            "forbidden",
+            "gate_refused",
             f"Run-authored gate C draft {draft['id']} cannot be activated directly; accept it to create an owner draft.",
         )
 
@@ -982,7 +1023,7 @@ def rollback(
     fence=None,
 ) -> dict:
     if actor.startswith("run:"):
-        raise contract.Problem("forbidden", f"Actor {actor!r} cannot roll back config.")
+        raise contract.Problem("gate_refused", f"Actor {actor!r} cannot roll back config.")
     found = configitems.item(kind, name)
     target = configitems.read(found, version=str(to))
     content = target["content"]
@@ -1012,9 +1053,14 @@ def rollback(
     )
 
 
-def _resolve_try_step(spec: object) -> tuple[str, str, str]:
-    """Return (repo_name, step_name, source_run_id) for one step selector in config.try."""
+def _resolve_try_step(spec: object) -> tuple[str, str, str, int | None]:
+    """Return (repo_name, step_name, source_run_id, source_step_id) for one step selector in config.try."""
     if isinstance(spec, dict):
+        raw_sid = spec.get("step_id")
+        if isinstance(raw_sid, int) and not isinstance(raw_sid, bool):
+            return _resolve_try_step(raw_sid)
+        if isinstance(raw_sid, str) and raw_sid.strip().isdecimal():
+            return _resolve_try_step(int(raw_sid.strip()))
         run_id = str(spec.get("run") or spec.get("run_id") or "").strip()
         step_name = str(spec.get("step") or spec.get("node") or "").strip()
         repo = str(spec.get("repo") or "").strip()
@@ -1024,16 +1070,16 @@ def _resolve_try_step(spec: object) -> tuple[str, str, str]:
                 repo = str(row.get("repo") or "")
         if not step_name:
             raise contract.Problem("validation", "Each step in config.try requires a step or node name.")
-        return repo, step_name, run_id
+        return repo, step_name, run_id, None
     if isinstance(spec, int) and not isinstance(spec, bool):
         with foundation.reader() as c:
             row = c.execute(
-                "SELECT s.run_id, s.step, r.repo FROM steps s LEFT JOIN runs r ON r.id = s.run_id WHERE s.id = ?",
+                "SELECT s.id, s.run_id, s.step, r.repo FROM steps s LEFT JOIN runs r ON r.id = s.run_id WHERE s.id = ?",
                 (spec,),
             ).fetchone()
         if row is None:
             raise contract.Problem("not_found", f"No step {spec}")
-        return str(row["repo"] or ""), str(row["step"] or ""), str(row["run_id"] or "")
+        return str(row["repo"] or ""), str(row["step"] or ""), str(row["run_id"] or ""), int(row["id"])
     if isinstance(spec, str):
         text = spec.strip()
         if not text:
@@ -1042,14 +1088,16 @@ def _resolve_try_step(spec: object) -> tuple[str, str, str]:
             run_id, _, step_name = text.partition(":")
             row = run_store.run_get(run_id)
             repo = str(row.get("repo") or "") if row else ""
-            return repo, step_name, run_id
+            return repo, step_name, run_id, None
         if text.isdecimal():
             return _resolve_try_step(int(text))
-        return "", text, ""
+        return "", text, "", None
     raise contract.Problem("validation", f"Unsupported step selector {spec!r}")
 
 
 def try_draft(kind: str, name: str, draft_id: str | int, steps_input: list, actor: str) -> dict:
+    if kind == "retention":
+        raise contract.Problem("validation", "Retention policy cannot be tried with config.try.")
     if not steps_input:
         raise contract.Problem("validation", "config.try requires at least one step.")
     draft = get(draft_id)
@@ -1060,6 +1108,24 @@ def try_draft(kind: str, name: str, draft_id: str | int, steps_input: list, acto
     if draft["state"] not in ("draft", "valid"):
         raise contract.Problem("invalid_state", f"Draft {draft['id']} in state {draft['state']!r} cannot be tried.")
 
+    resolved_steps = [_resolve_try_step(spec) for spec in steps_input]
+    for _, step_name, source_run_id, source_step_id in resolved_steps:
+        if source_run_id:
+            source_run = run_store.run_get(source_run_id)
+            if source_run is not None and (purged := source_run.get("files_purged")):
+                raise contract.Problem(
+                    "files_purged",
+                    f"run {source_run_id} files were removed on {purged}",
+                    purged_at=purged,
+                )
+        if purged_blob := blob_store.purged_input_for_step(source_run_id, step_name, step_id=source_step_id):
+            blob_sha, purged_at = purged_blob
+            raise contract.Problem(
+                "files_purged",
+                f"input blob {blob_sha} for run {source_run_id} step {step_name} was removed on {purged_at}",
+                purged_at=purged_at,
+            )
+
     rel = draft["path"] or default_path(kind, name)
     raw = draft["body"].encode("utf-8")
     ref_name, draft_commit = configrepo.commit_draft_ref(draft["id"], rel, raw, actor)
@@ -1067,8 +1133,7 @@ def try_draft(kind: str, name: str, draft_id: str | int, steps_input: list, acto
     content_ver = f"{kind}/{name}@{content_sha[:12]}"
 
     started_runs: list[str] = []
-    for spec in steps_input:
-        repo_name, step_name, source_run_id = _resolve_try_step(spec)
+    for repo_name, step_name, source_run_id, _ in resolved_steps:
         pin_res = pins.resolve(
             "trial",
             repo=repo_name or None,

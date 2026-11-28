@@ -171,21 +171,49 @@ def load(path: Path | None = None) -> Policy:
     return parse_bytes(raw)
 
 
-def load_live() -> Policy:
-    """Load retention policy from working retention.toml, falling back to git live or defaults if invalid."""
-    try:
-        return load()
-    except ValueError:
-        from . import configrepo
+def effective_tables(raw: bytes | None) -> dict[str, dict[str, float]]:
+    """Return all retention tables with overrides from raw merged over engine defaults."""
+    merged = {name: dict(values) for name, values in _default_tables().items()}
+    if raw is not None:
+        try:
+            data = tomllib.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            raise ValueError(f"{FILENAME} is not valid TOML: {e}") from e
+        for table_name, values in _validate_tables(data).items():
+            merged[table_name].update(values)
+    return merged
 
-        if configrepo.is_repo():
+
+def lowered_keys(old_bytes: bytes | None, new_bytes: bytes) -> list[str]:
+    """Return sorted 'table.key' paths whose effective numeric limit decreased."""
+    old_eff = effective_tables(old_bytes)
+    new_eff = effective_tables(new_bytes)
+    lowered: list[str] = []
+    for table_name in TABLE_ORDER:
+        old_tbl = old_eff[table_name]
+        new_tbl = new_eff[table_name]
+        for key in sorted(old_tbl):
+            if new_tbl[key] < old_tbl[key]:
+                lowered.append(f"{table_name}.{key}")
+    return lowered
+
+
+def load_live() -> Policy:
+    """Load retention policy from git live when a config repo exists, else working retention.toml or defaults."""
+    from . import configrepo, util
+    from .store import db as foundation
+
+    if configrepo.is_repo():
+        if (not configrepo._ACTIVE_REPO_LOCK.get() and not foundation.in_write()
+                and util.lock_is_held(configrepo.REPO_LOCK)):
+            with util.lock(configrepo.REPO_LOCK, wait=True):
+                live = configrepo.live_bytes(FILENAME)
+        else:
             live = configrepo.live_bytes(FILENAME)
-            if live is not None:
-                try:
-                    return parse_bytes(live)
-                except ValueError:
-                    pass
-        return default_policy()
+        if live is None:
+            return default_policy()
+        return parse_bytes(live)
+    return load()
 
 
 def _format_number(value: int | float) -> str:
