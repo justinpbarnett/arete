@@ -97,6 +97,8 @@ def worker_kind(args):
             return "file-rule"
         case ["loop", "new", *options] if "--run-id" in options:
             return "loop new"
+        case ["config", "ask-run", *options] if "--run-id" in options:
+            return "config ask-run"
         case ["loop", "exec", "--run-id", _]:
             return "loop exec"
         case ["session", "exec", _]:

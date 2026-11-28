@@ -22,7 +22,8 @@
     "research_audit": {"type": "string"},
     "explain": {"type": "string"},
     "document": {"type": "string"},
-    "capture_evidence": {"type": "string"}
+    "capture_evidence": {"type": "string"},
+    "config_ask": {"type": "string"}
   },
   "additionalProperties": false
 }

@@ -7325,7 +7325,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try")
+            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "ask", "promote")
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
                        for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
@@ -7682,7 +7682,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "api check": "api_check", "api diff": "contract_evolution", "ask": "jev_ask", "audit": "audit", "background": "background",
         "benchmark fixture": "lab.benchmark", "benchmark run": "lab.benchmark", "benchmark sample": "lab.benchmark",
         **{f"cohort {part}": "cohorts" for part in ("declare", "sync", "candidates", "report", "replacement", "note")},
-        "codex-guard": "codex", "dashboard": "dashboard", "devices probe": "devices",
+        "codex-guard": "codex", "config ask-run": "drafts", "dashboard": "dashboard", "devices probe": "devices",
         "document": "document", "eval": "evals", "experiment optimize": "lab.optimize",
         "experiment promote": "lab.optimize", "experiment run": "lab.experiment", "experiment sample": "lab.experiment",
         "guard": "guard", "heartbeat": "heartbeat", "hook": "tool_events", "init": "commands.setup",
@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 162)
-        self.assertEqual(len({op["name"] for op in operations}), 162)
+        self.assertEqual(len(operations), 164)
+        self.assertEqual(len({op["name"] for op in operations}), 164)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -15009,7 +15009,9 @@ r31_blob = blob_store.meta(r31["inputs_sha"])
 runs_before = len(run_store.runs(limit=100))
 
 # Create a valid prompt draft for config.try against r31's build step.
-prompt_draft, _ = drafts.create_and_check("prompt", "plan", (paths.PROMPTS_DIR / "plan.md").read_text(encoding="utf-8"), author=owner)
+from arete import prompts
+_, plan_body = prompts.parse((paths.PROMPTS_DIR / "plan.md").read_bytes())
+prompt_draft, _ = drafts.create_and_check("prompt", "plan", plan_body, author=owner)
 
 
 class QuietHandler(dashboard.Handler):
@@ -21270,6 +21272,566 @@ class OptimizeDraftWatchAndTryTests(_ConfigDraftsCase):
                     thread.join()
                     server.server_close()
         """)
+
+
+class PromptChecksAndValidationTests(_PromptReplayCase):
+    def test_prompt_draft_autofill_activate_pin_and_binding_check(self):
+        result = self.run_prompt_child(r"""
+import http.client, threading
+from arete import dashboard, inbox, principals, serve, tailnet, tasks
+from arete.store import tokens as token_store
+
+setup_sample(adw=True)
+owner = principals.seed_owner('test-owner')
+with db.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.issue(owner, 'Prompt checks', ['read', 'config:draft', 'config:activate', 'task:write'])
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+address = '127.0.0.1'
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, 'of', return_value='owner@example.com'), \
+     mock.patch('socket.getfqdn', return_value=address):
+    httpd = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    httpd.daemon_threads = False
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01})
+    thread.start()
+    try:
+        def req(method, path, body=None, *, key=None, expected=200):
+            conn = http.client.HTTPConnection(address, httpd.server_port, timeout=10)
+            try:
+                hdrs = {'Content-Type': 'application/json', 'Authorization': f'Bearer {owner_token}'}
+                if key:
+                    hdrs['Idempotency-Key'] = key
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+        engine_sha = hashlib.sha256(engine_raw).hexdigest()
+        engine_meta, engine_body = prompts.parse(engine_raw)
+        edited_body = engine_body.rstrip() + '\n\nName the kumquat file first.\n'
+
+        # Run 1 starts before activate; activate happens mid-run during plan.
+        tid1 = task_store.task_add(replay.SAMPLE_REPO, 'Pre-activate run', 'Add kumquat to notes.txt.')
+        activated = {'done': False}
+        real_replay_run = replay.run
+
+        def replay_with_midrun_activate(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+            if trace[1] == 'plan' and not activated['done']:
+                activated['done'] = True
+                draft_res = req(
+                    'PUT', '/api/v1/config/prompt/build/draft',
+                    {'body': edited_body, 'level': 'config', 'why': 'mention kumquat first'},
+                    key='prompt-build-draft-1', expected=201,
+                )
+                assert draft_res['report']['ok'], draft_res['report']
+                draft_id = draft_res['draft']['id']
+                act_res = req(
+                    'POST', '/api/v1/config/prompt/build/activate',
+                    {'draft': draft_id, 'base_version': 0},
+                    key='prompt-build-activate-1', expected=200,
+                )
+                assert act_res['version'] == 1, act_res
+            return real_replay_run(cwd, trace, cfg_arg, on_line, resume=resume, timeout=timeout, prompt=prompt)
+
+        with mock.patch.object(replay, 'run', side_effect=replay_with_midrun_activate):
+            rc1 = run_adw(tid1)
+        assert rc1 == 0 and activated['done']
+
+        live_bytes = configrepo.live_bytes('prompts/build.md')
+        assert live_bytes is not None
+        live_meta, live_body = prompts.parse(live_bytes)
+        assert live_meta['schema'] == 1, live_meta
+        assert live_meta['overrides'] == 'arete/prompts/build.md', live_meta
+        assert prompts.normalize_base_sha(live_meta['base']) == engine_sha, live_meta
+        assert sorted(live_meta['inputs']) == sorted(engine_meta['inputs']), live_meta
+        assert 'Name the kumquat file first.' in live_body
+
+        # Run 1 kept engine prompt_level.
+        r1 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid1)
+        b1_row, _, b1_rendered = rendered_for(r1['id'], 'build')
+        assert b1_row['prompt_level'] == 'engine', b1_row
+        assert 'Name the kumquat file first.' not in b1_rendered
+
+        # Run 2 uses config prompt override, matches config_index version, exposed by step.get & turn.list.
+        idx_row = config_store.live_item('prompt', 'build')
+        assert idx_row is not None
+        tid2 = task_store.task_add(replay.SAMPLE_REPO, 'Post-activate run', 'Add kumquat to notes.txt.')
+        rc2 = run_adw(tid2)
+        assert rc2 == 0
+        r2 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid2)
+        b2_row, _, b2_rendered = rendered_for(r2['id'], 'build')
+        assert b2_row['prompt_level'] == 'config', b2_row
+        assert b2_row['prompt_version'] == idx_row['version'], (b2_row['prompt_version'], idx_row['version'])
+        assert 'Name the kumquat file first.' in b2_rendered
+        step_get = req('GET', f"/api/v1/steps/{b2_row['id']}?run={r2['id']}")['step']
+        assert step_get['prompt_level'] == 'config', step_get
+        assert step_get['prompt_version'] == idx_row['version'], step_get
+        turn_list = req('GET', f"/api/v1/runs/{r2['id']}/steps/{b2_row['node'] or 'build'}/{b2_row['try'] or 1}/turns")
+        assert 'turns' in turn_list, turn_list
+
+        # [steps.plan] prompt = { plan = "review" } fails config.check with input_not_offered naming plan and diff,
+        # and a launch on that line waits with one HIGH config_invalid item.
+        base_cfg = paths.CONFIG_FILE.read_text(encoding='utf-8')
+        bad_cfg = base_cfg + '\n[steps.plan]\nprompt = { plan = "review" }\n'
+        chk = req(
+            'POST', '/api/v1/config/step_settings/defaults/check',
+            {'body': bad_cfg}, key='check-bad-binding', expected=200,
+        )['report']
+        assert not chk['ok'], chk
+        probs = [p for st in chk['stages'] for p in st['problems']]
+        assert any('input_not_offered' in p and 'plan' in p and 'diff' in p for p in probs), probs
+
+        paths.CONFIG_FILE.write_text(bad_cfg, encoding='utf-8')
+        prompts.sync_overrides()
+        inv_items = inbox.list(state='open', kind='config_invalid')
+        assert len(inv_items) == 1 and inv_items[0]['priority'] == 1, inv_items
+        with mock.patch.object(pipeline, 'spawn_run') as spawn_mock:
+            queued = tasks.start(replay.SAMPLE_REPO, prompt='Wait on bad binding', force=True)
+            assert queued['state'] == 'queued', queued
+            assert not spawn_mock.called
+    finally:
+        httpd.shutdown()
+        thread.join()
+        httpd.server_close()
+
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PromptValidationAndLayerApiTests(_PromptReplayCase):
+    def test_layer_appends_api_validation_and_schema_required_check(self):
+        result = self.run_prompt_child(r"""
+import http.client, threading
+from arete import dashboard, principals, tailnet
+from arete.store import tokens as token_store
+
+setup_sample(adw=True)
+owner = principals.seed_owner('test-owner')
+with db.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.issue(owner, 'Prompt validation', ['read', 'config:draft', 'config:activate'])
+
+rel_append = f'layers/{replay.SAMPLE_REPO}/prompts/build.append.md'
+commit_cfg(rel_append, 'Also list kumquat first.\n', 'add build append')
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+address = '127.0.0.1'
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, 'of', return_value='owner@example.com'), \
+     mock.patch('socket.getfqdn', return_value=address):
+    httpd = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    httpd.daemon_threads = False
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01})
+    thread.start()
+    try:
+        def req(method, path, body=None, *, key=None, expected=200):
+            conn = http.client.HTTPConnection(address, httpd.server_port, timeout=10)
+            try:
+                hdrs = {'Content-Type': 'application/json', 'Authorization': f'Bearer {owner_token}'}
+                if key:
+                    hdrs['Idempotency-Key'] = key
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        # config.read (config.get) for prompt/build lists the layer's build.append.md under appends.
+        item = req('GET', '/api/v1/config/prompt/build')['item']
+        assert item['drift'] is False, item
+        assert len(item['appends']) == 1, item['appends']
+        app = item['appends'][0]
+        assert app['layer'] == f'layer:{replay.SAMPLE_REPO}', app
+        assert app['path'] == rel_append, app
+        assert app['version'].startswith(f'prompt/{replay.SAMPLE_REPO}.build.append@'), app
+
+        # Layer draft with overrides in front matter gets 422 validation with path 'bytes'.
+        bad_layer_body = '---\noverrides: arete/prompts/build.md\n---\nNot allowed.\n'
+        err = req(
+            'PUT', '/api/v1/config/prompt/build/draft',
+            {'body': bad_layer_body, 'level': f'layer:{replay.SAMPLE_REPO}'},
+            key='layer-override-bad', expected=422,
+        )
+        assert err['code'] == 'validation' and err.get('path') == 'bytes', err
+
+        # Override using $kumquat not in inputs fails config.check with input_undeclared, and activate refuses it.
+        engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+        engine_sha = hashlib.sha256(engine_raw).hexdigest()
+        engine_meta, engine_body = prompts.parse(engine_raw)
+        undecl_text = (
+            '---\nschema: 1\noverrides: arete/prompts/build.md\n'
+            f'base: sha256:{engine_sha}\ninputs: [{", ".join(engine_meta["inputs"])}]\n---\n'
+            + engine_body + '\nMention $kumquat.\n'
+        )
+        bad_draft = req(
+            'PUT', '/api/v1/config/prompt/build/draft',
+            {'body': undecl_text, 'level': 'config'},
+            key='undecl-draft', expected=201,
+        )
+        assert not bad_draft['report']['ok'], bad_draft['report']
+        probs = [p for st in bad_draft['report']['stages'] for p in st['problems']]
+        assert any('input_undeclared' in p and 'kumquat' in p for p in probs), probs
+        act_err = req(
+            'POST', '/api/v1/config/prompt/build/activate',
+            {'draft': bad_draft['draft']['id'], 'base_version': 0},
+            key='undecl-activate', expected=409,
+        )
+        assert act_err['code'] == 'invalid_state', act_err
+
+        # Override using $workspace and listing workspace passes with one warning input_renamed at prompts/build.md.
+        ws_inputs = ['workspace' if k == 'worktree' else k for k in engine_meta['inputs']]
+        ws_text = (
+            '---\nschema: 1\noverrides: arete/prompts/build.md\n'
+            f'base: sha256:{engine_sha}\ninputs: [{", ".join(ws_inputs)}]\n---\n'
+            + engine_body.replace('$worktree', '$workspace')
+        )
+        ws_chk = req(
+            'POST', '/api/v1/config/prompt/build/check',
+            {'body': ws_text}, key='ws-check', expected=200,
+        )['report']
+        assert ws_chk['ok'], ws_chk
+        assert len(ws_chk['warnings']) == 1, ws_chk['warnings']
+        assert ws_chk['warnings'][0]['code'] == 'input_renamed', ws_chk['warnings']
+        assert ws_chk['warnings'][0]['path'] == 'prompts/build.md', ws_chk['warnings']
+
+        # Config file for render_engine-only prompt (explain) is refused with prompt_unbound.
+        exp_raw = (paths.PROMPTS_DIR / 'explain.md').read_bytes()
+        exp_sha = hashlib.sha256(exp_raw).hexdigest()
+        exp_meta, exp_body = prompts.parse(exp_raw)
+        exp_text = (
+            '---\nschema: 1\noverrides: arete/prompts/explain.md\n'
+            f'base: sha256:{exp_sha}\ninputs: [{", ".join(exp_meta["inputs"])}]\n---\n' + exp_body
+        )
+        exp_chk = req(
+            'POST', '/api/v1/config/prompt/explain/check',
+            {'body': exp_text}, key='unbound-check', expected=200,
+        )['report']
+        assert not exp_chk['ok'], exp_chk
+        exp_probs = [p for st in exp_chk['stages'] for p in st['problems']]
+        assert any('prompt_unbound' in p for p in exp_probs), exp_probs
+
+        # Schema override dropping a required field fails config.check.
+        plan_schema = dict(prompts.engine_schema('plan'))
+        bad_schema = {**plan_schema, 'required': [k for k in plan_schema['required'] if k != 'verify']}
+        sch_chk = req(
+            'POST', '/api/v1/config/schema/plan/check',
+            {'body': json.dumps(bad_schema)}, key='schema-check', expected=200,
+        )['report']
+        assert not sch_chk['ok'], sch_chk
+        sch_probs = [p for st in sch_chk['stages'] for p in st['problems']]
+        assert any('verify' in p for p in sch_probs), sch_probs
+    finally:
+        httpd.shutdown()
+        thread.join()
+        httpd.server_close()
+
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PromptDriftSyncTests(_PromptReplayCase):
+    def test_drift_sync_keep_mine_and_merge_autodelete(self):
+        result = self.run_prompt_child(r"""
+from arete import configitems, drafts, inbox, principals, serve
+
+setup_sample(adw=True)
+owner = principals.seed_owner('test-owner')
+
+engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+engine_meta, engine_body = prompts.parse(engine_raw)
+override_body = engine_body.rstrip() + '\n\nName the kumquat file first.\n'
+draft_row, report = drafts.create_and_check('prompt', 'build', override_body, author=owner, level='config')
+assert report['ok'], report
+drafts.activate(draft_row['id'], owner, 0)
+
+# Copy engine prompts dir and add one line to build.md.
+prompts_copy = root / 'engine-prompts-copy'
+shutil.copytree(paths.PROMPTS_DIR, prompts_copy)
+copy_build = prompts_copy / 'build.md'
+copy_build.write_text(engine_raw.decode('utf-8').rstrip() + '\n\nEngine note line.\n', encoding='utf-8')
+copy_sha = hashlib.sha256(copy_build.read_bytes()).hexdigest()
+
+def close_server(srv):
+    srv.pool.shutdown(wait=False)
+    for jp in srv.job_pools.values():
+        jp.shutdown(wait=False)
+    srv.outbox_pool.shutdown(wait=False)
+
+with mock.patch.object(paths, 'PROMPTS_DIR', prompts_copy):
+    s1 = serve.Server()
+    s2 = serve.Server()
+    try:
+        assert s1.tick() is True
+        assert s2.tick() is True
+    finally:
+        close_server(s1)
+        close_server(s2)
+
+    drift_items = inbox.list(state='open', kind='drift')
+    assert len(drift_items) == 1, drift_items
+    item = drift_items[0]
+    assert item['subject'] == 'config:prompt/build', item
+    assert item['verbs'] == ['keep_mine', 'take_engine', 'continue'], item['verbs']
+    assert 'diff' in item['detail'], item['detail']
+    cfg_item = configitems.item('prompt', 'build')
+    assert cfg_item['drift'] is True, cfg_item
+
+    # Forced run still uses the config override while drift is open.
+    tid1 = task_store.task_add(replay.SAMPLE_REPO, 'Run during drift', 'Add kumquat to notes.txt.')
+    assert run_adw(tid1) == 0
+    r1 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid1)
+    b1_row, _, b1_rendered = rendered_for(r1['id'], 'build')
+    assert b1_row['prompt_level'] == 'config', b1_row
+    assert 'Name the kumquat file first.' in b1_rendered
+
+    # keep_mine sets base to the copy sha256 and resolves the drift item.
+    with principals.acting(owner):
+        res = inbox.resolve(item['id'], base_version=item['version'], verb='keep_mine')
+    assert res['item']['state'] == 'resolved', res
+    rebased_meta, _ = prompts.parse(configrepo.live_bytes('prompts/build.md'))
+    assert prompts.normalize_base_sha(rebased_meta['base']) == copy_sha, rebased_meta
+    assert inbox.list(state='open', kind='drift') == []
+
+    # Copy whose build.md equals the override's body and inputs makes the next tick delete it with source 'merge'.
+    merged_engine = (
+        '---\nschema: 1\n'
+        f'inputs: [{", ".join(engine_meta["inputs"])}]\n---\n'
+        + override_body
+    )
+    copy_build.write_text(merged_engine, encoding='utf-8')
+    s3 = serve.Server()
+    try:
+        assert s3.tick() is True
+    finally:
+        close_server(s3)
+    assert configrepo.live_bytes('prompts/build.md') is None
+    assert not (paths.CONFIG_DIR / 'prompts' / 'build.md').exists()
+    with db.reader() as c:
+        del_row = c.execute(
+            "SELECT * FROM config_index WHERE kind = 'prompt' AND name = 'build' AND source = 'merge'"
+        ).fetchone()
+    assert del_row is not None, 'expected config_index row with source=merge'
+
+    tid2 = task_store.task_add(replay.SAMPLE_REPO, 'Run after merge', 'Add kumquat to notes.txt.')
+    assert run_adw(tid2) == 0
+    r2 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid2)
+    b2_row, _, _ = rendered_for(r2['id'], 'build')
+    assert b2_row['prompt_level'] == 'engine', b2_row
+
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PromptInvalidSyncTests(_PromptReplayCase):
+    def test_engine_drop_raises_config_invalid_waits_and_take_engine_unblocks(self):
+        result = self.run_prompt_child(r"""
+from arete import drafts, inbox, principals, serve, tasks
+
+setup_sample(adw=True)
+owner = principals.seed_owner('test-owner')
+
+engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+_, engine_body = prompts.parse(engine_raw)
+assert '$expertise' in engine_body
+draft_row, report = drafts.create_and_check(
+    'prompt', 'build', engine_body + '\nCustom note.\n', author=owner, level='config',
+)
+assert report['ok'], report
+drafts.activate(draft_row['id'], owner, 0)
+
+def close_server(srv):
+    srv.pool.shutdown(wait=False)
+    for jp in srv.job_pools.values():
+        jp.shutdown(wait=False)
+    srv.outbox_pool.shutdown(wait=False)
+
+reduced_offers = prompts.OFFERS['build'] - {'expertise'}
+with mock.patch.dict(prompts.OFFERS, {'build': reduced_offers}):
+    srv = serve.Server()
+    try:
+        assert srv.tick() is True
+    finally:
+        close_server(srv)
+
+    inv = inbox.list(state='open', kind='config_invalid')
+    assert len(inv) == 1, inv
+    item = inv[0]
+    assert item['priority'] == 1, item
+    assert item['subject'] == 'config:prompt/build', item
+    assert item['verbs'] == ['take_engine', 'continue'], item['verbs']
+    assert config.paused(config.load(), role='build'), 'expected step:build paused'
+
+    with mock.patch.object(pipeline, 'spawn_run') as spawn_mock, mock.patch.object(replay, 'run') as replay_mock:
+        queued = tasks.start(replay.SAMPLE_REPO, prompt='Wait for build override fix', force=True)
+        assert queued['state'] == 'queued', queued
+        assert not spawn_mock.called and not replay_mock.called
+
+    # take_engine deletes the override and lets the launch start.
+    with principals.acting(owner):
+        resolved = inbox.resolve(item['id'], base_version=item['version'], verb='take_engine')
+    assert resolved['item']['state'] == 'resolved', resolved
+    assert configrepo.live_bytes('prompts/build.md') is None
+    assert not config.paused(config.load(), role='build')
+    assert inbox.list(state='open', kind='config_invalid') == []
+
+    with mock.patch.object(pipeline, 'spawn_run') as spawn_mock:
+        started = tasks.start(replay.SAMPLE_REPO, prompt='Start after take_engine', force=True)
+        assert started['state'] != 'queued', started
+        assert spawn_mock.called
+
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class ConfigAskAndPromoteTests(_PromptReplayCase):
+    def test_config_ask_drafts_retries_conflict_and_promote_routes(self):
+        result = self.run_prompt_child(r"""
+import http.client, threading, time
+from arete import dashboard, drafts, principals, tailnet
+from arete.store import outbox as outbox_store, tokens as token_store
+
+sample_dir, _ = setup_sample(adw=True)
+owner = principals.seed_owner('test-owner')
+with db.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.issue(owner, 'Config ask', ['read', 'config:draft', 'config:activate'])
+
+engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+_, engine_body = prompts.parse(engine_raw)
+answers_dir = sample_dir / 'replay'
+(answers_dir / 'config_ask.json').write_text(json.dumps({
+    'body': engine_body.rstrip() + '\n\nMention kumquat in the summary.\n',
+    'why': 'Add kumquat instruction to build prompt.',
+}), encoding='utf-8')
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+address = '127.0.0.1'
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, 'of', return_value='owner@example.com'), \
+     mock.patch('socket.getfqdn', return_value=address):
+    httpd = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    httpd.daemon_threads = False
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01})
+    thread.start()
+    try:
+        def req(method, path, body=None, *, key=None, expected=200):
+            conn = http.client.HTTPConnection(address, httpd.server_port, timeout=10)
+            try:
+                hdrs = {'Content-Type': 'application/json', 'Authorization': f'Bearer {owner_token}'}
+                if key:
+                    hdrs['Idempotency-Key'] = key
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        # 1. config.ask on prompt/build answers 202 with a run of kind 'draft', and completes writing one valid config_drafts row.
+        ask_res = req(
+            'POST', '/api/v1/config/prompt/build/ask',
+            {'instruction': 'mention kumquat', 'base_version': 0},
+            key='ask-build-1', expected=202,
+        )
+        run_id = ask_res['run']['id']
+        assert ask_res['run']['kind'] == 'draft', ask_res['run']
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            row = run_store.run_get(run_id)
+            if row and row['status'] not in ('queued', 'running'):
+                break
+            time.sleep(0.05)
+        final_run = run_store.run_get(run_id)
+        assert final_run and final_run['status'] == 'done', final_run
+
+        found_drafts = drafts.list_drafts(kind='prompt', name='build')
+        assert len(found_drafts) == 1, found_drafts
+        d = found_drafts[0]
+        assert d['author'] == f'run:{run_id}/config_ask', d
+        assert d['instruction'] == 'mention kumquat', d
+        assert d['why'] == 'Add kumquat instruction to build prompt.', d
+        assert d['check_report'] and d['check_report']['ok'] is True, d['check_report']
+
+        # 2. Retry with check problems: attempt 1 has undeclared $kumquat -> attempt 2 sees problems in rendered prompt and succeeds.
+        engine_sha = hashlib.sha256(engine_raw).hexdigest()
+        engine_meta, _ = prompts.parse(engine_raw)
+        bad_body = (
+            '---\nschema: 1\noverrides: arete/prompts/build.md\n'
+            f'base: sha256:{engine_sha}\ninputs: [{", ".join(engine_meta["inputs"])}]\n---\n'
+            + engine_body + '\nUse $kumquat.\n'
+        )
+        (answers_dir / 'config_ask.json').write_text(json.dumps({'body': bad_body, 'why': 'bad try 1'}), encoding='utf-8')
+        (answers_dir / 'config_ask2.json').write_text(json.dumps({
+            'body': engine_body.rstrip() + '\n\nFixed kumquat note.\n',
+            'why': 'Fixed undeclared placeholder.',
+        }), encoding='utf-8')
+        retry_out = drafts.run_config_ask('prompt', 'build', instruction='mention kumquat', base_version=0)
+        assert retry_out['status'] == 'done', retry_out
+        retry_steps = run_store.steps(retry_out['run'])
+        assert len(retry_steps) == 2, retry_steps
+        by_step = run_store.step_inputs_by_run(retry_out['run'])
+        r2_row = next(r for r in by_step[retry_steps[1]['id']] if r['role'] == 'rendered')
+        r2_text = blob_store.read(r2_row['sha256']).decode('utf-8')
+        assert 'input_undeclared' in r2_text and 'kumquat' in r2_text, r2_text
+
+        # 3. Stale base_version ends the run with version_conflict and writes no draft.
+        drafts_before = len(drafts.list_drafts(kind='prompt', name='build'))
+        stale_out = drafts.run_config_ask('prompt', 'build', instruction='mention kumquat', base_version=99)
+        assert stale_out['status'] == 'failed' and stale_out.get('code') == 'version_conflict', stale_out
+        assert len(drafts.list_drafts(kind='prompt', name='build')) == drafts_before
+
+        # 4. config.promote on kind 'source' answers 404.
+        src_err = req('POST', '/api/v1/config/source/demo/promote', {}, key='promote-source', expected=404)
+        assert src_err['code'] == 'not_found', src_err
+
+        # 5. config.promote on prompt/build answers 501 outbox_missing when meta.features.outbox is False.
+        real_meta = api.meta
+        with mock.patch.object(api, 'meta', side_effect=lambda: {**real_meta(), 'features': {**real_meta()['features'], 'outbox': False}}):
+            ob_err = req('POST', '/api/v1/config/prompt/build/promote', {}, key='promote-no-outbox', expected=501)
+            assert ob_err['code'] == 'outbox_missing', ob_err
+
+        # 6. config.promote on prompt/build creates a public PR outbox item when outbox is enabled.
+        prom_res = req('POST', '/api/v1/config/prompt/build/promote', {}, key='promote-build-ok', expected=201)
+        ob_item = prom_res['item']
+        assert ob_item['kind'] == 'pr' and ob_item['audience'] == 'public', ob_item
+        assert outbox_store.get(ob_item['id']) is not None
+    finally:
+        httpd.shutdown()
+        thread.join()
+        httpd.server_close()
+
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
 
 
 class _TaskIdentityChildCase(unittest.TestCase):

@@ -1093,7 +1093,18 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
             kind, name = classify_path(rel)
             origin = origin_of(rel)
             if raw is None:
-                config_store.mark_deleted(conn, origin, rel)
+                config_store.record_deleted(
+                    conn,
+                    kind=kind,
+                    name=name,
+                    origin=origin,
+                    path=rel,
+                    commit_sha=sha,
+                    author=meta["author"],
+                    source=meta["source"],
+                    note=meta["note"],
+                    at=meta["at"],
+                )
                 events.emit(
                     f"config.{kind}.changed",
                     f"config:{kind}/{name}",
@@ -1278,6 +1289,41 @@ def _walk_history_rows(root: Path) -> list[dict]:
                     rows[prev]["live"] = 0
                 kind, name = classify_path(rel)
                 item_live_sha.pop((kind, name), None)
+                del_key = (origin, rel, ABSENT)
+                if del_key in rows:
+                    rows[del_key].update(
+                        kind=kind,
+                        name=name,
+                        version=f"{kind}/{name}@absent",
+                        commit_sha=sha,
+                        author=meta["author"],
+                        source=meta["source"],
+                        note=meta["note"],
+                        at=meta["at"],
+                        live=0,
+                        fields="{}",
+                        ver=0,
+                    )
+                else:
+                    n = max_n.get(op, 0) + 1
+                    max_n[op] = n
+                    rows[del_key] = {
+                        "kind": kind,
+                        "name": name,
+                        "origin": origin,
+                        "path": rel,
+                        "sha256": ABSENT,
+                        "version": f"{kind}/{name}@absent",
+                        "n": n,
+                        "commit_sha": sha,
+                        "author": meta["author"],
+                        "source": meta["source"],
+                        "note": meta["note"],
+                        "at": meta["at"],
+                        "live": 0,
+                        "fields": "{}",
+                        "ver": 0,
+                    }
                 continue
             blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
             if blob.returncode != 0:
@@ -1380,7 +1426,19 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                 for status, rel in valid_entries:
                     origin = origin_of(rel)
                     if status == "D":
-                        config_store.mark_deleted(conn, origin, rel)
+                        kind, name = classify_path(rel)
+                        config_store.record_deleted(
+                            conn,
+                            kind=kind,
+                            name=name,
+                            origin=origin,
+                            path=rel,
+                            commit_sha=sha,
+                            author=meta["author"],
+                            source=meta["source"],
+                            note=meta["note"],
+                            at=meta["at"],
+                        )
                         continue
                     blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
                     if blob.returncode != 0:

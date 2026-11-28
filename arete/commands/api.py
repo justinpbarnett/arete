@@ -63,6 +63,21 @@ def config_command(args):
     client.emit(config_read(args.operation, values))
 
 
+def config_ask_run(args):
+    from .. import control, drafts
+
+    control.require_worker("config ask-run")
+    res = drafts.run_config_ask(
+        args.kind,
+        args.name,
+        instruction=args.instruction,
+        base_version=args.base_version,
+        run_id=args.run_id,
+        level=args.level or None,
+    )
+    return 0 if res.get("status") == "done" else 1
+
+
 def config_mcp(_args):
     from .. import client, owner_asks
 
@@ -114,4 +129,12 @@ def register(sub):
             pos = field in shape["required"]
             verb.add_argument(field if pos else "--" + field, choices=spec.get("enum"))
         verb.set_defaults(fn=config_command, operation=op)
+    ask_run = verbs.add_parser("ask-run")
+    ask_run.add_argument("--run-id", required=True)
+    ask_run.add_argument("--kind", required=True)
+    ask_run.add_argument("--name", required=True)
+    ask_run.add_argument("--base-version", required=True)
+    ask_run.add_argument("--instruction", required=True)
+    ask_run.add_argument("--level", default="")
+    ask_run.set_defaults(fn=config_ask_run)
     sub.add_parser("mcp-config", help="serve config read tools over MCP").set_defaults(fn=config_mcp)

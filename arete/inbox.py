@@ -697,6 +697,13 @@ def _config_items(c) -> list[dict]:
                 "verbs": ["continue"],
                 "options": [],
             })
+    from . import prompts
+
+    seen_subjects = {item["subject"] for item in items}
+    for spec in prompts.prompt_invalid_specs(cfg):
+        if spec["subject"] not in seen_subjects:
+            seen_subjects.add(spec["subject"])
+            items.append(spec)
     return items
 
 
@@ -1367,6 +1374,7 @@ ADAPTER_KINDS: dict[str, tuple[str, ...]] = {
     "secrets": ("continue",),
     "stops": ("stop",),
     "faults": ("fault",),
+    "config": ("config_invalid",),
 }
 
 
@@ -2533,9 +2541,69 @@ def resolve(
                 handler_result = chat.drop_draft(cid)
                 resolution = "declined"
             stored_answer = verb
-        elif prefix in ("alert", "push", "config"):
+        elif prefix in ("alert", "push"):
             handler_result = {"subject": subject, "continued": True}
             resolution = "continued"
+            stored_answer = verb
+        elif prefix == "config":
+            if ident.startswith("prompt/") and verb in ("keep_mine", "take_engine"):
+                import hashlib
+
+                from . import configrepo, prompts
+
+                prompt_name = ident.removeprefix("prompt/")
+                rel = f"prompts/{prompt_name}.md"
+                root = paths.CONFIG_DIR.resolve()
+                use_repo = configrepo.is_repo(root)
+                if verb == "keep_mine":
+                    engine_file = paths.PROMPTS_DIR / f"{prompt_name}.md"
+                    if not engine_file.is_file():
+                        raise contract.Problem("not_found", f"No engine prompt {prompt_name!r}")
+                    engine_sha = hashlib.sha256(engine_file.read_bytes()).hexdigest()
+                    raw = configrepo.live_bytes(rel, root) if use_repo else (
+                        (root / rel).read_bytes() if (root / rel).is_file() else None
+                    )
+                    if raw is None:
+                        raise contract.Problem("not_found", f"No config override {rel}")
+                    updated_text = prompts.rebase_override_base(raw.decode("utf-8"), engine_sha)
+                    commit_sha = ""
+                    if use_repo:
+                        cur_blob = configrepo._live_blob(root, rel)
+                        commit_sha = configrepo.commit(
+                            {rel: updated_text},
+                            {rel: cur_blob},
+                            actor=actor,
+                            source="dashboard",
+                            note=f"keep_mine: rebase prompt/{prompt_name} to engine",
+                        )
+                    else:
+                        (root / rel).write_text(updated_text, encoding="utf-8")
+                    handler_result = {
+                        "subject": subject,
+                        "base": f"sha256:{engine_sha}",
+                        "commit": commit_sha,
+                    }
+                    resolution = "kept_mine"
+                else:
+                    commit_sha = ""
+                    if use_repo:
+                        cur_blob = configrepo._live_blob(root, rel)
+                        if cur_blob != configrepo.ABSENT:
+                            commit_sha = configrepo.commit(
+                                {rel: None},
+                                {rel: cur_blob},
+                                actor=actor,
+                                source="dashboard",
+                                note=f"take_engine: remove prompt/{prompt_name} override",
+                            )
+                    else:
+                        with suppress(FileNotFoundError):
+                            (root / rel).unlink()
+                    handler_result = {"subject": subject, "deleted": True, "commit": commit_sha}
+                    resolution = "took_engine"
+            else:
+                handler_result = {"subject": subject, "continued": True}
+                resolution = "continued"
             stored_answer = verb
         elif prefix == "incident":
             inc_id = int(ident)
@@ -2650,6 +2718,21 @@ def resolve(
             if updated and updated["state"] == "resolved":
                 raise contract.Problem("already_resolved", f"Inbox item {updated['id']} is already resolved.", current=updated)
             raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+        if prefix == "config" and ident.startswith("prompt/") and verb == "take_engine":
+            for sibling_kind in ("drift", "config_invalid"):
+                if sibling_kind == item["kind"]:
+                    continue
+                sibling = inbox_store.get_open_by_kind_and_subject(
+                    sibling_kind, subject, connect=lambda: nullcontext(c)
+                )
+                if sibling is not None:
+                    inbox_store.resolve_item(
+                        c,
+                        inbox_store.parse_id(sibling["id"]),
+                        resolution="cleared",
+                        answered_by=actor,
+                        answered_at=now,
+                    )
     return {"item": updated, "result": handler_result}
 
 

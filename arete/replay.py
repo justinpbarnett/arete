@@ -99,6 +99,8 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
                       "calls": answer["decision"]}}
         except (ValueError, KeyError, IndexError) as error:
             return failed(f"replay: invalid controller observation: {error}")
+    if trace[1].startswith("config_ask") and "structured" not in answer and "body" in answer and "why" in answer:
+        answer = {**answer, "structured": {"body": answer["body"], "why": answer["why"]}}
     try:
         res = Result(ok=bool(answer.get("ok", True)), text=str(answer.get("text") or ""),
                      structured=answer.get("structured"), error=str(answer.get("error") or ""),

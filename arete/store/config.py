@@ -124,7 +124,7 @@ def needs_ver_rebuild(conn: sqlite3.Connection) -> bool:
     if not available(conn) or not has_ver(conn):
         return False
     return conn.execute(
-        "SELECT 1 FROM config_index WHERE origin != 'engine' AND ver = 0 LIMIT 1"
+        "SELECT 1 FROM config_index WHERE origin != 'engine' AND sha256 != 'absent' AND ver = 0 LIMIT 1"
     ).fetchone() is not None
 
 
@@ -192,6 +192,58 @@ def upsert_live(conn: sqlite3.Connection, *, kind: str, name: str, origin: str, 
 
 def mark_deleted(conn: sqlite3.Connection, origin: str, path: str) -> None:
     conn.execute("UPDATE config_index SET live = 0 WHERE origin = ? AND path = ? AND live = 1", (origin, path))
+
+
+def record_deleted(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    name: str,
+    origin: str,
+    path: str,
+    commit_sha: str,
+    author: str,
+    source: str,
+    note: str,
+    at: str,
+) -> None:
+    mark_deleted(conn, origin, path)
+    with_ver = has_ver(conn)
+    sha = "absent"
+    version = f"{kind}/{name}@absent"
+    existing = conn.execute(
+        "SELECT n FROM config_index WHERE origin = ? AND path = ? AND sha256 = ?",
+        (origin, path, sha),
+    ).fetchone()
+    if existing:
+        if with_ver:
+            conn.execute(
+                "UPDATE config_index SET kind = ?, name = ?, version = ?, commit_sha = ?, author = ?, source = ?, "
+                "note = ?, at = ?, live = 0, fields = '{}', ver = 0 WHERE origin = ? AND path = ? AND sha256 = ?",
+                (kind, name, version, commit_sha, author, source, note, at, origin, path, sha),
+            )
+        else:
+            conn.execute(
+                "UPDATE config_index SET kind = ?, name = ?, version = ?, commit_sha = ?, author = ?, source = ?, "
+                "note = ?, at = ?, live = 0, fields = '{}' WHERE origin = ? AND path = ? AND sha256 = ?",
+                (kind, name, version, commit_sha, author, source, note, at, origin, path, sha),
+            )
+    else:
+        n = next_n(conn, origin, path)
+        if with_ver:
+            conn.execute(
+                "INSERT INTO config_index "
+                "(kind, name, origin, path, sha256, version, n, commit_sha, author, source, note, at, live, fields, ver) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '{}', 0)",
+                (kind, name, origin, path, sha, version, n, commit_sha, author, source, note, at),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO config_index "
+                "(kind, name, origin, path, sha256, version, n, commit_sha, author, source, note, at, live, fields) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '{}')",
+                (kind, name, origin, path, sha, version, n, commit_sha, author, source, note, at),
+            )
 
 
 def replace_all(conn: sqlite3.Connection, rows: list[dict]) -> None:

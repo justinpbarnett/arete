@@ -382,13 +382,49 @@ def _strip_retired_repo_limit(schema: dict) -> dict:
     return updated
 
 
+def _roles_enum(operations):
+    roles = (
+        operations.get("settings.resolved", {})
+        .get("result", {})
+        .get("properties", {})
+        .get("roles", {})
+        .get("items", {})
+        .get("properties", {})
+        .get("role", {})
+        .get("enum")
+    )
+    return list(roles) if isinstance(roles, list) else None
+
+
+def settings_result(name, op, operations):
+    result = op["result"]
+    roles = _roles_enum(operations)
+    if not roles:
+        return result
+    result = deepcopy(result)
+    props = result.get("properties", {})
+    if name == "settings.resolved":
+        role_schema = props.get("roles", {}).get("items", {}).get("properties", {}).get("role", {})
+        if role_schema.get("enum") == roles:
+            role_schema.pop("enum")
+    elif name in ("settings.get", "settings.update"):
+        s_props = props.get("settings", {}).get("properties", {})
+        for holder in (s_props, s_props.get("values", {}).get("properties", {})):
+            role_schema = holder.get("roles", {}).get("items", {}).get("properties", {}).get("role", {})
+            if role_schema.get("enum") == roles:
+                role_schema.pop("enum")
+    return result
+
+
 def compare(old, new):
     old_kinds, new_kinds = _config_kinds_enum(old["operations"]), _config_kinds_enum(new["operations"])
     additive_config_kinds = bool(old_kinds and new_kinds and set(old_kinds) <= set(new_kinds))
     retires_repo_limit = (
-        old.get("minor", 0) < 28 <= new.get("minor", 0)
+        old.get("minor", 0) < 29 <= new.get("minor", 0)
         and "line.create" in new["operations"]
     )
+    old_roles, new_roles = _roles_enum(old["operations"]), _roles_enum(new["operations"])
+    additive_roles = bool(old_roles and new_roles and set(old_roles) <= set(new_roles))
     for name, before in sorted(old["operations"].items()):
         after = new["operations"].get(name)
         identity = f"{name} ({route(before)})"
@@ -403,7 +439,10 @@ def compare(old, new):
         elif additive_config_kinds and name in ("config.kinds", "config.list", "config.read"):
             old_result = config_result(name, before, old["operations"])
             new_result = config_result(name, after, new["operations"])
-        elif retires_repo_limit and name in ("settings.get", "settings.update"):
+        elif additive_roles and name in ("settings.get", "settings.resolved", "settings.update"):
+            old_result = settings_result(name, before, old["operations"])
+            new_result = settings_result(name, after, new["operations"])
+        if retires_repo_limit and name in ("settings.get", "settings.update"):
             old_input = _strip_retired_repo_limit(old_input)
             old_result = _strip_retired_repo_limit(old_result)
         changes = [*schema_breaks(old_input, new_input, "input"),

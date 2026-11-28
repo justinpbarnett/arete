@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": "string",
+      "description": "The complete updated file content for the config item."
+    },
+    "why": {
+      "type": "string",
+      "description": "Short explanation of what changed and why."
+    }
+  },
+  "required": [
+    "body",
+    "why"
+  ]
+}
