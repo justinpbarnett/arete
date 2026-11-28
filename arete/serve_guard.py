@@ -105,10 +105,10 @@ def hold_path(state: Path, tip: str) -> Path:
 
 
 def git_bytes(checkout: Path, *args: str) -> bytes:
+    env = {k: v for k in ("PATH", "HOME", "TMPDIR", "USER", "LANG", "LC_ALL", "TZ") if (v := os.environ.get(k)) is not None}
     ran = subprocess.run(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
                           "-c", "core.fsmonitor=false", *args], cwd=checkout, stdin=subprocess.DEVNULL,
-                         capture_output=True, timeout=30,
-                         env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+                         capture_output=True, timeout=30, env=env)
     if ran.returncode:
         raise RuntimeError(f"git {args[0]}: {ran.stderr[:300].decode(errors='replace').strip()}")
     return ran.stdout

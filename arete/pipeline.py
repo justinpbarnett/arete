@@ -255,7 +255,8 @@ def seam_facts(run_id: str) -> dict:
 
 
 def public_text(run: AgentRun, text: str) -> str:
-    return outbound.redact(text) if run.repo.public else text
+    subject = getattr(run.repo, "name", "") or "outbound"
+    return outbound.redact(text, subject=subject) if run.repo.public else scrub.text(text, "outbound", subject)
 
 
 def provider_busy(res: Result) -> bool:

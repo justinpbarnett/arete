@@ -195,9 +195,12 @@ def prepare_replay(root):
     sample = root / "sample"
 
     def sample_git(args, cwd, *, check=True):
+        from . import environment
+
         where = cwd.resolve()
         require(where == sample or where.is_relative_to(sample), "replay Git working directory escaped the fixture")
-        done = subprocess.run(["git", *args], cwd=where, text=True, capture_output=True, timeout=10, check=False)
+        done = subprocess.run(["git", *args], cwd=where, text=True, capture_output=True, timeout=10, check=False,
+                              env=environment.build(()))
         if check and done.returncode:
             raise RuntimeError(f"replay sample: git {args[0]}: {done.stderr.strip()}")
         return done.stdout
@@ -208,7 +211,7 @@ def prepare_replay(root):
 
 
 def config_fixture_git(*args, layers=False):
-    from . import paths
+    from . import environment, paths
 
     require(paths.CONFIG_DIR == Path.cwd() / "config" and not paths.CONFIG_DIR.is_symlink(),
             "config Git working directory escaped the fixture")
@@ -216,7 +219,7 @@ def config_fixture_git(*args, layers=False):
     require(root.resolve() == root, "config Git working directory escaped the fixture")
     done = subprocess.run(["git", "-c", "user.name=Config Fixture", "-c", "user.email=config@example.invalid",
                            "-c", "commit.gpgsign=false", *args], cwd=root,
-                          capture_output=True, text=True, timeout=5)
+                          capture_output=True, text=True, timeout=5, env=environment.build(()))
     require(done.returncode == 0, f"config fixture: git {args[0]}: {done.stderr.strip()}")
     return done.stdout.strip()
 
@@ -312,12 +315,12 @@ class Check:
                 "POST /api/tasks replay created extra rows")
 
     def stale_write(self):
-        from . import record
+        from . import environment, record
 
         path = f"/api/v1/runs/{self.run}"
         before = self.read(path)["run"]
         with subprocess.Popen([sys.executable, "-IB", "-c", "import sys; sys.stdin.buffer.read(1)"],
-                              stdin=subprocess.PIPE, start_new_session=True) as replacement:
+                              stdin=subprocess.PIPE, start_new_session=True, env=environment.build(())) as replacement:
             record.note(self.run, pid=replacement.pid)
             current = self.read(path)["run"]
             _, raw = self.request("POST", f"/api/runs/{self.run}/stop", {"base_version": before["version"]}, status=409)
@@ -349,8 +352,11 @@ class Check:
             contract.validate(json.loads(payload), error["schema"], f"{method} {path} {code}")
 
     def cli_call(self, *argv, input=None):
+        from . import environment
+
         command = child_command(SOURCE, "from arete.api_check import cli_worker; sys.exit(cli_worker())", *argv)
-        done = subprocess.run(command, env={**os.environ, "ARETE_SERVER": f"http://{ADDRESS}:{self.port}"},
+        done = subprocess.run(command, env=environment.build(environment.INTERNAL_ARETE,
+                                                             {"ARETE_SERVER": f"http://{ADDRESS}:{self.port}"}),
                               text=True, input=input, capture_output=True, timeout=15, check=False)
         require(done.returncode == 0, f"arete {' '.join(argv)} failed: {done.stdout.strip()} {done.stderr.strip()}")
         return done

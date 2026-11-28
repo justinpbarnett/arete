@@ -66,10 +66,11 @@ class Worker:
         try:
             with log.open("ab") as output:
                 # The trusted SDK broker applies the runner's sandbox; nesting it prevents native startup on macOS.
-                from . import factory_control
+                from . import environment, factory_control
                 self.factory_key, self.proc = factory_control.spawn(
                     subprocess.Popen, command, stdin=subprocess.PIPE, stdout=output, stderr=output,
-                    pass_fds=(peer.fileno(),), start_new_session=True)
+                    pass_fds=(peer.fileno(),), start_new_session=True,
+                    env=environment.build(environment.INTERNAL_ARETE))
             self.proc.stdin.write(json.dumps(request).encode())
             self.proc.stdin.close()
             self.pid = self.proc.pid

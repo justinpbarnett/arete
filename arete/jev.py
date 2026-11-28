@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
-from . import config, jev_verdicts, paths, record, secretstore, util
+from . import config, jev_verdicts, paths, record, scrub, secretstore, util
 from .agent import Result
 from .store import db
 
@@ -183,7 +183,9 @@ def ask(state: str | dict | list, questions: dict[str, dict], cfg: config.Config
     token = key()
     if not cfg.jev.enabled or not token:
         return Reply(error="jev is off in the config" if token else f"no JEV key in the environment or at {KEY_ADDRESS}")
-    body = json.dumps({"model": cfg.jev.model, "state": clip(state), "questions": questions}).encode()
+    subject = f"{trace[0]}/{trace[1]}" if trace[0] else (trace[1] or "jev")
+    clean = scrub.value(state, "jev", subject)
+    body = json.dumps({"model": cfg.jev.model, "state": clip(clean), "questions": questions}).encode()
     started = time.monotonic()
     if deadline is not None:
         if receipt is None:
@@ -260,7 +262,8 @@ class WorkerJudge:
                 questions = {"q": q}
             else:
                 return {}
-            body = json.dumps({"model": cfg.model, "state": state, "questions": questions}).encode()
+            clean = scrub.text(state, "jev", f"{self.run_id}/{op}" if self.run_id else op)
+            body = json.dumps({"model": cfg.model, "state": clean, "questions": questions}).encode()
             self.left[op] -= 1
             started = time.monotonic()
             data = worker_post(body, self._token)
