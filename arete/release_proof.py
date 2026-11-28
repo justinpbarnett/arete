@@ -102,12 +102,91 @@ def pointer(value):
 
 
 PROMOTION_MODES = ("single", "per-change", "whole-branch")
+RELEASE_WORKFLOW_KINDS = ("ref_update", "release_pr", "tag", "workflow_dispatch")
+QA_AUTHORITIES = ("explicit", "tracker", "team")
+ACCOUNT_RE = re.compile(r"[a-zA-Z0-9_.:-]{1,128}")
+
+
+def validate_accounts(rows, message):
+    need(isinstance(rows, list) and bool(rows)
+         and all(isinstance(s, str) and ACCOUNT_RE.fullmatch(s) for s in rows), message)
+
+
+def validate_activations(rows):
+    need(isinstance(rows, list) and 1 <= len(rows) <= 16, "activations must list 1 to 16 entries")
+    for row in rows:
+        need(isinstance(row, dict) and set(row) == {"kind", "value"}
+             and row.get("kind") in ("feature_flag", "activation")
+             and isinstance(row.get("value"), str) and 0 < len(row["value"].strip()) <= 200,
+             "each activation entry needs kind (feature_flag or activation) and a non-empty value")
+
+
+def validate_release_workflow(wf):
+    if isinstance(wf, str):
+        need(wf in ("ref_update", "release_pr", "tag"),
+             "string release_workflow must be ref_update, release_pr, or tag")
+        return
+    need(isinstance(wf, dict) and wf.get("kind") in RELEASE_WORKFLOW_KINDS,
+         "release_workflow must specify kind in ref_update, release_pr, tag, or workflow_dispatch")
+    kind = wf["kind"]
+    if kind == "ref_update":
+        need(set(wf) == {"kind"}, "ref_update workflow takes no extra options")
+    elif kind == "release_pr":
+        need(set(wf) <= {"kind", "branch_prefix", "auto_merge"}, "unsupported release_pr workflow option")
+        if "branch_prefix" in wf:
+            prefix = wf["branch_prefix"]
+            need(isinstance(prefix, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,64}", prefix)
+                 and ".." not in prefix and not prefix.startswith("/") and not prefix.endswith("/"),
+                 "invalid release_pr branch_prefix")
+        if "auto_merge" in wf:
+            need(type(wf["auto_merge"]) is bool, "release_pr auto_merge must be a boolean")
+    elif kind == "tag":
+        need(set(wf) <= {"kind", "prefix"}, "unsupported tag workflow option")
+        if "prefix" in wf:
+            prefix = wf["prefix"]
+            need(isinstance(prefix, str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,40}", prefix)
+                 and ".." not in prefix and not prefix.startswith("/"),
+                 "invalid release tag prefix")
+    elif kind == "workflow_dispatch":
+        need(set(wf) <= {"kind", "workflow", "ref", "inputs"}, "unsupported workflow_dispatch option")
+        name = wf.get("workflow")
+        need(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name),
+             "workflow_dispatch requires a valid workflow filename or ID")
+        if "ref" in wf:
+            need(config.valid_target_branch(wf["ref"]), "invalid workflow_dispatch ref branch")
+        if "inputs" in wf:
+            inputs = wf["inputs"]
+            need(isinstance(inputs, dict) and len(inputs) <= 10
+                 and all(isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", k)
+                         and isinstance(v, str) and len(v) <= 200 for k, v in inputs.items()),
+                 "workflow_dispatch inputs must be a map of up to 10 short string pairs")
+
+
+def required_activations(policy, ticket=None) -> list[dict]:
+    from . import spec_graph_delivery
+
+    combined, seen = [], set()
+    for row in (policy or {}).get("activations") or ():
+        kind, value = row["kind"], row["value"].strip()
+        key = (kind, value.casefold())
+        if value and key not in seen:
+            seen.add(key)
+            combined.append({"kind": kind, "value": value})
+    if ticket is not None:
+        for row in spec_graph_delivery.activation_requirements(ticket):
+            kind, value = row["kind"], row["value"].strip()
+            key = (kind, value.casefold())
+            if value and key not in seen:
+                seen.add(key)
+                combined.append({"kind": kind, "value": value})
+    return combined
 
 
 def validate(data):
     need(isinstance(data, dict) and set(data) <= {"destination", "path", "assertions", "recovery", "revision",
          "staging", "production", "qa", "instructions", "identity_path", "observer_sha256",
-         "production_branch", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode"}
+         "production_branch", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode",
+         "qa_authority", "release_owners", "require_release_owner", "irreversible", "activations", "release_workflow"}
          and data.get("destination") in ("arete-serve", "staging", "production"),
          "invalid release policy or unattended destination")
     path = data.get("path")
@@ -120,8 +199,13 @@ def validate(data):
     if "observer_sha256" in data:
         need(isinstance(data["observer_sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", data["observer_sha256"]) is not None,
              "invalid observer fingerprint")
+    if "activations" in data:
+        validate_activations(data["activations"])
     if data["destination"] == "arete-serve":
-        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch", "identity_path", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode"} & set(data)), "invalid Arete client route")
+        need(path.startswith("/api/") and not ({"staging", "production", "qa", "observer_sha256", "production_branch",
+             "identity_path", "immutable_host_suffix", "checks", "qa_require_revision", "promotion_mode",
+             "qa_authority", "release_owners", "require_release_owner", "irreversible", "release_workflow"} & set(data)),
+             "invalid Arete client route")
     else:
         identity = data.get("identity_path")
         need(isinstance(identity, str) and re.fullmatch(r"/[A-Za-z0-9/_.-]+", identity)
@@ -135,6 +219,16 @@ def validate(data):
             need(type(data.get("qa_require_revision", False)) is bool, "qa_require_revision must be a boolean")
             need(data.get("promotion_mode", "single") in PROMOTION_MODES,
                  "promotion_mode must be single, per-change, or whole-branch")
+            need(data.get("qa_authority", "explicit") in QA_AUTHORITIES,
+                 "qa_authority must be explicit, tracker, or team")
+            need(type(data.get("require_release_owner", False)) is bool, "require_release_owner must be a boolean")
+            need(type(data.get("irreversible", False)) is bool, "irreversible must be a boolean")
+            if "release_owners" in data:
+                validate_accounts(data["release_owners"], "configure the authorized release owner tracker accounts")
+            if data.get("require_release_owner"):
+                need(bool(data.get("release_owners")), "require_release_owner requires configured release_owners")
+            if "release_workflow" in data:
+                validate_release_workflow(data["release_workflow"])
             if "checks" in data:
                 gates = data["checks"]
                 need(isinstance(gates, dict) and set(gates) == {"pr", "staging"}, "declare PR and staging checks")
@@ -143,9 +237,7 @@ def validate(data):
             if suffix := data.get("immutable_host_suffix"):
                 need(isinstance(suffix, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", suffix)
                      and server_url(data["staging"]).hostname.endswith("." + suffix), "invalid preview hostname suffix")
-            need(isinstance(data.get("qa"), list) and bool(data["qa"])
-                 and all(isinstance(s, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", s) for s in data["qa"]),
-                 "configure the authorized QA tracker accounts")
+            validate_accounts(data.get("qa"), "configure the authorized QA tracker accounts")
             need(data["staging"].rstrip("/") != data["production"].rstrip("/"), "use distinct staging and production origins")
 
 
@@ -657,7 +749,7 @@ def new_release_run(repo, ticket, run_id):
 
 def finish_standing(repo, ticket, tk, receipt):
     """Cache an observed ordinary tracker closure for this release and its factory admission."""
-    from . import unblock
+    from . import spec_graph_delivery, unblock
 
     folder = state_dir(repo.name, ticket)
     file = folder / "tracker-completion.json"
@@ -673,6 +765,9 @@ def finish_standing(repo, ticket, tk, receipt):
         item = tk.get(ticket)
         if item.is_spec or item.blocker:
             return
+        activations = required_activations(goal(repo.name, ticket), item)
+        if activations and spec_graph_delivery.activations_verified(activations, receipt=receipt):
+            return
         if item.open:
             if not unblock.approval(tk, item)[0]:
                 return
@@ -685,7 +780,7 @@ def finish_standing(repo, ticket, tk, receipt):
 
 
 def finish_verified(cfg, repo, ticket, revision, delivered=None):
-    from . import tracker, unblock
+    from . import spec_graph_delivery, tracker, unblock
 
     proof = delivered or evidence(repo.name, ticket, revision)
     if not proof:
@@ -699,12 +794,15 @@ def finish_verified(cfg, repo, ticket, revision, delivered=None):
     item = tk.get(ticket)
     if not item.open or "spec" in item.labels or item.blocker or not unblock.approval(tk, item)[0]:
         return
+    data = goal(repo.name, ticket)
+    activations = required_activations(data, item)
+    if activations and spec_graph_delivery.activations_verified(activations, receipt=proof):
+        return
     reason = f"Verified {proof['path']} on {proof['destination']} at {revision}. Receipt {proof['receipt_id']}."
     if isinstance(tk, tracker.GitHubTracker):
         tk.require_ordinary(ticket)
         gh.issue_close(repo.github, int(ticket), gh.marked(reason))
     elif isinstance(tk, tracker.JiraTracker):
-        data = goal(repo.name, ticket)
         branch = data.get("production_branch", repo.target_branch) if proof["destination"] == "production" else repo.target_branch
         tk.move_to(ticket, cfg.jira.landed.get(branch, ""))
 

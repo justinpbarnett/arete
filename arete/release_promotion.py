@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -18,6 +19,14 @@ NEUTRAL = {"thanks", "thank you", "looks good", "lgtm", "ack"}
 EXPLICIT = {"promote this to production", "push this to production", "moving this to push to production on the sheet"}
 APPROVE = re.compile(r"^promote ([a-f0-9]{40}(?:[a-f0-9]{24})?) to production[.!]?$", re.I)
 LIVE_DEPENDENCY = re.compile(r"\b(?:live|deployed|deployment|in production|production)\b", re.I)
+_HELD_LOCKS = threading.local()
+
+
+def _thread_locks():
+    locks = getattr(_HELD_LOCKS, "keys", None)
+    if locks is None:
+        locks = _HELD_LOCKS.keys = set()
+    return locks
 
 
 def pages(endpoint):
@@ -146,31 +155,156 @@ def comments(repo, ticket, tk):
             for r in rows if isinstance(r, dict)]
 
 
+def _actor_in_list(tk, actor, accounts):
+    if not actor or not accounts:
+        return False
+    if isinstance(tk, tracker.GitHubTracker):
+        return actor.casefold() in {a.casefold() for a in accounts}
+    return actor in set(accounts)
+
+
+def _qa_authorized(tk, repo, policy, actor):
+    if not actor:
+        return False
+    if _actor_in_list(tk, actor, policy.get("qa") or ()):
+        return True
+    if isinstance(tk, tracker.GitHubTracker) and repo.commenters:
+        return actor.casefold() in {c.casefold() for c in repo.commenters}
+    if isinstance(tk, tracker.JiraTracker) and policy.get("qa_authority") in ("tracker", "team"):
+        return True
+    return False
+
+
+def _release_owner_authorized(tk, policy, actor):
+    return _actor_in_list(tk, actor, policy.get("release_owners") or ())
+
+
+def _comment_url(tk, repo, ticket, cid):
+    return (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
+            else tk.client.comment_url(ticket, cid))
+
+
+def _match_approval(line, policy, revision, *, for_release_owner=False):
+    from . import ticket_feedback
+
+    directive = APPROVE.fullmatch(line)
+    matched_prod, prod_rev = ticket_feedback.match_production_instruction(line)
+    matched_owner, owner_rev = (ticket_feedback.match_release_owner_approval(line)
+                                if for_release_owner else (False, ""))
+    explicit_text = line.rstrip(".!").casefold() in EXPLICIT
+    if not (directive or matched_prod or matched_owner or explicit_text):
+        return False, False
+    explicit_sha = directive[1] if directive else (prod_rev or owner_rev)
+    if not explicit_sha and policy.get("qa_require_revision"):
+        return True, False
+    if explicit_sha and explicit_sha.lower() != revision.lower():
+        return True, False
+    return True, True
+
+
+def _valid_approval_metadata(cid, at, edited):
+    return bool(cid and at and cid.isascii() and cid.isdigit()
+                and (not edited or util.parse_iso(edited) == util.parse_iso(at)))
+
+
 def review_comments(tk, repo, ticket, policy, revision):
     from . import ticket_feedback
 
-    allowed = set(policy["qa"])
     notes = comments(repo, ticket, tk)
-    approvals, changes = [], []
+    approvals, changes, seen_approvals = [], [], set()
     for who, body, at, edited, cid in notes:
         # GitHub's visible bot types and Arete's own marked handoffs cannot grant release authority.
-        if who not in allowed or ticket_feedback.is_arete_comment(body) or not cid or not at:
+        qa_ok = _qa_authorized(tk, repo, policy, who)
+        owner_ok = _release_owner_authorized(tk, policy, who)
+        if not (qa_ok or owner_ok) or ticket_feedback.is_arete_comment(body) or not cid or not at:
             continue
         line = body.strip()
-        directive = APPROVE.fullmatch(line)
-        matched_prod, prod_rev = ticket_feedback.match_production_instruction(line)
-        explicit_sha = directive[1] if directive else prod_rev
-        if directive or matched_prod or line.rstrip(".!").casefold() in EXPLICIT:
-            if not explicit_sha and policy.get("qa_require_revision"):
-                continue
-            if (cid.isascii() and cid.isdigit() and (not explicit_sha or explicit_sha.lower() == revision.lower())
-                    and (not edited or util.parse_iso(edited) == util.parse_iso(at))):
-                url = (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
-                       else tk.client.comment_url(ticket, cid))
-                approvals.append({"id": cid, "at": cohorts.timestamp(at), "url": url, "actor": who})
+        is_qa_dir, qa_matches = _match_approval(line, policy, revision, for_release_owner=False)
+        is_owner_dir, _ = _match_approval(line, policy, revision, for_release_owner=True) if owner_ok else (False, False)
+        if is_qa_dir:
+            if qa_ok and qa_matches and _valid_approval_metadata(cid, at, edited):
+                seen_approvals.add(cid)
+                approvals.append({"id": cid, "at": cohorts.timestamp(at), "url": _comment_url(tk, repo, ticket, cid), "actor": who})
+        elif is_owner_dir:
+            # Release-owner sign-off comments are not behavior-changing corrections.
+            continue
         elif line.rstrip(".!").casefold() not in NEUTRAL and not ticket_feedback.is_neutral_acknowledgment(line):
             changes.append((who, cid, line))
+
+    # Also consume authorized production instructions routed through #988 ticket_feedback (including Jira team commenters).
+    for row in ticket_feedback.production_instructions(repo.name, str(ticket)):
+        if row.get("tracker") != tk.name or not row.get("authorized"):
+            continue
+        cid = str(row.get("comment_id") or "")
+        body = row.get("body") or ""
+        at = row.get("created") or ""
+        edited = row.get("updated") or ""
+        actor = row.get("author") or ""
+        if not cid or cid in seen_approvals or ticket_feedback.is_arete_comment(body):
+            continue
+        recorded_rev = (row.get("data") or {}).get("revision") or ""
+        if recorded_rev and recorded_rev.lower() != revision.lower():
+            continue
+        _, qa_matches = _match_approval(body.strip(), policy, revision, for_release_owner=False)
+        if qa_matches and _valid_approval_metadata(cid, at, edited):
+            seen_approvals.add(cid)
+            url = row.get("url") or _comment_url(tk, repo, ticket, cid)
+            approvals.append({"id": cid, "at": cohorts.timestamp(at), "url": url, "actor": actor})
     return changes, approvals
+
+
+def release_owner_required(policy, t=None):
+    if not policy:
+        return False
+    if policy.get("require_release_owner") or policy.get("irreversible"):
+        return True
+    if policy.get("release_owners") and policy.get("require_release_owner") is not False:
+        return True
+    labels = set(getattr(t, "labels", None) or ()) if t is not None else set()
+    return bool(labels & {"irreversible", "release-owner-required"})
+
+
+def release_owner_approvals(tk, repo, ticket, policy, revision):
+    from . import ticket_feedback
+
+    if not policy.get("release_owners"):
+        return []
+    found, seen = [], set()
+    for who, body, at, edited, cid in comments(repo, ticket, tk):
+        if not _release_owner_authorized(tk, policy, who) or ticket_feedback.is_arete_comment(body) or not cid or not at:
+            continue
+        _, matched = _match_approval(body.strip(), policy, revision, for_release_owner=True)
+        if matched and _valid_approval_metadata(cid, at, edited):
+            seen.add(cid)
+            found.append({"id": cid, "at": cohorts.timestamp(at), "url": _comment_url(tk, repo, ticket, cid), "actor": who})
+    for row in ticket_feedback.production_instructions(repo.name, str(ticket)):
+        if row.get("tracker") != tk.name or not row.get("authorized"):
+            continue
+        cid = str(row.get("comment_id") or "")
+        actor = row.get("author") or ""
+        body = row.get("body") or ""
+        at = row.get("created") or ""
+        edited = row.get("updated") or ""
+        if not cid or cid in seen or not _release_owner_authorized(tk, policy, actor) or ticket_feedback.is_arete_comment(body):
+            continue
+        recorded_rev = (row.get("data") or {}).get("revision") or ""
+        if recorded_rev and recorded_rev.lower() != revision.lower():
+            continue
+        _, matched = _match_approval(body.strip(), policy, revision, for_release_owner=True)
+        if matched and _valid_approval_metadata(cid, at, edited):
+            seen.add(cid)
+            url = row.get("url") or _comment_url(tk, repo, ticket, cid)
+            found.append({"id": cid, "at": cohorts.timestamp(at), "url": url, "actor": actor})
+    return found
+
+
+def release_workflow_config(policy):
+    wf = (policy or {}).get("release_workflow")
+    if not wf:
+        return {"kind": "ref_update"}
+    if isinstance(wf, str):
+        return {"kind": wf}
+    return dict(wf)
 
 
 def promotion_mode(policy):
@@ -397,11 +531,24 @@ def after_handoff(state, approvals):
     return [row for row in approvals if util.parse_iso(row["at"]) > util.parse_iso(state["qa_since"])]
 
 
+def _release_owner_signoff(tk, repo, ticket, policy, state, staged_rev, t):
+    if not release_owner_required(policy, t):
+        return None
+    proof.need(bool(policy.get("release_owners")),
+               "irreversible production action requires configured release_owners")
+    owner_list = release_owner_approvals(tk, repo, ticket, policy, staged_rev)
+    choices = after_handoff(state, owner_list) if state.get("handoff") else owner_list
+    proof.need(choices, "waiting for release-owner approval before irreversible production action")
+    return min(choices, key=lambda row: (row["at"], int(row["id"])))
+
+
 def ticket_approval(cfg, repo, ticket, policy, state):
     from . import ticket_feedback
 
     staged_rev = state.get("staged_revision") or state["revision"]
     tk, t, scope, approvals = authority(cfg, repo, ticket, policy, staged_rev)
+    proof.need(state.get("phase") != "paused",
+               state.get("paused_reason") or "paused: the tested behavior changed; returning to staging for fresh QA")
     proof.need(not ticket_feedback.pending_corrections(repo.name, ticket),
                "pending authorized feedback requires a corrected staging revision and fresh QA")
     proof.need(scope == state["scope"], "scope changed after staging; deploy the corrected revision for fresh QA")
@@ -413,6 +560,7 @@ def ticket_approval(cfg, repo, ticket, policy, state):
         choices = after_handoff(state, approvals)
         proof.need(choices, "waiting for a new QA instruction for the tested revision")
         approval = min(choices, key=lambda row: (row["at"], int(row["id"])))
+    _release_owner_signoff(tk, repo, ticket, policy, state, staged_rev, t)
     return tk, t, approval
 
 
@@ -556,6 +704,8 @@ def promotion_plan(cfg, repo, ticket, policy, state):
         raise proof.Held("repository enrollment is unavailable") from error
     proof.need(current == repo and current.pipeline and current.landing == "pr", "repository enrollment changed")
     tk, t, approval = ticket_approval(cfg, repo, ticket, policy, state)
+    owner_approval = _release_owner_signoff(tk, repo, ticket, policy, state, staged_rev, t)
+    owner_meta = {"release_owner_approval": owner_approval} if owner_approval else {}
     proof.need(repo.unattended_environment == "staging" and repo.target_branch != target
                and proof.digest(proof.goal(repo.name, ticket)) == state["policy"], "release policy changed")
     proof.need(selected_revision(repo, ticket) == staged_rev,
@@ -585,14 +735,15 @@ def promotion_plan(cfg, repo, ticket, policy, state):
         isolated = rev_parent != production
         return approval, {"base": production, "target": "" if isolated else staged_rev, "revisions": [staged_rev],
                           "tickets": [str(ticket)], "isolated": isolated, "graph_revisions": [],
-                          "reobserve_staging": reobserve}
+                          "reobserve_staging": reobserve, **owner_meta}
 
     if mode == "whole-branch":
         proof.need(staging_receipt_valid(repo, ticket, staged_rev, state),
                    "the tested staging receipt is missing or no longer matches")
         proof.need(production == proof.deployed_revision(policy, policy["production"]),
                    "promotion would include other unapproved changes or production identity is unconfirmed")
-        return approval, whole_branch_plan(cfg, repo, ticket, tk, t, policy, state, production, staging_tip)
+        return approval, {**whole_branch_plan(cfg, repo, ticket, tk, t, policy, state, production, staging_tip),
+                          **owner_meta}
 
     proof.need(staging_tip == staged_rev, "the staging branch or goal changed; fresh QA is required")
     hold = dependency_hold(cfg, repo, tk, ticket, t, policy)
@@ -605,7 +756,7 @@ def promotion_plan(cfg, repo, ticket, policy, state):
                and preview(repo, policy, staged_rev) == state["origin"], "the tested staging deployment changed")
     return approval, {"base": production, "target": staged_rev, "revisions": graph_revisions or [staged_rev],
                       "tickets": [str(ticket)], "isolated": False, "graph_revisions": graph_revisions,
-                      "reobserve_staging": True}
+                      "reobserve_staging": True, **owner_meta}
 
 
 def ready(cfg, repo, ticket, policy, state):
@@ -630,13 +781,14 @@ def peer_promotion(repo, ticket, state, policy):
     return None
 
 
-def isolate_revision(repo, revision, production, production_branch, *, on_prepared=None):
+def isolate_revision(repo, revision, production, production_branch, *, on_prepared=None, push_ref=""):
     """Cherry-pick a single staged commit onto production in an isolated worktree and push non-force."""
     proof.need(serve_guard.SHA.fullmatch(revision or "") and serve_guard.SHA.fullmatch(production or "")
                and config.valid_target_branch(production_branch),
                "per-change isolation requires validated commit SHAs and branch names")
     proof.need(repo.path.is_dir() and (repo.path / ".git").exists(),
                "per-change isolation requires a local repository checkout")
+    target_ref = push_ref or f"refs/heads/{production_branch}"
     with util.repo_lock(repo.path):
         if "origin" in util.git(["remote"], repo.path, check=False).split():
             util.git(["fetch", "-q", "origin", production_branch, repo.target_branch], repo.path, check=False)
@@ -659,10 +811,397 @@ def isolate_revision(repo, revision, production, production_branch, *, on_prepar
                 if on_prepared:
                     on_prepared(isolated)
                 util.git(["push", "-q", "--no-follow-tags", "--recurse-submodules=no",
-                          "origin", f"{isolated}:refs/heads/{production_branch}"], wt, timeout=120, retry=False)
+                          "origin", f"{isolated}:{target_ref}"], wt, timeout=120, retry=False)
                 return isolated
             finally:
                 util.git(["worktree", "remove", "--force", str(wt)], repo.path, check=False)
+
+
+def pause_for_feedback(repo_name, ticket, *, reason, comment_id=""):
+    """Safely pause a staged promotion before it enters production and clear stale QA approvals."""
+    file = proof.state_dir(repo_name, str(ticket)) / "promotion.json"
+    lock_name = "promote-" + proof.key(repo_name, str(ticket))
+    held = _thread_locks()
+    cm = nullcontext(True) if lock_name in held else util.lock(lock_name, wait=True)
+    with cm:
+        state = serve_guard.read(file) or {}
+        if state.get("phase") not in ("awaiting_qa", "staging_verified", "staged_for_parent", "paused"):
+            return None
+        state.update(
+            phase="paused",
+            paused_reason=reason,
+            paused_revision=state.get("staged_revision") or state.get("revision", ""),
+            paused_at=util.iso(),
+            waiting=reason,
+        )
+        if comment_id:
+            state["paused_by_comment"] = str(comment_id)
+        for stale in ("approval", "approval_comment", "release_owner_approval"):
+            state.pop(stale, None)
+        serve_guard.write(file, state)
+        return state
+
+
+def _queue_behavior_change_feedback(cfg, repo, tk, ticket, t, state, policy, revision):
+    """Ensure post-handoff behavior-changing comments are queued in ticket_feedback for the worker."""
+    from . import ticket_feedback
+    from .store import feedback as feedback_store
+
+    if not feedback_store.installed():
+        return
+    handoff = state.get("handoff") or ""
+    anchor = re.search(r"(?:issuecomment-|focusedCommentId=)([0-9]+)(?:$|[&#])", handoff)
+    anchor_id = int(anchor[1]) if anchor else 0
+    qa_since = util.parse_iso(state["qa_since"]) if state.get("qa_since") else None
+    thread_comments = []
+    for who, body, at, edited, cid in comments(repo, ticket, tk):
+        if not cid or not at or ticket_feedback.is_arete_comment(body):
+            continue
+        if anchor_id and cid.isdigit():
+            if int(cid) <= anchor_id:
+                continue
+        elif qa_since:
+            ts = ticket_feedback.parse_timestamp(at)
+            if ts and ts <= qa_since:
+                continue
+        line = body.strip()
+        if not line or line.rstrip(".!").casefold() in NEUTRAL or ticket_feedback.is_neutral_acknowledgment(line):
+            continue
+        if _match_approval(line, policy, revision, for_release_owner=True)[0]:
+            continue
+        thread_comments.append(ticket_feedback.ThreadComment(
+            comment_id=cid,
+            author=who,
+            author_display=who,
+            body=body,
+            url=_comment_url(tk, repo, ticket, cid),
+            created=at,
+            updated=edited or "",
+        ))
+    if thread_comments:
+        ticket_feedback.consume_ticket(cfg, repo, str(ticket), tk=tk, ticket=t, comments=thread_comments, since="")
+
+
+def tag_sha(repo, tag_name):
+    try:
+        row = gh.gh_json(["api", f"repos/{repo.github}/git/ref/tags/{quote(tag_name, safe='/')}"],
+                         timeout=15, retry=False)
+    except gh.GhError:
+        return ""
+    value = row.get("object") or {}
+    if row.get("ref") == "refs/tags/" + tag_name and serve_guard.SHA.fullmatch(value.get("sha", "")):
+        return value["sha"]
+    return ""
+
+
+def workflow_dispatch_run(repo, state):
+    wf = state.get("workflow", "")
+    if not wf:
+        return None
+    runs = gh.actions_rows(
+        f"repos/{repo.github}/actions/workflows/{quote(wf, safe='')}/runs?event=workflow_dispatch&per_page=20",
+        "workflow_runs", timeout=20, retry=False,
+    )
+    want_id = state.get("workflow_run_id")
+    if want_id is not None:
+        for run in runs:
+            if run.get("id") == want_id:
+                return run
+    dispatched = util.parse_iso(state["dispatched_at"]) if state.get("dispatched_at") else None
+    wf_ref = state.get("workflow_ref", "")
+    for run in runs:
+        if wf_ref and run.get("head_branch") and run.get("head_branch") != wf_ref:
+            continue
+        created = run.get("created_at") or ""
+        if dispatched and created:
+            try:
+                if util.parse_iso(created) < dispatched:
+                    continue
+            except ValueError:
+                pass
+        return run
+    return None
+
+
+def _ensure_remote_ref(repo, full_ref, sha):
+    api = f"repos/{repo.github}/git/refs"
+    try:
+        gh.gh(["api", api, "--method", "POST", "--input", "-"],
+              input=gh.Outgoing(json.dumps({"ref": full_ref, "sha": sha})),
+              write=True, retry=False, timeout=20)
+    except gh.GhError as error:
+        if "Reference already exists" not in str(error):
+            raise
+        ref_path = full_ref.removeprefix("refs/")
+        existing = gh.gh_json(["api", f"repos/{repo.github}/git/ref/{quote(ref_path, safe='/')}"],
+                              timeout=15, retry=False)
+        existing_sha = (existing.get("object") or {}).get("sha", "")
+        proof.need(existing_sha == sha, f"release ref {full_ref} already points to a different revision")
+
+
+def reconcile_promotion_intent(repo, ticket, policy, state, file):
+    """Reconcile an in-flight promotion across restarts and lost write confirmations."""
+    wf_kind = state.get("release_workflow") or "ref_update"
+    if wf_kind == "release_pr":
+        pr_url = state.get("release_pr", "")
+        if not pr_url and state.get("release_branch"):
+            pr_url = (gh.open_pr_url(repo.github, state["release_branch"])
+                      or (gh.find_pr_marker(repo.github, state["release_branch"], state["release_marker"])
+                          if state.get("release_marker") else ""))
+        if pr_url:
+            state.update(release_pr=pr_url, release_ref=pr_url)
+            pr = gh.pr_view(pr_url)
+            pr_state = pr.get("state")
+            if pr_state == "MERGED":
+                merged_sha = (pr.get("mergeCommit") or {}).get("oid", "")
+                if serve_guard.SHA.fullmatch(merged_sha or ""):
+                    state["revision"] = merged_sha
+                state.update(phase="observing_production")
+                serve_guard.write(file, state)
+                return True
+            serve_guard.write(file, state)
+            if pr_state == "OPEN":
+                raise proof.Held(f"waiting for release PR {pr_url} to merge")
+            raise proof.Held(f"release PR {pr_url} closed without merging; reconcile before retrying")
+        current_prod = branch(repo, state["production_branch"])
+        if current_prod == state["revision"]:
+            state.update(phase="observing_production")
+            serve_guard.write(file, state)
+            return True
+        if current_prod != state["parent"]:
+            raise proof.Held("production moved during release PR promotion; reconcile the release")
+        raise proof.Held("release PR confirmation was lost; reconcile before retrying")
+
+    if wf_kind == "tag":
+        tag_name = state.get("release_tag", "")
+        found_sha = tag_sha(repo, tag_name) if tag_name else ""
+        if found_sha == state["revision"]:
+            state.update(phase="observing_production", release_ref=f"refs/tags/{tag_name}")
+            serve_guard.write(file, state)
+            return True
+        if found_sha:
+            raise proof.Held(f"release tag {tag_name} points to a different revision; reconcile the release")
+        current_prod = branch(repo, state["production_branch"])
+        if current_prod == state["revision"]:
+            state.update(phase="observing_production")
+            serve_guard.write(file, state)
+            return True
+        if current_prod != state["parent"]:
+            raise proof.Held("production moved during release tag promotion; reconcile the release")
+        if state.get("isolated"):
+            raise proof.Held("an earlier isolated tag promotion did not land; reconcile before retrying")
+        return False
+
+    if wf_kind == "workflow_dispatch":
+        run = workflow_dispatch_run(repo, state)
+        if run:
+            state["workflow_run_id"] = run["id"]
+            if run.get("html_url"):
+                state["release_ref"] = run["html_url"]
+            if run.get("status") == "completed":
+                if run.get("conclusion") == "success":
+                    state.update(phase="observing_production")
+                    serve_guard.write(file, state)
+                    return True
+                serve_guard.write(file, state)
+                raise proof.Held(
+                    f"release workflow {state.get('workflow', '')} failed ({run.get('conclusion') or 'failure'}); spec stays open"
+                )
+            serve_guard.write(file, state)
+            raise proof.Held(f"waiting for release workflow {state.get('workflow', '')} run {run['id']} to complete")
+        try:
+            if proof.deployed_revision(policy, policy["production"]) == state["revision"]:
+                state.update(phase="observing_production")
+                serve_guard.write(file, state)
+                return True
+        except (OSError, ValueError, proof.Held):
+            pass
+        raise proof.Held(f"waiting for release workflow {state.get('workflow', '')} confirmation; reconcile before retrying")
+
+    # Default ref_update reconciliation.
+    current_prod = branch(repo, state["production_branch"])
+    if current_prod == state["revision"]:
+        state.update(phase="observing_production")
+        serve_guard.write(file, state)
+        return True
+    if current_prod != state["parent"]:
+        raise proof.Held("production moved during promotion; reconcile the release")
+    if state.get("isolated"):
+        raise proof.Held("an earlier isolated promotion did not reach production; reconcile before retrying")
+    if state.get("promoted_revisions") and branch(repo, repo.target_branch) != state["revision"]:
+        raise proof.Held("staging moved after promotion intent; cannot silently widen the approved release")
+    return False
+
+
+def execute_release_workflow(repo, ticket, policy, state, file, plan, revision):
+    wf = release_workflow_config(policy)
+    kind = wf["kind"]
+    prod_branch = policy["production_branch"]
+
+    if kind == "ref_update":
+        if plan["isolated"]:
+            def record_isolated_intent(isolated_sha):
+                state.update(phase="promotion_intent", parent=plan["base"], production_branch=prod_branch,
+                             staged_revision=revision, revision=isolated_sha,
+                             promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"], isolated=True)
+                serve_guard.write(file, state)
+
+            with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+                if state.get("standing_authority"):
+                    require_standing(repo, ticket, state)
+                isolate_revision(repo, revision, plan["base"], prod_branch, on_prepared=record_isolated_intent)
+            return state
+        target_sha = plan["target"]
+        if target_sha != revision:
+            state["staged_revision"] = revision
+        state.update(phase="promotion_intent", parent=plan["base"], production_branch=prod_branch,
+                     revision=target_sha, promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"])
+        serve_guard.write(file, state)
+        # A non-forced update of a direct child cannot land unrelated work if the branch races.
+        api = f"repos/{repo.github}/git/refs/heads/{quote(prod_branch, safe='/')}"
+        with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+            if state.get("standing_authority"):
+                require_standing(repo, ticket, state)
+            gh.gh(["api", api, "--method", "PATCH", "--input", "-"],
+                  input=gh.Outgoing(json.dumps({"sha": target_sha, "force": False})), write=True, retry=False, timeout=20)
+        return state
+
+    if kind == "release_pr":
+        prefix = wf.get("branch_prefix") or "arete/release"
+        release_branch = f"{prefix}/{ticket}-{revision[:12]}"
+        marker = f"arete-release-{ticket}-{revision[:12]}"
+        if plan["isolated"]:
+            def record_pr_isolated(isolated_sha):
+                state.update(phase="promotion_intent", release_workflow="release_pr",
+                             release_branch=release_branch, release_marker=marker,
+                             parent=plan["base"], production_branch=prod_branch,
+                             staged_revision=revision, revision=isolated_sha,
+                             promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"], isolated=True)
+                serve_guard.write(file, state)
+
+            with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+                if state.get("standing_authority"):
+                    require_standing(repo, ticket, state)
+                isolate_revision(repo, revision, plan["base"], prod_branch,
+                                 on_prepared=record_pr_isolated, push_ref=f"refs/heads/{release_branch}")
+        else:
+            target_sha = plan["target"]
+            state.update(phase="promotion_intent", release_workflow="release_pr",
+                         release_branch=release_branch, release_marker=marker,
+                         parent=plan["base"], production_branch=prod_branch,
+                         staged_revision=revision, revision=target_sha,
+                         promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"])
+            serve_guard.write(file, state)
+            with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+                if state.get("standing_authority"):
+                    require_standing(repo, ticket, state)
+                _ensure_remote_ref(repo, f"refs/heads/{release_branch}", target_sha)
+        pr_url = (gh.open_pr_url(repo.github, release_branch)
+                  or gh.find_pr_marker(repo.github, release_branch, marker))
+        if not pr_url:
+            title = f"Release {ticket} ({state['revision'][:12]}) to {prod_branch}"
+            body = gh.marked(
+                f"Promote verified staging revision `{state['revision']}` for ticket `{ticket}` to `{prod_branch}`.\n\n{marker}"
+            )
+            pr_url = gh.pr_create(repo.github, release_branch, prod_branch, title, body)
+        state.update(release_pr=pr_url, release_ref=pr_url)
+        serve_guard.write(file, state)
+        return state
+
+    if kind == "tag":
+        prefix = wf.get("prefix") or "release-"
+        tag_name = f"{prefix}{ticket}-{revision[:12]}"
+        if plan["isolated"]:
+            def record_tag_isolated(isolated_sha):
+                state.update(phase="promotion_intent", release_workflow="tag", release_tag=tag_name,
+                             parent=plan["base"], production_branch=prod_branch,
+                             staged_revision=revision, revision=isolated_sha,
+                             promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"], isolated=True)
+                serve_guard.write(file, state)
+
+            with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+                if state.get("standing_authority"):
+                    require_standing(repo, ticket, state)
+                isolate_revision(repo, revision, plan["base"], prod_branch,
+                                 on_prepared=record_tag_isolated, push_ref=f"refs/tags/{tag_name}")
+        else:
+            target_sha = plan["target"]
+            state.update(phase="promotion_intent", release_workflow="tag", release_tag=tag_name,
+                         parent=plan["base"], production_branch=prod_branch,
+                         staged_revision=revision, revision=target_sha,
+                         promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"])
+            serve_guard.write(file, state)
+            with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+                if state.get("standing_authority"):
+                    require_standing(repo, ticket, state)
+                _ensure_remote_ref(repo, f"refs/tags/{tag_name}", target_sha)
+        state["release_ref"] = f"refs/tags/{tag_name}"
+        serve_guard.write(file, state)
+        return state
+
+    # workflow_dispatch
+    wf_name = wf["workflow"]
+    wf_ref = wf.get("ref") or prod_branch
+    dispatch_id = f"arete-{ticket}-{revision[:12]}"
+    if plan["isolated"]:
+        release_branch = f"arete/release/{ticket}-{revision[:12]}"
+
+        def record_wf_isolated(isolated_sha):
+            state.update(phase="promotion_intent", release_workflow="workflow_dispatch",
+                         workflow=wf_name, workflow_ref=release_branch, dispatch_id=dispatch_id,
+                         dispatched_at=util.iso(), parent=plan["base"], production_branch=prod_branch,
+                         staged_revision=revision, revision=isolated_sha,
+                         promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"], isolated=True)
+            serve_guard.write(file, state)
+
+        with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+            if state.get("standing_authority"):
+                require_standing(repo, ticket, state)
+            isolate_revision(repo, revision, plan["base"], prod_branch,
+                             on_prepared=record_wf_isolated, push_ref=f"refs/heads/{release_branch}")
+        wf_ref = release_branch
+    else:
+        target_sha = plan["target"]
+        state.update(phase="promotion_intent", release_workflow="workflow_dispatch",
+                     workflow=wf_name, workflow_ref=wf_ref, dispatch_id=dispatch_id,
+                     dispatched_at=util.iso(), parent=plan["base"], production_branch=prod_branch,
+                     staged_revision=revision, revision=target_sha,
+                     promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"])
+        serve_guard.write(file, state)
+    inputs = {**(wf.get("inputs") or {}), "revision": state["revision"], "ticket": str(ticket), "dispatch_id": dispatch_id}
+    api = f"repos/{repo.github}/actions/workflows/{quote(wf_name, safe='')}/dispatches"
+    with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
+        if state.get("standing_authority"):
+            require_standing(repo, ticket, state)
+        gh.gh(["api", api, "--method", "POST", "--input", "-"],
+              input=gh.Outgoing(json.dumps({"ref": wf_ref, "inputs": inputs})),
+              write=True, retry=False, timeout=20)
+    return state
+
+
+def verify_production_observation(cfg, repo, ticket, policy, state, file, found):
+    from . import spec_graph_delivery
+
+    if found["status"] != "verified":
+        state["waiting"] = found["reason"]
+        return False
+    ticket_obj = None
+    try:
+        tk = tracker.for_ticket(cfg, repo, ticket)
+        if isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker)):
+            ticket_obj = tk.get(ticket)
+    except (gh.GhError, jira.JiraError, tracker.TaskError, KeyError, ValueError, OSError):
+        ticket_obj = None
+    reqs = proof.required_activations(policy, ticket_obj)
+    if missing := spec_graph_delivery.activations_verified(reqs, receipt=found):
+        state["waiting"] = "waiting for required feature-flag / audience activation: " + "; ".join(missing)
+        return False
+    state.update(phase="production_verified", production_receipt=found["receipt_id"],
+                 production_revision=state["revision"])
+    if reqs:
+        state["activations_verified"] = reqs
+    serve_guard.write(file, state)
+    return True
 
 
 def require_standing(repo, ticket, state):
@@ -693,22 +1232,28 @@ def score_approval(cfg, repo, ticket, state):
 
 def advance(cfg, repo, ticket):
     file = proof.state_dir(repo.name, ticket) / "promotion.json"
-    with util.lock("promote-" + proof.key(repo.name, ticket)) as acquired:
+    lock_name = "promote-" + proof.key(repo.name, ticket)
+    with util.lock(lock_name) as acquired:
         if not acquired:
             return {"phase": "in_progress"}
+        held = _thread_locks()
+        held.add(lock_name)
         try:
-            state = _advance(cfg, repo, ticket, file)
-        except (proof.Held, OSError, gh.GhError, jira.JiraError) as error:
-            state = serve_guard.read(file) or {"phase": "waiting"}
-            # Only controlled hold reasons may enter a release receipt.
-            state["waiting"] = str(error) if isinstance(error, proof.Held) else type(error).__name__
-        try:
-            score_approval(cfg, repo, ticket, state)
-        except (OSError, ValueError, sqlite3.Error, gh.GhError, jira.JiraError):
-            logging.getLogger(__name__).exception("Could not reconcile production QA accounting for %s/%s", repo.name, ticket)
-        if serve_guard.read(file) != state:
-            serve_guard.write(file, state)
-        return state
+            try:
+                state = _advance(cfg, repo, ticket, file)
+            except (proof.Held, OSError, gh.GhError, jira.JiraError) as error:
+                state = serve_guard.read(file) or {"phase": "waiting"}
+                # Only controlled hold reasons may enter a release receipt.
+                state["waiting"] = str(error) if isinstance(error, proof.Held) else type(error).__name__
+            try:
+                score_approval(cfg, repo, ticket, state)
+            except (OSError, ValueError, sqlite3.Error, gh.GhError, jira.JiraError):
+                logging.getLogger(__name__).exception("Could not reconcile production QA accounting for %s/%s", repo.name, ticket)
+            if serve_guard.read(file) != state:
+                serve_guard.write(file, state)
+            return state
+        finally:
+            held.discard(lock_name)
 
 
 def _advance(cfg, repo, ticket, file):
@@ -722,16 +1267,7 @@ def _advance(cfg, repo, ticket, file):
         return state
     # Reconcile sends first, even when a subsequent comment, policy or branch changed.
     if state.get("phase") == "promotion_intent":
-        current_prod = branch(repo, state["production_branch"])
-        if current_prod == state["revision"]:
-            state.update(phase="observing_production")
-            serve_guard.write(file, state)
-        elif current_prod != state["parent"]:
-            raise proof.Held("production moved during promotion; reconcile the release")
-        elif state.get("isolated"):
-            raise proof.Held("an earlier isolated promotion did not reach production; reconcile before retrying")
-        elif state.get("promoted_revisions") and branch(repo, repo.target_branch) != state["revision"]:
-            raise proof.Held("staging moved after promotion intent; cannot silently widen the approved release")
+        reconcile_promotion_intent(repo, ticket, policy, state, file)
     if state.get("phase") == "staged_for_parent":
         tk, _, scope, _ = authority(cfg, repo, ticket, policy, state["revision"])
         proof.need(scope == state["scope"] and graph_parent(tk, ticket) == state["graph_parent"],
@@ -750,16 +1286,12 @@ def _advance(cfg, repo, ticket, file):
             proof.need(branch(repo, state["production_branch"]) == state["revision"]
                        and production_checks_passed(repo, state), "waiting for the exact production push and its required checks")
         found = proof.observe(repo.name, ticket, state["revision"], destination="production", pinned=state["policy"])
-        if found["status"] == "verified":
-            state.update(phase="production_verified", production_receipt=found["receipt_id"])
-            serve_guard.write(file, state)
-        else:
-            state["waiting"] = found["reason"]
+        verify_production_observation(cfg, repo, ticket, policy, state, file, found)
         return state
     revision = selected_revision(repo, ticket)
     proof.need(revision and serve_guard.SHA.fullmatch(revision), "waiting for the enrolled ticket's merged staging PR")
     proof.need(not policy.get("revision") or policy["revision"] == revision, "goal release differs from the pinned revision")
-    tk, _, scope, _ = authority(cfg, repo, ticket, policy, revision)
+    tk, t, scope, _ = authority(cfg, repo, ticket, policy, revision)
     current_staged = state.get("staged_revision") or state.get("revision")
     if current_staged != revision:
         proof.need(state.get("phase") != "promotion_intent", "an earlier promotion needs reconciliation")
@@ -767,12 +1299,25 @@ def _advance(cfg, repo, ticket, file):
         if grant := release_profile.standing(repo, ticket):
             state.update(standing_authority=grant["id"], production_checks=grant["production_checks"])
         serve_guard.write(file, state)
-    proof.need(state["policy"] == proof.digest(policy) and state["scope"] == scope,
+    proof.need(state["policy"] == proof.digest(policy),
                "the tested behavior changed; a corrected staging revision and fresh QA are required")
     from . import ticket_feedback
 
-    proof.need(not ticket_feedback.pending_corrections(repo.name, ticket),
-               "pending authorized feedback requires a corrected staging revision and fresh QA")
+    pending_fb = ticket_feedback.pending_corrections(repo.name, ticket)
+    scope_changed = state["scope"] != scope
+    if state.get("phase") in ("awaiting_qa", "staging_verified", "staged_for_parent", "paused") and (
+            scope_changed or pending_fb or state.get("phase") == "paused"):
+        if scope_changed and not pending_fb:
+            _queue_behavior_change_feedback(cfg, repo, tk, ticket, t, state, policy, revision)
+        reason = (state.get("paused_reason") if state.get("phase") == "paused" and not scope_changed and not pending_fb
+                  else "paused: the tested behavior changed; returning to staging for fresh QA")
+        state.update(phase="paused", paused_reason=reason, paused_revision=current_staged)
+        for stale in ("approval", "approval_comment", "release_owner_approval"):
+            state.pop(stale, None)
+        serve_guard.write(file, state)
+        raise proof.Held(reason)
+    proof.need(not scope_changed, "the tested behavior changed; a corrected staging revision and fresh QA are required")
+    proof.need(not pending_fb, "pending authorized feedback requires a corrected staging revision and fresh QA")
     if state["phase"] == "observing_staging":
         found = observe_staging(repo, ticket, revision, pinned=state["policy"])
         if found["status"] != "verified":
@@ -804,11 +1349,7 @@ def _advance(cfg, repo, ticket, file):
                          promoted_revisions=peer["promoted_revisions"], promoted_tickets=peer["promoted_tickets"])
             serve_guard.write(file, state)
             found = proof.observe(repo.name, ticket, state["revision"], destination="production", pinned=state["policy"])
-            if found["status"] == "verified":
-                state.update(phase="production_verified", production_receipt=found["receipt_id"])
-                serve_guard.write(file, state)
-            else:
-                state["waiting"] = found["reason"]
+            verify_production_observation(cfg, repo, ticket, policy, state, file, found)
             return state
         if current_prod == peer["parent"]:
             raise proof.Held("waiting for the active whole-branch promotion to reach production")
@@ -821,31 +1362,8 @@ def _advance(cfg, repo, ticket, file):
                "QA authorization or release scope changed during verification")
     if approval:
         state.update(approval=approval["id"], approval_comment=approval)
+    if plan.get("release_owner_approval"):
+        state["release_owner_approval"] = plan["release_owner_approval"]
     if plan["graph_revisions"]:
         state["graph_revisions"] = plan["graph_revisions"]
-    if plan["isolated"]:
-        def record_isolated_intent(isolated_sha):
-            state.update(phase="promotion_intent", parent=plan["base"], production_branch=policy["production_branch"],
-                         staged_revision=revision, revision=isolated_sha,
-                         promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"], isolated=True)
-            serve_guard.write(file, state)
-
-        with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
-            if state.get("standing_authority"):
-                require_standing(repo, ticket, state)
-            isolate_revision(repo, revision, plan["base"], policy["production_branch"], on_prepared=record_isolated_intent)
-        return state
-    target_sha = plan["target"]
-    if target_sha != revision:
-        state["staged_revision"] = revision
-    state.update(phase="promotion_intent", parent=plan["base"], production_branch=policy["production_branch"],
-                 revision=target_sha, promoted_revisions=plan["revisions"], promoted_tickets=plan["tickets"])
-    serve_guard.write(file, state)
-    # A non-forced update of a direct child cannot land unrelated work if the branch races.
-    api = f"repos/{repo.github}/git/refs/heads/{quote(state['production_branch'], safe='/')}"
-    with util.lock("config", wait=True) if state.get("standing_authority") else nullcontext():
-        if state.get("standing_authority"):
-            require_standing(repo, ticket, state)
-        gh.gh(["api", api, "--method", "PATCH", "--input", "-"],
-              input=gh.Outgoing(json.dumps({"sha": target_sha, "force": False})), write=True, retry=False, timeout=20)
-    return state
+    return execute_release_workflow(repo, ticket, policy, state, file, plan, revision)

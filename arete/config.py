@@ -1345,8 +1345,11 @@ def probe_table(probe: dict) -> Probe:
     )
 
 
-def load(path: Path | None = None, strict: bool = False, *, required: bool = False) -> Config:
+def load(path: Path | None = None, strict: bool = False, *, required: bool = False,
+         base_dir: Path | None = None) -> Config:
     path = path or paths.CONFIG_FILE
+    anchor_dir = base_dir or path.parent
+    anchor_file = anchor_dir / "config.toml" if base_dir is not None else path
     ignored: list[str] | None = None if strict else []
     try:
         data = read_data(path)
@@ -1375,7 +1378,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     if (adws := (data.get("factory") or {}).get("adws")) is not None:
         if not isinstance(adws, str):
             raise TypeError(f"[factory] adws must be a folder path, not {adws!r}")
-        cfg.adws = path.parent / paths.expand(adws)
+        cfg.adws = anchor_dir / paths.expand(adws)
     cfg.steps = step_tables(data.get("steps") or {}, "steps", ignored)
     cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds", ignored)
     serve = data.get("serve", {})
@@ -1428,11 +1431,11 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
-    secrets_table(data.get("secrets", {}), path, repo_paths=(repo.path for repo in cfg.repos))
+    secrets_table(data.get("secrets", {}), anchor_file, repo_paths=(repo.path for repo in cfg.repos))
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
-    cfg.document = document_table(data.get("document") or {}, path.parent, ignored)
-    cfg.capture = capture_table(data.get("capture") or {}, path.parent)
+    cfg.document = document_table(data.get("document") or {}, anchor_dir, ignored)
+    cfg.capture = capture_table(data.get("capture") or {}, anchor_dir)
     cfg.ab = ab_tables(data.get("ab") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)

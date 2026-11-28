@@ -35,7 +35,12 @@ RECONNECT_SECONDS = 120
 HOOK_EVENTS_PATH = "/api/v1/hook-events"
 WAIT_EVENTS = ("step_end", "question", "error", run_lines.END)
 BROKE = (OSError, http.client.HTTPException)
-LEGACY_ROUTES = {"task.list": "/api/tasks", "run.stop": "/api/runs/{run}/stop"}
+LEGACY_ROUTES = {
+    "task.list": "/api/tasks",
+    "run.stop": "/api/runs/{run}/stop",
+    "loop.enable": "/api/loops/{loop}/enable",
+    "loop.disable": "/api/loops/{loop}/disable",
+}
 API_1_2_ONLY = frozenset({"status.get", "task.create", "comment.create", "task.close",
                           "run.pin", "run.unpin", "run.steer"})
 _ACQUISITION_LOCK = threading.Lock()
@@ -754,6 +759,11 @@ def legacy_answer(method, operation, legacy, body, key, where, deadline):
     schema = operation["result"]
     if operation["name"] == "task.list":
         answer["tasks"] = legacy_task_rows(field(answer, "tasks", kind=list), where, deadline)
+    if operation["name"] in ("loop.enable", "loop.disable"):
+        seq = answer.pop("seq", None)
+        answer = {"loop": answer, **({"seq": seq} if seq else {})}
+        if not seq:
+            schema = {**schema, "required": [name for name in schema["required"] if name != "seq"]}
     if method == "GET":
         answer.pop("seq", None)
         schema = {**schema, "required": [name for name in schema["required"] if name != "seq"]}

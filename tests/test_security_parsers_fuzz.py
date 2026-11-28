@@ -448,8 +448,8 @@ class MarkerSpoofingAndExternalClientTests(unittest.TestCase):
             repo = config.Repo("demo", Path(tmp), tracker="jira", jira_project="APP")
             tk = tracker.JiraTracker(repo, config.JiraConfig(base_url="https://jira.example.test"))
             tk._client = mock.Mock()
-            tk._client.attachment.return_value = b"\x89PNG"
-            t = tracker.Ticket("APP-1", "APP-1", "Title", images=[tracker.Image("../../escaped", "shot.png", 4)])
+            tk._client.attachment.return_value = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 8
+            t = tracker.Ticket("APP-1", "APP-1", "Title", images=[tracker.Image("../../escaped", "shot.png", 24)])
             saved = tk.save_images(t, dest)
             self.assertFalse(outside.exists())
             self.assertEqual(len(saved.paths), 1)
@@ -506,6 +506,56 @@ class MarkerSpoofingAndExternalClientTests(unittest.TestCase):
                 # Replay reconciles via marker without duplicating
                 tid2, _, _ = ticket_followups._ensure_local_followup_task(repo, item)
                 self.assertEqual(tid2, tid)
+
+    def test_new_main_modules_hardening(self):
+        from arete import configrepo, cross_repo, external_evidence, ticket_media
+        from arete.store import config as config_store
+
+        # 1. ticket_media: linear-time extraction on adversarial inputs & malformed IPv6 URLs
+        t0 = time.monotonic()
+        refs = ticket_media.extract_media_refs(
+            "![a" * 8000 + "\n<img " * 4000 + "\nhttps://[invalid-ipv6/pic.png\n",
+            "[link" * 8000,
+        )
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(refs, [])
+        self.assertEqual(ticket_media.fetch_url("https://[invalid-ipv6/a.png").error_status, "inaccessible")
+
+        # 2. external_evidence: malformed IPv6 URLs never crash extraction
+        self.assertEqual(external_evidence.extract_external_refs("see https://[bad-url/archives/C123456789/p1"), [])
+        self.assertEqual(external_evidence.display_url("https://[bad-url"), "")
+
+        # 3. cross_repo: reject flag-like or traversal repo slugs
+        self.assertIsNone(cross_repo.GH_REF_RE.search("-evil/repo#1"))
+        self.assertIsNone(cross_repo.GH_REF_RE.search("org/..#1"))
+        self.assertIsNotNone(cross_repo.GH_REF_RE.search("org/repo#1"))
+
+        # 4. store/config.by_selector: Unicode digits and huge digit strings never crash int()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state = root / "state"
+            with contextlib.ExitStack() as stack:
+                for name, value in {
+                    "STATE_DIR": state,
+                    "DB_FILE": state / "arete.db",
+                    "CONFIG_DIR": root / "config",
+                    "CONFIG_FILE": root / "config" / "config.toml",
+                    "RUNS_DIR": state / "runs",
+                    "WORKTREES_DIR": state / "worktrees",
+                    "LOCKS_DIR": state / "locks",
+                    "LOG_DIR": state / "logs",
+                }.items():
+                    stack.enter_context(mock.patch.object(paths, name, value))
+                stack.enter_context(mock.patch.object(db, "_CHECKED", set()))
+                paths.ensure_dirs()
+                db.migrate()
+                self.assertIsNone(config_store.by_selector("repo", "demo", "٢"))
+                self.assertIsNone(config_store.by_selector("repo", "demo", "9" * 5000))
+                # 5. configrepo: traversal loop name in loop-switches.json must not write outside CONFIG_DIR
+                (state / "loop-switches.json").write_text('{"../../escaped": true}', encoding="utf-8")
+                with mock.patch.object(configrepo, "_git"):
+                    configrepo.init()
+                self.assertFalse((root / "escaped").exists())
 
 
 if __name__ == "__main__":

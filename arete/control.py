@@ -11,6 +11,7 @@ from datetime import timedelta
 
 from . import (
     config,
+    configrepo,
     delivery,
     devices,
     events,
@@ -116,6 +117,8 @@ def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] 
 def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = (), *,
            start_new_session: bool = True) -> subprocess.Popen:
     paths.ensure_dirs()
+    if configrepo.is_repo():
+        configrepo.commit_hand_edits()
     from . import factory_control
     from .store import factory
 
@@ -267,9 +270,28 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
 
 
-def switch(name: str, enabled: bool) -> dict:
+def switch(name: str, enabled: bool, *, idem: str = "") -> dict:
     loop = working_loop(name) if enabled else find_loop(name)
-    loops.set_enabled(loop, enabled)
+    cfg_root = paths.CONFIG_DIR.resolve()
+    loop_file = loop.file.resolve()
+    if loop_file.is_relative_to(cfg_root):
+        rel = loop_file.relative_to(cfg_root).as_posix()
+        text, blob = configrepo.read(rel)
+        updated = configrepo._set_enabled_toml(text, enabled)
+    else:
+        rel = f"loops/{loop.name}/loop.toml"
+        text, blob = configrepo.read(rel)
+        updated = (f"enabled = {'true' if enabled else 'false'}\n" if blob == configrepo.ABSENT
+                   else configrepo._set_enabled_toml(text, enabled))
+    configrepo.ensure_repo()
+    configrepo.commit(
+        {rel: updated},
+        {rel: blob},
+        actor=principals.current(),
+        source="dashboard",
+        idem=idem,
+        note=f"loop {loop.name}: {'enable' if enabled else 'disable'}",
+    )
     return {"name": loop.name, "enabled": enabled, "serve_up": bool(serve_beat().get("alive"))}
 
 

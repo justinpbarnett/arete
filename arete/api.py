@@ -4,8 +4,8 @@ from collections import Counter
 from urllib.parse import unquote
 
 from . import (
-    api_http, board, codebase, config, configitems, contract, control, credential_http, events, pi, record,
-    refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks,
+    api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, events,
+    pi, record, refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -170,7 +170,17 @@ def set_secret(handler, op, target):
 
 def prepare(name, values):
     op = needed(contract.BY_NAME.get(name), name)
-    contract.validate(values, op["input"])
+    if name.startswith("config.") and "kind" in values and isinstance(values["kind"], str) and values["kind"] not in configkinds.REGISTRY:
+        raise contract.Problem("not_found", f"Unknown config kind {values['kind']}")
+    if name == "settings.update":
+        try:
+            contract.validate(values, op["input"])
+        except contract.Problem as error:
+            if error.code == "invalid_input":
+                raise contract.Problem("invalid_fields", str(error)) from None
+            raise
+    else:
+        contract.validate(values, op["input"])
     if name.startswith("secret."):
         credential_http.secret_access(values.get("scope", ""))
         if "name" in values:
@@ -308,14 +318,18 @@ def read(name, values, handler):
 
 
 def read_config(verb, values):
+    if verb == "kinds":
+        return {"kinds": configitems.kinds()}
     kind = values["kind"]
     if verb == "list":
         return {"items": configitems.listing(kind)}
-    found = configitems.item(kind, values["name"])
+    found = configitems.item(kind, values["name"], level=values.get("level"))
     if verb == "read":
-        return {"item": configitems.read(found)}
+        return {"item": configitems.read(found, version=values.get("version"), level=values.get("level"),
+                                         from_ref=values.get("from"), file=values.get("file"))}
     if verb == "versions":
-        return {"versions": configitems.revisions(found)}
+        shas, entries = configitems.versions(found)
+        return {"versions": shas, "entries": entries}
     diff = configitems.diff(found, values.get("from"), values.get("to"))
     if diff is None:
         raise contract.Problem("unavailable", "No config Git diff is available")
@@ -364,7 +378,8 @@ def command(handler, op, values, path_values, *, claim=None):
     action = (lambda: mutation(name, values, handler)) if contract.keyed_write(op) else (
         lambda: execute(name, values, handler))
     return handler.keyed_action(op["method"], op["path"], path_values, action,
-                                atomic=not read_only and name not in ("run.stop", "serve.install"),
+                                atomic=not read_only and name not in ("run.stop", "serve.install",
+                                                                      "settings.update", "loop.enable", "loop.disable"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
@@ -381,6 +396,18 @@ def mutation(name, values, handler):
     if name == "factory.set":
         from . import factory_control
         result = {"factory": factory_control.request(values["enabled"], values["base_version"])}
+    elif name == "settings.update":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        try:
+            saved = settings.save(values["values"], base_version=values["base_version"],
+                                  actor=principals.current(), source="dashboard", idem=key)
+        except (settings.Refused, ValueError, configrepo.ConfigRepoError) as error:
+            raise contract.Problem("invalid_fields", str(error)) from error
+        result = {"settings": saved}
+    elif name in ("loop.enable", "loop.disable"):
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        control.switch(values["loop"], name == "loop.enable", idem=key)
+        result = {"loop": serialize(control.loop_detail(values["loop"]), contract.LOOP)}
     elif name == "secret.remove":
         result = remove_secret(values["scope"], values["name"])
     elif name == "secret.check":

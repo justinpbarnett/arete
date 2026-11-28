@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import shlex
 import tomllib
@@ -15,7 +14,6 @@ from .store import db as foundation
 from .store import runs as run_store
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
-SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
 TRIES = 5
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
@@ -273,18 +271,48 @@ def fmt_seconds(s: float) -> str:
     return f"{s:g}s"
 
 
+def is_switch_only(folder: Path) -> bool:
+    toml_file = folder / "loop.toml"
+    if not toml_file.is_file() or (folder / "prompt.md").exists():
+        return False
+    try:
+        data = tomllib.loads(toml_file.read_text())
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(data, dict) and set(data.keys()) == {"enabled"} and isinstance(data["enabled"], bool)
+
+
+def switch_overrides(cfg: config.Config) -> dict[str, bool]:
+    found: dict[str, bool] = {}
+    for directory in cfg.loop_dirs:
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir()):
+            if not entry.is_dir():
+                continue
+            if (entry / "loop.toml").is_file():
+                if is_switch_only(entry):
+                    found[entry.name] = bool(tomllib.loads((entry / "loop.toml").read_text())["enabled"])
+                continue
+            for nested in sorted(entry.iterdir()):
+                if nested.is_dir() and is_switch_only(nested):
+                    found[f"{entry.name}/{nested.name}"] = bool(tomllib.loads((nested / "loop.toml").read_text())["enabled"])
+    return found
+
+
 def folders(cfg: config.Config) -> list[tuple[str, str, Path]]:
     out = [("arete", "", BUNDLED_LOOPS_DIR)]
     out += [("private", "", d) for d in cfg.loop_dirs]
     out += [("repo", r.name, r.layer_dir / "loops") for r in cfg.repos]
     return [(origin, repo, d / name) for origin, repo, d in out if d.is_dir()
-            for name in sorted(p.name for p in d.iterdir() if (p / "loop.toml").is_file())]
+            for name in sorted(p.name for p in d.iterdir() if (p / "loop.toml").is_file())
+            if not (origin == "private" and is_switch_only(d / name))]
 
 
 def load_all(cfg: config.Config | None = None) -> list[Loop]:
     cfg = cfg or config.load()
     loops: dict[str, Loop] = {}
-    switched = switches()
+    switched = switch_overrides(cfg)
     for origin, repo, folder in folders(cfg):
         name = f"{repo}/{folder.name}" if repo else folder.name
         try:
@@ -473,17 +501,3 @@ def check_env(loop: Loop, run_id: str) -> dict[str, str]:
 
 def prompt_text(loop: Loop) -> str:
     return loop.prompt_file.read_text() if loop.prompt_file.is_file() else ""
-
-
-def switches() -> dict[str, bool]:
-    try:
-        return {str(k): bool(v) for k, v in json.loads(SWITCHES_FILE.read_text()).items()}
-    except (FileNotFoundError, json.JSONDecodeError, AttributeError):
-        return {}
-
-
-def set_enabled(loop: Loop, enabled: bool) -> None:
-    current = switches()
-    current[loop.name] = enabled
-    SWITCHES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SWITCHES_FILE.write_text(json.dumps(dict(sorted(current.items())), indent=2) + "\n")

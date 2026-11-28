@@ -86,7 +86,8 @@ def active_child_blocker(run, ticket=_READINESS_ONLY):
     if (not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker)) or tracker.is_task_id(run.tid)
             or not specgraphs.tracks_ticket(source.repo.name, str(run.tid))):
         return ""
-    remote = spec_tracker.adapter(source)
+    repos = getattr(getattr(run, "cfg", None), "repos", ())
+    remote = spec_tracker.adapter(source, repos=repos)
     if not remote or not (key := specgraphs.membership(remote.scope, str(run.tid))):
         return "the native graph child's tracker enrollment could not be confirmed"
     from . import spec_amendments
@@ -138,11 +139,20 @@ def ready(source, remote, key, ref):
             return "the child identity, status or native parent changed"
         node = next(n for n in data["plan"]["children"] if n["key"] == name)
         prerequisites = set(node["requires"])
+        enrolled = tuple(getattr(source, "enrolled_repos", ()) or ())
+        external_blockers = []
         for block in remote.blockers(ref, data["policy"]):
             if block in by_ref:
                 prerequisites.add(by_ref[block])
-            elif remote.read(block).open:
-                return f"external prerequisite {block} is still open"
+            else:
+                external_blockers.append(block)
+        if external_blockers:
+            from . import cross_repo
+
+            satisfied_ext = cross_repo.satisfied_cross_repo_native(enrolled, source.repo, ref, external_blockers)
+            for block in external_blockers:
+                if block not in satisfied_ext and remote.read(block).open:
+                    return f"external prerequisite {block} is still open"
         for dep in sorted(prerequisites):
             released = dep in node.get("release_requires", [])
             artifact = node.get("artifacts", {}).get(dep)
@@ -347,7 +357,12 @@ def activations_verified(activations: list[dict], *, receipt: dict | None = None
             matched = (fields.get("/" + req["kind"]) == val_digest
                        or fields.get("/activation") == val_digest
                        or fields.get("/feature_flag") == val_digest
-                       or (bool(slug) and fields.get("/" + slug) in (val_digest, true_digest)))
+                       or fields.get("/audience") == val_digest
+                       or (bool(slug) and (
+                           fields.get("/" + slug) in (val_digest, true_digest)
+                           or fields.get("/flags/" + slug) in (val_digest, true_digest)
+                           or fields.get("/audiences/" + slug) in (val_digest, true_digest)
+                       )))
         if not matched:
             label = "Feature flag" if req["kind"] == "feature_flag" else "Activation"
             missing.append(f"{label}: {value}")

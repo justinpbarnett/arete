@@ -145,7 +145,8 @@ async function saveSettings(event) {
   const saveButton = document.getElementById("settings-save");
   saveButton.disabled = true;
   try {
-    const saved = await call("/api/settings", changes);
+    const payload = settingsData?.version ? { ...changes, base_version: settingsData.version } : changes;
+    const saved = await call("/api/settings", payload);
     drawSettings(saved);
     const words = [changes.max_parallel ? `runs at once ${saved.max_parallel}` : "",
       changes.max_parallel_per_repo ? `runs per repo ${saved.max_parallel_per_repo}` : "",
@@ -153,6 +154,7 @@ async function saveSettings(event) {
         : `${role} back to its default (${defaultModel(saved, role)})`))].filter(Boolean);
     say("settings-result", "ok", `Saved ${words.join(", ")}. The pipeline takes it at its next poll.`);
   } catch (e) {
+    if (e?.status === 409 && e?.data?.current) drawSettings(e.data.current);
     say("settings-result", "fault", e.message);
   } finally {
     saveButton.disabled = false;

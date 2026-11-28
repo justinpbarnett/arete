@@ -40,6 +40,7 @@ from . import (
     diffguard,
     document,
     environment,
+    external_evidence,
     factory,
     gh,
     intake,
@@ -3528,15 +3529,12 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     elif t.blocker and not run.force:
         return "skipped", t.blocker, ""
     try:
-        images = tk.save_images(t, run.dir / "images")
+        attachments, attachment_dirs, _manifest = collect_ticket_attachments(tk, t, run.dir, log=run.log)
     except tracker.ERRORS as e:
         return "failed", f"could not download the images on {run.ref}: {e}", ""
-    if images.paths:
-        run.add_dirs.append(run.dir / "images")
-        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
-    if images.left_out:
-        run.log(f"images: left out {', '.join(images.left_out)}")
-    attachments = images_note(images)
+    for d in attachment_dirs:
+        if d not in run.add_dirs:
+            run.add_dirs.append(d)
 
     main_layer = checked_layer(cfg, repo.layer_dir)
     branch = run.preview_branch or open_branch(run) or prompt_loader.fill_template(
@@ -5728,15 +5726,90 @@ def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
         run.log(f"ci: could not comment on {c.pr} for head {c.lease}: {util.first_line(str(e), 300)}")
 
 
-def images_note(images: tracker.SavedImages) -> str:
-    rows = []
-    if images.paths:
-        rows += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
-        rows += [f"- `{p}`" for p in images.paths]
-    if images.left_out:
-        rows += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
-                      f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+def images_note(images: tracker.SavedImages, *, ticket_ref: str = "") -> str:
+    if not images.outcomes:
+        rows = []
+        if images.paths:
+            rows += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
+            rows += [f"- `{p}`" for p in images.paths]
+        if images.left_out:
+            rows += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
+                          f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+        return "\n".join(rows).strip()
+
+    label = f" on {ticket_ref}" if ticket_ref else " on the issue"
+    resolved = [o for o in images.outcomes if o.ok]
+    unresolved = [o for o in images.outcomes if not o.ok]
+    rows = [f"## Media{label}"]
+    if resolved:
+        rows += ["", "Open each screenshot or extracted recording frame with Read; they show what the ticket describes.", ""]
+        for outcome in resolved:
+            source_label = "ticket description" if outcome.ref.source == "body" else "ticket comment"
+            if outcome.media_kind == "video":
+                dur = f", {outcome.duration_seconds:.1f}s" if outcome.duration_seconds else ""
+                rows.append(f"- Recording (from {source_label}{dur}): `{outcome.path}`")
+                if outcome.keyframes:
+                    rows.append("  - Extracted frames in chronological order (inspect each with Read):")
+                    rows.extend(f"    - `{frame}`" for frame in outcome.keyframes)
+                if outcome.detail:
+                    rows.append(f"  - Note: {outcome.detail}")
+            else:
+                rows.append(f"- Screenshot (from {source_label}): `{outcome.path}`")
+    if unresolved:
+        rows += ["", "### Unreadable or inaccessible media", ""]
+        for outcome in unresolved:
+            source_label = "ticket description" if outcome.ref.source == "body" else "ticket comment"
+            name = outcome.ref.name or outcome.ref.attachment_id or outcome.ref.url or "attachment"
+            detail = f": {outcome.detail}" if outcome.detail else ""
+            rows.append(f"- `{outcome.status}` (from {source_label}) {name}{detail}")
     return "\n".join(rows).strip()
+
+
+def collect_ticket_attachments(
+    tk: tracker.Tracker,
+    t: tracker.Ticket,
+    run_dir: Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    external_kwargs: dict | None = None,
+) -> tuple[str, list[Path], dict]:
+    ticket_ref = t.ref or t.id
+    images = tk.save_images(t, run_dir / "images")
+    evidence = external_evidence.resolve_ticket_evidence(t, run_dir / "evidence", **(external_kwargs or {}))
+    add_dirs: list[Path] = []
+    if images.paths:
+        add_dirs.append(run_dir / "images")
+        if log:
+            log(f"images: saved {util.count(len(images.paths), 'media file')} from {ticket_ref}")
+    if images.left_out and log:
+        log(f"images: left out {', '.join(images.left_out)}")
+    unresolved_media = [o for o in images.outcomes if not o.ok]
+    if unresolved_media and log:
+        summary = ", ".join(f"{o.ref.name or o.ref.attachment_id or 'media'} ({o.status})" for o in unresolved_media)
+        log(f"images: unresolved media on {ticket_ref}: {summary}")
+    if evidence.paths:
+        add_dirs.append(run_dir / "evidence")
+        if log:
+            log(f"evidence: resolved {util.count(len(evidence.resolved()), 'linked source')} from {ticket_ref}")
+    unresolved_ext = evidence.unresolved()
+    if unresolved_ext and log:
+        summary = ", ".join(f"{o.ref.provider} ({o.status})" for o in unresolved_ext)
+        log(f"evidence: unresolved links on {ticket_ref}: {summary}")
+
+    manifest = {
+        "ticket": ticket_ref,
+        "media": [o.to_dict() for o in images.outcomes],
+        "external": [o.to_dict() for o in evidence.outcomes],
+    }
+    if images.outcomes or evidence.outcomes:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "evidence-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    sections = [
+        images_note(images, ticket_ref=ticket_ref),
+        external_evidence.format_evidence_note(evidence, ticket_ref=ticket_ref),
+    ]
+    return "\n\n".join(part for part in sections if part).strip(), add_dirs, manifest
 
 
 def open_branch(run: Run) -> str:
@@ -6401,10 +6474,7 @@ def cut_at_end(text: str, limit: int) -> str:
 
 
 Learned = learning.Rewrite
-
-
-def layer_lock(layer_dir: Path) -> str:
-    return "layer-" + hashlib.sha256(str(layer_dir.resolve()).encode()).hexdigest()[:16]
+LEARN_REFUSAL_CAP = 3
 
 
 def expertise_now(expertise_file: Path) -> str:
@@ -6425,26 +6495,45 @@ def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw
 
 
 def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, apply: bool) -> str:
+    from . import configrepo
+
     if not run.story:
         run.log("learn: clean run, nothing to learn")
         return ""
-    base = expertise_now(expertise_file)
+    rel = ""
+    base_blob = configrepo.ABSENT
+    if run.repo.layer:
+        cfg_root = paths.CONFIG_DIR.resolve()
+        resolved = expertise_file.resolve()
+        if resolved.is_relative_to(cfg_root):
+            rel = resolved.relative_to(cfg_root).as_posix()
+            configrepo.ensure_repo()
+            raw, base_blob = configrepo.read(rel)
+            base = raw.strip()
+        else:
+            base = expertise_now(expertise_file)
+    else:
+        base = expertise_now(expertise_file)
     first = learned(run, wt, title, base, "learn")
     if first is None:
         return ""
     if not apply:
-        if first.rewrite == expertise_now(expertise_file):
+        current = configrepo.read(rel)[0].strip() if rel else expertise_now(expertise_file)
+        if first.rewrite == current:
             run.log("learn: expertise unchanged")
             return ""
         run.save("expertise-report.md", first.report)
         run.save("expertise.md", first.rewrite + "\n")
         run.log(f"learn: rewrite saved in the run, not applied ({first.added} added, {first.removed} removed)")
         return ""
-    return apply_learned(run, wt, expertise_file, title, base, first)
+    return apply_learned(run, wt, expertise_file, title, base, first, rel=rel, base_blob=base_blob)
 
 
-def apply_learned(run: AgentRun, wt: Path, expertise_file: Path, title: str, base: str, first: Learned) -> str:
-    with util.lock(layer_lock(expertise_file.parent), wait=True):
+def apply_learned(run: AgentRun, wt: Path, expertise_file: Path, title: str, base: str, first: Learned, *,
+                  rel: str = "", base_blob: str = "") -> str:
+    from . import configrepo
+
+    if not rel:
         current = expertise_now(expertise_file)
         chosen = first
         if current != base:
@@ -6463,34 +6552,52 @@ def apply_learned(run: AgentRun, wt: Path, expertise_file: Path, title: str, bas
         expertise_file.write_text(chosen.rewrite + "\n")
         run.log(f"learn: {chosen.added} added, {chosen.removed} removed, {len(chosen.rewrite.splitlines())} lines in "
                 f"{paths.short_path(expertise_file)}")
-        if not run.repo.layer:
+        return ""
+
+    chosen, current, current_blob = first, base, base_blob or configrepo.ABSENT
+    for attempt in range(1, LEARN_REFUSAL_CAP + 1):
+        if chosen.rewrite == current:
+            run.log("learn: expertise unchanged")
             return ""
         try:
-            sha = commit_written(expertise_file.parent, f"{run.repo.name}: learn from {run.ref} ({run.id})\n\n{chosen.report}",
-                                 [expertise_file])
-        except RuntimeError as e:
-            run.log(f"learn: wrote the file but the layer commit failed: {util.first_line(str(e), 300)}")
+            sha = configrepo.commit(
+                {rel: chosen.rewrite + "\n"},
+                {rel: current_blob},
+                actor=f"run:{run.id}/learn",
+                source="agent",
+                run_id=run.id,
+                note=f"{run.repo.name}: learn from {run.ref} ({run.id})",
+            )
+        except configrepo.StaleBase:
+            if attempt >= LEARN_REFUSAL_CAP:
+                run.save("expertise-report.md", chosen.report)
+                run.save("expertise.md", chosen.rewrite + "\n")
+                run.log(f"learn: expertise.md moved {LEARN_REFUSAL_CAP} times, so the rewrite is saved in the run, not applied")
+                return ""
+            run.log("learn: expertise.md changed since this run read it, so the learn step runs again on the current file")
+            new_raw, new_blob = configrepo.read(rel)
+            new_current = new_raw.strip()
+            next_chosen = learned(run, wt, title, new_current, round_name("learn", attempt + 1), wait_out_limits=False)
+            if next_chosen is None:
+                run.save("expertise-report.md", first.report)
+                run.save("expertise.md", first.rewrite + "\n")
+                run.log("learn: the second pass gave no usable file, so the first rewrite is saved in the run, not applied")
+                return ""
+            chosen, current, current_blob = next_chosen, new_current, new_blob
+        except (configrepo.ConfigRepoError, configrepo.HandEditInvalid) as e:
+            run.save("expertise-report.md", chosen.report)
+            run.save("expertise.md", chosen.rewrite + "\n")
+            run.log(f"learn: layer commit refused ({util.first_line(str(e), 300)}), so the rewrite is saved in the run, not applied")
             return ""
-        if sha:
-            run.save("expertise-commit.txt", sha + "\n")
-            run.log(f"learn: committed {sha[:12]} in {paths.short_path(expertise_file.parent)}")
-        return sha
-
-
-def commit_written(layer_dir: Path, message: str, written: list[Path]) -> str:
-    if git(["rev-parse", "--is-inside-work-tree"], layer_dir, check=False).strip() != "true":
-        git(["init", "-q"], layer_dir)
-    names = [str(p.relative_to(layer_dir)) for p in written]
-    git(["add", "--", *names], layer_dir)
-    if not util.sh(["git", "diff", "--cached", "--quiet", "--", *names], cwd=layer_dir).returncode:
-        return ""
-    util.git_as_owner(["commit", "-q", "-m", message, "--", *names], layer_dir)
-    return git(["rev-parse", "HEAD"], layer_dir).strip()
-
-
-def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
-    with util.lock(layer_lock(layer_dir), wait=True):
-        return commit_written(layer_dir, message, written)
+        else:
+            run.save("expertise-report.md", chosen.report)
+            run.log(f"learn: {chosen.added} added, {chosen.removed} removed, {len(chosen.rewrite.splitlines())} lines in "
+                    f"{paths.short_path(expertise_file)}")
+            if sha:
+                run.save("expertise-commit.txt", sha + "\n")
+                run.log(f"learn: committed {sha[:12]} in {paths.short_path(expertise_file.parent)}")
+            return sha
+    return ""
 
 
 def sync_labels(cfg: config.Config) -> None:
