@@ -1,0 +1,351 @@
+schema = 1
+
+[[portType]]
+id = "task"
+glyph = "☐"
+word = "task"
+
+[[portType]]
+id = "tree"
+glyph = "⋔"
+word = "work tree"
+
+[[portType]]
+id = "plan"
+glyph = "≡"
+word = "plan"
+
+[[portType]]
+id = "diff"
+glyph = "±"
+word = "diff"
+
+[[portType]]
+id = "feedback"
+glyph = "↩"
+word = "feedback"
+
+[[portType]]
+id = "verdict"
+glyph = "◐"
+word = "verdict"
+
+[[portType]]
+id = "report"
+glyph = "▤"
+word = "report"
+
+[[portType]]
+id = "pr"
+glyph = "⇄"
+word = "pull request"
+
+[[portType]]
+id = "event"
+glyph = "↯"
+word = "event"
+
+[[portType]]
+id = "text"
+glyph = "¶"
+word = "text"
+
+[[portType]]
+id = "object"
+glyph = "{}"
+word = "object"
+
+[[portType]]
+id = "any"
+glyph = "∗"
+word = "any"
+
+[[step]]
+id = "prepare"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "task", type = "task" }]
+out = [{ pin = "tree", type = "tree" }, { pin = "task", type = "task" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Prepare the work tree, branch, attachments, and layer context for a ticket."
+
+[[step]]
+id = "plan"
+kind = "agent"
+prompt = "plan.md"
+role = "plan"
+in = [{ pin = "task", type = "task" }, { pin = "tree", type = "tree" }]
+out = [{ pin = "plan", type = "plan" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Read the ticket and codebase and write an implementation plan with a size estimate."
+
+[[step]]
+id = "patch"
+kind = "agent"
+prompt = "patch.md"
+role = "build"
+in = [{ pin = "task", type = "task" }, { pin = "tree", type = "tree" }]
+out = [{ pin = "diff", type = "diff" }, { pin = "plan", type = "plan" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Build a bounded patch directly in the work tree or escalate to a full plan."
+
+[[step]]
+id = "revise"
+kind = "agent"
+prompt = "revise.md"
+role = "build"
+in = [{ pin = "task", type = "task" }, { pin = "tree", type = "tree" }, { pin = "feedback", type = "feedback" }]
+out = [{ pin = "diff", type = "diff" }, { pin = "plan", type = "plan" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Apply pull request review feedback to the open branch."
+
+[[step]]
+id = "repair"
+kind = "agent"
+prompt = "repair.md"
+role = "review_repair"
+in = [{ pin = "task", type = "task" }, { pin = "tree", type = "tree" }, { pin = "feedback", type = "feedback" }]
+out = [{ pin = "diff", type = "diff" }, { pin = "plan", type = "plan" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Fix saved internal review findings on a held pull request."
+
+[[step]]
+id = "implement"
+kind = "agent"
+prompt = "build.md"
+role = "build"
+in = [{ pin = "plan", type = "plan" }, { pin = "tree", type = "tree" }, { pin = "feedback", type = "feedback" }, { pin = "asks", type = "text" }]
+out = [{ pin = "diff", type = "diff" }, { pin = "report", type = "report" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Build the planned change or apply check, review, and CI repair feedback in the work tree."
+
+[[step]]
+id = "checks"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "tree", type = "tree" }]
+out = [{ pin = "feedback", type = "feedback" }, { pin = "report", type = "report" }]
+outcomes = ["pass", "fail", "feedback"]
+band = []
+about = "Run the repository tests, lint, and diff guard checks on the work tree."
+
+[[step]]
+id = "verify"
+kind = "agent"
+prompt = "verify.md"
+role = "verify"
+in = [{ pin = "tree", type = "tree" }, { pin = "plan", type = "plan" }]
+out = [{ pin = "verdict", type = "verdict" }, { pin = "report", type = "report" }, { pin = "feedback", type = "feedback" }]
+outcomes = ["pass", "fail", "feedback"]
+band = []
+about = "Exercise the staged change in use and record behavioral verification evidence."
+
+[[step]]
+id = "review"
+kind = "agent"
+prompt = "review.md"
+role = "review"
+in = [{ pin = "diff", type = "diff" }, { pin = "tree", type = "tree" }, { pin = "plan", type = "plan" }, { pin = "report", type = "report" }]
+out = [{ pin = "verdict", type = "verdict" }, { pin = "feedback", type = "feedback" }]
+outcomes = ["pass", "fail", "feedback"]
+band = []
+about = "Review the staged diff against the ticket and evidence to approve or request changes."
+
+[[step]]
+id = "learn"
+kind = "agent"
+prompt = "learn.md"
+role = "learn"
+in = [{ pin = "tree", type = "tree" }]
+out = [{ pin = "report", type = "report" }]
+outcomes = ["done"]
+band = []
+about = "Distill lessons from the run and optionally apply updates to the layer expertise file."
+
+[[step]]
+id = "document"
+kind = "agent"
+prompt = "document.md"
+role = "document"
+in = [{ pin = "task", type = "task" }, { pin = "tree", type = "tree" }, { pin = "verdict", type = "verdict" }]
+out = [{ pin = "text", type = "text" }]
+outcomes = ["done"]
+band = []
+about = "Write the pull request description from the ticket, verification, and review."
+
+[[step]]
+id = "pr"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "tree", type = "tree" }, { pin = "diff", type = "diff" }, { pin = "text", type = "text" }]
+out = [{ pin = "pr", type = "pr" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Commit, push, and open or refresh pull requests for changed checkouts."
+
+[[step]]
+id = "ci"
+kind = "agent"
+prompt = "ci_fix.md"
+role = "ci_repair"
+in = [{ pin = "tree", type = "tree" }, { pin = "pr", type = "pr" }]
+out = [{ pin = "report", type = "report" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Watch remote CI checks on the pull request and repair failures caused by the PR."
+
+[[step]]
+id = "publish"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "pr", type = "pr" }, { pin = "report", type = "report" }]
+out = [{ pin = "report", type = "report" }]
+outcomes = ["pass", "fail"]
+band = []
+about = "Finalize publication, automerge when eligible, and report status on the tracker."
+
+[[step]]
+id = "respond"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "pr", type = "pr" }, { pin = "report", type = "report" }, { pin = "text", type = "text" }]
+out = [{ pin = "report", type = "report" }]
+outcomes = ["done"]
+band = []
+about = "Record the terminal run result, post any final tracker comment, and clean up the workspace."
+
+[[step]]
+id = "orchestrate_ask"
+kind = "script"
+prompt = ""
+role = ""
+in = [{ pin = "request", type = "object" }, { pin = "call", type = "text" }]
+out = []
+outcomes = ["done", "feedback"]
+band = []
+about = "Raise a structured owner ask from orchestration and pause until answered."
+
+[[trigger]]
+id = "manual"
+kind = "manual"
+params = [
+  { name = "repo", type = "string", hint = "Repository name in config.toml" },
+  { name = "ticket", type = "string", hint = "Issue number, Jira key, or local task id" },
+  { name = "adw", type = "string", hint = "Optional ADW name overriding routes/adw.toml" },
+  { name = "dry_run", type = "boolean", hint = "Run locally without push, PR, or tracker writes" },
+]
+out = [{ pin = "task", type = "task" }]
+
+[[trigger]]
+id = "github"
+kind = "source"
+params = [
+  { name = "repos", type = "string[]", hint = "Repositories to watch (config names or owner/repo)" },
+  { name = "watch", type = "string[]", hint = "Event types to watch: ci_red, issue, or advisory" },
+  { name = "label", type = "string", hint = "Optional issue label filter" },
+  { name = "branch", type = "string", hint = "Optional branch filter for ci_red" },
+  { name = "every", type = "string", hint = "Poll interval such as 5m or 10m" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "task", type = "task" }]
+
+[[trigger]]
+id = "jira"
+kind = "source"
+params = [
+  { name = "jql", type = "string", hint = "JQL query selecting Jira issues" },
+  { name = "repo", type = "string", hint = "Target repository name for matched issues" },
+  { name = "limit", type = "integer", hint = "Maximum issues fetched per poll" },
+  { name = "on_update", type = "boolean", hint = "Re-emit when an issue updated timestamp changes" },
+  { name = "every", type = "string", hint = "Poll interval such as 5m or 15m" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "task", type = "task" }]
+
+[[trigger]]
+id = "log"
+kind = "source"
+params = [
+  { name = "path", type = "string", hint = "Log file path or glob pattern to tail" },
+  { name = "pattern", type = "string", hint = "Regular expression matching error lines" },
+  { name = "every", type = "string", hint = "Poll interval such as 5m" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "text", type = "text" }]
+
+[[trigger]]
+id = "command"
+kind = "source"
+params = [
+  { name = "command", type = "string", hint = "Command writing one JSON event object per stdout line" },
+  { name = "timeout", type = "number", hint = "Command timeout in seconds" },
+  { name = "trust", type = "string", hint = "Event trust level: untrusted, internal, or owner" },
+  { name = "every", type = "string", hint = "Poll interval such as 5m" },
+]
+out = [{ pin = "event", type = "event" }]
+
+[[trigger]]
+id = "closed-specs"
+kind = "source"
+params = [
+  { name = "tracker", type = "string", hint = "Tracker to watch for closed specs: github or jira" },
+  { name = "every", type = "string", hint = "Poll interval such as 5m" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "task", type = "task" }]
+
+[[trigger]]
+id = "schedule"
+kind = "schedule"
+params = [
+  { name = "every", type = "string", hint = "Repeat interval such as 5m, 15m, or 1h" },
+  { name = "cron", type = "string", hint = "Five-field cron expression; mutually exclusive with every" },
+  { name = "run_at_load", type = "boolean", hint = "Fire once immediately when arete serve starts" },
+]
+out = [{ pin = "tick", type = "event" }]
+
+[[trigger]]
+id = "feedback"
+kind = "event"
+params = [
+  { name = "repo", type = "string", hint = "Optional repository name filter" },
+  { name = "kind", type = "string", hint = "Optional ticket kind filter" },
+]
+out = [{ pin = "task", type = "task" }, { pin = "feedback", type = "feedback" }, { pin = "pr", type = "pr" }]
+
+[[trigger]]
+id = "interrupted"
+kind = "event"
+params = [
+  { name = "repo", type = "string", hint = "Optional repository name filter" },
+  { name = "repaired_by", type = "boolean", hint = "Match runs carrying an internal review repair request" },
+  { name = "kind", type = "string", hint = "Optional ticket kind filter" },
+]
+out = [{ pin = "task", type = "task" }, { pin = "feedback", type = "feedback" }, { pin = "report", type = "report" }]
+
+[[trigger]]
+id = "webhook"
+kind = "event"
+params = [
+  { name = "name", type = "string", hint = "Webhook path segment served at /hook/<name>" },
+  { name = "event", type = "string[]", hint = "Optional allowed event types such as github.issues or webhook" },
+  { name = "trust", type = "string", hint = "Minimum event trust level: untrusted, internal, or owner" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "payload", type = "object" }]
+
+[[trigger]]
+id = "loop-event"
+kind = "event"
+params = [
+  { name = "event", type = "string[]", hint = "Event types accepted from sources or upstream loops" },
+  { name = "group", type = "string", hint = "Optional event field used to batch and queue events" },
+  { name = "trust", type = "string", hint = "Minimum event trust level: untrusted, internal, or owner" },
+]
+out = [{ pin = "event", type = "event" }, { pin = "data", type = "any" }]

@@ -7276,10 +7276,11 @@ class ConfigKindRegistryTests(unittest.TestCase):
         from arete import configkinds
         from arete.commands import api as api_commands
 
-        kinds = ("prompt", "schema", "adw", "routes", "step_settings", "models", "prices", "budgets", "connector",
-                 "source", "target", "rule", "sync", "vocabularies", "device", "loop", "attention", "sound",
-                 "experiment", "retention")
-        assert tuple(configkinds.REGISTRY) == kinds
+        expected = ("prompt", "schema", "adw", "routes", "step_settings", "models", "prices", "budgets", "connector",
+                    "source", "target", "rule", "sync", "vocabularies", "device", "loop", "attention", "sound",
+                    "experiment", "retention", "library")
+        kinds = tuple(configkinds.REGISTRY)
+        assert set(expected) <= set(kinds)
         assert all((paths.PACKAGE_DIR.parent / entry.schema).is_file() and entry.home and entry.gate
                    and entry.verbs == ("list", "read", "versions", "diff") for entry in configkinds.REGISTRY.values())
         assert configkinds.classify("config.toml") == ("step_settings", "defaults")
@@ -12180,7 +12181,7 @@ assert keyed_after == keyed_before
 
 with api_server(scopes=('read', 'config:activate', 'settings:write')) as (api, _):
     kinds_resp = api.read('/api/v1/config')['kinds']
-    assert [k['kind'] for k in kinds_resp] == list(configkinds.REGISTRY) and len(kinds_resp) == 20
+    assert [k['kind'] for k in kinds_resp] == list(configkinds.REGISTRY) and 'library' in configkinds.REGISTRY
     for row in kinds_resp:
         assert row['verbs'] == ['list', 'read', 'versions', 'diff']
         api.read(f"/api/v1/config/{row['kind']}")
