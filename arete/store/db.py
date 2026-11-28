@@ -183,6 +183,8 @@ CONFIG_INDEX_SCHEMA = 35
 CONFIG_VER_SCHEMA = 36
 INBOX_SCHEMA = 37
 LOOP_QUEUE_SCHEMA = 38
+OUTBOX_SCHEMA = 39
+OUTBOX_APPROVALS_SCHEMA = 40
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -196,7 +198,7 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
                              SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, TICKET_FOLLOWUPS_SCHEMA,
                              SECRET_EXPOSE_SCHEMA, CONFIG_INDEX_SCHEMA, CONFIG_VER_SCHEMA, INBOX_SCHEMA,
-                             LOOP_QUEUE_SCHEMA))
+                             LOOP_QUEUE_SCHEMA, OUTBOX_SCHEMA, OUTBOX_APPROVALS_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -561,6 +563,9 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through:
                 version = migration.n
                 print(f"applied {migration.name}", flush=True)
             backup.finish_restore()
+            from .. import gh
+
+            gh.clear_mark_cache()
             return False
         finally:
             if conn is not None:

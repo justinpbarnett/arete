@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 12
+MINOR = 13
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -155,7 +155,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "secret_internal", "already_resolved", "validation",
                        "gate_refused", "presence_expired"}
-    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push") and name != "session.end":
+    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -184,11 +184,38 @@ INBOX_ITEM = obj({
     "detail": mapping(JSON),
     "verbs": array(STRING),
     "options": array(JSON),
-})
+    "outbox_id": NULL_TEXT,
+}, [
+    "id", "kind", "subject", "task_id", "run_id", "line", "title", "state", "snooze_until",
+    "snooze_watch", "shelve_reason", "shelve_until", "answer", "answered_by", "answered_at",
+    "resolution", "reminded", "raised", "resolved", "priority", "snooze_watch_ver", "shelves",
+    "version", "detail", "verbs", "options",
+])
 INBOX_EVENT = obj({
     "id": STRING, "seq": INTEGER, "epoch": STRING, "at": STRING, "kind": STRING, "subject": STRING,
     "ver": {"type": ["integer", "null"]}, "actor": STRING, "actor_name": NULL_TEXT, "data": mapping(JSON),
 }, ["id", "seq", "at", "kind", "subject", "actor", "data"], additional=JSON)
+NULL_INT = {"type": ["integer", "null"]}
+OUTBOX_ITEM = obj({
+    **dict.fromkeys(("id", "target", "kind", "object", "audience", "drafted_by", "slot", "state",
+                     "summary", "plain_summary", "review", "created", "updated"), STRING),
+    **dict.fromkeys(("marker", "posts_as", "task_id", "ref_id", "run_id", "step", "loop", "opened_at",
+                     "approved_by", "approved_rule", "approved_rule_version", "send_at", "base_remote_updated",
+                     "sent_at", "sent_ref", "sent_url", "error", "reject_reason", "sending_since"), NULL_TEXT),
+    **dict.fromkeys(("rev", "attempts", "shape", "version"), INTEGER),
+    "legacy_approval": NULL_INT,
+})
+OUTBOX_REVISION = obj({
+    "item": INTEGER, "rev": INTEGER, "base_rev": NULL_INT, "by": STRING, "body": STRING, "at": STRING,
+})
+OUTBOX_REDACTION = obj({
+    "item": INTEGER, "rev": INTEGER, "n": INTEGER, "kind": STRING, "start": INTEGER, "end": INTEGER, "why": STRING,
+})
+DELIVERY_ATTEMPT = obj({
+    "item": INTEGER, "n": INTEGER, "started": STRING, "ended": NULL_TEXT, "outcome": NULL_TEXT,
+    "http_status": NULL_INT, "retry_after": NULL_INT, "external_id": NULL_TEXT, "external_url": NULL_TEXT,
+    "lookup": NULL_TEXT, "error": NULL_TEXT,
+})
 PUSH_SUBSCRIPTION = obj({
     **dict.fromkeys(("id", "endpoint_host", "label", "created"), STRING),
     "last_success": NULL_TEXT,
@@ -220,7 +247,7 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
-                 "features": obj({"inbox": BOOLEAN}),
+                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN}, ["inbox"]),
                  "push": obj({"vapid_public_key": STRING})})
 META["required"] = [k for k in META["required"] if k not in ("features", "push")]
 ROLE_ENUM = {**STRING, "enum": list(configkinds.ROLE_NAMES)}
@@ -497,6 +524,52 @@ OPERATIONS += [
               "POST", errors=("validation",), success_status=201),
     operation("push.remove", "push/subscriptions/{subscription}", envelope({"id": STRING, "removed": BOOLEAN}),
               obj({"subscription": STRING}), {"subscription": "PS-1"}, "DELETE"),
+    operation("outbox.list", "outbox", envelope({"items": array(OUTBOX_ITEM)}),
+              obj({"state": STRING, "task": STRING, "run": STRING}, [])),
+    operation("outbox.get", "outbox/{item}",
+              envelope({"item": OUTBOX_ITEM, "revisions": array(OUTBOX_REVISION),
+                        "redactions": array(OUTBOX_REDACTION), "attempts": array(DELIVERY_ATTEMPT),
+                        "sending_since": NULL_TEXT}),
+              obj({"item": STRING}), {"item": "OB-1"}),
+    operation("outbox.edit", "outbox/{item}", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "base_rev": {**INTEGER, "minimum": 1}, "body": STRING}),
+              {"item": "OB-1", "base_version": 1, "base_rev": 1, "body": "Edited body"}, "PATCH",
+              errors=("invalid_state", "validation")),
+    operation("outbox.preview", "outbox/{item}/preview",
+              envelope({"item": STRING, "rev": INTEGER, "marker": NULL_TEXT, "body": STRING}),
+              obj({"item": STRING}), {"item": "OB-1"}),
+    operation("outbox.open", "outbox/{item}/open", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.approve", "outbox/{item}/approve", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "rev": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1, "rev": 1}, "POST",
+              errors=("invalid_state", "validation", "gate_refused", "presence_expired")),
+    operation("outbox.undo", "outbox/{item}/undo", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.hold", "outbox/{item}/hold", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.release", "outbox/{item}/release", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.reject", "outbox/{item}/reject", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "reason": STRING},
+                  ["item", "base_version"]),
+              {"item": "OB-1", "base_version": 1, "reason": "Not needed"}, "POST",
+              errors=("invalid_state", "validation", "gate_refused", "presence_expired")),
+    operation("outbox.retry", "outbox/{item}/retry", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST",
+              errors=("invalid_state", "gate_refused", "presence_expired")),
+    operation("outbox.discard", "outbox/{item}/discard", envelope({"item": OUTBOX_ITEM}),
+              obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
+    operation("outbox.history", "outbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
+              obj({"item": STRING}), {"item": "OB-1"}),
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):
