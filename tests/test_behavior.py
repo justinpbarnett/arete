@@ -6553,6 +6553,13 @@ timeout_minutes = 40
 """
 
     @classmethod
+    def setUpClass(cls):
+        cases = ("errors", "roles", "cli", "settings", "ignored", "reach_routing", "layer_and_oncall", "new_code")
+        workers = ThreadPoolExecutor(max_workers=len(cases))
+        cls.addClassCleanup(workers.shutdown, cancel_futures=True)
+        cls.results = {case: workers.submit(cls.observe, case) for case in cases}
+
+    @classmethod
     def observe(cls, case):
         with tempfile.TemporaryDirectory(prefix="arete-config-registry-") as directory:
             root = Path(directory).resolve()
@@ -6569,6 +6576,18 @@ timeout_minutes = 40
     def run_case(cls, case):
         from arete import loop_run, sources
         from arete.commands import setup
+
+        if case in ("ignored", "reach_routing", "layer_and_oncall", "new_code"):
+            with api_check.offline():
+                with redirect_stdout(StringIO()):
+                    assert setup.cmd_init(SimpleNamespace(force=False)) == 0
+                    root = Path.cwd()
+                    lines, _ = api_check.prepare_replay(root)
+                    base = "\n".join(lines) + "\n"
+                    layer_dir = root / "sample/layer"
+                    result = getattr(cls, f"case_{case}")(base, layer_dir)
+                print(json.dumps(result))
+            return
 
         with (api_check.offline(), mock.patch.object(pipeline, "spawn_run") as spawn,
               mock.patch.object(loop_run, "launch") as launch, mock.patch.object(sources, "fire") as fire,
@@ -6591,6 +6610,460 @@ timeout_minutes = 40
             for fake in (spawn, launch, fire, scan):
                 fake.assert_not_called()
             print(json.dumps(result))
+
+    @staticmethod
+    @contextmanager
+    def api_server():
+        with redirect_stdout(StringIO()):
+            db.migrate()
+            owner = principals.seed_owner(api_check.LOGIN)
+        with db.tx() as c:
+            token_store.ensure_key(c)
+            _, token = token_store.issue(owner, "Config reach fixture", ["*"])
+        node = SimpleNamespace(names={api_check.ADDRESS})
+        logins = tailnet.Logins(tailnet.ScratchHost())
+        logins.of = lambda _: api_check.LOGIN
+        with mock.patch("socket.getfqdn", return_value=api_check.ADDRESS):
+            server = tailnet.Server(api_check.ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)
+        with server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            try:
+                yield api_check.Check(server.server_port, Path.cwd(), [], token=token)
+            finally:
+                server.shutdown()
+                thread.join()
+
+    @staticmethod
+    def _quiet_server():
+        server = serve.Server()
+        said: list[str] = []
+        server.say = said.append
+        server.sweep_vms = lambda: None
+        server.sweep_workspaces = lambda: None
+        server.prune = lambda: None
+        server.rotate = lambda: None
+        server.move_secrets_when_due = lambda: None
+        server.check_secrets_when_due = lambda: None
+        server.zte_when_due = lambda: None
+        server.unblock_when_due = lambda: None
+        return server, said
+
+    @staticmethod
+    def _close_server(server):
+        for pool in (server.pool, *server.job_pools.values()):
+            pool.shutdown(wait=False)
+
+    @staticmethod
+    def _write_agent_loop(name: str = "test-agent", repo: str = "") -> Path:
+        folder = paths.CONFIG_DIR / "loops" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        body = 'kind = "watch"\ndescription = "Test agent loop"\n'
+        if repo:
+            body += f'[run]\nrepo = "{repo}"\n'
+        (folder / "loop.toml").write_text(body)
+        (folder / "prompt.md").write_text("Inspect and report.\n")
+        return folder
+
+    @classmethod
+    def case_ignored(cls, base, layer_dir):
+        from datetime import timedelta
+
+        from arete import configrepo, loop_run, loops, sources
+        from arete.store import loops as loop_store
+
+        paths.CONFIG_FILE.write_text(base)
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        configrepo.init()
+        extras = (
+            "\n[steps.future_step]\ntries = 1\n"
+            "\n[kinds.chore]\n"
+            "\n[capture]\nfuture_option = 1\n"
+            "\n[ask]\nfuture_option = 1\n"
+        )
+        paths.CONFIG_FILE.write_text(base + extras)
+        cfg = config.load()
+        assert cfg.problems == (), cfg.problems
+        for expected in ("future_step", "chore", "[capture] future_option", "[ask] future_option"):
+            assert any(expected in name for name in cfg.ignored), (expected, cfg.ignored)
+        try:
+            config.load(strict=True)
+        except ValueError as exc:
+            assert "future_step" in str(exc), str(exc)
+        else:
+            raise AssertionError("expected config.load(strict=True) to fail on future_step")
+
+        layer_file = layer_dir / "config.toml"
+        original_layer = layer_file.read_text()
+        layer_file.write_text(original_layer + "\n[steps.future_step]\ntries = 1\n\n[kinds.chore]\n")
+        layer = config.load_layer(layer_dir)
+        assert layer.problems == (), layer.problems
+        assert any("future_step" in name for name in layer.ignored), layer.ignored
+        assert any("chore" in name for name in layer.ignored), layer.ignored
+        try:
+            config.load_layer(layer_dir, strict=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected config.load_layer(strict=True) to fail on future_step")
+        layer_file.write_text(original_layer)
+
+        yesterday = util.iso(util.now() - timedelta(days=1))
+        engine_loops = [lp for lp in loops.load_all(cfg) if lp.enabled and not lp.error]
+
+        def run_two_ticks(text):
+            paths.CONFIG_FILE.write_text(text)
+            for lp in engine_loops:
+                loop_store.set_loop_state(lp.name, last_fire=yesterday, next_due=yesterday)
+            fired: list[str] = []
+            with (mock.patch.object(pipeline, "spawn_run") as spawn,
+                  mock.patch.object(loop_run, "launch") as launch,
+                  mock.patch.object(sources, "fire", side_effect=lambda lp, trig: fired.append(lp.name) or 1),
+                  mock.patch.object(serve.Server, "scan_oncall") as scan):
+                server, said = cls._quiet_server()
+                try:
+                    assert server.tick() is True
+                    assert server.tick() is True
+                finally:
+                    cls._close_server(server)
+                spawn.assert_not_called()
+                launch.assert_not_called()
+                scan.assert_not_called()
+            return fired, said
+
+        clean_fired, _ = run_two_ticks(base)
+        extra_fired, extra_said = run_two_ticks(base + extras)
+        assert extra_fired == clean_fired, (extra_fired, clean_fired)
+        ignored_lines = [line for line in extra_said if "future_step" in line]
+        assert len(ignored_lines) == 1, ignored_lines
+        for needle in ("future_step", "chore", "[capture] future_option", "[ask] future_option"):
+            assert needle in ignored_lines[0], (needle, ignored_lines[0])
+        return True
+
+    @classmethod
+    def case_reach_routing(cls, base, layer_dir):
+        from datetime import timedelta
+
+        from arete import configrepo, inbox, launch_lease, loop_run, record, replay, settings, sources, steps, tasks
+        from arete.commands import setup
+        from arete.store import loops as loop_store
+        from arete.store import tasks as task_store
+
+        paths.CONFIG_FILE.write_text(base)
+        with cls.api_server() as api:
+            configrepo.init()
+            cls._write_agent_loop("test-agent")
+            tid = task_store.task_add(replay.SAMPLE_REPO, "Sample task body", "Sample task", "feat")
+            spawn_calls: list[tuple] = []
+
+            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False):
+                spawn_calls.append((repo_name, ticket_id, force))
+                if (lease := launch_lease.CURRENT.get()) is not None:
+                    lease.passed = True
+                rid = record.new_id("pip")
+                record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                return SimpleNamespace(poll=lambda: None, pid=os.getpid())
+
+            def post_task(ticket_id):
+                _, raw = api.request("POST", "/api/tasks", {"repo": replay.SAMPLE_REPO, "ticket": ticket_id}, status=200)
+                return json.loads(raw)
+
+            # Sub-case A: [routing] future_key = 1
+            paths.CONFIG_FILE.write_text(base + "\n[routing]\nfuture_key = 1\n")
+            yesterday = util.iso(util.now() - timedelta(days=1))
+            loop_store.set_loop_state("heartbeat", last_fire=yesterday, next_due=yesterday)
+            fired: list[str] = []
+            with (mock.patch.object(pipeline, "spawn_run", side_effect=fake_spawn),
+                  mock.patch.object(sources, "fire", side_effect=lambda lp, trig: fired.append(lp.name) or 1),
+                  mock.patch.object(serve.Server, "scan_oncall") as scan):
+                server, _ = cls._quiet_server()
+                try:
+                    assert server.tick() is True
+                    assert server.tick() is True
+                    server.beat()
+                    scan.assert_not_called()
+
+                    assert "heartbeat" in fired, fired
+                    api.request("GET", "/", status=200, headers={"Accept": "text/html"})
+                    api.read("/api/v1/settings")
+                    health_raw = api.request("GET", "/api/health", status=200)[1].decode()
+                    assert "future_key" in health_raw, health_raw
+                    beat_data = control.serve_beat()
+                    assert "future_key" in beat_data.get("config_problem", ""), beat_data
+                    assert any("future_key" in p for p in beat_data.get("config_problems", ())), beat_data
+
+                    items = inbox.list(state="open", kind="config_invalid")
+                    assert len(items) == 1, items
+                    item = items[0]
+                    assert item["priority"] == 1
+                    assert item["subject"] == "config:step_settings/defaults"
+                    assert item["verbs"] == ["continue"]
+                    assert "[routing] future_key" in json.dumps(item["detail"]), item["detail"]
+
+                    queued = post_task(tid)
+                    assert queued["state"] == "queued", queued
+                    assert "[routing] future_key" in queued["why"], queued
+                    assert not spawn_calls
+
+                    cfg = config.load()
+                    try:
+                        steps.resolve(cfg, None, "build")
+                    except config.Paused as exc:
+                        assert "future_key" in str(exc)
+                    else:
+                        raise AssertionError("expected steps.resolve(build) to raise config.Paused")
+
+                    try:
+                        loop_run.launch("test-agent")
+                    except control.Refused as exc:
+                        assert "future_key" in str(exc)
+                    else:
+                        raise AssertionError("expected loop_run.launch(test-agent) to be refused")
+
+                    try:
+                        tasks.free_to_start(cfg, cfg.repo(replay.SAMPLE_REPO), tid, ahead=True)
+                    except control.Refused as exc:
+                        assert "future_key" in str(exc)
+                    else:
+                        raise AssertionError("expected free_to_start(ahead=True) to refuse")
+
+                    # Second problem in the same file updates the same open item (inbox_one_open).
+                    paths.CONFIG_FILE.write_text(base + "\n[routing]\nfuture_key = 1\n[environment]\nfuture_env = 1\n")
+                    assert server.tick() is True
+                    items2 = inbox.list(state="open", kind="config_invalid")
+                    assert len(items2) == 1 and items2[0]["id"] == item["id"], items2
+                    assert "future_env" in json.dumps(items2[0]["detail"]) and "future_key" in json.dumps(items2[0]["detail"])
+
+                    # Status prints problems alongside ignored names.
+                    from arete import board
+
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        setup.print_status(config.load(), "", [], board.snapshot(), board.panel(record.store), "")
+                    assert "future_key" in out.getvalue(), out.getvalue()
+
+                    # settings.save loads in strict mode and refuses bad reach keys.
+                    try:
+                        settings.save({"max_parallel": 2})
+                    except settings.Refused:
+                        pass
+                    else:
+                        raise AssertionError("expected settings.save to refuse in strict mode")
+
+                    # Sub-case B: [steps.build] session = "fork"
+                    paths.CONFIG_FILE.write_text(base + '\n[steps.build]\nsession = "fork"\n')
+                    assert server.tick() is True
+                    items_b = inbox.list(state="open", kind="config_invalid")
+                    assert len(items_b) == 1, items_b
+                    assert "session" in json.dumps(items_b[0]["detail"]), items_b[0]["detail"]
+                    queued_b = post_task(tid)
+                    assert queued_b["state"] == "queued" and "session" in queued_b["why"], queued_b
+                    assert not spawn_calls
+                    cfg_b = config.load()
+                    try:
+                        steps.resolve(cfg_b, None, "build")
+                    except config.Paused:
+                        pass
+                    else:
+                        raise AssertionError("expected build to be paused on bad session")
+                    assert steps.resolve(cfg_b, None, "plan").step == "plan"
+
+                    # Sub-case C: [ab.cheaper] on build with [ab.cheaper.arm] future_key = 1
+                    paths.CONFIG_FILE.write_text(
+                        base + '\n[ab.cheaper]\nstep = "build"\nshare = 0.25\n[ab.cheaper.arm]\nfuture_key = 1\n'
+                    )
+                    assert server.tick() is True
+                    items_c = inbox.list(state="open", kind="config_invalid")
+                    assert len(items_c) == 1, items_c
+                    assert "future_key" in json.dumps(items_c[0]["detail"]), items_c[0]["detail"]
+                    cfg_c = config.load()
+                    try:
+                        steps.resolve(cfg_c, None, "build")
+                    except config.Paused:
+                        pass
+                    else:
+                        raise AssertionError("expected build to be paused on bad A/B arm key")
+                    assert steps.resolve(cfg_c, None, "plan").step == "plan"
+                    queued_c = post_task(tid)
+                    assert queued_c["state"] == "queued" and not spawn_calls, queued_c
+
+                    # Sub-case D: remove the key -> next tick resolves item, POST /api/tasks reaches spawn_run
+                    paths.CONFIG_FILE.write_text(base)
+                    assert server.tick() is True
+                    assert inbox.list(state="open", kind="config_invalid") == []
+                    started = post_task(tid)
+                    assert started["state"] != "queued", started
+                    assert len(spawn_calls) == 1 and spawn_calls[0][:2] == (replay.SAMPLE_REPO, tid), spawn_calls
+                finally:
+                    cls._close_server(server)
+
+            # Unmocked pipeline.spawn_run backstop refuses when paused.
+            paths.CONFIG_FILE.write_text(base + "\n[routing]\nfuture_key = 1\n")
+            try:
+                pipeline.spawn_run(replay.SAMPLE_REPO, tid)
+            except control.Refused as exc:
+                assert "future_key" in str(exc)
+            else:
+                raise AssertionError("expected pipeline.spawn_run backstop to refuse")
+        return True
+
+    @classmethod
+    def case_layer_and_oncall(cls, base, layer_dir):
+        import re
+
+        from arete import configrepo, inbox, launch_lease, loop_run, record, replay, sources
+        from arete.store import tasks as task_store
+
+        paths.CONFIG_FILE.write_text(base)
+        layer_file = layer_dir / "config.toml"
+        original_layer = layer_file.read_text()
+        with cls.api_server() as api:
+            configrepo.init()
+            cls._write_agent_loop("no-repo-agent")
+            tid = task_store.task_add(replay.SAMPLE_REPO, "Layer test task", "Layer test", "feat")
+            spawn_calls: list[tuple] = []
+
+            def fake_spawn(repo_name, ticket_id, force=False, *, spec=False):
+                spawn_calls.append((repo_name, ticket_id, force))
+                if (lease := launch_lease.CURRENT.get()) is not None:
+                    lease.passed = True
+                rid = record.new_id("pip")
+                record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                return SimpleNamespace(poll=lambda: None, pid=os.getpid())
+
+            def post_task(ticket_id):
+                _, raw = api.request("POST", "/api/tasks", {"repo": replay.SAMPLE_REPO, "ticket": ticket_id}, status=200)
+                return json.loads(raw)
+
+            with (mock.patch.object(pipeline, "spawn_run", side_effect=fake_spawn),
+                  mock.patch.object(sources, "fire", return_value=1),
+                  mock.patch.object(serve.Server, "scan_oncall") as scan):
+                server, _ = cls._quiet_server()
+                try:
+                    # Sub-case A: sample layer with [factory] path = "future"
+                    if "[factory]" in original_layer:
+                        bad_layer = re.sub(r'(?m)^path\s*=\s*"[^"]*"', 'path = "future"', original_layer)
+                    else:
+                        bad_layer = original_layer + '\n[factory]\npath = "future"\n'
+                    layer_file.write_text(bad_layer)
+                    assert server.tick() is True
+                    items = inbox.list(state="open", kind="config_invalid")
+                    assert len(items) == 1, items
+                    assert items[0]["subject"] == f"config:step_settings/{replay.SAMPLE_REPO}", items[0]
+                    assert items[0]["priority"] == 1
+                    queued = post_task(tid)
+                    assert queued["state"] == "queued" and "future" in queued["why"], queued
+                    assert not spawn_calls
+
+                    # Agent loop with no repo still launches!
+                    detached: list[list[str]] = []
+                    with (mock.patch.object(control, "detach",
+                                            side_effect=lambda cmd, **kw: detached.append(cmd) or SimpleNamespace(pid=os.getpid())),
+                          mock.patch.object(loop_run, "began", side_effect=lambda run, proc: {"id": run.id, "status": "running"})):
+                        launched = loop_run.launch("no-repo-agent")
+                    assert launched["status"] == "running" and len(detached) == 1, (launched, detached)
+
+                    # Restore layer -> item resolves.
+                    layer_file.write_text(original_layer)
+                    assert server.tick() is True
+                    assert inbox.list(state="open", kind="config_invalid") == []
+
+                    # Sub-case B: [oncall] enabled = true + future_key = 1
+                    paths.CONFIG_FILE.write_text(base + "\n[oncall]\nenabled = true\nfuture_key = 1\n")
+                    assert server.tick() is True
+                    assert server.tick() is True
+                    oncall_items = inbox.list(state="open", kind="config_invalid")
+                    assert len(oncall_items) == 1, oncall_items
+                    assert "future_key" in json.dumps(oncall_items[0]["detail"]), oncall_items[0]["detail"]
+                    scan.assert_not_called()
+                    started = post_task(tid)
+                    assert started["state"] != "queued", started
+                    assert len(spawn_calls) == 1, spawn_calls
+
+                    # Sub-case C: wrong type still raises in both modes and raises inbox item on tick.
+                    paths.CONFIG_FILE.write_text(base + "\n[routing]\nfallback = 0\n")
+                    for strict in (False, True):
+                        try:
+                            config.load(strict=strict)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError(f"expected wrong type to raise with strict={strict}")
+                    assert server.tick() is False
+                    fatal_items = inbox.list(state="open", kind="config_invalid")
+                    assert len(fatal_items) == 1 and fatal_items[0]["subject"] == "config:step_settings/defaults", fatal_items
+                finally:
+                    cls._close_server(server)
+        return True
+
+    @classmethod
+    def case_new_code(cls, base, layer_dir):
+        from arete import configrepo, loop_run, sources
+        from arete.store import loops as loop_store
+
+        paths.CONFIG_FILE.write_text(base + "\n[oncall]\nenabled = true\n")
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        configrepo.init()
+        server, said = cls._quiet_server()
+        try:
+            # Queue a loop item so dispatch would launch if not held by code_problem.
+            loop_store.enqueue("heartbeat", "heartbeat", "", "manual", [])
+            new_stamp = frozenset({("changed.py", 1, 1)})
+            server.code_seen = new_stamp
+            exec_calls: list[tuple] = []
+            mode = {"kind": "reach_problem"}
+            new_problem = [{"path": str(paths.CONFIG_FILE), "section": "[routing]", "name": "future_key",
+                            "value": 1, "scope": "global"}]
+
+            def fake_sh(cmd, **kw):
+                text = " ".join(str(part) for part in cmd)
+                if "IMPORT_CHECK" in text or "codebase.load()" in text:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if "config.load()" in text:
+                    if mode["kind"] == "reach_problem":
+                        return SimpleNamespace(returncode=0, stdout=json.dumps(new_problem) + "\n", stderr="")
+                    if mode["kind"] == "clean":
+                        return SimpleNamespace(returncode=0, stdout="[]\n", stderr="")
+                    return SimpleNamespace(returncode=1, stdout="", stderr="ValueError: bad config\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (mock.patch.object(serve, "code_stamp", return_value=new_stamp),
+                  mock.patch.object(server, "busy_with", return_value=""),
+                  mock.patch.object(serve.os, "execv", side_effect=lambda *a: exec_calls.append(a)),
+                  mock.patch.object(util, "sh", side_effect=fake_sh),
+                  mock.patch.object(loop_run, "launch") as launch,
+                  mock.patch.object(sources, "fire", return_value=1),
+                  mock.patch.object(serve.Server, "scan_oncall") as scan):
+                server.load_new_code()
+                assert not exec_calls
+                assert server.code_problem and "future_key" in server.code_problem, server.code_problem
+                assert server.tick() is False
+                launch.assert_not_called()
+                scan.assert_not_called()
+                server.beat()
+                beat = control.serve_beat()
+                assert beat.get("code_problem") == server.code_problem, beat
+
+                server.load_new_code()
+                assert not exec_calls
+                problem_notes = [line for line in said if "future_key" in line]
+                assert len(problem_notes) == 1, problem_notes
+
+                mode["kind"] = "clean"
+                server.load_new_code()
+                assert len(exec_calls) == 1, exec_calls
+                assert not server.code_problem
+
+                # Running server holds a config.toml that does not load; CONFIG_CHECK exits 1 -> still execs!
+                paths.CONFIG_FILE.write_text(base + "\n[routing]\nfallback = 0\n")
+                mode["kind"] = "fail"
+                server.load_new_code()
+                assert len(exec_calls) == 2, exec_calls
+        finally:
+            cls._close_server(server)
+        return True
 
     @classmethod
     def errors(cls, base, layer_dir):
@@ -6660,7 +7133,7 @@ timeout_minutes = 40
 
     def assert_observation(self, case):
         expected = json.loads(self.golden.read_text())[case]
-        self.assertEqual(self.observe(case), expected)
+        self.assertEqual(self.results[case].result(), expected)
 
     def test_config_errors_and_order(self):
         self.assert_observation("errors")
@@ -6673,6 +7146,18 @@ timeout_minutes = 40
 
     def test_resolved_settings(self):
         self.assert_observation("settings")
+
+    def test_tolerant_ignored_names(self):
+        self.assertTrue(self.results["ignored"].result())
+
+    def test_reach_problems_pause_and_inbox(self):
+        self.assertTrue(self.results["reach_routing"].result())
+
+    def test_layer_and_oncall_scoped_pauses(self):
+        self.assertTrue(self.results["layer_and_oncall"].result())
+
+    def test_new_code_config_check_gate(self):
+        self.assertTrue(self.results["new_code"].result())
 
 
 class ConfigKindRegistryTests(unittest.TestCase):

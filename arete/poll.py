@@ -509,6 +509,11 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
                           **({"spec": True} if ticket.is_spec else {}))
     if not reply and claim and ask_store.asks_of(claim["run"], "open"):
         reply = "its asks are still waiting for an owner answer"
+    if why := config.repo_paused(cfg, repo.name, kind=ticket.kind):
+        if not dry_run:
+            source_store.pass_over(repo.name, str(tid))
+        print(f"{util.iso()} {name}: waiting, {why}")
+        return "held"
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
     if answered is None and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
@@ -629,7 +634,7 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
             try:
                 if spec_graph.queue_blocker(queue.tracker, row["issue"], native=True):
                     continue
-                slot_blocker = held_back(cfg, repo.name, going, slots - started)
+                slot_blocker = config.repo_paused(cfg, repo.name) or held_back(cfg, repo.name, going, slots - started)
                 can_start = started < MAX_STARTS_PER_POLL and not slot_blocker
                 if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start, slot_blocker=slot_blocker):
                     queue.selected.add(str(row["issue"]))

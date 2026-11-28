@@ -743,6 +743,12 @@ def incident_board(text: str) -> dict:
 
 def health_board(*, include_held: bool = True) -> dict:
     beat = control.serve_beat()
+    if "config_problems" not in beat:
+        cfg, problem = config.load_or_problem()
+        problems = [p.text() for p in cfg.problems]
+        first = problem or (problems[0] if problems else "")
+        if problems or first:
+            beat = {**beat, "config_problems": problems, **({"config_problem": first} if first else {})}
     found = checks_and_alerts()
     workspaces = panel(workspace.held_summary)
     if include_held and "rows" in workspaces:

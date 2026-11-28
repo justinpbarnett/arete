@@ -6767,6 +6767,11 @@ def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: in
 
 
 def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False) -> subprocess.Popen:
+    cfg, problem = config.load_or_problem()
+    if problem:
+        raise control.Refused(problem)
+    if why := config.repo_paused(cfg, repo_name):
+        raise control.Refused(why)
     return control.launch(run_command(repo_name, tid, force, **({"spec": True} if spec else {})), RUNS_LOG)
 
 
