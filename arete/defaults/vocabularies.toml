@@ -1,0 +1,46 @@
+schema = 1
+
+[task_states.intake]
+terminal = false
+
+[task_states.ready]
+terminal = false
+
+[task_states.running]
+terminal = false
+
+[task_states.needs-you]
+terminal = false
+
+[task_states.review]
+terminal = false
+
+[task_states.done]
+terminal = true
+
+[task_states.closed]
+terminal = true
+
+[legacy.todo]
+state = "ready"
+fault = false
+
+[legacy.running]
+state = "running"
+fault = false
+
+[legacy.pr]
+state = "review"
+fault = false
+
+[legacy.needs-info]
+state = "needs-you"
+fault = false
+
+[legacy.failed]
+state = "needs-you"
+fault = true
+
+[legacy.done]
+state = "done"
+fault = false

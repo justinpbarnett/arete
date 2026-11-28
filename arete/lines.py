@@ -313,7 +313,7 @@ def _validate_device_pool(value: object) -> list[str]:
     return list(value)
 
 
-def _validate_band(value: object) -> dict[str, list[float]]:
+def _validate_band(value: object) -> dict[str, list[int | float]]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -321,7 +321,7 @@ def _validate_band(value: object) -> dict[str, list[float]]:
             raise ValidationError("band", f"invalid JSON: {error}") from None
     if not isinstance(value, dict):
         raise ValidationError("band", "must be a JSON object mapping step node to [min, max] seconds")
-    out: dict[str, list[float]] = {}
+    out: dict[str, list[int | float]] = {}
     for node, bounds in value.items():
         if not isinstance(node, str) or not node.strip():
             raise ValidationError("band", "step node keys must be non-empty strings")
@@ -334,7 +334,7 @@ def _validate_band(value: object) -> dict[str, list[float]]:
         lo, hi = float(bounds[0]), float(bounds[1])
         if lo > hi:
             raise ValidationError("band", f"step '{node}' min ({lo}) cannot exceed max ({hi})")
-        out[node] = [lo, hi]
+        out[node] = [int(lo) if lo.is_integer() else lo, int(hi) if hi.is_integer() else hi]
     return out
 
 
@@ -659,6 +659,41 @@ def create_line(values: dict) -> dict:
         return _receipt_result(conn, data=present_line(row), subject=subject, ver=1, seq=seq)
 
 
+def apply_line_update(conn, existing: dict, fields: dict, *, cfg: config.Config) -> dict:
+    line_id = existing["id"]
+    base_version = int(existing["version"])
+    if existing["archived"]:
+        raise ValidationError("archived", f"line '{line_id}' is archived; restore it before updating")
+    merged = {**existing, **fields}
+    clean = _validate_line_image(conn, merged, cfg=cfg)
+    new_ver = base_version + 1
+    now = util.iso()
+    conn.execute(
+        "UPDATE lines SET project = ?, name = ?, kind = ?, repo = ?, adw_route = ?, device_pool = ?, "
+        "rank = ?, concurrency = ?, wip_limit = ?, priority = ?, paused = ?, paused_why = ?, band = ?, "
+        "version = ?, updated = ? WHERE id = ? AND version = ?",
+        (
+            clean["project"], clean["name"], clean["kind"], clean["repo"], clean["adw_route"],
+            _encode_json(clean["device_pool"]), clean["rank"], clean["concurrency"],
+            clean["wip_limit"], clean["priority"], int(clean["paused"]), clean["paused_why"],
+            _encode_json(clean["band"]), new_ver, now, line_id, base_version,
+        ),
+    )
+    if existing["paused"] != clean["paused"]:
+        inbox_store.set_line_paused(conn, line_id, clean["paused"])
+    row = projects_store.get_line(conn, line_id)
+    subject = f"line:{line_id}"
+    seq = events.emit(
+        "line.changed",
+        subject,
+        cls="durable",
+        ver=new_ver,
+        data={"fields": _diff_fields(existing, row, projects_store.LINE_EVENT_FIELDS)},
+        connection=conn,
+    )
+    return _receipt_result(conn, data=present_line(row), subject=subject, ver=new_ver, seq=seq)
+
+
 def update_line(line_id: str, base_version: int, fields: dict) -> dict:
     writes.validate_version(base_version)
     if "archived" in fields:
@@ -666,42 +701,13 @@ def update_line(line_id: str, base_version: int, fields: dict) -> dict:
     if unknown := sorted(set(fields) - LINE_WRITABLE):
         raise ValidationError(unknown[0], f"cannot update field(s): {', '.join(unknown)}")
     cfg = _load_cfg()
-    now = util.iso()
     with configrepo.maybe_instance_fence(), foundation.tx() as conn:
         existing = projects_store.get_line(conn, line_id)
         if existing is None:
             raise NotFound(f"No line {line_id}")
         if existing["version"] != base_version:
             raise writes.VersionConflict(present_line(existing))
-        if existing["archived"]:
-            raise ValidationError("archived", f"line '{line_id}' is archived; restore it before updating")
-        merged = {**existing, **fields}
-        clean = _validate_line_image(conn, merged, cfg=cfg)
-        new_ver = existing["version"] + 1
-        conn.execute(
-            "UPDATE lines SET project = ?, name = ?, kind = ?, repo = ?, adw_route = ?, device_pool = ?, "
-            "rank = ?, concurrency = ?, wip_limit = ?, priority = ?, paused = ?, paused_why = ?, band = ?, "
-            "version = ?, updated = ? WHERE id = ? AND version = ?",
-            (
-                clean["project"], clean["name"], clean["kind"], clean["repo"], clean["adw_route"],
-                _encode_json(clean["device_pool"]), clean["rank"], clean["concurrency"],
-                clean["wip_limit"], clean["priority"], int(clean["paused"]), clean["paused_why"],
-                _encode_json(clean["band"]), new_ver, now, line_id, base_version,
-            ),
-        )
-        if existing["paused"] != clean["paused"]:
-            inbox_store.set_line_paused(conn, line_id, clean["paused"])
-        row = projects_store.get_line(conn, line_id)
-        subject = f"line:{line_id}"
-        seq = events.emit(
-            "line.changed",
-            subject,
-            cls="durable",
-            ver=new_ver,
-            data={"fields": _diff_fields(existing, row, projects_store.LINE_EVENT_FIELDS)},
-            connection=conn,
-        )
-        return _receipt_result(conn, data=present_line(row), subject=subject, ver=new_ver, seq=seq)
+        return apply_line_update(conn, existing, fields, cfg=cfg)
 
 
 def restore_line(line_id: str, seq: int, base_version: int) -> dict:

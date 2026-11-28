@@ -17,6 +17,7 @@ from .db import (
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
     RUNS_PROMPT_BINDING_SCHEMA,
+    RUNS_ISSUE_CONTRACT_SCHEMA,
     STEPS_LIFECYCLE_SCHEMA,
     TASK_IDENTITY_EXPAND_SCHEMA,
     db,
@@ -63,6 +64,26 @@ def has_task_identity(c) -> bool:
     )
 
 
+def has_issue_column(c) -> bool:
+    if migration_applied(RUNS_ISSUE_CONTRACT_SCHEMA, c):
+        return False
+    return "issue" in {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+
+
+def issue_col(c, alias: str = "") -> str:
+    col = "issue_key" if (not has_issue_column(c) or has_task_identity(c)) else "issue"
+    return f"{alias}.{col}" if alias else col
+
+
+def run_row(r) -> dict:
+    d = dict(r)
+    if "issue" not in d and "issue_key" in d:
+        d["issue"] = d["issue_key"]
+    elif d.get("issue") is None and d.get("issue_key") is not None:
+        d["issue"] = d["issue_key"]
+    return d
+
+
 def _resolve_task_target(c, repo_or_task: str | int, issue: int | str | None = None) -> tuple[int | None, str | None, int | str | None]:
     if isinstance(repo_or_task, int) and not isinstance(repo_or_task, bool) and issue is None:
         return repo_or_task, None, None
@@ -101,6 +122,13 @@ def later_than(c, later: str, earlier: str) -> str:
 
 
 def filter_run_fields(c, fields: dict) -> dict:
+    out = dict(fields)
+    if has_task_identity(c):
+        if "issue" in out and out["issue"] is not None and not out.get("issue_key"):
+            raw = str(out["issue"])
+            out["issue_key"] = raw if raw != "" else None
+        if not has_issue_column(c):
+            out.pop("issue", None)
     drop: set[str] = set()
     if not has_pins(c):
         drop |= PINS_RUN_FIELDS
@@ -111,8 +139,8 @@ def filter_run_fields(c, fields: dict) -> dict:
     if not has_task_identity(c):
         drop |= TASK_IDENTITY_RUN_FIELDS
     if not drop:
-        return fields
-    return {k: v for k, v in fields.items() if k not in drop}
+        return out
+    return {k: v for k, v in out.items() if k not in drop}
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -215,7 +243,7 @@ def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, conn
         q += (" ORDER BY " + ("status = 'running' DESC, " if running_first else "")
               + f"started DESC, {seq_col(c)} DESC LIMIT ?")
         args.append(limit)
-        return [dict(r) for r in c.execute(q, args)]
+        return [run_row(r) for r in c.execute(q, args)]
 
 
 def run_facets(connect=reader) -> dict[str, list[str]]:
@@ -244,14 +272,14 @@ def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dic
 
 def merged_runs(connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute(
+        return [run_row(r) for r in c.execute(
             f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "  # noqa: S608
             "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
 
 
 def runs_since(since: str, connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
+        return [run_row(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
 
 
 DRAFT_READY = "run.draft-review.ready"
@@ -263,12 +291,13 @@ DRAFT_RECEIPT = ("SELECT e.at FROM events_log e WHERE e.subject = 'run:' || r.id
 def ticket_attention_runs(*, questions: bool = False) -> list[dict]:
     with reader() as c:
         k = seq_col(c)
-        return [dict(row) for row in c.execute(f"""
-            SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.issue != '' AND r.repo != ''
+        ic = issue_col(c)
+        return [run_row(row) for row in c.execute(f"""
+            SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND COALESCE(r.{ic}, '') != '' AND r.repo != ''
                 AND COALESCE(r.stop_asked, '') = '' AND {WHOLE_RUN} AND {LIVE_RUN}
                 AND ((r.status = 'pr' AND r.pr_url != '' AND COALESCE(r.environment_retry_of, '') = ''
                       AND NOT EXISTS ({DRAFT_RECEIPT})) OR (? AND r.status = 'needs-info' AND NOT EXISTS (
-                    SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.issue = r.issue
+                    SELECT 1 FROM runs later WHERE later.repo = r.repo AND later.{ic} = r.{ic}
                       AND later.kind = 'pipeline' AND {WHOLE_RUN} AND {LIVE_RUN}
                       AND (later.started, later.{k}) > (r.started, r.{k})))) ORDER BY r.started DESC, r.{k} DESC
         """, (DRAFT_READY, questions))]  # noqa: S608
@@ -342,7 +371,7 @@ def environment_holds(repo: str) -> list[dict]:
                     OR (released = 1 AND released_at IS NULL AND retry_id IS NOT NULL)))
             ORDER BY started, id
         """, (repo,))  # noqa: S608
-        holds = (_restore_legacy_owner_review(dict(row), repo, row["issue"], row["id"]) for row in rows)
+        holds = (_restore_legacy_owner_review(run_row(row), repo, run_row(row)["issue"], row["id"]) for row in rows)
         return [hold for hold in holds if not hold["released"] or hold["release_state"] == "owner-review"]
 
 
@@ -362,15 +391,17 @@ def save_environment_hold(run_id: str, prs: list[tuple[str, int, str, str]]) -> 
 
 def held_environment_branch(repo: str, issue: str) -> str:
     with reader() as c:
+        ic = issue_col(c, "r")
         row = c.execute(f"SELECT r.branch FROM environment_holds h JOIN runs r ON h.run_id = r.id "  # noqa: S608
-                        "WHERE r.repo = ? AND r.issue = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0 "
-                        f"ORDER BY {seq_col(c, 'r')} DESC LIMIT 1", (repo, issue)).fetchone()
+                        f"WHERE r.repo = ? AND {ic} = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0 "
+                        f"ORDER BY {seq_col(c, 'r')} DESC LIMIT 1", (repo, str(issue))).fetchone()
     return (row["branch"] or "") if row else ""
 
 
 def environment_hold(run_id: str) -> dict:
     with reader() as c:
-        row = c.execute(f"SELECT h.run_id, h.waits, r.repo, r.issue, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE h.run_id = ?",
+        ic = issue_col(c, "r")
+        row = c.execute(f"SELECT h.run_id, h.waits, r.repo, {ic} AS issue, {HOLD_LIFECYCLE} {HOLD_LINKS} WHERE h.run_id = ?",  # noqa: S608
                         (run_id,)).fetchone()
         if row is None:
             return {}
@@ -409,10 +440,12 @@ def end_environment_owner_review(run_id: str) -> None:
 
 def environment_waits(repo: str, issue: str) -> list[tuple[str, int]]:
     with reader() as c:
+        ic = issue_col(c, "r")
         return [(r[0], r[1]) for r in c.execute(
-            "SELECT DISTINCT json_extract(w.value, '$[0]'), json_extract(w.value, '$[1]') "
+            "SELECT DISTINCT json_extract(w.value, '$[0]'), json_extract(w.value, '$[1]') "  # noqa: S608
             "FROM environment_holds h JOIN runs r ON h.run_id = r.id, json_each(h.waits) w "
-            "WHERE r.repo = ? AND r.issue = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0", (repo, issue))]
+            f"WHERE r.repo = ? AND {ic} = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0",
+            (repo, str(issue)))]
 
 
 def environment_retry(run_id: str) -> bool:
@@ -458,7 +491,7 @@ def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None,
 def run_get(run_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        return dict(r) if r else None
+        return run_row(r) if r else None
 
 
 def save_report(run_id: str, report: dict, connect=db) -> None:
@@ -725,12 +758,12 @@ def loop_spent_since(since: str, loop: str | None = None, local_providers=()) ->
 
 def runs_marked_running(connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
+        return [run_row(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
 def runs_queued(connect=reader) -> list[dict]:
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'queued' ORDER BY started")]
+        return [run_row(r) for r in c.execute("SELECT * FROM runs WHERE status = 'queued' ORDER BY started")]
 
 
 def live_chat_run(chat_id: int, connect=reader) -> dict | None:
@@ -740,7 +773,7 @@ def live_chat_run(chat_id: int, connect=reader) -> dict | None:
             f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1",
             (f"%-chat-{chat_id}",),
         ).fetchone()
-        return dict(r) if r else None
+        return run_row(r) if r else None
 
 
 def ticket_runs(repo: str | int, issue: int | str | None = None, limit: int = 10, connect=reader, whole: bool = False,
@@ -754,17 +787,18 @@ def ticket_runs(repo: str | int, issue: int | str | None = None, limit: int = 10
     with connect() as c:
         tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
         if tnum is not None:
-            return [dict(r) for r in c.execute(
+            return [run_row(r) for r in c.execute(
                 f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? {extra}"  # noqa: S608
                 f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?",
                 (tnum, limit),
             )]
         if repo_name is None:
             return []
-        return [dict(r) for r in c.execute(
-            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? {extra}"  # noqa: S608
+        ic = issue_col(c)
+        return [run_row(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? {extra}"  # noqa: S608
             f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?",
-            (repo_name, raw_issue, limit),
+            (repo_name, str(raw_issue), limit),
         )]
 
 
@@ -794,10 +828,11 @@ def failed_ticket_runs_since(repo: str | int, issue: int | str | None, since: st
             )]
         if repo_name is None:
             return []
+        ic = issue_col(c)
         return [dict(r) for r in c.execute(
-            "SELECT failure FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+            f"SELECT failure FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? "  # noqa: S608
             "AND status = 'failed' AND finished > ?",
-            (repo_name, raw_issue, since_val),
+            (repo_name, str(raw_issue), since_val),
         )]
 
 
@@ -870,25 +905,28 @@ def ticket_runs_marked_running(repo: str | int, issue: int | str | None = None, 
     with connect() as c:
         tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
         if tnum is not None:
-            return [dict(r) for r in c.execute(
+            return [run_row(r) for r in c.execute(
                 f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? "  # noqa: S608
                 f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
                 (tnum,),
             )]
         if repo_name is None:
             return []
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
-                                           f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
-                                           (repo_name, raw_issue))]
+        ic = issue_col(c)
+        return [run_row(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? "  # noqa: S608
+                                              f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
+                                              (repo_name, str(raw_issue)))]
 
 
 def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
     with connect() as c:
+        ic_r = issue_col(c, "r")
+        ic = issue_col(c)
         labelled = [dict(r) for r in c.execute(
-            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "  # noqa: S608
+            f"SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, {ic_r} AS issue FROM steps "  # noqa: S608
             "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
             "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
-        held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
+        held = c.execute(f"SELECT repo, {ic} AS issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "  # noqa: S608
                          "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
     assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
                 for r in held for role, item in json_dict(r["ab_held"]).items()
@@ -915,14 +953,16 @@ def ticket_runs_since(repo: str | int, issue: int | str | None, since: str | Non
     with connect() as c:
         tnum, repo_name, raw_issue = _resolve_task_target(c, target_repo, target_issue)
         if tnum is not None:
-            return [dict(r) for r in c.execute(
+            return [run_row(r) for r in c.execute(
                 "SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? AND started >= ? ORDER BY started",
                 (tnum, since_val),
             )]
         if repo_name is None:
             return []
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND started >= ? ORDER BY started", (repo_name, raw_issue, since_val))]
+        ic = issue_col(c)
+        return [run_row(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? "  # noqa: S608
+            "AND started >= ? ORDER BY started", (repo_name, str(raw_issue), since_val))]
 
 
 def later_run(repo: str | int, issue: int | str | None, run_id: str | None = None, connect=reader, *, live: bool = False,
@@ -943,23 +983,25 @@ def later_run(repo: str | int, issue: int | str | None, run_id: str | None = Non
                           + ("AND id = ? " if candidate else "")
                           + f"AND {k} > (SELECT {k} FROM runs WHERE id = ?) ORDER BY {k} LIMIT 1",  # noqa: S608
                           (tnum, *([candidate] if candidate else []), target_run_id)).fetchone()
-            return dict(r) if r else None
+            return run_row(r) if r else None
         if repo_name is None:
             return None
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "  # noqa: S608
+        ic = issue_col(c)
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? AND {WHOLE_RUN} "  # noqa: S608
                       + (f"AND {LIVE_RUN} " if live else "")
                       + ("AND id = ? " if candidate else "")
                       + f"AND {k} > (SELECT {k} FROM runs WHERE id = ?) ORDER BY {k} LIMIT 1",  # noqa: S608
-                      (repo_name, raw_issue, *([candidate] if candidate else []), target_run_id)).fetchone()
-        return dict(r) if r else None
+                      (repo_name, str(raw_issue), *([candidate] if candidate else []), target_run_id)).fetchone()
+        return run_row(r) if r else None
 
 
 def interrupted_tickets(repo: str) -> list[str]:
     with reader() as c:
         k = seq_col(c)
         if has_task_identity(c):
+            ticket_expr = "issue_key" if not has_issue_column(c) else "COALESCE(issue_key, CAST(issue AS TEXT))"
             rows = c.execute(
-                f"SELECT COALESCE(issue_key, CAST(issue AS TEXT)) AS ticket, status FROM runs "  # noqa: S608
+                f"SELECT {ticket_expr} AS ticket, status FROM runs "  # noqa: S608
                 f"WHERE kind = 'pipeline' AND repo = ? AND task_id IS NOT NULL AND {WHOLE_RUN} "
                 f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
                 f"AND r2.task_id = runs.task_id AND {WHOLE_RUN} AND {LIVE_RUN} "
@@ -969,9 +1011,10 @@ def interrupted_tickets(repo: str) -> list[str]:
                 (repo,),
             ).fetchall()
             return [str(r["ticket"]) for r in rows if r["status"] == "interrupted"]
-        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
+        ic = issue_col(c)
+        rows = c.execute(f"SELECT {ic} AS issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
                          f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
+                         f"AND r2.repo = runs.repo AND r2.{ic} = runs.{ic} AND {WHOLE_RUN} AND {LIVE_RUN} "
                          f"AND r2.status != 'queued' "
                          f"ORDER BY r2.started DESC, r2.{k} DESC LIMIT 1) "
                          f"ORDER BY started, {k}", (repo,))
@@ -992,14 +1035,15 @@ def running_run(repo: str | int, issue: int | str | None = None, connect=reader)
                           f"AND status IN ('running', 'queued') "
                           f"ORDER BY status = 'running' DESC, started DESC, {seq_col(c)} DESC LIMIT 1",
                           (tnum,)).fetchone()
-            return dict(r) if r else None
+            return run_row(r) if r else None
         if repo_name is None:
             return None
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
+        ic = issue_col(c)
+        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? "  # noqa: S608
                       f"AND status IN ('running', 'queued') "
                       f"ORDER BY status = 'running' DESC, started DESC, {seq_col(c)} DESC LIMIT 1",
-                      (repo_name, raw_issue)).fetchone()
-        return dict(r) if r else None
+                      (repo_name, str(raw_issue))).fetchone()
+        return run_row(r) if r else None
 
 
 def pending_label(repo: str, issue: int | str) -> str:
@@ -1007,7 +1051,8 @@ def pending_label(repo: str, issue: int | str) -> str:
     if raw.isascii() and raw.isdigit():
         return ""
     with reader() as c:
-        r = c.execute(f"SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
+        ic = issue_col(c)
+        r = c.execute(f"SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND {ic} = ? "  # noqa: S608
                       f"AND label_pending IS NOT NULL ORDER BY started DESC, {seq_col(c)} DESC LIMIT 1",
                       (repo, raw)).fetchone()
         return r["label_pending"] if r else ""
@@ -1023,8 +1068,9 @@ def issue_running(repo: str | int, issue: int | str | None = None) -> bool:
             ).fetchone() is not None
         if repo_name is None:
             return False
-        return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status IN ('running', 'queued') LIMIT 1",
-                         (repo_name, raw_issue)).fetchone() is not None
+        ic = issue_col(c)
+        return c.execute(f"SELECT 1 FROM runs WHERE repo = ? AND {ic} = ? AND status IN ('running', 'queued') LIMIT 1",  # noqa: S608
+                         (repo_name, str(raw_issue))).fetchone() is not None
 
 
 def pin_record(run_id: str, *, require_record_dir: Callable[[], bool] | None = None) -> bool:
@@ -1070,7 +1116,7 @@ def running_runs(conn):
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
         return []
     conn.row_factory = sqlite3.Row
-    return [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
+    return [run_row(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
 
 
 def _sync_inbox_runs(c) -> None:
@@ -1501,9 +1547,9 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
 
 def finished_runs_since(since: str, until: str = "9999") -> list[dict]:
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status NOT IN ('running', 'queued') "
-                                           "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
-                                           "ORDER BY started", (since, until))]
+        return [run_row(r) for r in c.execute("SELECT * FROM runs WHERE status NOT IN ('running', 'queued') "
+                                              "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
+                                              "ORDER BY started", (since, until))]
 
 
 def purge_queue(connect=reader) -> list[dict]:

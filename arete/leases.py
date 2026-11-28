@@ -310,8 +310,10 @@ def lapse(
             updated = dict(c.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone())
             emit_changed(c, updated)
             if updated["run_id"]:
+                from .store import runs as run_store
+
                 run_row = c.execute("SELECT * FROM runs WHERE id = ?", (updated["run_id"],)).fetchone()
                 if run_row is not None and run_row["status"] == "running":
-                    record.interrupt(dict(run_row))
+                    record.interrupt(run_store.run_row(run_row))
             lapsed.append(int(updated["id"]))
     return lapsed

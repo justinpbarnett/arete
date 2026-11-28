@@ -292,6 +292,11 @@ class CliRouteFallbackTests(unittest.TestCase):
             "GET /api/chats/1/sessions/r1/report": {}, "POST /api/chats/1/sessions/r1/stop": {},
             source_list: {"seq": seq, "sources": []},
             source_poll: {"seq": seq, "ok": True, "dry_run": False, "op": "r1"},
+            "POST /api/v1/derived/band/demo/recompute": {
+                "seq": seq, "data": {"id": "demo", "band": {}}, "event_seq": None,
+                "subject": "line:demo", "ver": 1, "vers": {"line:demo": 1}, "replayed": False,
+                "changed": False, "source_mark": "0" * 64,
+            },
         }
         canonical = {
             "GET /api/tasks": "GET /api/v1/tasks",
@@ -311,7 +316,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         }
         after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
                  "session start --attach work": [info, feed, info, feed, info]}
-        values = {"task": "t-1234", "run": "r1", "session": "r1", "id": 1, "step": "build", "name": "example", "chat": 1, "source": "pipeline"}
+        values = {"task": "t-1234", "run": "r1", "session": "r1", "id": 1, "step": "build", "name": "example", "chat": 1, "line": "demo", "source": "pipeline"}
         command_values = {
             "webhook example": dict(values, id="example"),
             "webhook example --rotate": dict(values, loop="example"),
@@ -380,7 +385,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                         with self.subTest(historical=historical):
                             seen.clear()
                             result = self.cli(command)
-                            if primary in config_replies or primary in (webhook, rotate, source_list, source_poll):
+                            if primary in config_replies or primary in (webhook, rotate, source_list, source_poll, "POST /api/v1/derived/band/demo/recompute"):
                                 code, lines, err = result
                                 self.assertEqual((code, len(lines), err), (1, 1, ""), result)
                                 self.assertEqual(json.loads(lines[0])["code"], "unknown_route")

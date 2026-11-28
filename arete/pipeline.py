@@ -801,6 +801,7 @@ class Run(AgentRun):
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
     def _mirror_task_state(self, status: str, *, leaving: bool = False) -> None:
+        from . import sync as sync_mod
         from .store import db as foundation
         from .store import tasks as task_store
 
@@ -808,7 +809,11 @@ class Run(AgentRun):
         if tnum is None:
             try:
                 with foundation.reader() as c:
-                    tnum = task_store.TaskStore.find_task_num(c, self.repo, self.tid)
+                    run_row = c.execute("SELECT task_id FROM runs WHERE id = ?", (self.id,)).fetchone()
+                    if run_row is not None and run_row["task_id"] is not None:
+                        tnum = int(run_row["task_id"])
+                    else:
+                        tnum = task_store.TaskStore.find_task_num(c, self.repo, self.tid)
             except Exception:
                 tnum = None
         if tnum is None:
@@ -816,7 +821,7 @@ class Run(AgentRun):
         if leaving:
             task_store.task_set_state(tnum, "ready", 0, from_states=(status,))
         else:
-            canon, fault = config.canonical_task_state(status)
+            canon, fault = sync_mod.map_legacy_state(status)
             task_store.task_set_state(tnum, canon, fault)
 
     def enter(self, status: str) -> None:
@@ -853,9 +858,16 @@ class Run(AgentRun):
             if moved := self.tracker.move(self.tid, status):
                 self.log(f"tracker: {util.first_line(moved, 300)}")
             return
-        labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id)
-        if not isinstance(self.tracker, tracker.LocalTracker):
-            self._mirror_task_state(status)
+        if isinstance(self.tracker, tracker.JiraTracker):
+            from .store import db as foundation
+
+            with foundation.tx() as c:
+                labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id, c=c)
+                self._mirror_task_state(status)
+        else:
+            labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id)
+            if not isinstance(self.tracker, tracker.LocalTracker):
+                self._mirror_task_state(status)
         if not isinstance(self.tracker, tracker.JiraTracker):
             record.note(self.id, label_pending=status if labeled else "")
         from . import release_proof
@@ -901,6 +913,14 @@ class Run(AgentRun):
                 )
                 self._mirror_task_state(status, leaving=True)
             self.log(f"drafted OB-{item_id}")
+            return
+        if isinstance(self.tracker, tracker.JiraTracker):
+            from .store import db as foundation
+
+            with foundation.tx() as c:
+                if err := self.tracker.label(self.tid, remove=[status], run_id=self.id, c=c):
+                    self.log(f"tracker: {util.first_line(err, 300)}")
+                self._mirror_task_state(status, leaving=True)
             return
         if err := self.tracker.label(self.tid, remove=[status], run_id=self.id):
             self.log(f"tracker: {util.first_line(err, 300)}")

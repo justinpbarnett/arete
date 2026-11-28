@@ -230,14 +230,8 @@ def own_move(r: dict, m: tracker.Moved) -> None:
     if not (m.before and m.after):
         return
     with util.lock(triage.BOARD_LOCK, wait=True):
-        row = triage.board_row(r["ref"])
-        if not row or triage.moment(row["updated"]) != triage.moment(m.before):
-            return
-        report = insights_store.research_get(r["ref"])
-        triage_store.triage_put({**row, "updated": m.after})
-        if report and report["updated"] == row["updated"]:
-            insights_store.research_keep(r["ref"], updated=m.after)
-    r["updated"] = m.after
+        triage_store.copy_verdict_after_move(r["ref"], m.before, m.after)
+    r["updated"] = triage_store.iso_updated(m.after)
 
 
 def wanted(r: dict, report: dict) -> str:
@@ -625,13 +619,7 @@ def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
     summary = " ".join(str(answer.get("summary") or "").split())
     if h:
         titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
-        contents = f"{titled.rstrip()}\n"
         report = TITLE_LINE.sub("", titled, count=1)
-    else:
-        contents = (f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
-                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{report}\n")
-    report_file(ref).write_text(contents)
-    if h:
         try:
             filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
         except RuntimeError as e:
@@ -641,6 +629,15 @@ def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
             return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
     insights_store.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
                        ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+    stored_row = insights_store.research_get(ref)
+    blob_report = stored_row["report"] if stored_row and stored_row.get("report") else report
+    if h:
+        titled_blob = blob_report if TITLE_LINE.match(blob_report) else f"# {r['title']}\n\n{blob_report}"
+        contents = f"{titled_blob.rstrip()}\n"
+    else:
+        contents = (f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
+                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{blob_report}\n")
+    report_file(ref).write_text(contents)
     if h:
         ok, why = file_in_home(cfg, h, r)
         outcome, why = DONE if ok else FAILED, f"{why} ({util.paid_note(paid)})"

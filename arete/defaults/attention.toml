@@ -1,0 +1,8 @@
+newPer10Min = 1
+floodBurst = 10
+standingLimit = 10
+standingAim = 5
+highOnScreen = 1
+shelvedLimit = 30
+demoteAfterShelves = 3
+needsYouPerDay = 6

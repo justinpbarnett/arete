@@ -288,10 +288,11 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
 
         # Load remaining runs for folder & record phases.
         rec_col = "records_purged" if has_records_purged else "NULL AS records_purged"
+        ic = runs.issue_col(c)
         all_runs = [
             dict(r)
             for r in c.execute(
-                f"SELECT id, kind, repo, issue, status, started, finished, files_purged, {rec_col} FROM runs"  # noqa: S608
+                f"SELECT id, kind, repo, {ic} AS issue, status, started, finished, files_purged, {rec_col} FROM runs"  # noqa: S608
             ).fetchall()
         ]
         all_ids = {r["id"] for r in all_runs}

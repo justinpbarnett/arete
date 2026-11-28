@@ -15,15 +15,16 @@ from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
 from . import (
-    IMPORTED_NS, __version__, api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo,
-    contract, control, credential_http, devices, drafts, events, inbox, leases, loop_run, loops, outbox, paths, pi,
-    record, refusals, secretstore, settings, sources, stats, tasks, ticket_media, tool_events, triage, util, webhooks,
-    webpush,
+    IMPORTED_NS, __version__, api_http, attention, bands, board, codebase, config, configcheck, configitems,
+    configkinds, configrepo, contract, control, credential_http, devices, drafts, events, floor, inbox, leases,
+    loop_run, loops, outbox, paths, pi, record, refusals, secretstore, settings, sources, stats, tasks, ticket_media,
+    tool_events, triage, util, webhooks, webpush,
 )
 from . import principals as actor_principals
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import devices as device_store
+from .store import idempotency as claims_store
 from .store import sources as source_store
 from .store import tasks as task_store
 from .store import tokens, writes
@@ -45,7 +46,7 @@ def prefer_wait(handler, *, default: float = 2.0, maximum: float = 10.0) -> floa
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
-         "board": "Board"}
+         "board": "Board", "floor": "Floor", "shell": "Shell"}
 BOARD_STATES = ("needs-you", "needs-info", "failed", "running", "review", "pr", "ready", "todo", "intake", "done", "closed")
 
 
@@ -64,6 +65,10 @@ def run_object(row):
 
 
 def serialize(value, schema):
+    if isinstance(value, dict) and "anyOf" in schema:
+        for branch in schema["anyOf"]:
+            if isinstance(branch, dict) and "properties" in branch:
+                return serialize(value, branch)
     if isinstance(value, dict) and "properties" in schema:
         additional = schema.get("additionalProperties")
         return {k: serialize(v, schema["properties"].get(k, additional)) for k, v in value.items()
@@ -109,6 +114,12 @@ def meta():
 
 
 def projection(name, identity="", *, project=None, include_archived=False):
+    if name == "shell":
+        with foundation.reader() as conn:
+            return floor.shell_screen(conn)
+    if name == "floor":
+        with foundation.reader() as conn:
+            return floor.floor_screen(conn, project=project, include_archived=bool(include_archived))
     if name == "board":
         from . import lines as lines_mod
 
@@ -129,11 +140,19 @@ def projection(name, identity="", *, project=None, include_archived=False):
                 project=shown_project,
                 include_archived=bool(include_archived),
             )
+            andon_data = attention.andon(conn)
+            ny = attention.needs_you(conn)
+        task_ny = ny["tasks"]
+        for row in rows:
+            ids = list(task_ny.get(row["id"], ()))
+            row["needs_you"] = len(ids)
+            row["needs_you_ids"] = ids
         out = {
             "tasks": rows,
             "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
             "running_ids": running_ids,
             "lines": board_lines,
+            "andon": andon_data,
         }
         if saved_view is not None:
             out["saved_view"] = saved_view
@@ -163,8 +182,11 @@ def resources(name, values):
     if name == "view":
         return lines_mod.list_views(project=values.get("project"))
     if name == "step":
-        needed(runs.run_get(values["run"]), values["run"])
+        run_row = needed(runs.run_get(values["run"]), values["run"])
         inputs_by_step = runs.step_inputs_by_run(values["run"])
+        with foundation.reader() as rconn:
+            line_band = bands.line_band_for_run(rconn, run_row)
+            step_ny = attention.needs_you(rconn)["steps"]
         snapshots: dict[str, dict | None] = {}
         out = []
         for r in runs.steps(values["run"]):
@@ -172,7 +194,8 @@ def resources(name, values):
             if snap_sha and snap_sha not in snapshots:
                 snapshots[snap_sha] = runs.settings_snapshot(snap_sha)
             step_inputs = inputs_by_step.get(r["id"])
-            out.append({
+            node_name = r.get("node") or r["step"] or ""
+            entry = {
                 "id": r["id"], "run_id": values["run"], "name": r["step"], "model": r["model"] or "",
                 "runner": r["runner"] or "", "cost_usd": r["cost_usd"] or 0, "seconds": r["seconds"] or 0,
                 "settings_sha": snap_sha,
@@ -181,7 +204,7 @@ def resources(name, values):
                 "prompt_version": r.get("prompt_version") or None,
                 "prompt_level": r.get("prompt_level") or None,
                 "schema_version": r.get("schema_version") or None,
-                "node": r.get("node") or r["step"] or "",
+                "node": node_name,
                 "try": int(r.get("try") or 0),
                 "status": r.get("status") or ("done" if r.get("ok") else "fault"),
                 "queued_at": r.get("queued_at") or r.get("ts"),
@@ -192,7 +215,11 @@ def resources(name, values):
                 "version": int(r.get("version") or 1),
                 "runner_version": r.get("runner_version"),
                 "unread": int(r.get("unread") or 0),
-            })
+                "needs_you": int(step_ny.get((values["run"], node_name), 0)),
+            }
+            if node_name in line_band:
+                entry["band"] = list(line_band[node_name])
+            out.append(entry)
         return out
     if name == "loop":
         return [{"id": r["name"], "enabled": r["enabled"], "detail": r} for r in control.loop_views()]
@@ -418,6 +445,23 @@ def read(name, values, handler, *, conn=None):
         return {"events": inbox.history(values["item"])}
     if name == "triage_screen.get":
         return inbox.triage_screen()
+    if name == "shell_screen.get":
+        with foundation.reader() as c:
+            return floor.shell_screen(c)
+    if name == "floor_screen.get":
+        with foundation.reader() as c:
+            return floor.floor_screen(
+                c,
+                project=values.get("project"),
+                include_archived=bool(values.get("include_archived", False)),
+            )
+    if name == "board_screen.get":
+        return projection(
+            "board",
+            values.get("id", ""),
+            project=values.get("project"),
+            include_archived=bool(values.get("include_archived", False)),
+        )
     if name == "push.list":
         return {"subscriptions": webpush.list_v1()}
     if name == "device.list":
@@ -450,6 +494,8 @@ def read(name, values, handler, *, conn=None):
         lease_num = leases.parse_id(values["lease"])
         row = device_store.lease_get(lease_num) if lease_num is not None else None
         return {"lease": leases.view(needed(row, values["lease"]))}
+    if name == "run.steps":
+        return {"steps": [serialize(row, contract.RESOURCE["step"]) for row in resources("step", values)]}
     if name == "run.sandbox":
         run_id = values["run"]
         run_row = needed(runs.run_get(run_id), run_id)
@@ -507,12 +553,12 @@ def read(name, values, handler, *, conn=None):
             needed(task_store.task_get(values.get("id", "")), values.get("id", ""))
         view_data = (
             projection(
-                "board",
+                view,
                 values.get("id", ""),
                 project=values.get("project"),
                 include_archived=bool(values.get("include_archived", False)),
             )
-            if view == "board"
+            if view in ("board", "floor")
             else projection(view, values.get("id", ""))
         )
         return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(), "view": view_data}
@@ -645,6 +691,7 @@ def read(name, values, handler, *, conn=None):
         return {
             "ref": serialize(ref_row, contract.REF),
             "tasks": [serialize(t, contract.REF_TASK_LINK) for t in linked],
+            "fields": [serialize(f, contract.REF_FIELD) for f in ref_row.get("fields", [])],
         }
     if name == "ref.history":
         with foundation.reader() as c:
@@ -726,8 +773,20 @@ def read(name, values, handler, *, conn=None):
     if action == "get" and resource == "run":
         proj = projection("run", identity)
         run_view = run_object(proj["run"])
-        steps = [serialize(s, contract.RUN_STEP_SUMMARY) for s in proj.get("steps", ())]
-        return {"run": run_view, "steps": steps}
+        raw_steps = runs.steps(identity)
+        with foundation.reader() as c:
+            line_band = bands.line_band_for_run(c, proj["run"])
+            step_ny = attention.needs_you(c)["steps"]
+        eta, eta_partial = bands.run_eta(raw_steps, line_band)
+        steps = []
+        for s in proj.get("steps", ()):
+            entry = serialize(s, contract.RUN_STEP_SUMMARY)
+            node_name = entry.get("node") or ""
+            entry["needs_you"] = int(step_ny.get((identity, node_name), 0))
+            if node_name in line_band:
+                entry["band"] = list(line_band[node_name])
+            steps.append(entry)
+        return {"run": run_view, "steps": steps, "eta": eta, "eta_partial": eta_partial}
     if action == "get" and resource == "task":
         task = needed(task_store.task_get(identity), identity)
         return {"task": serialize(task, contract.TASK)}
@@ -786,7 +845,14 @@ def read_config_with_validator(verb, values, *, conn=None):
     if conn is None and verb == "read" and kind in ("prompt", "adw"):
         with foundation.one_read() as read_conn:
             return read_config_with_validator(verb, values, conn=read_conn)
-    found = configitems.item(kind, values["name"], level=values.get("level"), conn=conn)
+    historical = verb == "versions" or (
+        verb == "read" and (values.get("version") is not None or values.get("from") not in (None, "working"))
+    )
+    found = (
+        configitems.item_or_historical(kind, values["name"], level=values.get("level"), conn=conn)
+        if historical
+        else configitems.item(kind, values["name"], level=values.get("level"), conn=conn)
+    )
     if verb == "read":
         item = configitems.read(found, version=values.get("version"), level=values.get("level"),
                                 from_ref=values.get("from"), file=values.get("file"), conn=conn)
@@ -843,7 +909,20 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
             return {"draft_id": draft_row["id"], "gate": "C", "check_report": report}
         return None
     if name == "config.rollback":
-        found = configitems.item(values["kind"], values["name"])
+        found = configitems.item_or_historical(values["kind"], values["name"])
+        if configitems.is_tombstone_selector(found, str(values["to"])):
+            raise contract.Problem(
+                "validation",
+                f"Version {values['to']} of {values['kind']}/{values['name']} is a deletion tombstone and cannot be rolled back to as file bytes.",
+            )
+        live_row = drafts._current_ver_row(values["kind"], values["name"], found["path"])
+        live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        if not drafts._matches_base_version(values["base_version"], live_ver, live_row):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {values['kind']}/{values['name']} is at version {live_ver}, not {values['base_version']}.",
+                current={"kind": values["kind"], "name": values["name"], "version": live_ver},
+            )
         target = configitems.read(found, version=str(values["to"]))
         content = target["content"]
         if not isinstance(content, str):
@@ -855,6 +934,12 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
         )
         if report["ok"] and report["gate"] == "C":
             return {"kind": values["kind"], "name": values["name"], "to": values["to"],
+                    "gate": "C", "check_report": report}
+        return None
+    if name == "config.delete":
+        _, _, report = drafts.inspect_delete(values["kind"], values["name"], values["base_version"], actor, root=root)
+        if report["gate"] == "C":
+            return {"kind": values["kind"], "name": values["name"], "delete": True,
                     "gate": "C", "check_report": report}
         return None
     if name == "settings.update":
@@ -962,19 +1047,25 @@ def dispatch(handler, op, path_values, query):
                 return upload_inbox_evidence(handler, op, identity)
             if name == "blob.put":
                 return put_blob(handler, op, identity)
-            if (name in ("config.activate", "config.rollback", "settings.update")
+            if (name in ("config.activate", "config.rollback", "config.delete", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values, handler)
-                if extra_detail is not None:
-                    if handler.credential is None or "Idempotency-Key" not in handler.headers:
-                        credential_http.require_presence(handler.credential)
-                    return inbox.defer_presence(
-                        handler,
-                        op,
-                        values,
-                        path_values,
-                        extra_detail=extra_detail,
-                    )
+                idem_key = handler.headers.get("Idempotency-Key")
+                actor_claim = claims_store.lookup(handler.actor, idem_key) if idem_key else None
+                if actor_claim is not None and actor_claim["status"]:
+                    return inbox.defer_presence(handler, op, values, path_values)
+                person_claim = claims_store.lookup(handler.person, idem_key) if idem_key else None
+                if person_claim is None or not person_claim["status"]:
+                    extra_detail = _needs_config_presence(name, values, handler)
+                    if extra_detail is not None:
+                        if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                            credential_http.require_presence(handler.credential)
+                        return inbox.defer_presence(
+                            handler,
+                            op,
+                            values,
+                            path_values,
+                            extra_detail=extra_detail,
+                        )
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])
@@ -1012,14 +1103,16 @@ def dispatch(handler, op, path_values, query):
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
     "device.probe", "source.poll", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
-    "task.create", "task.update", "task.run", "session.start", "run.resume", "run.repair", "run.step",
+    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair",
+    "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
-    "config.draft", "config.check", "config.activate", "config.rollback", "config.try",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
     "config.ask", "config.promote", "draft.discard",
     "project.create", "project.update", "project.restore",
     "line.create", "line.update", "line.restore", "line.delete",
     "view.create", "view.update", "view.restore",
+    "derived.recompute",
 ))
 
 
@@ -1170,6 +1263,21 @@ def mutation(name, values, handler):
             )
         except drafts.PresenceRequired:
             raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.delete":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        try:
+            result = drafts.delete_item(
+                values["kind"],
+                values["name"],
+                values["base_version"],
+                _config_actor(handler),
+                idem=key,
+                why=str(values.get("why") or ""),
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
     elif name == "config.try":
         result = drafts.try_draft(
             values["kind"],
@@ -1277,6 +1385,10 @@ def mutation(name, values, handler):
             raise contract.Problem("validation", str(error)) from None
         result = {"comment": serialize(needed(updated, raw_cid), contract.TASK_COMMENT)}
     elif name == "task_ref.link":
+        from contextlib import suppress
+
+        from . import sync as sync_mod
+
         with foundation.tx() as c:
             try:
                 linked = task_store.TaskStore.link_ref(c, values["task"], values, values, principals.current())
@@ -1288,7 +1400,44 @@ def mutation(name, values, handler):
                 raise contract.Problem("not_found", str(error)) from None
             except ValueError as error:
                 raise contract.Problem("validation", str(error)) from None
+        if ref_row is not None and not ref_row.get("fetched_at") and ref_row.get("system") in ("github", "jira"):
+            with suppress(Exception):
+                fetched = sync_mod.fetch(ref_row["num"])
+                if fetched is not None:
+                    ref_row = fetched
         result = {"task_ref": serialize(linked, contract.TASK_REF), "ref": serialize(ref_row, contract.REF)}
+    elif name == "task.sync":
+        from . import sync as sync_mod
+        from . import tracker as tracker_mod
+
+        task_row = needed(task_store.task_get(values["task"]), values["task"])
+        primary_ref = task_row.get("primary_ref")
+        if not primary_ref:
+            raise contract.Problem("invalid_state", f"Task {task_row['id']} has no primary ref")
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        future = sync_mod.fetch_async(primary_ref["num"], idem=key)
+        try:
+            synced_ref = future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+            result = {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "task": task_row["id"],
+            }
+        except tracker_mod.ERRORS as error:
+            raise contract.Problem("upstream_failed", str(error)) from None
+        except LookupError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        else:
+            updated_task = needed(task_store.task_get(task_row["id"]), task_row["id"])
+            result = {
+                "task": serialize(updated_task, contract.TASK),
+                "ref": serialize(synced_ref, contract.REF),
+                "fields": [serialize(f, contract.REF_FIELD) for f in synced_ref.get("fields", [])],
+            }
     elif name == "task_ref.update":
         with foundation.tx() as c:
             try:
@@ -1530,6 +1679,8 @@ def mutation(name, values, handler):
     elif name == "inbox.shelve":
         result = {"item": inbox.shelve(values["item"], base_version=values["base_version"],
                                        reason=values["reason"], until=values.get("until"))}
+    elif name == "inbox.reopen":
+        result = {"item": inbox.reopen(values["item"], base_version=values["base_version"])}
     elif name == "inbox.resolve":
         result = inbox.resolve(
             values["item"],
@@ -1765,6 +1916,25 @@ def mutation(name, values, handler):
                 blockers=error.blockers,
                 retry_guidance=error.retry_guidance,
             ) from None
+        if handler is not None and result.get("event_seq"):
+            handler.write_receipt = {
+                "event_seq": result["event_seq"],
+                "subject": result["subject"],
+                "ver": result["ver"],
+            }
+    elif name == "derived.recompute":
+        from . import lines as lines_mod
+
+        try:
+            result = bands.recompute(values["line"], values["base_version"])
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("validation", str(error)) from None
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except bands.GateRefused as error:
+            raise contract.Problem("gate_refused", str(error)) from None
+        except bands.SourceMoved as error:
+            raise contract.Problem("conflict", str(error)) from None
         if handler is not None and result.get("event_seq"):
             handler.write_receipt = {
                 "event_seq": result["event_seq"],

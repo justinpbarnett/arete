@@ -5,7 +5,15 @@
     "settle": {"type": "boolean"},
     "expire_days": {"type": "number"},
     "remind_hours": {"type": "number"},
-    "push_contact": {"type": "string"}
+    "push_contact": {"type": "string"},
+    "newPer10Min": {"type": "integer", "minimum": 1},
+    "floodBurst": {"type": "integer", "minimum": 1},
+    "standingLimit": {"type": "integer", "minimum": 1},
+    "standingAim": {"type": "integer", "minimum": 1},
+    "highOnScreen": {"type": "integer", "minimum": 1},
+    "shelvedLimit": {"type": "integer", "minimum": 1},
+    "demoteAfterShelves": {"type": "integer", "minimum": 1},
+    "needsYouPerDay": {"type": "integer", "minimum": 1}
   },
   "additionalProperties": false
 }

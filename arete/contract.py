@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 32
+MINOR = 35
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -36,6 +36,15 @@ def mapping(values):
     return obj({}, [], values)
 
 
+REF_FIELD = obj({
+    "field": STRING,
+    "base": NULL_TEXT,
+    "remote": NULL_TEXT,
+    "remote_at": NULL_TEXT,
+    "remote_by": NULL_TEXT,
+    "owner": STRING,
+    "conflict": INTEGER,
+}, ["field", "base", "remote", "owner", "conflict"])
 REF = obj({
     "id": STRING,
     "system": {**STRING, "enum": ["github", "jira", "slack", "email", "meeting", "intake"]},
@@ -48,12 +57,17 @@ REF = obj({
     "facts": mapping(JSON),
     "run_id": NULL_TEXT,
     "remote_updated": NULL_TEXT,
+    "remote_actor": NULL_TEXT,
     "fetched_at": NULL_TEXT,
     "sync": {**STRING, "enum": ["local", "synced", "ahead", "behind", "conflict", "off"]},
+    "fields": array(REF_FIELD),
     "version": INTEGER,
     "created": STRING,
     "updated": STRING,
-})
+}, [
+    "id", "system", "kind", "key", "connector", "title", "url", "ext_state", "facts",
+    "run_id", "remote_updated", "fetched_at", "sync", "version", "created", "updated",
+])
 TASK_REF = obj({
     "id": INTEGER,
     "task": STRING,
@@ -122,6 +136,8 @@ TASK = obj({
     "refs": array(TASK_REF),
     "primary_ref": {"anyOf": [REF, {"type": "null"}]},
     "links": array(TASK_LINK),
+    "needs_you": INTEGER,
+    "needs_you_ids": array(STRING),
 }, _TASK_REQUIRED)
 RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
@@ -130,6 +146,7 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "task", "issue_key", "line")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id", "task_id")
+STEP_BAND = {**array(NUMBER), "minItems": 2, "maxItems": 2}
 RUN_STEP_SUMMARY = obj({
     "id": INTEGER,
     "node": STRING,
@@ -139,9 +156,12 @@ RUN_STEP_SUMMARY = obj({
     "model": STRING,
     "account": {"type": ["string", "null"]},
     "cost_usd": NUMBER,
+    "band": STEP_BAND,
+    "needs_you": INTEGER,
 }, ["node", "try", "status"])
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
-           **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
+           **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS},
+           "eta": NULL_TEXT, "eta_partial": BOOLEAN}, ["id", "status", "version"])
 RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
 RUN["properties"]["version"] = INTEGER
 FACTORY_STATE = obj({"enabled": BOOLEAN, "phase": STRING, "version": INTEGER, "actor": STRING, "changed": STRING,
@@ -240,7 +260,8 @@ RESOURCE = {
                  "node": STRING, "try": INTEGER, "status": STRING, "queued_at": NULL_TEXT,
                  "waiting_since": NULL_TEXT, "device": NULL_TEXT, "account": NULL_TEXT,
                  "chat_id": {"type": ["integer", "null"]}, "version": INTEGER,
-                 "runner_version": NULL_TEXT, "unread": INTEGER},
+                 "runner_version": NULL_TEXT, "unread": INTEGER,
+                 "band": STEP_BAND, "needs_you": INTEGER},
                 ["id", "run_id", "name", "model", "runner", "cost_usd", "seconds"]),
     "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
     "incident": obj({"id": STRING, "detail": INCIDENT}),
@@ -292,6 +313,12 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("outbox_missing", 501, "This instance has no outbox configured."),
     ("secret_internal", 409, "This secret is managed by its owning service."),
     ("already_resolved", 409, "This inbox item is already resolved."),
+    ("too_late", 409, "The ten-second window to reopen this inbox item has closed."),
+    ("already_sent", 409, "This approval was already sent and cannot be reopened."),
+    ("not_reversible", 409, "This inbox decision cannot be undone."),
+    ("already_open", 409, "Another open inbox item already exists for this subject."),
+    ("referenced", 409, "This config file is still referenced and cannot be deleted."),
+    ("engine_default", 409, "Engine default config files cannot be deleted."),
     ("still_missing", 409, "The required secret is still missing."),
     ("line_in_use", 409, "The line is still referenced or is the last active pipeline line."),
     ("incompatible_writers", 409, "Incompatible writers are still active; wait for them to drain or upgrade before retrying."),
@@ -319,10 +346,11 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else (
-        "task:write" if noun in ("comment", "task_ref", "task_link", "project", "line", "view") else f"{noun}:write"
+        "task:write" if noun in ("comment", "task_ref", "task_link", "project", "line", "view", "derived") else f"{noun}:write"
     )
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
-                       "secret_store_missing", "outbox_missing", "secret_internal", "already_resolved",
+                       "secret_store_missing", "outbox_missing", "secret_internal", "already_resolved", "too_late",
+                       "already_sent", "not_reversible", "already_open", "referenced", "engine_default",
                        "still_missing", "validation", "gate_refused", "presence_expired", "lease_fenced",
                        "lease_expired", "files_purged", "line_in_use", "incompatible_writers"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease", "source") and name != "session.end":
@@ -343,7 +371,7 @@ def sample(schema):
         return None if "null" in kind else sample({"type": kind[0]})
     if kind == "object":
         return {k: sample(v) for k, v in schema.get("properties", {}).items() if k in schema.get("required", [])}
-    return {"string": "example", "integer": 1, "number": 1, "boolean": True, "array": []}[kind]
+    return {"string": "example", "integer": 1, "number": 1, "boolean": True, "array": [], "null": None}[kind]
 
 
 INBOX_CONTINUE_DETAIL = obj({
@@ -447,6 +475,7 @@ for _error in ERRORS:
                 "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
                 "invalid_state": {"current": JSON},
+                "already_open": {"item": STRING}, "referenced": {"references": array(STRING)},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
                 "files_purged": {"purged_at": STRING},
@@ -608,7 +637,8 @@ for _name, _shape in RESOURCE.items():
         else obj(_selectors, list(_selectors))
     )
     _get_envelope = (
-        envelope({_name: _shape, "steps": array(RUN_STEP_SUMMARY)}, ["seq", _name])
+        envelope({_name: _shape, "steps": array(RUN_STEP_SUMMARY),
+                  "eta": NULL_TEXT, "eta_partial": BOOLEAN}, ["seq", _name])
         if _name == "run" else envelope({_name: _shape})
     )
     OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
@@ -710,6 +740,7 @@ CONFIG_DRAFT = obj({
     "created": STRING,
     "updated": STRING,
 })
+CONFIG_DELETE_DRAFT = obj({**CONFIG_DRAFT["properties"], "body": {"type": "null"}})
 CONFIG_BASE_VER = {"type": ["integer", "string"]}
 SECRET = obj({**dict.fromkeys(("subject", "name", "scope", "reference_kind"), STRING),
               **dict.fromkeys(("service", "fingerprint", "last_checked", "rotated"), NULL_TEXT),
@@ -810,6 +841,20 @@ OPERATIONS += [
                  obj({"draft": STRING, "reason": STRING}, ["draft"]),
                  {"draft": "CD-1"}, "POST", errors=("invalid_state",)),
      "scope": "config:draft"},
+    {**operation("config.delete", "config/{kind}/{name}",
+                 envelope({
+                     "draft": CONFIG_DELETE_DRAFT,
+                     "commit": STRING,
+                     "version": INTEGER,
+                     "tombstone": STRING,
+                     "previous_version": INTEGER,
+                     "previous_content_version": STRING,
+                 }),
+                 obj({**CONFIG_ID, "base_version": CONFIG_BASE_VER, "why": STRING},
+                     [*CONFIG_ID, "base_version"]),
+                 {"kind": "device", "name": "scratch", "base_version": 1}, "DELETE",
+                 errors=("validation", "invalid_state", "gate_refused", "presence_expired", "referenced", "engine_default")),
+     "scope": "config:activate"},
     operation("token.list", "tokens", envelope({"tokens": array(TOKEN)})),
     operation("token.issue", "tokens", TOKEN_ISSUED, TOKEN_ISSUE,
               {"label": "Remote CLI", "scopes": ["read", "task:write"]}, "POST", success_status=201),
@@ -873,6 +918,14 @@ OPERATIONS += [
     operation("task.restore", "tasks/{task}/restore", envelope({"task": TASK}),
               obj({"task": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["task"]),
               {"task": "T-1"}, "POST", errors=("invalid_state", "task_version_conflict")),
+    {**operation("task.sync", "tasks/{task}/sync",
+                 {"anyOf": [
+                     envelope({"task": TASK, "ref": REF, "fields": array(REF_FIELD)}),
+                     envelope({"accepted": BOOLEAN, "watch": STRING, "task": STRING}),
+                 ]},
+                 obj({"task": STRING}), {"task": "T-1"}, "POST",
+                 errors=("invalid_state", "upstream_failed")),
+     "scope": "run:start"},
     operation("comment.create", "tasks/{task}/comments", envelope({"task": TASK}),
               obj({"task": STRING, "body": STRING}), {"task": "T-1", "body": "Reply"}, "POST"),
     operation("comment.update", "tasks/{task}/comments/{comment}", envelope({"comment": TASK_COMMENT}),
@@ -903,7 +956,9 @@ OPERATIONS += [
               obj({"task": STRING, "ref": STRING}), {"task": "T-1", "ref": "R-1"}, "DELETE"),
     operation("ref.list", "refs", envelope({"refs": array(REF)}),
               obj({"system": STRING, "kind": STRING, "key": STRING, "sync": STRING}, [])),
-    operation("ref.get", "refs/{ref}", envelope({"ref": REF, "tasks": array(REF_TASK_LINK)}),
+    operation("ref.get", "refs/{ref}",
+              envelope({"ref": REF, "tasks": array(REF_TASK_LINK), "fields": array(REF_FIELD)},
+                       ["seq", "ref", "tasks"]),
               obj({"ref": STRING}), {"ref": "R-1"}),
     operation("ref.history", "refs/{ref}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"ref": STRING}), {"ref": "R-1"}),
@@ -966,6 +1021,11 @@ OPERATIONS += [
                      ["item", "base_version", "reason"]),
                  {"item": "TR-1", "base_version": 1, "reason": "Later"},
                  "POST", errors=("already_resolved", "invalid_state", "validation")), "scope": "inbox:resolve"},
+    {**operation("inbox.reopen", "inbox/{item}/reopen", envelope({"item": INBOX_ITEM}),
+                 obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["item", "base_version"]),
+                 {"item": "TR-1", "base_version": 2},
+                 "POST", errors=("too_late", "already_sent", "not_reversible", "already_open", "validation")),
+     "scope": "inbox:resolve"},
     {**operation("inbox.resolve", "inbox/{item}/resolve", envelope({"item": INBOX_ITEM, "result": JSON}),
                  obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "verb": STRING,
                       "option": JSON, "answer": STRING, "answers": array(JSON), "reason": STRING,
@@ -986,10 +1046,56 @@ OPERATIONS += [
      "scope": "inbox:resolve", "body_media": "application/octet-stream"},
     operation("inbox.history", "inbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"item": STRING}), {"item": "TR-1"}),
+]
+ZONE_WORD = {**STRING, "enum": ["ROBUST", "STABLE", "REACTIVE", "OVERLOADED"]}
+ANDON = obj({
+    "count": INTEGER,
+    "high": INTEGER,
+    "med": INTEGER,
+    "low": INTEGER,
+    "standing": INTEGER,
+    "limit": INTEGER,
+    "aim": INTEGER,
+    "zone": ZONE_WORD,
+    "why": STRING,
+})
+STATION = obj({
+    "name": STRING,
+    "state": {**STRING, "enum": ["fault", "running", "waiting", "queued", "done", "idle"]},
+    "wip": INTEGER,
+})
+FLOOR_LINE = obj({
+    **LINE["properties"],
+    "runs_going": INTEGER,
+    "tasks_in_progress": INTEGER,
+    "stations": array(STATION),
+}, [*LINE["required"], "band", "stations"])
+FLOOR_LIVE_RUN = obj({
+    "id": STRING,
+    "task": NULL_TEXT,
+    "line": NULL_TEXT,
+    "repo": NULL_TEXT,
+    "kind": NULL_TEXT,
+    "status": STRING,
+    "started": NULL_TEXT,
+    "adw": NULL_TEXT,
+    "node": NULL_TEXT,
+    "eta": NULL_TEXT,
+    "eta_partial": BOOLEAN,
+}, ["id", "status", "eta", "eta_partial"])
+BOARD_LINE = obj({
+    **LINE["properties"],
+    "runs_going": INTEGER,
+    "tasks_in_progress": INTEGER,
+}, LINE["required"])
+
+OPERATIONS += [
     operation("triage_screen.get", "screens/triage",
               envelope({"items": array(INBOX_ITEM),
                         "by_priority": obj({"high": array(INBOX_ITEM), "med": array(INBOX_ITEM), "low": array(INBOX_ITEM)}),
-                        "counts": mapping(INTEGER)})),
+                        "counts": mapping(INTEGER),
+                        "andon": ANDON},
+                       ["seq", "items", "by_priority", "counts"])),
 ]
 DEVICE_PROBE = obj({
     "at": STRING,
@@ -1352,6 +1458,52 @@ OPERATIONS += [
         envelope({"events": array(ENTITY_HISTORY_EVENT), "next_after": NULL_INT}, ["seq", "events"]),
         obj({"view": STRING, "limit": STRING, "after": STRING}, ["view"]),
         {"view": "ready-view"},
+    ),
+    operation(
+        "shell_screen.get", "screens/shell",
+        envelope({
+            "now": STRING,
+            "andon": ANDON,
+            "zone": ZONE_WORD,
+            "handledWithoutYouPct": NULL_INT,
+        }),
+    ),
+    operation(
+        "floor_screen.get", "screens/floor",
+        envelope({
+            "now": STRING,
+            "andon": ANDON,
+            "zone": ZONE_WORD,
+            "handledWithoutYouPct": NULL_INT,
+            "lines": array(FLOOR_LINE),
+            "live": array(FLOOR_LIVE_RUN),
+        }),
+        obj({"project": STRING, "include_archived": {**BOOLEAN, "default": False}}, []),
+    ),
+    operation(
+        "board_screen.get", "screens/board",
+        envelope({
+            "tasks": array(TASK),
+            "columns": array(obj({"state": STRING, "count": INTEGER})),
+            "running_ids": array(STRING),
+            "lines": array(BOARD_LINE),
+            "andon": ANDON,
+            "saved_view": VIEW,
+        }, ["seq", "tasks", "columns", "running_ids", "lines", "andon"]),
+        obj({"id": STRING, "project": STRING, "include_archived": {**BOOLEAN, "default": False}}, []),
+    ),
+    operation(
+        "derived.recompute", "derived/band/{line}/recompute",
+        command_result(LINE, {"changed": BOOLEAN, "source_mark": STRING}, ("changed", "source_mark")),
+        obj({"line": STRING, "base_version": BASE_VERSION}, ["line", "base_version"]),
+        {"line": "replay-sample-pipeline", "base_version": 1}, "POST",
+        errors=("validation", "invalid_state", "gate_refused"),
+    ),
+    operation(
+        "run.steps", "runs/{run}/steps",
+        envelope({"steps": array(RESOURCE["step"])}),
+        obj({"run": STRING}, ["run"]),
+        {"run": "pip-demo-1"},
     ),
 ]
 SOURCE_RATE_LIMIT = obj({

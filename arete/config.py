@@ -957,6 +957,10 @@ def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
     if (not isinstance(contact, str) or len(contact) > 200 or re.search(r"\s", contact)
             or contact and not contact.startswith(("mailto:", "https://"))):
         raise ValueError("[ask] push_contact must be empty or a mailto: or https:// address without spaces, at most 200 characters")
+    for key in ("newPer10Min", "floodBurst", "standingLimit", "standingAim",
+                "highOnScreen", "shelvedLimit", "demoteAfterShelves", "needsYouPerDay"):
+        if key in table:
+            whole(table[key], f"[ask] {key}", least=1, bound="of at least 1")
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
