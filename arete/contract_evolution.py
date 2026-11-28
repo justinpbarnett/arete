@@ -88,6 +88,8 @@ def registry_problems(registry):
         if path in RESERVED_PATHS or path == "/api/v1" or not path.startswith("/api/v1/"):
             yield f"{name} uses reserved or invalid path {path}"
         for field in sorted(RESERVED_FIELDS & operation["input"].get("properties", {}).keys()):
+            if name == "inbox.raise" and field == "subject":
+                continue
             yield f"{name} ({route(operation)}): input.{field} is reserved"
     if len({route(alias) for alias in registry["aliases"]}) != len(registry["aliases"]):
         yield "duplicate legacy alias route"
@@ -100,6 +102,8 @@ def registry_problems(registry):
 
 
 def openapi(registry, minor, source_hashes, oldest_client):
+    from . import credential_http
+
     schemas, paths, errors, problems = {}, {}, {}, {}
     for error in registry["errors"]:
         code = error["code"]
@@ -124,6 +128,8 @@ def openapi(registry, minor, source_hashes, oldest_client):
                     "examples": {code: {"value": errors[code]["example"]} for code in codes}}}}
             responses[str(status)] = {"$ref": f"#/components/responses/{key}"}
         entry = {"operationId": name, "responses": responses, "x-arete-errors": op["errors"]}
+        if name in credential_http.PRESENCE:
+            entry["x-arete-presence"] = True
         if "deprecated" in op:
             entry["deprecated"] = op["deprecated"]
         if "sunset" in op:

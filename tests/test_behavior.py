@@ -2354,7 +2354,9 @@ def request(method, at, payload=b'', *, token=None, cookie=None, key='request-de
             handler=dashboard.Handler, csrf=True, status=200, code=None, reason=None, allow=None):
     headers = {'Connection': 'close'}
     if method != 'GET':
-        headers.update({'Content-Type': media, 'Content-Length': str(len(payload)), 'Idempotency-Key': key})
+        headers.update({'Content-Type': media, 'Content-Length': str(len(payload))})
+        if key is not None:
+            headers['Idempotency-Key'] = key
     if token:
         headers['Authorization'] = 'Bearer ' + token
     if cookie:
@@ -2397,7 +2399,7 @@ value = b'fixture-api-token'
 write = dict(payload=value, media='text/plain', key='request-set')
 for tls, status, code, reason in [(None, 426, 'tls_required', None), (object(), 403, 'forbidden', 'presence_required')]:
     server.tls = tls
-    request('PUT', item + '/value', token=bearer, status=status, code=code, reason=reason, **write)
+    request('PUT', item + '/value', token=bearer, status=status, code=code, reason=reason, **{**write, 'key': None})
 assert secretstore.get('global', 'DEMO_KEY') is None and not Path('store').exists()
 cookie = browser_session()
 _, result = request('PUT', item + '/value', cookie=cookie, **write)
@@ -2487,7 +2489,7 @@ cookie = browser_session()
 request('PUT', item, cookie=cookie, csrf=False, allow='GET, DELETE', **unsupported)
 write = dict(payload=b'fixture-registry-value', media='text/plain')
 for token, status, code, reason in [(None, 401, 'unauthenticated', None), (reader, 403, 'forbidden', 'presence_required')]:
-    request('PUT', item + '/value', token=token, status=status, code=code, reason=reason, **write)
+    request('PUT', item + '/value', token=token, key=None, status=status, code=code, reason=reason, **write)
 request('PUT', item + '/value', cookie=cookie, csrf=False, status=403, code='csrf', **write)
 assert secretstore.get('global', 'DEMO_KEY') is None
 """)
@@ -2984,7 +2986,7 @@ def cli_over_http():
     instance = db.schema_metadata()['instance_id']
     with mock.patch('socket.getfqdn', return_value=address):
         fixture = ThreadingHTTPServer((address, 0), Handler)
-    fixture.node, fixture.logins, fixture.tls = server.node, server.logins, server.tls
+    fixture.node, fixture.logins, fixture.tls, fixture.pending_secrets = server.node, server.logins, server.tls, {}
     where = client.Server('https', address, fixture.server_port, address, instance)
     credential_files.write_client(where.tag, bearer)
 
@@ -2997,6 +2999,42 @@ def cli_over_http():
     with (_CliThroughServeCase.listening(fixture), mock.patch.object(client, 'discover', return_value=where),
           mock.patch.object(client, 'connect', side_effect=connect)):
         yield requests
+
+
+@contextmanager
+def resolve_presence_in_background(cookie, verb='reject'):
+    import threading
+    import time
+    from arete import inbox as inbox_mod
+
+    stop = threading.Event()
+    errors = []
+
+    def worker():
+        try:
+            deadline = time.monotonic() + 5
+            while not stop.is_set() and time.monotonic() < deadline:
+                found = [it for it in inbox_mod.list(state='open', kind='approval')
+                         if it['subject'].startswith('presence:')]
+                if found:
+                    it = found[0]
+                    request('POST', f"/api/v1/inbox/{it['id']}/resolve",
+                            json.dumps({'verb': verb, 'base_version': it['version']}).encode(),
+                            cookie=cookie, key=f"decide-{it['id']}")
+                    return
+                time.sleep(0.02)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        with mock.patch.object(client, 'RETRY_SECONDS', 0.05):
+            yield
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        assert not errors, errors
 """
 
 
@@ -3011,17 +3049,18 @@ before = repo_file.read_bytes()
 row = secretstore.put(scope, name, repo_value, 'repo_answer', actor)
 ref, settings = item_reference(row), config.secret_settings()
 route = root + '/repo%3Ademo/DEMO_TOKEN'
-with cli_over_http() as trace:
+cookie = browser_session()
+with cli_over_http() as trace, resolve_presence_in_background(cookie, 'reject'):
     status, out, err = run_cli('secrets', 'rm', 'demo', name)
-assert ('DELETE', route, 403) in trace, trace
+assert ('DELETE', route, 202) in trace and ('DELETE', route, 403) in trace, trace
 assert status == 1 and repo_value not in out + err, (status, out, err)
 problem = json.loads(out)
-assert problem['reason'] == 'presence_required', problem
-assert f'DELETE {route}' in problem['hint'] and 'paired owner browser' in problem['hint'], problem
+assert problem['code'] == 'gate_refused', problem
+assert 'TR-' in err, err
 assert repo_file.read_bytes() == before and secretstore.get(scope, name) == row
 assert secretstore.read_item(ref, settings) == repo_value.encode()
 
-_, result = request('DELETE', route, cookie=browser_session(), key='remove-repo-secret')
+_, result = request('DELETE', route, cookie=cookie, key='remove-repo-secret')
 assert result['secret']['present'] is False and repo_value not in json.dumps(result)
 assert secretstore.read_item(ref, settings) is None
 assert json.loads(repo_file.read_text()) == retained
@@ -3064,7 +3103,7 @@ assert secretstore.get(scope, name) is None and not hook_file.exists()
 server.tls = None
 request('POST', rotate_route, token=bearer, status=426, code='tls_required')
 server.tls = object()
-request('POST', rotate_route, token=bearer, status=403, code='forbidden', reason='presence_required')
+request('POST', rotate_route, token=bearer, key=None, status=403, code='forbidden', reason='presence_required')
 cookie = browser_session()
 request('POST', rotate_route, cookie=cookie, csrf=False, status=403, code='csrf')
 principals.update(actor, role='viewer')
@@ -3121,10 +3160,11 @@ assert [call for call in trace if call[1] == loop_route] == [('GET', loop_route,
 
     def test_cli_token_cannot_rotate_without_presence(self):
         self.run_file_workflow(WEBHOOK_ROTATE_FIXTURE + SECRET_CLI_HTTP_FIXTURE + r"""
-with cli_over_http() as trace:
+cookie = browser_session()
+with cli_over_http() as trace, resolve_presence_in_background(cookie, 'reject'):
     status, out, err = run_cli('webhook', 'demo', '--rotate')
-assert status != 0 and 'presence_required' in out + err, (status, out, err)
-assert ('POST', rotate_route, 403) in trace, trace
+assert status != 0 and 'gate_refused' in out + err and 'TR-' in err, (status, out, err)
+assert ('POST', rotate_route, 202) in trace and ('POST', rotate_route, 403) in trace, trace
 assert secretstore.get(scope, name) is None and not hook_file.exists()
 """)
 
@@ -5939,7 +5979,7 @@ row = workspaces.open_for("sample-app-stray")
 assert (row["state"], row["repo"], row["owner_run"], row["held_by"]) == ("held", "sample-app", "", ["notes.txt"])
 assert workspaces.open_for("sample-app-young") is None
 item, = inbox.list()
-assert item["kind"] == "workspace" and item["id"] == row["id"]
+assert item["kind"] == "workspace" and item["subject"] == f"workspace:{row['id']}"
 entry, = board.health_board()["workspaces"]["rows"]["rows"]
 assert entry["blocked"] and entry["why"] == "workspace removal blocked (notes.txt)", entry
 """)
@@ -9310,8 +9350,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 70)
-        self.assertEqual(len({op["name"] for op in operations}), 70)
+        self.assertEqual(len(operations), 81)
+        self.assertEqual(len({op["name"] for op in operations}), 81)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -9815,7 +9855,9 @@ class _CredentialCase(unittest.TestCase):
             sent["Cookie"] = cookie
         if method == "POST":
             body = json.dumps(body or {})
-            sent.update({"Content-Type": "application/json", "Idempotency-Key": key or f"credential-{next(self.keys)}"})
+            sent["Content-Type"] = "application/json"
+            if key != "":
+                sent["Idempotency-Key"] = key or f"credential-{next(self.keys)}"
         with closing(self.connect(server)) as connection:
             connection.request(method, path, body=body, headers=sent)
             response = connection.getresponse()
@@ -9895,8 +9937,9 @@ class CredentialMcpHttpTests(_CredentialMcpCase):
             issued = self.issue(server, self.pair(server), scopes=("read", "task:write", "run:write"))
             post, session = self.mcp(server, issued["text"])
             names = {tool["name"] for tool in post("tools/list", 2)[0]["result"]["tools"]}
-            self.assertEqual(names, {"screen__get", "task__list", "task__get", "task__create", "comment__create",
-                                     "run__list", "run__get", "run__stop", "run__steer"})
+            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "task__list", "task__get",
+                                     "task__create", "comment__create", "run__list", "run__get", "run__stop",
+                                     "run__steer"})
             post("tools/call", 3, {"name": "token__issue"}, status=403, code="scope_missing")
             create = {"name": "task__create", "arguments": {"repo": "fixture", "body": "Work </untrusted>"}}
             answer, _ = post("tools/call", 4, create)
@@ -10821,7 +10864,7 @@ class CredentialAdmissionTests(_CredentialCase):
             for path in (self.TASKS, "/api/tasks"):
                 self.task(server, path=path, headers=only_header, status=401, code="unauthenticated")
             for bearer in (None, self.owner_text):
-                result, _ = self.request(server, "POST", self.TOKENS, bearer=bearer, status=403, code="forbidden")
+                result, _ = self.request(server, "POST", self.TOKENS, bearer=bearer, key="", status=403, code="forbidden")
                 self.assertEqual(result["reason"], "presence_required")
             printed, link = self.cli(["pair"]).splitlines()
             pairing = link.rsplit("#", 1)[1]
@@ -10860,7 +10903,7 @@ class CredentialRotationTests(_CredentialCase):
             cookie = self.pair(server)
             first = self.issue(server, cookie)
             rotate = f"{self.TOKENS}/{first['token']['id']}/rotate"
-            denied, _ = self.request(server, "POST", rotate, bearer=first["text"], status=403)
+            denied, _ = self.request(server, "POST", rotate, bearer=first["text"], key="", status=403)
             self.assertEqual(denied["reason"], "presence_required")
             new, _ = self.request(server, "POST", rotate, cookie=cookie, body={"grace_seconds": 0}, status=201)
             self.request(server, "GET", self.TASKS, bearer=first["text"], status=401, code="token_rotated")
@@ -11458,3 +11501,950 @@ for p in sorted(paths.PACKAGE_DIR.rglob('*.py')):
 assert not bad, '\n'.join(bad)
 """)
 
+
+class _InboxCase(_CredentialCase):
+    INBOX = "/api/v1/inbox"
+    PUSH = "/api/v1/push/subscriptions"
+
+    @staticmethod
+    def run_case(case):
+        with (mock.patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected network request")),
+              mock.patch.object(accounts, "read", side_effect=AssertionError("Unexpected accounts.read")),
+              mock.patch.object(gh, "gh", side_effect=AssertionError("Unexpected gh.gh"))):
+            name, fixture_method = case.split(".")
+            fixture = globals()[name]()
+            fixture.prepare()
+            check = getattr(type(fixture), fixture_method)
+            result = getattr(check, "__wrapped__", check)(fixture, json.load(sys.stdin))
+        print("BEHAVIOR_RESULT=" + json.dumps(result))
+
+    def prepare(self):
+        super().prepare()
+        root = Path.cwd()
+        repo_dir = root / "repo"
+        repo_dir.mkdir(exist_ok=True)
+        gh_dir = root / "ghrepo"
+        gh_dir.mkdir(exist_ok=True)
+        paths.CONFIG_FILE.write_text(
+            f'arete_repo = "fixture"\n'
+            f'[dashboard]\nowner = "{self.LOGIN}"\nhttps = true\n'
+            f'[secrets]\nstore = "pve_store"\nstore_dir = {json.dumps(str(root / "secret-store"))}\n'
+            f'[[repo]]\nname = "fixture"\npath = {json.dumps(str(repo_dir))}\n'
+            f'tracker = "local"\ngithub = "fixture/repo"\n'
+            f'[[repo]]\nname = "ghfixture"\npath = {json.dumps(str(gh_dir))}\n'
+            f'tracker = "github"\ngithub = "fixture/repo"\npipeline = true\n'
+        )
+
+    def http(self, server, method, path, *, body=None, raw_body=None, media="application/json",
+             bearer=None, cookie=None, key=None, headers=None, status=200, code=None):
+        sent = {"X-Arete": "1"} if cookie is not None else {}
+        sent.update(headers or {})
+        if bearer:
+            sent["Authorization"] = f"Bearer {bearer}"
+        if cookie:
+            sent["Cookie"] = cookie
+        payload = None
+        if method != "GET":
+            payload = raw_body if raw_body is not None else json.dumps(body or {}).encode()
+            sent["Content-Type"] = media
+            if key != "":
+                sent["Idempotency-Key"] = key or f"inbox-req-{next(self.keys)}"
+        with closing(self.connect(server)) as connection:
+            connection.request(method, path, body=payload, headers=sent)
+            response = connection.getresponse()
+            raw = response.read()
+            result = json.loads(raw) if raw else {}
+            self.assertEqual(response.status, status, (method, path, result.get("code"), result.get("detail"), result))
+            if code:
+                self.assertEqual(result.get("code"), code)
+            return result, response.headers
+
+    def pair_and_client(self, server, scopes=("read", "inbox:raise", "inbox:resolve", "token:write", "secret:write")):
+        cookie = self.pair(server)
+        issued = self.issue(server, cookie, scopes=scopes)
+        return cookie, issued
+
+
+def inbox_test(fn):
+    @wraps(fn)
+    def run(self):
+        self.scratch(fn.__qualname__)
+
+    return run
+
+
+class InboxTests(_InboxCase):
+    PRELUDE = "from tests.test_behavior import _InboxCase; _InboxCase.run_case(sys.argv[1])"
+
+    @inbox_test
+    def test_all_nine_sources_and_dependency_wait_separation(self, _):
+        from arete import inbox
+        from arete.store import asks as asks_store, incidents as incidents_store
+
+        posts = []
+        with mock.patch.object(webpush, "post", side_effect=lambda ep, hdrs: posts.append((ep, hdrs)) or 201):
+            with self.listen() as server:
+                cookie, _ = self.pair_and_client(server)
+                meta, _ = self.http(server, "GET", "/api/v1/meta", cookie=cookie)
+                self.assertTrue(meta["features"]["inbox"])
+
+                # 1. 101 pending approvals + 1 failed approval (no 100 cap).
+                for i in range(101):
+                    approvals_store.add_approval(
+                        "demo-loop", f"r-appr-{i}",
+                        {"type": "push", "item": {"title": f"Push {i}", "about": f"About {i}", "files": ["a.py"]}},
+                        f"Approve push {i}",
+                    )
+                failed_id = approvals_store.add_approval(
+                    "demo-loop", "r-appr-fail",
+                    {"type": "push", "item": {"title": "Push fail", "about": "Failed", "files": ["b.py"]}},
+                    "Approve failed push",
+                )
+                approvals_store.settle_approval(failed_id, "failed", "delivery error", judged="failed")
+
+                # 2. 2 non-dependency skipped + 1 dependency_wait skipped.
+                from arete import poll
+                skips = pipeline.SkipLog({})
+                skips.note("fixture#201", tracker.Ticket("201", "#201", "Parked ticket"),
+                           "blocked by parked run r-parked", "fixture")
+                skips.note("fixture#202", tracker.Ticket("202", "#202", "Unreadable dep"),
+                           "blocked by unreadable #999", "fixture")
+                skips.note("fixture#203", tracker.Ticket("203", "#203", "Routine dep"),
+                           "waiting on #10", "fixture", blocker_kind=tracker.DEPENDENCY_WAIT)
+                poll.save_skips(skips)
+
+                # 3. 1 ready triage ticket.
+                triage_store.triage_put({
+                    "ref": "fixture/repo#301", "source": "GitHub fixture/repo", "tracker": "github", "repo": "ghfixture",
+                    "route": "triage", "title": "Ready ticket", "url": "https://github.com/fixture/repo/issues/301",
+                    "updated": util.iso(), "ready": 1, "code": 1, "size": "s", "questions": [],
+                    "plan": ["Plan"], "why": "Ready", "cost": 0.0, "ts": util.iso(), "kind": "feat",
+                    "repos": ["ghfixture"], "assumptions": [], "in_sprint": 0, "parent": "", "closed": "", "checks": [],
+                })
+
+                # 4. 2 chat drafts.
+                c1 = chats_store.chat_add("Draft one")
+                chats_store.chat_say(c1, "assistant", "draft", draft_title="First draft", draft_body="Body 1")
+                c2 = chats_store.chat_add("Draft two")
+                chats_store.chat_say(c2, "assistant", "draft", draft_title="Second draft", draft_body="Body 2")
+
+                # 5. 4 proposals (memory, hand, approve, filing).
+                for status, title in (("memory", "Mem"), ("hand", "Hand"), ("approve", "Appr"), ("filing", "File")):
+                    approvals_store.add_proposal(
+                        f"r-p-{status}",
+                        {"layer": "repo", "repo": "fixture", "file": f"{status}.md",
+                         "change": f"Change {title}", "why": f"Detail {status}"},
+                        status,
+                    )
+
+                # 6. 1 open choice ask.
+                ask_run = record.start("pipeline", repo="fixture", issue="401")
+                asks_store.ask_add(
+                    ask_run, ask_run, "fixture", "401", "implement", "ask", "Need choice", "",
+                    [{"kind": "choice", "header": "Pick", "question": "Pick one",
+                      "options": [{"label": "A", "recommended": True}, {"label": "B"}]}], {},
+                )
+                record.move(ask_run, "needs-info", ("running",))
+
+                # 7. 1 needs-info run without an ask.
+                bare_run = record.start("pipeline", repo="fixture", issue="402")
+                record.move(bare_run, "needs-info", ("running",))
+
+                # 8. 1 alert.
+                incidents_store.alert_set("disk_low", "Disk space low", "Less than 1 GB left")
+
+                # 9. 1 blocked incident.
+                from arete.sighting import Sighting
+                inc_id, _ = incidents_store.record_incident(
+                    Sighting("fp-inc-1", "error", "oncall", "fixture", "API down", 1, "evidence", "")
+                )
+                incidents_store.update_incident(inc_id, phase="blocked", waiting="Needs owner decision")
+
+                inbox.sync_all()
+
+                listed, _ = self.http(server, "GET", self.INBOX, cookie=cookie)
+                items = listed["items"]
+                by_kind = {}
+                for it in items:
+                    by_kind.setdefault(it["kind"], []).append(it)
+                self.assertEqual(len(by_kind["approval"]), 102)
+                self.assertEqual(sum(it["subject"].startswith("skipped:") for it in by_kind["candidate"]), 2)
+                self.assertEqual(sum(it["subject"].startswith("ticket:") for it in by_kind["candidate"]), 1)
+                self.assertEqual(sum(it["subject"].startswith("chat:") for it in by_kind["proposal"]), 2)
+                self.assertEqual(sum(it["subject"].startswith("proposal:") for it in by_kind["proposal"]), 4)
+                self.assertEqual(len(by_kind["choice"]), 1)
+                self.assertEqual(len(by_kind["freeform"]), 1)
+                self.assertEqual({it["subject"] for it in by_kind["alert"]}, {"alert:disk_low", f"incident:{inc_id}"})
+                self.assertEqual(len(items), 115)
+                self.assertEqual(by_kind["choice"][0]["priority"], 1)
+                self.assertEqual(by_kind["freeform"][0]["priority"], 1)
+                self.assertEqual(by_kind["approval"][0]["priority"], 2)
+                by_sub = {it["subject"]: it for it in items}
+                self.assertEqual(by_sub["alert:disk_low"]["priority"], 2)
+                self.assertEqual(by_sub[f"incident:{inc_id}"]["priority"], 2)
+                self.assertTrue(any(it["priority"] == 3 for it in by_kind["proposal"]))
+
+                # Dependency wait is excluded from inbox, events, and push, and shown in /api/live.dependency_waits.
+                self.assertFalse(any("203" in it["subject"] for it in items))
+                with db.reader() as c:
+                    raised_events = c.execute("SELECT subject FROM events_log WHERE kind = 'inbox.raised'").fetchall()
+                self.assertEqual(len(raised_events), 115)
+                self.assertEqual(posts, [])
+
+                live, _ = self.http(server, "GET", "/api/live", cookie=cookie)
+                self.assertEqual([w["ticket"] for w in live["dependency_waits"]["rows"]], ["fixture#203"])
+                self.assertEqual(sorted(s["ticket"] for s in live["needs_you"]["skipped"]["rows"]),
+                                 ["fixture#201", "fixture#202"])
+
+                screen, _ = self.http(server, "GET", "/api/v1/screens/triage", cookie=cookie)
+                self.assertEqual(len(screen["items"]), 115)
+                self.assertEqual(screen["counts"]["open"], 115)
+
+    @inbox_test
+    def test_dependency_wait_poll_lifecycle_and_reclassification(self, _):
+        from arete import inbox, poll
+
+        repo = config.Repo("fixture", Path.cwd(), tracker="local", github="fixture/repo")
+        blocker_id = task_store.task_add("fixture", "Must finish first", title="Blocker issue")
+        waiter_id = task_store.task_add("fixture", f"Waits on {blocker_id}", title="Waiting ticket")
+        parked_id = task_store.task_add("fixture", "Work", title="Parked ticket")
+        mixed_id = task_store.task_add("fixture", f"Waits on {blocker_id}, t-999999", title="Mixed ticket")
+        parked_run = record.start("pipeline", repo="fixture", issue=parked_id)
+        record.move(parked_run, "needs-info", ("running",))
+        with db.tx() as c:
+            c.execute("UPDATE runs SET label_pending = 'needs-info' WHERE id = ?", (parked_run,))
+
+        local = tracker.LocalTracker(repo)
+        skips = pipeline.SkipLog({})
+        with self.listen() as server:
+            cookie, _ = self.pair_and_client(server)
+            picked = list(poll.fresh_candidates(repo, local, skips, set(), set(), (), None))
+            poll.save_skips(skips)
+            self.assertEqual([t.id for t in picked], [blocker_id])
+
+            live, _ = self.http(server, "GET", "/api/live", cookie=cookie)
+            sidebar, _ = self.http(server, "GET", "/api/sidebar", cookie=cookie)
+            self.assertEqual([w["ticket"] for w in live["dependency_waits"]["rows"]], [f"fixture {waiter_id}"])
+            self.assertEqual({s["ticket"] for s in live["needs_you"]["skipped"]["rows"]},
+                             {f"fixture {parked_id}", f"fixture {mixed_id}"})
+            items = self.http(server, "GET", self.INBOX, cookie=cookie)[0]["items"]
+            skipped_subjects = {it["subject"] for it in items if it["subject"].startswith("skipped:")}
+            self.assertEqual(skipped_subjects, {f"skipped:fixture {parked_id}", f"skipped:fixture {mixed_id}"})
+            self.assertEqual(sidebar["needs_you"], len(items))
+
+            # Reclassify an existing skipped inbox item to dependency_wait -> resolves cleared without new alert.
+            reclass_skips = pipeline.SkipLog(dict(skips.current))
+            reclass_skips.note(tracker.ticket_name("fixture", mixed_id),
+                               tracker.Ticket(mixed_id, mixed_id, "Mixed ticket"),
+                               f"waiting on {blocker_id}", "fixture", blocker_kind=tracker.DEPENDENCY_WAIT)
+            poll.save_skips(reclass_skips)
+            after_reclass = self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
+            resolved_mixed = [it for it in after_reclass if it["subject"] == f"skipped:fixture {mixed_id}"]
+            self.assertEqual(len(resolved_mixed), 1)
+            self.assertEqual(resolved_mixed[0]["resolution"], "cleared")
+            self.assertEqual(self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"], [])
+
+            # Close blocker -> dependency wait disappears and waiter is picked normally.
+            task_store.task_set_state(blocker_id, "done")
+            skips2 = pipeline.SkipLog({})
+            picked2 = list(poll.fresh_candidates(repo, local, skips2, set(), set(), (), None))
+            poll.save_skips(skips2)
+            self.assertIn(waiter_id, [t.id for t in picked2])
+            live2, _ = self.http(server, "GET", "/api/live", cookie=cookie)
+            self.assertEqual(live2["dependency_waits"]["rows"], [])
+
+    @inbox_test
+    def test_idempotent_sync_snooze_shelve_persistence_and_until_changed(self, _):
+        from arete import inbox
+
+        a1 = approvals_store.add_approval(
+            "demo", "r1", {"type": "push", "item": {"title": "A1", "about": "One", "files": ["a.py"]}}, "A1"
+        )
+        a2 = approvals_store.add_approval(
+            "demo", "r2", {"type": "push", "item": {"title": "A2", "about": "Two", "files": ["b.py"]}}, "A2"
+        )
+        approvals_store.add_proposal(
+            "r-p1", {"layer": "repo", "repo": "fixture", "file": "flow.md",
+                     "change": "Improve flow", "why": "Details"}, "hand",
+        )
+        pid = approvals_store.proposals()[0]["id"]
+        inbox.sync_all()
+
+        with db.reader() as c:
+            before_inbox = c.execute("SELECT count(*) FROM inbox").fetchone()[0]
+            before_events = c.execute("SELECT count(*) FROM events_log").fetchone()[0]
+        inbox.sync_all()
+        with db.reader() as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM inbox").fetchone()[0], before_inbox)
+            self.assertEqual(c.execute("SELECT count(*) FROM events_log").fetchone()[0], before_events)
+
+        tomorrow = util.iso(util.now() + timedelta(days=1))
+        with self.listen() as server1:
+            cookie, _ = self.pair_and_client(server1)
+            items = self.http(server1, "GET", self.INBOX, cookie=cookie)[0]["items"]
+            by_sub = {it["subject"]: it for it in items}
+            appr1, appr2, prop = by_sub[f"approval:{a1}"], by_sub[f"approval:{a2}"], by_sub[f"proposal:{pid}"]
+            self.assertEqual(self.http(server1, "GET", "/api/sidebar", cookie=cookie)[0]["needs_you"], 3)
+
+            snoozed, _ = self.http(server1, "POST", f"{self.INBOX}/{appr1['id']}/snooze",
+                                   body={"until": tomorrow, "base_version": appr1["version"]}, cookie=cookie)
+            self.assertEqual(snoozed["item"]["state"], "snoozed")
+            shelved, _ = self.http(server1, "POST", f"{self.INBOX}/{prop['id']}/shelve",
+                                   body={"reason": "Next week", "base_version": prop["version"]}, cookie=cookie)
+            self.assertEqual(shelved["item"]["state"], "shelved")
+
+            self.assertEqual(self.http(server1, "GET", "/api/sidebar", cookie=cookie)[0]["needs_you"], 1)
+            live, _ = self.http(server1, "GET", "/api/live", cookie=cookie)
+            self.assertEqual(set(live["needs_you"]), {"approvals", "skipped", "proposals", "ready", "draft"})
+            self.assertEqual([a["id"] for a in live["needs_you"]["approvals"]["rows"]], [a2])
+            self.assertEqual(live["needs_you"]["proposals"]["rows"], {"memory": [], "hand": [], "approve": []})
+
+            # Snooze a2 with until_changed, then update review text -> reopens with higher version.
+            watched, _ = self.http(server1, "POST", f"{self.INBOX}/{appr2['id']}/snooze",
+                                   body={"until_changed": True, "base_version": appr2["version"]}, cookie=cookie)
+            self.assertEqual(watched["item"]["state"], "snoozed")
+            watched_ver = watched["item"]["version"]
+            approvals_store.set_approval_note(
+                a2, "review",
+                json.dumps({"by": "reviewer", "decision": "wait", "confidence": "high",
+                            "reason": "Updated reviewer note"}),
+            )
+            reopened, _ = self.http(server1, "GET", f"{self.INBOX}/{appr2['id']}", cookie=cookie)
+            self.assertEqual(reopened["item"]["state"], "open")
+            self.assertGreater(reopened["item"]["version"], watched_ver)
+
+        # Start a second Server on the same state -> ids, states, snooze_until, shelve_reason unchanged.
+        with self.listen() as server2:
+            inbox.sync_all()
+            got1, _ = self.http(server2, "GET", f"{self.INBOX}/{appr1['id']}", cookie=cookie)
+            gotp, _ = self.http(server2, "GET", f"{self.INBOX}/{prop['id']}", cookie=cookie)
+            self.assertEqual((got1["item"]["state"], got1["item"]["snooze_until"]), ("snoozed", tomorrow))
+            self.assertEqual((gotp["item"]["state"], gotp["item"]["shelve_reason"]), ("shelved", "Next week"))
+
+
+class InboxLifecycleTests(_InboxCase):
+    PRELUDE = "from tests.test_behavior import _InboxCase; _InboxCase.run_case(sys.argv[1])"
+
+    @inbox_test
+    def test_alerts_and_blocked_incidents_lifecycle(self, _):
+        from arete.store import incidents as incidents_store
+
+        incidents_store.alert_set("runner_err", "Runner error", "Details 1")
+        with self.listen() as server:
+            cookie, _ = self.pair_and_client(server)
+            first, = self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"]
+            incidents_store.alert_clear("runner_err")
+            cleared, _ = self.http(server, "GET", f"{self.INBOX}/{first['id']}", cookie=cookie)
+            self.assertEqual((cleared["item"]["state"], cleared["item"]["resolution"]), ("resolved", "cleared"))
+
+            incidents_store.alert_set("runner_err", "Runner error again", "Details 2")
+            second, = self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"]
+            self.assertNotEqual(second["id"], first["id"])
+            self.http(server, "POST", f"{self.INBOX}/{second['id']}/resolve",
+                      body={"verb": "continue", "base_version": second["version"]}, cookie=cookie)
+            # Refreshing last_seen on the same alert raises nothing new.
+            incidents_store.alert_set("runner_err", "Runner error again", "Details 2")
+            self.assertEqual(self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"], [])
+
+            from arete.sighting import Sighting
+            inc1, _ = incidents_store.record_incident(Sighting("fp-i1", "error", "oncall", "fixture", "Blocked 1", 1, "body", ""))
+            incidents_store.update_incident(inc1, phase="blocked", waiting="Needs owner")
+            inc2, _ = incidents_store.record_incident(Sighting("fp-i2", "error", "oncall", "fixture", "Blocked 2", 1, "body", ""))
+            incidents_store.update_incident(inc2, phase="blocked", waiting="Needs owner")
+            incs = {it["subject"]: it for it in self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"]
+                    if it["subject"].startswith("incident:")}
+            self.http(server, "POST", f"{self.INBOX}/{incs[f'incident:{inc1}']['id']}/resolve",
+                      body={"verb": "dismiss", "base_version": incs[f"incident:{inc1}"]["version"]}, cookie=cookie)
+            self.assertEqual(incidents_store.incident(inc1)["state"], "dismissed")
+            incidents_store.update_incident(inc2, phase="resolved")
+            got2, _ = self.http(server, "GET", f"{self.INBOX}/{incs[f'incident:{inc2}']['id']}", cookie=cookie)
+            self.assertEqual((got2["item"]["state"], got2["item"]["resolution"]), ("resolved", "cleared"))
+
+    @inbox_test
+    def test_legacy_aliases_and_proposal_accept_detached(self, _):
+        from arete import inbox
+        from arete.store import asks as asks_store
+
+        aid = approvals_store.add_approval(
+            "demo", "r-a", {"type": "ticket", "item": {"title": "Reject me", "body": "x", "repo": "fixture"}},
+            "Reject me",
+        )
+        r1 = record.start("pipeline", repo="fixture", issue="501")
+        asks_store.ask_add(r1, r1, "fixture", "501", "implement", "ask", "Q1", "",
+                           [{"kind": "choice", "header": "P1", "question": "P1",
+                             "options": [{"label": "yes", "recommended": True}, {"label": "no"}]}], {})
+        record.move(r1, "needs-info", ("running",))
+        r2 = record.start("pipeline", repo="fixture", issue="502")
+        asks_store.ask_add(r2, r2, "fixture", "502", "implement", "ask", "Q2", "",
+                           [{"kind": "choice", "header": "P2", "question": "P2",
+                             "options": [{"label": "x", "recommended": True}, {"label": "y"}]}], {})
+        record.move(r2, "needs-info", ("running",))
+        approvals_store.add_proposal("r-rej", {"layer": "repo", "repo": "fixture", "file": "rej.md", "change": "Rej", "why": "d"}, "approve")
+        approvals_store.add_proposal("r-app", {"layer": "repo", "repo": "fixture", "file": "app.md", "change": "App", "why": "d"}, "approve")
+        approvals_store.add_proposal("r-fil", {"layer": "repo", "repo": "fixture", "file": "fil.md", "change": "Fil", "why": "d"}, "filing")
+        by_file = {p["file"]: p["id"] for p in approvals_store.proposals()}
+        p_rej, p_app, p_fil = by_file["rej.md"], by_file["app.md"], by_file["fil.md"]
+        inbox.sync_all()
+
+        from arete import launch_lease
+
+        def fake_launch(command, log_path):
+            launch_lease.passed()
+            record.start("pipeline", repo="fixture", issue="501")
+            proc = mock.Mock(pid=os.getpid())
+            proc.poll.return_value = None
+            return proc
+
+        with (self.listen() as server,
+              mock.patch.object(control, "launch", side_effect=fake_launch) as spawned,
+              mock.patch.object(control, "detach") as detached):
+            cookie, _ = self.pair_and_client(server)
+
+            # POST /api/approvals/{id} {"approve": false}
+            ans, _ = self.http(server, "POST", f"/api/approvals/{aid}", body={"approve": False}, cookie=cookie)
+            self.assertEqual(set(ans), {"id", "approved", "result"})
+            self.assertFalse(ans["approved"])
+            self.assertEqual(approvals_store.approval(aid)["status"], "rejected")
+            resolved_a = [it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
+                          if it["subject"] == f"approval:{aid}"][0]
+            self.assertEqual(resolved_a["resolution"], "rejected")
+            self.assertEqual(resolved_a["answered_by"], self.owner)
+
+            # POST /api/asks/{id}/answer {"recommended": true}
+            self.http(server, "POST", f"/api/asks/{r1}/answer", body={"recommended": True}, cookie=cookie)
+            spawned.assert_called_once()
+            # GET /api/asks still lists remaining open ask even after snooze.
+            asks_before, _ = self.http(server, "GET", "/api/asks", cookie=cookie)
+            self.assertEqual([a["id"] for a in asks_before["asks"]], [r2])
+            ask2_item = [it for it in self.http(server, "GET", f"{self.INBOX}?kind=choice", cookie=cookie)[0]["items"]
+                         if it["subject"] == f"ask:{r2}"][0]
+            self.http(server, "POST", f"{self.INBOX}/{ask2_item['id']}/snooze",
+                      body={"until": util.iso(util.now() + timedelta(hours=2)), "base_version": ask2_item["version"]},
+                      cookie=cookie)
+            asks_after, _ = self.http(server, "GET", "/api/asks", cookie=cookie)
+            self.assertEqual([a["id"] for a in asks_after["asks"]], [r2])
+
+            # POST /api/proposals/{id}/reject
+            self.http(server, "POST", f"/api/proposals/{p_rej}/reject", body={}, cookie=cookie)
+            self.assertEqual(approvals_store.proposal(p_rej)["status"], "rejected")
+            rej_item = [it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
+                        if it["subject"] == f"proposal:{p_rej}"][0]
+            self.assertEqual(rej_item["resolution"], "declined")
+
+            # accept on approve proposal leaves item open with answer set; moving to applied resolves cleared.
+            open_props = {it["subject"]: it for it in self.http(server, "GET", f"{self.INBOX}?kind=proposal", cookie=cookie)[0]["items"]}
+            app_it = open_props[f"proposal:{p_app}"]
+            self.http(server, "POST", f"{self.INBOX}/{app_it['id']}/resolve",
+                      body={"verb": "accept", "base_version": app_it["version"]}, cookie=cookie)
+            detached.assert_called_once()
+            still_open, _ = self.http(server, "GET", f"{self.INBOX}/{app_it['id']}", cookie=cookie)
+            self.assertEqual(still_open["item"]["state"], "open")
+            self.assertTrue(still_open["item"]["answer"])
+            approvals_store.move_proposal(p_app, ("approve", "filing"), "applied")
+            done_prop, _ = self.http(server, "GET", f"{self.INBOX}/{app_it['id']}", cookie=cookie)
+            self.assertEqual((done_prop["item"]["state"], done_prop["item"]["resolution"]), ("resolved", "cleared"))
+
+            # decline on filing proposal -> 409 invalid_state.
+            fil_it = open_props[f"proposal:{p_fil}"]
+            self.http(server, "POST", f"{self.INBOX}/{fil_it['id']}/resolve",
+                      body={"verb": "decline", "base_version": fil_it["version"]}, cookie=cookie,
+                      status=409, code="invalid_state")
+
+
+class InboxConflictTests(_InboxCase):
+    PRELUDE = "from tests.test_behavior import _InboxCase; _InboxCase.run_case(sys.argv[1])"
+
+    @inbox_test
+    def test_version_conflict_concurrent_resolve_and_verb_validation(self, _):
+        from arete import delivery
+
+        aid = approvals_store.add_approval(
+            "demo", "r-race", {"type": "push", "item": {"title": "Race", "about": "Race", "files": ["r.py"]}}, "Race"
+        )
+        with self.listen() as server:
+            cookie, _ = self.pair_and_client(server)
+            item, = self.http(server, "GET", f"{self.INBOX}?kind=approval", cookie=cookie)[0]["items"]
+
+            # Stale base_version -> 409 version_conflict with current.
+            stale, _ = self.http(server, "POST", f"{self.INBOX}/{item['id']}/resolve",
+                                 body={"verb": "approve", "base_version": item["version"] + 99},
+                                 cookie=cookie, status=409, code="version_conflict")
+            self.assertEqual(stale["current"]["id"], item["id"])
+
+            # Invalid verb on approval -> 422 validation.
+            self.http(server, "POST", f"{self.INBOX}/{item['id']}/resolve",
+                      body={"verb": "redirect", "base_version": item["version"]},
+                      cookie=cookie, status=422, code="validation")
+
+            # Two concurrent resolves with 0.2s pause in delivery.send -> one 200, one 409 already_resolved, 1 delivery.
+            delivered = []
+
+            def fake_send(delivery_obj, loop, run_id, cfg, **kwargs):
+                time.sleep(0.2)
+                delivered.append((loop, delivery_obj["type"]))
+                return "delivered-ok"
+
+            def fire(key):
+                with closing(self.connect(server)) as conn:
+                    conn.request(
+                        "POST", f"{self.INBOX}/{item['id']}/resolve",
+                        body=json.dumps({"verb": "approve", "base_version": item["version"]}).encode(),
+                        headers={"Cookie": cookie, "X-Arete": "1", "Content-Type": "application/json",
+                                 "Idempotency-Key": key},
+                    )
+                    resp = conn.getresponse()
+                    return resp.status, json.loads(resp.read())
+
+            with (mock.patch.object(delivery, "send", side_effect=fake_send),
+                  ThreadPoolExecutor(max_workers=2) as pool):
+                f1 = pool.submit(fire, "race-key-1")
+                f2 = pool.submit(fire, "race-key-2")
+                outcomes = [f1.result(), f2.result()]
+
+            statuses = sorted(s for s, _ in outcomes)
+            self.assertEqual(statuses, [200, 409], outcomes)
+            conflict_body = next(body for s, body in outcomes if s == 409)
+            self.assertEqual(conflict_body["code"], "already_resolved")
+            self.assertEqual(len(delivered), 1)
+            self.assertEqual(approvals_store.approval(aid)["status"], "done")
+
+
+class InboxPresenceTests(_InboxCase):
+    PRELUDE = "from tests.test_behavior import _InboxCase; _InboxCase.run_case(sys.argv[1])"
+
+    @inbox_test
+    def test_presence_defer_approve_and_reject(self, _):
+        with self.listen() as server:
+            cookie, issued = self.pair_and_client(server)
+            actor = f"client:{issued['token']['id']}"
+            body = {"label": "Sub token", "scopes": ["read"], "profile": "remote"}
+
+            pending, _ = self.http(server, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                                   key="pres-approve-key", status=202)
+            self.assertEqual(pending["state"], "awaiting_presence")
+            expires_delta = (util.parse_iso(pending["expires"]) - util.now()).total_seconds()
+            self.assertTrue(540 <= expires_delta <= 660, expires_delta)
+
+            with db.reader() as c:
+                rows = c.execute("SELECT actor, key FROM pending_commands").fetchall()
+            self.assertEqual([(r["actor"], r["key"]) for r in rows], [(actor, "pres-approve-key")])
+
+            item = self.http(server, "GET", f"{self.INBOX}/{pending['item']}", cookie=cookie)[0]["item"]
+            self.assertEqual((item["kind"], item["priority"], item["subject"]),
+                             ("approval", 1, f"presence:{actor}/pres-approve-key"))
+
+            # Resolving presence item with client token -> 403 presence_required.
+            refused, _ = self.http(server, "POST", f"{self.INBOX}/{item['id']}/resolve",
+                                   body={"verb": "approve", "base_version": item["version"]},
+                                   bearer=issued["text"], status=403, code="forbidden")
+            self.assertEqual(refused["reason"], "presence_required")
+
+            # Approve from paired session -> pending row gone, item approved, repeat gets 201 answer.
+            self.http(server, "POST", f"{self.INBOX}/{item['id']}/resolve",
+                      body={"verb": "approve", "base_version": item["version"]}, cookie=cookie)
+            with db.reader() as c:
+                self.assertEqual(c.execute("SELECT count(*) FROM pending_commands").fetchone()[0], 0)
+            after, _ = self.http(server, "GET", f"{self.INBOX}/{item['id']}", cookie=cookie)
+            self.assertEqual((after["item"]["state"], after["item"]["resolution"]), ("resolved", "approved"))
+            replayed, _ = self.http(server, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                                    key="pres-approve-key", status=201)
+            self.assertIn("token", replayed)
+            self.assertTrue(replayed["text"].startswith("ar_"))
+
+            # Second request rejected -> 403 gate_refused.
+            p2, _ = self.http(server, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                              key="pres-reject-key", status=202)
+            it2 = self.http(server, "GET", f"{self.INBOX}/{p2['item']}", cookie=cookie)[0]["item"]
+            self.http(server, "POST", f"{self.INBOX}/{it2['id']}/resolve",
+                      body={"verb": "reject", "base_version": it2["version"]}, cookie=cookie)
+            self.http(server, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                      key="pres-reject-key", status=403, code="gate_refused")
+
+    @inbox_test
+    def test_presence_expiry_and_secret_memory_wipe_on_restart(self, _):
+        from arete import inbox
+
+        planted = "planted-secret-value-for-issue-857-restart-check"
+        with self.listen() as server1:
+            cookie, issued = self.pair_and_client(server1)
+            body = {"label": "Expire token", "scopes": ["read"], "profile": "remote"}
+            p1, _ = self.http(server1, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                              key="pres-expire-key", status=202)
+            with db.tx() as c:
+                c.execute("UPDATE pending_commands SET expires = ? WHERE key = ?",
+                          (util.iso(util.now() - timedelta(minutes=1)), "pres-expire-key"))
+            inbox.tick()
+            with db.reader() as c:
+                self.assertEqual(c.execute("SELECT count(*) FROM pending_commands WHERE key = 'pres-expire-key'").fetchone()[0], 0)
+            exp_item, _ = self.http(server1, "GET", f"{self.INBOX}/{p1['item']}", cookie=cookie)
+            self.assertEqual((exp_item["item"]["state"], exp_item["item"]["resolution"]), ("resolved", "expired"))
+            self.http(server1, "POST", self.TOKENS, body=body, bearer=issued["text"],
+                      key="pres-expire-key", status=409, code="presence_expired")
+
+            # secret.set waiting for presence on server1.
+            p_sec, _ = self.http(server1, "PUT", "/api/v1/secrets/global/TEST_SECRET/value",
+                                 raw_body=planted.encode(), media="text/plain",
+                                 bearer=issued["text"], key="pres-secret-key", status=202)
+            self.assertEqual(p_sec["state"], "awaiting_presence")
+
+        # Second Server on the same state has empty pending_secrets -> expires secret pending row at startup.
+        with self.listen() as server2:
+            self.http(server2, "PUT", "/api/v1/secrets/global/TEST_SECRET/value",
+                      raw_body=planted.encode(), media="text/plain",
+                      bearer=issued["text"], key="pres-secret-key", status=409, code="presence_expired")
+            sec_item, _ = self.http(server2, "GET", f"{self.INBOX}/{p_sec['item']}", cookie=cookie)
+            self.assertEqual((sec_item["item"]["state"], sec_item["item"]["resolution"]), ("resolved", "expired"))
+
+        # Planted value appears in NO file under state or log folders.
+        for folder in (paths.STATE_DIR, paths.LOG_DIR):
+            if folder.exists():
+                for file in folder.rglob("*"):
+                    if file.is_file():
+                        self.assertNotIn(planted.encode(), file.read_bytes(), file)
+
+    @inbox_test
+    def test_client_call_waits_for_presence_approval(self, _):
+        from arete import inbox
+
+        with self.listen() as server, self.cli_environment(server):
+            cookie, issued = self.pair_and_client(server)
+            credential_files.write_client(self.meta["instance_tag"], issued["text"])
+            stop = threading.Event()
+            errors = []
+
+            def approver():
+                try:
+                    deadline = time.monotonic() + 5
+                    while not stop.is_set() and time.monotonic() < deadline:
+                        found = [it for it in inbox.list(state="open", kind="approval")
+                                 if it["subject"].startswith("presence:")]
+                        if found:
+                            it = found[0]
+                            self.http(server, "POST", f"{self.INBOX}/{it['id']}/resolve",
+                                      body={"verb": "approve", "base_version": it["version"]}, cookie=cookie)
+                            return
+                        time.sleep(0.02)
+                except Exception as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=approver, daemon=True)
+            worker.start()
+            err = StringIO()
+            try:
+                with mock.patch.object(client, "RETRY_SECONDS", 0.05), redirect_stderr(err):
+                    ans = client.call("POST", self.TOKENS, {"label": "Waited", "scopes": ["read"], "profile": "remote"})
+            finally:
+                stop.set()
+                worker.join(timeout=2)
+            self.assertEqual(errors, [])
+            client_lines = [line for line in err.getvalue().splitlines() if line.strip() and not line.startswith("{")]
+            self.assertEqual(len(client_lines), 1, client_lines)
+            self.assertIn("TR-", client_lines[0])
+            self.assertTrue(ans["text"].startswith("ar_"))
+
+
+class InboxPushTests(_InboxCase):
+    PRELUDE = "from tests.test_behavior import _InboxCase; _InboxCase.run_case(sys.argv[1])"
+
+    @staticmethod
+    def _verify_vapid_jwt(auth_header: str, vapid_public_key: str, expected_aud: str) -> None:
+        # Parse Authorization: vapid t=<jwt>, k=<pub>
+        prefix, _, rest = auth_header.partition(" ")
+        assert prefix == "vapid", auth_header
+        parts = dict(part.strip().split("=", 1) for part in rest.split(","))
+        token = parts["t"]
+        assert parts["k"] == vapid_public_key
+        h_b64, p_b64, s_b64 = token.split(".")
+        pad = lambda s: s + "=" * (-len(s) % 4)
+        claims_obj = json.loads(base64.urlsafe_b64decode(pad(p_b64)))
+        assert claims_obj["aud"] == expected_aud, claims_obj
+        raw_sig = base64.urlsafe_b64decode(pad(s_b64))
+        assert len(raw_sig) == 64
+
+        def der_int(raw: bytes) -> bytes:
+            raw = raw.lstrip(b"\x00") or b"\x00"
+            if raw[0] & 0x80:
+                raw = b"\x00" + raw
+            return bytes([0x02, len(raw)]) + raw
+
+        seq = der_int(raw_sig[:32]) + der_int(raw_sig[32:])
+        der_sig = bytes([0x30, len(seq)]) + seq
+        point = base64.urlsafe_b64decode(pad(vapid_public_key))
+        assert len(point) == 65
+        spki_prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+        pub_pem = ("-----BEGIN PUBLIC KEY-----\n"
+                   + base64.encodebytes(spki_prefix + point).decode()
+                   + "-----END PUBLIC KEY-----\n")
+        with tempfile.TemporaryDirectory() as td:
+            pub_file = Path(td) / "pub.pem"
+            sig_file = Path(td) / "sig.der"
+            pub_file.write_text(pub_pem)
+            sig_file.write_bytes(der_sig)
+            res = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-verify", str(pub_file), "-signature", str(sig_file)],
+                input=f"{h_b64}.{p_b64}".encode(),
+                capture_output=True,
+                check=False,
+            )
+            assert res.returncode == 0, res.stderr.decode(errors="replace")
+
+    @inbox_test
+    def test_push_subscription_v1_and_alias(self, _):
+        keys = {"p256dh": "A" * 80, "auth": "B" * 20}
+        endpoint = "http://127.0.0.1:19991/push/secret-path"
+        with self.listen() as server:
+            cookie, _ = self.pair_and_client(server)
+            created, _ = self.http(server, "POST", self.PUSH,
+                                   body={"endpoint": endpoint, "keys": keys, "label": "My phone"},
+                                   cookie=cookie, status=201)
+            sub = created["subscription"]
+            self.assertEqual((sub["id"], sub["endpoint_host"], sub["label"]), ("PS-1", "127.0.0.1", "My phone"))
+
+            listed, _ = self.http(server, "GET", self.PUSH, cookie=cookie)
+            self.assertEqual(len(listed["subscriptions"]), 1)
+            body_text = json.dumps(listed)
+            self.assertNotIn("secret-path", body_text)
+            self.assertNotIn(keys["p256dh"], body_text)
+            self.assertNotIn(keys["auth"], body_text)
+
+            # Resubscribe same endpoint keeps PS-1 and updates label.
+            updated, _ = self.http(server, "POST", self.PUSH,
+                                   body={"endpoint": endpoint, "keys": keys, "label": "Renamed"},
+                                   cookie=cookie, status=201)
+            self.assertEqual((updated["subscription"]["id"], updated["subscription"]["label"]), ("PS-1", "Renamed"))
+
+            # Alias /api/push still returns legacy shape.
+            alias, _ = self.http(server, "GET", "/api/push", cookie=cookie)
+            self.assertIn("key", alias)
+            self.assertEqual([d["label"] for d in alias["devices"]], ["Renamed"])
+
+            # Non-https remote endpoint and non-loopback endpoint in scratch state refused with 422 validation.
+            self.http(server, "POST", self.PUSH,
+                      body={"endpoint": "http://push.example.com/sub", "keys": keys, "label": "Plaintext"},
+                      cookie=cookie, status=422, code="validation")
+            with mock.patch.object(paths, "ISOLATED", True), self.assertRaises(webpush.Refused):
+                webpush.checked_endpoint("https://push.example.com/sub")
+
+            self.http(server, "DELETE", f"{self.PUSH}/PS-1", cookie=cookie)
+            self.assertEqual(self.http(server, "GET", self.PUSH, cookie=cookie)[0]["subscriptions"], [])
+
+    @inbox_test
+    def test_high_inbox_push_coalescing_jwt_and_priorities(self, _):
+        from arete.store import asks as asks_store
+
+        posts = []
+        keys = {"p256dh": "A" * 80, "auth": "B" * 20}
+        endpoint = "http://127.0.0.1:19992/push/device"
+        with (self.listen() as server,
+              mock.patch.object(webpush, "post", side_effect=lambda ep, hdrs: posts.append((ep, hdrs)) or 201)):
+            cookie, _ = self.pair_and_client(server)
+            meta, _ = self.http(server, "GET", "/api/v1/meta", cookie=cookie)
+            vapid_pub = meta["push"]["vapid_public_key"]
+            self.assertTrue(vapid_pub)
+            self.http(server, "POST", self.PUSH, body={"endpoint": endpoint, "keys": keys, "label": "Phone"},
+                      cookie=cookie, status=201)
+
+            # Single open ask -> 1 post with TTL 86400, Urgency high, Topic tr-<id>, valid VAPID JWT.
+            r1 = record.start("pipeline", repo="fixture", issue="601")
+            asks_store.ask_add(r1, r1, "fixture", "601", "implement", "ask", "Need input", "",
+                               [{"kind": "choice", "header": "Q", "question": "Q",
+                                 "options": [{"label": "1", "recommended": True}]}], {})
+            record.move(r1, "needs-info", ("running",))
+            self.assertEqual(len(posts), 1)
+            ep, hdrs = posts[0]
+            self.assertEqual((ep, hdrs["TTL"], hdrs["Urgency"], hdrs["Content-Length"]), (endpoint, "86400", "high", "0"))
+            ask1_item = self.http(server, "GET", f"{self.INBOX}?kind=choice", cookie=cookie)[0]["items"][0]
+            self.assertEqual(hdrs["Topic"], ask1_item["id"].lower())
+            self._verify_vapid_jwt(hdrs["Authorization"], vapid_pub, "http://127.0.0.1:19992")
+
+            # Two asks opened in one tx() -> ONE post.
+            posts.clear()
+            r2 = record.start("pipeline", repo="fixture", issue="602")
+            r3 = record.start("pipeline", repo="fixture", issue="603")
+            with db.tx():
+                asks_store.ask_add(r2, r2, "fixture", "602", "implement", "ask", "Q2", "",
+                                   [{"kind": "choice", "header": "A", "question": "A",
+                                     "options": [{"label": "1", "recommended": True}]}], {})
+                asks_store.ask_add(r3, r3, "fixture", "603", "implement", "ask", "Q3", "",
+                                   [{"kind": "choice", "header": "B", "question": "B",
+                                     "options": [{"label": "1", "recommended": True}]}], {})
+            self.assertEqual(len(posts), 1)
+
+            # MED approval -> 0 posts.
+            posts.clear()
+            approvals_store.add_approval(
+                "demo", "r-med", {"type": "push", "item": {"title": "Med", "about": "m", "files": ["m.py"]}}, "Med"
+            )
+            self.assertEqual(posts, [])
+
+            # HIGH needs-info run without ask -> 1 post.
+            r4 = record.start("pipeline", repo="fixture", issue="604")
+            record.move(r4, "needs-info", ("running",))
+            self.assertEqual(len(posts), 1)
+
+    @inbox_test
+    def test_push_reminders_410_removal_and_five_failures_alert(self, _):
+        from arete.store import asks as asks_store
+
+        posts = []
+        status_by_endpoint = {}
+        keys = {"p256dh": "A" * 80, "auth": "B" * 20}
+        ep1 = "http://127.0.0.1:19993/push/d1"
+        ep2 = "http://127.0.0.1:19994/push/d2"
+
+        def fake_post(ep, hdrs):
+            posts.append((ep, hdrs))
+            return status_by_endpoint.get(ep, 201)
+
+        with self.listen() as server, mock.patch.object(webpush, "post", side_effect=fake_post):
+            cookie, _ = self.pair_and_client(server)
+            self.http(server, "POST", self.PUSH, body={"endpoint": ep1, "keys": keys, "label": "D1"},
+                      cookie=cookie, status=201)
+
+            r_open = record.start("pipeline", repo="fixture", issue="701")
+            asks_store.ask_add(r_open, r_open, "fixture", "701", "implement", "ask", "Open ask", "",
+                               [{"kind": "choice", "header": "Q", "question": "Q",
+                                 "options": [{"label": "1", "recommended": True}]}], {})
+            record.move(r_open, "needs-info", ("running",))
+            r_snoozed = record.start("pipeline", repo="fixture", issue="702")
+            asks_store.ask_add(r_snoozed, r_snoozed, "fixture", "702", "implement", "ask", "Snoozed ask", "",
+                               [{"kind": "choice", "header": "Q", "question": "Q",
+                                 "options": [{"label": "1", "recommended": True}]}], {})
+            record.move(r_snoozed, "needs-info", ("running",))
+
+            items = {it["subject"]: it for it in self.http(server, "GET", f"{self.INBOX}?kind=choice", cookie=cookie)[0]["items"]}
+            open_it, snooze_it = items[f"ask:{r_open}"], items[f"ask:{r_snoozed}"]
+            self.http(server, "POST", f"{self.INBOX}/{snooze_it['id']}/snooze",
+                      body={"until": util.iso(util.now() + timedelta(hours=3)), "base_version": snooze_it["version"]},
+                      cookie=cookie)
+
+            # Backdate raised so tiny remind_hours triggers reminder on open item only.
+            with db.tx() as c:
+                c.execute("UPDATE inbox SET raised = ?", (util.iso(util.now() - timedelta(minutes=5)),))
+            posts.clear()
+            cfg = config.load()
+            cfg.ask.remind_hours = 0.001
+            webpush.remind_inbox(cfg)
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0][1]["Topic"], open_it["id"].lower())
+            refreshed = self.http(server, "GET", f"{self.INBOX}/{open_it['id']}", cookie=cookie)[0]["item"]
+            self.assertTrue(refreshed["reminded"])
+            asks_view = {a["id"]: a for a in self.http(server, "GET", "/api/asks", cookie=cookie)[0]["asks"]}
+            self.assertEqual(asks_view[r_open]["reminded"], refreshed["reminded"])
+
+            # 410 deletes subscription PS-1; 5x 500 on PS-2 raises LOW alert push:PS-2.
+            self.http(server, "POST", self.PUSH, body={"endpoint": ep2, "keys": keys, "label": "D2"},
+                      cookie=cookie, status=201)
+            status_by_endpoint[ep1] = 410
+            status_by_endpoint[ep2] = 500
+            for _ in range(5):
+                webpush.send_test(cfg)
+            remaining = self.http(server, "GET", self.PUSH, cookie=cookie)[0]["subscriptions"]
+            self.assertEqual([s["id"] for s in remaining], ["PS-2"])
+            alerts = [it for it in self.http(server, "GET", f"{self.INBOX}?kind=alert", cookie=cookie)[0]["items"]
+                      if it["subject"] == "push:PS-2"]
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(alerts[0]["priority"], 3)
+
+
+class InboxWorkspaceTests(_WorkspaceChildCase):
+    def test_held_scratch_done_remove_gates_and_auto_resolves(self):
+        self.run_child(WORKSPACE_REPO + WORKSPACE_FLOW + SCRATCH_RECORD + r"""
+from arete import contract, inbox, principals, serve
+
+owner = principals.seed_owner("owner@example.test")
+held = {}
+
+def finish(flow, ws):
+    write_workspace_output(ws, "before scratch settled")
+    root, lease = pending_scratch(ws, flow.ctx.run.id)
+    held.update(root=root, lease=lease)
+    root.mkdir()
+    return flows.finish(flow, "done", summary="finished with scratch pending")
+
+with scratch_records():
+    try:
+        code, ws, run = run_local_workflow(finish)
+        assert code == 0
+        root = held["root"]
+        row = workspaces.open_for(ws.name)
+        wid = row["id"]
+        assert run["status"] == "done" and row["state"] == "held"
+
+        item, = inbox.list(state="open", kind="workspace")
+        assert item["subject"] == f"workspace:{wid}"
+        assert item["priority"] == 3 and ws.name in item["title"]
+        assert item["verbs"] == ["keep", "remove"]
+        assert item["detail"]["name"] == ws.name and item["detail"]["owner_run"] == run["id"]
+
+        # Non-person actor gets 403 forbidden.
+        with principals.acting(f"run:{run['id']}/respond"):
+            try:
+                inbox.resolve(item["id"], base_version=item["version"], verb="remove")
+                raise AssertionError("expected forbidden")
+            except contract.Problem as err:
+                assert err.code == "forbidden", err
+
+        # Owner gets 409 invalid_state naming the pending scratch root.
+        with principals.acting(owner):
+            try:
+                inbox.resolve(item["id"], base_version=item["version"], verb="remove")
+                raise AssertionError("expected invalid_state")
+            except contract.Problem as err:
+                assert err.code == "invalid_state" and root.name in str(err), (err.code, str(err))
+    finally:
+        if "lease" in held:
+            os.close(held["lease"])
+
+    root.rename(Path.cwd() / "archived-scratch")
+    with patch.object(scratch, "holders", return_value=[]):
+        pipeline.retry_scratch()
+    server = serve.Server()
+    server.cfg = cfg
+    server.sweep_workspaces()
+    assert not ws.exists() and workspaces.get(wid)["state"] == "removed"
+    resolved = inbox.get(item["id"])["item"]
+    assert resolved["state"] == "resolved" and resolved["resolution"] == "cleared"
+""")
+
+    def test_held_scratch_done_keep_leaves_folder_on_sweep(self):
+        self.run_child(WORKSPACE_REPO + WORKSPACE_FLOW + SCRATCH_RECORD + r"""
+from arete import inbox, principals, serve
+
+owner = principals.seed_owner("owner@example.test")
+held = {}
+
+def finish(flow, ws):
+    write_workspace_output(ws, "before scratch settled")
+    root, lease = pending_scratch(ws, flow.ctx.run.id)
+    held.update(root=root, lease=lease)
+    root.mkdir()
+    return flows.finish(flow, "done", summary="finished with scratch pending")
+
+with scratch_records():
+    try:
+        code, ws, run = run_local_workflow(finish)
+        assert code == 0
+        root = held["root"]
+        row = workspaces.open_for(ws.name)
+        wid = row["id"]
+        item, = inbox.list(state="open", kind="workspace")
+        with principals.acting(owner):
+            inbox.resolve(item["id"], base_version=item["version"], verb="keep")
+    finally:
+        if "lease" in held:
+            os.close(held["lease"])
+
+    kept = workspaces.get(wid)
+    assert kept["state"] == "kept" and kept["kept_reason"] == "operator"
+    resolved = inbox.get(item["id"])["item"]
+    assert resolved["state"] == "resolved"
+
+    root.rename(Path.cwd() / "archived-scratch")
+    with patch.object(scratch, "holders", return_value=[]):
+        pipeline.retry_scratch()
+    server = serve.Server()
+    server.cfg = cfg
+    server.sweep_workspaces()
+    assert ws.exists() and workspaces.get(wid)["state"] == "kept"
+""")

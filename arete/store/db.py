@@ -179,6 +179,7 @@ FACTORY_SCHEMA = 31
 TICKET_FEEDBACK_SCHEMA = 32
 TICKET_FOLLOWUPS_SCHEMA = 33
 SECRET_EXPOSE_SCHEMA = 34
+INBOX_SCHEMA = 35
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -191,7 +192,7 @@ WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] wo
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
                              SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, TICKET_FOLLOWUPS_SCHEMA,
-                             SECRET_EXPOSE_SCHEMA))
+                             SECRET_EXPOSE_SCHEMA, INBOX_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -706,6 +707,7 @@ def owned(mode, timeout, before_commit=None):
             _OWNER.after_commit = callbacks
             if mode == "write" and isinstance(conn, ScrubbingConnection):
                 conn._scrub_params = True
+            _OWNER.state = {}
             if bounded:
                 check()
                 conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
@@ -725,6 +727,7 @@ def owned(mode, timeout, before_commit=None):
     finally:
         _OWNER.active = None
         _OWNER.after_commit = None
+        _OWNER.state = None
     for callback in callbacks:
         callback()
 
@@ -799,6 +802,11 @@ def after_transaction(callback: Callable[[], None]) -> bool:
 
 def isolated_busy() -> bool:
     return bool(getattr(DB_THREAD, "active", False)) and transaction_mode() is None
+
+
+def tx_state() -> dict:
+    write_connection()
+    return _OWNER.state
 
 
 def transaction_mode():

@@ -161,6 +161,10 @@ def _insert(c, name: str, fields: dict, fingerprints: dict[str, str]) -> dict:
                     tuple(values.values())).fetchone()
     _write_files(c, row["id"], fingerprints)
     _emit(c, None, row)
+    if row["state"] == "held":
+        from .. import inbox
+
+        inbox.sync(c, "workspaces")
     return _decode(row)
 
 
@@ -193,6 +197,10 @@ def _update(c, before, values: dict, fingerprints: dict[str, str] | None) -> dic
     after = c.execute(f"UPDATE workspaces SET {setters} WHERE id = ? RETURNING *",
                       (*changed.values(), workspace_id)).fetchone()
     _emit(c, before, after)
+    if before["state"] == "held" or after["state"] == "held":
+        from .. import inbox
+
+        inbox.sync(c, "workspaces")
     return _decode(after)
 
 

@@ -688,7 +688,33 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
             if operation["name"] in API_1_2_ONLY:
                 raise requires_api_1_2(method, path) from None
         raise
+    if response.status == 202:
+        answer = decoded(response, method, path)
+        if answer.get("state") == "awaiting_presence" and answer.get("item") and key is not None:
+            return wait_for_presence(method, path, body, key, where, answer, deadline=deadline)
+        return answer
     return decoded(response, method, path)
+
+
+def wait_for_presence(method: str, path: str, body: dict | None, key: str, where: Server,
+                      pending: dict, *, deadline: float | None = None) -> dict:
+    item = pending["item"]
+    print(f"Waiting for presence approval on {item} (approve from a paired browser)", file=sys.stderr)
+    try:
+        expires_at = util.parse_iso(pending["expires"]).timestamp()
+    except (KeyError, ValueError, TypeError):
+        expires_at = time.time() + 600
+    while True:
+        remaining = expires_at - time.time()
+        if deadline is not None:
+            remaining = min(remaining, deadline - time.monotonic())
+        if remaining <= 0:
+            raise Failed({"code": "presence_expired", "error": f"Presence approval for {item} expired."}, 409)
+        time.sleep(min(RETRY_SECONDS, remaining))
+        response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline)
+        if response.status != 202:
+            return decoded(response, method, path)
+        decoded(response, method, path)
 
 
 def requires_api_1_2(method: str, path: str) -> Failed:

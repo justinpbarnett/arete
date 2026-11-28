@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 10
+MINOR = 11
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -126,6 +126,10 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("not_implemented", 501, "The server does not implement this method."),
     ("secret_store_missing", 501, "This instance has no secret store configured."),
     ("secret_internal", 409, "This secret is managed by its owning service."),
+    ("already_resolved", 409, "This inbox item is already resolved."),
+    ("validation", 422, "The request failed domain validation."),
+    ("gate_refused", 403, "The owner refused the pending presence request."),
+    ("presence_expired", 409, "The presence approval expired before it was approved."),
     ("upstream_failed", 502, "The target could not complete the request."),
     ("draining", 503, "Serve is loading new code. Try again after Retry-After."),
     ("unsupported_http_version", 505, "Use HTTP/1.0 or HTTP/1.1."),
@@ -146,8 +150,10 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
-    optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict", "secret_store_missing", "secret_internal"}
-    if noun not in ("token", "pairing", "principal", "secret") and name != "session.end":
+    optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
+                       "secret_store_missing", "secret_internal", "already_resolved", "validation",
+                       "gate_refused", "presence_expired"}
+    if noun not in ("token", "pairing", "principal", "secret", "inbox", "push") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -168,10 +174,34 @@ def sample(schema):
     return {"string": "example", "integer": 1, "number": 1, "boolean": True, "array": []}[kind]
 
 
+INBOX_ITEM = obj({
+    **dict.fromkeys(("id", "kind", "subject", "task_id", "run_id", "line", "title", "state", "snooze_until",
+                     "snooze_watch", "shelve_reason", "shelve_until", "answer", "answered_by", "answered_at",
+                     "resolution", "reminded", "raised", "resolved"), STRING),
+    **dict.fromkeys(("priority", "snooze_watch_ver", "shelves", "version"), INTEGER),
+    "detail": mapping(JSON),
+    "verbs": array(STRING),
+    "options": array(JSON),
+})
+INBOX_EVENT = obj({
+    "id": STRING, "seq": INTEGER, "epoch": STRING, "at": STRING, "kind": STRING, "subject": STRING,
+    "ver": {"type": ["integer", "null"]}, "actor": STRING, "actor_name": NULL_TEXT, "data": mapping(JSON),
+}, ["id", "seq", "at", "kind", "subject", "actor", "data"], additional=JSON)
+PUSH_SUBSCRIPTION = obj({
+    **dict.fromkeys(("id", "endpoint_host", "label", "created"), STRING),
+    "last_success": NULL_TEXT,
+})
+PUSH_SUBSCRIBE = obj({
+    "endpoint": STRING,
+    "keys": obj({"p256dh": STRING, "auth": STRING}),
+    "label": STRING,
+}, ["endpoint", "keys"])
+
 for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
-                "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
+                "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
+                "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
@@ -187,7 +217,10 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "server": obj({"engine_sha": STRING}), "oldest_client": obj(dict.fromkeys(OLDEST_CLIENT, STRING)),
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
-                 "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)})})
+                 "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
+                 "features": obj({"inbox": BOOLEAN}),
+                 "push": obj({"vapid_public_key": STRING})})
+META["required"] = [k for k in META["required"] if k not in ("features", "push")]
 SETTINGS = obj({"max_parallel": INTEGER, "max_parallel_per_repo": INTEGER, "parallel_max": INTEGER,
                 "aliases": array(STRING), "models": mapping(STRING), "defaults": mapping(STRING)})
 PANEL = obj({"rows": JSON, "error": STRING}, [])
@@ -349,6 +382,45 @@ OPERATIONS += [
     operation("usage.record", "usage", obj({}), obj({"kind": STRING, "device": STRING, "tab": STRING,
               "view": STRING, "via": STRING, "name": STRING, "ms": INTEGER}, ["kind", "device", "tab", "view"]),
               {"kind": "visit", "device": "desktop", "tab": "0123456789abcdef", "view": "live", "via": "open"}, "POST"),
+    operation("inbox.list", "inbox", envelope({"items": array(INBOX_ITEM)}),
+              obj({"state": STRING, "kind": STRING, "priority": STRING, "task": STRING, "run": STRING, "line": STRING}, [])),
+    {**operation("inbox.raise", "inbox", envelope({"item": INBOX_ITEM}),
+                 obj({"kind": STRING, "subject": STRING, "title": STRING, "priority": {**INTEGER, "minimum": 1, "maximum": 3},
+                      "detail": mapping(JSON), "verbs": array(STRING), "options": array(JSON),
+                      "task_id": STRING, "run_id": STRING, "line": STRING, "ask": mapping(JSON)}, []),
+                 {"kind": "alert", "subject": "alert:example", "title": "Example alert", "priority": 2, "verbs": ["continue"]},
+                 "POST", errors=("validation",), success_status=201), "scope": "inbox:raise"},
+    operation("inbox.get", "inbox/{item}", envelope({"item": INBOX_ITEM, "subject_object": JSON}),
+              obj({"item": STRING}), {"item": "TR-1"}),
+    {**operation("inbox.snooze", "inbox/{item}/snooze", envelope({"item": INBOX_ITEM}),
+                 obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "until": STRING, "until_changed": BOOLEAN},
+                     ["item", "base_version"]),
+                 {"item": "TR-1", "base_version": 1, "until": "2099-01-01T00:00:00Z"},
+                 "POST", errors=("already_resolved", "invalid_state", "validation")), "scope": "inbox:resolve"},
+    {**operation("inbox.shelve", "inbox/{item}/shelve", envelope({"item": INBOX_ITEM}),
+                 obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "reason": STRING, "until": STRING},
+                     ["item", "base_version", "reason"]),
+                 {"item": "TR-1", "base_version": 1, "reason": "Later"},
+                 "POST", errors=("already_resolved", "invalid_state", "validation")), "scope": "inbox:resolve"},
+    {**operation("inbox.resolve", "inbox/{item}/resolve", envelope({"item": INBOX_ITEM, "result": JSON}),
+                 obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "verb": STRING,
+                      "option": JSON, "answer": STRING, "answers": array(JSON), "reason": STRING},
+                     ["item", "base_version", "verb"]),
+                 {"item": "TR-1", "base_version": 1, "verb": "continue"},
+                 "POST", errors=("already_resolved", "invalid_state", "validation", "gate_refused", "presence_expired")),
+     "scope": "inbox:resolve"},
+    operation("inbox.history", "inbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
+              obj({"item": STRING}), {"item": "TR-1"}),
+    operation("triage_screen.get", "screens/triage",
+              envelope({"items": array(INBOX_ITEM),
+                        "by_priority": obj({"high": array(INBOX_ITEM), "med": array(INBOX_ITEM), "low": array(INBOX_ITEM)}),
+                        "counts": mapping(INTEGER)})),
+    operation("push.list", "push/subscriptions", envelope({"subscriptions": array(PUSH_SUBSCRIPTION)})),
+    operation("push.subscribe", "push/subscriptions", envelope({"subscription": PUSH_SUBSCRIPTION}), PUSH_SUBSCRIBE,
+              {"endpoint": "http://127.0.0.1:9999/push", "keys": {"p256dh": "examplekey", "auth": "exampleauth"}, "label": "Phone"},
+              "POST", errors=("validation",), success_status=201),
+    operation("push.remove", "push/subscriptions/{subscription}", envelope({"id": STRING, "removed": BOOLEAN}),
+              obj({"subscription": STRING}), {"subscription": "PS-1"}, "DELETE"),
 ]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):

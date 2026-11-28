@@ -185,11 +185,28 @@ def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
     return "waiting on CI without a run slot" if slots.freed_slot_for_ci(r["id"]) else "without a run slot"
 
 
-def skipped(running: list[dict]) -> list[dict]:
+def skipped_split(running: list[dict]) -> tuple[list[dict], list[dict]]:
     tickets_running = {(r["repo"], str(r["issue"])) for r in running if r["issue"]}
-    return [{"ticket": name, "repo": v.get("repo", ""), "why": v["why"], "since": v.get("since", ""),
-             "url": v.get("url", ""), "can_run": bool(v.get("repo"))}
-            for name, v in sorted(pipeline.skipped_tickets().items()) if (v.get("repo"), v.get("id")) not in tickets_running]
+    attention, waits = [], []
+    for name, v in sorted(pipeline.skipped_tickets().items()):
+        if not isinstance(v, dict) or (v.get("repo"), v.get("id")) in tickets_running:
+            continue
+        if v.get("blocker_kind") == tracker.DEPENDENCY_WAIT:
+            waits.append({"ticket": name, "repo": v.get("repo", ""), "why": v["why"],
+                          "since": v.get("since", ""), "url": v.get("url", "")})
+        else:
+            attention.append({"ticket": name, "repo": v.get("repo", ""), "why": v["why"],
+                              "since": v.get("since", ""), "url": v.get("url", ""),
+                              "can_run": bool(v.get("repo"))})
+    return attention, waits
+
+
+def skipped(running: list[dict]) -> list[dict]:
+    return skipped_split(running)[0]
+
+
+def dependency_waits(running: list[dict]) -> list[dict]:
+    return skipped_split(running)[1]
 
 
 def waiting() -> dict:
@@ -561,22 +578,24 @@ def run_log(run_id: str) -> list[str]:
 
 
 def sidebar(talk: dict) -> dict:
+    from . import inbox
+
     running = run_store.runs_marked_running(connect=foundation.reader)
     board = functools.cache(lambda: triage.view(connect=foundation.reader))
     beat = control.serve_beat()
-    asks = needs_you(running, board, talk["draft"])
     with_questions = panel(lambda: triage.groups(board())[triage.WITH_QUESTIONS])
-    return {"now": util.iso(), "needs_you": needs_you_count(asks), "running": len(running),
+    return {"now": util.iso(), "needs_you": inbox.open_count(connect=foundation.reader), "running": len(running),
             "questions": len(with_questions.get("rows", [])), "health": health_word(beat, checks_and_alerts()),
             "serve": beat, "chat": {"busy": talk["busy"], "draft": bool(talk["draft"])}}
 
 
 def live_board(draft: dict | None, *, include_ticket_progress: bool = False) -> dict:
     running = run_store.runs_marked_running(connect=foundation.reader)
-    board = functools.cache(lambda: triage.view(connect=foundation.reader))
+    _, waits = skipped_split(running)
     result = {"now": util.iso(), "live": panel(lambda: live(running)), "waiting": panel(waiting),
+              "dependency_waits": {"rows": waits},
               "recovery": panel(recovery_queue), "recovering_tasks": recovering_tasks(),
-              "needs_you": needs_you(running, board, draft)}
+              "needs_you": inbox_needs_you(running)}
     if include_ticket_progress:
         result["ticket_progress"] = panel(lambda: ticket_status(running))
     return result
@@ -598,16 +617,42 @@ def skipped_for_owner(running: list[dict]) -> list[dict]:
     return [row for row in skipped(running) if row["repo"] not in enabled]
 
 
-def needs_you(running: list[dict], board, draft: dict | None) -> dict:
-    return {"approvals": panel(lambda: delivery.waiting(connect=foundation.reader)),
-            "skipped": panel(lambda: skipped_for_owner(running)), "proposals": panel(proposals),
-            "ready": panel(lambda: ready_in_one_click(board())), "draft": draft}
+def inbox_needs_you(running: list[dict]) -> dict:
+    from . import inbox
 
-
-def needs_you_count(asks: dict) -> int:
-    rows = [asks[part].get("rows") or [] for part in ("approvals", "skipped", "ready")]
-    by_hand = asks["proposals"].get("rows") or {}
-    return sum(map(len, rows)) + sum(map(len, by_hand.values())) + bool(asks["draft"])
+    tickets_running = {(r["repo"], str(r["issue"])) for r in running if r["issue"]}
+    open_items = inbox.list(state="open", connect=foundation.reader)
+    approvals = []
+    skipped_rows = []
+    ready_rows = []
+    proposals_by_kind: dict[str, list[dict]] = {"memory": [], "hand": [], "approve": []}
+    drafts = []
+    for item in open_items:
+        subj = item["subject"]
+        detail = item["detail"]
+        if subj.startswith("approval:"):
+            approvals.append({k: v for k, v in detail.items() if k != "stamp"})
+        elif subj.startswith("skipped:"):
+            if (detail.get("repo"), detail.get("id")) not in tickets_running:
+                skipped_rows.append({k: v for k, v in detail.items() if k != "stamp"})
+        elif subj.startswith("ticket:"):
+            ready_rows.append({k: v for k, v in detail.items() if k != "stamp"})
+        elif subj.startswith("proposal:"):
+            status = detail.get("status", "")
+            bucket = "approve" if status in ("approve", "filing") else status
+            if bucket in proposals_by_kind:
+                proposals_by_kind[bucket].append({k: detail.get(k, "") for k in ("id", "repo", "file", "change", "status")})
+        elif subj.startswith("chat:") and subj.endswith("/draft"):
+            drafts.append(detail)
+    approvals.sort(key=lambda a: a.get("id", 0), reverse=True)
+    for bucket in proposals_by_kind.values():
+        bucket.sort(key=lambda p: p.get("id", 0), reverse=True)
+    draft = None
+    if drafts:
+        newest = max(drafts, key=lambda d: (d.get("updated", ""), d.get("chat", 0)))
+        draft = {k: newest[k] for k in ("chat", "title", "body", "repo", "fingerprint") if k in newest}
+    return {"approvals": {"rows": approvals}, "skipped": {"rows": skipped_rows},
+            "proposals": {"rows": proposals_by_kind}, "ready": {"rows": ready_rows}, "draft": draft}
 
 
 def ready_in_one_click(v: dict) -> list[dict]:

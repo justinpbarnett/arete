@@ -21,9 +21,9 @@ COOKIE = "__Host-arete_session"
 PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set", "webhook.rotate"}
-PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate"}
+PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate", "push.subscribe"}
 WRITES = ("POST", "PATCH", "PUT", "DELETE")
-SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|config:activate")
+SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:activate")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
 LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "stage": "capture"}
 
@@ -278,7 +278,12 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
         if credential is None and name == "token.issue":
             logins = handler.server.logins
             logins.credentials.issue(logins.node_key(peer))
-        require_presence(credential)
+        if credential is None or credential.kind != "session":
+            if credential is None or "Idempotency-Key" not in handler.headers:
+                require_presence(credential)
+            require_scope(credential, op["scope"])
+            handler.awaiting_presence = True
+            return
     if write and credential is None:
         raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":
