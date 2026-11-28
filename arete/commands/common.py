@@ -136,6 +136,11 @@ def print_ticket_progress(rows: list[dict]) -> None:
             label = "Draft follow-up" if follow_up["draft"] else "Follow-up PR"
             for url in follow_up["prs"]:
                 print(f"    {label}: {url}")
+        if graph := row.get("spec_graph"):
+            for child in graph.get("children", ()):
+                label = f"{child['ticket']} ({child['key']})" if child.get("ticket") else child["key"]
+                wait = f" — {child['wait_reason']}" if child.get("wait_reason") else ""
+                print(f"    Child {label}: {child['state']}{wait}")
         for update in row["updates"]:
             print(f"    {when(update['at'])}: {update['message']}")
 

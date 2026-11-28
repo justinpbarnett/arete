@@ -27,6 +27,7 @@ from . import (
     run_timing,
     sessions,
     slots,
+    spec_graph_delivery,
     tracker,
     triage,
     util,
@@ -44,6 +45,7 @@ from .store import loops as loop_store
 from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import specgraphs
 from .store import ticket_progress
 from .store import triage as triage_store
 from .store import unblock as unblock_store
@@ -375,15 +377,40 @@ def timing_lines(timing: dict) -> list[str]:
         lines.append(f"{activity}: {timing_duration(entry['seconds'])}")
     return lines
 
+def skipped_by_ticket() -> dict[tuple[str, str], dict]:
+    return {(row["repo"], str(row["id"])): row for row in pipeline.skipped_tickets().values()
+            if row.get("repo") and row.get("id")}
+
+
+def spec_graph_activity(graph: dict) -> tuple[str, str, str]:
+    active = [c for c in graph["children"] if c["state"] != "replaced"]
+    landed = sum(c["state"] == "landed" for c in active)
+    running = sum(c["state"] == "running" for c in active)
+    waiting = graph["waiting"]
+    parts = [f"{landed}/{len(active)} landed"]
+    if running:
+        parts.append(f"{running} running")
+    if waiting:
+        parts.append(f"{len(waiting)} waiting")
+    activity = f"Delivering spec graph ({', '.join(parts)})" if graph["complete"] else "Publishing spec graph"
+    blocker = "; ".join(f"{w['ticket'] or w['key']}: {w['reason']}" for w in waiting)
+    next_event = ("Waiting children start as prerequisites become usable, then integrated verification runs" if waiting
+                  else "Integrated verification completes and closes the parent spec" if graph["state"] in ("published", "evidenced")
+                  else "Spec graph publication completes")
+    return activity, blocker, next_event
+
+
 def ticket_projection(repo: str, issue: str, *, queued: dict, recovery: dict, as_of: datetime,
-                      timing_run: str = "", recorded_only: bool = False, may_have_draft: bool = False) -> dict | None:
+                      timing_run: str = "", recorded_only: bool = False, may_have_draft: bool = False,
+                      running: list[dict] | None = None, skipped_map: dict | None = None) -> dict | None:
     saved = ticket_progress.get(repo, issue)
     run = run_store.newest_live_whole_run(repo, issue) or {}
     run_id, status = run.get("id", ""), run.get("status")
     log = run_timing.read_log(run_id) if status in ("pr", "failed") else []
     merge_hold = merge_blocker(run, log)
     parked = run_timing.last_event(log, "parked") if status == "failed" else {}
-    if recorded_only and not (saved or may_have_draft or merge_hold or parked):
+    graph = spec_graph_delivery.graph_status(repo, issue, skipped=skipped_map, running=running)
+    if recorded_only and not (saved or may_have_draft or merge_hold or parked or graph):
         return None
     timing_id = timing_run or run_id
     timing = run_timing.project(timing_id, as_of=as_of) if timing_id else None
@@ -400,7 +427,9 @@ def ticket_projection(repo: str, issue: str, *, queued: dict, recovery: dict, as
             current = run_timing.project(run_id, as_of=as_of) or {}
         activity, blocker, next_event = ticket_activity(run, queued, recovery, current,
                                                        draft=draft, merge_hold=merge_hold, parked=parked)
-        if recorded_only and not (saved or draft or merge_hold or blocker and parked):
+        if graph and status != "running" and (graph["state"] in ("published", "evidenced") or not graph["complete"]):
+            activity, blocker, next_event = spec_graph_activity(graph)
+        if recorded_only and not (saved or draft or merge_hold or graph or blocker and parked):
             return None
         unrecorded_retry = (status == "running" and not run.get("stop_asked") and hold.get("draft")
                             and run.get("environment_retry_of") == saved.get("run"))
@@ -417,28 +446,33 @@ def ticket_projection(repo: str, issue: str, *, queued: dict, recovery: dict, as
         else:
             hold = None
     since = queued.get("since", "") if blocker and activity in (queued.get("activity"), "Owner answered") else ""
-    return {"repo": repo, "issue": issue, "ticket": tracker.issue_name(repo, issue), "run": run_id,
-            "activity": activity, "blocker": blocker, "next_event": next_event, "since": since,
-            "url": queued.get("url", ""), "follow_up": hold,
-            "prerequisites": saved.get("prerequisites", []), "prerequisite_issues": saved.get("prerequisite_issues", {}),
-            "updates": ticket_updates(repo, issue) if saved else [],
-            "timing": {**{key: timing[key] for key in TIMING_FIELDS}, "lines": timing_lines(timing)} if timing else None}
+    row = {"repo": repo, "issue": issue, "ticket": tracker.issue_name(repo, issue), "run": run_id,
+           "activity": activity, "blocker": blocker, "next_event": next_event, "since": since,
+           "url": queued.get("url", ""), "follow_up": hold,
+           "prerequisites": saved.get("prerequisites", []), "prerequisite_issues": saved.get("prerequisite_issues", {}),
+           "updates": ticket_updates(repo, issue) if saved else [],
+           "timing": {**{key: timing[key] for key in TIMING_FIELDS}, "lines": timing_lines(timing)} if timing else None}
+    if graph is not None:
+        row["spec_graph"] = graph
+    return row
 
 def ticket_status(running: list[dict], *, as_of: datetime | None = None) -> list[dict]:
     with foundation.one_read():
         as_of = as_of or util.now()
         queued = ticket_queue()
+        skips = skipped_by_ticket()
         recovery = {(row["repo"], row["ticket"]): row for row in recovery_queue()}
         repos = [repo.name for repo in config.load_or_problem()[0].repos]
         holds = (ticket_identity(row) for repo in repos for row in run_store.environment_holds(repo) if tracked_run(row)
                  and (not row["released"] or run_store.environment_owner_review_active(row)))
         declared = ((repo, issue) for repo in repos for issue in ticket_progress.declared_prerequisite_tickets(repo))
+        spec_parents = ((repo, parent) for repo in repos for parent in specgraphs.active_parents(repo))
         asking = {(row["repo"], row["ticket"]) for row in asks_store.open_asks(connect=foundation.reader) if row["repo"]}
         attention = run_store.ticket_attention_runs(questions=True)
         classic = (ticket_identity(row) for row in attention if row["status"] == "needs-info"
                    and not asks_store.routes_of([rid := row["id"]]) and classic_tracker_question(rid) and not pipeline.answer_text(rid))
         current = dict.fromkeys([*(ticket_identity(row) for row in running if tracked_run(row)),
-                                 *queued, *recovery, *sorted(asking), *classic, *holds, *declared])
+                                 *queued, *recovery, *sorted(asking), *classic, *holds, *declared, *spec_parents])
         open_prs = dict.fromkeys(ticket_identity(row) for row in attention if row["status"] == "pr"
                                 and ((log := run_timing.read_log(row["id"]))
                                      and (run_timing.draft_report(row, log) or merge_blocker(row, log))))
@@ -446,7 +480,8 @@ def ticket_status(running: list[dict], *, as_of: datetime | None = None) -> list
         candidates = dict.fromkeys([*current, *open_prs, *(ticket_identity(row) for row in recent if tracked_run(row))])
         return [row for key in candidates if (row := ticket_projection(
             *key, queued=queued.get(key, {}), recovery=recovery.get(key, {}), as_of=as_of,
-            recorded_only=key not in current, may_have_draft=key in open_prs)) is not None]
+            recorded_only=key not in current, may_have_draft=key in open_prs,
+            running=running, skipped_map=skips)) is not None]
 
 
 def loops_running() -> set[str]:
@@ -742,8 +777,10 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
             result["ticket_progress"] = None
             if tracked_run(r):
                 key = ticket_identity(r)
-                result["ticket_progress"] = ticket_projection(*key, queued=ticket_queue().get(key, {}), recovery=recovery,
-                                                              as_of=util.now(), timing_run=run_id)
+                live_runs = run_store.runs_marked_running(connect=foundation.reader)
+                result["ticket_progress"] = ticket_projection(
+                    *key, queued=ticket_queue().get(key, {}), recovery=recovery,
+                    as_of=util.now(), timing_run=run_id, running=live_runs, skipped_map=skipped_by_ticket())
         return result
 
 

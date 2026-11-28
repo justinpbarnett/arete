@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import secrets
+import threading
 from datetime import timedelta
 from urllib.parse import parse_qs
 
@@ -15,10 +17,16 @@ from .store import sources as source_store
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 KEY_NAME = "WEBHOOK_SECRET"
 HOOK_PATH = "/hook/"
+SPEC_HOOK = "spec-amendments"
 BODY_KEY_WINDOW = timedelta(minutes=10)
 MAX_HOOK_BODY = 1024 * 1024
 MAX_EVENT_BODY = 60_000
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+GITHUB_SPEC_EVENTS = {
+    "github.issues": {"edited"},
+    "github.issue_comment": {"created", "edited"},
+}
+JIRA_SPEC_EVENTS = {"jira:issue_updated", "comment_created", "comment_updated"}
 
 
 def hook_path(name: str) -> str:
@@ -64,9 +72,10 @@ def unique_scope(name, found):
 def rotate(name, actor):
     found = loops.load_all()
     loop = next((loop for loop in found if loop.name == name), None)
-    if not loop or not loop.trigger.webhook:
+    is_spec_hook = loop is None and name == SPEC_HOOK
+    if not is_spec_hook and (not loop or not loop.trigger.webhook):
         raise Stated(404, f"No webhook for {name}.")
-    if loop.error:
+    if loop and loop.error:
         raise Stated(409, f"The loop {name} is broken.")
     unique_scope(name, found)
     target = scope(name)
@@ -130,10 +139,89 @@ def event_of(name: str, headers, body: bytes) -> dict:
                          data=data if len(text) <= MAX_EVENT_BODY else {"truncated": text[:MAX_EVENT_BODY]})
 
 
+def spec_amendment_target(event: dict) -> tuple[str, str, str] | None:
+    """Identify a GitHub or Jira parent issue from an edit/comment webhook event."""
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return None
+    kind = event.get("type") or event.get("kind", "")
+    if kind in GITHUB_SPEC_EVENTS:
+        action = data.get("action")
+        if action not in GITHUB_SPEC_EVENTS[kind]:
+            return None
+        repo = (data.get("repository") or {}).get("full_name") if isinstance(data.get("repository"), dict) else event.get("repo")
+        issue = data.get("issue")
+        number = issue.get("number") if isinstance(issue, dict) else None
+        if isinstance(repo, str) and repo.strip() and isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            return "github", repo.strip().casefold(), str(number)
+        return None
+    jira_event = data.get("webhookEvent")
+    if isinstance(jira_event, str) and jira_event in JIRA_SPEC_EVENTS:
+        issue = data.get("issue")
+        issue_key = issue.get("key") if isinstance(issue, dict) else None
+        if isinstance(issue_key, str) and issue_key.strip():
+            return "jira", "", issue_key.strip().upper()
+    return None
+
+
+def reconcile_spec_event(event: dict, *, cfg=None) -> list[tuple[str, str]]:
+    """Reconcile any matching published spec graph when a webhook notifies of an issue update."""
+    target = spec_amendment_target(event)
+    if not target:
+        return []
+    kind, slug, ref = target
+    from . import config, gh, jira, spec_amendments, tracker
+    from .store import specs, workspaces
+
+    cfg = cfg or config.load()
+    matched: list[tuple[str, str]] = []
+    for pending in specs.pending():
+        if pending.get("state") != "published" or not pending.get("data", {}).get("graph"):
+            continue
+        repo_name, tid = pending["repo"], str(pending["issue"])
+        try:
+            repo = cfg.repo(repo_name)
+        except config.UnknownRepo:
+            continue
+        if kind == "github":
+            if repo.tracker != "github" or repo.github.casefold() != slug or tid != ref:
+                continue
+        elif repo.tracker != "jira" or tid.upper() != ref:
+            continue
+        with workspaces.ticket_lock(repo_name, tid) as got:
+            if not got:
+                continue
+            claim = specs.find(repo_name, tid)
+            if claim.get("state") != "published" or not claim.get("data", {}).get("graph"):
+                continue
+            try:
+                source = tracker.for_ticket(cfg, repo, tid)
+                spec_amendments.reconcile(source, claim, source.get(tid))
+                matched.append((repo_name, tid))
+            except (KeyError, ValueError, OSError, gh.GhError, jira.JiraError, tracker.TaskError):
+                logging.getLogger(__name__).exception("Webhook spec amendment reconciliation failed for %s/%s", repo_name, tid)
+    return matched
+
+
+def schedule_spec_reconcile(event: dict) -> bool:
+    if not spec_amendment_target(event):
+        return False
+
+    def _run():
+        try:
+            reconcile_spec_event(event)
+        except Exception:
+            logging.getLogger(__name__).exception("Background webhook spec amendment reconciliation failed")
+
+    threading.Thread(target=_run, name="arete-spec-webhook", daemon=True).start()
+    return True
+
+
 def receive(name: str, headers, body: bytes) -> dict:
     found = loops.load_all()
     loop = next((x for x in found if x.name == name), None)
-    if not loop or not loop.trigger.webhook:
+    is_spec_hook = loop is None and name == SPEC_HOOK
+    if not is_spec_hook and (not loop or not loop.trigger.webhook):
         raise Stated(404, f"No webhook for {name}.")
     unique_scope(name, found)
     check(name, headers, body)
@@ -142,10 +230,10 @@ def receive(name: str, headers, body: bytes) -> dict:
         version = factory.admit()
     except factory.Off as error:
         raise Stated(503, str(error)) from error
-    if not loop.enabled or loop.error:
+    if loop and (not loop.enabled or loop.error):
         raise Stated(409, f"The loop {name} is turned off.")
     e = event_of(name, headers, body)
-    if why := loop.trigger.refusal(e):
+    if loop and (why := loop.trigger.refusal(e)):
         raise Stated(403, f"The loop {name} {why}.")
     with foundation.tx() as c:
         try:
@@ -156,5 +244,12 @@ def receive(name: str, headers, body: bytes) -> dict:
             source_store.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
         if not source_store.claim_seen(e["source"], [e["key"]]):
             return {"queued": False, "why": "already received", "key": e["key"]}
-        [item] = sources.fire(loop, "webhook", [e])
-    return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}
+        if is_spec_hook:
+            item = None
+        else:
+            [item] = sources.fire(loop, "webhook", [e])
+    reconcile = schedule_spec_reconcile(e)
+    if is_spec_hook:
+        return {"queued": reconcile, "reconcile": reconcile, "key": e["key"], "at": util.iso()}
+    return {"queued": True, "item": item, "key": e["key"], "at": util.iso(),
+            **({"reconcile": True} if reconcile else {})}
