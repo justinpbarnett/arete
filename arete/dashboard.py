@@ -731,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def loop_action(self, name: str, action: str):
         if action in ("enable", "disable"):
-            return control.switch(name, action == "enable")
+            return control.switch(name, action == "enable", idem=self.headers.get("Idempotency-Key", ""))
         if action == "start":
             return loop_run.launch(name)
         if action == "try":
@@ -1225,7 +1225,11 @@ def post_capture_evidence(handler, rest, query):
 
 
 def post_settings(handler, rest, query):
-    return settings.save(handler.body())
+    body = handler.body()
+    base_version = body.get("base_version")
+    values = {k: v for k, v in body.items() if k != "base_version"}
+    return settings.save(values, base_version=base_version, actor=principals.current(),
+                         source="dashboard", idem=handler.headers.get("Idempotency-Key", ""))
 
 
 def post_chat_new(handler, rest, query):

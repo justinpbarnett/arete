@@ -1086,12 +1086,25 @@ def end_as(result: str, kind: str, **fields) -> Outcome:
     return Outcome(result, feedback=fields.get("why") or fields.get("summary") or "", data={"ending": kind, **fields})
 
 
-def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies: list[str]) -> list[workspace.Checkout]:
+def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies: list[str], *,
+                    extra_repos=()) -> list[workspace.Checkout]:
     repo = run.repo
-    checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
-                                   repo.target_branch or base or util.origin_default_branch(repo.path / p.dir))
-                 for p in repo.parts or [config.Part("", repo.name)]]
-    workspace.require_target_branch(repo, checkouts, work_branch=branch)
+    if extra_repos:
+        checkouts = []
+        for target_repo in (repo, *extra_repos):
+            group = []
+            for p in target_repo.parts or [config.Part("", target_repo.github or target_repo.name)]:
+                subdir = f"{target_repo.name}/{p.dir}" if p.dir else target_repo.name
+                c = workspace.Checkout(subdir, p.github, target_repo.path / p.dir, ws / subdir,
+                                       target_repo.target_branch or base or util.origin_default_branch(target_repo.path / p.dir))
+                group.append(c)
+                checkouts.append(c)
+            workspace.require_target_branch(target_repo, group, work_branch=branch)
+    else:
+        checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
+                                       repo.target_branch or base or util.origin_default_branch(repo.path / p.dir))
+                     for p in repo.parts or [config.Part("", repo.name)]]
+        workspace.require_target_branch(repo, checkouts, work_branch=branch)
     kept = workspace.kept_or_cleared(ws, checkouts, repo.path, copies, branch)
 
     def resumes_for(c: workspace.Checkout) -> bool:
@@ -1136,13 +1149,9 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     elif t.blocker and not run.force:
         return end_as("stop", "quiet", status="skipped", summary=t.blocker)
     try:
-        images = tk.save_images(t, run.dir / "images")
+        attachments, attachment_dirs, _manifest = pipeline.collect_ticket_attachments(tk, t, run.dir, log=run.log)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not download the images on {run.ref}: {e}")
-    if images.paths:
-        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
-    if images.left_out:
-        run.log(f"images: left out {', '.join(images.left_out)}")
     main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
@@ -1163,13 +1172,21 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         tk.prepare()
     if not run.alone:
         run.enter("running")
+    extra_repos = []
+    if t.is_spec:
+        from . import cross_repo
+
+        authorized, _ = cross_repo.authorized_repos(cfg, repo, t)
+        extra_repos = [r for r in authorized if r.name != repo.name]
     try:
         if repo.parts and (not run.dry_run or run.preview_of):
             exclusion = {"excluded": run.closed_checkout_paths} if run.closed_checkouts else {}
+            extra = {"extra_repos": extra_repos} if extra_repos else {}
             checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
-                                                main_layer.copy, preview_of=run.preview_of, **exclusion)[1]
+                                                main_layer.copy, preview_of=run.preview_of, **exclusion, **extra)[1]
         else:
-            checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
+            checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy,
+                                        extra_repos=extra_repos)
         pipeline.claim_workspace(run, job.ws, checkouts)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
@@ -1186,8 +1203,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                         excluded=run.closed_checkout_paths)
     approval = triage_store.triage_approval(run.triage_key)
     data = prepared_fields(t, branch, [*checkouts, *run.closed_checkouts], layer,
-                           [run.dir / "images"] if images.paths else [],
-                           pipeline.images_note(images), approval)
+                           attachment_dirs, attachments, approval)
     if job.closed_prs:
         data["closed_prs"] = sorted(job.closed_prs)
     if feedback_prs:

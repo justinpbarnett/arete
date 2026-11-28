@@ -227,11 +227,11 @@ def reserve(run, remote, parent, data, candidates):
         return specgraphs.accept(key, run.repo.name, data, existing)
 
 
-def queue_blocker(source, tid, *, native=False):
+def queue_blocker(source, tid, *, native=False, repos=()):
     if (tracker.is_task_id(tid) or not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker))
             or not native and not specgraphs.tracks_ticket(source.repo.name, str(tid))):
         return ""
-    if not (remote := spec_tracker.adapter(source)):
+    if not (remote := spec_tracker.adapter(source, repos=repos)):
         return ""
     ref = str(tid)
     if key := specgraphs.membership(remote.scope, ref):
@@ -436,13 +436,14 @@ def intake(job, accepted_direct=None):
     run = job.run
     if SPEC not in job.ticket.labels:
         return None
-    remote = spec_tracker.adapter(run.tracker)
+    repos = getattr(getattr(run, "cfg", None), "repos", ())
+    remote = spec_tracker.adapter(run.tracker, repos=repos)
     if remote is None:
         return None
     key = GraphKey(remote.scope, str(run.tid))
     saved = specgraphs.get(key, run.repo.name)
     try:
-        remote = spec_tracker.adapter(run.tracker, fresh=not run.dry_run)
+        remote = spec_tracker.adapter(run.tracker, fresh=not run.dry_run, repos=repos)
         if remote.scope != key.scope:
             raise Held("the tracker destination changed before spec intake; restore it before resuming")
         return intake_graph(job, remote, key, saved, accepted_direct)

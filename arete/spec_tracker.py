@@ -43,11 +43,17 @@ class Item:
 
 
 def adapter(tk, *, fresh=False, repos=()):
+    enrolled = tuple(repos) or tuple(getattr(tk, "enrolled_repos", ()) or ())
     if isinstance(tk, tracker.GitHubTracker):
-        return GitHub(tk.repo.github, (repo.github for repo in repos if repo.tracker == "github"))
+        return GitHub(tk.repo.github, (repo.github for repo in enrolled if repo.tracker == "github"))
     if isinstance(tk, tracker.JiraTracker):
         client = jira.Client.from_env(tk.cfg) if fresh else tk.client
-        return Jira(client, tk.project, tk.route)
+        projects = (
+            tracker.jira_project(repo, tk.cfg)
+            for repo in enrolled
+            if repo.tracker == "jira" and repo.jira_site in ("", client.base)
+        )
+        return Jira(client, tk.project, tk.route, allowed_projects=projects)
     return None
 
 
@@ -217,9 +223,10 @@ JIRA_FIELDS = "summary,description,labels,status,parent,project,issuetype,issuel
 
 
 class Jira:
-    def __init__(self, client, project, route):
+    def __init__(self, client, project, route, allowed_projects=()):
         self.client = client
         self.project = project.upper()
+        self.allowed_projects = {self.project, *(p.upper() for p in allowed_projects if p)}
         self.route = route
         self.scope = f"jira:{client.base}"
 
@@ -231,7 +238,7 @@ class Jira:
 
     def ref(self, text, *, same_project=True):
         ref = text.upper()
-        if not jira.KEY_RE.fullmatch(ref) or same_project and ref.rsplit("-", 1)[0] != self.project:
+        if not jira.KEY_RE.fullmatch(ref) or (same_project and ref.rsplit("-", 1)[0] not in self.allowed_projects):
             raise Held(f"{text!r} is not a Jira issue key in project {self.project}")
         return ref
 

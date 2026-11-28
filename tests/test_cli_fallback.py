@@ -240,10 +240,12 @@ class CliRouteFallbackTests(unittest.TestCase):
         session_start = "POST /api/sessions"
         task_details = ["GET /api/tasks/t-1234", "GET /api/tasks/t-5678"]
         report = b'{"event":"report","seq":1,"status":"done"}\n'
+        config_kinds = "GET /api/v1/config"
         config_list = "GET /api/v1/config/step_settings"
         config_read = f"{config_list}/defaults"
         config_item = {"kind": "step_settings", "name": "defaults", "path": "config.toml"}
-        config_replies = {config_list: {"items": [config_item]}, config_read: {"item": {**config_item, "content": ""}},
+        config_replies = {config_kinds: {"kinds": []}, config_list: {"items": [config_item]},
+                          config_read: {"item": {**config_item, "content": ""}},
                           f"{config_read}/versions": {"versions": []}, f"{config_read}/diff": {"diff": ""}}
         replies = {
             **config_replies,
@@ -264,6 +266,8 @@ class CliRouteFallbackTests(unittest.TestCase):
             "POST /api/loops/example/start": {"id": "r1"},
             "POST /api/loops/example/enable": {"name": "example", "enabled": True, "serve_up": True},
             "POST /api/loops/example/disable": {"name": "example", "enabled": False},
+            "POST /api/v1/loops/example/enable": {"seq": seq, "loop": {"name": "example", "enabled": True}},
+            "POST /api/v1/loops/example/disable": {"seq": seq, "loop": {"name": "example", "enabled": False}},
             session_start: {"id": "r1", "task": False, "runner": "pi", "model": "test", "device": "local",
                             "cwd": "/tmp", "branch": "", "tools": []},
             "POST /api/incidents/switch": {}, "POST /api/incidents/1/cancel": {"stopped": "", "cooldown_until": ""},
@@ -272,7 +276,9 @@ class CliRouteFallbackTests(unittest.TestCase):
             "GET /api/chats/1/sessions": {}, "POST /api/chats/1/sessions": {},
             "GET /api/chats/1/sessions/r1/report": {}, "POST /api/chats/1/sessions/r1/stop": {},
         }
-        canonical = {"GET /api/tasks": "GET /api/v1/tasks", "POST /api/runs/r1/stop": "POST /api/v1/runs/r1/stop"}
+        canonical = {"GET /api/tasks": "GET /api/v1/tasks", "POST /api/runs/r1/stop": "POST /api/v1/runs/r1/stop",
+                     "POST /api/loops/example/enable": "POST /api/v1/loops/example/enable",
+                     "POST /api/loops/example/disable": "POST /api/v1/loops/example/disable"}
         before = {
             "answer r1": [ask], "resume r1": [info], "repair r1": [info], "step r1 build": [info],
             "stop r1": [info], "session stop r1": [info], "loop stop example": [loop, info],

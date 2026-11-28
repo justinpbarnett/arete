@@ -82,6 +82,22 @@ def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracke
     return [*([tk] if repo.parts or isinstance(tk, tracker.JiraTracker) else []), tracker.LocalTracker(repo)]
 
 
+def _conflicts_other_routes(repo: config.Repo, source: tracker.Tracker,
+                            ticket: tracker.Ticket, other_routes: set[str]) -> bool:
+    hits = other_routes & set(ticket.labels)
+    if not hits:
+        return False
+    if ticket.is_spec and (enrolled := getattr(source, "enrolled_repos", ())):
+        from . import cross_repo
+
+        authorized, error = cross_repo.authorized_repos(config.Config(repos=list(enrolled)), repo, ticket)
+        if not error and len(authorized) > 1 and authorized[0].name == repo.name:
+            allowed_routes = {tracker.route_label(r) for r in authorized}
+            if hits <= allowed_routes:
+                return False
+    return True
+
+
 def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                      other_routes: set[str], excluded: set[str],
                      recovered: tuple[tracker.Ticket, ...], observe) -> Iterator[tracker.Ticket]:
@@ -109,7 +125,8 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
             observe(source, list({t.id: t for t in (*listed, *extra, *open_tickets)}.values()))
         for t in queueing.prioritized([*listed, *extra], open_tickets=open_tickets):
             tid = str(t.id)
-            if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
+            if (tid in excluded or _conflicts_other_routes(repo, source, t, other_routes)
+                    or run_store.issue_running(repo.name, t.id)
                     or not pilot.pickable(tid, repo.name)
                     or (zte.reserved(tid) and not (zte.scheduled_poll() and zte.pickable(tid, repo.name)))):
                 continue
@@ -188,7 +205,7 @@ def priority_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLo
         for t in source.replied():
             if not eligible_again(t.id):
                 continue
-            if other_routes & set(t.labels):
+            if _conflicts_other_routes(repo, source, t, other_routes):
                 skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
                 continue
             blocker, blocker_kind = tracker.blocker_of(source, t.id)
