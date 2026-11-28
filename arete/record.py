@@ -199,7 +199,7 @@ def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dic
     return settled
 
 
-def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:
+def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None, release_claims: bool = True) -> list[dict]:
     settled = []
     for row in run_store.runs_marked_running():
         if ((row["kind"] in TICKET_KINDS) != tickets
@@ -209,8 +209,9 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
             if gone and (done := interrupt(row)):
                 then(done)
                 settled.append(done)
-    if not tickets:
-        loop_store.release_settled_claims()
+    if not tickets and release_claims:
+        with foundation.tx() as c:
+            loop_store.release_settled_claims(c)
     return settled
 
 
