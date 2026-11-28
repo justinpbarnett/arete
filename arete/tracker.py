@@ -165,8 +165,8 @@ def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
     if repo.tracker == "local":
         return LocalTracker(repo)
     if repo.tracker == "jira":
-        return JiraTracker(repo, cfg.jira)
-    return GitHubTracker(repo)
+        return JiraTracker(repo, cfg.jira, enrolled_repos=tuple(cfg.repos))
+    return GitHubTracker(repo, enrolled_repos=tuple(cfg.repos))
 
 
 def for_ticket(cfg: config.Config, repo: config.Repo, tid: str | int) -> Tracker:
@@ -178,9 +178,10 @@ class GitHubTracker:
     pr_labels = ("arete",)
     states = config.STATES
 
-    def __init__(self, repo: config.Repo):
+    def __init__(self, repo: config.Repo, *, enrolled_repos: tuple[config.Repo, ...] = ()):
         self.repo = repo
         self.owner = repo.github.split("/")[0]
+        self.enrolled_repos = tuple(enrolled_repos)
         self._tickets: dict[str, Ticket] = {}
         self._open: dict[int, bool | None] = {}
         self._open_agent_tickets: list[Ticket] = []
@@ -286,8 +287,9 @@ class GitHubTracker:
         refs = [n if repo == own else f"{repo}#{n}" for repo, n in waits]
         native = set(ticket.github_blockers)
         if native:
-            from . import spec_graph_delivery
+            from . import cross_repo, spec_graph_delivery
             satisfied = spec_graph_delivery.satisfied_native(self, ticket.id, native)
+            satisfied |= cross_repo.satisfied_cross_repo_native(self.enrolled_repos, self.repo, ticket.id, native)
             native -= satisfied
             refs = [ref for ref in refs if ref not in satisfied]
         return wait_blocker([*refs, *sorted(native, key=str)], lambda ref: ref in native or self.wait_is_open(ref))
@@ -419,9 +421,10 @@ class JiraTracker:
     pr_labels: tuple[str, ...] = ()
     states = config.RUN_LABELS
 
-    def __init__(self, repo: config.Repo, jcfg: config.JiraConfig):
+    def __init__(self, repo: config.Repo, jcfg: config.JiraConfig, *, enrolled_repos: tuple[config.Repo, ...] = ()):
         self.repo = repo
         self.cfg = jcfg
+        self.enrolled_repos = tuple(enrolled_repos)
         self.project = jira_project(repo, jcfg)
         self.route = route_label(repo)
         self._client: jira.Client | None = None
@@ -698,12 +701,27 @@ def spec_blocker(cfg: config.Config, tk: Tracker, ticket: Ticket, *, require_ope
         return ticket.blocker or "the spec has no stable tracker identity"
     if not tk.repo.pipeline or not tk.repo.parts:
         return "the spec needs a configured pipeline checkout and PR target"
+    from . import cross_repo
+
+    authorized, auth_error = cross_repo.authorized_repos(cfg, tk.repo, ticket)
+    if auth_error:
+        return auth_error
     if isinstance(tk, JiraTracker):
         routed = [r.name for r in cfg.repos if r.tracker == "jira" and r.pipeline
                   and (r.jira_project or cfg.jira.project).upper() == tk.project.upper()
                   and route_label(r) in ticket.labels]
-        if routed != [tk.repo.name]:
-            return "the Jira spec must route to exactly one configured pipeline checkout"
+        if len(authorized) == 1:
+            if routed != [tk.repo.name]:
+                return "the Jira spec must route to exactly one configured pipeline checkout"
+        else:
+            primary = authorized[0].name
+            allowed_names = {r.name for r in authorized}
+            if tk.repo.name != primary:
+                return f"this multi-repo spec is orchestrated by {primary}"
+            if not routed or tk.repo.name not in routed or set(routed) - allowed_names:
+                return "the multi-repo Jira spec route labels do not match its authorized repositories"
+    if require_open and (peer_wait := cross_repo.peer_blocker(cfg, tk.repo, ticket)):
+        return peer_wait
     return ""
 
 
