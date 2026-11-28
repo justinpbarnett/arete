@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from collections import Counter
 from urllib.parse import unquote
@@ -9,7 +10,7 @@ from . import (
     inbox, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage, util,
     webhooks, webpush,
 )
-from .store import chats, credentials, insights, principals, runs
+from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import tasks as task_store
 from .store import tokens, writes
@@ -92,9 +93,22 @@ def resources(name, values):
         return [{"id": k, "label": v} for k, v in VIEWS.items()]
     if name == "step":
         needed(runs.run_get(values["run"]), values["run"])
-        return [{"id": r["id"], "run_id": values["run"], "name": r["step"], "model": r["model"] or "",
-                 "runner": r["runner"] or "", "cost_usd": r["cost_usd"] or 0, "seconds": r["seconds"] or 0}
-                for r in runs.steps(values["run"])]
+        inputs_by_step = runs.step_inputs_by_run(values["run"])
+        snapshots: dict[str, dict | None] = {}
+        out = []
+        for r in runs.steps(values["run"]):
+            snap_sha = r.get("settings_sha") or None
+            if snap_sha and snap_sha not in snapshots:
+                snapshots[snap_sha] = runs.settings_snapshot(snap_sha)
+            step_inputs = inputs_by_step.get(r["id"])
+            out.append({
+                "id": r["id"], "run_id": values["run"], "name": r["step"], "model": r["model"] or "",
+                "runner": r["runner"] or "", "cost_usd": r["cost_usd"] or 0, "seconds": r["seconds"] or 0,
+                "settings_sha": snap_sha,
+                "settings": snapshots.get(snap_sha) if snap_sha else None,
+                "inputs": step_inputs if step_inputs is not None else [],
+            })
+        return out
     if name == "loop":
         return [{"id": r["name"], "enabled": r["enabled"], "detail": r} for r in control.loop_views()]
     if name == "incident":
@@ -208,6 +222,21 @@ def upload_inbox_evidence(handler, op, target):
         status=op["success_status"],
         hash_body={"sha256": digest, "filename": raw_name, "size": len(data)},
     )
+
+
+def put_blob(handler, op, target):
+    expected_sha = target["sha256"]
+    data = api_http.read_body(handler.rfile, handler.content_size, blobs.MAX_BLOB_BYTES)
+    actual_sha = blobs.digest(data)
+    if actual_sha != expected_sha:
+        raise contract.Problem("validation", f"Blob sha256 mismatch: expected {expected_sha}, got {actual_sha}")
+
+    def change():
+        row = blobs.put_verified(expected_sha, data)
+        return with_seq({"blob": {k: row[k] for k in ("sha256", "kind", "bytes")}})
+
+    return handler.keyed_action(op["method"], op["path"], target, change, atomic=True, status=op["success_status"],
+                                hash_body={"sha256": expected_sha})
 
 
 def prepare(name, values):
@@ -336,6 +365,33 @@ def read(name, values, handler):
                 "view": projection(view, values.get("id", ""))}
     if name == "settings.get":
         return {"settings": settings.current()}
+    if name == "settings.resolved":
+        try:
+            return settings.resolved(
+                repo=values.get("repo", ""),
+                task_kind=values.get("task_kind", ""),
+                node=values.get("node", ""),
+            )
+        except config.UnknownRepo as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except ValueError as error:
+            raise contract.Problem("invalid_input", str(error)) from None
+    if name == "blob.get":
+        found = blobs.get(values["sha256"])
+        if found is None:
+            raise contract.Problem("not_found", f"No blob {values['sha256']}")
+        meta_row, raw = found
+        try:
+            encoded, encoding = raw.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            encoded, encoding = base64.b64encode(raw).decode("ascii"), "base64"
+        return {"blob": {
+            "sha256": meta_row["sha256"],
+            "kind": meta_row["kind"],
+            "bytes": meta_row["bytes"],
+            "data": encoded,
+            "encoding": encoding,
+        }}
     if name.startswith("config."):
         return read_config(name.removeprefix("config."), values)
     if name == "health.get":
@@ -412,7 +468,7 @@ def dispatch(handler, op, path_values, query):
     values = {**query, **identity}
     write = contract.keyed_write(op)
     if method != "GET":
-        body = {} if name in ("secret.set", "inbox.upload_evidence") else handler.body()
+        body = {} if name in ("secret.set", "inbox.upload_evidence", "blob.put") else handler.body()
         if write and (query or identity.keys() & body.keys()):
             raise contract.Problem("invalid_input", "Send the target in the URL and writable fields in the body")
         values = {**body, **identity}
@@ -442,6 +498,8 @@ def dispatch(handler, op, path_values, query):
                 )
             if name == "inbox.upload_evidence":
                 return upload_inbox_evidence(handler, op, identity)
+            if name == "blob.put":
+                return put_blob(handler, op, identity)
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])

@@ -779,7 +779,8 @@ def slot_reason(exp: Experiment, free: int, passed: list[dict]) -> str:
     return slots.no_free_slot(exp.cfg.max_parallel) if free <= 0 else ""
 
 
-def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple[str, TextIO, str, float]:
+def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals, *,
+              resolution=None) -> tuple[str, TextIO, str, float]:
     tag = f"{exp.name}-{waiting['task']}-{waiting['arm']}-{waiting['repeat']}"
     began, noted, since, told = time.monotonic(), time.monotonic(), "", ""
     while True:
@@ -788,7 +789,7 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
             passed = source_store.tickets_passed_over()
             if free > 0 and not passed:
                 run_id = record.start("experiment", tag=tag, lock=run_store.run_lock("experiment", exp.repo.name),
-                                      repo=exp.repo.name)
+                                      repo=exp.repo.name, resolution=resolution)
                 held = slots.hold(exp.repo.name, None)
                 if since:
                     append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
@@ -829,36 +830,50 @@ def overrun(limits: dict, used: Totals) -> dict:
 
 
 def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals, seen: dict) -> str:
+    from .. import configrepo, pins
+
     found = events(path)
     attempt = 1 + max((e["attempt"] for e in found if e.get("event") == "start" and key_of(e) == (task, arm, repeat)),
                       default=0)
     waiting = {"event": "wait", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt}
-    run_id, held, since, waited = take_slot(exp, path, waiting, used)
+    extra = exp.extras.get(arm, {})
+    prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
+        if "prompts" in extra else evals.Prompts()
+    src = evals.Source(exp.repo, extra.get("context", ""))
+    pin_res = pins.resolve(
+        "experiment",
+        repo=exp.repo,
+        layer=exp.layer,
+        arm={"name": arm, "atom": exp.atom, "settings": exp.arms[arm], "frozen": exp.frozen},
+        prompts_dir=prompts.dir,
+        prompts_level="arm" if "prompts" in extra else "engine",
+        prompts_from=f"arm:{arm}" if "prompts" in extra else "",
+        harness_source=src,
+        cfg=exp.cfg if not configrepo.is_repo() else None,
+    )
+    run_id, held, since, waited = take_slot(exp, path, waiting, used, resolution=pin_res)
     try:
-        with record.failed_on_crash(run_id):
+        with record.failed_on_crash(run_id), pins.use(pin_res):
             if since:
                 run_lines.waited(run_id, "slot", since, util.iso())
             seen = observed(exp, arm)
             if changed := drift(exp, arm, seen):
                 record.settle(run_id, "stopped", summary=drift_reason(changed))
                 return drift_reason(changed)
-            begun ={"event": "start", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt,
+            begun = {"event": "start", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt,
                      "run": run_id, "at": util.iso(), "seen": seen}
             append(path, begun)
             started = time.monotonic()
-            given = {"id": run_id, "repo": exp.repo, "dir": paths.RUNS_DIR / run_id, "cfg": exp.cfg, "task": task,
+            given = {"id": run_id, "repo": pin_res.repo or exp.repo, "dir": paths.RUNS_DIR / run_id,
+                     "cfg": pin_res.cfg, "task": task,
                      "trial": f"{arm}-{repeat}", "step_overrides": trial_overrides(exp, arm), "limits": exp.limits,
-                     "pinned": exp.layer, "follow": exp.follow, "reviews": exp.reviews,
+                     "pinned": pin_res.layer or exp.layer, "follow": exp.follow, "reviews": exp.reviews,
                      "checks_required": exp.checks_required, "before": replace(used, seconds=used.seconds + waited)}
             trial = exp.make_run(exp, arm, given) if exp.make_run else TrialRun(**given)
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
                 with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
-                    extra = exp.extras.get(arm, {})
-                    prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
-                        if "prompts" in extra else evals.Prompts()
-                    result = evals.run_task(exp.cfg, evals.Source(exp.repo, extra.get("context", "")),
-                                            exp.tasks[task], prompts, run=trial)
+                    result = evals.run_task(pin_res.cfg, src, exp.tasks[task], prompts, run=trial)
                 seen = observed(exp, arm)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)

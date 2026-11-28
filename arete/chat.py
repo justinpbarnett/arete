@@ -161,25 +161,28 @@ def answer_lock(chat_id: int) -> str:
 
 
 def send(chat_id: int, text: str) -> dict:
+    from . import factory_control, pins, principals
     from .store import factory as factory_state
-
-    from . import factory_control
 
     version = factory_state.admit()
     chat_row(chat_id)
     sessions.tell_chats()
     held = util.lock_file(answer_lock(chat_id))
+    actor = principals.current()
     try:
         if not util.take_lock(held, wait=False) or not (message_id := chats_store.chat_claim(chat_id, text, title_of(text))):
             raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
         row = chat_row(chat_id)
+        pin_res = pins.resolve("chat", repo=row["project"] or None)
+        run_id = record.start("chat", tag=f"chat-{chat_id}", repo=row["project"] or None, resolution=pin_res)
 
         def locked_answer() -> None:
-            with held:
+            with held, principals.acting(actor), pins.use(pin_res):
                 try:
                     with factory_control.activity("chat", version):
-                        answer(chat_id, text, message_id, row["project"])
+                        answer(chat_id, text, message_id, row["project"], run_id=run_id)
                 except factory_state.Off as error:
+                    record.settle(run_id, "stopped", summary=str(error)[:300])
                     chats_store.chat_say(chat_id, "arete", str(error), busy=0)
 
         threading.Thread(target=locked_answer, daemon=True).start()
@@ -189,36 +192,68 @@ def send(chat_id: int, text: str) -> dict:
     return view(chat_id)
 
 
-def answer(chat_id: int, text: str, message_id: int, project: str) -> None:
+def answer(chat_id: int, text: str, message_id: int, project: str, *, run_id: str = "") -> None:
+    from . import pins
+
+    created_pin = None
+    if not run_id:
+        created_pin = pins.resolve("chat", repo=project or None)
+        run_id = record.start("chat", tag=f"chat-{chat_id}", repo=project or None, resolution=created_pin)
     try:
-        reply_to(chat_id, text, message_id, project)
+        if created_pin is not None:
+            with pins.use(created_pin):
+                reply_to(chat_id, text, message_id, project, run_id=run_id)
+        else:
+            reply_to(chat_id, text, message_id, project, run_id=run_id)
     finally:
         replying.pop(chat_id, None)
 
 
-def reply_to(chat_id: int, text: str, message_id: int, project: str) -> None:
-    reply, cost, paid, draft, notes = "", 0.0, 0.0, None, []
+def reply_to(chat_id: int, text: str, message_id: int, project: str, *, run_id: str = "") -> None:
+    from . import pins
+
+    created_pin = None
+    if not run_id:
+        created_pin = pins.resolve("chat", repo=project or None)
+        run_id = record.start("chat", tag=f"chat-{chat_id}", repo=project or None, resolution=created_pin)
+    if created_pin is not None:
+        with pins.use(created_pin):
+            _reply_to_pinned(chat_id, text, message_id, project, run_id)
+    else:
+        _reply_to_pinned(chat_id, text, message_id, project, run_id)
+
+
+def _reply_to_pinned(chat_id: int, text: str, message_id: int, project: str, run_id: str) -> None:
+    from . import pins
+
+    reply, cost, paid, draft, notes, run_status = "", 0.0, 0.0, None, [], "done"
     try:
-        cfg = config.load()
+        cfg = pins.active_config()
         allowance = reserve_reply(chat_id, cfg)
         if allowance <= 0:
             reply = (f"This chat's budget is spent ([chat] budget_usd {cfg.chat.budget_usd:g}), so it cannot answer. "
                      "Start another chat, or raise the budget in the config.")
+            run_status = "skipped"
         else:
-            prompt, summary_cost, summary_paid = context_for(chat_id, text, message_id, cfg, allowance)
+            prompt, summary_cost, summary_paid = context_for(chat_id, text, message_id, cfg, allowance, run_id=run_id)
             cost, paid = summary_cost, summary_paid
             if allowance - cost <= 0:
                 reply = "This chat's budget ran out while it summarized the older messages. Send the message again."
+                run_status = "failed"
             else:
-                result = ask(chat_id, prompt, project, cfg, allowance - cost)
+                result = ask(chat_id, prompt, project, cfg, allowance - cost, run_id=run_id)
                 cost, paid = cost + result.cost_usd, paid + result.paid_usd
-                notes = tool_notes(result)
+                notes = tool_notes(result, run_id)
                 if result.ok:
                     reply, draft = reply_and_draft(result)
                 else:
                     reply = f"The agent stopped: {result.error or result.text}"
+                    run_status = "failed"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
+        run_status = "failed"
+    finally:
+        record.settle(run_id, run_status, summary=util.first_line(reply, 300))
     chats_store.chat_say(chat_id, "arete", reply, cost, paid_usd=paid, busy=0, before=[("tool", n) for n in notes],
                    **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
 
@@ -294,8 +329,9 @@ def batches_of(messages: list[dict], limit: int) -> list[list[dict]]:
 
 
 def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
-              allowance: float) -> tuple[str, float, float]:
+              allowance: float, *, run_id: str = "") -> tuple[str, float, float]:
     cost = paid = 0.0
+    trace_run = run_id
     for batch in batches_of(old, cfg.chat.context_tokens):
         if allowance - cost <= 0:
             return "", cost, paid
@@ -305,7 +341,7 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
                 cwd, model=cfg.chat.summary_model, tools=[], persist=False,
                 timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
                 hard_cap=True, wait_out_limits=False,
-                trace=("chat", f"chat {chat_id} summary"), cfg=cfg)
+                trace=(trace_run, f"chat {chat_id} summary"), cfg=cfg)
         cost, paid = cost + res.cost_usd, paid + res.paid_usd
         summary = capped(res.text.strip(), summary_limit(cfg)) if res.ok else ""
         if not summary:
@@ -327,7 +363,7 @@ def sections_of(summary: str, shown: list[dict], left_out: int, row: dict, text:
 
 
 def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config,
-                allowance: float = BUDGET_USD) -> tuple[str, float, float]:
+                allowance: float = BUDGET_USD, *, run_id: str = "") -> tuple[str, float, float]:
     row = chat_row(chat_id)
     budget = cfg.chat.context_tokens
     summary = capped(row["summary"] or "", summary_limit(cfg))
@@ -336,7 +372,7 @@ def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config,
         return sections_of(summary, fresh, 0, row, text), 0.0, 0.0
     recent = newest_within(fresh, budget // 2)
     old = fresh[:len(fresh) - len(recent)]
-    written, cost, paid = summarize(chat_id, summary, old, cfg, allowance) if old else ("", 0.0, 0.0)
+    written, cost, paid = summarize(chat_id, summary, old, cfg, allowance, run_id=run_id) if old else ("", 0.0, 0.0)
     if written:
         chats_store.chat_summarize(chat_id, written, old[-1]["id"])
         return sections_of(written, recent, 0, row, text), cost, paid
@@ -344,13 +380,13 @@ def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config,
     return sections_of(summary, shown, len(fresh) - len(shown), row, text), cost, paid
 
 
-def tool_notes(result: Result) -> list[str]:
-    if not result.record:
+def tool_notes(result: Result, run_id: str = "") -> list[str]:
+    if not result.record or not run_id:
         return []
     calls: dict[str, dict] = {}
     results: dict[str, dict] = {}
     try:
-        for event in record.events(paths.record_dir("chat") / result.record):
+        for event in record.events(paths.record_dir(run_id) / result.record):
             if event.get("kind") == "tool_call" and event.get("name") not in HIDDEN_TOOLS:
                 calls[event.get("id", "")] = event
             elif event.get("kind") == "tool_result":
@@ -538,7 +574,10 @@ def arete_repo(cfg: config.Config) -> config.Repo:
 
 
 def project_section(repo: config.Repo) -> str:
-    layer = config.load_layer(repo.layer_dir)
+    from . import pins
+
+    pin = pins.current()
+    layer = pin.layer if pin is not None and pin.layer is not None else config.load_layer(repo.layer_dir)
     expertise = layer.expertise_file.read_text().strip() if layer.expertise_file.exists() else ""
     return prompt_loader.prompt("chat_project", repo=repo.name, path=repo.path, layer=layer.dir,
                            checks=pipeline.check_list(layer), expertise=expertise or "(none yet)")
@@ -549,9 +588,11 @@ def session_rules(chat_id: int) -> list[str]:
             for rule in (f"Bash(arete session {verb} --chat {chat_id})", f"Bash(arete session {verb} --chat {chat_id} *)")]
 
 
-def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd: float = BUDGET_USD) -> Result:
+def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd: float = BUDGET_USD,
+        *, run_id: str = "") -> Result:
     model = cfg.model("chat")
-    util.write_json(CONTEXT_FILE, {"snapshot": board.snapshot(), "trends": board.trends(), "settings": settings.current()})
+    context_file = (paths.RUNS_DIR / run_id / "context" / "dashboard.json") if run_id else CONTEXT_FILE
+    util.write_json(context_file, {"snapshot": board.snapshot(), "trends": board.trends(), "settings": settings.current()})
     (paths.STATE_DIR / "dashboard.json").unlink(missing_ok=True)
     arete = arete_repo(cfg)
     work = cfg.repo(project) if project else arete
@@ -559,7 +600,7 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
     reads_issues = [f"Bash(gh issue list --repo {github}*)", f"Bash(gh issue view * --repo {github}*)"] if github else []
     return runner.run(
         prompt, work.path,
-        trace=("chat", f"chat {chat_id}"),
+        trace=(run_id, f"chat {chat_id}"),
         persist=False,
         cfg=cfg,
         repo=work,
@@ -569,7 +610,7 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
                        "Bash(arete record*)", "Bash(arete lines*)",
                        "Bash(git show*)", *reads_issues, *session_rules(chat_id)],
         json_schema=REPLY_SCHEMA,
-        system=prompt_loader.prompt("chat", code=arete.path, workdir=work.path, context=CONTEXT_FILE,
+        system=prompt_loader.prompt("chat", code=arete.path, workdir=work.path, context=context_file,
                                github=github or "(no GitHub repo set)", chat=chat_id,
                                max_sessions=cfg.chat.max_sessions, budget=f"{cfg.chat.budget_usd:g}",
                                project=project_section(work) if project else ""),
@@ -578,5 +619,5 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
         needs_server=True,
         timeout=TIMEOUT_SECONDS,
         wait_out_limits=False,
-        add_dirs=[CONTEXT_FILE.parent, *([arete.path] if project else [])],
+        add_dirs=[context_file.parent, *([arete.path] if project else [])],
     )

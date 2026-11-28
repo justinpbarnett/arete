@@ -315,6 +315,53 @@ def record_workspace(row, provider, mode):
         LOG.warning("Could not record a workspace account (%s)", type(error).__name__)
 
 
+def account_for(auth: Auth, connect=db.reader) -> dict | None:
+    who = auth.identity or auth.credential
+    if not (auth.mode and who) or not paths.DB_FILE.exists():
+        return None
+    from . import runner as runner_mod
+
+    try:
+        acct_key = runner_mod.account_of(auth)
+    except Exception:
+        acct_key = ""
+    candidates: list[str] = [v for v in (acct_key, auth.identity, auth.credential) if v]
+    digests: list[str] = []
+    try:
+        key = secretstore.fingerprint_key(None)
+    except Exception:
+        key = None
+    if key is not None and auth.provider:
+        digests.append(secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who))
+        candidates.append(secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, who))
+        if not auth.identity and auth.mode == "subscription":
+            login = scope(auth, "")
+            if login:
+                candidates.append(secretstore.digest(key, "account", auth.provider, auth.mode, auth.family, login))
+    try:
+        with connect() as c:
+            if not db.migration_applied(db.SECRET_REGISTRY_SCHEMA, c):
+                return None
+            for ident in dict.fromkeys(candidates):
+                row = c.execute(
+                    "SELECT * FROM accounts WHERE id = ? OR identity = ? LIMIT 1",
+                    (ident, ident),
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+            if auth.provider and digests:
+                for fp in dict.fromkeys(digests):
+                    row = c.execute(
+                        "SELECT * FROM accounts WHERE provider = ? AND mode = ? AND fingerprint = ? LIMIT 1",
+                        (auth.provider, auth.mode, fp),
+                    ).fetchone()
+                    if row is not None:
+                        return dict(row)
+    except (sqlite3.Error, db.NoDatabase, db.IncompatibleSchema):
+        return None
+    return None
+
+
 def record_resolved(auth: Auth, *, refresh_only: bool = False, defer_unconfigured: bool = False,
                     wait_for_activation: bool = False) -> bool:
     """Return true when the provider attempt should retry enrollment after its child exits."""

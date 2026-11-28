@@ -67,6 +67,7 @@ class Calls:
     step: str
     made: list[dict] = field(default_factory=list)
     n: int = 0
+    schema: str = ""
 
     def add(self, error: str = "", **usage) -> None:
         self.made.append({**usage, "error": error})
@@ -162,7 +163,15 @@ def chain(run_id: str) -> list[list[dict]]:
     while run_id and run_id not in seen:
         seen.add(run_id)
         found.append(read := run_lines.read(run_id))
-        run_id = str(first(read, "route").get("continues") or "")
+        row = None
+        try:
+            row = run_store.run_get(run_id)
+        except Exception:
+            row = None
+        if row is not None and "continues" in row:
+            run_id = str(row.get("continues") or "")
+        else:
+            run_id = str(first(read, "route").get("continues") or "")
     return found
 
 
@@ -273,6 +282,11 @@ class Flow:
         self.work_started = False
         self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
                         and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
+        try:
+            self._highest_contract = run_store.highest_contract_migration()
+        except Exception:
+            self._highest_contract = 0
+        self._writer_versions: dict[str, int | None] = {}
         if self.matching:
             run_lines.write(run_id, "route", continues=continues, only=only, again=again, renew=renew)
 
@@ -366,8 +380,8 @@ class Flow:
 
     def carried(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
-        if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
-                and (not self.again or self.carry < self.again_at)):
+        if (line.get("step") == name and line.get("result") == "pass" and self.stored_compatible(name, line)
+                and self.ctx.keeps(name, kw) and (not self.again or self.carry < self.again_at)):
             outcome = outcome_of(line)
             if not self.accepts(name, outcome, kw):
                 self.carrying = False
@@ -383,9 +397,43 @@ class Flow:
     def takes(self, name: str) -> bool:
         return name != self.only and (name != self.again or self.at < self.again_at)
 
+    def _writer_schema_version(self, writer_id: str) -> int | None:
+        if not writer_id:
+            return None
+        if writer_id not in self._writer_versions:
+            try:
+                row = run_store.run_get(writer_id)
+            except Exception:
+                row = None
+            val = row.get("schema_version") if row else None
+            self._writer_versions[writer_id] = val if isinstance(val, int) else None
+        return self._writer_versions[writer_id]
+
+    def expected_schema(self, name: str) -> str:
+        from . import pins
+
+        if (pin := pins.current()) is not None:
+            return pin.schema_version_for(name)
+        return pins.step_schema_version(name)
+
+    def stored_compatible(self, name: str, line: dict) -> bool:
+        if self._highest_contract > 0:
+            writer_id = str(line.get("run") or self.continues)
+            if writer_id:
+                try:
+                    row = run_store.run_get(writer_id)
+                except Exception:
+                    row = None
+                if row is not None:
+                    sv = self._writer_schema_version(writer_id)
+                    if sv is None or sv < self._highest_contract:
+                        return False
+        expected = self.expected_schema(name)
+        return not (expected and str(line.get("schema") or "") != expected)
+
     def stored(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
-        if line.get("step") != name or not self.takable(line):
+        if line.get("step") != name or not self.takable(line) or not self.stored_compatible(name, line):
             return None
         outcome = outcome_of(line)
         if not self.accepts(name, outcome, kw):
@@ -487,10 +535,12 @@ class Flow:
         if kw.get("tree"):
             where = os.path.abspath(kw["tree"])
             tree = {"tree": where, "fingerprint": fingerprint(where)}
+        schema_ver = calls.schema or self.expected_schema(name)
+        schema_extra = {"schema": schema_ver} if schema_ver else {}
         run_lines.write(self.run_id, "step_end", step=name, **{"try": n}, result=outcome.result, ok=outcome.passed,
                     next=outcome.next, feedback=outcome.feedback, data=outcome.data,
                     session=asdict(outcome.session), **envelope(calls.made), seconds=seconds,
-                    error=error[:MAX_ERROR_CHARS], **tree, **extra)
+                    error=error[:MAX_ERROR_CHARS], **tree, **schema_extra, **extra)
 
     def respond(self, status: str, **fields) -> dict:
         if self.matching and self.stepped:
@@ -547,6 +597,8 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="continue the open PR of this held run from its saved internal review")
     p.add_argument("--action", default="", help="rerun a durable adaptive action by ID with --continue")
     p.add_argument("--only-action", action="store_true", help="rerun only --action, without controller or publication")
+    p.add_argument("--restart", default="", choices=("", "answer", "resume", "step"),
+                   help="why this run restarts an earlier one")
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
@@ -554,8 +606,10 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
         table = overrides(args.sets, flows.SETTABLE)
     except (ValueError, TypeError) as e:
         p.error(str(e))
+    restart = args.restart or ("step" if args.only else "resume" if (args.continues or args.repairs) else "")
     script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
-                             args.repairs, args.action, args.only_action, args.environment_release, tuple(args.sets))
+                             args.repairs, args.action, args.only_action, args.environment_release, tuple(args.sets),
+                             restart)
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)

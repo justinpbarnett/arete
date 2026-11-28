@@ -12,13 +12,13 @@ import threading
 import time
 import traceback
 from concurrent.futures import CancelledError
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import (
-    codebase,
     config,
+    configrepo,
     control,
     delivery,
     device_turns,
@@ -431,6 +431,16 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
         for stale in run_store.runs_marked_running():
             if stale["kind"] == "loop" and stale["loop"] == loop.name:
                 record.interrupt(stale)
+        from . import pins, principals
+
+        loop_actor = principals.current()
+        started_by_val = loop_actor if loop_actor.startswith(("u:", "client:", "rule:")) else f"rule:{loop.name}"
+        pin_res = None
+        if not detach:
+            pin_res = pins.resolve("loop", repo=loop.repo or None, loop_name=loop.name,
+                                   cfg=cfg if not configrepo.is_repo() else None)
+            cfg = pin_res.cfg
+            loop = control.working_loop(name, cfg)
         model = loop.model_for(cfg) if loop.agent else ""
         runner_name = routing.route(model, loop.runner)[0] if loop.agent else ""
         with foundation.tx() as c:
@@ -440,10 +450,15 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
             run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
                           trigger="try" if trial else (fire["trigger"] if fire else "manual"),
                           events=list(events or (fire["payload"] if fire else [])))
-            record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
-                         repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
-                         device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
-                         log=paths.short_path(run.log_file), model=model, runner=runner_name)
+            continues_id = (fire.get("last_run") or None) if fire else None
+            restart_kind = "interrupted" if continues_id else ""
+            with principals.acting(started_by_val):
+                record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
+                             repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
+                             device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
+                             log=paths.short_path(run.log_file), model=model, runner=runner_name,
+                             continues=continues_id, restart=restart_kind,
+                             resolution=pin_res, loop_payer=loop.payer)
             if fire and not loop_store.claim(c, item, run.id):
                 raise control.NotFound(f"queue item {item} was taken by another run")
         if fire and fire.get("last_run"):
@@ -451,9 +466,11 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
         if run.events:
             util.write_json(run.events_file, run.events)
         if not detach:
-            carry(run)
+            with (pins.use(pin_res) if pin_res is not None else nullcontext()):
+                carry(run)
             return run_store.run_get(run.id)
-        proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
+        with principals.acting(started_by_val):
+            proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
         util.mark_holder(held, proc.pid)
     return began(run, proc)
 
@@ -475,14 +492,18 @@ def began(run: LoopRun, proc: subprocess.Popen) -> dict:
 
 
 def carry_opened(run_id: str) -> str:
+    from . import pins
+
     r = run_store.run_get(run_id)
     if not r or r["kind"] != "loop" or r["status"] != "running":
         raise control.NotFound(f"no loop run {run_id} waits to begin")
-    cfg = config.load()
+    pin_res = pins.resolve("loop", repo=r["repo"] or None, loop_name=r["loop"])
+    cfg = pin_res.cfg
     run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
     run.events = util.read_json(run.events_file, [])
-    record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
-    return carry(run)
+    record.attach_pin(run_id, pin_res, pid=os.getpid())
+    with pins.use(pin_res):
+        return carry(run)
 
 
 def carry(run: LoopRun) -> str:
@@ -556,11 +577,13 @@ def reports(row: dict) -> bool:
 
 @loops.runs_kind("command")
 def command_loop(run: LoopRun) -> tuple[str, str]:
-    from . import releasejourneys
+    from . import pins, releasejourneys
 
     loop = run.loop
     env = {"ARETE_RUN_ID": run.id, "ARETE_LOOP": loop.name, "ARETE_LOOP_DIR": str(loop.dir),
            "ARETE_TRIAL": "1" if run.trial else "", "PYTHONUNBUFFERED": "1"}
+    if (pin := pins.current()) is not None and pin.config_commit:
+        env["ARETE_CONFIG_DIR"] = str(pin.config_dir)
     stdin = "".join(json.dumps(e, default=str) + "\n" for e in run.events)
     argv = loop.try_command if run.trial and loop.try_command else loop.command
     run.log("start", f"$ {shlex.join(argv)}" + (f" on {run.device.name}" if run.device.remote else ""))
@@ -843,9 +866,12 @@ def finish_watch(run: LoopRun, events: list[dict], found: list[dict], fresh: lis
 
 
 def open_workspace(run: LoopRun) -> Workspace:
+    from . import pins
+
     repo = run.loop.work_repo(run.cfg)
     src, github = repo.path, repo.github
-    layer = config.load_layer(repo.layer_dir)
+    pin = pins.current()
+    layer = pin.layer if pin is not None and pin.repo and pin.repo.name == repo.name else config.load_layer(repo.layer_dir)
     if "origin" in util.git(["remote"], src, check=False).split():
         base = repo.target_branch or layer.base_branch or (
             gh.default_branch(github) if github else util.origin_default_branch(src))

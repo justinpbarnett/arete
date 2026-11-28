@@ -286,7 +286,11 @@ def environment_checkouts(repo: config.Repo, ws: Path, data: dict, heads: dict[s
         raise workspace.RunFailed("the saved workspace does not match the published draft")
     if left := workspace.scratch_held(ws, checkouts):
         raise workspace.scratch_failure(f"verification scratch at {left[0]} is still held", ws, left)
-    if why := workspace.kept_work(ws, checkouts, repo.path, config.load_layer(repo.layer_dir).copy, commits=False):
+    from . import pins
+
+    pin = pins.current()
+    copy_list = pin.layer.copy if pin is not None and pin.layer is not None else config.load_layer(repo.layer_dir).copy
+    if why := workspace.kept_work(ws, checkouts, repo.path, copy_list, commits=False):
         raise workspace.RunFailed(why)
     branch = data["branch"]
     for c in checkouts:

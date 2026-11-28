@@ -9841,8 +9841,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 99)
-        self.assertEqual(len({op["name"] for op in operations}), 99)
+        self.assertEqual(len(operations), 102)
+        self.assertEqual(len({op["name"] for op in operations}), 102)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -12378,8 +12378,11 @@ with api_server(scopes=('read', 'config:activate')) as (api, _):
     assert isinstance(got['values'], dict)
     roles = got['values']['roles']
     assert [r['role'] for r in roles] == [r.name for r in config.ROLES]
-    assert all(r['level'] is None for r in roles)
     by_role = {r['role']: r for r in roles}
+    assert by_role['build']['level'] == 'config'
+    assert by_role['plan']['level'] in ('engine', 'config', 'inherit')
+    assert by_role['check_repair']['level'] in ('inherit', 'engine')
+    assert all(r['level'] in (None, 'inherit', 'engine', 'config', 'config kind', 'layer', 'layer kind', 'arm', 'run') for r in roles)
     assert by_role['build']['overrides'] == {
         'models': {'build': 'sonnet'},
         'steps': {'implement': {'runner': 'claude', 'model': 'opus', 'effort': 'high'}},
@@ -13885,3 +13888,960 @@ with scratch_records():
     server.sweep_workspaces()
     assert ws.exists() and workspaces.get(wid)["state"] == "kept"
 """)
+
+
+class _PinnedRunCase(unittest.TestCase):
+    def run_pinned(self, body: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-pinned-") as directory:
+            root = Path(directory).resolve()
+            env = api_check.isolated_env(root)
+            preamble = (
+                "import hashlib, json, os, shutil, sqlite3, subprocess, sys, tempfile, threading, tomllib\n"
+                "from contextlib import contextmanager, redirect_stderr, redirect_stdout\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "from arete import (\n"
+                "    accounts, api, api_check, api_http, auditor, board, chat, client, codebase, config,\n"
+                "    configrepo, contract, control, dashboard, doctor, evals, factory, flows, loop_run,\n"
+                "    loops, paths, pins, pipeline, poll, principals, prompt_loader, record,\n"
+                "    replay, routing, run_lines, runner, serve, settings, steps, tailnet, tasks, util,\n"
+                ")\n"
+                "from arete.commands import costs as costs_cmd\n"
+                "from arete.lab import experiment, optimize\n"
+                "from arete.store import (\n"
+                "    asks as ask_store, blobs as blob_store, chats as chat_store, db, insights as insights_store,\n"
+                "    loops as loop_store, runs as run_store, tasks as task_store, tokens as token_store,\n"
+                ")\n"
+                "root = Path.cwd()\n"
+                "GIT_ENV = {\n"
+                "    **{k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'TMPDIR', 'USER', 'LANG', 'LC_ALL', 'TZ')},\n"
+                "    'GIT_AUTHOR_NAME': 'hand', 'GIT_AUTHOR_EMAIL': 'hand',\n"
+                "    'GIT_COMMITTER_NAME': 'hand', 'GIT_COMMITTER_EMAIL': 'hand',\n"
+                "}\n"
+                "def git_run(args, cwd):\n"
+                "    return subprocess.run(['git', *args], cwd=cwd, env=GIT_ENV, check=True, capture_output=True, text=True)\n"
+                "def init_sample_repo(name='sample', check_cmd='true'):\n"
+                "    origin_dir = root / 'origins' / f'{name}.git'\n"
+                "    origin_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    git_run(['init', '--bare', '-q', '-b', 'main'], origin_dir)\n"
+                "    repo_dir = root / 'repos' / name\n"
+                "    repo_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    git_run(['init', '-q', '-b', 'main'], repo_dir)\n"
+                "    (repo_dir / 'README.md').write_text('# sample\\n')\n"
+                "    (repo_dir / 'app.txt').write_text('hello\\n')\n"
+                "    git_run(['add', '.'], repo_dir)\n"
+                "    git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'init'], repo_dir)\n"
+                "    git_run(['remote', 'add', 'origin', str(origin_dir)], repo_dir)\n"
+                "    git_run(['push', '-q', '-u', 'origin', 'main'], repo_dir)\n"
+                "    layer_dir = paths.CONFIG_DIR / 'layers' / name\n"
+                "    layer_dir.mkdir(parents=True, exist_ok=True)\n"
+                "    (layer_dir / 'config.toml').write_text(\n"
+                "        f'[checks]\\nunit = {json.dumps(check_cmd)}\\n'\n"
+                "    )\n"
+                "    (layer_dir / 'expertise.md').write_text('initial expertise\\n')\n"
+                "    return repo_dir, layer_dir\n"
+                "def commit_cfg(rel_path, text, note='edit'):\n"
+                "    _, base = configrepo.read(rel_path)\n"
+                "    return configrepo.commit({rel_path: text}, {rel_path: base}, actor='hand', source='hand', note=note)\n"
+                "@contextmanager\n"
+                "def api_server(scopes=('read', 'config:activate')):\n"
+                "    owner = principals.seed_owner(api_check.LOGIN)\n"
+                "    with db.tx() as c:\n"
+                "        token_store.ensure_key(c)\n"
+                "        _, tok = token_store.issue(owner, 'Pinned test', list(scopes))\n"
+                "    node = SimpleNamespace(names={api_check.ADDRESS})\n"
+                "    logins = tailnet.Logins(tailnet.ScratchHost())\n"
+                "    logins.of = lambda _: api_check.LOGIN\n"
+                "    with mock.patch('socket.getfqdn', return_value=api_check.ADDRESS):\n"
+                "        srv = tailnet.Server(api_check.ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)\n"
+                "    with srv:\n"
+                "        t = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)\n"
+                "        t.start()\n"
+                "        try:\n"
+                "            yield api_check.Check(srv.server_port, root, [], token=tok), owner\n"
+                "        finally:\n"
+                "            srv.shutdown()\n"
+                "            t.join(timeout=5)\n"
+                "codebase.load()\n"
+                "with redirect_stdout(StringIO()):\n"
+                "    db.migrate()\n"
+                "with api_check.offline():\n"
+            )
+            indented = indent(body.lstrip("\n"), "    ")
+            script = preamble + indented + "\n    print('BEHAVIOR_RESULT=' + json.dumps(result))\n"
+            command = api_check.child_command(api_check.SOURCE, script)
+            done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+            self.assertEqual(done.returncode, 0, done.stdout + "\n" + done.stderr)
+            lines = [line for line in done.stdout.splitlines() if line.startswith("BEHAVIOR_RESULT=")]
+            self.assertEqual(len(lines), 1, done.stdout + "\n" + done.stderr)
+            return json.loads(lines[0].partition("=")[2])
+
+
+class PinnedRunTests(_PinnedRunCase):
+    def test_pins_resume_ab_resolved_roles_and_api_blobs(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='false')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\n'
+    'all = true\n'
+    '[steps.plan]\n'
+    'runner = "replay"\n'
+    'model = "sonnet"\n'
+    'effort = "medium"\n'
+    '[steps.build]\n'
+    'runner = "replay"\n'
+    'model = "sonnet"\n'
+    'effort = "high"\n'
+    'timeout_minutes = 11\n'
+    '[ab.build-exp]\n'
+    'step = "build"\n'
+    'share = 0.5\n'
+    '[ab.build-exp.arm]\n'
+    'effort = "low"\n'
+    '[[repo]]\n'
+    'name = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+commit1 = configrepo.live_sha()
+tid = task_store.task_add('sample', 'Pinned run ticket', 'Do the work')
+state = {'commit2': ''}
+seen_prompts = {}
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    seen_prompts.setdefault(step_name, []).append(prompt)
+    if step_name == 'plan':
+        # Mutate config.toml timeout and layer check mid-run BEFORE build runs (once on run 1)!
+        if not state['commit2']:
+            new_cfg = paths.CONFIG_FILE.read_text().replace('timeout_minutes = 11', 'timeout_minutes = 7')
+            commit_cfg('config.toml', new_cfg, 'change timeout')
+            state['commit2'] = commit_cfg('layers/sample/config.toml', '[checks]\nunit = "true"\n', 'fix check')
+        return runner.Result(ok=True, runner='replay', model='sonnet', text='{"plan":"do it","verify":"ok"}',
+                             structured={'plan': 'do it', 'verify': 'ok', 'estimated_lines': 5}, turns=1)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='built', turns=1)
+
+def flow_fn(flow):
+    run = flow.ctx.run
+    brief = prompt_loader.Brief('sample', 'ws', tid, 'Pinned run ticket', 'Do the work')
+    plan_text = brief.prompt('plan', paths.PROMPTS_DIR, triage='', checks='unit')
+    p_res = run.agent('plan', plan_text, flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    assert p_res.ok
+    build_text = brief.prompt('build', paths.PROMPTS_DIR, plan='do it', checks='unit', estimate=5, verify='ok')
+    b_res = run.agent('build', build_text, flow.ctx.ws, role='build')
+    assert b_res.ok
+    chk = flow.ctx.run.layer.checks['unit']
+    if chk == 'false':
+        return 'failed', 'old check failed', ''
+    return 'done', 'new check passed', ''
+
+script1 = pipeline.Script('feature', flow_fn)
+with (mock.patch.object(steps, 'in_arm', return_value=True),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc1 = pipeline.run_issue('sample', tid, force=True, script=script1)
+assert rc1 == 1, rc1
+
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['status'] == 'failed', r1
+assert r1['config_commit'] == commit1, (r1['config_commit'], commit1)
+assert r1['resolved_sha']
+resolved_file = paths.RUNS_DIR / r1['id'] / 'resolved.json'
+assert resolved_file.is_file()
+assert blob_store.read(r1['resolved_sha']) == resolved_file.read_bytes()
+resolved_doc = json.loads(resolved_file.read_bytes())
+assert resolved_doc['config_commit'] == commit1
+assert resolved_doc['settings']['build']['timeout_minutes']['value'] == 11
+assert resolved_doc['settings']['build']['effort']['level'] == 'arm'
+assert resolved_doc['settings']['build']['effort']['from'] == 'ab:build-exp'
+
+steps1 = run_store.steps(r1['id'])
+assert [s['step'] for s in steps1] == ['plan', 'build'], steps1
+by_step1 = run_store.step_inputs_by_run(r1['id'])
+for s in steps1:
+    assert s['settings_sha']
+    snap = run_store.settings_snapshot(s['settings_sha'])
+    assert snap is not None
+    roles_present = {i['role'] for i in by_step1[s['id']]}
+    assert {'prompt', 'inputs', 'rendered'} <= roles_present, (s['step'], roles_present)
+    rendered_item = next(i for i in by_step1[s['id']] if i['role'] == 'rendered')
+    assert blob_store.read(rendered_item['sha256']).decode('utf-8') == seen_prompts[s['step']][0]
+    if s['step'] == 'plan':
+        assert 'schema' in roles_present, roles_present
+    if s['step'] == 'build':
+        assert snap['timeout_minutes']['value'] == 11
+        assert snap['timeout_minutes']['level'] == 'config'
+        assert snap['timeout_minutes']['from'] == f'config.toml@{commit1}'
+
+# Verify tasks.resume builds argv and running via factory.main picks up commit2, timeout 7, passing check,
+# and preserves A/B placement without mutating first run.
+ab1_before = run_store.ab_held(r1['id'])
+assert 'build' in ab1_before, ab1_before
+resume_argv = []
+def capture_launch(cmd, log):
+    resume_argv.extend(cmd)
+    return r1['id']
+with (mock.patch.object(pipeline, 'run_refusal', return_value=(True, '')),
+      mock.patch.object(tasks, 'spawned', side_effect=lambda repo, tid, spawn: (spawn(), 'done')),
+      mock.patch.object(tasks.control, 'launch', side_effect=capture_launch)):
+    tasks.resume(r1['id'])
+assert '--continue' in resume_argv and r1['id'] in resume_argv, resume_argv
+
+script2 = pipeline.Script('feature', flow_fn, continues=r1['id'], restart='resume')
+with (mock.patch.object(steps, 'in_arm', return_value=False),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc2 = pipeline.run_issue('sample', tid, force=True, script=script2)
+assert rc2 == 0, rc2
+r2 = run_store.newest_whole_run('sample', tid)
+assert r2['id'] != r1['id'] and r2['status'] == 'done'
+assert r2['config_commit'] == state['commit2']
+r2_doc = json.loads(blob_store.read(r2['resolved_sha']))
+assert r2_doc['settings']['build']['timeout_minutes']['value'] == 7
+assert r2_doc['settings']['build']['effort']['level'] == 'arm'
+assert run_store.ab_held(r2['id']) == ab1_before
+assert run_store.run_get(r1['id'])['config_commit'] == commit1
+assert run_store.ab_held(r1['id']) == ab1_before
+
+# Verify API surface: GET/PUT blobs, GET settings (RoleView.level), GET settings/resolved (ETag/304), Run/Step fields, arete steps.
+with api_server(scopes=('*',)) as (api_client, owner):
+    # Blob GET
+    got_blob = api_client.read(f"/api/v1/blobs/{r1['resolved_sha']}")
+    assert got_blob['blob']['sha256'] == r1['resolved_sha']
+    assert got_blob['blob']['kind'] == 'resolved'
+    # Blob PUT mismatch -> 422
+    bad_sha = '0' * 64
+    _, raw_bad = api_client.request('PUT', f'/api/v1/blobs/{bad_sha}', b'hello',
+                                    headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-bad-1'},
+                                    status=422)
+    assert json.loads(raw_bad)['code'] == 'validation', raw_bad
+    # Blob PUT valid -> 201 and idempotent 201
+    good_body = b'pinned-blob-payload'
+    good_sha = hashlib.sha256(good_body).hexdigest()
+    _, raw1 = api_client.request('PUT', f'/api/v1/blobs/{good_sha}', good_body,
+                                 headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-good-1'},
+                                 status=201)
+    _, raw2 = api_client.request('PUT', f'/api/v1/blobs/{good_sha}', good_body,
+                                 headers={'Content-Type': 'application/octet-stream', 'Idempotency-Key': 'blob-good-2'},
+                                 status=201)
+    assert json.loads(raw1)['blob']['sha256'] == good_sha
+    assert json.loads(raw2)['blob']['sha256'] == good_sha
+    # Settings RoleView.level + overrides preserved
+    s_resp = api_client.read('/api/v1/settings')['settings']
+    roles_view = {r['role']: r for r in s_resp['values']['roles']}
+    assert list(roles_view) == [r.name for r in config.ROLES]
+    assert roles_view['build']['level'] == 'config'
+    assert roles_view['build']['overrides']['steps']['build']['effort'] == 'high'
+    assert roles_view['check_repair']['level'] in ('inherit', 'engine')
+    # Null provenance when steps.resolve fails / yields empty provenance
+    assert steps.role_level(steps.resolve(config.load(), None, 'build', ''), {}) is None
+    # settings.resolved with repo & ETag / 304
+    res_hdrs, res_raw = api_client.request('GET', '/api/v1/settings/resolved?repo=sample', status=200)
+    res_data = json.loads(res_raw)
+    assert res_data['config_commit'] == state['commit2'], res_data
+    assert res_data['values']['build']['timeout_minutes'] == 7
+    assert res_data['levels']['build']['timeout_minutes']['level'] == 'config'
+    res_roles = {r['role']: r for r in res_data['roles']}
+    assert res_roles['build']['level'] == 'config'
+    etag = res_hdrs.get('ETag')
+    assert etag, res_hdrs
+    api_client.request('GET', '/api/v1/settings/resolved?repo=sample', headers={'If-None-Match': etag}, status=304)
+    # Run & Step API fields
+    run_api = api_client.read(f"/api/v1/runs/{r1['id']}")['run']
+    assert run_api['config_commit'] == commit1 and run_api['resolved_sha'] == r1['resolved_sha']
+    assert run_api['chain'] == r1['id'] and run_api['started_by']
+    steps_api = api_client.read(f"/api/v1/steps?run={r1['id']}")['steps']
+    assert steps_api and all(st['settings_sha'] and st['inputs'] for st in steps_api), steps_api
+
+# Verify `arete steps` uses settings.resolved cleanly
+buf = StringIO()
+with redirect_stdout(buf):
+    assert costs_cmd.cmd_steps(SimpleNamespace(repo='sample', kind='', json=True)) == 0
+steps_out = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+assert any(item['step'] == 'build' for item in steps_out), steps_out
+result = {'ok': True, 'commit1': commit1, 'commit2': state['commit2']}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_new_names_mid_run_never_reloads_config(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\nall = true\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[steps.build]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Mid-run unknown names', 'Body')
+orig_load = config.load
+orig_load_layer = config.load_layer
+orig_resolve = pins.resolve
+resolve_done = {'v': False}
+load_calls_after_resolve = []
+
+def strict_load(*a, **kw):
+    if resolve_done['v']:
+        load_calls_after_resolve.append((a, kw))
+    cfg = orig_load(*a, **kw)
+    if 'future_step' in cfg.steps:
+        raise ValueError('unknown step future_step')
+    return cfg
+
+def strict_load_layer(*a, **kw):
+    layer = orig_load_layer(*a, **kw)
+    if 'future_step' in layer.steps:
+        raise ValueError('unknown layer step future_step')
+    return layer
+
+def wrapped_resolve(*a, **kw):
+    res = orig_resolve(*a, **kw)
+    resolve_done['v'] = True
+    return res
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    if step_name == 'plan':
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text() + '\n[routing]\nfuture_key = true\n[steps.future_step]\nmodel = "sonnet"\n')
+        (layer_dir / 'config.toml').write_text((layer_dir / 'config.toml').read_text() + '\n[steps.future_step]\nmodel = "sonnet"\n')
+        git_run(['add', 'config.toml', 'layers/sample/config.toml'], paths.CONFIG_DIR)
+        git_run(['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-qm', 'newer engine unknown keys'], paths.CONFIG_DIR)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='ok', turns=1)
+
+def flow_fn(flow):
+    run = flow.ctx.run
+    assert run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan').ok
+    assert run.agent('build', 'build prompt', flow.ctx.ws, role='build').ok
+    return 'done', 'finished cleanly', ''
+
+with (mock.patch.object(pins, 'resolve', side_effect=wrapped_resolve),
+      mock.patch.object(config, 'load', side_effect=strict_load),
+      mock.patch.object(config, 'load_layer', side_effect=strict_load_layer),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('mid-run', flow_fn))
+assert rc == 0, rc
+assert load_calls_after_resolve == [], load_calls_after_resolve
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_engine_stamp_reaper_and_child_dirty(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Engine stamp test', 'Body')
+
+def flow_fn(flow):
+    flow.ctx.run.write_line('step_end', step='plan', result='pass')
+    return 'done', 'ok', ''
+
+rc = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('eng', flow_fn))
+assert rc == 0
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['engine_sha'] == codebase.STAMP
+doc = json.loads((paths.RUNS_DIR / r1['id'] / 'resolved.json').read_text())
+assert doc['engine_sha'] == codebase.STAMP
+lines = run_lines.read(r1['id'])
+assert lines and all(ln.get('engine') == codebase.STAMP for ln in lines), lines
+
+# Reaper with patched codebase.STAMP = 'reaper' writes error and report lines with engine = 'reaper'
+dead_id = record.start('pipeline', repo='sample', issue=tid, pid=999999999)
+with db.tx() as c:
+    c.execute("UPDATE runs SET started = '2020-01-01T00:00:00Z' WHERE id = ?", (dead_id,))
+with (mock.patch.object(codebase, 'STAMP', 'reaper'),
+      mock.patch.object(util, 'pid_alive', return_value=False)):
+    pipeline.settle_abandoned_runs(config.load())
+reaped_lines = run_lines.read(dead_id)
+by_ev = {ln['event']: ln for ln in reaped_lines}
+assert 'error' in by_ev and by_ev['error']['engine'] == 'reaper', reaped_lines
+assert 'report' in by_ev and by_ev['report']['engine'] == 'reaper', reaped_lines
+
+# Child started through control.command from a copied git repo after 2nd commit and dirty edit
+copied = root / 'arete-copy'
+copied.mkdir()
+git_run(['init', '-q', '-b', 'main'], copied)
+shutil.copytree(paths.PACKAGE_DIR, copied / 'arete', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+(copied / 'adws').mkdir()
+git_run(['add', '.'], copied)
+git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'first'], copied)
+sha1 = git_run(['rev-parse', '--short=12', 'HEAD'], copied).stdout.strip()
+(copied / 'arete' / '_marker.py').write_text('X = 1\n')
+git_run(['add', '.'], copied)
+git_run(['-c', 'commit.gpgsign=false', 'commit', '-qm', 'second'], copied)
+sha2 = git_run(['rev-parse', '--short=12', 'HEAD'], copied).stdout.strip()
+assert sha1 != sha2
+
+child_env = {**os.environ, 'PYTHONPATH': str(copied)}
+child_cmd = [sys.executable, '-c', 'from arete import codebase; print(codebase.load())']
+out_clean = subprocess.run(child_cmd, cwd=copied, env=child_env, check=True, capture_output=True, text=True).stdout.strip()
+assert out_clean == sha2, (out_clean, sha2)
+(copied / 'arete' / '_marker.py').write_text('X = 2\n')
+out_dirty = subprocess.run(child_cmd, cwd=copied, env=child_env, check=True, capture_output=True, text=True).stdout.strip()
+assert out_dirty.startswith(sha2 + '+dirty.'), out_dirty
+result = {'ok': True, 'sha2': sha2, 'dirty': out_dirty}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_stored_steps_schema_and_contract_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[replay]\nall = true\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[steps.build]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Stored step schema test', 'Body')
+calls = []
+
+def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    step_name = trace[1]
+    calls.append(step_name)
+    return runner.Result(ok=True, runner='replay', model='sonnet', text='{"plan":"p"}',
+                         structured={'plan': 'p', 'verify': 'v'}, turns=1)
+
+def do_plan(flow):
+    res = flow.ctx.run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    return factory.Outcome(data={'plan': res.structured['plan']}, result='pass')
+
+def parked_flow(flow):
+    flow.step('plan')
+    if not flow.continues:
+        return 'needs-info', 'parked waiting', ''
+    return 'done', 'continued done', ''
+
+# Run 1: executes plan and parks
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc1 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow))
+assert rc1 == 0
+r1 = run_store.newest_whole_run('sample', tid)
+assert r1['status'] == 'needs-info' and calls == ['plan']
+
+# Run 2: PLAN_SCHEMA gains one property -> plan runs again under continuation!
+extended_schema = {
+    **pipeline.PLAN_SCHEMA,
+    'properties': {**pipeline.PLAN_SCHEMA['properties'], 'extra_field': {'type': 'string'}},
+}
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(pipeline, 'PLAN_SCHEMA', extended_schema),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc2 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow, continues=r1['id'], restart='resume'))
+assert rc2 == 0
+r2 = run_store.newest_whole_run('sample', tid)
+assert calls == ['plan', 'plan'], calls
+assert any(s['step'] == 'plan' for s in run_store.steps(r2['id']))
+
+# Run 3: contract migration added above r1.schema_version -> takes no stored step even with same schema!
+calls.clear()
+with db.tx() as c:
+    c.execute(
+        "INSERT INTO schema_migrations (n, name, area, phase, sha256, applied) VALUES (?, 'm9999_future_contract.py', 'runs', 'contract', '0', ?)",
+        (r1['schema_version'] + 10, util.iso()),
+    )
+with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
+      mock.patch.object(replay, 'run', side_effect=fake_replay)):
+    rc3 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow, continues=r1['id'], restart='resume'))
+assert rc3 == 0
+assert calls == ['plan'], calls
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PinnedRunLineageTests(_PinnedRunCase):
+    def test_lineage_restarts_chain_and_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[steps.plan]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+tid = task_store.task_add('sample', 'Lineage ticket', 'Body')
+
+# 1. Fresh run: restart='', chain == id
+def finish_flow(status='done'):
+    def _fn(flow):
+        return status, status, ''
+    return _fn
+
+assert pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', finish_flow('needs-info'))) == 0
+r_fresh = run_store.newest_whole_run('sample', tid)
+assert r_fresh['restart'] == '' and r_fresh['chain'] == r_fresh['id'] and r_fresh['continues'] is None
+
+# 2. tasks.continuing passes --restart answer; factory.main parses it and records restart='answer'
+ask_store.ask_add('ask-1', r_fresh['id'], 'sample', tid, 'plan', 'ask', 'why', 'tried',
+                  [{'q': 'which?'}], {}, recovery_route='owner')
+ask_store.ask_close('ask-1', 'answered', [{'text': 'yes'}])
+cfg_now = config.load()
+cont_argv = tasks.continuing(cfg_now, cfg_now.repo('sample'), r_fresh)
+assert '--restart' in cont_argv and cont_argv[cont_argv.index('--restart') + 1] == 'answer', cont_argv
+
+assert pipeline.run_issue('sample', tid, force=True,
+                          script=pipeline.Script('feature', finish_flow('failed'), continues=r_fresh['id'], restart='answer')) == 1
+r_answer = run_store.newest_whole_run('sample', tid)
+assert r_answer['continues'] == r_fresh['id'] and r_answer['restart'] == 'answer' and r_answer['chain'] == r_fresh['id']
+
+# 3. tasks.resume -> restart='resume'
+assert pipeline.run_issue('sample', tid, force=True,
+                          script=pipeline.Script('feature', finish_flow('done'), continues=r_answer['id'], restart='resume')) == 0
+r_resume = run_store.newest_whole_run('sample', tid)
+assert r_resume['continues'] == r_answer['id'] and r_resume['restart'] == 'resume' and r_resume['chain'] == r_fresh['id']
+
+# 4. factory.earlier (--only) -> restart='step'
+def only_plan_flow(flow):
+    flow.step('plan')
+    return 'done', 'done', ''
+with mock.patch.dict(factory.STEPS, {'plan': lambda fl: factory.Outcome(data={}, result='pass')}):
+    assert pipeline.run_issue('sample', tid, force=True,
+                              script=pipeline.Script('feature', only_plan_flow, continues=r_resume['id'], only='plan', restart='step')) == 0
+r_step = run_store.runs(kind='pipeline', limit=1)[0]
+assert r_step['continues'] == r_resume['id'] and r_step['restart'] == 'step' and r_step['chain'] == r_fresh['id']
+
+# 5. Interrupted restart -> restart='interrupted'
+int_id = record.start('pipeline', repo='sample', issue=tid)
+record.interrupt(run_store.run_get(int_id))
+assert pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', finish_flow('done'))) == 0
+r_int = run_store.newest_whole_run('sample', tid)
+assert r_int['continues'] == int_id and r_int['restart'] == 'interrupted' and r_int['chain'] == int_id
+
+# 6. Deleting all route lines from run.jsonl still walks factory.chain via runs.continues
+for rid in (r_fresh['id'], r_answer['id'], r_resume['id'], r_step['id']):
+    p = paths.RUNS_DIR / rid / 'run.jsonl'
+    if p.exists():
+        kept = [ln for ln in p.read_text().splitlines() if '"route"' not in ln]
+        p.write_text('\n'.join(kept) + ('\n' if kept else ''))
+chain_ids = [lines[0]['run'] for lines in factory.chain(r_step['id'])]
+assert chain_ids == [r_step['id'], r_resume['id'], r_answer['id'], r_fresh['id']], chain_ids
+
+# 7. Loop retry with last_run (#289 + #868) sets continues=last_run and restart='interrupted'
+loop_dir = paths.CONFIG_DIR / 'loops' / 'ping'
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / 'loop.toml').write_text('kind = "command"\n[run]\ncommand = "true"\n')
+configrepo.commit_hand_edits()
+prev_loop = record.start('loop', loop='ping', loop_kind='command')
+record.settle(prev_loop, 'interrupted', summary='interrupted')
+with db.tx() as c:
+    qid = c.execute(
+        "INSERT INTO queue (loop, queue, trigger, grp, payload, enqueued, last_run) VALUES ('ping', 'ping', 'manual', '', '[]', ?, ?)",
+        (util.iso(), prev_loop),
+    ).lastrowid
+launched = loop_run.launch('ping', item=qid, detach=False)
+assert launched['continues'] == prev_loop and launched['restart'] == 'interrupted' and launched['chain'] == prev_loop
+
+# 8. Migration m0040 backfill on a seeded schema-39 DB
+mig_root = root / 'mig-lineage'
+mig_state = mig_root / 'state'
+mig_state.mkdir(parents=True)
+with mock.patch.multiple(paths, STATE_DIR=mig_state, DB_FILE=mig_state / 'arete.db',
+                         RUNS_DIR=mig_state / 'runs', LOCKS_DIR=mig_state / 'locks'):
+    chain42 = [m for m in db.migrations.load() if m.n <= 42]
+    with mock.patch.object(db.migrations, 'load', return_value=chain42):
+        db.migrate()
+    owner_id = principals.seed_owner('owner@mig.test')
+    with db.tx() as c:
+        for idx, rid in enumerate(('r-fresh', 'r-step', 'r-ans', 'r-int', 'r-res'), 1):
+            c.execute("INSERT INTO runs (id, kind, status, started, repo, issue) VALUES (?, 'pipeline', 'done', ?, 'sample', '1')",
+                      (rid, f'2026-01-01T00:00:0{idx}Z'))
+        c.execute("INSERT INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, status, taken_by) "
+                  "VALUES ('a1', 'r-fresh', 'sample', '1', 'plan', 'ask', 'w', 't', '[]', '2026-01-01T00:00:01Z', 'answered', 'r-ans')")
+    (mig_state / 'runs' / 'r-step').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-step' / 'run.jsonl').write_text(json.dumps({'event': 'route', 'continues': 'r-fresh', 'only': 'plan'}) + '\n')
+    (mig_state / 'runs' / 'r-ans').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-ans' / 'run.jsonl').write_text(json.dumps({'event': 'route', 'continues': 'r-fresh'}) + '\n')
+    (mig_state / 'runs' / 'r-int').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-int' / 'run.log').write_text('restarting after run r-fresh was interrupted\n')
+    (mig_state / 'runs' / 'r-res').mkdir(parents=True)
+    (mig_state / 'runs' / 'r-res' / 'run.jsonl').write_text(json.dumps({'event': 'repair', 'source': 'r-ans'}) + '\n')
+    db.migrate()
+    with db.reader() as c:
+        rows = {r['id']: dict(r) for r in c.execute('SELECT rowid AS rid_num, * FROM runs')}
+    assert rows['r-fresh']['restart'] == '' and rows['r-fresh']['chain'] == 'r-fresh'
+    assert rows['r-step']['restart'] == 'step' and rows['r-step']['continues'] == 'r-fresh' and rows['r-step']['chain'] == 'r-fresh'
+    assert rows['r-ans']['restart'] == 'answer' and rows['r-ans']['continues'] == 'r-fresh' and rows['r-ans']['chain'] == 'r-fresh'
+    assert rows['r-int']['restart'] == 'interrupted' and rows['r-int']['continues'] == 'r-fresh' and rows['r-int']['chain'] == 'r-fresh'
+    assert rows['r-res']['restart'] == 'resume' and rows['r-res']['continues'] == 'r-ans' and rows['r-res']['chain'] == 'r-fresh'
+    assert all(r['payer'] == owner_id and r['seq'] == r['rid_num'] for r in rows.values())
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_payer_resolution_and_routing_enforcement(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+owner = principals.seed_owner('owner@example.test')
+with db.tx() as c:
+    c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('multi_user', 'ready')")
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-a', 'human', 'member', 'active', 'A', ?)", (util.iso(),))
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-b', 'human', 'member', 'active', 'B', ?)", (util.iso(),))
+
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    '[automation]\n'
+    f'payer = {json.dumps(owner)}\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+
+# 1. Person A -> started_by = payer = A
+with principals.acting('u:person-a'):
+    r_a = run_store.run_get(record.start('pipeline', repo='sample', issue='1'))
+assert r_a['started_by'] == 'u:person-a' and r_a['payer'] == 'u:person-a'
+
+# 2. Poller with automation.payer -> started_by = rule:poll, payer = owner
+with principals.acting('rule:poll'):
+    r_poll = run_store.run_get(record.start('pipeline', repo='sample', issue='2'))
+assert r_poll['started_by'] == 'rule:poll' and r_poll['payer'] == owner
+
+# 3. Poller without automation.payer -> payer = NULL
+commit_cfg('config.toml', paths.CONFIG_FILE.read_text().replace(f'[automation]\npayer = {json.dumps(owner)}\n', ''), 'drop auto payer')
+with principals.acting('rule:poll'):
+    r_null = run_store.run_get(record.start('pipeline', repo='sample', issue='3'))
+assert r_null['started_by'] == 'rule:poll' and r_null['payer'] is None
+
+# 4. Loop [run] payer = A
+loop_dir = paths.CONFIG_DIR / 'loops' / 'paid-loop'
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / 'loop.toml').write_text('kind = "command"\n[run]\ncommand = "true"\npayer = "u:person-a"\n')
+configrepo.commit_hand_edits()
+r_loop = loop_run.launch('paid-loop', detach=False)
+assert r_loop['payer'] == 'u:person-a'
+
+# 5. Interrupted restart keeps continued run's payer; resume as person B has payer B
+with principals.acting('rule:poll'):
+    r_int = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='interrupted'))
+assert r_int['payer'] == 'u:person-a'
+with principals.acting('u:person-b'):
+    r_res_b = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='resume'))
+assert r_res_b['started_by'] == 'u:person-b' and r_res_b['payer'] == 'u:person-b'
+
+# 6. routing.select personal vs workspace account enforcement
+personal_auth = accounts.Auth(provider='anthropic', mode='subscription', identity='acct-personal', credential='cred-p')
+work_auth = accounts.Auth(provider='anthropic', mode='api-key', identity='acct-work', credential='cred-w')
+with db.tx() as c:
+    now = util.iso()
+    c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES ('acct-personal', 'anthropic', 'acct-personal', 'subscription', 'u:person-a', 'personal', 'fp-p', ?)", (now,))
+    c.execute("INSERT INTO accounts (id, provider, identity, mode, holder, usage, fingerprint, created) "
+              "VALUES ('acct-work', 'anthropic', 'acct-work', 'api-key', 'workspace', 'workspace', 'fp-w', ?)", (now,))
+
+from dataclasses import replace as dc_replace
+cfg = config.load()
+link_personal = routing.Link('sonnet', 'claude', 'anthropic', 't1', 0, True, '', ())
+link_work = routing.Link('sonnet', 'pi', 'anthropic', 't1', 1, False, '', ())
+step_s = dc_replace(steps.resolve(cfg, None, 'build', ''), runner='claude', model='sonnet', provider='anthropic',
+                    chain=(link_personal, link_work), fallback=True)
+way_personal = routing.Way(link_personal, 'claude', 'sonnet', 'cred-p', 'free', 'subscription')
+way_work = routing.Way(link_work, 'pi', 'sonnet', 'cred-w', 'paid', 'api_key')
+
+def fake_auth_for(self, way):
+    return personal_auth if way.runner == 'claude' else work_auth
+
+def fake_ways(self, link):
+    return [way_personal] if link.runner == 'claude' else [way_work]
+
+def fake_probe(self, model, mode=''):
+    return SimpleNamespace(token_error='', login_available=True, key_available=True, error='',
+                           auth=work_auth, model='sonnet', provider='anthropic', hidden=(), models={})
+
+with (mock.patch.object(routing.Discovery, 'auth_for_way', fake_auth_for),
+      mock.patch.object(routing.Discovery, 'ways', fake_ways),
+      mock.patch.object(routing.Discovery, 'probe', fake_probe)):
+    sel_a = routing.select(routing.Discovery(cfg, payer='u:person-a'), step_s)
+    sel_b = routing.select(routing.Discovery(cfg, payer='u:person-b'), step_s)
+    sel_null = routing.select(routing.Discovery(cfg, payer=None), step_s)
+assert sel_a.kept is True, sel_a
+assert sel_b.kept is False and sel_b.route is not None and sel_b.route.runner == 'pi', sel_b
+assert sel_null.kept is False and sel_null.route is not None and sel_null.route.runner == 'pi', sel_null
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_run_order_seq_and_rebuild_invariance(self):
+        result = self.run_pinned(r"""
+# 1. Static check: no rowid reference against runs in arete/
+bad_hits = []
+for py in paths.PACKAGE_DIR.rglob('*.py'):
+    text = py.read_text()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        low = line.lower()
+        if 'rowid' in low and ('runs' in low or 'later.rowid' in low or 'r.rowid' in low or 'r2.rowid' in low):
+            if 'step_inputs' not in low and 'runs_seq' not in low and 'task_comments' not in low:
+                bad_hits.append(f'{py.name}:{lineno}:{line.strip()}')
+assert bad_hits == [], bad_hits
+
+# 2. Insert whole runs A then B with an open ask on A
+id_a = record.start('pipeline', run_id='pip-z-first', repo='sample', issue='42')
+record.settle(id_a, 'needs-info', summary='waiting')
+ask_store.ask_add('ask-a', id_a, 'sample', '42', 'plan', 'ask', 'why', 'tried', [{'q': 'q'}], {})
+id_b = record.start('pipeline', run_id='pip-a-second', repo='sample', issue='42')
+record.settle(id_b, 'done', summary='finished')
+
+with db.reader() as c:
+    assert c.execute('SELECT count(*) FROM runs WHERE seq IS NULL').fetchone()[0] == 0
+
+# 3. Rebuild runs table copying rows in REVERSE id/seq order (which swaps rowids)
+with db.tx() as c:
+    rows = [dict(r) for r in c.execute('SELECT * FROM runs ORDER BY seq DESC')]
+    c.execute('DELETE FROM runs')
+    cols = list(rows[0].keys())
+    ph = ','.join('?' for _ in cols)
+    for row in rows:
+        c.execute(f"INSERT INTO runs ({', '.join(cols)}) VALUES ({ph})", [row[k] for k in cols])
+    rowids = {r['id']: r['rid'] for r in c.execute('SELECT id, rowid AS rid FROM runs')}
+assert rowids[id_b] < rowids[id_a], rowids
+
+# 4. later_run and open_asks still follow seq order, NOT rowid order!
+later_a = run_store.later_run('sample', '42', id_a)
+assert later_a is not None and later_a['id'] == id_b, later_a
+assert run_store.later_run('sample', '42', id_b) is None
+assert all(a['id'] != 'ask-a' for a in ask_store.open_asks())
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PinnedRunChatEvalTests(_PinnedRunCase):
+    def test_chat_runs_exclusions_and_migration(self):
+        result = self.run_pinned(r"""
+repo_dir, layer_dir = init_sample_repo('sample', check_cmd='true')
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 1\n'
+    'arete_repo = "sample"\n'
+    '[replay]\nall = true\n'
+    '[steps.chat]\nrunner = "replay"\nmodel = "sonnet"\n'
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\n'
+)
+configrepo.init()
+with db.tx() as c:
+    c.execute("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('multi_user', 'ready')")
+    c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES ('u:person-a', 'human', 'member', 'active', 'A', ?)", (util.iso(),))
+
+cid = chat_store.chat_add('sample')
+mid = chat_store.chat_claim(cid, 'Hello chat', 'Hello chat')
+fake_res = runner.Result(ok=True, runner='replay', model='sonnet', text='{"reply":"Hi back","notes":[]}',
+                         structured={'reply': 'Hi back', 'notes': []}, cost_usd=0.05, tokens_in=10, tokens_out=5, turns=1)
+with (principals.acting('u:person-a'),
+      mock.patch.object(replay, 'run', return_value=fake_res)):
+    chat.reply_to(cid, 'Hello chat', mid, 'sample')
+
+chat_runs = run_store.runs(kind='chat', limit=10)
+assert len(chat_runs) == 1, chat_runs
+cr = chat_runs[0]
+assert cr['started_by'] == 'u:person-a' and cr['payer'] == 'u:person-a' and cr['resolved_sha'], cr
+assert cr['status'] == 'done', cr
+chat_steps = run_store.steps(cr['id'])
+assert len(chat_steps) == 1, chat_steps
+assert run_store.steps('chat') == []
+
+# Excluded from runs(), board.snapshot, auditor.run_stats
+assert all(r['kind'] != 'chat' for r in run_store.runs(limit=50))
+snap = board.snapshot()
+assert all(r['kind'] != 'chat' for r in snap['recent']['rows']), snap['recent']
+assert all(r['kind'] != 'chat' for r in snap['live']['rows']['runs']), snap['live']
+stats = auditor.run_stats()
+assert all(r.get('kind') != 'chat' for r in stats), stats
+
+# Migration m0041 backfills seeded 'chat' steps into one 'chat' run row and doctor reports no 'chat' line and no orphan
+mig_state = root / 'mig-chat' / 'state'
+mig_state.mkdir(parents=True)
+with mock.patch.multiple(paths, STATE_DIR=mig_state, DB_FILE=mig_state / 'arete.db',
+                         RUNS_DIR=mig_state / 'runs', LOCKS_DIR=mig_state / 'locks'):
+    chain43 = [m for m in db.migrations.load() if m.n <= 43]
+    with mock.patch.object(db.migrations, 'load', return_value=chain43):
+        db.migrate()
+    owner_id = principals.seed_owner('owner@chatmig.test')
+    with db.tx() as c:
+        c.execute("INSERT INTO steps (run_id, step, runner, model, ok, cost_usd, tokens_in, tokens_out, ts) "
+                  "VALUES ('chat', 'chat', 'replay', 'sonnet', 1, 0.10, 100, 50, '2026-01-01T00:00:01Z')")
+        c.execute("INSERT INTO steps (run_id, step, runner, model, ok, cost_usd, tokens_in, tokens_out, ts) "
+                  "VALUES ('chat', 'chat', 'replay', 'sonnet', 1, 0.20, 200, 80, '2026-01-01T00:00:02Z')")
+    db.migrate()
+    backfilled = run_store.run_get('chat')
+    assert backfilled is not None and backfilled['kind'] == 'chat' and backfilled['payer'] == owner_id
+    assert abs(backfilled['cost_usd'] - 0.30) < 1e-6
+    doc_results = doctor.run()
+    assert 'chat' not in doctor.NAMES
+    assert not any(r.name == 'chat' for r in doc_results)
+    orphans = next(r for r in doc_results if r.name == 'orphans')
+    assert orphans.count == 0, orphans
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_evals_pin_regression_and_legacy_fallback(self):
+        result = self.run_pinned(r"""
+sample_dir = root / 'opt-sample'
+sample_lines = optimize.sample(sample_dir)
+layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO
+shutil.copytree(sample_dir / 'layer', layer_dest)
+rewritten = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line
+             for line in sample_lines if not line.startswith('#')]
+cfg_text = optimize.edited('\n'.join(rewritten) + '\n', 'models', {'build': 'scratch-a'})
+paths.CONFIG_FILE.write_text(cfg_text)
+configrepo.init()
+
+# Run 3 passing evals
+with redirect_stdout(StringIO()):
+    for _ in range(3):
+        assert evals.run(replay.SAMPLE_REPO, 'word-train') == 0
+
+runs_before = run_store.runs(kind='eval', limit=10)
+assert len(runs_before) == 3
+for r in runs_before:
+    assert r['resolved_sha'] and r['engine_sha'] == codebase.STAMP
+
+# Mutate build model -> scratch-b, add a line to build.md in --prompts dir, and change overlaid harness file (CLAUDE.md)
+commit_cfg('config.toml', cfg_text.replace('scratch-a', 'scratch-b'), 'bump build model')
+custom_prompts = root / 'custom-prompts'
+shutil.copytree(paths.PROMPTS_DIR, custom_prompts)
+(custom_prompts / 'build.md').write_text((custom_prompts / 'build.md').read_text() + '\n# extra line\n')
+repo_obj = config.load().repo(replay.SAMPLE_REPO)
+(repo_obj.path / 'CLAUDE.md').write_text('# changed harness\n')
+
+# 4th run fails -> REGRESSED names build model, prompts, and harness
+orig_run_task = evals.run_task
+def failing_fourth(cfg, src, task, prompts_arg, run_obj):
+    res = orig_run_task(cfg, src, task, prompts_arg, run_obj)
+    res.passed = False
+    res.why = 'forced regression'
+    return res
+
+buf = StringIO()
+with mock.patch.object(evals, 'run_task', side_effect=failing_fourth), redirect_stdout(buf):
+    assert evals.run(replay.SAMPLE_REPO, 'word-train', prompts=evals.Prompts(custom_prompts, 'custom')) == 0
+
+out = buf.getvalue()
+assert 'REGRESSED:' in out, out
+reg_line = next(ln for ln in out.splitlines() if 'REGRESSED:' in ln)
+assert 'build model' in reg_line and 'prompts' in reg_line and 'harness' in reg_line, reg_line
+
+runs_after = run_store.runs(kind='eval', limit=10)
+assert runs_after[0]['resolved_sha'] != runs_before[0]['resolved_sha']
+assert runs_after[0]['engine_sha'] == codebase.STAMP
+
+# Each evals row joins only its own step range's step_inputs, and pre-pin evals row still reads interim values
+hist = insights_store.task_history(replay.SAMPLE_REPO, 'word-train', 4)
+assert len(hist) == 3 and all(h['run_id'] for h in hist), hist
+hist_custom = insights_store.task_history(replay.SAMPLE_REPO, 'word-train', 4, source='worktree with prompts custom')
+assert len(hist_custom) == 1 and hist_custom[0]['run_id'] == runs_after[0]['id'], hist_custom
+raw_eval = insights_store.eval_rows(runs_after[0]['id'])[0]
+assert raw_eval['engine_sha'] == '' and raw_eval['prompts_sha'] == '' and raw_eval['settings'] == ''
+step_ids_4 = [s['id'] for s in run_store.steps(runs_after[0]['id'])]
+assert step_ids_4 and all(raw_eval['after_step'] < sid <= raw_eval['last_step'] for sid in step_ids_4)
+
+legacy_row = {
+    'run_id': 'legacy-unpinned-eval',
+    'engine_sha': 'old-engine',
+    'prompts_sha': 'old-prompts',
+    'base_commit': 'abc',
+    'context_sha': 'old-ctx',
+    'settings': json.dumps({'models': {'build': 'old-model'}}),
+}
+assert evals.has_lineage(legacy_row)
+diff_legacy = evals.lineage_changes(legacy_row, hist_custom[0])
+assert any('old-model' in d for d in diff_legacy) and 'prompts' in diff_legacy, diff_legacy
+result = {'ok': True, 'reg_line': reg_line}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_trials_pin_prompts_and_harness(self):
+        result = self.run_pinned(r"""
+sample_dir = root / 'opt-sample'
+sample_lines = optimize.sample(sample_dir)
+layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO
+shutil.copytree(sample_dir / 'layer', layer_dest)
+rewritten = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line
+             for line in sample_lines if not line.startswith('#')]
+paths.CONFIG_FILE.write_text('\n'.join(rewritten) + '\n')
+configrepo.init()
+
+cfg = config.load()
+repo_obj = cfg.repo(replay.SAMPLE_REPO)
+arm_prompts = root / 'arm-prompts'
+shutil.copytree(paths.PROMPTS_DIR, arm_prompts)
+(repo_obj.path / 'CLAUDE.md').write_text('# original harness\n')
+
+base_sha = git_run(['rev-parse', 'HEAD'], repo_obj.path).stdout.strip()
+exp = experiment.designed({
+    'name': 'sample-trial',
+    'repo': replay.SAMPLE_REPO,
+    'atom': 'build',
+    'repeats': 1,
+    'arms': {'base': {'effort': 'medium'}, 'trial': {'effort': 'low', 'prompts': str(arm_prompts)}},
+    'tasks': {'word-train': {'split': 'train', 'base': base_sha}},
+    'accept': {'baseline': 'base', 'split': 'train'},
+    'limits': {'spend_usd': 10.0, 'minutes': 10, 'calls': 50, 'tokens': 100000},
+})
+trail = root / 'trail.jsonl'
+trail.write_text('')
+
+orig_prepare = evals.prepare
+overlay_claude_seen = []
+
+def wrapped_prepare(repo_arg, src_arg, wt_arg, run_arg):
+    # Edit harness file on disk right BEFORE evals.prepare; pinned blob overlay must ignore this edit!
+    (repo_obj.path / 'CLAUDE.md').write_text('# mutated mid-trial harness\n')
+    layer_out = orig_prepare(repo_arg, src_arg, wt_arg, run_arg)
+    overlay_claude_seen.append((wt_arg / 'CLAUDE.md').read_text())
+    return layer_out
+
+orig_run = runner.run
+def wrapped_runner(prompt_text, cwd, **kw):
+    step_name = kw.get('trace', ('', ''))[1]
+    if step_name == 'plan':
+        # Append to arm's build.md AFTER plan; build's rendered prompt must NOT include this line!
+        (arm_prompts / 'build.md').write_text((arm_prompts / 'build.md').read_text() + '\nMUTATED_AFTER_PLAN\n')
+    return orig_run(prompt_text, cwd, **kw)
+
+with (mock.patch.object(evals, 'prepare', side_effect=wrapped_prepare),
+      mock.patch.object(runner, 'run', side_effect=wrapped_runner)):
+    experiment.run_trial(exp, trail, 'word-train', 'trial', 1, experiment.Totals(), {})
+
+trial_runs = run_store.runs(kind='experiment', limit=5)
+assert len(trial_runs) == 1, trial_runs
+tr = trial_runs[0]
+assert tr['resolved_sha'] and tr['engine_sha'] == codebase.STAMP
+steps_tr = run_store.steps(tr['id'])
+assert steps_tr
+inputs_tr = run_store.step_inputs_by_run(tr['id'])
+build_step = next(s for s in steps_tr if s['step'] == 'build')
+rendered_build = next(i for i in inputs_tr[build_step['id']] if i['role'] == 'rendered')
+build_text = blob_store.read(rendered_build['sha256']).decode('utf-8')
+assert 'MUTATED_AFTER_PLAN' not in build_text
+assert overlay_claude_seen == ['# original harness\n'], overlay_claude_seen
+result = {'ok': True, 'run_id': tr['id']}
+""")
+        self.assertTrue(result["ok"])
+

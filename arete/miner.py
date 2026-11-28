@@ -995,11 +995,19 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
         if not got:
             print("miner already running")
             return 0
+        from contextlib import nullcontext
+        from . import configrepo, pins
+
         since, until, checkpointed, lost = window(cfg, hours, util.now())
+        pin_res = None if dry_run else pins.resolve("miner", cfg=cfg if not configrepo.is_repo() else None)
+        if pin_res is not None:
+            cfg = pin_res.cfg
         run_id = (record.new_id("min") if dry_run else
-                  record.start("miner", lock=run_store.run_lock("miner"), trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER))
+                  record.start("miner", lock=run_store.run_lock("miner"),
+                               trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER, resolution=pin_res))
         try:
-            code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply)
+            with (pins.use(pin_res) if pin_res is not None else nullcontext()):
+                code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply)
             if not dry_run:
                 mark_loop("mine", code == 0)
             return code

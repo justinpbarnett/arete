@@ -334,7 +334,9 @@ class AgentRun:
     @property
     def config(self) -> config.Config:
         if self.cfg is None:
-            self.cfg = config.load()
+            from . import pins
+
+            self.cfg = pins.active_config()
         return self.cfg
 
     @property
@@ -345,6 +347,11 @@ class AgentRun:
         role = config.STEP_ALIASES.get(role, role)
         if role in self.resolved_settings:
             return self.resolved_settings[role]
+        from . import pins
+
+        if (pin := pins.current()) is not None and not self.overrides and not self.step_overrides:
+            if (self.kind or "") == (pin.task_kind or "") and (pinned := pin.settings_for(role)) is not None:
+                return pinned
         return steps.resolve(self.config, self.layer, role, self.kind,
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}), ticket=self.ab_ticket,
@@ -440,8 +447,16 @@ class AgentRun:
         cfg = kw.get("cfg") or self.config
         if not (s and s.requires.declared and not cfg.replay.all):
             return kw
+        from . import pins
+
         size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
-        found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
+        if (pin := pins.current()) is not None:
+            run_payer = pin.payer
+        elif (row := run_store.run_get(self.id)) is not None:
+            run_payer = row.get("payer")
+        else:
+            run_payer = routing._UNSET
+        found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer, payer=run_payer)
         servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
         bare, denied = routing.reach(kw)
         effective = replace(s, tools=bare, denied=denied, mcp=tuple(servers))
@@ -2215,6 +2230,7 @@ class Script:
     action_only: bool = False
     environment_release: str = ""
     settings_args: tuple[str, ...] = ()
+    restart: str = ""
 
     @property
     def run_fields(self) -> dict:
@@ -2601,7 +2617,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = run_store.run_lock("pipeline", repo.name, tid)
-    with workspaces.ticket_lock(repo.name, tid) as got:
+    with workspaces.ticket_lock(repo.name, tid) as got, ExitStack() as pin_stack:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -2820,9 +2836,48 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     print(f"could not admit the one-shot task: {e}")
                     slot.free()
                     return 2
+            answering_earlier = bool(earlier) and earlier["status"] == "needs-info"
+            if script and script.continues:
+                continues_id = script.continues
+                restart_kind = script.restart or ("step" if script.only else "resume")
+            elif script and script.repairs:
+                continues_id = script.repairs
+                restart_kind = script.restart or "resume"
+            elif restarting:
+                continues_id = earlier["id"]
+                restart_kind = "interrupted"
+            elif answering_earlier:
+                continues_id = earlier["id"]
+                restart_kind = "answer"
+            elif mending:
+                continues_id = mending
+                restart_kind = (script.restart if script else "") or "resume"
+            else:
+                continues_id = None
+                restart_kind = ""
+            held_from = earlier["id"] if restarting or answering_earlier else (
+                script.continues or script.repairs if script else ""
+            )
+            carried_ab = run_store.ab_held(held_from) if held_from else {}
+            from . import pins
+
+            pin_res = pins.resolve(
+                "pipeline",
+                repo=repo.name,
+                overrides=script.overrides if script else None,
+                ab_ticket=(repo.name, str(tid)),
+                ab_held=carried_ab,
+                adw_path=script.path if script else "classic",
+            )
+            pin_stack.enter_context(pins.use(pin_res))
+            cfg = pin_res.cfg
+            repo = pin_res.repo or repo
+            layer = pin_res.layer or layer
+
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    only_step=only, dry_run=int(dry_run), **retry_of)
+                                    only_step=only, dry_run=int(dry_run), resolution=pin_res,
+                                    continues=continues_id, restart=restart_kind, **retry_of)
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -2904,7 +2959,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force, from_poll=poll_launch,
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, cfg=cfg, layer=layer,
+                      tracker=tk, tid=tid, force=force, from_poll=poll_launch,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       ticket_feedback=[] if mending and not repair_with_feedback else ticket_fb,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
@@ -2933,11 +2989,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     raise
                 return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
-            if held_from := earlier["id"] if restarting or run.answering else (
-                    script.continues or script.repairs if script else ""):
-                run.ab_held = run_store.ab_held(held_from)
+            if carried_ab:
+                run.ab_held = dict(carried_ab)
                 for role, (ab, side, arm) in run.ab_held.items():
                     record.hold_ab(run_id, role, ab, side, arm)
+            elif pin_res.ab_held:
+                run.ab_held = dict(pin_res.ab_held)
             if mending:
                 run_lines.write(run_id, "repair", source=mending)
                 run.log(f"repairing the review findings of run {mending}")
@@ -3439,8 +3496,17 @@ def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | No
 
 
 def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
+    from . import pins
+
     repo = run.repo
+    pin = pins.current()
     if repo.layer:
+        if pin is not None and pin.layer is not None:
+            try:
+                steps.check(cfg, pin.layer)
+            except (ValueError, TypeError) as e:
+                raise workspace.RunFailed(f"{paths.short_path(pin.layer.config_file)}: {e}") from e
+            return pin.layer
         return checked_layer(cfg, repo.layer)
     if (ws / ".agents" / "config.toml").exists():
         return checked_layer(cfg, ws / ".agents")

@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import (
-    codebase,
     config,
     configrepo,
     control,
@@ -24,7 +23,6 @@ from . import (
     sources,
     util,
 )
-from .store import db as foundation
 from .store import runs as run_store
 
 DRAFT_TRIES = 3
@@ -154,18 +152,22 @@ def start_draft(request: DraftRequest) -> dict:
 
 
 def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
-    cfg = config.load()
+    from . import pins
+
+    pin_res = pins.resolve("draft", repo=request.repo or None)
+    cfg = pin_res.cfg
     if run_id:
-        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
+        record.attach_pin(run_id, pin_res, pid=os.getpid())
     else:
         check_request(request, cfg, loop_names(cfg))
-        run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200))
+        run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200),
+                              resolution=pin_res)
 
     def tell(kind: str, text: str) -> None:
         say(text)
         run_store.add_feed(run_id, kind, text)
 
-    with record.stoppable(), record.failed_on_crash(run_id):
+    with pins.use(pin_res), record.stoppable(), record.failed_on_crash(run_id):
         try:
             made = write_draft(run_id, request, cfg, tell)
         except (control.Refused, record.Stopped) as e:

@@ -3,13 +3,23 @@ from __future__ import annotations
 import json
 
 from .. import owner_asks, util
+from . import runs as run_store
 from ._rows import json_dict, json_list
 from .db import db, reader
 
-# Ignore a question from a ticket that has since started another whole run.
+
+def _latest(c) -> str:
+    # Ignore a question from a ticket that has since started another whole run.
+    return (
+        "NOT EXISTS (SELECT 1 FROM runs a, runs later "  # noqa: S608
+        "WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue "
+        f"AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND {run_store.later_than(c, 'later', 'a')})"
+    )
+
+
 LATEST = """NOT EXISTS (SELECT 1 FROM runs a, runs later
     WHERE a.id = asks.run AND later.kind = 'pipeline' AND later.repo = a.repo AND later.issue = a.issue
-      AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.rowid > a.rowid)"""
+      AND COALESCE(later.only_step, '') = '' AND NOT later.dry_run AND later.seq > a.seq)"""
 
 TABLES = {
     "asks": "kept",
@@ -46,7 +56,7 @@ def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str,
             questions: list[dict], session: dict, *, recovery_route: str = "owner") -> bool:
     with db() as c:
         first = call != owner_asks.CHECK_RUNNER_CALL or c.execute(
-            f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {LATEST} LIMIT 1", (call,)).fetchone() is None  # noqa: S608
+            f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {_latest(c)} LIMIT 1", (call,)).fetchone() is None  # noqa: S608
         c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
                   "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
@@ -110,7 +120,7 @@ def open_asks(connect=reader, *, owner_only=False, group_runners=False) -> list[
         rows = [ask_row(r) for r in c.execute(
             "SELECT * FROM asks WHERE status = 'open' "  # noqa: S608
             + ("AND recovery_route='owner' " if owner_only else "")
-            + f"AND {LATEST} ORDER BY asked, rowid")]
+            + f"AND {_latest(c)} ORDER BY asked, rowid")]
     if group_runners:
         shared = [r for r in rows if r["call"] == owner_asks.CHECK_RUNNER_CALL]
         if len(shared) > 1:
@@ -124,7 +134,7 @@ def ready_runner_tickets(repo: str) -> list[str]:
         return [str(r[0]) for r in c.execute(
             f"""SELECT ticket FROM asks JOIN runs ON runs.id=asks.run
                 WHERE asks.repo=? AND call=? AND asks.status='answered' AND taken_by=''
-                  AND json_extract(asks.answers, '$[0].done')=1 AND runs.status='needs-info' AND {LATEST}
+                  AND json_extract(asks.answers, '$[0].done')=1 AND runs.status='needs-info' AND {_latest(c)}
                   AND NOT EXISTS (SELECT 1 FROM asks other WHERE other.run=asks.run AND other.status='open')
                 ORDER BY asked, asks.rowid""", (repo, owner_asks.CHECK_RUNNER_CALL))]  # noqa: S608
 

@@ -139,13 +139,71 @@ def prompts_from(prompts: Prompts) -> str:
     return str(prompts.dir) if prompts.dir != paths.PROMPTS_DIR else ""
 
 
+def _pin_lineage(row: dict) -> dict:
+    from .store import blobs as blob_store
+
+    run_id = str(row.get("run_id") or "")
+    run_row = run_store.run_get(run_id) if run_id else None
+    resolved_sha = (run_row or {}).get("resolved_sha") or ""
+    if resolved_sha and (raw := blob_store.read(resolved_sha)):
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            prompts_map = doc.get("prompts") or {}
+            prompts_sha = util.digest(
+                *(part for name, meta in sorted(prompts_map.items())
+                  if isinstance(meta, dict) for part in (name, str(meta.get("sha256") or "")))
+            ) if prompts_map else ""
+            harness_doc = doc.get("harness") or {}
+            harness_sha = row.get("context_sha") or (
+                util.digest(json.dumps(harness_doc, sort_keys=True)) if harness_doc else ""
+            )
+            settings_doc = doc.get("settings") or {}
+            models = {}
+            for role in ("plan", "build", "check_repair", "review", "eval_grade"):
+                entry = settings_doc.get(role)
+                if isinstance(entry, dict) and isinstance(entry.get("model"), dict):
+                    models[role] = entry["model"].get("value", "")
+            grade_doc = settings_doc.get("eval_grade") or {}
+            settings_obj = {
+                "models": models,
+                "runner": (grade_doc.get("runner") or {}).get("value", ""),
+                "effort": (grade_doc.get("effort") or {}).get("value", ""),
+                "tier": (grade_doc.get("tier") or {}).get("value", ""),
+            }
+            return {
+                "has_lineage": True,
+                "engine_sha": str(doc.get("engine_sha") or (run_row or {}).get("engine_sha") or ""),
+                "prompts_sha": prompts_sha,
+                "base_commit": str(row.get("base_commit") or ""),
+                "context_sha": str(harness_sha),
+                "settings_obj": settings_obj,
+            }
+    try:
+        settings_obj = json.loads(row.get("settings") or "{}")
+    except ValueError:
+        settings_obj = {}
+    has_any = any(row.get(k) for k in insights_store.EVAL_LINEAGE[:6])
+    return {
+        "has_lineage": has_any,
+        "engine_sha": str(row.get("engine_sha") or ""),
+        "prompts_sha": str(row.get("prompts_sha") or ""),
+        "base_commit": str(row.get("base_commit") or ""),
+        "context_sha": str(row.get("context_sha") or ""),
+        "settings_obj": settings_obj if isinstance(settings_obj, dict) else {},
+    }
+
+
 def lineage_changes(before: dict, after: dict, skip=()) -> list[str]:
+    prev, cur = _pin_lineage(before), _pin_lineage(after)
     changed = []
     for key, name in (("engine_sha", "Arete"), ("prompts_sha", "prompts"),
                       ("base_commit", "base"), ("context_sha", "harness")):
-        if name not in skip and before.get(key, "") != after.get(key, ""):
-            changed.append(f"Arete {before.get(key, '')} to {after.get(key, '')}" if name == "Arete" else name)
-    old, new = (json.loads(row.get("settings") or "{}") for row in (before, after))
+        if name not in skip and prev.get(key, "") != cur.get(key, ""):
+            changed.append(f"Arete {prev.get(key, '')} to {cur.get(key, '')}" if name == "Arete" else name)
+    old, new = prev["settings_obj"], cur["settings_obj"]
     for key in sorted(old.keys() | new.keys()):
         if key == "models":
             a, b = old.get(key, {}), new.get(key, {})
@@ -159,7 +217,7 @@ def lineage_changes(before: dict, after: dict, skip=()) -> list[str]:
 
 
 def has_lineage(row: dict) -> bool:
-    return any(row.get(k) for k in insights_store.EVAL_LINEAGE[:6])
+    return bool(_pin_lineage(row)["has_lineage"])
 
 
 @dataclass
@@ -495,15 +553,71 @@ def check_copy_links(path: Path, overlay_links: set[tuple[int, int]]) -> None:
             pending.extend(reversed(target.parts))
 
 
+def overlay_harness_pinned(pin_harness: dict, wt: Path, *, paired: bool = False) -> tuple[list[str], set[tuple[int, int]]]:
+    from .store import blobs as blob_store
+
+    root = wt.resolve()
+    files_meta: dict[str, dict] = pin_harness.get("files") or {}
+    copied = sorted(files_meta)
+    original_links = {}
+    if paired:
+        for f in copied:
+            dest = root / f
+            if dest.is_symlink() and dest.parent.resolve() == dest.parent:
+                original_links[f] = os.readlink(dest)
+    shutil.rmtree(wt / EVALS, ignore_errors=True)
+    remove_base_harness(wt, harness_globs())
+    overlay_links = set()
+    for f in copied:
+        dest = root / f
+        if dest.parent.resolve() != dest.parent:
+            raise workspace.RunFailed(f"harness path {f} has a symlink parent")
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        entry = files_meta[f]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        target = entry.get("link")
+        if target is not None:
+            os.symlink(target, dest)
+        else:
+            raw = blob_store.read(entry["sha256"])
+            if raw is None:
+                raise workspace.RunFailed(f"pinned harness blob {entry['sha256']} for {f} is missing")
+            dest.write_bytes(raw)
+            if entry.get("executable"):
+                dest.chmod(dest.stat().st_mode | 0o111)
+        if paired and target is not None and target != original_links.get(f):
+            info = dest.lstat()
+            overlay_links.add((info.st_dev, info.st_ino))
+    return copied, overlay_links
+
+
 def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.RepoLayer:
-    copied, overlay_links = overlay_harness(src, wt)
+    from . import pins
+    from .store import blobs as blob_store
+
+    pin = pins.current()
+    pin_harness = pin.harness if pin is not None else None
+    if pin_harness is not None:
+        copied, overlay_links = overlay_harness_pinned(pin_harness, wt, paired=isinstance(src, HarnessOverlay))
+    else:
+        copied, overlay_links = overlay_harness(src, wt)
     run.harness_paths = copied
     run.log(f"harness from {src.label} ({len(copied)} files)")
     local_layer = repo.path / LAYER_CONFIG
-    if isinstance(src, HarnessOverlay) and not repo.layer and LAYER_CONFIG not in copied and local_layer.is_file():
-        run.local_layer_settings = local_layer.read_bytes()
-        write_fixture(wt, LAYER_CONFIG, run.local_layer_settings)
-    layer = config.load_layer(repo.layer or wt / ".agents")
+    if isinstance(src, HarnessOverlay) and not repo.layer and LAYER_CONFIG not in copied:
+        if pin_harness is not None and pin_harness.get("layer_config"):
+            raw_layer = blob_store.read(pin_harness["layer_config"])
+            if raw_layer is not None:
+                run.local_layer_settings = raw_layer
+                write_fixture(wt, LAYER_CONFIG, run.local_layer_settings)
+        elif local_layer.is_file():
+            run.local_layer_settings = local_layer.read_bytes()
+            write_fixture(wt, LAYER_CONFIG, run.local_layer_settings)
+    if repo.layer and pin is not None and pin.layer is not None:
+        layer = pin.layer
+    else:
+        layer = config.load_layer(repo.layer or wt / ".agents")
     overlay_paths = src.changed.union(copied) if isinstance(src, HarnessOverlay) else frozenset()
     for c in layer.copy:
         s = repo.path / c
@@ -555,14 +669,34 @@ def grade_failure(graded: verify.Verified) -> str:
 
 
 def context_digest(src: Source, repo: config.Repo, run: EvalRun, expertise: str, *, ignore=()) -> str:
+    from . import pins
+    from .store import blobs as blob_store
+
+    pin = pins.current()
+    pin_harness = pin.harness if pin is not None else None
     parts = []
-    for name in sorted(set(run.harness_paths).difference(ignore)):
-        link = src.link(name)
-        parts.extend((name, link.encode() if link is not None else src.read(name)))
-        if link is None and src.executable(name):
-            parts.append("executable")
-    if repo.layer and (repo.layer / "config.toml").exists():
-        parts.extend(("layer/config.toml", (repo.layer / "config.toml").read_bytes()))
+    if pin_harness is not None:
+        files_meta = pin_harness.get("files") or {}
+        for name in sorted(set(run.harness_paths).difference(ignore)):
+            entry = files_meta.get(name, {})
+            link = entry.get("link")
+            if link is not None:
+                parts.extend((name, link.encode()))
+            else:
+                raw = blob_store.read(entry.get("sha256", "")) or b""
+                parts.extend((name, raw))
+                if entry.get("executable"):
+                    parts.append("executable")
+        if repo.layer and pin_harness.get("layer_config"):
+            parts.extend(("layer/config.toml", blob_store.read(pin_harness["layer_config"]) or b""))
+    else:
+        for name in sorted(set(run.harness_paths).difference(ignore)):
+            link = src.link(name)
+            parts.extend((name, link.encode() if link is not None else src.read(name)))
+            if link is None and src.executable(name):
+                parts.append("executable")
+        if repo.layer and (repo.layer / "config.toml").exists():
+            parts.extend(("layer/config.toml", (repo.layer / "config.toml").read_bytes()))
     if run.local_layer_settings is not None:
         parts.extend((LAYER_CONFIG, run.local_layer_settings))
     if not repo.layer and ".agents/expertise.md" in ignore:
@@ -828,20 +962,36 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, pr
 
 def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Task], tag: str,
               prompts: Prompts) -> Arm:
+    from . import configrepo, pins
+
     label = prompts.applied_to(src.label)
     engine = codebase.load()
-    lineage = {"engine_sha": engine, "prompts_sha": prompts_digest(prompts), "prompts_from": prompts_from(prompts)}
-    run_id = record.start("eval", tag=tag, lock=run_store.run_lock("eval", repo.name), repo=repo.name)
+    p_level = "run" if prompts.dir.resolve() != paths.PROMPTS_DIR.resolve() else "engine"
+    pin_res = pins.resolve(
+        "eval",
+        repo=repo,
+        prompts_dir=prompts.dir,
+        prompts_level=p_level,
+        prompts_from=prompts_from(prompts),
+        harness_source=src,
+        cfg=cfg if not configrepo.is_repo() else None,
+        engine_sha=engine,
+    )
+    pinned_cfg = pin_res.cfg
+    pinned_repo = pin_res.repo or repo
+    run_id = record.start("eval", tag=tag, lock=run_store.run_lock("eval", pinned_repo.name),
+                          repo=pinned_repo.name, resolution=pin_res)
     results = []
-    with record.failed_on_crash(run_id):
+    with record.failed_on_crash(run_id), pins.use(pin_res):
         for t in tasks:
-            prior = insights_store.task_history(repo.name, t.name, 3)
+            prior = insights_store.task_history(pinned_repo.name, t.name, 3)
             after_step = run_store.last_step_id(run_id)
-            r = run_task(cfg, src, t, prompts, EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / t.name,
-                                                       task=t.name))
-            current = {**lineage, "base_commit": r.base_commit, "context_sha": r.context_sha,
-                       "settings": r.settings, "after_step": after_step, "last_step": run_store.last_step_id(run_id)}
-            insights_store.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
+            r = run_task(pinned_cfg, src, t, prompts, EvalRun(id=run_id, repo=pinned_repo,
+                                                              dir=paths.RUNS_DIR / run_id / t.name,
+                                                              cfg=pinned_cfg, task=t.name))
+            current = {"run_id": run_id, "base_commit": r.base_commit, "context_sha": r.context_sha,
+                       "after_step": after_step, "last_step": run_store.last_step_id(run_id)}
+            insights_store.add_eval(run_id, pinned_repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
             r.regressed = len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
             if r.regressed:
                 r.changed = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
@@ -850,11 +1000,11 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         arm = Arm(run_id, results)
         summary = f"{arm.score} passed on {label}"
         record.settle(run_id, "done", summary=summary)
-    print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
+    print(f"{pinned_repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
         print(f"  {'PASS' if r.passed else 'FAIL'} {r.task:<28} {r.seconds:>6.0f}s {util.paid_note(r.paid):>12} {r.why}"
               + (f"  REGRESSED: {', '.join(r.changed)}" if r.regressed else ""))
-    (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
+    (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(pinned_repo.name, label, results))
     return arm
 
 

@@ -13,7 +13,6 @@ from pathlib import Path
 
 from . import (
     claude,
-    codebase,
     config,
     control,
     devices,
@@ -755,9 +754,13 @@ def execute(session_id: str) -> str:
             return "busy"
         if (ended := (run_store.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
-        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
+        from . import pins
+
+        pin_res = pins.resolve("session", repo=spec.repo or None)
+        cfg = pin_res.cfg
+        record.attach_pin(session_id, pin_res, pid=os.getpid())
         try:
-            with (record.stoppable(),
+            with (pins.use(pin_res), record.stoppable(),
                   devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
                                 lambda: unreturned_reason(spec)) as device):
                 status, summary = run_conversation(spec, cfg, device)

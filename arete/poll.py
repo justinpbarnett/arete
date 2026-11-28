@@ -359,6 +359,8 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                                                   "--continue", continues)
 
             def spawn():
+                from . import principals
+
                 lease = launch_lease.CURRENT.get()
                 lease.poll = True
                 if zte.reserved(str(tid)):
@@ -366,7 +368,8 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                 if readmission:
                     lease.readmission = json.dumps(asdict(readmission))
                     readmission.attempted(record=True)
-                return control.launch(command, pipeline.RUNS_LOG) if command else spawn_run(repo_name, tid, **({"spec": True} if spec else {}))
+                with principals.acting("rule:poll"):
+                    return control.launch(command, pipeline.RUNS_LOG) if command else spawn_run(repo_name, tid, **({"spec": True} if spec else {}))
 
             tasks.spawn_pending(repo_name, str(tid), spawn)
             return True

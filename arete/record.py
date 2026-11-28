@@ -21,13 +21,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
+from . import agent, codebase, launch_lease, paths, principals, run_lines, scrub, util
 from .store import approvals as approvals_store
+from .store import blobs as blob_store
 from .store import db as foundation
 from .store import insights as insights_store
 from .store import loops as loop_store
 from .store import runs as run_store
 from .store import specgraphs
+
+_UNSET = object()
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -46,35 +49,167 @@ def new_id(prefix: str, tag: str = "") -> str:
     return "-".join(filter(None, [prefix.replace("/", "."), stamp, os.urandom(2).hex(), tag]))
 
 
-def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
+def _resolve_started_by(actor: str) -> str:
+    if not actor or actor == "hand":
+        return "rule:serve"
+    if actor.startswith("client:"):
+        token_id = actor.removeprefix("client:")
+        try:
+            with foundation.reader() as c:
+                row = c.execute("SELECT principal FROM tokens WHERE id = ?", (token_id,)).fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except (sqlite3.Error, foundation.NoDatabase, foundation.IncompatibleSchema):
+            pass
+    return actor
+
+
+def _is_person_actor(actor: str | None) -> bool:
+    if not actor:
+        return False
+    if actor.startswith("u:"):
+        return True
+    try:
+        return principals.is_person(actor)
+    except (sqlite3.Error, foundation.NoDatabase, foundation.IncompatibleSchema):
+        return False
+
+
+def _resolve_payer(started_by: str, *, restart: str, continues: str | None,
+                   explicit_payer, resolution=None, loop_payer: str = "",
+                   repo_payer: str = "", repo_name: str = "") -> str | None:
+    if explicit_payer is not _UNSET:
+        return explicit_payer or None
+    if restart in ("interrupted", "lease") and continues:
+        parent = run_store.run_get(continues)
+        return parent.get("payer") if parent else None
+    if _is_person_actor(started_by):
+        return started_by
+    if loop_payer:
+        return loop_payer
+    if repo_payer:
+        return repo_payer
+    if resolution is not None:
+        if resolution.repo is not None and resolution.repo.payer:
+            return resolution.repo.payer
+        if resolution.cfg.automation_payer:
+            return resolution.cfg.automation_payer
+        return None
+    try:
+        from . import pins
+
+        cfg = pins.active_config()
+    except Exception:
+        return None
+    if repo_name:
+        for r in cfg.repos:
+            if r.name == repo_name and r.payer:
+                return r.payer
+    return cfg.automation_payer or None
+
+
+def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolution=None,
+          continues: str | None = None, restart: str = "", started_by: str | None = None,
+          payer=_UNSET, loop_payer: str = "", repo_payer: str = "", **fields) -> str:
     nested = foundation.in_write()
-    row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
+    actor = started_by if started_by is not None else _resolve_started_by(principals.current())
+    continues_val = continues or None
+    restart_val = restart or ""
+    payer_val = _resolve_payer(
+        actor, restart=restart_val, continues=continues_val, explicit_payer=payer,
+        resolution=resolution, loop_payer=loop_payer, repo_payer=repo_payer,
+        repo_name=str(fields.get("repo") or ""),
+    )
+    chain_val: str | None = None
+    if continues_val:
+        parent = run_store.run_get(continues_val)
+        chain_val = (parent.get("chain") or continues_val) if parent else continues_val
+    row = {
+        "kind": kind,
+        "status": "running",
+        "started": util.iso(),
+        "lock": lock or None,
+        "pid": os.getpid(),
+        "engine_sha": resolution.engine_sha if resolution is not None else codebase.STAMP,
+        "schema_version": resolution.schema_version if resolution is not None else foundation.LATEST,
+        "continues": continues_val,
+        "restart": restart_val,
+        "started_by": actor,
+        "payer": payer_val,
+        **fields,
+    }
+    blob_rows: tuple[tuple[str, str, int], ...] = ()
+    if resolution is not None:
+        resolution.payer = payer_val
+        blob_rows = resolution.write_blobs()
+        row["config_commit"] = resolution.config_commit or None
+        row["resolved_sha"] = resolution.resolved_sha
     if kind in TICKET_KINDS:
         row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
                    measured_at=row["started"])
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
+        row_with_chain = {**row, "chain": chain_val or minted}
         try:
-            run_store.insert_run(minted, row)
+            with foundation.tx() as c:
+                if run_store.has_pins(c):
+                    for sha, blob_kind, size in blob_rows:
+                        blob_store.record_row(c, sha, blob_kind, size)
+                    if resolution is not None and resolution.settings_snapshots:
+                        run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+                run_store.insert_run(minted, row_with_chain)
         except sqlite3.IntegrityError as e:
             if run_id or "runs.id" not in str(e):
                 raise
             continue
+        if resolution is not None:
+            resolved_file = paths.RUNS_DIR / minted / "resolved.json"
+            util.write_durably(resolved_file, resolution.resolved_bytes, 0o600)
         # A nested writer has not committed yet; retain its lease until exit.
         if kind in TICKET_KINDS and not nested:
             launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
         return minted
 
 
+def attach_pin(run_id: str, resolution, *, pid: int | None = None) -> None:
+    blob_rows = resolution.write_blobs()
+    fields = {
+        "config_commit": resolution.config_commit or None,
+        "resolved_sha": resolution.resolved_sha,
+        "engine_sha": resolution.engine_sha,
+        "schema_version": resolution.schema_version,
+    }
+    if pid is not None:
+        fields["pid"] = pid
+    with foundation.tx() as c:
+        if run_store.has_pins(c):
+            for sha, blob_kind, size in blob_rows:
+                blob_store.record_row(c, sha, blob_kind, size)
+            if resolution.settings_snapshots:
+                run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+        run_store.note(run_id, **fields)
+    existing = run_store.run_get(run_id)
+    if existing is not None:
+        resolution.payer = existing.get("payer")
+    util.write_durably(paths.RUNS_DIR / run_id / "resolved.json", resolution.resolved_bytes, 0o600)
+
+
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
-         try_no: int = 0, auth_mode: str = "") -> None:
-    steps(run_id, name, [(res, seconds)], effort, tier, kind, try_no, auth_mode)
+         try_no: int = 0, auth_mode: str = "", *, inputs: Sequence[dict] = (), settings_sha: str = "",
+         settings_snapshots: dict[str, str] | None = None,
+         blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+    steps(run_id, name, [(res, seconds)], effort, tier, kind, try_no, auth_mode,
+          inputs=inputs, settings_sha=settings_sha, settings_snapshots=settings_snapshots,
+          blob_rows=blob_rows)
 
 
 def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
-          try_no: int = 0, auth_mode: str = "") -> None:
-    run_store.insert_steps(run_id, name, calls, effort, tier, kind, try_no, auth_mode)
+          try_no: int = 0, auth_mode: str = "", *, inputs: Sequence[dict] = (), settings_sha: str = "",
+          settings_snapshots: dict[str, str] | None = None,
+          blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+    run_store.insert_steps(run_id, name, calls, effort, tier, kind, try_no, auth_mode,
+                           inputs=inputs, settings_sha=settings_sha, settings_snapshots=settings_snapshots,
+                           blob_rows=blob_rows)
 
 
 def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") -> None:
@@ -212,6 +347,10 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None, rele
     if not tickets and release_claims:
         with foundation.tx() as c:
             loop_store.release_settled_claims(c)
+    if not tickets:
+        from . import pins
+
+        pins.reap_config_worktrees()
     return settled
 
 

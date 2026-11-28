@@ -85,33 +85,92 @@ def role_overrides_from(raw_data: dict, role: str) -> dict:
     return {"models": models_map, "steps": steps_map}
 
 
-def role_views(cfg: config.Config, raw_data: dict) -> list[dict]:
+def role_views(cfg: config.Config, raw_data: dict, *, layer: config.RepoLayer | None = None,
+               task_kind: str = "", config_commit: str = "", layer_from: str = "") -> list[dict]:
     cfg_no_replay = replace(cfg, replay=config.ReplayConfig())
     views: list[dict] = []
     for role_info in config.ROLES:
         role = role_info.name
         try:
-            resolved = steps.resolve(cfg_no_replay, None, role, "")
+            resolved, prov = steps.resolve(
+                cfg_no_replay, layer, role, task_kind,
+                provenance=True, config_commit=config_commit, layer_from=layer_from,
+            )
             runner_val = resolved.runner or None
             model_val = resolved.model or None
             effort_val = resolved.effort or None
+            level_val = steps.role_level(resolved, prov)
         except ValueError:
-            runner_val = model_val = effort_val = None
+            runner_val = model_val = effort_val = level_val = None
         views.append({
             "role": role,
             "runner": runner_val,
             "model": model_val,
             "effort": effort_val,
-            "level": None,
+            "level": level_val,
             "overrides": role_overrides_from(raw_data, role),
         })
     return views
 
 
+def resolved(repo: str = "", task_kind: str = "", node: str = "") -> dict:
+    from . import pins
+
+    if task_kind and task_kind not in config.KINDS:
+        raise ValueError(f"unknown task_kind '{task_kind}'; use {', '.join(config.KINDS)}")
+    cfg, raw_data = _load_authoritative()
+    cfg_no_replay = replace(cfg, replay=config.ReplayConfig())
+    commit = configrepo.live_sha() if configrepo.is_repo() else ""
+    repo_obj = cfg_no_replay.repo(repo) if repo else None
+    layer = config.load_layer(repo_obj.layer_dir) if repo_obj is not None else None
+    layer_from = ""
+    if layer is not None and layer.config_file.is_file():
+        rel_layer = pins.relative_path(layer.config_file, repo_root=repo_obj.path if repo_obj else None)
+        layer_from = f"{rel_layer}@{commit}" if commit else rel_layer
+    values_out: dict[str, dict] = {}
+    levels_out: dict[str, dict] = {}
+    roles_out: list[dict] = []
+    for role_info in config.ROLES:
+        role = role_info.name
+        try:
+            res, prov = steps.resolve(
+                cfg_no_replay, layer, role, task_kind,
+                provenance=True, config_commit=commit, layer_from=layer_from,
+            )
+            values_out[role] = {k: v["value"] for k, v in prov.items()}
+            levels_out[role] = {k: {"level": v["level"], "from": v["from"]} for k, v in prov.items()}
+            roles_out.append({
+                "role": role,
+                "runner": res.runner or None,
+                "model": res.model or None,
+                "effort": res.effort or None,
+                "level": steps.role_level(res, prov),
+                "overrides": role_overrides_from(raw_data, role),
+            })
+        except ValueError:
+            values_out[role] = {}
+            levels_out[role] = {}
+            roles_out.append({
+                "role": role,
+                "runner": None,
+                "model": None,
+                "effort": None,
+                "level": None,
+                "overrides": role_overrides_from(raw_data, role),
+            })
+    return {
+        "values": values_out,
+        "levels": levels_out,
+        "roles": roles_out,
+        "config_commit": commit or None,
+    }
+
+
 def current(conn=None) -> dict:
     cfg, raw_data = _load_authoritative()
     ver = current_version(conn)
-    roles = role_views(cfg, raw_data)
+    commit = configrepo.live_sha() if configrepo.is_repo() else ""
+    roles = role_views(cfg, raw_data, config_commit=commit)
     values = {
         **{key: getattr(cfg, key) for key in RUN_LIMITS},
         "parallel_max": PARALLEL_MAX,
