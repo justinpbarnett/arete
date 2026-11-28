@@ -1198,6 +1198,17 @@ def get_outcomes(handler, rest, query):
     return board.panel(board.outcomes)
 
 
+def get_insight(handler, rest, query):
+    chart = unquote(rest)
+    values = {"chart": chart, **{k: v for k, v in query.items() if k in ("days", "by", "min_seq", "price_version", "run_id", "step")}}
+    with foundation.one_read() as conn:
+        seq = event_store.metadata(conn)["head"]
+        payload, validator = api.read_insight(values, conn=conn)
+        if handler is not None:
+            api_http.set_etag_context((seq, validator))
+        return {"seq": seq, **payload}
+
+
 def get_find(handler, rest, query):
     return board.find()
 

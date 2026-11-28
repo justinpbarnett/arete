@@ -11,6 +11,7 @@ import { SettingsFocus, SettingsQueue } from "./ui-settings.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
+import { TopBar } from "./ui-topbar.js";
 import { browserPaired, clientNotice, staleWrite } from "./ui-notice.js";
 
 const html = htm.bind(h);
@@ -112,13 +113,10 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
   return html`<div class="ui-app" data-screen=${route.screen} data-detail=${parent ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
-      <div class="top-bar ops-links" aria-label="Dashboard shortcuts">
-        ${browserPaired.value ? html`<a href="/pair">Pair a device and manage tokens</a>` : null}
-        ${route.screen === "run" ? html`<a href="/#sessions">Sessions in classic</a>` : null}
-        <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
-      </div>
+      <${TopBar} route=${route} snapshot=${snapshot} now=${now} runs=${runs} page=${page} />
       <header class="page-head">
         <div class="head-row"><h1>${page.title}</h1><div class="head-tools"><factory-switch></factory-switch>
+          ${browserPaired.value ? html`<a class="ops-back" href="/pair">Pair</a>` : null}
           ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
           ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
         </div></div>

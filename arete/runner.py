@@ -54,7 +54,6 @@ from .agent import (
     UsageLimit,
     streamed_turn,
     subscription,
-    token_cost,
     traits_of,
 )
 from .store import devices as devices_store
@@ -220,17 +219,41 @@ def cost_note(res: Result) -> str:
     return f"({util.count(res.turns, 'turn')}, {paid})"
 
 
-def priced(res: Result, cfg: config.Config) -> float:
-    if res.runner == REPLAY:
-        return res.cost_usd
-    if res.runner == "pi" and res.auth_mode == "subscription":
-        return res.cost_usd
-    rate = cfg.pricing.get(res.model) or cfg.pricing.get(f"{res.runner}:{res.model}")
-    if rate:
-        return (res.tokens_in * (rate[0] or 0) + res.tokens_out * (rate[1] or 0)) / 1_000_000
-    if res.runner == "pi" and (res.provider or routing.provider_of(res.model)) in cfg.local_providers:
-        return 0.0
-    return res.cost_usd
+def _active_billing_policy(cfg: config.Config) -> prices.BillingPolicy:
+    from . import pins
+
+    if (pin := pins.current()) is not None and pin.billing_policy is not None:
+        return pin.billing_policy
+    return prices.load_billing(cfg=cfg)
+
+
+def price_result(
+    res: Result,
+    cfg: config.Config,
+    *,
+    policy: prices.BillingPolicy | None = None,
+    selected_local: bool = False,
+    openrouter_rates=None,
+) -> prices.ChargeOutcome:
+    active_policy = policy if policy is not None else _active_billing_policy(cfg)
+    return prices.price_call(
+        runner=res.runner,
+        model=res.model,
+        provider=res.provider,
+        auth_mode="local" if selected_local else res.auth_mode,
+        tokens_in=res.tokens_in,
+        tokens_out=res.tokens_out,
+        cache_read=res.cache_read,
+        cache_write=res.cache_write,
+        provider_cost_usd=res.cost_usd,
+        policy=active_policy,
+        selected_local=selected_local,
+        openrouter_rates=openrouter_rates,
+    )
+
+
+def priced(res: Result, cfg: config.Config, *, policy: prices.BillingPolicy | None = None) -> float:
+    return price_result(res, cfg, policy=policy).cost_usd
 
 
 def admitted(kw: dict, limits: dict | None) -> dict:
@@ -1213,11 +1236,44 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         hidden.add(selected.hidden)
         header["env"] = route["env"]
         header["provider"] = selected.provider
-    rate = cfg.pricing.get(name) or cfg.pricing.get(f"{which}:{name}")
-    if rate:
-        header["pricing_rate"] = [rate[0], rate[1]]
-    if on_local or (which == "pi" and (header["provider"] or routing.provider_of(name)) in cfg.local_providers):
+    from . import pins
+
+    pin = pins.current()
+    billing_policy = _active_billing_policy(cfg)
+    matched_rate = billing_policy.lookup(which, name)
+    if matched_rate is not None:
+        r_in, r_out = matched_rate[1].per_million()
+        header["pricing_rate"] = [r_in, r_out]
+    if on_local or (
+        which == "pi"
+        and auth.mode != "subscription"
+        and matched_rate is None
+        and (header["provider"] or routing.provider_of(name)) in billing_policy.local_providers
+    ):
         header["local_billing"] = True
+    billing_ctx = prices.billing_context_for(
+        runner=which,
+        model=name,
+        provider=header["provider"],
+        auth_mode=auth.mode,
+        account_id=account_id,
+        payer=pin.payer if pin is not None else None,
+        selected_local=on_local,
+        policy=billing_policy,
+        openrouter_rates=openrouter_quote.rates if openrouter_quote is not None else None,
+        reference_meta=pin.prices if pin is not None else None,
+    )
+    header["billing_context"] = billing_ctx
+    if step_id is not None and paths.DB_FILE.exists():
+        from contextlib import suppress
+
+        from .store import db as foundation
+
+        with suppress(sqlite3.Error, foundation.NoDatabase, foundation.IncompatibleSchema):
+            run_store.set_step_billing_context(
+                step_id,
+                json.dumps(billing_ctx, sort_keys=True, separators=(",", ":")),
+            )
     subject = f"{record_id}/{trace[1]}" if record_id else trace[1]
 
     def safe_line(line):
@@ -1228,10 +1284,30 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     at = util.now()
     max_tokens = kw.pop("max_tokens", None)
 
+    def apply_charge(target_res: Result) -> prices.ChargeOutcome:
+        outcome = price_result(
+            target_res,
+            cfg,
+            policy=billing_policy,
+            selected_local=on_local,
+            openrouter_rates=openrouter_quote.rates if openrouter_quote is not None else None,
+        )
+        target_res.cost_nusd = outcome.cost_nusd
+        target_res.paid_nusd = outcome.paid_nusd
+        target_res.cost_usd = outcome.cost_usd
+        target_res.price_version = outcome.price_version
+        if outcome.auth_mode == "local":
+            target_res.auth_mode = "local"
+        return outcome
+
     def charged(res: Result) -> float:
-        if openrouter_quote is not None:
-            return token_cost(openrouter_quote.rates, res.tokens_in, res.tokens_out, res.cache_read, res.cache_write)
-        return 0.0 if on_local else priced(res, cfg)
+        return price_result(
+            res,
+            cfg,
+            policy=billing_policy,
+            selected_local=on_local,
+            openrouter_rates=openrouter_quote.rates if openrouter_quote is not None else None,
+        ).cost_usd
 
     (step_inputs, step_blob_payloads, step_blob_rows, step_settings_sha, step_prompt_version,
      step_prompt_level, step_schema_version) = _step_inputs_for(prompt, trace, kw, resume, atom, try_no)
@@ -1269,12 +1345,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         refresh_redactions(hidden, selected)
         seen = replace(meter.seen, provider=header["provider"],
                        error=scrub.text(rec.exception_text(error), "record", subject, extra=hidden))
-        seen.cost_usd = charged(seen)
+        apply_charge(seen)
         persist(seen)
         rec.finish(seen, time.monotonic() - started)
 
     meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None or openrouter_quote is not None else None,
-                  (lambda r: priced(r, cfg)) if openrouter_quote is None else charged,
+                  (lambda r: priced(r, cfg, policy=billing_policy)) if openrouter_quote is None else charged,
                   Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode),
                   actions=kw.pop("action_limit", None), reader=record.reader_for(header))
     with record.Recorder(record_id, trace[1], header, hidden, step_id=step_id) as rec:
@@ -1305,11 +1381,17 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                     res.usage_limit = None
             if res.calls:
                 for call in res.calls:
-                    call.cost_usd = charged(call)
-                res.cost_usd = sum(call.cost_usd for call in res.calls)
-                res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
+                    apply_charge(call)
+                total_cost_nusd = sum(call.cost_nusd or 0 for call in res.calls)
+                total_paid_nusd = sum(call.paid_nusd or 0 for call in res.calls)
+                res.cost_nusd = total_cost_nusd
+                res.paid_nusd = total_paid_nusd
+                res.cost_usd = total_cost_nusd / 1_000_000_000
+                res.aggregate_paid_usd = total_paid_nusd / 1_000_000_000
+                pvs = {call.price_version for call in res.calls if call.price_version}
+                res.price_version = next(iter(pvs)) if len(pvs) == 1 else ("mixed" if len(pvs) > 1 else "")
             else:
-                res.cost_usd = charged(res)
+                apply_charge(res)
             if openrouter_quote is not None and res.session.id:
                 res.session = replace(res.session, spent_usd=resume.spent_usd + res.cost_usd)
             if not budget_error:
@@ -1339,16 +1421,26 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
 
 
 def quote_calls(res: Result, which: str, name: str, at: datetime) -> None:
-    snapshot = prices.load()
+    from . import pins
+
+    pin = pins.current()
+    if pin is not None and pin.reference_prices is not None:
+        snapshot = pin.reference_prices
+        ref_ver = str((pin.prices or {}).get("id") or snapshot.get("version") or "")
+    else:
+        snapshot, meta = prices.load_models(None)
+        ref_ver = str((meta or {}).get("id") or (snapshot.get("version") if snapshot else "") or "")
     for call in res.calls or [res]:
         call.quote = prices.applied(snapshot, which, (call.model, name), at,
                                     call.tokens_in if call.turns <= 1 else None)
         call.reference_usd = prices.reference_usd(call.quote, call.tokens_in, call.tokens_out, call.cache_read,
                                                   call.cache_write)
+        call.reference_price_version = ref_ver if call.quote else ""
     if res.calls:
         res.quote = res.calls[-1].quote
         known = [call.reference_usd for call in res.calls]
         res.reference_usd = None if None in known else round(sum(known), 6)
+        res.reference_price_version = ref_ver if res.quote else ""
 
 
 def origin(cwd: Path | str, cfg: config.Config, target: devices.Device) -> dict:

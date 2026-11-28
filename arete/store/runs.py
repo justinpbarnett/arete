@@ -11,6 +11,8 @@ from ..agent import billing_of
 from . import events, writes
 from ._rows import json_dict, validate_columns
 from .db import (
+    MONEY_BACKFILL_SCHEMA,
+    MONEY_EXPAND_SCHEMA,
     RECORD_TURNS_SCHEMA,
     RUN_RETENTION_SCHEMA,
     RUNS_ADW_SCHEMA,
@@ -58,6 +60,14 @@ def has_record_turns(c) -> bool:
     return migration_applied(RECORD_TURNS_SCHEMA, c)
 
 
+def has_money_expand(c) -> bool:
+    return migration_applied(MONEY_EXPAND_SCHEMA, c)
+
+
+def has_money_backfill(c) -> bool:
+    return migration_applied(MONEY_BACKFILL_SCHEMA, c)
+
+
 def has_task_identity(c) -> bool:
     return migration_applied(TASK_IDENTITY_EXPAND_SCHEMA, c) or (
         "task_id" in {r[1] for r in c.execute("PRAGMA table_info(runs)")}
@@ -81,6 +91,8 @@ def run_row(r) -> dict:
         d["issue"] = d["issue_key"]
     elif d.get("issue") is None and d.get("issue_key") is not None:
         d["issue"] = d["issue_key"]
+    if d.get("cost_nusd") is not None:
+        d["cost_usd"] = int(d["cost_nusd"]) / 1_000_000_000
     return d
 
 
@@ -169,6 +181,8 @@ FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status I
 
 
 def backfill_legacy_cost(before: dict | None = None) -> int:
+    from .migrations import m0073_runs_money_backfill as money_backfill
+
     before = {} if before is None else before
     if not isinstance(before, dict) or any(not isinstance(k, str) or isinstance(v, bool)
                                          or not isinstance(v, (int, float))
@@ -184,6 +198,9 @@ def backfill_legacy_cost(before: dict | None = None) -> int:
         missing = sorted(set(before) - {r[0] for r in c.execute("SELECT id FROM runs")})
         if missing:
             raise ValueError(f"no run: {missing[0]}")
+        if has_money_expand(c):
+            before_nusd = {k: int(util.nusd(v) or 0) for k, v in before.items()}
+            return money_backfill.backfill_legacy_nusd(c, before_nusd)
         c.execute("""
             WITH totals AS MATERIALIZED (
                 SELECT run_id, SUM(cost_usd) AS usd, SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
@@ -253,21 +270,35 @@ def run_facets(connect=reader) -> dict[str, list[str]]:
                 for column in ("kind", "repo", "loop")}
 
 
-def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dict[str, float]:
+def paid_nusd_by_run(run_ids: list[str], connect=reader) -> dict[str, int]:
     if not run_ids:
         return {}
-    if local_providers is None:
+    placeholders = ",".join("?" * len(run_ids))
+    with connect() as c:
+        if has_money_backfill(c):
+            rows = c.execute(
+                f"SELECT run_id, SUM(COALESCE(paid_nusd, 0)) AS paid_nusd FROM steps "  # noqa: S608
+                f"WHERE run_id IN ({placeholders}) GROUP BY run_id HAVING SUM(COALESCE(paid_nusd, 0)) != 0",
+                run_ids,
+            )
+            return {str(r["run_id"]): int(r["paid_nusd"]) for r in rows}
         from .. import pins
 
         local_providers = pins.active_config().local_providers
-    paid: dict[str, float] = {}
-    with connect() as c:
-        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "  # noqa: S608
-                         f"WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
+        paid: dict[str, int] = {}
+        rows = c.execute(
+            f"SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "  # noqa: S608
+            f"WHERE run_id IN ({placeholders})",
+            run_ids,
+        )
         for r in rows:
             if billing_of(dict(r), local_providers) == "api_key":
-                paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
-    return {k: round(v, 6) for k, v in paid.items()}
+                paid[r[0]] = paid.get(r[0], 0) + int(util.nusd(float(r["cost_usd"] or 0)) or 0)
+        return {k: v for k, v in paid.items() if v != 0}
+
+
+def paid_by_run(run_ids: list[str], connect=reader) -> dict[str, float]:
+    return {run_id: nusd / 1_000_000_000 for run_id, nusd in paid_nusd_by_run(run_ids, connect=connect).items()}
 
 
 def merged_runs(connect=reader) -> list[dict]:
@@ -660,11 +691,36 @@ def fail_step(step_id: int | None, error: str, *, runner: str = "", model: str =
         inbox.on_step_settled(c, step_id)
 
 
+def set_step_billing_context(step_id: int | None, billing_context: str) -> None:
+    if step_id is None:
+        return
+    with writes.atomic() as c:
+        if not has_money_expand(c):
+            return
+        c.execute(
+            "UPDATE steps SET billing_context = ?, version = version + 1 WHERE id = ?",
+            (billing_context, step_id),
+        )
+
+
 def insert_turn(step_id: int, n: int, run_id: str, *, at: str, status: str, tool: str, excerpt: str,
                 seconds: float, tokens_in: int, cache_read: int, tokens_out: int, cost_nusd: int | None,
-                file: str, member_offset: int, member_len: int) -> None:
+                file: str, member_offset: int, member_len: int, paid_nusd: int | None = None,
+                auth_mode: str = "", price_version: str = "", cache_write: int = 0,
+                billing_context: str | None = None) -> None:
     with db() as c:
         if not has_record_turns(c):
+            return
+        if has_money_expand(c):
+            c.execute(
+                "INSERT OR REPLACE INTO turn_index "
+                "(step_id, n, run_id, at, status, tool, excerpt, seconds, tokens_in, cache_read, tokens_out, "
+                "cost_nusd, paid_nusd, auth_mode, price_version, cache_write, billing_context, "
+                "file, member_offset, member_len) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (step_id, n, run_id, at, status, tool, excerpt, seconds, tokens_in, cache_read, tokens_out,
+                 cost_nusd, paid_nusd, auth_mode or None, price_version or None, int(cache_write or 0),
+                 billing_context, file, member_offset, member_len),
+            )
             return
         c.execute(
             "INSERT OR REPLACE INTO turn_index "
@@ -720,11 +776,15 @@ def clear_turn_index(run_id: str | None = None, *, step_id: int | None = None) -
             c.execute("DELETE FROM turn_index")
 
 
-def steps_since(since: str, connect=reader) -> list[dict]:
+def steps_since(since: str, connect=reader, *, paid_only: bool = False) -> list[dict]:
     with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
-                                           "LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? "
-                                           "ORDER BY steps.ts", (since,))]
+        paid_clause = " AND COALESCE(steps.paid_nusd, 0) <> 0" if (paid_only and has_money_backfill(c)) else ""
+        rows = [dict(r) for r in c.execute(
+            "SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "  # noqa: S608
+            f"LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ?{paid_clause} "
+            "ORDER BY steps.ts",
+            (since,),
+        )]
     return [{**d, "task_kind": d.get("kind") or "", "kind": d["run_kind"]} for d in rows]
 
 
@@ -744,14 +804,26 @@ def feed(run_id: str, after: int = 0, connect=reader) -> list[dict]:
                                            (run_id, after))]
 
 
-def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
-    q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
-         "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
-    args: list = [since]
-    if loop:
-        q += " AND r.loop = ?"
-        args.append(loop)
+def loop_spent_since(since: str, loop: str | None = None) -> float:
     with reader() as c:
+        if has_money_backfill(c):
+            q = ("SELECT COALESCE(SUM(steps.paid_nusd), 0) AS total_nusd FROM steps "
+                 "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
+            args: list = [since]
+            if loop:
+                q += " AND r.loop = ?"
+                args.append(loop)
+            row = c.execute(q, args).fetchone()
+            return int(row["total_nusd"] or 0) / 1_000_000_000
+        from .. import pins
+
+        local_providers = pins.active_config().local_providers
+        q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
+             "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
+        args = [since]
+        if loop:
+            q += " AND r.loop = ?"
+            args.append(loop)
         return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
                    if billing_of(dict(r), local_providers) == "api_key")
 
@@ -1209,6 +1281,43 @@ def highest_contract_migration(connect=reader) -> int:
     return int(row[0]) if row else 0
 
 
+def _step_money_fields(res, auth_mode: str, kind: str) -> tuple[int, int, str, str]:
+    eff_auth = auth_mode or getattr(res, "auth_mode", "") or ""
+    runner = getattr(res, "runner", "") or ""
+    cost_nusd = (
+        int(res.cost_nusd)
+        if getattr(res, "cost_nusd", None) is not None
+        else int(util.nusd(res.cost_usd) or 0)
+    )
+    if eff_auth == "local" or runner == "replay":
+        paid_nusd = 0
+    elif runner == "guard":
+        paid_nusd = 0
+    elif getattr(res, "paid_nusd", None) is not None:
+        paid_nusd = int(res.paid_nusd)
+    elif eff_auth == "subscription":
+        paid_nusd = 0
+    elif eff_auth == "api_key":
+        paid_nusd = cost_nusd
+    else:
+        paid_nusd = int(util.nusd(res.paid_usd) or 0)
+    pv = getattr(res, "price_version", "") or ""
+    if not pv:
+        if runner == "legacy" or kind == "legacy":
+            pv = "legacy"
+        elif runner == "correction" or kind == "correction":
+            pv = "correction"
+        elif runner == "replay":
+            pv = "replay"
+        elif runner == "guard":
+            pv = "guard"
+        elif eff_auth == "local":
+            pv = "local"
+        else:
+            pv = "provider"
+    return cost_nusd, paid_nusd, eff_auth, pv
+
+
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
                  try_no: int = 0, auth_mode: str = "", *, inputs: tuple[dict, ...] | list[dict] = (),
                  settings_sha: str = "", settings_snapshots: dict[str, str] | None = None,
@@ -1224,6 +1333,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
         bound = has_prompt_binding(c)
         lifecycle = has_steps_lifecycle(c)
         turns_schema = has_record_turns(c)
+        money_expand = has_money_expand(c)
         if pinned:
             for sha, blob_kind, size in blob_rows:
                 blob_store.record_row(c, sha, blob_kind, size)
@@ -1232,13 +1342,23 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
         for index, (res, seconds) in enumerate(calls):
             now = util.iso()
             status = "done" if res.ok else "fault"
+            cost_nusd, paid_nusd, eff_auth, price_ver = _step_money_fields(res, auth_mode, kind)
+            cost_real = cost_nusd / 1_000_000_000 if money_expand else res.cost_usd
+            delta_cost_nusd = cost_nusd
             if index == 0 and step_id is not None and lifecycle:
-                existing = c.execute(
-                    "SELECT cost_usd, tokens_in, tokens_out, device, account_id, chat_id FROM steps WHERE id = ?",
-                    (step_id,),
-                ).fetchone()
+                sel_cols = (
+                    "cost_usd, cost_nusd, tokens_in, tokens_out, device, account_id, chat_id"
+                    if money_expand
+                    else "cost_usd, tokens_in, tokens_out, device, account_id, chat_id"
+                )
+                existing = c.execute(f"SELECT {sel_cols} FROM steps WHERE id = ?", (step_id,)).fetchone()  # noqa: S608
                 if existing is not None:
                     prev_cost = float(existing["cost_usd"] or 0.0)
+                    prev_cost_nusd = (
+                        int(existing["cost_nusd"])
+                        if money_expand and existing["cost_nusd"] is not None
+                        else int(util.nusd(prev_cost) or 0)
+                    )
                     prev_tin = int(existing["tokens_in"] or 0)
                     prev_tout = int(existing["tokens_out"] or 0)
                     if not device:
@@ -1247,7 +1367,24 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                         account_id = existing["account_id"]
                     if resolved_chat_id is None:
                         resolved_chat_id = existing["chat_id"]
-                    if turns_schema:
+                    if money_expand and turns_schema:
+                        c.execute(
+                            "UPDATE steps SET runner=?, model=?, provider=?, ok=?, status=?, cost_usd=?, "
+                            "cost_nusd=?, paid_nusd=?, price_version=?, tokens_in=?, "
+                            "tokens_out=?, turns=?, seconds=?, error=?, ts=?, first_context_tokens=?, effort=?, "
+                            "tier=?, kind=?, cache_read=?, cache_write=?, api_seconds=?, auth_mode=?, settings_sha=?, "
+                            "prompt_version=?, prompt_level=?, schema_version=?, "
+                            "unread=?, runner_version=COALESCE(NULLIF(?, ''), runner_version), "
+                            "waiting_since=NULL, version=version+1 WHERE id=?",
+                            (res.runner, res.model, res.provider, int(res.ok), status, cost_real,
+                             cost_nusd, paid_nusd, price_ver, res.tokens_in,
+                             res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
+                             res.first_context_tokens, effort or "", tier or "", kind or "", res.cache_read,
+                             res.cache_write, round(res.api_seconds, 2), eff_auth,
+                             settings_sha or None, prompt_version or None, prompt_level or None,
+                             schema_version or None, int(unread or 0), runner_version or "", step_id),
+                        )
+                    elif turns_schema:
                         c.execute(
                             "UPDATE steps SET runner=?, model=?, provider=?, ok=?, status=?, cost_usd=?, tokens_in=?, "
                             "tokens_out=?, turns=?, seconds=?, error=?, ts=?, first_context_tokens=?, effort=?, "
@@ -1258,7 +1395,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                             (res.runner, res.model, res.provider, int(res.ok), status, res.cost_usd, res.tokens_in,
                              res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                              res.first_context_tokens, effort or "", tier or "", kind or "", res.cache_read,
-                             res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                             res.cache_write, round(res.api_seconds, 2), eff_auth,
                              settings_sha or None, prompt_version or None, prompt_level or None,
                              schema_version or None, int(unread or 0), runner_version or "", step_id),
                         )
@@ -1272,12 +1409,13 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                             (res.runner, res.model, res.provider, int(res.ok), status, res.cost_usd, res.tokens_in,
                              res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                              res.first_context_tokens, effort or "", tier or "", kind or "", res.cache_read,
-                             res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                             res.cache_write, round(res.api_seconds, 2), eff_auth,
                              settings_sha or None, prompt_version or None, prompt_level or None,
                              schema_version or None, step_id),
                         )
                     written_step_id = step_id
-                    delta_cost = res.cost_usd - prev_cost
+                    delta_cost_nusd = cost_nusd - prev_cost_nusd
+                    delta_cost = delta_cost_nusd / 1_000_000_000 if money_expand else res.cost_usd - prev_cost
                     delta_tin = res.tokens_in - prev_tin
                     delta_tout = res.tokens_out - prev_tout
                 else:
@@ -1286,7 +1424,26 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                 written_step_id = None
             if written_step_id is None:
                 call_unread = int(unread or 0) if index == 0 else 0
-                if lifecycle and turns_schema:
+                if money_expand and lifecycle and turns_schema:
+                    cur = c.execute(
+                        "INSERT INTO steps (run_id, step, node, status, queued_at, device, account_id, chat_id, "
+                        "runner, runner_version, unread, model, provider, ok, cost_usd, cost_nusd, paid_nusd, "
+                        "price_version, tokens_in, tokens_out, "
+                        "turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, "
+                        "cache_write, api_seconds, auth_mode, settings_sha, prompt_version, prompt_level, "
+                        "schema_version, version) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                        "?,?,?,?,?,?,?,?,?,1)",
+                        (run_id, name, node, status, now, device or "", account_id, resolved_chat_id,
+                         res.runner, runner_version or "", call_unread, res.model, res.provider, int(res.ok),
+                         cost_real, cost_nusd, paid_nusd, price_ver, res.tokens_in, res.tokens_out,
+                         res.turns, round(seconds, 2), (res.error or "")[:500], now, res.first_context_tokens,
+                         effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                         res.cache_write, round(res.api_seconds, 2), eff_auth, settings_sha or None,
+                         prompt_version or None, prompt_level or None, schema_version or None),
+                    )
+                elif lifecycle and turns_schema:
                     cur = c.execute(
                         "INSERT INTO steps (run_id, step, node, status, queued_at, device, account_id, chat_id, "
                         "runner, runner_version, unread, model, provider, ok, cost_usd, tokens_in, tokens_out, "
@@ -1301,7 +1458,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                          res.cost_usd, res.tokens_in, res.tokens_out, res.turns, round(seconds, 2),
                          (res.error or "")[:500], now, res.first_context_tokens, effort or "", tier or "",
                          try_no, run_id, name, kind or "", res.cache_read, res.cache_write,
-                         round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None,
+                         round(res.api_seconds, 2), eff_auth, settings_sha or None,
                          prompt_version or None, prompt_level or None, schema_version or None),
                     )
                 elif lifecycle:
@@ -1317,7 +1474,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                          res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                          res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                          res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "",
-                         res.cache_read, res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                         res.cache_read, res.cache_write, round(res.api_seconds, 2), eff_auth,
                          settings_sha or None, prompt_version or None, prompt_level or None, schema_version or None),
                     )
                 elif bound:
@@ -1331,7 +1488,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                         (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                          res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                          res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "",
-                         res.cache_read, res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode,
+                         res.cache_read, res.cache_write, round(res.api_seconds, 2), eff_auth,
                          settings_sha or None, prompt_version or None, prompt_level or None, schema_version or None),
                     )
                 elif pinned:
@@ -1344,7 +1501,7 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                         (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                          res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                          res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                         res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None))
+                         res.cache_write, round(res.api_seconds, 2), eff_auth, settings_sha or None))
                 else:
                     cur = c.execute(
                         "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
@@ -1355,9 +1512,10 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                         (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
                          res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], now,
                          res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                         res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
+                         res.cache_write, round(res.api_seconds, 2), eff_auth))
                 written_step_id = cur.lastrowid
-                delta_cost = res.cost_usd
+                delta_cost_nusd = cost_nusd
+                delta_cost = cost_real
                 delta_tin = res.tokens_in
                 delta_tout = res.tokens_out
             if pinned and inputs and written_step_id is not None:
@@ -1369,8 +1527,14 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                       str(item.get("sha256") or ""), int(item.get("call") or 0))
                      for item in inputs],
                 )
-            writes.update("runs", run_id, {}, increments={"cost_usd": delta_cost, "tokens_in": delta_tin,
-                                                         "tokens_out": delta_tout})
+            run_increments: dict[str, float | int] = {
+                "cost_usd": delta_cost,
+                "tokens_in": delta_tin,
+                "tokens_out": delta_tout,
+            }
+            if money_expand:
+                run_increments["cost_nusd"] = delta_cost_nusd
+            writes.update("runs", run_id, {}, increments=run_increments)
             if lifecycle and written_step_id is not None:
                 from .. import inbox
 
@@ -1464,8 +1628,15 @@ def ask_stop(run_id: str, base_version=None) -> dict | None:
 def _close_open_steps_in_tx(c, run_id: str) -> dict[str, float | int]:
     if not has_steps_lifecycle(c):
         return {}
+    money_expand = has_money_expand(c)
+    sel_cols = (
+        "id, runner, cost_usd, cost_nusd, paid_nusd, auth_mode, price_version, billing_context, "
+        "tokens_in, tokens_out, cache_read, cache_write, turns, ts"
+        if money_expand
+        else "id, runner, cost_usd, auth_mode, tokens_in, tokens_out, cache_read, cache_write, turns, ts"
+    )
     rows = c.execute(
-        "SELECT id, cost_usd, tokens_in, tokens_out, cache_read, turns, ts FROM steps "
+        f"SELECT {sel_cols} FROM steps "  # noqa: S608
         "WHERE run_id = ? AND status IN ('queued', 'waiting', 'running') ORDER BY id",
         (run_id,),
     ).fetchall()
@@ -1474,40 +1645,122 @@ def _close_open_steps_in_tx(c, run_id: str) -> dict[str, float | int]:
     turns_available = has_record_turns(c)
     now = util.iso()
     delta_cost = 0.0
+    delta_cost_nusd = 0
     delta_tin = 0
     delta_tout = 0
     for row in rows:
         prev_cost = float(row["cost_usd"] or 0.0)
+        prev_cost_nusd = (
+            int(row["cost_nusd"])
+            if money_expand and row["cost_nusd"] is not None
+            else int(util.nusd(prev_cost) or 0)
+        )
+        prev_paid_nusd = int(row["paid_nusd"]) if money_expand and row["paid_nusd"] is not None else 0
         prev_tin = int(row["tokens_in"] or 0)
         prev_tout = int(row["tokens_out"] or 0)
         prev_cr = int(row["cache_read"] or 0)
+        prev_cw = int(row["cache_write"] or 0)
         prev_turns = int(row["turns"] or 0)
-        new_cost, new_tin, new_tout, new_cr, new_turns = prev_cost, prev_tin, prev_tout, prev_cr, prev_turns
+        prev_auth = str(row["auth_mode"] or "")
+        prev_pv = str(row["price_version"] or "") if money_expand else ""
+        ctx_auth = ""
+        ctx_pv = ""
+        if money_expand and row["billing_context"]:
+            try:
+                parsed_ctx = json.loads(row["billing_context"])
+            except (ValueError, TypeError):
+                parsed_ctx = None
+            if isinstance(parsed_ctx, dict):
+                ctx_auth = str(parsed_ctx.get("auth_mode") or "")
+                bsrc = str(parsed_ctx.get("billing_source") or "")
+                ctx_pv = (
+                    str(parsed_ctx.get("billing_version") or "")
+                    if bsrc == "pinned"
+                    else bsrc
+                )
+        new_cost, new_cost_nusd, new_paid_nusd = prev_cost, prev_cost_nusd, prev_paid_nusd
+        new_tin, new_tout, new_cr, new_cw, new_turns = prev_tin, prev_tout, prev_cr, prev_cw, prev_turns
+        new_auth = prev_auth or ctx_auth
+        new_pv = prev_pv or ctx_pv or ("replay" if row["runner"] == "replay" else "compat:unknown")
         if turns_available:
-            agg = c.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(tokens_in), 0) AS tin, COALESCE(SUM(cache_read), 0) AS cr, "
-                "COALESCE(SUM(tokens_out), 0) AS tout, COALESCE(SUM(cost_nusd), 0) AS cnusd "
-                "FROM turn_index WHERE step_id = ?",
-                (row["id"],),
-            ).fetchone()
-            if agg and agg["n"]:
-                recovered_cost = agg["cnusd"] / 1_000_000_000
-                new_cost = max(prev_cost, recovered_cost)
-                new_tin = max(prev_tin, int(agg["tin"]))
-                new_tout = max(prev_tout, int(agg["tout"]))
-                new_cr = max(prev_cr, int(agg["cr"]))
-                new_turns = max(prev_turns, int(agg["n"]))
-        c.execute(
-            "UPDATE steps SET status = 'fault', ok = 0, error = 'interrupted', "
-            "ts = COALESCE(NULLIF(ts, ''), ?), cost_usd = ?, tokens_in = ?, tokens_out = ?, "
-            "cache_read = ?, turns = ?, waiting_since = NULL, version = version + 1 WHERE id = ?",
-            (now, new_cost, new_tin, new_tout, new_cr, new_turns, row["id"]),
-        )
-        delta_cost += new_cost - prev_cost
+            if money_expand:
+                turn_rows = c.execute(
+                    "SELECT tokens_in, cache_read, cache_write, tokens_out, cost_nusd, paid_nusd, "
+                    "auth_mode, price_version FROM turn_index WHERE step_id = ? ORDER BY n",
+                    (row["id"],),
+                ).fetchall()
+                if turn_rows:
+                    rec_tin = sum(int(t["tokens_in"] or 0) for t in turn_rows)
+                    rec_cr = sum(int(t["cache_read"] or 0) for t in turn_rows)
+                    rec_cw = sum(int(t["cache_write"] or 0) for t in turn_rows)
+                    rec_tout = sum(int(t["tokens_out"] or 0) for t in turn_rows)
+                    rec_cost = sum(int(t["cost_nusd"] or 0) for t in turn_rows)
+                    known_paid = [t["paid_nusd"] for t in turn_rows if t["paid_nusd"] is not None]
+                    rec_paid = sum(int(p) for p in known_paid) if known_paid else None
+                    new_cost_nusd = max(prev_cost_nusd, rec_cost)
+                    new_cost = new_cost_nusd / 1_000_000_000
+                    if rec_paid is not None:
+                        new_paid_nusd = max(prev_paid_nusd, rec_paid)
+                    elif prev_paid_nusd:
+                        new_paid_nusd = prev_paid_nusd
+                    else:
+                        new_paid_nusd = None
+                    new_tin = max(prev_tin, rec_tin)
+                    new_tout = max(prev_tout, rec_tout)
+                    new_cr = max(prev_cr, rec_cr)
+                    new_cw = max(prev_cw, rec_cw)
+                    new_turns = max(prev_turns, len(turn_rows))
+                    turn_auths = [str(t["auth_mode"]) for t in turn_rows if t["auth_mode"]]
+                    if turn_auths:
+                        new_auth = turn_auths[-1]
+                    turn_pvs = list(dict.fromkeys(str(t["price_version"]) for t in turn_rows if t["price_version"]))
+                    if len(turn_pvs) == 1:
+                        new_pv = turn_pvs[0]
+                    elif len(turn_pvs) > 1:
+                        new_pv = "mixed"
+            else:
+                agg = c.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(SUM(tokens_in), 0) AS tin, COALESCE(SUM(cache_read), 0) AS cr, "
+                    "COALESCE(SUM(tokens_out), 0) AS tout, COALESCE(SUM(cost_nusd), 0) AS cnusd "
+                    "FROM turn_index WHERE step_id = ?",
+                    (row["id"],),
+                ).fetchone()
+                if agg and agg["n"]:
+                    recovered_cost = agg["cnusd"] / 1_000_000_000
+                    new_cost = max(prev_cost, recovered_cost)
+                    new_tin = max(prev_tin, int(agg["tin"]))
+                    new_tout = max(prev_tout, int(agg["tout"]))
+                    new_cr = max(prev_cr, int(agg["cr"]))
+                    new_turns = max(prev_turns, int(agg["n"]))
+        if money_expand:
+            c.execute(
+                "UPDATE steps SET status = 'fault', ok = 0, error = 'interrupted', "
+                "ts = COALESCE(NULLIF(ts, ''), ?), cost_usd = ?, cost_nusd = ?, paid_nusd = ?, "
+                "auth_mode = ?, price_version = ?, tokens_in = ?, tokens_out = ?, "
+                "cache_read = ?, cache_write = ?, turns = ?, waiting_since = NULL, version = version + 1 "
+                "WHERE id = ?",
+                (now, new_cost, new_cost_nusd, new_paid_nusd, new_auth, new_pv,
+                 new_tin, new_tout, new_cr, new_cw, new_turns, row["id"]),
+            )
+            step_delta_nusd = new_cost_nusd - prev_cost_nusd
+            delta_cost_nusd += step_delta_nusd
+            delta_cost += step_delta_nusd / 1_000_000_000
+        else:
+            c.execute(
+                "UPDATE steps SET status = 'fault', ok = 0, error = 'interrupted', "
+                "ts = COALESCE(NULLIF(ts, ''), ?), cost_usd = ?, tokens_in = ?, tokens_out = ?, "
+                "cache_read = ?, turns = ?, waiting_since = NULL, version = version + 1 WHERE id = ?",
+                (now, new_cost, new_tin, new_tout, new_cr, new_turns, row["id"]),
+            )
+            delta_cost += new_cost - prev_cost
         delta_tin += new_tin - prev_tin
         delta_tout += new_tout - prev_tout
     increments: dict[str, float | int] = {}
-    if delta_cost:
+    if money_expand:
+        if delta_cost_nusd:
+            increments["cost_nusd"] = delta_cost_nusd
+            increments["cost_usd"] = delta_cost_nusd / 1_000_000_000
+    elif delta_cost:
         increments["cost_usd"] = delta_cost
     if delta_tin:
         increments["tokens_in"] = delta_tin

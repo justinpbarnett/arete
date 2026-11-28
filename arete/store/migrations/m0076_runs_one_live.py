@@ -81,6 +81,6 @@ def apply(conn) -> None:
         "CREATE UNIQUE INDEX runs_one_live ON runs (lock) WHERE status = 'running' AND lock IS NOT NULL"
     )
     conn.execute(
-        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 74 "
-        "THEN '74' ELSE value END WHERE key = 'oldest_writer'"
+        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 76 "
+        "THEN '76' ELSE value END WHERE key = 'oldest_writer'"
     )

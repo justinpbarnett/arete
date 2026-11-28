@@ -65,7 +65,11 @@ def apply(conn) -> None:
             chat_id INTEGER REFERENCES chats(id),
             version INTEGER NOT NULL DEFAULT 1,
             runner_version TEXT,
-            unread INTEGER NOT NULL DEFAULT 0
+            unread INTEGER NOT NULL DEFAULT 0,
+            cost_nusd INTEGER,
+            paid_nusd INTEGER,
+            price_version TEXT,
+            billing_context TEXT
         )
     """)
     step_cols = (
@@ -73,7 +77,7 @@ def apply(conn) -> None:
         "turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, "
         "cache_write, api_seconds, atom, ab, ab_side, settings_sha, prompt_version, prompt_level, "
         "schema_version, node, status, queued_at, waiting_since, device, account_id, chat_id, "
-        "version, runner_version, unread"
+        "version, runner_version, unread, cost_nusd, paid_nusd, price_version, billing_context"
     )
     conn.execute(f"INSERT INTO steps_new ({step_cols}) SELECT {step_cols} FROM steps")  # noqa: S608
     conn.execute("DROP TABLE steps")
@@ -97,6 +101,25 @@ def apply(conn) -> None:
             AND a.holder IS NOT COALESCE((SELECT payer FROM runs WHERE id = NEW.run_id),
                                          (SELECT payer FROM chats WHERE id = NEW.chat_id)))
         BEGIN SELECT RAISE(ABORT, 'personal account used for another payer'); END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS steps_cost_nusd_mirror_ins AFTER INSERT ON steps
+        WHEN NEW.cost_nusd IS NULL AND NEW.cost_usd IS NOT NULL
+        BEGIN
+          UPDATE steps SET cost_nusd = CAST(round(NEW.cost_usd * 1e9) AS INTEGER)
+          WHERE id = NEW.id;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS steps_cost_nusd_mirror_upd AFTER UPDATE OF cost_usd ON steps
+        WHEN NEW.cost_nusd IS OLD.cost_nusd
+        AND (NEW.cost_usd IS NOT OLD.cost_usd
+        OR (NEW.cost_nusd IS NULL AND NEW.cost_usd IS NOT NULL))
+        BEGIN
+          UPDATE steps SET cost_nusd = CASE WHEN NEW.cost_usd IS NULL THEN NULL
+          ELSE CAST(round(NEW.cost_usd * 1e9) AS INTEGER) END
+          WHERE id = NEW.id;
+        END
     """)
     _time_triggers(conn, "steps", ("ts",))
 
@@ -164,19 +187,39 @@ def apply(conn) -> None:
             settings TEXT DEFAULT '',
             base_commit TEXT DEFAULT '',
             after_step INTEGER DEFAULT 0,
-            last_step INTEGER DEFAULT 0
+            last_step INTEGER DEFAULT 0,
+            cost_nusd INTEGER
         )
     """)
     conn.execute(
         "INSERT INTO evals_new (run_id, repo, task, passed, seconds, cost_usd, ts, source, "
-        "engine_sha, prompts_sha, prompts_from, context_sha, settings, base_commit, after_step, last_step) "
+        "engine_sha, prompts_sha, prompts_from, context_sha, settings, base_commit, after_step, last_step, cost_nusd) "
         "SELECT NULLIF(run_id, ''), repo, task, passed, seconds, cost_usd, ts, source, "
-        "engine_sha, prompts_sha, prompts_from, context_sha, settings, base_commit, after_step, last_step "
+        "engine_sha, prompts_sha, prompts_from, context_sha, settings, base_commit, after_step, last_step, cost_nusd "
         "FROM evals"
     )
     conn.execute("DROP TABLE evals")
     conn.execute("ALTER TABLE evals_new RENAME TO evals")
     conn.execute("CREATE UNIQUE INDEX evals_key ON evals (run_id, repo, task)")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS evals_cost_nusd_mirror_ins AFTER INSERT ON evals
+        WHEN NEW.cost_nusd IS NULL AND NEW.cost_usd IS NOT NULL
+        BEGIN
+          UPDATE evals SET cost_nusd = CAST(round(NEW.cost_usd * 1e9) AS INTEGER)
+          WHERE rowid = NEW.rowid;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS evals_cost_nusd_mirror_upd AFTER UPDATE OF cost_usd ON evals
+        WHEN NEW.cost_nusd IS OLD.cost_nusd
+        AND (NEW.cost_usd IS NOT OLD.cost_usd
+        OR (NEW.cost_nusd IS NULL AND NEW.cost_usd IS NOT NULL))
+        BEGIN
+          UPDATE evals SET cost_nusd = CASE WHEN NEW.cost_usd IS NULL THEN NULL
+          ELSE CAST(round(NEW.cost_usd * 1e9) AS INTEGER) END
+          WHERE rowid = NEW.rowid;
+        END
+    """)
     _time_triggers(conn, "evals", ("ts",))
 
     # 5. Rebuild zte_deliveries to drop its pre-m0059 TEXT REFERENCES tasks(id) (tasks.id became INTEGER in m0059).

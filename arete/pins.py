@@ -51,6 +51,9 @@ class Resolution:
     schema_objects: dict[str, dict] = field(default_factory=dict)
     draft_id: str = ""
     line: dict | None = None
+    reference_prices: dict | None = None
+    billing_policy: prices.BillingPolicy | None = None
+    billing_prices: dict | None = None
 
     @property
     def config(self) -> config.Config:
@@ -643,13 +646,11 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             "sha256": exp_sha,
         }
 
-    prices_meta: dict | None = None
-    if (loaded_prices := prices.load()) is not None:
-        prices_meta = {
-            "version": loaded_prices.get("version", ""),
-            "source": loaded_prices.get("source", ""),
-            "sha256": hashlib.sha256(_canonical_json_bytes(loaded_prices)).hexdigest(),
-        }
+    loaded_prices, prices_meta = prices.load_models(config_dir, config_commit=config_commit)
+    if loaded_prices is None:
+        loaded_prices, prices_meta = prices.load_models(None)
+    billing_policy = prices.load_billing(config_dir, cfg=pinned_cfg, config_commit=config_commit)
+    billing_meta = billing_policy.meta() if billing_policy.content_version else None
 
     resolved_adw, resolved_adw_version, resolved_adw_rule = _adw_fields(
         adw_name or adw_path, adw_version, adw_rule, engine_sha, config_dir,
@@ -693,6 +694,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             for role, table in sorted(step_overrides.items())
         },
         "prices": prices_meta,
+        "billing_prices": billing_meta,
         "prompts": prompts_meta,
         "prompt_appends": {
             k: [a.as_row() for a in v] for k, v in sorted(prompt_appends.items())
@@ -739,6 +741,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         schema_objects=schema_objects,
         draft_id=draft_id,
         line=pinned_line,
+        reference_prices=loaded_prices,
+        billing_policy=billing_policy,
+        billing_prices=billing_meta,
     )
 
 

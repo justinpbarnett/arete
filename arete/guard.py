@@ -414,7 +414,8 @@ def decide(payload: dict, judge: bool = False, boundary: Floor | None = None) ->
 
 
 def kept_out(tool: str, target: str) -> str:
-    note(Result(ok=False, error=f"kept {tool} out of {target}", runner="guard"))
+    note(Result(ok=False, error=f"kept {tool} out of {target}", runner="guard",
+                cost_usd=0.0, cost_nusd=0, paid_nusd=0, price_version="guard"))
     return (f"Arete's guard keeps agents out of secret files, and {target} looks like one. Leave it alone and say in "
             f"your summary what it needs.")
 

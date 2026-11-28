@@ -60,12 +60,12 @@ from arete import (
 from arete.store import chats, db, inbox as inbox_store, insights as insights_store
 from arete.store import loops as loop_store, retention as retention_store, runs as run_store, tasks as task_store, tokens
 
-# 1. Seed a pre-m0074 DB (through=73) with two running rows on one lock, then migrate to LATEST (74).
+# 1. Seed a pre-m0076 DB (through=75) with two running rows on one lock, then migrate to LATEST (76).
 sample = ROOT / "sample"
 with mock.patch.object(util, "git", local_git):
     cfg_lines = replay.sample(sample, adw=True)
 paths.CONFIG_FILE.write_text("max_parallel = 4\n" + "\n".join(cfg_lines) + "\n")
-db.migrate(through=73)
+db.migrate(through=75)
 owner = principals.seed_owner("owner@example.test")
 tokens.init_owner()
 with db.tx() as c:
@@ -85,7 +85,7 @@ with db.reader() as c:
     new_status = c.execute("SELECT status FROM runs WHERE id = 'dup-new'").fetchone()[0]
     assert old_status == "interrupted" and new_status == "running", (old_status, new_status)
     oldest = c.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0]
-    assert int(oldest) >= 74, oldest
+    assert int(oldest) >= 76, oldest
     idx = c.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'runs_one_live'").fetchone()
     assert idx is not None and "WHERE status = 'running' AND lock IS NOT NULL" in idx[0], idx
 record.settle("dup-new", "done")
@@ -852,7 +852,7 @@ try:
     assert engine_copy.ensure(sha_a, source_root=src_checkout) == copy_a
 
     # Start a run pinned at engine A while serve's checkout is at engine B.
-    run_id = record.start("loop", loop="pin-worker", engine_sha=sha_a, schema_version=73, pid=os.getpid())
+    run_id = record.start("loop", loop="pin-worker", engine_sha=sha_a, schema_version=75, pid=os.getpid())
     lease_id = int(run_store.run_get(run_id)["lease_id"])
     with db.tx() as c:
         claim_tok = leases.issue_claim_token(c, run_id, lease_id)
@@ -923,12 +923,12 @@ try:
     assert probe_data["stamp"] == sha_a, probe_data
     assert probe_data["sub_uses_copy"], probe_data
 
-    # Migration gate counts live leases by schema_version and blocks contract 74 while schema_version=73 lease is open!
+    # Migration gate counts live leases by schema_version and blocks contract 76 while schema_version=75 lease is open!
     with db.reader() as c:
         counts = db.live_lease_schema_counts(c)
-        blockers_74 = db.contract_blockers(c, 74)
-    assert counts.get(73, 0) >= 1, counts
-    assert f"lease L-{lease_id}" in blockers_74, blockers_74
+        blockers_76 = db.contract_blockers(c, 76)
+    assert counts.get(75, 0) >= 1, counts
+    assert f"lease L-{lease_id}" in blockers_76, blockers_76
 
     # Release lease -> folder STATE_DIR/engine/<A>/ is removed automatically, and contract blocker clears!
     st_rel, _ = client.release(claimed["lease"]["id"], claimed["token"], claimed["header"], node="worker")
@@ -937,8 +937,8 @@ try:
     assert not copy_a.exists(), f"engine copy {copy_a} still exists after lease release"
     with db.reader() as c:
         counts_after = db.live_lease_schema_counts(c)
-        blockers_after = db.contract_blockers(c, 74)
-    assert counts_after.get(73, 0) == 0, counts_after
+        blockers_after = db.contract_blockers(c, 76)
+    assert counts_after.get(75, 0) == 0, counts_after
     assert f"lease L-{lease_id}" not in blockers_after, blockers_after
 finally:
     worker_listener.stop(w_server)

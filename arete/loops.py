@@ -433,10 +433,10 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
         limits.append(("run budget", loop.budget_usd - spent_this_run))
     if loop.daily_budget_usd:
         limits.append(("daily loop budget", loop.daily_budget_usd
-                       - run_store.loop_spent_since(day_ago, loop.name, cfg.local_providers)))
+                       - run_store.loop_spent_since(day_ago, loop.name)))
     if cfg.daily_budget_usd:
         limits.append(("daily budget for all loops",
-                       cfg.daily_budget_usd - run_store.loop_spent_since(day_ago, None, cfg.local_providers)))
+                       cfg.daily_budget_usd - run_store.loop_spent_since(day_ago, None)))
     return min(limits, key=lambda x: x[1]) if limits else None
 
 

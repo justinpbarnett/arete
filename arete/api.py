@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import hashlib
 import json
+import math
 import platform
 import re
 import secrets
@@ -197,7 +198,20 @@ def resources(name, values):
             node_name = r.get("node") or r["step"] or ""
             entry = {
                 "id": r["id"], "run_id": values["run"], "name": r["step"], "model": r["model"] or "",
-                "runner": r["runner"] or "", "cost_usd": r["cost_usd"] or 0, "seconds": r["seconds"] or 0,
+                "runner": r["runner"] or "",
+                "cost_usd": (
+                    int(r["cost_nusd"]) / 1_000_000_000
+                    if r.get("cost_nusd") is not None
+                    else (r["cost_usd"] or 0)
+                ),
+                "paid_usd": (
+                    int(r["paid_nusd"]) / 1_000_000_000
+                    if r.get("paid_nusd") is not None
+                    else None
+                ),
+                "price_version": r.get("price_version") or None,
+                "auth_mode": r.get("auth_mode") or None,
+                "seconds": r["seconds"] or 0,
                 "settings_sha": snap_sha,
                 "settings": snapshots.get(snap_sha) if snap_sha else None,
                 "inputs": step_inputs if step_inputs is not None else [],
@@ -418,9 +432,52 @@ def execute(name, values, handler=None):
         return {"seq": seq, **payload}
 
 
+def read_insight(values: dict, *, conn=None) -> tuple[dict[str, object], str]:
+    from . import insights as insights_mod
+
+    chart = str(values.get("chart") or "")
+    if chart not in insights_mod.CHARTS:
+        raise contract.Problem("invalid_input", f"Unknown insight chart {chart!r}")
+    days_val: float | None = None
+    if values.get("days") not in (None, ""):
+        try:
+            days_val = float(values["days"])
+        except (TypeError, ValueError):
+            raise contract.Problem("invalid_input", "days must be a finite nonnegative number") from None
+        if not math.isfinite(days_val) or days_val < 0:
+            raise contract.Problem("invalid_input", "days must be a finite nonnegative number")
+    min_seq_val: int | None = None
+    if values.get("min_seq") not in (None, ""):
+        raw_min = str(values["min_seq"]).strip()
+        if not (raw_min.isascii() and raw_min.isdecimal()):
+            raise contract.Problem("invalid_input", "min_seq must be a nonnegative integer")
+        min_seq_val = int(raw_min)
+    by_val = str(values["by"]).strip() if values.get("by") not in (None, "") else None
+    pv_val = str(values["price_version"]).strip() if values.get("price_version") not in (None, "") else None
+    run_id_val = str(values["run_id"]).strip() if values.get("run_id") not in (None, "") else None
+    step_val = str(values["step"]).strip() if values.get("step") not in (None, "") else None
+    try:
+        return insights_mod.query(
+            chart,
+            days=days_val,
+            by=by_val,
+            min_seq=min_seq_val,
+            price_version=pv_val,
+            run_id=run_id_val,
+            step=step_val,
+            conn=conn,
+        )
+    except LookupError as error:
+        raise contract.Problem("not_found", str(error)) from None
+    except ValueError as error:
+        raise contract.Problem("invalid_input", str(error)) from None
+
+
 def read_with_validator(name, values, handler, *, conn=None):
     if name == "adw.stats":
         return read_adw_stats(values["name"], conn=conn)
+    if name == "insight.get":
+        return read_insight(values, conn=conn)
     if name.startswith("config."):
         return read_config_with_validator(name.removeprefix("config."), values, conn=conn)
     return read(name, values, handler, conn=conn), None
@@ -601,6 +658,8 @@ def read(name, values, handler, *, conn=None):
         }}
     if name == "adw.stats":
         return read_adw_stats(values["name"], conn=conn)[0]
+    if name == "insight.get":
+        return read_insight(values, conn=conn)[0]
     if name.startswith("config."):
         return read_config_with_validator(name.removeprefix("config."), values, conn=conn)[0]
     if name == "draft.list":

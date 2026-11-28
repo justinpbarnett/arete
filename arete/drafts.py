@@ -1075,6 +1075,10 @@ def activate(
         # Ensure draft publication is finalized even on no-op or idempotent replay.
         with foundation.tx() as c, principals.acting(actor):
             finalize_activated_draft(c, draft["id"], commit_sha)
+        if draft["kind"] == "prices" and draft["name"] == "models" and body_bytes is not None:
+            from . import prices
+
+            prices.sync_snapshot_mirror(body_bytes)
         new_ver = _live_ver_for(draft["kind"], draft["name"], rel)
         updated = get(draft["numeric_id"])
     return {"draft": public(updated), "commit": commit_sha, "version": new_ver}

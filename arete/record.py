@@ -350,8 +350,24 @@ def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") 
         raise ValueError("invalid auth mode")
     if not run_store.run_get(run_id):
         raise ValueError(f"no run: {run_id}")
-    step(run_id, "correction", agent.Result(ok=True, runner="correction", cost_usd=usd, error=why,
-                                           auth_mode=auth_mode), 0, kind="correction")
+    cost_nusd = int(util.nusd(usd) or 0)
+    paid_nusd = cost_nusd if auth_mode == "api_key" else 0
+    step(
+        run_id,
+        "correction",
+        agent.Result(
+            ok=True,
+            runner="correction",
+            cost_usd=cost_nusd / 1_000_000_000,
+            cost_nusd=cost_nusd,
+            paid_nusd=paid_nusd,
+            price_version="correction",
+            error=why,
+            auth_mode=auth_mode,
+        ),
+        0,
+        kind="correction",
+    )
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
@@ -561,25 +577,15 @@ def runner_version_of(which: str) -> str:
     return ""
 
 
+def _turn_charge_from_header(header: dict, ev: dict, *, billing_ctx: dict | None = None):
+    from . import prices
+
+    return prices.price_turn(header, ev, billing_ctx=billing_ctx)
+
+
 def _turn_cost_from_header(header: dict, ev: dict) -> float | None:
-    which = header.get("runner", "")
-    auth_mode = header.get("auth_mode", "")
-    tin = int(ev.get("tokens_in") or 0)
-    tout = int(ev.get("tokens_out") or 0)
-    cr = int(ev.get("cache_read") or 0)
-    cw = int(ev.get("cache_write") or 0)
-    if header.get("usage_rates") is not None:
-        return agent.token_cost(header["usage_rates"], tin, tout, cr, cw)
-    if header.get("local_billing"):
-        return 0.0
-    if which == "replay":
-        return float(ev["cost_usd"]) if ev.get("cost_usd") is not None else 0.0
-    if which == "pi" and auth_mode == "subscription":
-        return float(ev["cost_usd"]) if ev.get("cost_usd") is not None else 0.0
-    rate = header.get("pricing_rate")
-    if isinstance(rate, (list, tuple)) and len(rate) >= 2:
-        return (tin * (rate[0] or 0) + tout * (rate[1] or 0)) / 1_000_000
-    return float(ev["cost_usd"]) if ev.get("cost_usd") is not None else None
+    outcome = _turn_charge_from_header(header, ev)
+    return None if outcome.cost_nusd is None else outcome.cost_nusd / 1_000_000_000
 
 
 def _turn_at(started_iso: str, clock_seconds: float) -> str:
@@ -638,6 +644,15 @@ class Recorder:
         self._turn_tool = ""
         self._turn_excerpt = ""
         self._turn_status = "ok"
+        self._billing_context: dict | None = (
+            dict(header["billing_context"]) if isinstance(header.get("billing_context"), dict) else None
+        )
+        self._indexed_tin = 0
+        self._indexed_tout = 0
+        self._indexed_cr = 0
+        self._indexed_cw = 0
+        self._indexed_cost_nusd = 0
+        self._indexed_paid_nusd = 0
         self.header = {
             "arete": "header",
             "v": 1,
@@ -703,6 +718,8 @@ class Recorder:
         if not isinstance(entry, dict):
             return
         if entry.get("arete"):
+            if entry.get("arete") == "billing" and isinstance(entry.get("billing_context"), dict):
+                self._billing_context = dict(entry["billing_context"])
             return
         if self.runner == "claude" and entry.get("type") == "system" and entry.get("subtype") == "init":
             init_ver = str(entry.get("claude_code_version") or "").strip()
@@ -719,11 +736,39 @@ class Recorder:
                 self._turn_excerpt = util.one_line(str(ev["text"]), 200)
             elif kind == "tool_result" and ev.get("error"):
                 self._turn_status = "error"
-            elif kind == "usage" and not ev.get("total"):
+            elif kind == "usage":
+                is_total = bool(ev.get("total"))
+                tin = int(ev.get("tokens_in") or 0)
+                cr = int(ev.get("cache_read") or 0)
+                cw = int(ev.get("cache_write") or 0)
+                tout = int(ev.get("tokens_out") or 0)
+                outcome = _turn_charge_from_header(self.header, ev, billing_ctx=self._billing_context)
+                cost_n = outcome.cost_nusd
+                paid_n = outcome.paid_nusd
+                if is_total:
+                    d_tin = max(0, tin - self._indexed_tin)
+                    d_cr = max(0, cr - self._indexed_cr)
+                    d_cw = max(0, cw - self._indexed_cw)
+                    d_tout = max(0, tout - self._indexed_tout)
+                    d_cost = None if cost_n is None else max(0, cost_n - self._indexed_cost_nusd)
+                    d_paid = None if paid_n is None else max(0, paid_n - self._indexed_paid_nusd)
+                    if not any((d_tin, d_tout, d_cr, d_cw)) and not (d_cost or 0):
+                        continue
+                    tin, cr, cw, tout, cost_n, paid_n = d_tin, d_cr, d_cw, d_tout, d_cost, d_paid
                 self._turn_n += 1
+                self._indexed_tin += tin
+                self._indexed_cr += cr
+                self._indexed_cw += cw
+                self._indexed_tout += tout
+                self._indexed_cost_nusd += cost_n or 0
+                self._indexed_paid_nusd += paid_n or 0
                 turn_seconds = round(max(0.0, self._clock_seconds - self._prev_turn_seconds), 2)
                 self._prev_turn_seconds = self._clock_seconds
-                turn_cost = _turn_cost_from_header(self.header, ev)
+                ctx_json = (
+                    json.dumps(self._billing_context, sort_keys=True, separators=(",", ":"))
+                    if self._billing_context is not None
+                    else None
+                )
                 if self.step_id is not None and self.path is not None and span is not None and paths.DB_FILE.exists():
                     with contextlib.suppress(sqlite3.Error, OSError, foundation.NoDatabase, foundation.IncompatibleSchema):
                         run_store.insert_turn(
@@ -735,10 +780,15 @@ class Recorder:
                             tool=self._turn_tool,
                             excerpt=self._turn_excerpt,
                             seconds=turn_seconds,
-                            tokens_in=int(ev.get("tokens_in") or 0),
-                            cache_read=int(ev.get("cache_read") or 0),
-                            tokens_out=int(ev.get("tokens_out") or 0),
-                            cost_nusd=util.nusd(turn_cost),
+                            tokens_in=tin,
+                            cache_read=cr,
+                            tokens_out=tout,
+                            cost_nusd=cost_n,
+                            paid_nusd=paid_n,
+                            auth_mode=outcome.auth_mode,
+                            price_version=outcome.price_version,
+                            cache_write=cw,
+                            billing_context=ctx_json,
                             file=_relative_record_file(self.path),
                             member_offset=span[0],
                             member_len=span[1],
@@ -792,7 +842,9 @@ class Recorder:
 
     def finish(self, res: agent.Result, seconds: float) -> None:
         self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
-                  "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
+                  "cost_usd": res.cost_usd, "cost_nusd": res.cost_nusd, "paid_nusd": res.paid_nusd,
+                  "price_version": res.price_version, "reference_price_version": res.reference_price_version,
+                  "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
                   "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
                   "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
                   "auth_modes": list(res.modes), "paid_usd": res.paid_usd, "credential": res.credential,
@@ -801,6 +853,8 @@ class Recorder:
                   "reference_usd": res.reference_usd, "quote": res.quote,
                   **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
                                 "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
+                                "cost_nusd": c.cost_nusd, "paid_nusd": c.paid_nusd,
+                                "price_version": c.price_version, "reference_price_version": c.reference_price_version,
                                 "tokens_in": c.tokens_in, "tokens_out": c.tokens_out,
                                 "cache_read": c.cache_read, "cache_write": c.cache_write, "turns": c.turns,
                                 "reference_usd": c.reference_usd, "quote": c.quote} for c in res.calls]}
@@ -1458,6 +1512,7 @@ def reader_for(header: dict) -> Callable[[dict], list[dict]]:
 def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
                         missing_only: bool = False) -> int:
     header: dict | None = None
+    billing_ctx: dict | None = None
     read: Callable[[dict], list[dict]] = read_nothing
     sid: int | None = None
     run_id = ""
@@ -1465,6 +1520,12 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
     clock_seconds = 0.0
     prev_turn_seconds = 0.0
     turn_n = 0
+    indexed_tin = 0
+    indexed_cr = 0
+    indexed_cw = 0
+    indexed_tout = 0
+    indexed_cost_nusd = 0
+    indexed_paid_nusd = 0
     turn_tool = ""
     turn_excerpt = ""
     turn_status = "ok"
@@ -1482,6 +1543,9 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
             own = line.get("arete")
             if own == "header":
                 header = line
+                billing_ctx = (
+                    dict(line["billing_context"]) if isinstance(line.get("billing_context"), dict) else None
+                )
                 run_id = str(line.get("run_id") or path.parent.parent.name)
                 started = str(line.get("started") or "")
                 raw_sid = line.get("step_id")
@@ -1492,12 +1556,29 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
                     for row in run_store.steps(run_id):
                         if row.get("step") == step_name or row.get("node") == node:
                             sid = row["id"]
+                            if billing_ctx is None and row.get("billing_context"):
+                                with contextlib.suppress(ValueError, TypeError):
+                                    parsed_ctx = json.loads(row["billing_context"])
+                                    if isinstance(parsed_ctx, dict):
+                                        billing_ctx = parsed_ctx
+                            break
+                elif billing_ctx is None:
+                    for row in run_store.steps(run_id):
+                        if row.get("id") == sid and row.get("billing_context"):
+                            with contextlib.suppress(ValueError, TypeError):
+                                parsed_ctx = json.loads(row["billing_context"])
+                                if isinstance(parsed_ctx, dict):
+                                    billing_ctx = parsed_ctx
                             break
                 if sid is None or (step_ids is not None and sid not in step_ids):
                     return 0
                 if missing_only:
                     existing_ns = {t["n"] for t in run_store.step_turns(sid)}
                 read = reader_for(header)
+                continue
+            if own == "billing":
+                if isinstance(line.get("billing_context"), dict):
+                    billing_ctx = dict(line["billing_context"])
                 continue
             if own == "clock":
                 clock_seconds = float(line.get("seconds", clock_seconds) or 0.0)
@@ -1516,12 +1597,40 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
                     turn_excerpt = util.one_line(str(ev["text"]), 200)
                 elif kind == "tool_result" and ev.get("error"):
                     turn_status = "error"
-                elif kind == "usage" and not ev.get("total"):
+                elif kind == "usage":
+                    is_total = bool(ev.get("total"))
+                    tin = int(ev.get("tokens_in") or 0)
+                    cr = int(ev.get("cache_read") or 0)
+                    cw = int(ev.get("cache_write") or 0)
+                    tout = int(ev.get("tokens_out") or 0)
+                    outcome = _turn_charge_from_header(header, ev, billing_ctx=billing_ctx)
+                    cost_n = outcome.cost_nusd
+                    paid_n = outcome.paid_nusd
+                    if is_total:
+                        d_tin = max(0, tin - indexed_tin)
+                        d_cr = max(0, cr - indexed_cr)
+                        d_cw = max(0, cw - indexed_cw)
+                        d_tout = max(0, tout - indexed_tout)
+                        d_cost = None if cost_n is None else max(0, cost_n - indexed_cost_nusd)
+                        d_paid = None if paid_n is None else max(0, paid_n - indexed_paid_nusd)
+                        if not any((d_tin, d_tout, d_cr, d_cw)) and not (d_cost or 0):
+                            continue
+                        tin, cr, cw, tout, cost_n, paid_n = d_tin, d_cr, d_cw, d_tout, d_cost, d_paid
                     turn_n += 1
+                    indexed_tin += tin
+                    indexed_cr += cr
+                    indexed_cw += cw
+                    indexed_tout += tout
+                    indexed_cost_nusd += cost_n or 0
+                    indexed_paid_nusd += paid_n or 0
                     turn_seconds = round(max(0.0, clock_seconds - prev_turn_seconds), 2)
                     prev_turn_seconds = clock_seconds
                     if not missing_only or turn_n not in existing_ns:
-                        turn_cost = _turn_cost_from_header(header, ev)
+                        ctx_json = (
+                            json.dumps(billing_ctx, sort_keys=True, separators=(",", ":"))
+                            if billing_ctx is not None
+                            else None
+                        )
                         run_store.insert_turn(
                             sid,
                             turn_n,
@@ -1531,10 +1640,15 @@ def _rebuild_file_turns(path: Path, *, step_ids: set[int] | None = None,
                             tool=turn_tool,
                             excerpt=turn_excerpt,
                             seconds=turn_seconds,
-                            tokens_in=int(ev.get("tokens_in") or 0),
-                            cache_read=int(ev.get("cache_read") or 0),
-                            tokens_out=int(ev.get("tokens_out") or 0),
-                            cost_nusd=util.nusd(turn_cost),
+                            tokens_in=tin,
+                            cache_read=cr,
+                            tokens_out=tout,
+                            cost_nusd=cost_n,
+                            paid_nusd=paid_n,
+                            auth_mode=outcome.auth_mode,
+                            price_version=outcome.price_version,
+                            cache_write=cw,
+                            billing_context=ctx_json,
                             file=rel_file,
                             member_offset=member_offset,
                             member_len=member_len,

@@ -718,12 +718,38 @@ def incidents_board() -> dict:
     return {"now": util.iso(), "watcher": watcher(cfg), "incidents": [incident_row(r) for r in rows]}
 
 
-def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str, float]) -> dict:
-    listed = [{"id": r["id"], "status": r["status"], "started": r["started"], "finished": r["finished"],
-               "pr_url": r["pr_url"] or "", "paid": paid.get(r["id"], 0)} for r in runs]
+def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str, int] | dict[str, float]) -> dict:
+    # Support both integer nUSD maps (preferred) and legacy float dollar maps.
+    is_nusd = any(type(v) is int for v in paid.values()) if paid else True
+    if is_nusd:
+        listed = [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "started": r["started"],
+                "finished": r["finished"],
+                "pr_url": r["pr_url"] or "",
+                "paid": int(paid.get(r["id"], 0)) / 1_000_000_000,
+            }
+            for r in runs
+        ]
+        total_nusd = sum(int(paid.get(r["id"], 0)) for r in runs)
+        total_paid = total_nusd / 1_000_000_000
+    else:
+        listed = [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "started": r["started"],
+                "finished": r["finished"],
+                "pr_url": r["pr_url"] or "",
+                "paid": float(paid.get(r["id"], 0.0)),
+            }
+            for r in runs
+        ]
+        total_paid = sum(r["paid"] for r in listed)
     return {"attempt": number, "repo": repair["repo"], "task": repair["task"], "started": repair["started"],
-            "ended": repair["ended"], "outcome": repair["outcome"], "runs": listed,
-            "paid": sum(r["paid"] for r in listed)}
+            "ended": repair["ended"], "outcome": repair["outcome"], "runs": listed, "paid": total_paid}
 
 
 def incident_board(text: str) -> dict:
@@ -734,14 +760,15 @@ def incident_board(text: str) -> dict:
     made = {x["id"]: [] if not x["task"] else run_store.ticket_runs(x["repo"], x["task"], limit=50, connect=foundation.reader)
             for x in r["repairs"]}
     ids = [run["id"] for runs in made.values() for run in runs]
-    paid = run_store.paid_by_run(ids, connect=foundation.reader, local_providers=cfg.local_providers)
+    paid_nusd = run_store.paid_nusd_by_run(ids, connect=foundation.reader)
     numbers = {x["id"]: n for n, x in enumerate(oncall.attempts(r), 1)}
-    repairs = [incident_repair(x, numbers.get(x["id"], 0), made[x["id"]], paid) for x in r["repairs"]]
+    repairs = [incident_repair(x, numbers.get(x["id"], 0), made[x["id"]], paid_nusd) for x in r["repairs"]]
+    total_paid_nusd = sum(paid_nusd.get(run["id"], 0) for runs in made.values() for run in runs)
     open_to_steer = r["state"] == "open" and not oncall.live_repair(r)
     return {"now": util.iso(), "watcher": watcher(cfg), "incident": {
         **incident_row(r), "evidence": outbound.redact(r["evidence"] or ""), "answers": r["answers"],
         "notes": r["notes"], "notes_total": r["notes_total"], "max_attempts": cfg.oncall.max_attempts,
-        "repairs": repairs, "paid": sum(x["paid"] for x in repairs),
+        "repairs": repairs, "paid": total_paid_nusd / 1_000_000_000,
         "can": {"dismiss": open_to_steer, "retry": open_to_steer and r["decision"] == "wake",
                 "cancel": oncall.live_repair(r) is not None}}}
 
@@ -806,7 +833,6 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
         if not r:
             raise control.NotFound(f"nothing has the id {run_id}")
         models: dict[tuple[str, str, str], dict] = {}
-        local_providers = config.load_or_problem()[0].local_providers
         step_rows = run_store.steps(run_id, connect=foundation.reader)
         board_steps = [
             {
@@ -817,27 +843,51 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
                 "queued_at": s.get("queued_at") or s.get("ts"),
                 "model": s.get("model") or "",
                 "account": s.get("account_id"),
-                "cost_usd": round(float(s.get("cost_usd") or 0.0), 6),
+                "cost_usd": (
+                    int(s["cost_nusd"]) / 1_000_000_000
+                    if s.get("cost_nusd") is not None
+                    else float(s.get("cost_usd") or 0.0)
+                ),
             }
             for s in step_rows
         ]
+        total_paid_nusd = 0
         for s in step_rows:
             if s.get("status") in ("queued", "waiting"):
                 continue
-            billing = control.billing_of(s, local_providers)
+            billing = control.billing_of(s)
             metered = billing == "api_key"
+            step_cost_nusd = (
+                int(s["cost_nusd"])
+                if s.get("cost_nusd") is not None
+                else int(util.nusd(float(s.get("cost_usd") or 0.0)) or 0)
+            )
+            step_paid_nusd = (
+                int(s["paid_nusd"])
+                if s.get("paid_nusd") is not None
+                else (step_cost_nusd if metered else 0)
+            )
             key = (s["model"] or "no model", s["runner"] or "no runner", billing)
             row = models.setdefault(key, {"model": key[0], "runner": key[1], "metered": metered,
-                                          "auth_mode": billing, "billing": billing, "paid": 0.0,
-                                          "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0})
+                                          "auth_mode": billing, "billing": billing, "paid_nusd": 0,
+                                          "steps": 0, "tokens_in": 0, "tokens_out": 0, "cost_nusd": 0})
             row["steps"] += 1
             row["tokens_in"] += s["tokens_in"] or 0
             row["tokens_out"] += s["tokens_out"] or 0
-            row["cost_usd"] += 0 if billing in ("local", "replay") else s["cost_usd"] or 0
-            row["paid"] += (s["cost_usd"] or 0) if metered else 0
-        rows = sorted(({**m, "cost_usd": round(m["cost_usd"], 4), "paid": round(m["paid"], 4)}
-                       for m in models.values()),
-                      key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["billing"]))
+            row["cost_nusd"] += 0 if billing in ("local", "replay") else step_cost_nusd
+            row["paid_nusd"] += step_paid_nusd
+            total_paid_nusd += step_paid_nusd
+        rows = sorted(
+            (
+                {
+                    **{k: v for k, v in m.items() if k not in ("cost_nusd", "paid_nusd")},
+                    "cost_usd": m["cost_nusd"] / 1_000_000_000,
+                    "paid": m["paid_nusd"] / 1_000_000_000,
+                }
+                for m in models.values()
+            ),
+            key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["billing"]),
+        )
         spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
         adaptive = orchestration_store.view(run_id, connect=foundation.reader, messages_after=messages_after)
         if adaptive:
@@ -847,7 +897,7 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
         routes = asks_store.routes_of([run_id], connect=foundation.reader) if r["status"] == "needs-info" else {}
         result = {"now": util.iso(), "run": {**r, "adw": r.get("adw"), "adw_version": r.get("adw_version"),
                                              "adw_rule": r.get("adw_rule"), "ticket": ticket(r),
-                                             "paid": round(sum(m["paid"] for m in rows), 4),
+                                             "paid": total_paid_nusd / 1_000_000_000,
                                              "ask_route": routes.get(run_id, "")},
                   "recovery": {k: recovery[k] for k in ("phase", "cause", "detail")} if recovery else None,
                   "models": rows,
@@ -882,9 +932,16 @@ def find() -> dict:
 
 
 def outcomes() -> dict:
-    figures = trend_figures()
-    return {**figures, "decisions": decisions(figures["since"]),
-            "check_verification": gate_metrics.check_verification(figures["since"])}
+    from . import insights
+
+    with foundation.one_read() as conn:
+        figures = trend_figures(conn=conn)
+        needs_you = insights.query("needs-you", since_override=figures["since"], conn=conn)[0]["series"]
+        return {
+            **figures,
+            "decisions": {"pushes": needs_you["pushes"], "tickets": needs_you["tickets"]},
+            "check_verification": gate_metrics.check_verification(figures["since"]),
+        }
 
 
 def decisions(since: str) -> dict:
@@ -946,48 +1003,70 @@ def trends() -> dict:
     return panel(trend_figures)
 
 
-def trend_figures() -> dict:
+def trend_figures(*, conn=None) -> dict:
+    from . import insights
+
     first_day = datetime.now().astimezone().date() - timedelta(days=TREND_DAYS - 1)
-    days = [(first_day + timedelta(days=n)).isoformat() for n in range(TREND_DAYS)]
     since = util.iso(datetime.combine(first_day, time.min).astimezone().astimezone(UTC))
-    runs = run_store.runs_since(since, connect=foundation.reader)
-    evals = insights_store.evals_since(since, connect=foundation.reader)
-
-    spend = control.paid_since(since, foundation.reader)
-    paid_on = {d["name"]: d["cost_usd"] for d in spend["by_day"]}
-    by_day = {d: {"day": d, "paid": paid_on.get(d, 0.0), "shipped": 0, "failed": 0, "other": 0} for d in days}
-    by_repo: dict[str, list[dict]] = defaultdict(list)
-    for r in runs:
-        if r["kind"] != "pipeline" or r["status"] == "running":
-            continue
-        by_repo[r["repo"]].append(r)
-        if day := by_day.get(local_day(r["started"])):
-            day[outcome(r["status"])] += 1
-    paid = run_store.paid_by_run([r["id"] for rows in by_repo.values() for r in rows], connect=foundation.reader)
-
-    eval_repos: dict[str, list[dict]] = defaultdict(list)
-    for e in evals:
-        if e["source"] == insights_store.BASELINE_SOURCE:
-            eval_repos[e["repo"]].append(e)
+    if conn is None:
+        with foundation.one_read() as read_conn:
+            return trend_figures(conn=read_conn)
+    shipped = insights.query("shipped", days=TREND_DAYS, since_override=since, conn=conn)[0]["series"]
+    evals_data = insights.query("evals", days=TREND_DAYS, since_override=since, conn=conn)[0]["series"]
     return {
         "since": since,
-        "days": list(by_day.values()),
-        "repos": [repo_trend(name, rows, paid) for name, rows in sorted(by_repo.items())],
-        "evals": [eval_trend(name, rows) for name, rows in sorted(eval_repos.items())],
-        "total_paid": spend["total_usd"],
-        **{group: spend[group] for group in ("by_model", "by_runner", "by_loop")},
+        "days": [
+            {"day": d["day"], "paid": d["paid"], "shipped": d["shipped"], "failed": d["failed"], "other": d["other"]}
+            for d in shipped["by_day"]
+        ],
+        "repos": [
+            {
+                "repo": r["repo"],
+                "runs": r["runs"],
+                "shipped": r["shipped"],
+                "failed": r["failed"],
+                "pass_rate": r["pass_rate"],
+                "median_seconds": r["median_seconds"],
+                "paid": r["paid"],
+            }
+            for r in shipped["repos"]
+        ],
+        "evals": [
+            {"repo": e["repo"], "tasks": e["tasks"], "passed": e["passed"], "pass_rate": e["pass_rate"], "last": e["last"]}
+            for e in evals_data["repos"]
+        ],
+        "total_paid": shipped["total_paid"],
+        **{
+            group: [
+                {
+                    "name": item["name"],
+                    "cost_usd": item["cost_usd"],
+                    "steps": item["steps"],
+                    "tokens_in": item["tokens_in"],
+                    "tokens_out": item["tokens_out"],
+                }
+                for item in shipped[group]
+            ]
+            for group in ("by_model", "by_runner", "by_loop")
+        },
     }
 
 
-def repo_trend(name: str, rows: list[dict], paid: dict[str, float]) -> dict:
+def repo_trend(name: str, rows: list[dict], paid: dict[str, int] | dict[str, float]) -> dict:
     outcomes = Counter(outcome(r["status"]) for r in rows)
     shipped, failed = outcomes["shipped"], outcomes["failed"]
     finished = [seconds_between(r["started"], r["finished"]) for r in rows if r["finished"]]
+    is_nusd = any(type(v) is int for v in paid.values()) if paid else True
+    paid_val = (
+        sum(int(paid.get(r["id"], 0)) for r in rows) / 1_000_000_000
+        if is_nusd
+        else sum(float(paid.get(r["id"], 0.0)) for r in rows)
+    )
     return {
         "repo": name, "runs": len(rows), "shipped": shipped, "failed": failed,
         "pass_rate": round(shipped / (shipped + failed), 2) if shipped + failed else None,
         "median_seconds": int(statistics.median(finished)) if finished else None,
-        "paid": round(sum(paid.get(r["id"], 0) for r in rows), 4),
+        "paid": paid_val,
     }
 
 

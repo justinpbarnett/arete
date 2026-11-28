@@ -27,7 +27,7 @@ from . import (
     util,
     webhooks,
 )
-from .agent import billing_of
+from . import agent
 from .loops import Loop
 from .store import db as foundation
 from .store import loops as loop_store
@@ -319,6 +319,36 @@ def day_ago() -> str:
     return util.iso(util.now() - timedelta(days=1))
 
 
+def billing_of(step: dict, local_providers=None) -> str:
+    which = step.get("runner") or ""
+    if which == agent.REPLAY:
+        return "replay"
+    if "paid_nusd" in step and step.get("paid_nusd") is not None:
+        mode = step.get("auth_mode") or ""
+        if mode:
+            return mode
+        if int(step["paid_nusd"]) != 0:
+            return "api_key"
+        return ""
+    if local_providers is None:
+        local_providers = config.load_or_problem()[0].local_providers
+    return agent.billing_of(step, local_providers)
+
+
+def _step_cost_nusd(step: dict) -> int:
+    if step.get("cost_nusd") is not None:
+        return int(step["cost_nusd"])
+    return int(util.nusd(float(step.get("cost_usd") or 0.0)) or 0)
+
+
+def _step_paid_nusd(step: dict, local_providers=None) -> int:
+    if "paid_nusd" in step and step.get("paid_nusd") is not None:
+        return int(step["paid_nusd"])
+    if billing_of(step, local_providers) == "api_key":
+        return _step_cost_nusd(step)
+    return 0
+
+
 def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> list[dict]:
     cfg = cfg or config.load_or_problem()[0]
     every_loop = loops.load_all(cfg)
@@ -326,10 +356,11 @@ def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> l
     running = {r["loop"]: r["id"] for r in run_store.runs_marked_running(connect) if r["kind"] == "loop"}
     waiting = Counter(item["loop"] for item in loop_store.pending(connect))
     dead = Counter(item["loop"] for item in loop_store.dead_items(connect))
-    spent: dict[str, float] = defaultdict(float)
-    for s in run_store.steps_since(day_ago(), connect):
-        if billing_of(s, cfg.local_providers) == "api_key":
-            spent[s.get("loop") or ""] += s["cost_usd"] or 0
+    spent_nusd: dict[str, int] = defaultdict(int)
+    for s in run_store.steps_since(day_ago(), connect, paid_only=True):
+        paid = _step_paid_nusd(s, cfg.local_providers)
+        if paid:
+            spent_nusd[s.get("loop") or ""] += paid
     out = []
     for loop in every_loop:
         last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
@@ -337,7 +368,7 @@ def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> l
         out.append({**loop.view(), "running": running.get(loop.name, ""), "pending": waiting[loop.name],
                     "dead": dead[loop.name],
                     "next_due": st.get("next_due") if loop.enabled else None, "last_fire": st.get("last_fire"),
-                    "spent_24h": round(spent[loop.name], 4),
+                    "spent_24h": spent_nusd[loop.name] / 1_000_000_000,
                     "last": {k: last[k] for k in ("id", "status", "started", "finished", "summary", "cost_usd",
                                                   "trigger")} if last else None})
     return out
@@ -437,8 +468,9 @@ def costs(days: float | None = None, connect=foundation.reader, cfg: config.Conf
     return {"days": days, **paid_since(since, connect, cfg), "by_route": by_route}
 
 
-def route_of(step: dict, cfg: config.Config) -> dict:
-    which, model, billing = step.get("runner") or "", step.get("model") or "", billing_of(step, cfg.local_providers)
+def route_of(step: dict, cfg: config.Config | None = None) -> dict:
+    which, model = step.get("runner") or "", step.get("model") or ""
+    billing = billing_of(step, cfg.local_providers if cfg is not None else None)
     fallback = {"claude": "anthropic", "codex": "openai" if step.get("auth_mode") == "api_key" else "chatgpt",
                 "pi": model.partition("/")[0] if "/" in model else ""}.get(which, "")
     provider = step.get("provider") or fallback
@@ -447,40 +479,50 @@ def route_of(step: dict, cfg: config.Config) -> dict:
 
 
 def step_costs(by: str, days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None, *,
-              since: str | None = None) -> dict:
+               since: str | None = None) -> dict:
     if by not in COST_GROUPS:
         raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
     if since is None:
         days, since = cost_window(days)
-    cfg = cfg or config.load_or_problem()[0]
+    local_providers = cfg.local_providers if cfg is not None else None
     groups: dict[str, dict] = {}
-    paid = subscribed = 0.0
+    paid_nusd = 0
+    subscribed_nusd = 0
     for s in run_store.steps_since(since, connect):
         route = route_of(s, cfg)
         name = route["name"] if by == "route" else s[STEP_FIELD_OF[by]] or f"no {by}"
-        row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_usd": 0.0,
-                                       "paid_usd": 0.0, "subscription_usd": 0.0,
+        row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_nusd": 0,
+                                       "paid_nusd": 0, "subscription_nusd": 0,
                                        **({k: route[k] for k in ("runner", "provider", "model", "billing")}
                                           if by == "route" else {}),
                                        **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
-        local = route["billing"] == "local"
-        cost = 0 if local or route["billing"] == "replay" else s["cost_usd"] or 0
-        side = "subscription_usd" if route["billing"] == "subscription" else "paid_usd"
+        billing = route["billing"]
+        step_cost = 0 if billing in ("local", "replay") else _step_cost_nusd(s)
+        step_paid = _step_paid_nusd(s, local_providers)
+        step_sub = step_cost if billing == "subscription" else 0
         row["runs"].add(s["run_id"])
         row["calls"] += 1
-        row["cost_usd"] += cost
-        row[side] += cost
-        if side == "paid_usd":
-            paid += cost
-        else:
-            subscribed += cost
+        row["cost_nusd"] += step_cost
+        row["paid_nusd"] += step_paid
+        row["subscription_nusd"] += step_sub
+        paid_nusd += step_paid
+        subscribed_nusd += step_sub
         for f in TOKEN_FIELDS:
             row[f] += s.get(f) or 0
         row["minutes"] += (s["seconds"] or 0) / 60
         row["api_minutes"] += (s.get("api_seconds") or 0) / 60
-    out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "paid_usd": round(r["paid_usd"], 4),
-            "subscription_usd": round(r["subscription_usd"], 4), "minutes": round(r["minutes"], 2),
-            "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
+    out = [
+        {
+            **{k: v for k, v in r.items() if k not in ("cost_nusd", "paid_nusd", "subscription_nusd")},
+            "runs": len(r["runs"]),
+            "cost_usd": r["cost_nusd"] / 1_000_000_000,
+            "paid_usd": r["paid_nusd"] / 1_000_000_000,
+            "subscription_usd": r["subscription_nusd"] / 1_000_000_000,
+            "minutes": round(r["minutes"], 2),
+            "api_minutes": round(r["api_minutes"], 2),
+        }
+        for r in groups.values()
+    ]
     waits = dict.fromkeys(run_lines.WAIT_CAUSES, 0.0)
     for r in run_store.runs_since(since, connect):
         try:
@@ -492,8 +534,8 @@ def step_costs(by: str, days: float | None = None, connect=foundation.reader, cf
         for cause in waits:
             if type(recorded.get(cause)) in (int, float):
                 waits[cause] += recorded[cause]
-    return {"days": days, "since": since, "by": by, "paid_usd": round(paid, 4),
-            "subscription_usd": round(subscribed, 4),
+    return {"days": days, "since": since, "by": by, "paid_usd": paid_nusd / 1_000_000_000,
+            "subscription_usd": subscribed_nusd / 1_000_000_000,
             "groups": sorted(out, key=lambda r: (-r["cost_usd"], -r["calls"], r["name"])),
             "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
 
@@ -514,33 +556,36 @@ def rate_difference(arm: tuple[int, int], base: tuple[int, int]) -> tuple[float,
     return d, d - math.sqrt((p1 - l1) ** 2 + (u2 - p2) ** 2), d + math.sqrt((u1 - p1) ** 2 + (p2 - l2) ** 2)
 
 
-def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, connect, cfg: config.Config) -> dict:
+def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, connect,
+            cfg: config.Config | None = None) -> dict:
     runs = [r for repo, issue in tickets for r in run_store.ticket_runs_since(repo, issue, since, connect)]
     merged = {(r["repo"], r["issue"]) for r in runs if r["status"] == "merged"}
     rows = [(r["id"], s) for r in runs for s in steps_by_run.get(r["id"], ())]
-    cost = {"api_key": 0.0, "subscription": 0.0}
+    local_providers = cfg.local_providers if cfg is not None else None
+    paid_nusd = 0
+    sub_nusd = 0
     for _, s in rows:
-        billing = billing_of(s, cfg.local_providers)
-        if billing in cost:
-            cost[billing] += s["cost_usd"] or 0
+        billing = billing_of(s, local_providers)
+        paid_nusd += _step_paid_nusd(s, local_providers)
+        if billing == "subscription":
+            sub_nusd += _step_cost_nusd(s)
 
     def counted(atoms: tuple[str, ...]) -> int:
         return len({(run_id, s["step"], s["try"]) for run_id, s in rows if s.get("atom") in atoms})
 
-    def per(total: float) -> float | None:
-        return round(total / len(merged), 4) if merged else None
+    def per(total_nusd: int) -> float | None:
+        return round((total_nusd / 1_000_000_000) / len(merged), 4) if merged else None
 
     return {"tickets": len(tickets), "runs": len(runs), "merged": len(merged),
             "no_pr": sum(1 for r in runs if r["status"] != "running" and not r["pr_url"]),
             "repairs": counted(REPAIRS), "review_rounds": counted(("review",)),
-            "paid_usd": round(cost["api_key"], 4), "subscription_usd": round(cost["subscription"], 4),
-            "paid_per_merged": per(cost["api_key"]), "subscription_per_merged": per(cost["subscription"]),
+            "paid_usd": paid_nusd / 1_000_000_000, "subscription_usd": sub_nusd / 1_000_000_000,
+            "paid_per_merged": per(paid_nusd), "subscription_per_merged": per(sub_nusd),
             "merge_rate": round(len(merged) / len(tickets), 4) if tickets else 0.0}
 
 
 def ab_report(name: str = "", days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None) -> list[dict]:
     days, since = cost_window(AB_DAYS if days is None else days)
-    cfg = cfg or config.load_or_problem()[0]
     placed: dict[str, dict] = {}
     for p in run_store.ab_placements(since, name, connect):
         test = placed.setdefault(p["ab"], {"step": p["atom"], "arm": set(), "baseline": set()})
@@ -561,23 +606,40 @@ def ab_report(name: str = "", days: float | None = None, connect=foundation.read
 
 def paid_since(since: str, connect=foundation.reader, cfg: config.Config | None = None) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
-    total = 0.0
-    cfg = cfg or config.load_or_problem()[0]
-    for s in run_store.steps_since(since, connect):
-        if billing_of(s, cfg.local_providers) != "api_key":
+    total_nusd = 0
+    local_providers = cfg.local_providers if cfg is not None else None
+    for s in run_store.steps_since(since, connect, paid_only=True):
+        cost_n = _step_paid_nusd(s, local_providers)
+        if not cost_n:
             continue
-        cost = s["cost_usd"] or 0
-        total += cost
+        total_nusd += cost_n
         keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",
                 "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "no loop",
                 "day": util.parse_iso(s["ts"]).astimezone().strftime("%Y-%m-%d")}
         for group, key in keys.items():
-            row = groups[group].setdefault(key, {"name": key, "cost_usd": 0.0, "steps": 0, "tokens_in": 0,
+            row = groups[group].setdefault(key, {"name": key, "cost_nusd": 0, "steps": 0, "tokens_in": 0,
                                                  "tokens_out": 0})
-            row["cost_usd"] += cost
+            row["cost_nusd"] += cost_n
             row["steps"] += 1
             row["tokens_in"] += s["tokens_in"] or 0
             row["tokens_out"] += s["tokens_out"] or 0
-    return {"since": since, "total_usd": round(total, 4),
-            **{f"by_{group}": sorted(({**r, "cost_usd": round(r["cost_usd"], 4)} for r in rows.values()),
-                                     key=lambda r: (-r["cost_usd"], r["name"])) for group, rows in groups.items()}}
+    return {
+        "since": since,
+        "total_usd": total_nusd / 1_000_000_000,
+        **{
+            f"by_{group}": sorted(
+                (
+                    {
+                        "name": r["name"],
+                        "cost_usd": r["cost_nusd"] / 1_000_000_000,
+                        "steps": r["steps"],
+                        "tokens_in": r["tokens_in"],
+                        "tokens_out": r["tokens_out"],
+                    }
+                    for r in rows.values()
+                ),
+                key=lambda r: (-r["cost_usd"], r["name"]),
+            )
+            for group, rows in groups.items()
+        },
+    }

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from .. import util
 from . import factory
 from ._rows import validate_columns
-from .db import STEPS_LIFECYCLE_SCHEMA, db, migration_applied, reader
+from .db import MONEY_BACKFILL_SCHEMA, MONEY_EXPAND_SCHEMA, STEPS_LIFECYCLE_SCHEMA, db, migration_applied, reader
 
 TABLES = {
     "chats": "kept",
@@ -22,6 +22,22 @@ CHAT_UPDATABLE_FIELDS = frozenset((
 CHAT_USAGE = ("(SELECT COALESCE(SUM(m.paid_usd), 0) FROM chat_messages m WHERE m.chat_id = chats.id) AS paid_usd, "
               "(SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = chats.id "
               "AND m.paid_usd IS NULL AND m.cost != 0) AS unclassified_messages")
+
+CHAT_USAGE_NUSD = (
+    "(SELECT COALESCE(SUM(m.paid_nusd), 0) FROM chat_messages m WHERE m.chat_id = chats.id) AS paid_nusd, "
+    "(SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = chats.id "
+    "AND m.paid_nusd IS NULL AND COALESCE(m.cost_nusd, 0) != 0) AS unclassified_messages"
+)
+
+
+def _chat_row(r, *, money_backfill: bool) -> dict:
+    d = dict(r)
+    if money_backfill:
+        if d.get("spent_nusd") is not None:
+            d["spent"] = int(d["spent_nusd"]) / 1_000_000_000
+        if "paid_nusd" in d:
+            d["paid_usd"] = int(d["paid_nusd"] or 0) / 1_000_000_000
+    return d
 
 
 def _default_chat_payer(c) -> str | None:
@@ -51,17 +67,37 @@ def chat_add(project: str, *, payer: str | None = None) -> int:
 
 def chat_get(chat_id: int) -> dict | None:
     with reader() as c:
-        r = c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats WHERE id = ?", (chat_id,)).fetchone()  # noqa: S608
-        return dict(r) if r else None
+        backfill = migration_applied(MONEY_BACKFILL_SCHEMA, c)
+        usage_sql = CHAT_USAGE_NUSD if backfill else CHAT_USAGE
+        r = c.execute(f"SELECT chats.*, {usage_sql} FROM chats WHERE id = ?", (chat_id,)).fetchone()  # noqa: S608
+        return _chat_row(r, money_backfill=backfill) if r else None
 
 
 def chats() -> list[dict]:
     with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT chats.*, {CHAT_USAGE} FROM chats ORDER BY created DESC, id DESC")]  # noqa: S608
+        backfill = migration_applied(MONEY_BACKFILL_SCHEMA, c)
+        usage_sql = CHAT_USAGE_NUSD if backfill else CHAT_USAGE
+        return [
+            _chat_row(r, money_backfill=backfill)
+            for r in c.execute(f"SELECT chats.*, {usage_sql} FROM chats ORDER BY created DESC, id DESC")  # noqa: S608
+        ]
 
 
 def chat_messages(chat_id: int) -> list[dict]:
     with reader() as c:
+        if migration_applied(MONEY_BACKFILL_SCHEMA, c):
+            out = []
+            for r in c.execute(
+                "SELECT id, sender, text, cost, cost_nusd, paid_usd, paid_nusd, ts "
+                "FROM chat_messages WHERE chat_id = ? ORDER BY id",
+                (chat_id,),
+            ):
+                d = dict(r)
+                cost = int(d["cost_nusd"]) / 1_000_000_000 if d["cost_nusd"] is not None else float(d["cost"] or 0.0)
+                paid = None if d["paid_nusd"] is None else int(d["paid_nusd"]) / 1_000_000_000
+                out.append({"id": d["id"], "sender": d["sender"], "text": d["text"],
+                            "cost": cost, "paid_usd": paid, "ts": d["ts"]})
+            return out
         return [dict(r) for r in c.execute("SELECT id, sender, text, cost, paid_usd, ts FROM chat_messages WHERE chat_id = ? "
                                            "ORDER BY id", (chat_id,))]
 
@@ -72,6 +108,12 @@ def chat_claim(chat_id: int, text: str, title: str) -> int:
         claimed = c.execute("UPDATE chats SET busy = 1, updated = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
                             "WHERE id = ? AND busy = 0", (ts, title, chat_id)).rowcount
         if claimed:
+            if migration_applied(MONEY_EXPAND_SCHEMA, c):
+                return c.execute(
+                    "INSERT INTO chat_messages (chat_id, sender, text, cost, cost_nusd, paid_usd, paid_nusd, ts) "
+                    "VALUES (?,?,?,0,0,NULL,NULL,?)",
+                    (chat_id, "you", text, ts),
+                ).lastrowid
             return c.execute("INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)",
                              (chat_id, "you", text, ts)).lastrowid
         return 0
@@ -83,14 +125,38 @@ def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_us
     ts = util.iso()
     reported_cost = cost if reported_cost is None else reported_cost
     paid_usd = 0.0 if reported_cost == 0 and paid_usd is None else paid_usd
+    cost_nusd = util.nusd(reported_cost)
+    paid_nusd = util.nusd(paid_usd)
     with db() as c:
-        for kind, note in before:
+        expanded = migration_applied(MONEY_EXPAND_SCHEMA, c)
+        if expanded:
+            for kind, note in before:
+                c.execute(
+                    "INSERT INTO chat_messages (chat_id, sender, text, cost, cost_nusd, paid_usd, paid_nusd, ts) "
+                    "VALUES (?,?,?,0,0,0,0,?)",
+                    (chat_id, kind, note, ts),
+                )
+            cost_real = (cost_nusd / 1_000_000_000) if cost_nusd is not None else reported_cost
+            paid_real = (paid_nusd / 1_000_000_000) if paid_nusd is not None else None
+            c.execute(
+                "INSERT INTO chat_messages (chat_id, sender, text, cost, cost_nusd, paid_usd, paid_nusd, ts) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (chat_id, sender, text, cost_real, cost_nusd, paid_real, paid_nusd, ts),
+            )
+            add_nusd = int(cost_nusd or 0)
+            c.execute(
+                f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, "  # noqa: S608
+                "spent = COALESCE(spent, 0) + ?, spent_nusd = COALESCE(spent_nusd, 0) + ? WHERE id = ?",
+                (*fields.values(), ts, add_nusd / 1_000_000_000, add_nusd, chat_id),
+            )
+        else:
+            for kind, note in before:
+                c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                          (chat_id, kind, note, 0, 0, ts))
             c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
-                      (chat_id, kind, note, 0, 0, ts))
-        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
-                  (chat_id, sender, text, reported_cost, paid_usd, ts))
-        c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",  # noqa: S608
-                  (*fields.values(), ts, reported_cost, chat_id))
+                      (chat_id, sender, text, reported_cost, paid_usd, ts))
+            c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",  # noqa: S608
+                      (*fields.values(), ts, reported_cost, chat_id))
         if "draft_title" in fields or "draft_body" in fields:
             from .. import inbox
 
@@ -146,8 +212,15 @@ def chat_tell_session(run_id: str, text: str) -> bool:
         if not row or not c.execute("UPDATE chat_sessions SET told = ? WHERE run_id = ? AND told = ''",
                                     (ts, run_id)).rowcount:
             return False
-        c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
-                  (row["chat_id"], "session", text, 0, 0, ts))
+        if migration_applied(MONEY_EXPAND_SCHEMA, c):
+            c.execute(
+                "INSERT INTO chat_messages (chat_id, sender, text, cost, cost_nusd, paid_usd, paid_nusd, ts) "
+                "VALUES (?,?,?,0,0,0,0,?)",
+                (row["chat_id"], "session", text, ts),
+            )
+        else:
+            c.execute("INSERT INTO chat_messages (chat_id, sender, text, cost, paid_usd, ts) VALUES (?,?,?,?,?,?)",
+                      (row["chat_id"], "session", text, 0, 0, ts))
         c.execute("UPDATE chats SET updated = ? WHERE id = ?", (ts, row["chat_id"]))
         return True
 
