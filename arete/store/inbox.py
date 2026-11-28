@@ -14,7 +14,7 @@ TABLES = {
 
 KINDS = frozenset((
     "approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace", "config_invalid",
-    "queue.dead", "evidence", "outbox",
+    "queue.dead", "evidence", "outbox", "stop", "fault",
 ))
 STATES = frozenset(("open", "snoozed", "shelved", "paused", "resolved"))
 PRIORITIES = (1, 2, 3)
@@ -220,8 +220,8 @@ def resolve_item(
     answered_by: str = "",
     answered_at: str = "",
     base_version: int | None = None,
+    detail: dict | None = None,
 ) -> tuple[dict | None, int | None, bool]:
-    """Resolve an inbox item. Returns (item_or_current, seq, ok)."""
     row = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
     if row is None:
         return None, None, False
@@ -232,11 +232,13 @@ def resolve_item(
     now = util.iso()
     new_ver = row["version"] + 1
     where = "id = ? AND state != 'resolved'"
+    enc_detail = _encode_json(detail) if detail is not None else row["detail"]
     args = [
         resolution,
         str(answer or ""),
         str(answered_by or ""),
         str(answered_at or ""),
+        enc_detail,
         now,
         new_ver,
         numeric_id,
@@ -246,7 +248,7 @@ def resolve_item(
         args.append(base_version)
     changed = c.execute(
         f"UPDATE inbox SET state = 'resolved', resolution = ?, answer = ?, answered_by = ?, answered_at = ?, "  # noqa: S608
-        f"snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, shelve_until = '', "
+        f"detail = ?, snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, shelve_until = '', "
         f"resolved = ?, version = ? WHERE {where}",
         args,
     ).rowcount
@@ -327,11 +329,18 @@ def shelve_item(
     if row is None or row["state"] == "resolved" or row["version"] != base_version:
         return decode(row), None, False
     new_ver = row["version"] + 1
+    enc_detail = row["detail"]
+    if row["kind"] == "fault":
+        detail = json.loads(row["detail"] or "{}")
+        if isinstance(detail, dict):
+            detail["shelved_reason"] = reason
+            detail["shelve_until"] = until
+            enc_detail = _encode_json(detail)
     changed = c.execute(
         "UPDATE inbox SET state = 'shelved', shelve_reason = ?, shelve_until = ?, shelves = shelves + 1, "
-        "snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, version = ? "
+        "detail = ?, snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, version = ? "
         "WHERE id = ? AND state != 'resolved' AND version = ?",
-        (reason, until, new_ver, numeric_id, base_version),
+        (reason, until, enc_detail, new_ver, numeric_id, base_version),
     ).rowcount
     after = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
     if not changed:
@@ -352,10 +361,17 @@ def reopen_due(c, now: str | None = None) -> list[dict]:
     reopened = []
     for row in rows:
         new_ver = row["version"] + 1
+        enc_detail = row["detail"]
+        if row["kind"] == "fault":
+            detail = json.loads(row["detail"] or "{}")
+            if isinstance(detail, dict):
+                detail.pop("shelved_reason", None)
+                detail.pop("shelve_until", None)
+                enc_detail = _encode_json(detail)
         c.execute(
-            "UPDATE inbox SET state = 'open', snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
+            "UPDATE inbox SET state = 'open', detail = ?, snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
             "shelve_until = '', version = ? WHERE id = ?",
-            (new_ver, row["id"]),
+            (enc_detail, new_ver, row["id"]),
         )
         after = c.execute("SELECT * FROM inbox WHERE id = ?", (row["id"],)).fetchone()
         _emit(c, "inbox.changed", after, {"reopened": True})
@@ -417,19 +433,43 @@ def get_open_by_subject(subject: str, connect=reader) -> dict | None:
         return decode(row)
 
 
-def newest_resolved_by_subject(c, subject: str) -> dict | None:
-    row = c.execute(
-        "SELECT * FROM inbox WHERE subject = ? AND state = 'resolved' ORDER BY id DESC LIMIT 1",
-        (subject,),
-    ).fetchone()
+def get_open_by_kind_and_subject(kind: str, subject: str, connect=reader) -> dict | None:
+    with connect() as c:
+        if not available(c):
+            return None
+        row = c.execute(
+            "SELECT * FROM inbox WHERE kind = ? AND subject = ? AND state != 'resolved' ORDER BY id DESC LIMIT 1",
+            (kind, subject),
+        ).fetchone()
+        return decode(row)
+
+
+def newest_resolved_by_subject(c, subject: str, *, kind: str | None = None) -> dict | None:
+    if kind is not None:
+        row = c.execute(
+            "SELECT * FROM inbox WHERE kind = ? AND subject = ? AND state = 'resolved' ORDER BY id DESC LIMIT 1",
+            (kind, subject),
+        ).fetchone()
+    else:
+        row = c.execute(
+            "SELECT * FROM inbox WHERE subject = ? AND state = 'resolved' ORDER BY id DESC LIMIT 1",
+            (subject,),
+        ).fetchone()
     return decode(row)
 
 
-def unresolved_for_pattern(c, pattern: str) -> list[dict]:
-    rows = c.execute(
-        "SELECT * FROM inbox WHERE state != 'resolved' AND subject LIKE ? ORDER BY id",
-        (pattern,),
-    ).fetchall()
+def unresolved_for_pattern(c, pattern: str, *, kinds: tuple[str, ...] | None = None) -> list[dict]:
+    if kinds:
+        placeholders = ",".join("?" for _ in kinds)
+        rows = c.execute(
+            f"SELECT * FROM inbox WHERE state != 'resolved' AND subject LIKE ? AND kind IN ({placeholders}) ORDER BY id",  # noqa: S608
+            (pattern, *kinds),
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT * FROM inbox WHERE state != 'resolved' AND subject LIKE ? ORDER BY id",
+            (pattern,),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 

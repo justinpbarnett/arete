@@ -873,6 +873,21 @@ def _deliver_one(item_id: int, expected_version: int, now_iso: str, *, allow_byp
         )
         return
 
+    from . import inbox
+
+    if missing := inbox.check_outbox_missing_secrets(claimed):
+        names = ", ".join(f"{s['scope']}/{s['name']}" for s in missing)
+        wait_err = f"waiting on missing secret {names}"
+        _settle_tx(
+            item_id,
+            claimed_version,
+            attempt_n,
+            item_fields={"state": "approved", "send_at": None, "error": wait_err},
+            attempt_fields={"outcome": "refused", "error": wait_err},
+            event_kind="outbox.changed",
+        )
+        return
+
     if claimed["kind"] == "loop":
         try:
             with writes.atomic() as c:

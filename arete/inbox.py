@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import builtins
 import json
+import re
 import threading
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from datetime import timedelta
 
@@ -19,6 +20,7 @@ from . import (
     paths,
     pipeline,
     principals,
+    record,
     retention,
     secretstore,
     tasks,
@@ -31,7 +33,9 @@ from . import (
 )
 from .store import approvals as approvals_store
 from .store import asks as asks_store
+from .store import credentials as credentials_store
 from .store import db as foundation
+from .store import devices as device_store
 from .store import events as event_store
 from .store import evidence as evidence_store
 from .store import idempotency as claims_store
@@ -44,6 +48,9 @@ from .store import workspaces as workspaces_store
 _RESOLVING: ContextVar[str | None] = ContextVar("inbox_resolving", default=None)
 _SECRETS_LOCK = threading.Lock()
 _FALLBACK_SECRETS: dict[tuple[str, str], str] = {}
+_EXC_CLASS_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Timeout|Failure|Fault|Refused|Denied|Interrupt))\b")
+_HTTP_STATUS_RE = re.compile(r"\b(?:HTTP\s+)?([45]\d{2})\b")
+_NON_WORD_RE = re.compile(r"[^a-z0-9]+")
 
 PRESENCE_TTL_MINUTES = 10
 RESERVED_MANUAL_PREFIXES = (
@@ -61,6 +68,8 @@ RESERVED_MANUAL_PREFIXES = (
     "config:",
     "queue:",
     "outbox:",
+    "secret:",
+    "step:",
 )
 
 
@@ -708,10 +717,538 @@ def _outbox_items(c) -> list[dict]:
     return items
 
 
-ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
+def error_line(error: str | None) -> str:
+    for line in str(error or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def error_class(error: str | None) -> str:
+    line = error_line(error)
+    if not line:
+        return "unknown"
+    if match := _EXC_CLASS_RE.search(line):
+        return match.group(1)
+    if match := _HTTP_STATUS_RE.search(line):
+        return f"http_{match.group(1)}"
+    head, sep, _ = line.partition(":")
+    if sep:
+        head_clean = head.strip()
+        if 0 < len(head_clean) <= 48 and "/" not in head_clean:
+            slug = _NON_WORD_RE.sub("_", head_clean.lower()).strip("_")
+            if slug:
+                return slug
+    slug = _NON_WORD_RE.sub("_", line[:48].lower()).strip("_")
+    return slug or "unknown"
+
+
+def _secret_subject_context(c, scope: str, waiting_subjects: builtins.list[str]) -> tuple[str, str, str]:
+    line = scope.partition(":")[2] if scope.startswith(("repo:", "line:")) else ""
+    run_id = ""
+    task_id = ""
+    for subj in waiting_subjects:
+        if subj.startswith("run:"):
+            rid = subj.removeprefix("run:")
+            row = run_store.run_get(rid, connect=lambda: nullcontext(c))
+            if row:
+                run_id = rid
+                task_id = str(row.get("issue") or "")
+                line = str(row.get("repo") or row.get("loop") or line)
+                break
+        elif subj.startswith("outbox:"):
+            oid = subj.removeprefix("outbox:")
+            if oid.isdecimal():
+                from .store import outbox as outbox_store
+
+                if outbox_store.available(c):
+                    row = outbox_store.get_row(c, int(oid))
+                    if row:
+                        run_id = str(row.get("run_id") or "")
+                        task_id = str(row.get("task_id") or "")
+                        line = str(row.get("loop") or row.get("object") or row.get("target") or line)
+                        break
+    return line, run_id, task_id
+
+
+def _secret_continue_spec(c, scope: str, name: str, waiting_subjects: builtins.list[str]) -> dict | None:
+    if not waiting_subjects:
+        return None
+    has_secrets = c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'secrets'").fetchone() is not None
+    row = credentials_store.secret(c, scope, name) if has_secrets else None
+    if row is not None and row["status"] == "set":
+        return None
+    line, run_id, task_id = _secret_subject_context(c, scope, waiting_subjects)
+    count = len(waiting_subjects)
+    scope_part = "" if scope == "global" else f" ({scope})"
+    title = f"{name} missing{scope_part}: {count} waiting"
+    members = builtins.list(waiting_subjects)
+    missing_since = row.get("missing_since") if row else None
+    detail = {
+        "name": name,
+        "scope": scope,
+        "required": bool(row["required"]) if row else True,
+        "status": row["status"] if row else "missing",
+        "missing_since": missing_since,
+        "last_check": {
+            "checked_at": row.get("checked_at") if row else None,
+            "ok": None if (row is None or row.get("check_ok") is None) else bool(row["check_ok"]),
+        },
+        "waiting": members,
+        "group_key": f"continue:{scope}/{name}",
+        "group_members": members,
+        "stamp": f"{scope}/{name}:{missing_since or ''}:{members[0]}",
+    }
+    return {
+        "kind": "continue",
+        "subject": f"secret:{scope}/{name}",
+        "task_id": task_id,
+        "run_id": run_id,
+        "line": line,
+        "priority": 1,
+        "title": title,
+        "detail": detail,
+        "verbs": ["continue"],
+        "options": [],
+    }
+
+
+def _secrets_items(c) -> builtins.list[dict]:
+    waits = device_store.open_secret_waits(c)
+    if not waits:
+        return []
+    grouped: dict[str, builtins.list[str]] = {}
+    for w in waits:
+        blocker = w["blocker"]
+        bucket = grouped.setdefault(blocker, [])
+        if w["subject"] not in bucket:
+            bucket.append(w["subject"])
+    items = []
+    for blocker, subjects in grouped.items():
+        scope, sep, name = blocker.removeprefix("secret:").partition("/")
+        if not sep or not scope or not name:
+            continue
+        spec = _secret_continue_spec(c, scope, name, subjects)
+        if spec is not None:
+            items.append(spec)
+    return items
+
+
+def _run_label(run: dict) -> str:
+    return tracker.run_ticket_name(run) if run.get("issue") else str(run["id"])
+
+
+def _chain_run_ids(c, run_id: str) -> builtins.list[str]:
+    seen: builtins.list[str] = [run_id]
+    if not run_store.has_lineage(c):
+        return seen
+    row = c.execute("SELECT continues, chain FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return seen
+    chain = row["chain"] or ""
+    if chain:
+        for r in c.execute("SELECT id FROM runs WHERE chain = ? ORDER BY id", (chain,)):
+            if r["id"] not in seen:
+                seen.append(r["id"])
+    cur = row["continues"]
+    while cur and cur not in seen:
+        seen.append(cur)
+        parent = c.execute("SELECT continues FROM runs WHERE id = ?", (cur,)).fetchone()
+        cur = parent["continues"] if parent else None
+    return seen
+
+
+def _later_node_passed(c, run_id: str, node: str, latest_step_id: int) -> bool:
+    if not run_store.has_steps_lifecycle(c):
+        return False
+    related = _chain_run_ids(c, run_id)
+    if len(related) <= 1:
+        return False
+    placeholders = ",".join("?" for _ in related)
+    return c.execute(
+        f"SELECT 1 FROM steps WHERE run_id IN ({placeholders}) "  # noqa: S608
+        "AND COALESCE(NULLIF(node, ''), step) = ? AND status = 'done' AND id > ? LIMIT 1",
+        (*related, node, latest_step_id),
+    ).fetchone() is not None
+
+
+def _node_terminal_steps(c, run_id: str, node: str) -> builtins.list[dict]:
+    if not run_store.has_steps_lifecycle(c):
+        return []
+    rows = c.execute(
+        "SELECT id, try, status, ok, error, ts FROM steps "
+        "WHERE run_id = ? AND COALESCE(NULLIF(node, ''), step) = ? AND status IN ('done', 'fault') "
+        "ORDER BY id DESC",
+        (run_id, node),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _is_consecutive_same_fault(steps: builtins.list[dict]) -> bool:
+    if len(steps) < 2:
+        return False
+    if steps[0]["status"] != "fault" or steps[1]["status"] != "fault":
+        return False
+    err1 = error_line(steps[0].get("error"))
+    return bool(err1) and err1 == error_line(steps[1].get("error"))
+
+
+def _attempt_count(steps: builtins.list[dict]) -> int:
+    if not steps:
+        return 0
+    return max(len(steps), max(int(s.get("try") or 0) for s in steps))
+
+
+def _stop_spec(run: dict, node: str, latest: dict, attempts: int) -> dict:
+    from . import board
+
+    run_id = str(run["id"])
+    err = error_line(latest.get("error"))
+    err_cls = error_class(err)
+    label = _run_label(run)
+    last_lines = board.log_lines(run)[-20:]
+    jidoka = {
+        "detect": f"{node} failed twice in a row with the same error: {err}",
+        "stop": f"run {run_id} halted at {node} after {attempts} attempts",
+        "fix": f"Inspect {node} error ({err}) and redirect the run with a fix",
+        "prevent": f"Add a preflight check or guard for {err_cls} before {node}",
+    }
+    detail = {
+        "run_id": run_id,
+        "node": node,
+        "error": err,
+        "error_class": err_cls,
+        "attempts": attempts,
+        "jidoka": jidoka,
+        "last_lines": last_lines,
+        "group_key": f"stop:{err_cls}",
+        "stamp": f"stop:{latest['id']}",
+    }
+    return {
+        "kind": "stop",
+        "subject": f"run:{run_id}",
+        "task_id": str(run.get("issue") or ""),
+        "run_id": run_id,
+        "line": str(run.get("repo") or run.get("loop") or ""),
+        "priority": 1,
+        "title": f"{label} stopped itself at {node}: same failure twice",
+        "detail": detail,
+        "verbs": ["redirect", "retry", "stop"],
+        "options": [],
+    }
+
+
+def _fault_spec(c, run: dict, node: str, latest: dict, attempts: int) -> dict:
+    from . import board
+
+    run_id = str(run["id"])
+    err = error_line(latest.get("error"))
+    err_cls = error_class(err)
+    label = _run_label(run)
+    last_lines = board.log_lines(run)[-20:]
+    subject = f"step:{run_id}/{node}"
+    detail: dict[str, object] = {
+        "run_id": run_id,
+        "node": node,
+        "error": err,
+        "error_class": err_cls,
+        "attempts": attempts,
+        "last_lines": last_lines,
+        "group_key": f"fault:{err_cls}",
+        "stamp": f"step:{latest['id']}",
+    }
+    existing = inbox_store.get_open_by_kind_and_subject("fault", subject, connect=lambda: nullcontext(c))
+    if existing is not None and existing["state"] == "shelved":
+        detail["shelved_reason"] = existing["shelve_reason"]
+        detail["shelve_until"] = existing["shelve_until"]
+    attempt_word = "attempt" if attempts == 1 else "attempts"
+    title = f"{label}: {node} failed ({attempts} {attempt_word})"
+    return {
+        "kind": "fault",
+        "subject": subject,
+        "task_id": str(run.get("issue") or ""),
+        "run_id": run_id,
+        "line": str(run.get("repo") or run.get("loop") or ""),
+        "priority": 2,
+        "title": title,
+        "detail": detail,
+        "verbs": ["retry", "dismiss"],
+        "options": [],
+    }
+
+
+def _upsert_item_in_tx(c, spec: dict) -> dict:
+    existing = inbox_store.get_open_by_kind_and_subject(spec["kind"], spec["subject"], connect=lambda: nullcontext(c))
+    if existing is not None:
+        numeric_id = inbox_store.parse_id(existing["id"])
+        updated = inbox_store.update_item(
+            c,
+            numeric_id,
+            title=spec["title"],
+            detail=spec["detail"],
+            priority=spec["priority"],
+            verbs=spec["verbs"],
+            options=spec["options"],
+            task_id=spec["task_id"],
+            run_id=spec["run_id"],
+            line=spec["line"],
+        )
+        return updated[0] if updated is not None else existing
+    item, _, _ = inbox_store.raise_item(
+        c,
+        kind=spec["kind"],
+        subject=spec["subject"],
+        priority=spec["priority"],
+        title=spec["title"],
+        detail=spec["detail"],
+        verbs=spec["verbs"],
+        options=spec["options"],
+        task_id=spec["task_id"],
+        run_id=spec["run_id"],
+        line=spec["line"],
+    )
+    return item
+
+
+def _escalate_fault_in_tx(c, run_id: str, node: str) -> None:
+    subject = f"step:{run_id}/{node}"
+    existing = inbox_store.get_open_by_kind_and_subject("fault", subject, connect=lambda: nullcontext(c))
+    if existing is not None:
+        inbox_store.resolve_item(
+            c,
+            inbox_store.parse_id(existing["id"]),
+            resolution="escalated",
+            answer="escalated",
+        )
+
+
+def on_step_settled(c, step_id: int) -> None:
+    if not inbox_store.available(c) or not run_store.has_steps_lifecycle(c):
+        return
+    row = c.execute(
+        "SELECT id, run_id, step, node, status, ok, error, try, ts FROM steps WHERE id = ?",
+        (step_id,),
+    ).fetchone()
+    if row is None or not row["run_id"]:
+        return
+    run_id = str(row["run_id"])
+    node = str(row["node"] or row["step"] or "").strip()
+    if not node:
+        return
+    status = row["status"] or ("done" if row["ok"] == 1 else "fault")
+    if status == "done":
+        for related_run in _chain_run_ids(c, run_id):
+            fault_item = inbox_store.get_open_by_kind_and_subject(
+                "fault", f"step:{related_run}/{node}", connect=lambda: nullcontext(c)
+            )
+            if fault_item is not None:
+                inbox_store.resolve_item(
+                    c,
+                    inbox_store.parse_id(fault_item["id"]),
+                    resolution="passed",
+                    answer="passed",
+                )
+            stop_item = inbox_store.get_open_by_kind_and_subject(
+                "stop", f"run:{related_run}", connect=lambda: nullcontext(c)
+            )
+            if stop_item is not None and stop_item["detail"].get("node") == node:
+                inbox_store.resolve_item(
+                    c,
+                    inbox_store.parse_id(stop_item["id"]),
+                    resolution="passed",
+                    answer="passed",
+                )
+        return
+    if status != "fault":
+        return
+    run = run_store.run_get(run_id, connect=lambda: nullcontext(c))
+    if run is None:
+        return
+    node_steps = _node_terminal_steps(c, run_id, node)
+    if not node_steps or node_steps[0]["status"] != "fault":
+        return
+    attempts = _attempt_count(node_steps)
+    if run.get("status") != "needs-info" and _is_consecutive_same_fault(node_steps):
+        _escalate_fault_in_tx(c, run_id, node)
+        _upsert_item_in_tx(c, _stop_spec(run, node, node_steps[0], attempts))
+    else:
+        _upsert_item_in_tx(c, _fault_spec(c, run, node, node_steps[0], attempts))
+
+
+def _stops_items(c) -> builtins.list[dict]:
+    if not run_store.has_steps_lifecycle(c):
+        return []
+    pairs = c.execute(
+        "SELECT DISTINCT run_id, COALESCE(NULLIF(node, ''), step) AS node_name "
+        "FROM steps WHERE status = 'fault' AND COALESCE(run_id, '') != '' "
+        "ORDER BY run_id, node_name"
+    ).fetchall()
+    by_run: dict[str, tuple[int, dict]] = {}
+    for pair in pairs:
+        run_id, node = str(pair["run_id"]), str(pair["node_name"] or "").strip()
+        if not node:
+            continue
+        run = run_store.run_get(run_id, connect=lambda: nullcontext(c))
+        if run is None or run.get("status") == "needs-info":
+            continue
+        node_steps = _node_terminal_steps(c, run_id, node)
+        if not _is_consecutive_same_fault(node_steps):
+            continue
+        latest_id = int(node_steps[0]["id"])
+        if _later_node_passed(c, run_id, node, latest_id):
+            continue
+        _escalate_fault_in_tx(c, run_id, node)
+        prev = by_run.get(run_id)
+        if prev is None or latest_id > prev[0]:
+            by_run[run_id] = (latest_id, _stop_spec(run, node, node_steps[0], _attempt_count(node_steps)))
+    return [entry[1] for entry in by_run.values()]
+
+
+def _faults_items(c) -> builtins.list[dict]:
+    if not run_store.has_steps_lifecycle(c):
+        return []
+    pairs = c.execute(
+        "SELECT DISTINCT run_id, COALESCE(NULLIF(node, ''), step) AS node_name "
+        "FROM steps WHERE status = 'fault' AND COALESCE(run_id, '') != '' "
+        "ORDER BY run_id, node_name"
+    ).fetchall()
+    items = []
+    for pair in pairs:
+        run_id, node = str(pair["run_id"]), str(pair["node_name"] or "").strip()
+        if not node:
+            continue
+        run = run_store.run_get(run_id, connect=lambda: nullcontext(c))
+        if run is None:
+            continue
+        node_steps = _node_terminal_steps(c, run_id, node)
+        if not node_steps or node_steps[0]["status"] != "fault":
+            continue
+        latest_id = int(node_steps[0]["id"])
+        if _later_node_passed(c, run_id, node, latest_id):
+            continue
+        if run.get("status") != "needs-info" and _is_consecutive_same_fault(node_steps):
+            continue
+        items.append(_fault_spec(c, run, node, node_steps[0], _attempt_count(node_steps)))
+    return items
+
+
+def check_run_missing_secrets(run_id: str, *, repo: str = "", loop: str = "") -> builtins.list[dict]:
+    with foundation.tx() as c:
+        missing = secretstore.missing_required_for_run(c, repo=repo, loop=loop)
+        if not missing:
+            return []
+        for row in missing:
+            blocker = f"secret:{row['scope']}/{row['name']}"
+            device_store.open_wait(c, f"run:{run_id}", blocker, f"waiting on missing secret {row['scope']}/{row['name']}")
+        sync(c, "secrets")
+        return missing
+
+
+def check_outbox_missing_secrets(row: dict) -> builtins.list[dict]:
+    item_id = int(row["id"])
+    with foundation.tx() as c:
+        missing = secretstore.missing_required_for_outbox(
+            c,
+            str(row.get("target") or ""),
+            kind=str(row.get("kind") or ""),
+            loop=str(row.get("loop") or ""),
+        )
+        if not missing:
+            return []
+        for sec in missing:
+            blocker = f"secret:{sec['scope']}/{sec['name']}"
+            device_store.open_wait(c, f"outbox:{item_id}", blocker, f"waiting on missing secret {sec['scope']}/{sec['name']}")
+        sync(c, "secrets")
+        return missing
+
+
+def resolve_secret_continue_in_tx(c, scope: str, name: str, *, actor: str, at: str) -> dict | None:
+    if not inbox_store.available(c):
+        return None
+    existing = inbox_store.get_open_by_kind_and_subject(
+        "continue", f"secret:{scope}/{name}", connect=lambda: nullcontext(c)
+    )
+    if existing is None:
+        return None
+    resolved, _, ok = inbox_store.resolve_item(
+        c,
+        inbox_store.parse_id(existing["id"]),
+        resolution="continued",
+        answer="continue",
+        answered_by=actor,
+        answered_at=at,
+    )
+    return resolved if ok else None
+
+
+def resume_unblocked_subjects(subjects: Sequence[str]) -> builtins.list[str]:
+    from . import sessions
+
+    resumed: builtins.list[str] = []
+    for subject in subjects:
+        if subject.startswith("run:"):
+            run_id = subject.removeprefix("run:")
+            row = run_store.run_get(run_id)
+            if row is None:
+                continue
+            if row["status"] == "queued":
+                saved = record.read_launch(run_id)
+                cmd = saved.get("command") if isinstance(saved.get("command"), builtins.list) and saved.get("command") else None
+                log_name = str(saved.get("log") or "")
+                kind = row.get("kind") or ""
+                if cmd is None:
+                    if kind == "session" and sessions.spec_file(run_id).is_file():
+                        cmd = control.command(["session", "exec", run_id])
+                        log_name = sessions.SESSION_LOG
+                    elif kind == "loop" and row.get("loop"):
+                        cmd = control.command(["loop", "exec", "--run-id", run_id])
+                        log_name = control.DETACHED_LOG
+                    elif kind == "pipeline" and row.get("repo") and row.get("issue"):
+                        cmd = pipeline.run_command(row["repo"], str(row["issue"]), run_id=run_id)
+                        log_name = pipeline.RUNS_LOG
+                if not cmd:
+                    continue
+                with suppress(Exception):
+                    if kind == "pipeline":
+                        tasks.spawn_queued(
+                            row["repo"],
+                            str(row["issue"]),
+                            lambda c=cmd, log=log_name or pipeline.RUNS_LOG: control.launch(c, log),
+                        )
+                    else:
+                        control.launch(cmd, log_name or control.DETACHED_LOG)
+                    resumed.append(subject)
+            elif row.get("kind") == "pipeline" and row["status"] in tasks.RESUMABLE:
+                with suppress(Exception):
+                    tasks.resume(run_id)
+                    resumed.append(subject)
+        elif subject.startswith("outbox:"):
+            ident = subject.removeprefix("outbox:")
+            if not ident.isdecimal():
+                continue
+            from .store import outbox as outbox_store
+
+            ob_id = int(ident)
+            with foundation.tx() as c:
+                if outbox_store.available(c):
+                    changed = c.execute(
+                        "UPDATE outbox SET send_at = COALESCE(send_at, ?), error = NULL, updated = ? "
+                        "WHERE id = ? AND state = 'approved'",
+                        (util.iso(), util.iso(), ob_id),
+                    ).rowcount
+                    if changed:
+                        resumed.append(subject)
+    return resumed
+
+
+ADAPTERS: dict[str, tuple[str, Callable[..., builtins.list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
     "runs": ("run:%", _runs_items),
+    "secrets": ("secret:%", _secrets_items),
+    "stops": ("run:%", _stops_items),
+    "faults": ("step:%", _faults_items),
     "evidence": ("evidence:%", _evidence_items),
     "proposals": ("proposal:%", _proposals_items),
     "skipped": ("skipped:%", _skipped_items),
@@ -723,6 +1260,12 @@ ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "config": ("config:%", _config_items),
     "queue": ("queue:%", _queue_dead_items),
     "outbox": ("outbox:%", _outbox_items),
+}
+ADAPTER_KINDS: dict[str, tuple[str, ...]] = {
+    "runs": ("freeform",),
+    "secrets": ("continue",),
+    "stops": ("stop",),
+    "faults": ("fault",),
 }
 
 
@@ -737,6 +1280,17 @@ def _clear_resolution(c, source: str, subject: str) -> str:
         row = c.execute("SELECT status FROM private_evidence WHERE id = ?", (ev_id,)).fetchone()
         if row and row["status"] in ("uploaded", "access_restored", "stopped"):
             return "dismissed" if row["status"] == "stopped" else row["status"]
+    if source == "faults" and subject.startswith("step:"):
+        run_id, sep, node = subject.removeprefix("step:").partition("/")
+        if sep and run_id and node:
+            node_steps = _node_terminal_steps(c, run_id, node)
+            if node_steps and node_steps[0]["status"] == "done":
+                return "passed"
+            if node_steps and _later_node_passed(c, run_id, node, int(node_steps[0]["id"])):
+                return "passed"
+            run = run_store.run_get(run_id, connect=lambda: nullcontext(c))
+            if run is not None and run.get("status") != "needs-info" and _is_consecutive_same_fault(node_steps):
+                return "escalated"
     return "cleared"
 
 
@@ -748,10 +1302,11 @@ def sync(c, source: str) -> None:
             sync(c, name)
         return
     pattern, producer = ADAPTERS[source]
+    kinds = ADAPTER_KINDS.get(source)
     resolving = _RESOLVING.get()
     desired = producer(c)
     wanted = {(spec["kind"], spec["subject"]): spec for spec in desired}
-    existing_rows = inbox_store.unresolved_for_pattern(c, pattern)
+    existing_rows = inbox_store.unresolved_for_pattern(c, pattern, kinds=kinds)
     present_keys: set[tuple[str, str]] = set()
     for row in existing_rows:
         key = (row["kind"], row["subject"])
@@ -780,7 +1335,7 @@ def sync(c, source: str) -> None:
             continue
         stamp = (spec["detail"] or {}).get("stamp")
         if stamp:
-            prev = inbox_store.newest_resolved_by_subject(c, spec["subject"])
+            prev = inbox_store.newest_resolved_by_subject(c, spec["subject"], kind=spec["kind"])
             if prev and prev["resolution"] != "cleared" and prev["detail"].get("stamp") == stamp:
                 continue
         inbox_store.raise_item(
@@ -898,6 +1453,18 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
             return next((r for r in view["rows"] if r.get("ref") == ident), None)
         if kind == "config":
             return dict(item["detail"])
+        if kind == "secret":
+            from . import api
+
+            scope, sep, name = ident.partition("/")
+            if sep and scope and name:
+                row = credentials_store.secret(c, scope, name)
+                return api.secret_view(row) if row else None
+        if kind == "step":
+            run_id, sep, node = ident.partition("/")
+            if sep and run_id and node:
+                steps_found = _node_terminal_steps(c, run_id, node)
+                return steps_found[0] if steps_found else None
     return None
 
 
@@ -1419,6 +1986,85 @@ def _resolve_queue_dead(
     raise AssertionError("unreachable")
 
 
+def _resolve_secret_continue(
+    item: dict,
+    *,
+    numeric_id: int,
+    base_version: int,
+    actor: str,
+) -> dict:
+    scope, sep, name = item["subject"].removeprefix("secret:").partition("/")
+    if not sep or not scope or not name:
+        raise contract.Problem("validation", f"Invalid secret subject {item['subject']!r}.")
+    try:
+        checked = secretstore.check(scope, name, actor)
+    except (secretstore.StoreMissing, secretstore.StoreError, ValueError):
+        checked = None
+    ok_check = checked is not None and checked.get("status") == "set" and bool(checked.get("check_ok"))
+    if not ok_check:
+        sync_source("secrets")
+        refreshed = inbox_store.get(numeric_id) or item
+        raise contract.Problem(
+            "still_missing",
+            f"Secret {scope}/{name} is still missing.",
+            current=refreshed,
+        )
+    now = util.iso()
+    blocker = f"secret:{scope}/{name}"
+    with foundation.tx() as c:
+        current = inbox_store.get(numeric_id, connect=lambda: nullcontext(c))
+        if current is None:
+            raise contract.Problem("not_found", f"No inbox item {item['id']}")
+        if current["state"] == "resolved":
+            raise contract.Problem("already_resolved", f"Inbox item {current['id']} is already resolved.", current=current)
+        if current["version"] != base_version:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=current)
+        waiting_subjects = [w["subject"] for w in device_store.open_waits_for_blocker(c, blocker)]
+        device_store.clear_waits_for_blocker(c, blocker)
+        updated, _, ok = inbox_store.resolve_item(
+            c,
+            numeric_id,
+            resolution="continued",
+            answer="continue",
+            answered_by=actor,
+            answered_at=now,
+            base_version=base_version,
+        )
+        if not ok:
+            raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+        unblocked = tuple(s for s in waiting_subjects if not device_store.has_open_waits(c, s))
+        if unblocked:
+            foundation.after_commit(lambda subjects=unblocked: resume_unblocked_subjects(subjects))
+    return {"item": updated, "result": {"secret": blocker, "continued": True, "resumed": builtins.list(unblocked)}}
+
+
+def retry_item(
+    item_id: str | int,
+    *,
+    base_version: int | None = None,
+    credential=None,
+    pending_secrets=None,
+) -> dict:
+    numeric = inbox_store.parse_id(item_id)
+    if numeric is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    item = inbox_store.get(numeric)
+    if item is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    if item["state"] == "resolved":
+        raise contract.Problem("already_resolved", f"Inbox item {item['id']} is already resolved.", current=item)
+    if base_version is not None and item["version"] != base_version:
+        raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=item)
+    effective_version = item["version"] if base_version is None else base_version
+    return resolve(
+        item_id,
+        base_version=effective_version,
+        verb="retry",
+        credential=credential,
+        pending_secrets=pending_secrets,
+    )
+
+
 def resolve(
     item_id: str | int,
     *,
@@ -1426,8 +2072,10 @@ def resolve(
     verb: str,
     option=None,
     answer: str | None = None,
-    answers: list | None = None,
+    answers: builtins.list | None = None,
     reason: str | None = None,
+    fix: str | None = None,
+    prevent: str | None = None,
     credential=None,
     publication=None,
     pending_secrets=None,
@@ -1465,6 +2113,13 @@ def resolve(
             base_version=base_version,
             verb=verb,
         )
+    if subject.startswith("secret:"):
+        return _resolve_secret_continue(
+            item,
+            numeric_id=numeric,
+            base_version=base_version,
+            actor=principals.current(),
+        )
 
     if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:
         if credential is None or credential.kind != "session":
@@ -1476,6 +2131,7 @@ def resolve(
     stored_answer = str(answer or "")
     resolution = ""
     keep_open = False
+    updated_detail: dict | None = None
 
     token = _RESOLVING.set(subject)
     try:
@@ -1498,6 +2154,42 @@ def resolve(
                 current = inbox_store.get(numeric) or item
                 raise contract.Problem("already_resolved", str(e), current=current) from None
             resolution = "answered"
+        elif prefix == "run" and item["kind"] == "stop":
+            node = str(item["detail"].get("node") or "")
+            if verb == "redirect":
+                if fix is not None:
+                    edited_fix = str(fix).strip()
+                elif answer is not None:
+                    edited_fix = str(answer).strip()
+                else:
+                    edited_fix = str((item["detail"].get("jidoka") or {}).get("fix") or "").strip()
+                if not edited_fix:
+                    raise contract.Problem("validation", "fix or answer is required for redirect.")
+                handler_result = tasks.reply(ident, edited_fix)
+                new_detail = dict(item["detail"])
+                jidoka = dict(new_detail.get("jidoka") or {})
+                jidoka["fix"] = edited_fix
+                if prevent is not None:
+                    jidoka["prevent"] = str(prevent).strip()
+                new_detail["jidoka"] = jidoka
+                updated_detail = new_detail
+                resolution = "redirected"
+                stored_answer = edited_fix
+            elif verb == "retry":
+                handler_result = tasks.resume(ident, node)
+                resolution = "retried"
+                stored_answer = verb
+            else:
+                try:
+                    handler_result = control.stop_run(ident)
+                except control.Refused:
+                    run_row = run_store.run_get(ident)
+                    if run_row is not None and run_row["status"] in ("failed", "stopped", "interrupted"):
+                        handler_result = {"id": ident, "stopped": True, "was": run_row["status"]}
+                    else:
+                        raise
+                resolution = "stopped"
+                stored_answer = verb
         elif prefix == "run":
             text = str(answer or "").strip()
             if not text:
@@ -1509,6 +2201,18 @@ def resolve(
                 raise contract.Problem("already_resolved", str(e), current=current) from None
             resolution = "answered"
             stored_answer = text
+        elif prefix == "step":
+            run_id, sep, node = ident.partition("/")
+            if not sep or not run_id or not node:
+                raise contract.Problem("validation", f"Invalid step subject {subject!r}.")
+            if verb == "retry":
+                handler_result = tasks.resume(run_id, node)
+                keep_open = True
+                stored_answer = verb
+            else:
+                handler_result = {"run_id": run_id, "node": node, "dismissed": True}
+                resolution = "dismissed"
+                stored_answer = verb
         elif prefix == "proposal":
             pid = int(ident)
             prop = approvals_store.proposal(pid)
@@ -1653,6 +2357,9 @@ def resolve(
     now = util.iso()
     with foundation.tx() as c:
         if keep_open:
+            current = inbox_store.get(numeric, connect=lambda: nullcontext(c))
+            if current is not None and current["state"] == "resolved" and prefix == "step" and verb == "retry":
+                return {"item": current, "result": handler_result}
             updated, _, ok = inbox_store.record_answer(
                 c, numeric, answer=stored_answer, answered_by=actor, answered_at=now, base_version=base_version
             )
@@ -1665,6 +2372,7 @@ def resolve(
                 answered_by=actor,
                 answered_at=now,
                 base_version=base_version,
+                detail=updated_detail,
             )
         if not ok:
             if updated and updated["state"] == "resolved":

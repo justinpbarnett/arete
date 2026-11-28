@@ -7162,7 +7162,10 @@ def run_skipped(name: str) -> dict:
         run_id = queue_run(repo_name, tid)
         cmd = run_command(repo_name, tid, force=True, run_id=run_id)
         record.write_launch(run_id, cmd, RUNS_LOG)
-        tasks.spawn_queued(repo_name, tid, lambda: control.launch(cmd, RUNS_LOG))
+        from . import inbox
+
+        if not inbox.check_run_missing_secrets(run_id, repo=repo_name):
+            tasks.spawn_queued(repo_name, tid, lambda: control.launch(cmd, RUNS_LOG))
     return {"ticket": name, "repo": repo_name, "id": entry["id"], "run": run_id}
 
 
