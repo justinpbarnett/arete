@@ -13,7 +13,7 @@
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "enum": ["issue", "comment", "reply", "label", "status"]
+        "enum": ["issue", "comment", "reply", "label", "status", "transition", "pr", "push", "loop", "email"]
       }
     },
     "audience": {

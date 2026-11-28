@@ -8223,11 +8223,10 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
         self.in_subprocess("check_approval_waits_out_drain")
 
     def check_approval_waits_out_drain(self):
-        from arete import client, delivery
+        from arete import client
 
         seen, refused, instances = [], [], []
-        with (self.serve_at(seen, write_instances=instances),
-              mock.patch.object(delivery.EMITS["push"], "execute", return_value="sent") as send):
+        with self.serve_at(seen, write_instances=instances):
             number = approvals_store.add_approval("example", "", {"type": "push", "item": {}}, "deliver")
             connect = client.connect
 
@@ -8247,8 +8246,7 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
                 self.assertEqual(code, 0, (lines, err))
             finally:
                 dashboard.POSTS_IN_FLIGHT.reopen()
-            send.assert_called_once()
-            self.assertEqual(approvals_store.approval(number)["status"], "done")
+            self.assertEqual(approvals_store.approval(number)["status"], "approved")
         self.assertEqual(refused, [True])
         self.assertIn(("GET", client.META, 503, None), seen)
         self.assertIn(("GET", "/api/meta", 200, None), seen)
@@ -9553,34 +9551,19 @@ class VersionedApiTests(unittest.TestCase):
             patches.enter_context(mock.patch.object(source, "ticket",
                                                     return_value=triage.TicketText("", "Ticket", "", "old")))
             post = self.publication_post
+            from arete import outbox
+
             with self.subTest(publication="approval-pr"):
-                path, route, params = f"/api/approvals/{pr_id}", "/api/approvals/{id}", {"id": str(pr_id)}
+                path = f"/api/approvals/{pr_id}"
                 body, key = {"approve": True}, "fixture-key-approval-pr"
                 before = len(remote["pulls"])
-                with (mock.patch.object(idempotency.Publication, "record", side_effect=RuntimeError("cut off")),
-                      mock.patch.object(approvals_store, "settle_approval", side_effect=settle_until_disconnect)):
-                    self.assertEqual(post(path, body, key)[0], 500)
-                self.assertEqual(len(remote["pulls"]), before + 1)
-                sha = idempotency.fingerprint("POST", route, params, body)
-                tag = db.schema_metadata()["instance_tag"]
-                self.assertIn(f"arete:{tag}:k-{sha[:8]}", remote["pulls"][-1]["body"].splitlines())
-                self.assertEqual(claims.lookup(self.actor, key)["status"], 0)
-                self.assertEqual(approvals_store.approval(pr_id)["status"], "approved")
                 status, headers, answer = post(path, body, key)
                 self.assertEqual(status, 200, answer)
-                saved = claims.lookup(self.actor, key)
-                self.assertEqual(headers["Arete-Seq"], claims.receipt(saved["last_seq"])["event_seq"])
-                with db.reader() as conn:
-                    event = conn.execute("SELECT subject, data FROM events_log WHERE seq=?",
-                                         (saved["last_seq"],)).fetchone()
-                self.assertEqual((event["subject"], json.loads(event["data"])["url"]), (f"approval:{pr_id}", pr_url))
+                self.assertEqual(len(remote["pulls"]), before)
+                self.assertTrue(str(json.loads(answer)["result"]).startswith("OB-"))
+                self.assertEqual(approvals_store.approval(pr_id)["status"], "approved")
                 status, headers, again = post(path, body, key)
                 self.assertEqual((status, headers["Idempotent-Replayed"], again), (200, "true", answer))
-                self.assertEqual(len(remote["pulls"]), before + 1)
-                self.assertEqual(pushed, [["push", "-u", "origin", "fixture/head"]])
-                self.assertEqual(approvals_store.approval(pr_id)["result"], pr_url)
-
-            from arete import outbox
 
             with self.subTest(publication="triage drafts outbox items atomically"):
                 path = "/api/triage/fixture%237/send"
@@ -9608,29 +9591,23 @@ class VersionedApiTests(unittest.TestCase):
                 self.assertEqual(chat_items[0]["state"], "draft")
                 self.assertIn(f"Drafted {chat_items[0]['id']}", chats_store.chat_messages(chat_id)[-1]["text"])
 
-            with self.subTest(publication="legacy ticket approval drafts into outbox"):
+            with self.subTest(publication="legacy ticket approval approves outbox item"):
                 path = f"/api/approvals/{approval_id}"
                 status, headers, answer = post(path, {"approve": True}, "fixture-key-approval")
                 self.assertEqual(status, 200, answer)
                 self.assertEqual(post(path, {"approve": False}, "fixture-key-approval")[0], 422)
-                self.assertTrue(approvals_store.approval(approval_id)["result"].startswith("OB-"))
+                self.assertTrue(str(json.loads(answer)["result"]).startswith("OB-"))
+                self.assertEqual(approvals_store.approval(approval_id)["status"], "approved")
 
-            with self.subTest(publication="pr approval prerequisite failure is kept"):
+            with self.subTest(publication="pr approval queues for outbox delivery"):
                 retry_pr = {"type": "pr", "item": {**pr_item, "branch": "fixture/retry", "labels": ["fixture-label"]}}
                 ident = approvals_store.add_approval("fixture", "", retry_pr, "Recover the prerequisite failure")
                 path, key = f"/api/approvals/{ident}", f"fixture-prerequisite-{ident}"
                 before = len(remote["pulls"])
-                with mock.patch.object(gh, "ensure_label", return_value=""), \
-                        mock.patch.object(util, "git", side_effect=gh.GhError("prerequisite failed")):
-                    status, _, failure = post(path, {"approve": True}, key)
-                    self.assertEqual(status, 502, failure)
-                self.assertEqual(approvals_store.approval(ident)["status"], "failed")
-                self.assertEqual(len(remote["pulls"]), before)
-                with mock.patch.object(gh, "ensure_label", return_value=""):
-                    status, _, answer = post(path, {"approve": True}, key)
+                status, _, answer = post(path, {"approve": True}, key)
                 self.assertEqual(status, 200, answer)
-                self.assertEqual(len(remote["pulls"]), before + 1)
-                self.assertEqual(approvals_store.approval(ident)["status"], "done")
+                self.assertEqual(len(remote["pulls"]), before)
+                self.assertEqual(approvals_store.approval(ident)["status"], "approved")
 
             with self.subTest(publication="chat without a bound draft"):
                 chats_store.chat_say(chat_id, "arete", "Drafted again", draft_title="New draft", draft_body="Different body")
@@ -9738,8 +9715,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 127)
-        self.assertEqual(len({op["name"] for op in operations}), 127)
+        self.assertEqual(len(operations), 128)
+        self.assertEqual(len({op["name"] for op in operations}), 128)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10889,29 +10866,32 @@ class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
 
     @credential_test
     def test_publication_resumes_pre_deploy_approval(self, _):
-        approval_key = "pre-upgrade-approval"
+        from arete import outbox
+        from arete.store import outbox as outbox_store
+
         github = "fixture/repo"
         with self.old_schema(), principals.acting(self.owner):
             item = {"repo": "fixture", "title": "Approve delivery", "body": "An issue", "labels": []}
             approval = approvals_store.add_approval("fixture", "", {"type": "ticket", "item": item}, "File it")
-            context = self.old_claim(approval_key, "/api/approvals/{id}", {"approve": True}, id=str(approval))
-            pending = idempotency.Publication(context, None)
-            claim = approvals_store.claim_approval(approval, util.iso(util.now() + timedelta(minutes=2)))
-            pending.remember({"token": claim, "repo": github, "send_started": True})
-            self.assertTrue(approvals_store.bind_publication(approval, claim, pending.marker))
+            approvals_store.claim_approval(approval, util.iso(util.now() + timedelta(minutes=2)))
         self.upgrade()
-        url = gh.issue_url(github, 2)
-        with (self.listen() as server, mock.patch.object(gh, "find_issue_marker", return_value=url) as lookup,
-              mock.patch.object(gh, "issue_create", side_effect=AssertionError("Duplicate publication")),
-              self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=approval_key)):
-            for _ in range(2):
-                self.assertEqual(json.loads(self.cli(["approve", str(approval)]))["result"], url)
-            lookup.assert_called_once_with(github, pending.marker)
-        saved = claims.lookup(self.owner, approval_key)
-        self.assertEqual(saved["status"], 200)
         with db.reader() as c:
-            row = c.execute("SELECT actor, kind FROM events_log WHERE seq = ?", (saved["last_seq"],)).fetchone()
-        self.assertEqual(tuple(row), (f"client:{self.owner_text.split('_', 3)[2]}", "publication.sent"))
+            row = outbox_store.get_by_legacy_approval(c, approval)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["state"], "sending")
+        swept = outbox.sweep(since=util.now() + timedelta(minutes=5))
+        self.assertEqual(swept, [row["id"]])
+        url = gh.issue_url(github, 2)
+        with (mock.patch.object(gh, "api_list", return_value=[
+                  {"number": 2, "html_url": url, "body": f"An issue\n\n<!-- {row['marker']} -->"}
+              ]),
+              mock.patch.object(gh, "api_create_issue", side_effect=AssertionError("Duplicate publication"))):
+            outbox.send_due(now=util.now() + timedelta(minutes=5))
+        settled = outbox.get(row["id"])
+        self.assertEqual(settled["item"]["state"], "sent")
+        self.assertEqual(settled["item"]["sent_url"], url)
+        self.assertEqual(approvals_store.approval(approval)["status"], "done")
+        self.assertEqual(approvals_store.approval(approval)["result"], url)
 
 
 class CredentialWriteTests(_CredentialCase):
@@ -13292,8 +13272,6 @@ class InboxConflictTests(_InboxCase):
 
     @inbox_test
     def test_version_conflict_concurrent_resolve_and_verb_validation(self, _):
-        from arete import delivery
-
         aid = approvals_store.add_approval(
             "demo", "r-race", {"type": "push", "item": {"title": "Race", "about": "Race", "files": ["r.py"]}}, "Race"
         )
@@ -13312,13 +13290,17 @@ class InboxConflictTests(_InboxCase):
                       body={"verb": "redirect", "base_version": item["version"]},
                       cookie=cookie, status=422, code="validation")
 
-            # Two concurrent resolves with 0.2s pause in delivery.send -> one 200, one 409 already_resolved, 1 delivery.
-            delivered = []
+            # Two concurrent resolves -> one 200, one 409 already_resolved, and one outbox approval (no inline send).
+            from arete import outbox
 
-            def fake_send(delivery_obj, loop, run_id, cfg, **kwargs):
-                time.sleep(0.2)
-                delivered.append((loop, delivery_obj["type"]))
-                return "delivered-ok"
+            approved_ids = []
+            real_approve = outbox.approve
+
+            def slow_approve(item_id, **kwargs):
+                time.sleep(0.1)
+                res = real_approve(item_id, **kwargs)
+                approved_ids.append(res["id"])
+                return res
 
             def fire(key):
                 with closing(self.connect(server)) as conn:
@@ -13331,7 +13313,7 @@ class InboxConflictTests(_InboxCase):
                     resp = conn.getresponse()
                     return resp.status, json.loads(resp.read())
 
-            with (mock.patch.object(delivery, "send", side_effect=fake_send),
+            with (mock.patch.object(outbox, "approve", side_effect=slow_approve),
                   ThreadPoolExecutor(max_workers=2) as pool):
                 f1 = pool.submit(fire, "race-key-1")
                 f2 = pool.submit(fire, "race-key-2")
@@ -13341,8 +13323,8 @@ class InboxConflictTests(_InboxCase):
             self.assertEqual(statuses, [200, 409], outcomes)
             conflict_body = next(body for s, body in outcomes if s == 409)
             self.assertEqual(conflict_body["code"], "already_resolved")
-            self.assertEqual(len(delivered), 1)
-            self.assertEqual(approvals_store.approval(aid)["status"], "done")
+            self.assertEqual(len(approved_ids), 1)
+            self.assertEqual(approvals_store.approval(aid)["status"], "approved")
 
 
 class InboxPresenceTests(_InboxCase):
@@ -18741,3 +18723,883 @@ emit({
         ):
             self.assertIn(expected_dep, res["deprecated_paths"])
         self.assertTrue(res["dry_no_row"])
+
+
+class _OutboxCompleteChildCase(unittest.TestCase):
+    def run_child(self, body: str) -> dict:
+        root, env = isolated_behavior_environment(self)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        out_file = root / "child-result.json"
+        env["ARETE_TEST_RESULT_FILE"] = str(out_file)
+        preamble = r"""
+import ast, io, json, os, re, shutil, signal, subprocess, sys, urllib.error
+from datetime import datetime, timedelta, timezone
+from email.message import Message
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from arete import (
+    adf, api, board, config, contract, control, dashboard, delivery, emits, factory, flows, gh,
+    inbox, jira, loop_run, loops, outcomes, outbox, paths, pipeline, principals, push,
+    record, replay, secretstore, send_github, send_jira, send_loop, send_push, senders,
+    sources, tracker, triage, util, workspace,
+)
+from arete.store import (
+    approvals as approvals_store,
+    db,
+    inbox as inbox_store,
+    insights as insights_store,
+    loops as loop_store,
+    outbox as outbox_store,
+    runs as run_store,
+    triage as triage_store,
+)
+
+class _FakeJiraResp(io.BytesIO):
+    def __init__(self, payload, url):
+        raw = json.dumps(payload).encode("utf-8") if not isinstance(payload, (bytes, bytearray)) else bytes(payload)
+        super().__init__(raw)
+        self._url = url
+    def geturl(self):
+        return self._url
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+class FakeJiraOpener:
+    def __init__(self):
+        self.issues = {}
+        self.comments = {}
+        self.requests = []
+        self.faults = {}
+        self._next_cid = 100
+        self.transitions = {
+            "In Progress": "21",
+            "In Review": "31",
+            "QA": "41",
+            "Done": "51",
+            "To Do": "11",
+        }
+
+    def seed(self, key, *, status="To Do", labels=(), summary="Jira task", description="Body"):
+        self.issues[key] = {
+            "key": key,
+            "fields": {
+                "summary": summary,
+                "description": description,
+                "status": {"name": status, "statusCategory": {"key": "done" if status == "Done" else "new"}},
+                "labels": list(labels),
+                "updated": "2026-11-28T00:00:00.000+0000",
+                "reporter": {"displayName": "Owner"},
+            },
+        }
+        self.comments.setdefault(key, [])
+
+    def queue_fault(self, key, exc):
+        self.faults.setdefault(key, []).append(exc)
+
+    def _pop_fault(self, key):
+        q = self.faults.get(key)
+        return q.pop(0) if q else None
+
+    def open(self, req, timeout=None):
+        method = req.get_method()
+        url = req.full_url
+        path = url.split("://", 1)[-1].split("/", 1)[-1]
+        path = "/" + path.split("?", 1)[0]
+        raw = req.data.decode("utf-8") if req.data else ""
+        data = json.loads(raw) if raw else {}
+        self.requests.append((method, path, data))
+
+        if path == "/rest/api/3/myself":
+            return _FakeJiraResp({"accountId": "acct-owner"}, url)
+
+        if m := re.fullmatch(r"/rest/api/[23]/issue/([A-Z]+-\d+)/comment", path):
+            key = m.group(1)
+            if method == "GET":
+                return _FakeJiraResp({"comments": list(self.comments.get(key, [])), "total": len(self.comments.get(key, []))}, url)
+            if method == "POST":
+                self._next_cid += 1
+                cid = str(self._next_cid)
+                props = data.get("properties") or []
+                body_adf = data.get("body")
+                body_text = adf.to_text(body_adf) if isinstance(body_adf, dict) else str(body_adf or "")
+                self.comments.setdefault(key, []).append({
+                    "id": cid,
+                    "body": body_text,
+                    "properties": props,
+                    "created": util.iso(),
+                    "author": {"accountId": "acct-owner", "displayName": "Owner"},
+                })
+                if fault := self._pop_fault(("comment_post", key)):
+                    raise fault(url) if callable(fault) else fault
+                return _FakeJiraResp({"id": cid}, url)
+
+        if m := re.fullmatch(r"/rest/api/[23]/issue/([A-Z]+-\d+)/transitions", path):
+            key = m.group(1)
+            if method == "GET":
+                items = [{"id": tid, "name": name, "to": {"name": name}} for name, tid in self.transitions.items()]
+                return _FakeJiraResp({"transitions": items}, url)
+            if method == "POST":
+                tid = str((data.get("transition") or {}).get("id") or "")
+                target_name = next((n for n, i in self.transitions.items() if i == tid), None)
+                if target_name and key in self.issues:
+                    self.issues[key]["fields"]["status"]["name"] = target_name
+                    self.issues[key]["fields"]["status"]["statusCategory"]["key"] = "done" if target_name == "Done" else "indeterminate"
+                if fault := self._pop_fault(("transition_post", key)):
+                    raise fault(url) if callable(fault) else fault
+                return _FakeJiraResp({}, url)
+
+        if m := re.fullmatch(r"/rest/api/[23]/issue/([A-Z]+-\d+)", path):
+            key = m.group(1)
+            if method == "GET":
+                return _FakeJiraResp(self.issues[key], url)
+            if method == "PUT":
+                if fault := self._pop_fault(("label_put", key)):
+                    raise fault(url) if callable(fault) else fault
+                labels = list(self.issues[key]["fields"]["labels"])
+                for op in (data.get("update") or {}).get("labels") or []:
+                    if "add" in op and op["add"] not in labels:
+                        labels.append(op["add"])
+                    if "remove" in op and op["remove"] in labels:
+                        labels.remove(op["remove"])
+                self.issues[key]["fields"]["labels"] = labels
+                return _FakeJiraResp({}, url)
+
+        if m := re.fullmatch(r"/rest/api/3/project/([A-Z0-9_]+)/statuses", path):
+            return _FakeJiraResp([{"statuses": [{"name": n} for n in self.transitions]}], url)
+
+        raise AssertionError(f"unexpected Jira request: {method} {url}")
+
+def http_502(url):
+    return urllib.error.HTTPError(url, 502, "Bad Gateway", Message(), io.BytesIO(b"upstream"))
+
+class FakeGhPrs:
+    def __init__(self):
+        self.prs = {}
+        self.next_num = 1
+        self.faults = {}
+        self.calls = []
+
+    def handle(self, args, cwd=None, input=None, write=False, retry=True, **kw):
+        self.calls.append((list(args), str(input) if input is not None else None))
+        if args[:2] == ["label", "create"]:
+            return ""
+        if args[:2] == ["pr", "create"]:
+            repo = args[args.index("--repo") + 1]
+            head = args[args.index("--head") + 1]
+            base = args[args.index("--base") + 1]
+            title = args[args.index("--title") + 1]
+            if (repo, head) in self.prs:
+                raise gh.GhError(f"a pull request for branch {head!r} into branch {base!r} already exists")
+            num = self.next_num
+            self.next_num += 1
+            url = f"https://github.com/{repo}/pull/{num}"
+            self.prs[(repo, head)] = {
+                "number": num, "url": url, "head": head, "base": base,
+                "title": title, "body": str(input or ""), "draft": "--draft" in args, "state": "OPEN",
+            }
+            if q := self.faults.get("pr_create"):
+                raise q.pop(0)
+            return url
+        if args[:2] == ["pr", "list"]:
+            repo = args[args.index("--repo") + 1]
+            head = args[args.index("--head") + 1] if "--head" in args else ""
+            matches = [p for (r, h), p in self.prs.items() if r == repo and (not head or h == head)]
+            return json.dumps([{"url": p["url"], "number": p["number"], "headRefName": p["head"]} for p in matches])
+        if args[:2] == ["pr", "view"]:
+            url = args[2]
+            found = next((p for p in self.prs.values() if p["url"] == url), None)
+            if found is None:
+                raise gh.GhError(f"no PR {url}")
+            return json.dumps({
+                "url": found["url"], "number": found["number"], "body": found["body"],
+                "isDraft": found["draft"], "headRefOid": "head-sha", "state": found["state"],
+            })
+        if args[:2] == ["pr", "edit"]:
+            url = args[2]
+            found = next((p for p in self.prs.values() if p["url"] == url), None)
+            if found:
+                found["body"] = str(input or "")
+            return ""
+        if args[:2] == ["pr", "ready"]:
+            url = args[2]
+            found = next((p for p in self.prs.values() if p["url"] == url), None)
+            if found:
+                found["draft"] = "--undo" in args
+            return ""
+        if args[:3] == ["api", "-X", "PUT"]:
+            if q := self.faults.get("pr_merge"):
+                raise q.pop(0)
+            return '{"merged": true}'
+        if args[0] == "api" and "labels" in args[1]:
+            return "[]"
+        return ""
+"""
+        epilogue = r"""
+Path(os.environ["ARETE_TEST_RESULT_FILE"]).write_text(json.dumps(result), encoding="utf-8")
+"""
+        script = preamble + "\n" + body + "\n" + epilogue
+        repo_root = Path(__file__).resolve().parents[1]
+        cmd = [sys.executable, "-I", "-c", script]
+        done = subprocess.run(
+            cmd,
+            cwd=root,
+            env={**env, "PYTHONPATH": str(repo_root)},
+            capture_output=True,
+            text=True,
+            timeout=CHILD_HANG_TIMEOUT,
+        )
+        self.assertEqual(done.returncode, 0, f"stdout:\n{done.stdout}\nstderr:\n{done.stderr}")
+        self.assertTrue(out_file.exists(), f"missing result file\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}")
+        return json.loads(out_file.read_text(encoding="utf-8"))
+
+
+class JiraOutboxCompletionTests(_OutboxCompleteChildCase):
+    def test_jira_source_scan_and_triage_send_drafts_and_version_conflict(self):
+        result = self.run_child(r"""
+import arete
+
+# 1. Source scan: no jira.Client write calls outside sender modules + specialized post-outbox protocol modules.
+pkg = Path(arete.__file__).parent
+MIGRATED_JIRA_FILES = {
+    "tracker.py", "triage.py", "intake.py", "outcomes.py",
+    "pipeline.py", "tasks.py", "research.py", "poll.py",
+}
+ALLOWED_JIRA_FILES = {
+    "jira.py", "send_jira.py",
+    "release_promotion.py", "spec_delivery.py", "ticket_feedback.py",
+    "ticket_followups.py", "ticket_publication.py", "unblock.py",
+}
+bad_jira = []
+migrated_jira = []
+for path in sorted(pkg.rglob("*.py")):
+    rel = path.relative_to(pkg).as_posix()
+    tree = ast.parse(path.read_text(), filename=rel)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr in ("comment", "edit_labels", "transition", "_send"):
+                src = ast.unparse(node.func)
+                if any(tok in src for tok in ("client.", "jira.")):
+                    if rel in MIGRATED_JIRA_FILES:
+                        migrated_jira.append([rel, node.lineno, src])
+                    if rel not in ALLOWED_JIRA_FILES:
+                        bad_jira.append([rel, node.lineno, src])
+assert bad_jira == [], bad_jira
+assert migrated_jira == [], migrated_jira
+
+# 2. Triage send on a Jira ticket with 2 questions leaves draft comment + draft label items,
+# makes no non-GET Jira requests, and returns 409 version_conflict on an older base_version.
+db.migrate()
+sample_root = paths.STATE_DIR / "sample"
+replay.sample(sample_root)
+sample = sample_root / "repo"
+paths.CONFIG_FILE.write_text(
+    '[jira]\n'
+    'base_url = "https://jira.example.test"\n'
+    'email = "owner@example.test"\n'
+    '[jira.transitions]\n'
+    'running = "In Progress"\n'
+    'pr = "In Review"\n'
+    '[[repo]]\n'
+    f'name = "{replay.SAMPLE_REPO}"\n'
+    f'path = {json.dumps(str(sample))}\n'
+    'tracker = "jira"\n'
+    'project = "APP"\n'
+    'github = "acme/sample"\n',
+    encoding="utf-8",
+)
+os.environ["JIRA_API_TOKEN"] = "tok-jira-test"
+fake = FakeJiraOpener()
+fake.seed("APP-7", status="To Do", labels=["triage"])
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+
+with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
+    src = triage.JiraSource("APP", [repo], jira_cfg=cfg.jira)
+    cand = triage.Candidate("APP-7", "APP-7", "Fix login", src.client.browse_url("APP-7"), "2026-11-28T00:00:00.000+0000")
+    triage_store.triage_put(triage.row(
+        src, cand, updated="2026-11-28T00:00:00.000+0000", ready=0, code=1, repo=repo.name,
+        questions=["Which endpoint?", "What status code?"],
+    ))
+    initial = next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")
+    v1 = int(initial["version"])
+
+    # Update row once so v1 becomes stale, then call api.triage_send with stale v1 -> 409 version_conflict.
+    triage_store.triage_put({**initial, "summary": "Refreshed triage"})
+    v2 = int(next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")["version"])
+    assert v2 > v1
+    with mock.patch.object(triage, "sources", return_value=[src]):
+        try:
+            api.mutation(
+                "triage.send",
+                {"ticket": "APP-7", "questions": ["Which endpoint?", "What status code?"],
+                 "answers": ["POST /login", "401"], "repo": repo.name, "base_version": v1},
+                None,
+            )
+            raise AssertionError("expected 409 version_conflict")
+        except contract.Problem as err:
+            assert (err.status, err.code) == (409, "version_conflict"), (err.status, err.code)
+
+        # Now send with current v2 -> creates draft comment + draft label, zero non-GET Jira requests.
+        sent = api.mutation(
+            "triage.send",
+            {"ticket": "APP-7", "questions": ["Which endpoint?", "What status code?"],
+             "answers": ["POST /login", "401"], "repo": repo.name, "base_version": v2},
+            None,
+        )
+    assert sent["data"]["kind"] == "label"
+    assert sent["data"]["state"] == "draft"
+    items = [it for it in outbox.list_items() if it["object"] == "jira:APP-7"]
+    assert sorted((it["kind"], it["state"]) for it in items) == [("comment", "draft"), ("label", "draft")], items
+    non_gets = [r for r in fake.requests if r[0] != "GET"]
+    assert non_gets == [], non_gets
+
+result = {"ok": True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_jira_comment_transition_label_recovery_and_landing_slots(self):
+        result = self.run_child(r"""
+db.migrate()
+sample_root = paths.STATE_DIR / "sample"
+replay.sample(sample_root)
+sample = sample_root / "repo"
+paths.CONFIG_FILE.write_text(
+    '[jira]\n'
+    'base_url = "https://jira.example.test"\n'
+    'email = "owner@example.test"\n'
+    '[jira.transitions]\n'
+    'running = "In Progress"\n'
+    'pr = "In Review"\n'
+    '[jira.landed]\n'
+    'staging = "QA"\n'
+    'production = "Done"\n'
+    '[[repo]]\n'
+    f'name = "{replay.SAMPLE_REPO}"\n'
+    f'path = {json.dumps(str(sample))}\n'
+    'tracker = "jira"\n'
+    'project = "APP"\n'
+    'github = "acme/sample"\n',
+    encoding="utf-8",
+)
+os.environ["JIRA_API_TOKEN"] = "tok-jira-test"
+fake = FakeJiraOpener()
+fake.seed("APP-10", status="To Do", labels=["agent"])
+fake.seed("APP-11", status="To Do", labels=["agent"])
+fake.seed("APP-12", status="In Review", labels=["agent"])
+fake.seed("APP-13", status="To Do", labels=["agent"])
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+
+with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
+    tk = tracker.JiraTracker(repo, cfg.jira)
+
+    # 1. Comment stored then POST answers 502 (case A) and TimeoutError (case B):
+    # after sender runs twice -> 1 comment on issue, delivery_attempts = ["unknown", "found"], sent_ref = comment id.
+    for key, fault in (("APP-10", http_502), ("APP-11", TimeoutError("timed out"))):
+        fake.queue_fault(("comment_post", key), fault)
+        tk.comment(key, f"Update for {key}")
+        outbox.send_due(now=util.now() + timedelta(seconds=5))
+        outbox.send_due(now=util.now() + timedelta(minutes=10))
+        items = [it for it in outbox.list_items() if it["object"] == f"jira:{key}" and it["kind"] == "comment"]
+        assert len(items) == 1, items
+        detail = outbox.get(items[0]["id"])
+        assert detail["item"]["state"] == "sent", detail
+        assert [a["outcome"] for a in detail["attempts"]] == ["unknown", "found"], detail["attempts"]
+        assert len(fake.comments[key]) == 1, fake.comments[key]
+        assert detail["item"]["sent_ref"] == fake.comments[key][0]["id"]
+
+    # 2. Transition applied then POST answers 502 -> ends sent with outcome found, 1 transition POST, no tracker: line in run.log.
+    rid = record.start("pipeline", repo=repo.name, issue="APP-12")
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    run_obj = pipeline.Run(rid, repo, rdir, tracker=tk, tid="APP-12")
+    fake.queue_fault(("transition_post", "APP-12"), http_502)
+    run_obj.enter("running")
+    outbox.send_due(now=util.now() + timedelta(seconds=120))
+    outbox.send_due(now=util.now() + timedelta(minutes=10))
+    t_items = [it for it in outbox.list_items() if it["object"] == "jira:APP-12" and it["kind"] == "transition"]
+    assert len(t_items) == 1, t_items
+    t_detail = outbox.get(t_items[0]["id"])
+    assert t_detail["item"]["state"] == "sent", t_detail
+    assert [a["outcome"] for a in t_detail["attempts"]] == ["unknown", "found"], t_detail["attempts"]
+    trans_posts = [r for r in fake.requests if r[0] == "POST" and r[1] == "/rest/api/2/issue/APP-12/transitions"]
+    assert len(trans_posts) == 1, trans_posts
+    run_log = (rdir / "run.log").read_text() if (rdir / "run.log").exists() else ""
+    assert "tracker:" not in run_log, run_log
+
+    # 3. Landing slots: two merged rows on the same PR set draft 1 landing comment + 1 move per branch reached;
+    # older row carried by newer merged row drafts none.
+    pr1 = "https://github.com/acme/sample/pull/1"
+    pr2 = "https://github.com/acme/sample/pull/2"
+    r_old = record.start("pipeline", repo=repo.name, issue="APP-12")
+    record.note(r_old, pr_url=pr1)
+    with db.tx() as c:
+        run_store.settle(r_old, {"status": "merged", "finished": "2026-11-28T01:00:00Z"})
+    r_a = record.start("pipeline", repo=repo.name, issue="APP-12")
+    record.note(r_a, pr_url=f"{pr1} {pr2}")
+    with db.tx() as c:
+        run_store.settle(r_a, {"status": "merged", "finished": "2026-11-28T02:00:00Z"})
+    r_b = record.start("pipeline", repo=repo.name, issue="APP-12")
+    record.note(r_b, pr_url=f"{pr2} {pr1}")
+    with db.tx() as c:
+        run_store.settle(r_b, {"status": "merged", "finished": "2026-11-28T03:00:00Z"})
+
+    with mock.patch.object(outcomes, "furthest_branch", return_value="staging"), \
+         mock.patch.object(outcomes, "uat_steps", return_value="1. Verify on staging."), \
+         mock.patch.object(tracker, "for_repo", return_value=tk):
+        outcomes.sync_landings(cfg)
+    landing_items = [it for it in outbox.list_items() if (it.get("slot") or "").startswith("landing:")]
+    assert sorted(it["kind"] for it in landing_items) == ["comment", "transition"], landing_items
+    assert len(landing_items) == 2, landing_items
+
+    # 4. Jira label edit answered 502 twice delivers on later pass; state label matches runs.status;
+    # newer state label item discards older unsent one.
+    r_lbl = record.start("pipeline", repo=repo.name, issue="APP-13")
+    record.move(r_lbl, "pr", ("running",))
+    tk.label("APP-13", add=["running"], remove=["pr"], family="state", run_id=r_lbl)
+    tk.label("APP-13", add=["pr"], remove=["running"], family="state", run_id=r_lbl)
+    lbl_items = [it for it in outbox.list_items() if it["object"] == "jira:APP-13" and it["kind"] == "label"]
+    assert [it["state"] for it in lbl_items] == ["discarded", "approved"], lbl_items
+    fake.queue_fault(("label_put", "APP-13"), http_502)
+    fake.queue_fault(("label_put", "APP-13"), http_502)
+    outbox.send_due(now=util.now() + timedelta(seconds=120))
+    outbox.send_due(now=util.now() + timedelta(minutes=5))
+    outbox.send_due(now=util.now() + timedelta(minutes=30))
+    latest_lbl = outbox.get(lbl_items[1]["id"])
+    assert latest_lbl["item"]["state"] == "sent", latest_lbl
+    assert tk.label_name("pr") in fake.issues["APP-13"]["fields"]["labels"], fake.issues["APP-13"]["fields"]["labels"]
+    assert tk.label_name("running") not in fake.issues["APP-13"]["fields"]["labels"]
+    assert tk.label_name(run_store.run_get(r_lbl)["status"]) in fake.issues["APP-13"]["fields"]["labels"]
+
+result = {"ok": True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class OutboxPrPushLoopAndContractTests(_OutboxCompleteChildCase):
+    def test_pr_push_source_scan_pr_recovery_logical_identity_and_email_refusal(self):
+        result = self.run_child(r"""
+import arete
+
+# 1. Source scan: no gh PR writes or git push arg lists outside sender modules + replay.py + post-outbox protocol modules.
+pkg = Path(arete.__file__).parent
+ALLOWED_PR_FILES = {"gh.py", "send_github.py", "release_promotion.py"}
+ALLOWED_PUSH_FILES = {"send_push.py", "replay.py", "release_promotion.py", "pr_recovery.py", "zte_github.py"}
+bad_pr, bad_push = [], []
+for path in sorted(pkg.rglob("*.py")):
+    rel = path.relative_to(pkg).as_posix()
+    tree = ast.parse(path.read_text(), filename=rel)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("pr_create", "pr_edit_body", "pr_set_draft", "pr_merge_auto"):
+                if rel not in ALLOWED_PR_FILES:
+                    bad_pr.append([rel, node.lineno, node.func.attr])
+        if isinstance(node, ast.List) and node.elts:
+            first = node.elts[0]
+            if isinstance(first, ast.Constant) and first.value == "push":
+                if rel not in ALLOWED_PUSH_FILES:
+                    bad_push.append([rel, node.lineno, ast.unparse(node)[:60]])
+assert bad_pr == [], bad_pr
+assert bad_push == [], bad_push
+
+# 2. Backfill migration (m0051) + contract (m0052) strip workdir/file/env from copied push & pr rows.
+db.migrate(through=49)
+sample_root = paths.STATE_DIR / "sample"
+replay.sample(sample_root)
+sample = sample_root / "repo"
+util.git(["checkout", "-q", "-b", "arete/legacy-branch"], sample)
+(sample / "notes.txt").write_text("legacy change\n", encoding="utf-8")
+util.git(["-c", "user.name=Test", "-c", "user.email=t@test", "-c", "commit.gpgSign=false", "commit", "-qam", "legacy"], sample)
+util.git(["checkout", "-q", "main"], sample)
+
+with db.tx() as c:
+    c.execute("INSERT INTO runs (id, kind, repo, status, started) VALUES ('r-leg', 'loop', 'sample', 'done', '2026-11-28T00:00:00Z')")
+    c.execute(
+        "INSERT INTO approvals (loop, run_id, emit, summary, status, result, created, decided) VALUES (?,?,?,?,?,?,?,?)",
+        ("demo", "r-leg", json.dumps({
+            "type": "push",
+            "item": {"repo": replay.SAMPLE_REPO, "workdir": str(sample), "branch": "arete/legacy-branch",
+                     "base": "main", "check": "true", "env": {"ARETE_RUN": "r-leg"}, "file": "notes.txt"},
+        }), "Legacy push", "pending", "", "2026-11-28T00:01:00Z", ""),
+    )
+    c.execute(
+        "INSERT INTO approvals (loop, run_id, emit, summary, status, result, created, decided) VALUES (?,?,?,?,?,?,?,?)",
+        ("demo", "r-leg", json.dumps({
+            "type": "pr",
+            "item": {"repo": "acme/sample", "name": replay.SAMPLE_REPO, "workdir": str(sample),
+                     "branch": "arete/legacy-branch", "base": "main", "title": "Legacy PR", "body": "Body",
+                     "env": {"X": "1"}, "file": "notes.txt"},
+        }), "Legacy PR", "done", "https://github.com/acme/sample/pull/99", "2026-11-28T00:02:00Z", "2026-11-28T00:03:00Z"),
+    )
+db.migrate()
+
+with db.reader() as c:
+    rev_rows = c.execute(
+        "SELECT o.id, o.kind, r.body FROM outbox o JOIN outbox_revisions r ON r.item = o.id WHERE o.kind IN ('push', 'pr')"
+    ).fetchall()
+assert len(rev_rows) >= 2, rev_rows
+for row in rev_rows:
+    parsed = json.loads(row["body"])
+    for forbidden in ("workdir", "file", "env"):
+        assert forbidden not in parsed, (row["id"], row["kind"], forbidden, parsed)
+
+# 3. Fake gh creates PR then exits with connection reset -> pr item ends sent by found with PR URL, fake holds 1 PR.
+fake_gh = FakeGhPrs()
+fake_gh.faults["pr_create"] = [gh.GhUnsure("connection reset")]
+pr_id = outbox.draft(
+    target="github",
+    kind="pr",
+    object="github:acme/sample",
+    body=json.dumps({
+        "action": "create", "repo": "acme/sample", "name": replay.SAMPLE_REPO,
+        "base": "main", "branch": "arete/reset-pr", "title": "Reset PR", "body": "PR body",
+    }),
+    drafted_by="run:r-pr",
+    slot="test:pr-reset",
+)
+with mock.patch.object(gh, "gh", side_effect=fake_gh.handle):
+    outbox.send_due(now=util.now() + timedelta(seconds=120))
+    outbox.send_due(now=util.now() + timedelta(minutes=10))
+pr_detail = outbox.get(pr_id)
+assert pr_detail["item"]["state"] == "sent", pr_detail
+assert [a["outcome"] for a in pr_detail["attempts"]] == ["unknown", "found"], pr_detail["attempts"]
+assert pr_detail["item"]["sent_url"] == "https://github.com/acme/sample/pull/1"
+assert len(fake_gh.prs) == 1
+
+# 4. Email item fails with "no email connector".
+email_id = outbox.draft(
+    target="email",
+    kind="email",
+    object="email:owner@example.test",
+    body="Hello",
+    drafted_by="arete",
+    slot="test:email-refusal",
+    approved_by="owner",
+)
+outbox.send_due(now=util.now() + timedelta(minutes=5))
+email_detail = outbox.get(email_id)
+assert email_detail["item"]["state"] == "failed", email_detail
+assert email_detail["item"]["error"] == "no email connector", email_detail
+
+result = {"ok": True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_push_sigkill_recovery_verdicts_relocation_and_secret_scan(self):
+        result = self.run_child(r"""
+db.migrate()
+sample_root = paths.STATE_DIR / "sample"
+replay.sample(sample_root)
+clone_a = sample_root / "repo"
+origin_git = sample_root / "origin.git"
+assert origin_git.is_dir()
+
+# Create commit on clone A for SIGKILL test.
+base_sha = util.git(["rev-parse", "HEAD"], clone_a).strip()
+util.git(["checkout", "-q", "-b", "arete/sigkill-push"], clone_a)
+(clone_a / "notes.txt").write_text("sigkill-commit\n", encoding="utf-8")
+util.git(["-c", "user.name=Test", "-c", "user.email=t@test", "-c", "commit.gpgSign=false", "commit", "-qam", "sigkill commit"], clone_a)
+head_sigkill = util.git(["rev-parse", "HEAD"], clone_a).strip()
+util.git(["checkout", "-q", "main"], clone_a)
+
+paths.CONFIG_FILE.write_text(
+    '[[repo]]\n'
+    f'name = "{replay.SAMPLE_REPO}"\n'
+    f'path = {json.dumps(str(clone_a))}\n'
+    'github = "acme/sample"\n',
+    encoding="utf-8",
+)
+
+# 1. Push item approved + verdict recorded; sender child SIGKILLs itself right after git push returns.
+run_push = record.start("loop", loop="fixer", repo=replay.SAMPLE_REPO)
+insights_store.add_verdict(run_push, "push", replay.SAMPLE_REPO, "sigkill push", {}, "held", outcome="waiting")
+push_id = outbox.draft(
+    target="git",
+    kind="push",
+    object=f"git:{replay.SAMPLE_REPO}",
+    body=json.dumps({
+        "mode": "land", "repo": replay.SAMPLE_REPO, "base": "main",
+        "branch": "arete/sigkill-push", "start": base_sha, "head": head_sigkill,
+        "check": "true", "require_check": True,
+    }),
+    drafted_by="loop:fixer",
+    slot="test:sigkill-push",
+    run_id=run_push,
+    loop="fixer",
+    hold_as_draft=True,
+)
+with db.tx() as c:
+    c.execute("UPDATE verdicts SET approval = ? WHERE run_id = ?", (push_id, run_push))
+outbox.approve(push_id, approved_by="owner")
+
+# Spawn child that installs SIGKILL in send_push._after_push_hook and runs outbox.send_due().
+killer_code = (
+    "import os, signal\n"
+    "from datetime import timedelta\n"
+    "from arete import outbox, send_push, util\n"
+    "def kill_now(item, head):\n"
+    "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    "send_push._after_push_hook = kill_now\n"
+    "outbox.send_due(now=util.now() + timedelta(minutes=5))\n"
+)
+killed = subprocess.run([sys.executable, "-I", "-c", killer_code], env=os.environ.copy(), capture_output=True)
+assert killed.returncode == -signal.SIGKILL, killed.returncode
+
+# Immediately after SIGKILL: item reads sending, board.push_decision does NOT count it approved.
+mid = outbox.get(push_id)
+assert mid["item"]["state"] == "sending", mid
+assert mid["attempts"][-1]["external_id"] == head_sigkill, mid["attempts"]
+with db.reader() as c:
+    v_mid = dict(c.execute("SELECT * FROM verdicts WHERE run_id = ?", (run_push,)).fetchone())
+assert board.push_decision(v_mid) != "approved", board.push_decision(v_mid)
+
+# After restart: sweep + send_due finds external_id on origin/main, marks sent once, verdict now counts approved.
+swept = outbox.sweep(since=util.now() + timedelta(minutes=6))
+assert push_id in swept, swept
+outbox.send_due(now=util.now() + timedelta(minutes=10))
+after = outbox.get(push_id)
+assert after["item"]["state"] == "sent", after
+assert [a["outcome"] for a in after["attempts"]] == ["unknown", "found"], after["attempts"]
+origin_log = util.git(["log", "--format=%s", "main"], origin_git).splitlines()
+assert origin_log.count("sigkill commit") == 1, origin_log
+with db.reader() as c:
+    v_after = dict(c.execute("SELECT * FROM verdicts WHERE run_id = ?", (run_push,)).fetchone())
+assert board.push_decision(v_after) == "approved", board.push_decision(v_after)
+
+# 2. Relocation: push drafted from clone A, clone A deleted, config points to clone B holding head -> lands on origin.
+clone_b = paths.STATE_DIR / "clone-b"
+util.git(["clone", "-q", str(origin_git), str(clone_b)], paths.STATE_DIR)
+util.git(["fetch", "-q", "origin", "main"], clone_a)
+util.git(["reset", "-q", "--hard", "origin/main"], clone_a)
+(clone_a / "notes.txt").write_text("relocated-commit\n", encoding="utf-8")
+util.git(["-c", "user.name=Test", "-c", "user.email=t@test", "-c", "commit.gpgSign=false", "commit", "-qam", "relocated commit"], clone_a)
+head_reloc = util.git(["rev-parse", "HEAD"], clone_a).strip()
+util.git(["fetch", "-q", str(clone_a), head_reloc], clone_b)
+shutil.rmtree(clone_a)
+
+paths.CONFIG_FILE.write_text(
+    '[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
+    '[[repo]]\n'
+    f'name = "{replay.SAMPLE_REPO}"\n'
+    f'path = {json.dumps(str(clone_b))}\n'
+    'github = "acme/sample"\n',
+    encoding="utf-8",
+)
+reloc_id = outbox.draft(
+    target="git",
+    kind="push",
+    object=f"git:{replay.SAMPLE_REPO}",
+    body=json.dumps({
+        "mode": "land", "repo": replay.SAMPLE_REPO, "base": "main",
+        "start": head_sigkill, "head": head_reloc, "check": "true", "require_check": True,
+    }),
+    drafted_by="loop:fixer",
+    slot="test:reloc-push",
+    approved_by="owner",
+)
+outbox.send_due(now=util.now() + timedelta(minutes=15))
+assert outbox.get(reloc_id)["item"]["state"] == "sent", outbox.get(reloc_id)
+assert "relocated commit" in util.git(["log", "--format=%s", "main"], origin_git).splitlines()
+
+# Missing head sha on clone B -> failed naming sha and repo.
+missing_sha = "deadbeef" * 5
+miss_id = outbox.draft(
+    target="git",
+    kind="push",
+    object=f"git:{replay.SAMPLE_REPO}",
+    body=json.dumps({
+        "mode": "land", "repo": replay.SAMPLE_REPO, "base": "main",
+        "head": missing_sha, "check": "true", "require_check": True,
+    }),
+    drafted_by="loop:fixer",
+    slot="test:missing-sha",
+    approved_by="owner",
+)
+outbox.send_due(now=util.now() + timedelta(minutes=20))
+miss_detail = outbox.get(miss_id)
+assert miss_detail["item"]["state"] == "failed", miss_detail
+assert missing_sha in (miss_detail["item"]["error"] or ""), miss_detail["item"]["error"]
+assert replay.SAMPLE_REPO in (miss_detail["item"]["error"] or ""), miss_detail["item"]["error"]
+
+# 3. Secret scan: diff holding a secret registry value fails naming the secret, value appears nowhere, origin unchanged.
+origin_tip_before = util.git(["rev-parse", "main"], origin_git).strip()
+secret_val = "sk_live_SUPERSECRET_OUTBOX_998877665544"
+owner = principals.owner()
+secretstore.put("global", "OUTBOX_TEST_SECRET", secret_val, "api_key", owner)
+
+(clone_b / "notes.txt").write_text(f"leaked={secret_val}\n", encoding="utf-8")
+util.git(["-c", "user.name=Test", "-c", "user.email=t@test", "-c", "commit.gpgSign=false", "commit", "-qam", "secret commit"], clone_b)
+head_secret = util.git(["rev-parse", "HEAD"], clone_b).strip()
+sec_id = outbox.draft(
+    target="git",
+    kind="push",
+    object=f"git:{replay.SAMPLE_REPO}",
+    body=json.dumps({
+        "mode": "land", "repo": replay.SAMPLE_REPO, "base": "main",
+        "start": origin_tip_before, "head": head_secret, "check": "true", "require_check": True,
+    }),
+    drafted_by="loop:fixer",
+    slot="test:secret-push",
+    approved_by="owner",
+)
+outbox.send_due(now=util.now() + timedelta(minutes=25))
+sec_detail = outbox.get(sec_id)
+assert sec_detail["item"]["state"] == "failed", sec_detail
+assert "global/OUTBOX_TEST_SECRET" in (sec_detail["item"]["error"] or ""), sec_detail["item"]["error"]
+assert secret_val not in json.dumps(sec_detail)
+with db.reader() as c:
+    for tbl in ("outbox", "outbox_revisions", "delivery_attempts", "events_log"):
+        rows_txt = json.dumps([dict(r) for r in c.execute(f"SELECT * FROM {tbl}").fetchall()])
+        assert secret_val not in rows_txt, tbl
+assert util.git(["rev-parse", "main"], origin_git).strip() == origin_tip_before
+
+result = {"ok": True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_loop_emit_crash_recovery_pr_on_run_and_approvals_view_contract(self):
+        result = self.run_child(r"""
+db.migrate()
+sample_root = paths.STATE_DIR / "sample"
+replay.sample(sample_root)
+sample = sample_root / "repo"
+loops_dir = paths.CONFIG_DIR / "loops"
+for lname, body in (
+    ("producer", 'name = "producer"\nkind = "watch"\nenabled = true\n[trigger]\nkind = "manual"\n[[emit]]\ntype = "loop"\nloop = "consumer"\n'),
+    ("consumer", 'name = "consumer"\nkind = "command"\nenabled = true\n[trigger]\nevent = ["finding"]\n[run]\ncommand = "true"\n'),
+):
+    ldir = loops_dir / lname
+    ldir.mkdir(parents=True, exist_ok=True)
+    (ldir / "loop.toml").write_text(body, encoding="utf-8")
+    if lname == "producer":
+        (ldir / "prompt.md").write_text("Watch for issues.\n", encoding="utf-8")
+paths.CONFIG_FILE.write_text(
+    f'[serve]\nloop_dirs = [{json.dumps(str(loops_dir))}]\n'
+    '[[repo]]\n'
+    f'name = "{replay.SAMPLE_REPO}"\n'
+    f'path = {json.dumps(str(sample))}\n'
+    'github = "acme/sample"\n',
+    encoding="utf-8",
+)
+cfg = config.load()
+prod_loop = loops.find("producer", cfg)
+
+# 1. Loop emit drafted in record_finding tx; process killed before sender runs -> after restart, 1 queued event; second pass adds none.
+r_loop = record.start("loop", loop="producer", loop_kind="watch", trigger="manual")
+finding = {"title": "Alert consumer", "summary": "Something happened", "fingerprint": "fp-loop-1", "repo": replay.SAMPLE_REPO}
+fake_run = SimpleNamespace(loop=prod_loop, cfg=cfg, id=r_loop, trial=False, log=lambda *a: None)
+loop_run.new_findings(fake_run, [finding])
+with db.reader() as c:
+    q_before = c.execute("SELECT * FROM queue WHERE loop = 'consumer'").fetchall()
+assert q_before == [], q_before
+outbox.send_due(now=util.now() + timedelta(minutes=5))
+outbox.send_due(now=util.now() + timedelta(minutes=10))
+with db.reader() as c:
+    q_after = c.execute("SELECT * FROM queue WHERE loop = 'consumer'").fetchall()
+assert len(q_after) == 1, q_after
+
+# 2. PR on the run: stopped, failed in publish, crashed with GhError from automerge, SIGKILLed + record.interrupt,
+# and restart taking stored pr outcome all preserve runs.pr_url and report.prs!
+fake_gh = FakeGhPrs()
+with mock.patch.object(gh, "gh", side_effect=fake_gh.handle):
+    urls_by_case = {}
+    for case in ("stopped", "failed_publish", "automerge_crash", "sigkilled"):
+        rid = record.start("pipeline", repo=replay.SAMPLE_REPO, issue=case)
+        rdir = paths.RUNS_DIR / rid
+        rdir.mkdir(parents=True, exist_ok=True)
+        res = outbox.publish_pr(
+            action="create",
+            repo="acme/sample",
+            name=replay.SAMPLE_REPO,
+            base="main",
+            branch=f"arete/{case}",
+            title=f"PR {case}",
+            body="Body",
+            run_id=rid,
+        )
+        pr_url = res["sent_url"]
+        urls_by_case[case] = pr_url
+        assert run_store.run_get(rid)["pr_url"] == pr_url
+        run_obj = pipeline.Run(rid, cfg.repo(replay.SAMPLE_REPO), rdir, tracker=tracker.LocalTracker(cfg.repo(replay.SAMPLE_REPO)), tid=case)
+        if case == "stopped":
+            pipeline.settle_run(run_obj, "stopped", "stopped by owner", "", False, None, echo_end=False)
+        elif case == "failed_publish":
+            pipeline.settle_run(run_obj, "failed", "publish failed", "", False, None, echo_end=False)
+        elif case == "automerge_crash":
+            fake_gh.faults["pr_merge"] = [gh.GhError("automerge 500")]
+            try:
+                outbox.publish_pr_merge(repo="acme/sample", number=gh.pr_number(pr_url), head="h", base="main", base_sha="b", run_id=rid)
+            except gh.GhError:
+                pass
+            pipeline.settle_run(run_obj, "failed", "crashed in automerge", "", False, None, echo_end=False)
+        elif case == "sigkilled":
+            record.interrupt(run_store.run_get(rid))
+            pipeline.write_report(run_store.run_get(rid), None, run_obj)
+        from arete import run_lines
+
+        row = run_store.run_get(rid)
+        assert row["pr_url"] == pr_url, (case, row)
+        report = next(line for line in reversed(run_lines.read(rid)) if line.get("event") == "report")
+        assert pr_url in report["prs"], (case, report)
+
+    # Restart taking stored pr outcome copies the chain's sent PR onto its own row.
+    r_child = record.start("pipeline", repo=replay.SAMPLE_REPO, issue="stored-pr")
+    rdir_c = paths.RUNS_DIR / r_child
+    rdir_c.mkdir(parents=True, exist_ok=True)
+    run_c = pipeline.Run(r_child, cfg.repo(replay.SAMPLE_REPO), rdir_c, tracker=tracker.LocalTracker(cfg.repo(replay.SAMPLE_REPO)), tid="stored-pr")
+    co = workspace.Checkout("", "acme/sample", sample, sample, "main")
+    job = flows.Job(cfg, run_c, sample)
+    job.branch = "arete/stopped"
+    job.checkouts = [co]
+    job.built = pipeline.Build(cfg=cfg, run=run_c, ticket=tracker.Ticket("stored-pr", "#1", "Stored"),
+                               ws=sample, checkouts=[co], layer=config.RepoLayer(dir=sample),
+                               timeout=0, workspace="sample", tools=[], deny=[])
+    stored_url = urls_by_case["stopped"]
+    job.take("pr", factory.Outcome("pass", data={
+        "prs": {"acme/sample": stored_url}, "opened": [], "pushed": ["acme/sample"], "changed": ["acme/sample"],
+        "draft_why": "", "report_body": "", "summary": "stored", "committed_lines": 1,
+    }), stored=True)
+    assert run_store.run_get(r_child)["pr_url"] == stored_url
+
+# 3. After contract migration (m0051): approvals is a VIEW; CREATE TABLE IF NOT EXISTS approvals + add_approval INSERT
+# lands in outbox with legacy_approval set, and /api/approvals/{id} resolves it through inbox.resolve.
+with db.reader() as c:
+    assert approvals_store.is_view(c) is True
+with db.tx() as c:
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS approvals ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, loop TEXT NOT NULL, run_id TEXT NOT NULL, "
+        "emit TEXT NOT NULL, summary TEXT NOT NULL, plain_summary TEXT NOT NULL DEFAULT '', "
+        "review TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', "
+        "result TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, decided TEXT NOT NULL DEFAULT '', "
+        "claimed_by TEXT NOT NULL DEFAULT '', claim_until TEXT NOT NULL DEFAULT '')"
+    )
+aid = approvals_store.add_approval("demo", "", {"type": "push", "item": {"repo": replay.SAMPLE_REPO}}, "View test push")
+with db.reader() as c:
+    ob_row = outbox_store.get_by_legacy_approval(c, aid)
+assert ob_row is not None and ob_row["legacy_approval"] == aid, ob_row
+inbox.sync_all()
+inbox_item = inbox_store.get_open_by_subject(f"approval:{aid}")
+assert inbox_item is not None
+resolved = inbox.resolve(inbox_item["id"], base_version=inbox_item["version"], verb="reject", allow_legacy_auth=True)
+assert resolved["item"]["resolution"] == "rejected"
+assert approvals_store.approval(aid)["status"] == "rejected"
+
+# 4. Schema ledger gate blocks contract migration (m0051) while a live process has schema_version < 51.
+with db.tx() as c:
+    c.execute(
+        "INSERT OR REPLACE INTO runs (id, kind, repo, status, started, pid, schema_version) "
+        "VALUES ('live-old', 'pipeline', 'sample', 'running', '2026-11-28T00:00:00Z', ?, 48)",
+        (os.getpid(),),
+    )
+    blockers = db.contract_blockers(c, db.OUTBOX_CONTRACT_SCHEMA)
+assert blockers, "expected live schema_version=48 process to block m0051 contract"
+
+result = {"ok": True}
+""")
+        self.assertTrue(result["ok"])

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import gh
+from . import gh, outbound
+
+_PRIOR_OUTBOX_MARK_RE = re.compile(r"\n*<!-- arete:[^\s>]+ --> <!-- arete:[^\s>]+:ob-\d+ -->\s*")
 
 
 @dataclass(frozen=True)
@@ -43,9 +46,12 @@ def _ensure_builtins() -> None:
     if _BUILTINS_LOADED:
         return
     _BUILTINS_LOADED = True
-    from . import send_github
+    from . import send_github, send_jira, send_loop, send_push
 
     send_github.register_all()
+    send_jira.register_all()
+    send_push.register_all()
+    send_loop.register_all()
 
 
 def marks_for(marker: str) -> str:
@@ -56,9 +62,15 @@ def marks_for(marker: str) -> str:
 
 
 def rendered_github_body(body: str, marker: str) -> str:
-    screened = str(gh.outgoing(body)).rstrip()
+    cleaned = _PRIOR_OUTBOX_MARK_RE.sub("\n\n", body).strip()
+    screened = str(gh.outgoing(cleaned)).rstrip()
     marks = marks_for(marker)
     return f"{screened}\n\n{marks}" if screened else marks
+
+
+def rendered_jira_body(body: str, marker: str) -> str:
+    screened = outbound.screen(body).rstrip()
+    return f"{screened}\n\n{marker}" if screened else marker
 
 
 def known_connectors() -> frozenset[str]:

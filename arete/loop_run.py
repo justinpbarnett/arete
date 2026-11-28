@@ -43,7 +43,6 @@ from . import (
 )
 from .agent import Cut, Result
 from .loops import Loop
-from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import insights as insights_store
 from .store import loops as loop_store
@@ -720,6 +719,19 @@ def _prepare_ticket_drafts(run: LoopRun, finding: dict, trust: str) -> list[tupl
     return prepared
 
 
+def _prepare_loop_drafts(run: LoopRun, finding: dict, trust: str) -> list[tuple[int, dict, str]]:
+    loop_emit = delivery.EMITS["loop"]
+    outcome = {"trust": trust}
+    prepared: list[tuple[int, dict, str]] = []
+    for idx, spec in enumerate(run.loop.emits):
+        if spec.get("type") != "loop":
+            continue
+        rendered = loop_emit.render(run.loop, run.id, spec, [finding], outcome)
+        held_reason = loop_emit.held(spec, rendered, run.cfg)
+        prepared.append((idx, rendered, held_reason))
+    return prepared
+
+
 def new_findings(run: LoopRun, found: list[dict], *, trust: str | None = None) -> list[dict]:
     from . import mergecheck, outbox
 
@@ -732,16 +744,22 @@ def new_findings(run: LoopRun, found: list[dict], *, trust: str | None = None) -
         spec.get("type") == "ticket" and spec.get("tracker", "github") == "github"
         for spec in run.loop.emits
     )
+    has_loop_emit = any(spec.get("type") == "loop" for spec in run.loop.emits)
     prepared_by_finding: dict[int, list[tuple[int, str, dict, str]]] = {}
-    if not run.trial and has_gh_ticket:
+    loop_drafts_by_finding: dict[int, list[tuple[int, dict, str]]] = {}
+    if not run.trial and (has_gh_ticket or has_loop_emit):
         for f in found:
             if twins.get(id(f)):
                 continue
             if loop_store.finding_settled(run.loop.name, f["fingerprint_key"]):
                 continue
-            prepared_by_finding[id(f)] = _prepare_ticket_drafts(run, f, resolved_trust)
+            if has_gh_ticket:
+                prepared_by_finding[id(f)] = _prepare_ticket_drafts(run, f, resolved_trust)
+            if has_loop_emit:
+                loop_drafts_by_finding[id(f)] = _prepare_loop_drafts(run, f, resolved_trust)
 
     ticket_emit = delivery.EMITS["ticket"]
+    loop_emit = delivery.EMITS["loop"]
     for f in found:
         if twin := twins.get(id(f)):
             if run.trial:
@@ -755,6 +773,7 @@ def new_findings(run: LoopRun, found: list[dict], *, trust: str | None = None) -
             is_new = mergecheck.builtin(run.loop) or not loop_store.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
             prepared = prepared_by_finding.get(id(f), [])
+            loop_prepared = loop_drafts_by_finding.get(id(f), [])
             with foundation.tx() as c:
                 is_new = loop_store.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
                                                    outbound.plain(f.get("title"), 200), "", run.id)
@@ -788,6 +807,35 @@ def new_findings(run: LoopRun, found: list[dict], *, trust: str | None = None) -
                             run.log("emit", f"drafted OB-{item_id} ({held_reason}): {ticket_emit.describe(rendered)}")
                         else:
                             run.log("emit", f"drafted OB-{item_id}: {ticket_emit.describe(rendered)}")
+                if is_new and loop_prepared:
+                    for spec_idx, rendered, held_reason in loop_prepared:
+                        slot_sha = hashlib.sha256(
+                            json.dumps([run.loop.name, f["fingerprint_key"], spec_idx]).encode()
+                        ).hexdigest()[:24]
+                        loop_payload = {
+                            "loop": rendered["loop"],
+                            "from_loop": run.loop.name,
+                            "event": rendered["event"],
+                        }
+                        item_id = outbox.draft(
+                            c,
+                            target="loop",
+                            kind="loop",
+                            object=f"loop:{rendered['loop']}",
+                            body=json.dumps(loop_payload),
+                            drafted_by=f"loop:{run.loop.name}",
+                            slot=f"loop:{slot_sha}",
+                            run_id=run.id,
+                            loop=run.loop.name,
+                            summary=loop_emit.describe(rendered),
+                            review=held_reason,
+                            hold_as_draft=bool(held_reason),
+                            on_conflict_ignore=True,
+                        )
+                        if held_reason:
+                            run.log("emit", f"drafted OB-{item_id} ({held_reason}): {loop_emit.describe(rendered)}")
+                        else:
+                            run.log("emit", f"drafted OB-{item_id}: {loop_emit.describe(rendered)}")
         run.log("finding", f"{'new' if is_new else 'seen before'}: {outbound.plain(f.get('title'), 200)}")
         if is_new:
             fresh.append(f)
@@ -1154,9 +1202,27 @@ def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[s
 
 
 def waiting_fixes(run: LoopRun) -> list[tuple[str, str]]:
-    return [(f"waiting for approval #{a['id']}", a["emit"]["item"]["patch"]) for a in approvals_store.approvals()
-            if a["loop"] == run.loop.name and a["status"] == "pending" and a["emit"].get("type") == "push"
-            and a["emit"].get("item", {}).get("patch")]
+    from .store import outbox as outbox_store
+
+    found: list[tuple[str, str]] = []
+    with foundation.reader() as c:
+        if outbox_store.available(c):
+            for row in c.execute(
+                "SELECT id, rev FROM outbox WHERE loop = ? AND kind = 'push' AND state IN ('draft', 'edited', 'approved', 'held') "
+                "ORDER BY id DESC LIMIT 100",
+                (run.loop.name,),
+            ).fetchall():
+                rev = outbox_store.latest_revision(c, int(row["id"]), int(row["rev"]))
+                if rev is None:
+                    continue
+                try:
+                    parsed = json.loads(rev["body"])
+                except ValueError:
+                    continue
+                item = parsed.get("item") if isinstance(parsed, dict) and isinstance(parsed.get("item"), dict) else parsed
+                if isinstance(item, dict) and item.get("patch"):
+                    found.append((f"waiting for outbox OB-{row['id']}", str(item["patch"])))
+    return found
 
 
 def already_fixed(run: LoopRun, ws: Workspace) -> str:

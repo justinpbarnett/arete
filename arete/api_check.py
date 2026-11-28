@@ -442,7 +442,7 @@ class Check:
 
     def shapes(self):
         from . import (
-            agent, cohorts, contract, control, dashboard, devices, heartbeat, leases, oncall, outbox, paths,
+            agent, cohorts, config, contract, control, dashboard, devices, heartbeat, leases, oncall, outbox, paths,
             pipeline, principals, private_evidence, record, replay, research, secretstore, triage,
         )
         from . import tasks as tasks_mod
@@ -511,6 +511,18 @@ class Check:
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
+        sample_cfg = config.load()
+        sample_repo = sample_cfg.repo(replay.SAMPLE_REPO)
+        send_src = triage.GitHubSource(sample_repo.github or f"owner/{sample_repo.name}", [sample_repo])
+        send_ticket = triage.Candidate(f"{sample_repo.name}#9", "9", "Fixture send ticket", "https://example.invalid/9", "old")
+        triage_store.triage_put({
+            **triage.row(send_src, send_ticket, updated="old"),
+            "repo": sample_repo.name,
+            "repos": [sample_repo.name],
+            "ready": True,
+            "code": 1,
+            "questions": [],
+        })
         insights.research_set(ticket.ref, status="done", title="Fixture research")
         stopped = record.start("loop", pid=0)
         session = record.start("session")
@@ -538,7 +550,7 @@ class Check:
                         closes="2099-01-01T00:00:00Z", hours=24)
         identities = {"task": self.task, "run": self.run, "step": str(turn_step["id"]),
                       "node": str(turn_step.get("node") or turn_step["step"]), "try": str(turn_step.get("try") or 1),
-                      "n": "1", "ticket": ticket.ref,
+                      "n": "1", "ticket": send_ticket.ref,
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
@@ -581,6 +593,11 @@ class Check:
                 values["repo"] = replay.SAMPLE_REPO
             if name == "chat.file":
                 values["repo"] = replay.SAMPLE_REPO
+            if name == "triage.send":
+                values["repo"] = sample_repo.name
+                values["base_version"] = int((triage.board_row(send_ticket.ref) or {}).get("version") or 1)
+                values["questions"] = []
+                values["answers"] = []
             if method == "GET":
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
             else:
@@ -592,6 +609,11 @@ class Check:
                     continue
                 if name == "serve.install":
                     with patch.object(dashboard, "install_serve", return_value={"restarting": True}):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "triage.send":
+                    fake_text = triage.TicketText("", "", "", "old", (), send_ticket.title)
+                    with patch.object(triage, "sources", return_value=[send_src]), \
+                            patch.object(triage, "read_send_ticket", return_value=fake_text):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 elif name == "inbox.upload_evidence":
                     import struct

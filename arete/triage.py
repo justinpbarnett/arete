@@ -236,16 +236,48 @@ class JiraSource(Source):
     def route(self, repo: str) -> str:
         return tracker.route_label(self.by_name()[repo]) if repo else ""
 
-    def comment(self, ref: str, text: str, *, return_url=False) -> str | None:
-        if return_url:
-            return self.client.comment(ref, text, return_url=True, single_attempt=True)
-        return self.client.comment(ref, text)
+    def comment(self, ref: str, text: str, *, return_url=False, approved_by: str | None = None, c=None) -> str | None:
+        import secrets
+
+        from . import outbox
+        from .store import outbox as outbox_store
+
+        actor = approved_by or principals.current()
+        item_id = outbox.draft(
+            c,
+            target="jira",
+            kind="comment",
+            object=f"jira:{ref}",
+            body=text,
+            drafted_by=actor,
+            approved_by=approved_by,
+            slot=f"triage:jira:{ref}:comment:{secrets.token_hex(6)}",
+            summary=f"comment on {ref}",
+        )
+        return outbox_store.format_id(item_id) if return_url else None
 
     def find_comment(self, ref: str, marker: str) -> str:
         return self.client.find_comment_marker(ref, marker)
 
-    def approve(self, r: dict) -> None:
-        self.client.edit_labels(r["ref"], labels_to_add(r))
+    def approve(self, r: dict, *, approved_by: str | None = None, c=None) -> int:
+        import secrets
+
+        from . import outbox
+
+        ref = r["ref"]
+        labels = list(dict.fromkeys(labels_to_add(r)))
+        actor = approved_by or ("triage" if r.get("automatic") else principals.current())
+        return outbox.draft(
+            c,
+            target="jira",
+            kind="label",
+            object=f"jira:{ref}",
+            body=json.dumps({"add": labels, "remove": [], "family": ""}),
+            drafted_by=actor,
+            approved_by=approved_by,
+            slot=f"triage:jira:{ref}:approve:{secrets.token_hex(6)}",
+            summary=f"add {' and '.join(labels)} on {ref}",
+        )
 
 
 @dataclass
@@ -748,7 +780,9 @@ def answers_comment(pairs: list[tuple[str, str]]) -> str:
 
 @factory_control.work
 def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str,
-         *, publication=None) -> str:
+         *, publication=None, base_version: int | None = None, return_item: bool = False):
+    from . import contract
+
     with util.lock(BOARD_LOCK, wait=True):
         if publication and publication.pending:
             pending = publication.pending
@@ -762,7 +796,8 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
             repo = src.by_name().get(sent_row["repo"])
             if (not current or current != pending.get("board") or not repo or standing(current) not in SENDABLE
                     or repo.name not in repo_choices(src, current) or src.route(repo.name) != sent_row["route"]):
-                raise NotSendable(f"Triage changed {ref} while the send was pending. Read it again.")
+                raise contract.Problem("version_conflict", f"Triage changed {ref} while the send was pending. Read it again.",
+                                       current=current)
 
             def revalidate(*, posted=False):
                 now = read_send_ticket(src, current)
@@ -777,18 +812,28 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
                 screen_send(cfg, current, repo, sent_row, now)
                 return False
 
-            return send_to_tracker(src, sent_row, pending["comment"], publication, revalidate=revalidate)
+            return send_to_tracker(src, sent_row, pending["comment"], publication, revalidate=revalidate,
+                                   return_item=return_item)
         r = board_row(ref)
         if not r:
             if a := triage_store.triage_approval(ref.strip()):
                 raise NotOnBoard(f"{a['ref']} went to the pipeline {stamp(a['ts'])}, so there is nothing left to send.")
             raise NotOnBoard(f"{ref} is not on the triage board.")
+        if base_version is not None and int(r.get("version") or 1) != int(base_version):
+            raise contract.Problem(
+                "version_conflict",
+                f"Triage row {r['ref']} changed (current version {r.get('version', 1)}).",
+                current=r,
+            )
         if standing(r) not in SENDABLE:
             raise NotSendable(f"{r['ref']} is under {standing(r)}. Only tickets that are ready or have questions go to "
                               "the pipeline from here.")
         if questions != r["questions"]:
-            raise NotSendable(f"Triage asked new questions about {r['ref']} since the page loaded. Read them and send "
-                              "again.")
+            raise contract.Problem(
+                "version_conflict",
+                f"Triage asked new questions about {r['ref']} since the page loaded. Read them and send again.",
+                current=r,
+            )
         if len(answers) != len(questions):
             raise BadAnswers(f"Send one answer for each of the {util.count(len(questions), 'question')}.")
         src = send_source(cfg, r)
@@ -812,7 +857,7 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
         if publication:
             publication.remember({"row": sent_row, "board": r, "target": comment_target(src, sent_row),
                                   "comment": comment, "content": [now.title, now.body]})
-        return send_to_tracker(src, sent_row, comment, publication)
+        return send_to_tracker(src, sent_row, comment, publication, return_item=return_item)
 
 
 def read_send_ticket(src, row):
@@ -849,21 +894,23 @@ def comment_target(src, row):
     return src.client.browse_url(row["ref"]) if isinstance(src, JiraSource) else row["url"]
 
 
-def send_to_tracker(src, row, comment, publication, *, revalidate=None):
+def send_to_tracker(src, row, comment, publication, *, revalidate=None, return_item: bool = False):
+    from . import outbox
+    from .store import outbox as outbox_store
+
     ref = row["ref"]
     labels_list = list(dict.fromkeys(labels_to_add({**row, "automatic": False})))
     labels = " and ".join(labels_list)
     url = row["url"]
-    if isinstance(src, GitHubSource):
-        from . import outbox
+    actor = principals.current()
+    now = util.iso()
+    stamp_key = row.get("updated") or now
+    done = f"posted your answers and added {labels}" if comment else f"added {labels}"
+    result = f"Sent {ref} to the pipeline for {row['repo']}: {done}."
 
-        actor = principals.current()
-        now = util.iso()
+    if isinstance(src, GitHubSource):
         tid = src.tid(ref)
         obj = f"github:{src.key}#{int(tid)}"
-        stamp_key = row.get("updated") or now
-        done = f"posted your answers and added {labels}" if comment else f"added {labels}"
-        result = f"Sent {ref} to the pipeline for {row['repo']}: {done}."
         with foundation.tx() as c:
             if comment:
                 outbox.draft(
@@ -878,7 +925,7 @@ def send_to_tracker(src, row, comment, publication, *, revalidate=None):
                     slot=f"triage:{ref}:{stamp_key}:answers",
                     summary=f"post triage answers on {src.key}#{int(tid)}",
                 )
-            outbox.draft(
+            label_id = outbox.draft(
                 c,
                 target="github",
                 kind="label",
@@ -893,42 +940,45 @@ def send_to_tracker(src, row, comment, publication, *, revalidate=None):
             record_send(row, actor)
             if publication:
                 publication.record(f"triage:{ref}", url, result)
-        return result
-    labels_present = revalidate() if revalidate and not comment else False
-    if comment:
-        try:
-            if publication:
-                url = src.find_comment(ref, publication.marker)
-                if url and revalidate:
-                    labels_present = revalidate(posted=True)
-                if not url:
-                    if revalidate:
-                        revalidate()
-                    publication.begin_send()
-                    url = src.comment(ref, publication.text(comment), return_url=True)
-                if not url:
-                    raise TrackerFailed(f"Could not confirm the URL of the answers posted to {ref}. Try again.")
-            else:
-                src.comment(ref, comment)
-        except tracker.ERRORS as e:
-            raise TrackerFailed(f"Could not post your answers to {ref} ({tracker_said(e)}).") from e
-    try:
-        if not labels_present:
-            if publication and not publication.pending.get("labels_started"):
-                publication.remember({**publication.pending, "labels_started": True})
-            src.approve({**row, "automatic": False})
-    except tracker.ERRORS as e:
+            label_item = outbox_store.decode_on(c, outbox_store.get_row(c, label_id)) if return_item else None
+        return label_item if return_item else result
+
+    obj = f"jira:{ref}"
+    task_id = f"{row['repo']} {ref}" if row.get("repo") else ref
+    with foundation.tx() as c:
         if comment:
-            raise TrackerFailed(f"Posted your answers, but could not add {labels} to {ref} ({tracker_said(e)}). "
-                                "Add them by hand, or the next refresh triages it again with your answers.") from e
-        raise TrackerFailed(f"Could not add {labels} to {ref} ({tracker_said(e)}).") from e
-    done = f"posted your answers and added {labels}" if comment else f"added {labels}"
-    result = f"Sent {ref} to the pipeline for {row['repo']}: {done}."
-    with foundation.tx():
-        record_send(row, principals.current())
+            comment_text = publication.text(comment) if publication else comment
+            outbox.draft(
+                c,
+                target="jira",
+                kind="comment",
+                object=obj,
+                body=comment_text,
+                drafted_by=actor,
+                hold_as_draft=True,
+                slot=f"triage:{ref}:{stamp_key}:answers",
+                task_id=task_id,
+                ref_id=ref,
+                summary=f"post triage answers on {ref}",
+            )
+        label_id = outbox.draft(
+            c,
+            target="jira",
+            kind="label",
+            object=obj,
+            body=json.dumps({"add": labels_list, "remove": [], "family": ""}),
+            drafted_by=actor,
+            hold_as_draft=True,
+            slot=f"triage:{ref}:{stamp_key}:approve",
+            task_id=task_id,
+            ref_id=ref,
+            summary=f"add {labels} on {ref}",
+        )
+        record_send(row, actor)
         if publication:
             publication.record(f"triage:{ref}", url, result)
-    return result
+        label_item = outbox_store.decode_on(c, outbox_store.get_row(c, label_id)) if return_item else None
+    return label_item if return_item else result
 
 
 def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dict[str, dict],

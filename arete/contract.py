@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 22
+MINOR = 23
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -74,7 +74,7 @@ INCIDENT = obj({**dict.fromkeys(("state", "phase", "waiting", "class", "source",
                ["id", "state"])
 TRIAGE = obj({**dict.fromkeys(("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "size", "why",
                              "ts", "kind", "parent"), NULL_TEXT), "ready": JSON, "code": JSON, "closed": JSON,
-              "in_sprint": JSON, "cost": NUMBER,
+              "in_sprint": JSON, "cost": NUMBER, "version": INTEGER,
               **{k: array(STRING) for k in ("questions", "plan", "repos", "assumptions", "checks")}}, ["ref", "title"])
 RESEARCH = obj({**dict.fromkeys(("ref", "source", "title", "url", "updated", "status", "summary", "report", "error",
                                "run_id", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved",
@@ -707,6 +707,13 @@ OPERATIONS += [
               {"item": "OB-1", "base_version": 1}, "POST", errors=("invalid_state",)),
     operation("outbox.history", "outbox/{item}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"item": STRING}), {"item": "OB-1"}),
+    {**operation("triage.send", "triage/{ticket}/send", envelope({"data": OUTBOX_ITEM}),
+                 obj({"ticket": STRING, "base_version": {**INTEGER, "minimum": 1},
+                      "questions": array(STRING), "answers": array(STRING), "repo": STRING},
+                     ["ticket", "base_version", "questions", "answers"]),
+                 {"ticket": "APP-7", "base_version": 1, "questions": [], "answers": [], "repo": "demo"},
+                 "POST", errors=("invalid_state", "validation"), success_status=201),
+     "scope": "task:write"},
 ]
 TURN = obj({
     "step_id": INTEGER,

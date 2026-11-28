@@ -194,8 +194,11 @@ RUNS_CHAT_SCHEMA = 46
 RUN_RETENTION_SCHEMA = 47
 RUNS_PROMPT_BINDING_SCHEMA = 48
 RUNS_ADW_SCHEMA = 49
-STEPS_LIFECYCLE_SCHEMA = 50
-RECORD_TURNS_SCHEMA = 51
+TRIAGE_VERSION_SCHEMA = 50
+OUTBOX_BACKFILL_SCHEMA = 51
+OUTBOX_CONTRACT_SCHEMA = 52
+STEPS_LIFECYCLE_SCHEMA = 53
+RECORD_TURNS_SCHEMA = 54
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -212,6 +215,7 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
                              LOOP_QUEUE_SCHEMA, PRIVATE_EVIDENCE_SCHEMA, OUTBOX_SCHEMA, OUTBOX_APPROVALS_SCHEMA,
                              DEVICES_LEASES_SCHEMA, RUNS_PINS_SCHEMA, RUNS_LINEAGE_SCHEMA, RUNS_CHAT_SCHEMA,
                              RUN_RETENTION_SCHEMA, RUNS_PROMPT_BINDING_SCHEMA, RUNS_ADW_SCHEMA,
+                             TRIAGE_VERSION_SCHEMA, OUTBOX_BACKFILL_SCHEMA,
                              STEPS_LIFECYCLE_SCHEMA, RECORD_TURNS_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
@@ -299,7 +303,7 @@ def contract_blockers(conn, n):
         blockers.extend(workspace_admission_blockers())
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
-    elif n == DEVICES_CONTRACT_SCHEMA:
+    elif n in (DEVICES_CONTRACT_SCHEMA, OUTBOX_CONTRACT_SCHEMA):
         beat = control.database_beat()
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)

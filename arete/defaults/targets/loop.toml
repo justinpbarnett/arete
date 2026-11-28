@@ -1,0 +1,5 @@
+connector = "loop"
+kinds = ["loop"]
+audience = "self"
+posts_as = "arete"
+send_window = 0

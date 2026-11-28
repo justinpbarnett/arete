@@ -1,0 +1,5 @@
+connector = "git"
+kinds = ["push"]
+audience = "self"
+posts_as = "git"
+send_window = 60

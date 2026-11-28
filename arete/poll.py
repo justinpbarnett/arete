@@ -154,6 +154,17 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
                         repo.name,
                     )
                     continue
+            elif isinstance(source, tracker.JiraTracker):
+                from .store import outbox as outbox_store
+
+                if item_id := outbox_store.pending_label_item(f"jira:{t.id}"):
+                    skips.note(
+                        tracker.ticket_name(repo.name, t.ref),
+                        t,
+                        f"its label item OB-{item_id} is not sent yet",
+                        repo.name,
+                    )
+                    continue
             elif owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
@@ -559,6 +570,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
             pending_label = (
                 bool(outbox_store.pending_label_item(f"github:{source.repo.github}#{int(tid)}"))
                 if isinstance(source, tracker.GitHubTracker)
+                else bool(outbox_store.pending_label_item(f"jira:{tid}"))
+                if isinstance(source, tracker.JiraTracker)
                 else bool(run_store.pending_label(repo.name, tid))
             )
             if (not queued or pending_label or not unblock.recovery_changed(

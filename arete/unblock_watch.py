@@ -190,12 +190,21 @@ def land(repo, tid, case, attempt, candidate):
         cause, fresh = merge_review.assess(cfg, current, t, row, prs)
         if cause != "merge-review" or fresh != candidate:
             return
-        from . import release_proof
+        from . import outbox, release_proof
 
-        hold = gh.pr_merge_auto(candidate["github"], gh.pr_number(candidate["url"]), candidate["head"],
-                                candidate["target"], candidate["base"], track_moved_base=True,
-                                required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)),
-                                **release_proof.pr_check_options(current, tid, candidate["github"], candidate["target"]))
+        opts = release_proof.pr_check_options(current, tid, candidate["github"], candidate["target"])
+        hold = outbox.publish_pr_merge(
+            repo=candidate["github"],
+            number=gh.pr_number(candidate["url"]),
+            head=candidate["head"],
+            base=candidate["target"],
+            base_sha=candidate["base"],
+            track_moved_base=True,
+            required=pilot.required_check(cfg, current, config.load_layer(current.layer_dir)),
+            stage_checks=opts.get("stage_checks"),
+            run_id=row["id"],
+            drafted_by="unblock",
+        )
         if hold:
             ledger.mark(case, "waiting", unblock.safe(hold), unblock.RECHECK)
         else:

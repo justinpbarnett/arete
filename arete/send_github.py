@@ -5,10 +5,17 @@ import re
 import threading
 from urllib.parse import urlencode
 
-from . import gh, outbound, senders, tracker, util
+from . import config, emits, gh, outbound, send_push, senders, tracker, util
 
 _DIGITS_RE = re.compile(r"^[1-9][0-9]{0,17}$")
 _TRANSIENT_RE = re.compile(r"HTTP 5\d\d|Something went wrong while executing your query", re.IGNORECASE)
+_FORBIDDEN_HOST_KEYS = frozenset(("workdir", "file", "env"))
+
+
+class PrMergeHeld(gh.GhError):
+    def __init__(self, hold: str):
+        super().__init__(str(hold))
+        self.hold = hold
 
 LABEL_STYLES: dict[str, tuple[str, str]] = {
     tracker.LABEL: tracker.APPROVAL_LABEL_STYLE,
@@ -16,6 +23,8 @@ LABEL_STYLES: dict[str, tuple[str, str]] = {
     **{f"agent:{state}": (color, "Arete pipeline state") for state, color in tracker.STATE_COLORS.items()},
     "arete-alert": ("d93f0b", "Opened by arete heartbeat"),
     "arete-triage": ("c5def5", "Arete triage board"),
+    "arete-miner": ("1d76db", "Harness fixes mined by arete"),
+    "arete-trust": ("0e8a16", "Trust level change proposed by arete"),
     "agent:auto": ("c5def5", "Approved by automatic triage"),
     "fix": ("d73a4a", "Repair existing behavior; eligible for Arete's guarded patch flow"),
     "feature": ("a2eeef", "New or changed capability; use Arete's full feature flow"),
@@ -81,7 +90,7 @@ def _ensure_labels(repo: str, labels: list[str]) -> None:
                 continue
         color, description = LABEL_STYLES.get(label, ("5319e7", ""))
         err = gh.ensure_label(repo, label, color, description, restyle=False)
-        if err:
+        if isinstance(err, str) and err:
             if util.NETWORK_ERROR.search(err) or _TRANSIENT_RE.search(err):
                 raise gh.GhUnsure(err)
             raise gh.GhError(err)
@@ -368,6 +377,243 @@ def _status_look(item: dict, since_iso: str) -> senders.LookResult:
     )
 
 
+def parse_pr_payload(body: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(body)
+    except ValueError as error:
+        raise ValueError(f"GitHub PR payload must be JSON: {error}") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("GitHub PR payload must be a JSON object")
+    for forbidden in _FORBIDDEN_HOST_KEYS:
+        if forbidden in parsed:
+            raise ValueError(f"GitHub PR payload must not hold host key {forbidden!r}")
+    action = str(parsed.get("action") or "create").strip()
+    if action not in ("create", "body", "draft", "merge"):
+        raise ValueError(f"unsupported GitHub PR action: {action!r}")
+    return {**parsed, "action": action}
+
+
+def _pr_url_from_payload(item: dict, payload: dict[str, object]) -> tuple[str, str, int]:
+    url = str(payload.get("url") or "").strip()
+    if url:
+        return url, gh.pr_repo(url), gh.pr_number(url)
+    repo = str(payload.get("repo") or "").strip()
+    number = payload.get("number")
+    if repo and number is not None:
+        num = _parse_positive_int(str(number), "PR number")
+        return f"https://github.com/{gh._safe_repo(repo)}/pull/{num}", gh._safe_repo(repo), num
+    obj_repo, obj_num = _parse_issue(item["object"])
+    return f"https://github.com/{obj_repo}/pull/{obj_num}", obj_repo, obj_num
+
+
+def _scan_pr_payload(payload: dict[str, object]) -> None:
+    for field in ("title", "body", "link"):
+        val = payload.get(field)
+        if isinstance(val, str) and (hit := send_push.scan_text_for_secrets(val)):
+            raise send_push.SecretScanError(f"secret scan blocked PR {payload['action']}: {field} contains {hit}")
+    head = str(payload.get("head") or "").strip()
+    repo_name = str(payload.get("name") or payload.get("repo") or "").strip()
+    base = str(payload.get("base") or "").strip()
+    if head and repo_name:
+        try:
+            cfg = config.load()
+        except Exception:
+            cfg = None
+        repo = emits.config_repo(cfg, repo_name) if cfg is not None else None
+        if repo is not None and repo.path.is_dir():
+            has_head = util.sh(["git", "cat-file", "-e", f"{head}^{{commit}}"], cwd=repo.path).returncode == 0
+            if has_head:
+                send_push.scan_commit_diff(repo.path, head, base=base)
+
+
+def _pr_send(item: dict, body: str) -> senders.SendResult:
+    payload = parse_pr_payload(body)
+    action = str(payload["action"])
+    _scan_pr_payload(payload)
+
+    if action == "create":
+        repo = gh._safe_repo(str(payload.get("repo") or _parse_repo(item["object"])))
+        branch = str(payload.get("branch") or "").strip()
+        base = str(payload.get("base") or "").strip()
+        title = str(payload.get("title") or "").strip()
+        pr_body = str(payload.get("body") or "")
+        link = str(payload.get("link") or "")
+        labels = [str(lb) for lb in (payload.get("labels") or ()) if str(lb).strip()]
+        draft = bool(payload.get("draft", False))
+        name = str(payload.get("name") or "").strip()
+        head = str(payload.get("head") or "").strip()
+        lease = str(payload.get("lease") or "").strip()
+        if payload.get("push_branch"):
+            cfg = config.load()
+            cfg_repo = emits.config_repo(cfg, name or repo)
+            if cfg_repo and cfg_repo.target_branch and (base != cfg_repo.target_branch or branch == cfg_repo.target_branch):
+                raise ValueError(f"the queued PR must target {cfg_repo.target_branch} from a separate work branch")
+            send_push.push_pr_branch(
+                cfg,
+                repo_name=name or repo,
+                base=base,
+                branch=branch,
+                head=head,
+                lease=lease,
+                use_lease=bool(lease),
+                item=item,
+            )
+        if labels:
+            _ensure_labels(repo, labels)
+        full_body = senders.rendered_github_body(pr_body, item["marker"])
+        try:
+            url = gh.pr_create(
+                repo,
+                branch,
+                base,
+                title,
+                full_body,
+                labels=labels,
+                draft=draft,
+                link=link,
+                single_attempt=True,
+            )
+        except gh.GhError as error:
+            if not isinstance(error, gh.GhUnsure) and "already exists" in str(error).lower():
+                existing_url = gh.open_pr_url(repo, branch)
+                if existing_url:
+                    return senders.SendResult(external_id=str(gh.pr_number(existing_url)), external_url=existing_url)
+            raise
+        return senders.SendResult(external_id=str(gh.pr_number(url)), external_url=url)
+
+    url, repo, number = _pr_url_from_payload(item, payload)
+    if action == "body":
+        pr_body = str(payload.get("body") or "")
+        link = str(payload.get("link") or "")
+        full_body = senders.rendered_github_body(pr_body, item["marker"])
+        gh.pr_edit_body(url, full_body, link=link)
+        return senders.SendResult(external_id=str(number), external_url=url)
+
+    if action == "draft":
+        draft = bool(payload.get("draft", False))
+        gh.pr_set_draft(url, draft)
+        return senders.SendResult(external_id=str(number), external_url=url)
+
+    if action == "merge":
+        head = str(payload.get("head") or "")
+        base = str(payload.get("base") or "")
+        base_sha = str(payload.get("base_sha") or "")
+        track_moved_base = bool(payload.get("track_moved_base", False))
+        required = payload.get("required") if isinstance(payload.get("required"), dict) else None
+        stage_checks = payload.get("stage_checks") if isinstance(payload.get("stage_checks"), dict) else None
+        hold = gh.pr_merge_auto(
+            repo,
+            number,
+            head,
+            base,
+            base_sha,
+            track_moved_base=track_moved_base,
+            required=required,
+            stage_checks=stage_checks,
+        )
+        if hold:
+            raise PrMergeHeld(hold)
+        return senders.SendResult(external_id=str(number), external_url=url)
+
+    raise ValueError(f"unsupported GitHub PR action: {action!r}")
+
+
+def _pr_look(item: dict, since_iso: str) -> senders.LookResult:
+    payload = parse_pr_payload(str(item.get("body") or "{}"))
+    action = str(payload["action"])
+
+    if action == "create":
+        repo = gh._safe_repo(str(payload.get("repo") or _parse_repo(item["object"])))
+        branch = str(payload.get("branch") or "").strip()
+        url = gh.open_pr_url(repo, branch)
+        if url:
+            num = gh.pr_number(url)
+            return senders.LookResult(
+                found=True,
+                external_id=str(num),
+                external_url=url,
+                summary=f"open_pr_url({repo}, {branch}): found {url}",
+            )
+        return senders.LookResult(
+            found=False,
+            external_id=None,
+            external_url=None,
+            summary=f"open_pr_url({repo}, {branch}): not found",
+        )
+
+    url, repo, number = _pr_url_from_payload(item, payload)
+    if action == "body":
+        current = gh.pr_body(url)
+        needle = f"<!-- {item['marker']} -->"
+        if needle in current:
+            return senders.LookResult(
+                found=True,
+                external_id=str(number),
+                external_url=url,
+                summary=f"pr_body {repo}#{number}: marker matched",
+            )
+        return senders.LookResult(
+            found=False,
+            external_id=None,
+            external_url=None,
+            summary=f"pr_body {repo}#{number}: marker not found",
+        )
+
+    if action == "draft":
+        wanted = bool(payload.get("draft", False))
+        current_draft, _head = gh.pr_draft_and_head(url)
+        if current_draft == wanted:
+            return senders.LookResult(
+                found=True,
+                external_id=str(number),
+                external_url=url,
+                summary=f"pr_draft_and_head {repo}#{number}: draft={current_draft}",
+            )
+        return senders.LookResult(
+            found=False,
+            external_id=None,
+            external_url=None,
+            summary=f"pr_draft_and_head {repo}#{number}: draft={current_draft} != {wanted}",
+        )
+
+    if action == "merge":
+        row = gh.pr_view(url) or {}
+        state = str(row.get("state") or "")
+        auto_merge = bool(row.get("autoMergeRequest"))
+        if state == "MERGED" or auto_merge:
+            return senders.LookResult(
+                found=True,
+                external_id=str(number),
+                external_url=url,
+                summary=f"pr_view {repo}#{number}: state={state or 'OPEN'} auto_merge={auto_merge}",
+            )
+        return senders.LookResult(
+            found=False,
+            external_id=None,
+            external_url=None,
+            summary=f"pr_view {repo}#{number}: state={state or 'unknown'} auto_merge={auto_merge}",
+        )
+
+    raise ValueError(f"unsupported GitHub PR action: {action!r}")
+
+
+def _pr_preview(item: dict, body: str) -> str:
+    payload = parse_pr_payload(body)
+    action = str(payload["action"])
+    if action == "create":
+        rendered = senders.rendered_github_body(str(payload.get("body") or ""), item["marker"])
+        link = str(payload.get("link") or "").strip()
+        parts = [str(payload.get("title") or "").strip(), link, rendered]
+        return "\n\n".join(p for p in parts if p)
+    if action == "body":
+        rendered = senders.rendered_github_body(str(payload.get("body") or ""), item["marker"])
+        link = str(payload.get("link") or "").strip()
+        return f"{link}\n\n{rendered}" if link else rendered
+    if action == "draft":
+        return f"pr draft={bool(payload.get('draft', False))}"
+    return f"pr merge {payload.get('repo') or item.get('object')}#{payload.get('number') or ''}"
+
+
 def _comment_preview(item: dict, body: str) -> str:
     return senders.rendered_github_body(body, item["marker"])
 
@@ -401,3 +647,4 @@ def register_all() -> None:
     senders.register(senders.Sender("github", "issue", _issue_send, _issue_look, _issue_preview))
     senders.register(senders.Sender("github", "label", _label_send, _label_look, _label_preview))
     senders.register(senders.Sender("github", "status", _status_send, _status_look, _status_preview))
+    senders.register(senders.Sender("github", "pr", _pr_send, _pr_look, _pr_preview))

@@ -27,13 +27,24 @@ def _sync_inbox(c, source: str) -> None:
     inbox.sync(c, source)
 
 
+def is_view(c) -> bool:
+    return c.execute("SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'approvals'").fetchone() is not None
+
+
 def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
     with db() as c:
         cur = c.execute("INSERT INTO approvals (loop, run_id, emit, summary, status, result, created) "
                         "VALUES (?,?,?,?,?,?,?)", (loop, run_id, json.dumps(emit, default=str), summary[:2000],
                                                    "failed" if failed else "pending", failed[:1000], util.iso()))
-        approval_id = cur.lastrowid
+        if is_view(c):
+            row = c.execute(
+                "SELECT legacy_approval FROM outbox WHERE legacy_approval IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            approval_id = int(row["legacy_approval"])
+        else:
+            approval_id = int(cur.lastrowid)
         _sync_inbox(c, "approvals")
+        _sync_inbox(c, "outbox")
         return approval_id
 
 

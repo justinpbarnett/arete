@@ -1,0 +1,5 @@
+connector = "email"
+kinds = ["email"]
+audience = "self"
+posts_as = "email"
+send_window = 60

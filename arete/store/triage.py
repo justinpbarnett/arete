@@ -12,7 +12,7 @@ TABLES = {
 
 TRIAGE_COLUMNS = ("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "ready", "code", "size",
                   "questions", "plan", "why", "cost", "ts", "kind", "repos", "assumptions", "in_sprint", "parent",
-                  "closed", "checks")
+                  "closed", "checks", "version")
 
 
 TRIAGE_LISTS = ("questions", "plan", "repos", "assumptions", "checks")
@@ -25,23 +25,46 @@ APPROVAL_COLUMNS = ("ref", "repo", "route", "title", "url", "kind", "size", "pla
 APPROVAL_LISTS = ("plan", "assumptions", "checks")
 
 
+def _has_version(c) -> bool:
+    return "version" in {row[1] for row in c.execute("PRAGMA table_info(triage)").fetchall()}
+
+
 def triage_rows(connect=reader) -> list[dict]:
     with connect() as c:
-        return [lists_read(dict(r), TRIAGE_LISTS) for r in c.execute("SELECT * FROM triage")]
+        return [lists_read({**dict(r), "version": int(r["version"]) if "version" in r.keys() and r["version"] else 1}, TRIAGE_LISTS)
+                for r in c.execute("SELECT * FROM triage")]
 
 
 def triage_replace(source: str, rows: list[dict]) -> None:
     refs = [r["ref"] for r in rows]
     with db() as c:
+        has_ver = _has_version(c)
+        cols = TRIAGE_COLUMNS if has_ver else TRIAGE_COLUMNS[:-1]
+        prev_versions: dict[str, int] = {}
+        if has_ver:
+            for existing in c.execute("SELECT ref, version FROM triage"):
+                prev_versions[existing["ref"]] = int(existing["version"] or 1)
         c.execute("DELETE FROM triage WHERE source = ?", (source,))
         c.executemany("DELETE FROM triage WHERE ref = ?", [(ref,) for ref in refs])
-        c.executemany(insert_sql("triage", TRIAGE_COLUMNS),
-                      [lists_written(r, TRIAGE_COLUMNS, TRIAGE_LISTS) for r in rows])
+        written = []
+        for r in rows:
+            item = dict(r)
+            if has_ver:
+                prev = prev_versions.get(r["ref"])
+                item["version"] = prev + 1 if prev is not None else 1
+            written.append(lists_written(item, cols, TRIAGE_LISTS))
+        c.executemany(insert_sql("triage", cols), written)
 
 
 def triage_put(row: dict) -> None:
     with db() as c:
-        c.execute(insert_sql("triage", TRIAGE_COLUMNS, "INSERT OR REPLACE"), lists_written(row, TRIAGE_COLUMNS, TRIAGE_LISTS))
+        has_ver = _has_version(c)
+        cols = TRIAGE_COLUMNS if has_ver else TRIAGE_COLUMNS[:-1]
+        item = dict(row)
+        if has_ver:
+            prev = c.execute("SELECT version FROM triage WHERE ref = ?", (row["ref"],)).fetchone()
+            item["version"] = int(prev["version"] or 1) + 1 if prev is not None else 1
+        c.execute(insert_sql("triage", cols, "INSERT OR REPLACE"), lists_written(item, cols, TRIAGE_LISTS))
 
 
 def triage_drop(ref: str) -> None:

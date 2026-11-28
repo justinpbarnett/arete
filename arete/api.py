@@ -644,7 +644,7 @@ def dispatch(handler, op, path_values, query):
 
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "settings.update", "loop.enable", "loop.disable",
-    "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file",
+    "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
     "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
@@ -1024,6 +1024,26 @@ def mutation(name, values, handler):
         result = {"item": outbox.retry(values["item"], base_version=values["base_version"])}
     elif name == "outbox.discard":
         result = {"item": outbox.discard(values["item"], base_version=values["base_version"])}
+    elif name == "triage.send":
+        try:
+            item = triage.send(
+                config.load_or_problem()[0],
+                values["ticket"],
+                values["questions"],
+                values["answers"],
+                str(values.get("repo") or ""),
+                base_version=values["base_version"],
+                return_item=True,
+            )
+        except triage.NotOnBoard as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except triage.NotSendable as error:
+            raise contract.Problem("invalid_state", str(error)) from None
+        except triage.BadAnswers as error:
+            raise contract.Problem("validation", str(error)) from None
+        except refusals.Upstream as error:
+            raise contract.Problem("upstream_failed", str(error)) from None
+        result = {"data": item}
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)
