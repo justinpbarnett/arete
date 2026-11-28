@@ -8,7 +8,8 @@ from arete import accounts, agent, claude, codex, config, pi, routing, runner, u
 from arete.store import devices as devices_store
 from tests import support
 
-support.isolate_live_state()
+def setUpModule():
+    support.isolate_live_state()
 
 CAPACITY = "Selected model is at capacity. Please try a different model."
 CODEX_LIMIT = "You've hit your usage limit. Try again in 2 hours."

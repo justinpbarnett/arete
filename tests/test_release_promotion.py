@@ -11,7 +11,8 @@ from support import isolate_live_state
 
 from arete import config, gh, paths, release_promotion as promotion, release_proof as proof, tracker
 
-isolate_live_state()
+def setUpModule():
+    isolate_live_state()
 
 
 class StagingRelease(unittest.TestCase):
@@ -71,7 +72,7 @@ class StagingRelease(unittest.TestCase):
             def log_message(self, *args):
                 pass
         http = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), API))
-        t = threading.Thread(target=http.serve_forever, daemon=True)
+        t = threading.Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         t.start()
         self.addCleanup(t.join, 5)
         self.addCleanup(http.shutdown)

@@ -775,6 +775,8 @@ def read_json_snapshot(p: Path, default):
 
 
 def flush_fd(fd: int) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     if os.environ.get("ARETE_DRIVE_FLUSH") != "0" and hasattr(fcntl, "F_FULLFSYNC"):
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
@@ -785,6 +787,8 @@ def flush_fd(fd: int) -> None:
 
 
 def flush_file(p: Path) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     fd = os.open(p, os.O_RDONLY)
     try:
         flush_fd(fd)
@@ -793,6 +797,8 @@ def flush_file(p: Path) -> None:
 
 
 def flush_folder(folder: Path) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     fd = os.open(folder, os.O_RDONLY)
     try:
         os.fsync(fd)

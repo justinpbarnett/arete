@@ -27,6 +27,7 @@ from arete import (
 )
 from arete.store import db as foundation
 from arete.store import runs as run_store
+from tests import support
 
 
 class FlushFdTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class FlushFdTests(unittest.TestCase):
               mock.patch.object(fcntl, "fcntl") as full_flush,
               mock.patch.object(os, "fsync") as fsync):
             os.environ.pop("ARETE_DRIVE_FLUSH", None)
+            os.environ.pop("ARETE_TEST_FAST_SYNC", None)
             util.flush_fd(42)
         full_flush.assert_called_once_with(42, fcntl.F_FULLFSYNC)
         fsync.assert_not_called()
@@ -45,9 +47,18 @@ class FlushFdTests(unittest.TestCase):
               mock.patch.object(fcntl, "F_FULLFSYNC", create=True),
               mock.patch.object(fcntl, "fcntl") as full_flush,
               mock.patch.object(os, "fsync") as fsync):
+            os.environ.pop("ARETE_TEST_FAST_SYNC", None)
             util.flush_fd(42)
         full_flush.assert_not_called()
         fsync.assert_called_once_with(42)
+
+    def test_fast_sync_opt_out_skips_fsync_in_disposable_test_env(self):
+        with (mock.patch.dict(os.environ, {"ARETE_TEST_FAST_SYNC": "1"}),
+              mock.patch.object(fcntl, "fcntl") as full_flush,
+              mock.patch.object(os, "fsync") as fsync):
+            util.flush_fd(42)
+        full_flush.assert_not_called()
+        fsync.assert_not_called()
 
 
 class DurableCostTests(unittest.TestCase):
@@ -65,7 +76,7 @@ class DurableCostTests(unittest.TestCase):
             patches.enter_context(mock.patch.object(paths, name, value))
         patches.enter_context(mock.patch.object(foundation, "_CHECKED", set()))
         patches.enter_context(mock.patch.object(dbstats.Timing, "finished"))
-        foundation.migrate()
+        support.seed_db(cls.root, db_file=database)
         patches.enter_context(mock.patch.object(prices, "SNAPSHOT_FILE", cls.root / "absent-prices.json"))
         patches.enter_context(mock.patch.object(runner, "origin", return_value={"repo": "", "commit": ""}))
         patches.enter_context(mock.patch.object(runner, "secret_files", return_value=[]))
