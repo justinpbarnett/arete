@@ -40,16 +40,32 @@ APPROVE_SHA_RE = re.compile(r"^\s*promote\s+([a-f0-9]{40}(?:[a-f0-9]{24})?)\s+to
 
 # Explicit production instructions recognized in context (including QA sheet handoff phrasing).
 PRODUCTION_EXPLICIT_PATTERNS = (
-    re.compile(r"\bpromote\s+(?:this|it|the\s+(?:change|fix|revision|build|branch|pr)|[a-f0-9]{40}(?:[a-f0-9]{24})?)\s+to\s+prod(?:uction)?\b", re.I),
-    re.compile(r"\b(?:push|deploy|ship|release)\s+(?:this|it|the\s+(?:change|fix|revision|build|branch|pr))?\s*to\s+prod(?:uction)?\b", re.I),
+    re.compile(r"\bpromote\s+(?:(?:this|it|the\s+(?:change|fix|revision|build|branch|pr)|[a-f0-9]{40}(?:[a-f0-9]{24})?)\s+)?to\s+prod(?:uction)?\b", re.I),
+    re.compile(r"\b(?:push|deploy|ship|release)\s+(?:(?:this|it|the\s+(?:change|fix|revision|build|branch|pr))\s+)?to\s+prod(?:uction)?\b", re.I),
     re.compile(r"\bmov(?:ing|ed)\s+(?:this|it)\s+to\s+(?:push\s+to\s+)?prod(?:uction)?(?:\s+on\s+the\s+sheet)?\b", re.I),
-    re.compile(r"\b(?:approved?|ready|good|clear)\s+(?:to\s+(?:push|promote|deploy|ship|release)\s+to|for)\s+prod(?:uction)?\b", re.I),
+    re.compile(r"\b(?:approved?|ready|good|clear)\s+(?:to\s+(?:push|promote|deploy|ship|release)\s+(?:(?:this|it)\s+)?to|for)\s+prod(?:uction)?\b", re.I),
     re.compile(r"\bgo\s+ahead\s+(?:and\s+)?(?:push|promote|deploy|ship|release)(?:\s+(?:this|it))?\s+to\s+prod(?:uction)?\b", re.I),
 )
 
+RELEASE_OWNER_APPROVAL_PATTERNS = (
+    re.compile(r"\b(?:approve[ds]?|sign(?:ed)?\s+off(?:\s+on)?)\s+(?:the\s+)?(?:irreversible\s+)?(?:release|promotion|prod(?:uction)?\s+release)\b", re.I),
+    re.compile(r"\b(?:release|promotion|irreversible\s+action)\s+(?:is\s+)?approved\b", re.I),
+    re.compile(r"\bapproved\s+for\s+(?:release|promotion)\b", re.I),
+    re.compile(r"\brelease[- ]owner\s+(?:approved|sign[- ]off)\b", re.I),
+)
+
 PRODUCTION_BLOCKING_RE = re.compile(
-    r"\b(?:don['’]?t|do\s+not|not\s+ready|hold\s+off|hold\s+on|wait\s+(?:to|before|on)|"
+    r"\b(?:don['’]?t|do\s+not|not\s+(?:approved?|ready|good|clear|yet|now)|no\s+go|"
+    r"cannot|can['’]?t|shouldn['’]?t|won['’]?t|hold\s+(?:off|on)|hold\b|wait\s+(?:to|before|on)|"
     r"before\s+(?:we|you|pushing|promoting|deploying|shipping)|stop|pause|cancel|block|never)\b",
+    re.I,
+)
+
+PRODUCTION_CONDITIONAL_RE = re.compile(
+    r"(?:^\s*(?:can|could|should|would|shall|do|does|did|is|are|will)\s+(?:we|you|i|this|it)\b|"
+    r"\b(?:if|unless|maybe|might|pending|assuming)\b|"
+    r"\b(?:once|when|after)\s+(?:we|you|the|it|this|that|ci|tests?|checks?)\b|"
+    r"\bas\s+soon\s+as\b)",
     re.I,
 )
 
@@ -137,6 +153,8 @@ class ThreadContext:
     parent_ticket: str = ""
     staged: bool = False
     staged_revision: str = ""
+    delivered: bool = False
+    promotion_phase: str = ""
     qa_handoff_at: str = ""
     qa_handoff_comment_id: str = ""
     open_clarifications: tuple[dict, ...] = ()
@@ -214,13 +232,15 @@ def github_commenter_allowlist(repo: config.Repo) -> tuple[str, ...]:
     return repo.github_commenters()
 
 
-def authorize_comment(repo: config.Repo, tracker_name: str, comment: ThreadComment) -> AuthDecision:
+def authorize_comment(repo: config.Repo, tracker_name: str, comment: ThreadComment, *,
+                      extra_allowed: tuple[str, ...] | list[str] = ()) -> AuthDecision:
     if comment.is_bot or is_arete_comment(comment.body):
         return AuthDecision(False, "arete bot comment")
     if not comment.body.strip():
         return AuthDecision(False, "empty comment")
     if tracker_name == "github":
         allowlist = {login.casefold() for login in github_commenter_allowlist(repo)}
+        allowlist.update(login.strip().casefold() for login in extra_allowed if isinstance(login, str) and login.strip())
         actor = (comment.author or "").strip()
         if not actor:
             return AuthDecision(False, "missing GitHub commenter login")
@@ -268,19 +288,35 @@ def is_neutral_acknowledgment(body: str) -> bool:
 
 
 def match_production_instruction(body: str) -> tuple[bool, str]:
-    text = _strip_relay_prefix(body)
+    text = MENTION_LEAD_RE.sub("", _strip_relay_prefix(body)).strip()
     if not text:
         return False, ""
     if m := APPROVE_SHA_RE.fullmatch(text):
         return True, m[1].lower()
     if "?" in text:
         return False, ""
-    if PRODUCTION_BLOCKING_RE.search(text) or CHANGE_CONJUNCTION_RE.search(text):
+    if PRODUCTION_BLOCKING_RE.search(text) or CHANGE_CONJUNCTION_RE.search(text) or PRODUCTION_CONDITIONAL_RE.search(text):
         return False, ""
     for pattern in PRODUCTION_EXPLICIT_PATTERNS:
         if pattern.search(text):
             sha = SHA_RE.search(text)
             return True, sha[1].lower() if sha else ""
+    return False, ""
+
+
+def match_release_owner_approval(body: str) -> tuple[bool, str]:
+    matched, sha = match_production_instruction(body)
+    if matched:
+        return True, sha
+    text = MENTION_LEAD_RE.sub("", _strip_relay_prefix(body)).strip()
+    if not text or "?" in text:
+        return False, ""
+    if PRODUCTION_BLOCKING_RE.search(text) or CHANGE_CONJUNCTION_RE.search(text) or PRODUCTION_CONDITIONAL_RE.search(text):
+        return False, ""
+    for pattern in RELEASE_OWNER_APPROVAL_PATTERNS:
+        if pattern.search(text):
+            found = SHA_RE.search(text)
+            return True, found[1].lower() if found else ""
     return False, ""
 
 
@@ -364,7 +400,7 @@ def classify_intent(comment: ThreadComment, ctx: ThreadContext, *,
                 answers_clarification_id=target["id"],
             )
 
-    # 2. Explicit production direction in context.
+    # 2. Explicit production direction or release-owner sign-off in context.
     matched_prod, prod_rev = match_production_instruction(text)
     if matched_prod:
         return IntentResult(
@@ -372,6 +408,14 @@ def classify_intent(comment: ThreadComment, ctx: ThreadContext, *,
             "explicit production direction in ticket thread",
             summary=util.first_line(text, 240),
             production_revision=prod_rev or ctx.staged_revision,
+        )
+    matched_owner, owner_rev = match_release_owner_approval(text)
+    if matched_owner:
+        return IntentResult(
+            "production_instruction",
+            "explicit release-owner approval in ticket thread",
+            summary=util.first_line(text, 240),
+            production_revision=owner_rev or ctx.staged_revision,
         )
 
     # 3. Pure neutral acknowledgment (thank-you / looks good / ack).
@@ -532,7 +576,9 @@ def build_context(cfg: config.Config, repo: config.Repo, tk: tracker.Tracker, ti
         if claim and claim.get("state") == "complete":
             ticket_open = False
     promo = _staging_state(repo.name, tid)
-    staged = promo.get("phase") in ("observing_staging", "awaiting_qa", "staging_verified", "staged_for_parent")
+    promo_phase = promo.get("phase", "")
+    delivered = promo_phase == "production_verified"
+    staged = promo_phase in ("observing_staging", "awaiting_qa", "staging_verified", "staged_for_parent", "paused")
     handoff_url = promo.get("handoff", "")
     parent = promo.get("graph_parent", "") or _parent_ticket_for(repo, tk, tid)
     open_clars = tuple(feedback_store.open_clarifications(repo.name, tid))
@@ -546,7 +592,9 @@ def build_context(cfg: config.Config, repo: config.Repo, tk: tracker.Tracker, ti
         is_spec=is_spec,
         parent_ticket=parent,
         staged=staged,
-        staged_revision=promo.get("revision", ""),
+        staged_revision=promo.get("staged_revision") or promo.get("revision", ""),
+        delivered=delivered,
+        promotion_phase=promo_phase,
         qa_handoff_at=promo.get("qa_since", ""),
         qa_handoff_comment_id=_comment_id_from_url(handoff_url),
         open_clarifications=open_clars,
@@ -699,8 +747,14 @@ def process_comment(cfg: config.Config, repo: config.Repo, tk: tracker.Tracker,
             steered_run_id=existing.get("run_id", ""),
         )
 
-    auth = authorize_comment(repo, tk.name, comment)
-    ticket_state = "open" if ctx.ticket_open else "closed"
+    extra_allowed: tuple[str, ...] = ()
+    try:
+        if policy := release_proof.goal(repo.name, tid):
+            extra_allowed = tuple(policy.get("qa") or ()) + tuple(policy.get("release_owners") or ())
+    except (OSError, ValueError):
+        extra_allowed = ()
+    auth = authorize_comment(repo, tk.name, comment, extra_allowed=extra_allowed)
+    ticket_state = "closed" if not ctx.ticket_open else ("delivered" if ctx.delivered else "open")
     base_row = {
         "repo": repo.name,
         "ticket": tid,
@@ -797,8 +851,17 @@ def process_comment(cfg: config.Config, repo: config.Repo, tk: tracker.Tracker,
             extra_data.update(clarification_id=resolved_clar_id, original_comment_id=clar["source_comment_id"],
                               question=clar["question"], combined_instruction=combined_instruction)
 
-    # Closed/completed ticket -> route to follow-up workflow (keeps original ticket Done).
-    if not ctx.ticket_open:
+    # Release already in progress -> reconcile actual deployment outcome first before routing.
+    if ctx.promotion_phase in ("promotion_intent", "observing_production"):
+        return FeedbackOutcome(
+            repo.name, tid, tk.name, comment.comment_id, True, "correction",
+            "reconcile_release", "deferred",
+            "release already in progress; reconcile actual deployment outcome first",
+            acted=False, replayed=False, clarification_id=resolved_clar_id,
+        )
+
+    # Closed or confirmed-delivered ticket -> route to follow-up workflow (keeps original ticket closed/delivered).
+    if not ctx.ticket_open or ctx.delivered:
         if not dry_run:
             inserted = feedback_store.record_comment({
                 **base_row,
@@ -846,6 +909,15 @@ def process_comment(cfg: config.Config, repo: config.Repo, tk: tracker.Tracker,
                                              comment.author_display or comment.author, comment.body)
         if clar := feedback_store.get_clarification(resolved_clar_id):
             feedback_store.update_comment(repo.name, tid, tk.name, clar["source_comment_id"], status="answered")
+
+    # If a staging promotion can still safely pause, pause it and reset prior QA approval for the new revision.
+    if ctx.promotion_phase in ("awaiting_qa", "staging_verified", "staged_for_parent"):
+        from . import release_promotion
+        release_promotion.pause_for_feedback(
+            repo.name, tid,
+            reason="paused: the tested behavior changed; returning to staging for fresh QA",
+            comment_id=comment.comment_id,
+        )
 
     # Also check if a needs-info worker run is waiting on non-secret asks and can resume directly.
     resumed_ask = _resolve_open_worker_asks(repo.name, tid, combined_instruction)
@@ -928,6 +1000,8 @@ def watched_tickets(cfg: config.Config, repo: config.Repo) -> list[str]:
                 add(row["issue"])
     except (db.NoDatabase, OSError, ValueError):
         return []
+    for tid in release_proof.enrolled(repo.name):
+        add(tid)
     return found
 
 
