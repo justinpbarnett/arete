@@ -10,14 +10,18 @@ from datetime import timedelta
 from pathlib import Path
 
 from .. import drafts, paths, record, retention, run_lines, util
+from . import blobs as blob_store
 from . import devices, events, idempotency, incidents, loops, orchestration, runs, writes
 from .db import (
+    BLOBS_RETENTION_SCHEMA,
     RECORD_TURNS_SCHEMA,
     RUN_RETENTION_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
+    RUNS_PINS_SCHEMA,
     SPEC_DELIVERY_SCHEMA,
     WORKER_EXCHANGE_SCHEMA,
     migration_applied,
+    reader,
     tx,
 )
 
@@ -119,8 +123,8 @@ def measure() -> Measured:
     return Measured(runs_bytes, folder_bytes, record_bytes, record_written, continues_edges)
 
 
-def _cited_runs(c, candidate_ids: set[str]) -> set[str]:
-    return drafts.cited_runs(c, candidate_ids)
+def _cited_runs(c, candidate_ids: set[str], *, states: tuple[str, ...] = ("draft", "valid")) -> set[str]:
+    return drafts.cited_runs(c, candidate_ids, states=states)
 
 
 def _chain_kept(c, recent_runs: set[str], continues_edges: dict[str, str]) -> set[str]:
@@ -201,6 +205,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
     with tx() as c:
         has_records_purged = migration_applied(RUN_RETENTION_SCHEMA, c)
         has_turn_index = migration_applied(RECORD_TURNS_SCHEMA, c)
+        has_pins = migration_applied(RUNS_PINS_SCHEMA, c)
+        has_blobs_retention = migration_applied(BLOBS_RETENTION_SCHEMA, c)
         rows_removed = 0
         queued_reason: dict[str, str] = {}
         queued_bytes = 0
@@ -245,18 +251,33 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             if r[0]
         }
 
-        # 1. Firings: delete runs, steps, feed rows and queue folder removal.
+        # 1. Firings: delete runs, steps, step_inputs, turn_index, feed rows and queue folder removal.
         firing_rows = c.execute(
             f"SELECT id FROM runs WHERE {runs.FIRINGS} AND started < ?",  # noqa: S608
             (firings_since,),
         ).fetchall()
         firing_ids = {r["id"] for r in firing_rows}
-        firing_cited = _cited_runs(c, firing_ids)
+        firing_cited = _cited_runs(c, firing_ids, states=("draft", "valid"))
+        firing_blob_shas: set[str] = set()
         for row in firing_rows:
             rid = row["id"]
             if rid in pinned or rid in open_asks or rid in firing_cited:
                 continue
             queue_purge(rid, "firing")
+            if has_pins:
+                firing_blob_shas.update(
+                    str(r[0])
+                    for r in c.execute(
+                        "SELECT DISTINCT si.sha256 FROM step_inputs si "
+                        "JOIN steps s ON s.id = si.step_id "
+                        "WHERE s.run_id = ? AND si.sha256 != ''",
+                        (rid,),
+                    )
+                )
+                rows_removed += c.execute(
+                    "DELETE FROM step_inputs WHERE step_id IN (SELECT id FROM steps WHERE run_id = ?)",
+                    (rid,),
+                ).rowcount
             if has_turn_index:
                 rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM steps WHERE run_id = ?", (rid,)).rowcount
@@ -301,10 +322,19 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                 if r["repo"] and r["issue"] not in (None, "")
             }
 
-        folder_cited = _cited_runs(c, all_ids)
-        record_cited = folder_cited
+        folder_cited = _cited_runs(c, all_ids, states=("draft", "valid"))
+        active_cited = _cited_runs(c, all_ids, states=("active",))
 
-        # 2. Folders / lines past [folders] days.
+        def record_kept_by_draft(r: dict) -> bool:
+            rid = r["id"]
+            if rid in folder_cited:
+                return True
+            if rid in active_cited:
+                age = r["finished"] or r["started"] or ""
+                return not (age and age < folders_since)
+            return False
+
+        # 2. Folders / lines past [folders] days (step_inputs rows stay with files_purged set).
         lines_purged_now: set[str] = set()
         for r in all_runs:
             rid = r["id"]
@@ -326,6 +356,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             if ticket_key and (ticket_key in recent_tickets or ticket_key in active_specs):
                 continue
             queue_purge(rid, "lines")
+            if has_turn_index:
+                rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM feed WHERE run_id = ?", (rid,)).rowcount
             fields = {"files_purged": now}
             if has_records_purged and r["records_purged"] is None:
@@ -344,7 +376,7 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                 continue
             if queued_reason.get(rid) in ("firing", "lines"):
                 continue
-            if r["status"] in PROTECTED_STATUSES or rid in pinned or rid in open_asks or rid in record_cited:
+            if r["status"] in PROTECTED_STATUSES or rid in pinned or rid in open_asks or record_kept_by_draft(r):
                 continue
             rec_mtime = measured.record_written.get(rid)
             if rec_mtime is not None and rec_mtime > recent_record_ts:
@@ -357,6 +389,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                 continue
             if rid in measured.record_bytes:
                 queue_purge(rid, "record")
+            if has_turn_index:
+                rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
             if has_records_purged:
                 writes.update("runs", rid, {"records_purged": now})
             records_purged_now.add(rid)
@@ -376,7 +410,7 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                 and r["status"] not in PROTECTED_STATUSES
                 and r["id"] not in pinned
                 and r["id"] not in open_asks
-                and r["id"] not in record_cited
+                and not record_kept_by_draft(r)
                 and measured.record_written.get(r["id"], 0.0) <= recent_record_ts
             ]
             candidates.sort(key=lambda r: (measured.record_written[r["id"]], r["finished"] or r["started"] or "", r["id"]))
@@ -385,10 +419,44 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                     break
                 rid = r["id"]
                 queue_purge(rid, "record")
+                if has_turn_index:
+                    rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
                 if has_records_purged:
                     writes.update("runs", rid, {"records_purged": now})
                 remaining_bytes = max(0, measured.runs_bytes - queued_bytes)
         over_budget = remaining_bytes > limit_bytes
+
+        # 4b. Ensure no turn_index rows outlive records_purged runs, and mark eligible inputs/rendered blobs purged.
+        if has_turn_index and has_records_purged:
+            rows_removed += c.execute(
+                "DELETE FROM turn_index WHERE run_id IN (SELECT id FROM runs WHERE records_purged IS NOT NULL)"
+            ).rowcount
+        if has_pins and has_blobs_retention and has_records_purged:
+            rows_removed += c.execute(
+                "UPDATE blobs SET purged_at = ?, purge_reason = 'retention' "
+                "WHERE kind IN ('inputs', 'rendered') "
+                "AND purged_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM step_inputs si WHERE si.sha256 = blobs.sha256) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM step_inputs si "
+                "  LEFT JOIN steps s ON s.id = si.step_id "
+                "  LEFT JOIN runs r ON r.id = s.run_id "
+                "  WHERE si.sha256 = blobs.sha256 AND r.records_purged IS NULL"
+                ")",
+                (now,),
+            ).rowcount
+            for sha in sorted(firing_blob_shas):
+                rows_removed += c.execute(
+                    "UPDATE blobs SET purged_at = ?, purge_reason = 'retention' "
+                    "WHERE sha256 = ? AND kind IN ('inputs', 'rendered') AND purged_at IS NULL "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM step_inputs si "
+                    "  LEFT JOIN steps s ON s.id = si.step_id "
+                    "  LEFT JOIN runs r ON r.id = s.run_id "
+                    "  WHERE si.sha256 = blobs.sha256 AND r.records_purged IS NULL"
+                    ")",
+                    (now, sha),
+                ).rowcount
 
         # 5. Time-keyed tables in the same transaction.
         rows_removed += events.trim(
@@ -469,4 +537,24 @@ def prune_files() -> FilesPruned:
                 raise ValueError(f"unknown purge reason {reason!r} for {run_id}")
         except (OSError, ValueError) as e:
             errors.append(f"{run_id}: {type(e).__name__}: {e}")
+    with blob_store.lock():
+        purged_shas: list[str] = []
+        with reader() as c:
+            if migration_applied(BLOBS_RETENTION_SCHEMA, c):
+                purged_shas = [
+                    str(r["sha256"])
+                    for r in c.execute("SELECT sha256 FROM blobs WHERE purged_at IS NOT NULL ORDER BY sha256").fetchall()
+                ]
+        for sha256 in purged_shas:
+            try:
+                target = blob_store.blob_path(sha256)
+                if target.is_symlink():
+                    raise ValueError(f"unsafe blob file {sha256}")
+                if target.exists():
+                    measured_size = target.lstat().st_size
+                    os.unlink(target)
+                    blobs += 1
+                    size += measured_size
+            except (OSError, ValueError) as e:
+                errors.append(f"blob {sha256}: {type(e).__name__}: {e}")
     return FilesPruned(folders=folders, records=records, blobs=blobs, size=size, errors=tuple(errors))

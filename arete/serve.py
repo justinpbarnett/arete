@@ -1022,7 +1022,7 @@ class Server:
         if made:
             self.copy_off_machine(made)
         try:
-            policy = retention.load()
+            policy = retention.load_live()
         except Exception as e:
             self.say(f"retention policy failed, so nothing was pruned: {type(e).__name__}: {util.first_line(str(e), 300)}")
             return

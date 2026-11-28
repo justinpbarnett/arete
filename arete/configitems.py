@@ -223,7 +223,7 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
         if level is not None and entry["level"] != level:
             raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
         return entry
-    if level is None and kind == "prompt" and (engine := _engine_item(kind, name)) is not None:
+    if level is None and kind in ("prompt", "retention") and (engine := _engine_item(kind, name)) is not None:
         return engine
     raise refusals.NotFound(f"No config item {kind}/{name}")
 

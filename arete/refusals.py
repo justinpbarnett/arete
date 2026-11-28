@@ -17,6 +17,16 @@ class Conflict(Refusal):
     status = 409
 
 
+class Gone(Refusal):
+    status = 410
+    code = "files_purged"
+
+    def __init__(self, text: str, *, purged_at: str):
+        super().__init__(text)
+        self.purged_at = purged_at
+        self.details = {"purged_at": purged_at}
+
+
 class TooLarge(Refusal):
     status = 413
 

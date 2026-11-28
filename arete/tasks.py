@@ -24,6 +24,7 @@ from . import (
     pipeline,
     principals,
     record,
+    refusals,
     repairs,
     run_lines,
     runlimits,
@@ -38,6 +39,7 @@ from . import (
 )
 from .refusals import TrackerFailed
 from .store import asks as ask_store
+from .store import blobs as blob_store
 from .store import db as foundation
 from .store import idempotency as claims
 from .store import migrations
@@ -904,8 +906,11 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
-            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
-                                  "start the ticket again with POST /api/tasks")
+            raise refusals.Gone(
+                f"run {run_id} files were removed on {row['files_purged']}; "
+                "start the ticket again with POST /api/tasks",
+                purged_at=row["files_purged"],
+            )
         if row["status"] == "running":
             with record.dead(row) as gone:
                 if gone:
@@ -972,8 +977,11 @@ def repair(run_id: str, base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
-            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
-                                  "start the ticket again with POST /api/tasks")
+            raise refusals.Gone(
+                f"run {run_id} files were removed on {row['files_purged']}; "
+                "start the ticket again with POST /api/tasks",
+                purged_at=row["files_purged"],
+            )
         tid = str(row["issue"])
         if (later := run_store.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
             return answer(tid, repo.name, later["id"], later["status"],
@@ -1025,8 +1033,17 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
-            raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
-                                  "start the ticket again with POST /api/tasks")
+            raise refusals.Gone(
+                f"run {run_id} files were removed on {row['files_purged']}; "
+                "start the ticket again with POST /api/tasks",
+                purged_at=row["files_purged"],
+            )
+        if purged_blob := blob_store.purged_input_for_step(run_id, step):
+            blob_sha, purged_at = purged_blob
+            raise refusals.Gone(
+                f"input blob {blob_sha} for run {run_id} step {step} was removed on {purged_at}",
+                purged_at=purged_at,
+            )
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         path = str(row.get("adw") or "")

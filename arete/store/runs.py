@@ -12,6 +12,7 @@ from . import events, writes
 from ._rows import json_dict, validate_columns
 from .db import (
     RECORD_TURNS_SCHEMA,
+    RUN_RETENTION_SCHEMA,
     RUNS_ADW_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
@@ -1049,9 +1050,20 @@ def issue_running(repo: str | int, issue: int | str | None = None) -> bool:
 
 def pin_record(run_id: str, *, require_record_dir: Callable[[], bool] | None = None) -> bool:
     with db() as c:
-        row = c.execute("SELECT files_purged FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if migration_applied(RUN_RETENTION_SCHEMA, c):
+            row = c.execute("SELECT files_purged, records_purged FROM runs WHERE id = ?", (run_id,)).fetchone()
+        else:
+            row = c.execute("SELECT files_purged, NULL AS records_purged FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row and row["files_purged"]:
-            raise refusals.Conflict(f"run {run_id} files were removed on {row['files_purged']}")
+            raise refusals.Gone(
+                f"run {run_id} files were removed on {row['files_purged']}",
+                purged_at=row["files_purged"],
+            )
+        if row and row["records_purged"]:
+            raise refusals.Gone(
+                f"run {run_id} records were removed on {row['records_purged']}",
+                purged_at=row["records_purged"],
+            )
         if c.execute("SELECT 1 FROM run_purges WHERE run_id = ?", (run_id,)).fetchone():
             raise refusals.Conflict(f"run {run_id} is already queued for removal")
         if require_record_dir is not None and not require_record_dir():
