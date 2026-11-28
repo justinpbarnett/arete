@@ -12,7 +12,10 @@ TABLES = {
     "pending_commands": "until resolved or expired",
 }
 
-KINDS = frozenset(("approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace", "config_invalid"))
+KINDS = frozenset((
+    "approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace", "config_invalid",
+    "queue.dead",
+))
 STATES = frozenset(("open", "snoozed", "shelved", "paused", "resolved"))
 PRIORITIES = (1, 2, 3)
 ID_RE = re.compile(r"^(?:[Tt][Rr]-)?([1-9][0-9]{0,17})$")
