@@ -253,19 +253,19 @@ def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
     return [found[key] for key in sorted(found)]
 
 
-def _engine_item(kind: str, name: str) -> dict | None:
+def _engine_item(kind: str, name: str, conn=None) -> dict | None:
     if kind == "step_settings" and name == "defaults":
         target = paths.DEFAULTS_DIR / "steps.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/steps.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/steps.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "retention" and name == "defaults":
         target = paths.DEFAULTS_DIR / "retention.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/retention.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/retention.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "vocabularies" and name == "defaults":
@@ -291,14 +291,14 @@ def _engine_item(kind: str, name: str) -> dict | None:
         target = paths.PACKAGE_DIR / "loops" / name / "loop.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": f"arete/loops/{name}/loop.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": f"arete/loops/{name}/loop.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "device" and name == "local":
         target = paths.DEFAULTS_DIR / "devices" / "local.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/devices/local.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": "arete/defaults/devices/local.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind in ("target", "rule") and re.fullmatch(configkinds.NAME_PATTERN, name):
@@ -310,42 +310,42 @@ def _engine_item(kind: str, name: str) -> dict | None:
                     "name": name,
                     "path": f"arete/defaults/{kind}s/{name}.toml",
                     "engine": str(target),
-                }),
+                }, conn),
                 "_engine_file": str(target),
             }
     if kind == "adw" and name != "library" and re.fullmatch(configkinds.NAME_PATTERN, name):
         target = paths.ENGINE_ADWS_DIR / f"{name}.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": f"arete/adws/{name}.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": f"arete/adws/{name}.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "routes" and name == "adw":
         target = paths.ENGINE_ROUTES_DIR / "adw.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": "arete/routes/adw.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": "arete/routes/adw.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "library" and name == "adw":
         target = paths.ENGINE_ADWS_DIR / "library.toml"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": "arete/adws/library.toml", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": "arete/adws/library.toml", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "prompt" and re.fullmatch(configkinds.PROMPT_NAME_PATTERN, name):
         target = paths.PROMPTS_DIR / f"{name}.md"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": f"arete/prompts/{name}.md", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": f"arete/prompts/{name}.md", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     if kind == "schema" and re.fullmatch(configkinds.NAME_PATTERN, name):
         target = paths.SCHEMAS_DIR / f"{name}.json"
         if target.is_file():
             return {
-                **_enrich({"kind": kind, "name": name, "path": f"arete/schemas/{name}.json", "engine": str(target)}),
+                **_enrich({"kind": kind, "name": name, "path": f"arete/schemas/{name}.json", "engine": str(target)}, conn),
                 "_engine_file": str(target),
             }
     return None
@@ -355,22 +355,84 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
     if kind not in configkinds.REGISTRY:
         raise refusals.NotFound(f"Unknown config kind {kind}")
     if level == "engine":
-        engine = _engine_item(kind, name)
+        engine = _engine_item(kind, name, conn=conn)
         if engine is not None:
             return engine
         raise refusals.NotFound(f"No engine config item {kind}/{name}")
     if found := listing(kind, name=name, conn=conn):
         entry = found[0]
         if entry["level"] == "engine":
-            engine = _engine_item(kind, name)
+            engine = _engine_item(kind, name, conn=conn)
             if engine is not None:
                 entry = engine
         if level is not None and entry["level"] != level:
             raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
         return entry
-    if level is None and kind in ("prompt", "schema", "retention") and (engine := _engine_item(kind, name)) is not None:
+    if level is None and kind in ("prompt", "schema", "retention", "adw") and (engine := _engine_item(kind, name, conn=conn)) is not None:
         return engine
     raise refusals.NotFound(f"No config item {kind}/{name}")
+
+
+def item_or_historical(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
+    try:
+        return item(kind, name, level=level, conn=conn)
+    except refusals.NotFound:
+        if kind not in configkinds.REGISTRY or level == "engine":
+            raise
+    lookup_kind = "step_settings" if kind == "attention" else kind
+    row = config_store.latest_item(lookup_kind, name, conn)
+    if row is not None:
+        item_level = row["origin"] if row["origin"].startswith("layer:") else configrepo.level_of(row["path"])
+        if level is not None and item_level != level:
+            raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
+        return {
+            "kind": kind,
+            "name": name,
+            "path": row["path"],
+            "subject": f"config:{kind}/{name}",
+            "version": int(row.get("ver") or 0),
+            "content_version": row["version"],
+            "level": item_level,
+        }
+    if configrepo.is_repo():
+        from . import drafts
+
+        rel = drafts.default_path(kind, name)
+        entries = configrepo.version_history(lookup_kind, name, rel)
+        if entries:
+            latest = entries[0]
+            item_level = latest["origin"] if latest["origin"].startswith("layer:") else configrepo.level_of(rel)
+            if level is not None and item_level != level:
+                raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
+            return {
+                "kind": kind,
+                "name": name,
+                "path": rel,
+                "subject": f"config:{kind}/{name}",
+                "version": int(latest["version"]),
+                "content_version": latest["content_version"],
+                "level": item_level,
+            }
+    raise refusals.NotFound(f"No config item {kind}/{name}")
+
+
+def is_tombstone_selector(found: dict, selector: str, conn=None) -> bool:
+    lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+    tombstone_cv = f"{lookup_kind}/{found['name']}{config_store.DELETED_SUFFIX}"
+    if selector in (tombstone_cv, f"{found['kind']}/{found['name']}{config_store.DELETED_SUFFIX}"):
+        return True
+    row = config_store.by_selector(lookup_kind, found["name"], selector, conn)
+    if row is not None:
+        return not row["sha256"] or str(row["version"]).endswith(config_store.DELETED_SUFFIX)
+    history = configrepo.version_history(lookup_kind, found["name"], found["path"])
+    for entry in history:
+        if (
+            (selector.isdecimal() and entry["version"] == int(selector))
+            or entry["commit_sha"] == selector
+            or entry["content_version"] == selector
+        ):
+            return not entry["sha256"] or entry["content_version"].endswith(config_store.DELETED_SUFFIX)
+    return False
 
 
 def _validate_subfile(file_name: str) -> str:

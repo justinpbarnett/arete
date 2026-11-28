@@ -50,6 +50,7 @@ class Resolution:
     prompt_appends: dict[str, tuple[prompts.LayerAppend, ...]] = field(default_factory=dict)
     schema_objects: dict[str, dict] = field(default_factory=dict)
     draft_id: str = ""
+    line: dict | None = None
 
     @property
     def config(self) -> config.Config:
@@ -524,7 +525,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             adw_rule: str = "", loop_name: str = "",
             cfg: config.Config | None = None, config_commit: str | None = None,
             config_dir: Path | None = None, engine_sha: str | None = None,
-            draft_id: str = "") -> Resolution:
+            draft_id: str = "", line: dict | None = None) -> Resolution:
     engine_sha = codebase.STAMP if engine_sha is None else engine_sha
     schema_version = foundation.LATEST
     live_root = paths.CONFIG_DIR.resolve()
@@ -664,6 +665,17 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             **({"settings": arm.get("settings")} if isinstance(arm.get("settings"), dict) else {}),
         }
 
+    pinned_line = (
+        {
+            "id": line["id"],
+            "version": int(line["version"]),
+            "concurrency": int(line["concurrency"]),
+            "wip_limit": line["wip_limit"],
+        }
+        if isinstance(line, dict) and line.get("id")
+        else None
+    )
+
     resolved_doc = {
         "adw": resolved_adw,
         "adw_rule": resolved_adw_rule,
@@ -674,6 +686,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         "expertise": expertise_meta,
         "harness": harness_meta,
         "kind": kind,
+        "line": pinned_line,
         "loop_files": loop_files,
         "overrides": {
             role: {k: {"value": v, "level": "run", "from": "--set"} for k, v in table.items()}
@@ -725,6 +738,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         prompt_appends=prompt_appends,
         schema_objects=schema_objects,
         draft_id=draft_id,
+        line=pinned_line,
     )
 
 

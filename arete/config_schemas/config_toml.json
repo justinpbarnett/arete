@@ -41,7 +41,6 @@
     "arete_repo": {"type": "string"},
     "zte_repo": {"type": "string"},
     "max_parallel": {"type": "integer"},
-    "max_parallel_per_repo": {"type": "integer"},
     "max_parallel_checks": {"type": "integer"},
     "dashboard": {
       "type": "object",

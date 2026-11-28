@@ -144,6 +144,8 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False, legacy_reten
             policy_config["oncall"] = {**policy_config["oncall"], "keep_days": LEGACY_ONCALL_KEEP_DAYS}
     if legacy_adws:
         policy_config["adws"] = None
+        if not resume:
+            policy_config["max_parallel" + "_per_repo"] = 1
     if resume:
         config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,

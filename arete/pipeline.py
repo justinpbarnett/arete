@@ -2381,10 +2381,11 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False, *,
-                spec: bool = False, run_id: str = "") -> list[str]:
+                spec: bool = False, run_id: str = "", line: str = "") -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else []),
-             *(["--run-id", run_id] if run_id else [])]
+             *(["--run-id", run_id] if run_id else []),
+             *(["--line", line] if line else [])]
     repo = cfg.repo(repo_name)
     if not tracker.is_task_id(tid) and (spec or spec_store.find(repo.name, str(tid))):
         return adw_command(repo.name, str(tid), "--adw", "orchestrate", *flags)
@@ -2617,7 +2618,7 @@ def crash_failure(error: Exception) -> dict:
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None, admission: Callable | None = None,
               launch_done: Callable | None = None, closed_context: tuple[str, ...] = (), *,
-              run_id: str = "", persist_run: bool = True) -> int:
+              run_id: str = "", persist_run: bool = True, line: str = "") -> int:
     given_run_id = run_id
     if dry_run and os.environ.get("ARETE_DRY_RUN_NO_PERSIST") == "1":
         persist_run = False
@@ -2664,11 +2665,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
 
     task_num: int | None = None
     issue_key: str | None = None
+    resolved_line_id: str = str(line or "").strip()
     if given_run_id:
         existing_run = run_store.run_get(given_run_id)
         if existing_run is not None:
             task_num = existing_run.get("task_id")
             issue_key = existing_run.get("issue_key")
+            if not resolved_line_id and existing_run.get("line"):
+                resolved_line_id = str(existing_run["line"])
     elif persist_run:
         with db.reader() as c:
             if task_store.has_identity_expand(c):
@@ -2995,6 +2999,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 script.continues or script.repairs if script else ""
             )
             carried_ab = run_store.ab_held(held_from) if held_from else {}
+            from . import lines as lines_mod
+            from .store import projects as projects_store
+
+            pinned_line_row: dict | None = None
+            with db.reader() as c:
+                if projects_store.available(c):
+                    if resolved_line_id:
+                        pinned_line_row = projects_store.get_line(c, resolved_line_id)
+                    else:
+                        pinned_line_row = lines_mod.resolve_line_for_ticket(c, repo.name, tid, cfg=cfg)
+                        if pinned_line_row is not None:
+                            resolved_line_id = pinned_line_row["id"]
             pin_res = pins.resolve(
                 "pipeline",
                 repo=repo.name,
@@ -3007,6 +3023,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 cfg=cfg,
                 config_commit=config_commit,
                 config_dir=config_dir,
+                line=pinned_line_row,
             )
             pin_stack.enter_context(pins.use(pin_res))
             cfg = pin_res.cfg
@@ -3014,30 +3031,41 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             layer = pin_res.layer or layer
 
             def start():
-                nonlocal task_num, issue_key, lock
+                nonlocal task_num, issue_key, lock, resolved_line_id
                 if not persist_run:
                     return given_run_id or record.new_id("pip", f"{repo.name}-{tid}")
+                line_extra = {"line": resolved_line_id} if resolved_line_id else {}
                 if given_run_id:
                     if not record.claim(
                         given_run_id, lock=lock, only_step=only, dry_run=int(dry_run),
-                        resolution=pin_res, continues=continues_id, restart=restart_kind, **retry_of,
+                        resolution=pin_res, continues=continues_id, restart=restart_kind,
+                        **line_extra, **retry_of,
                     ):
                         raise RuntimeError(f"run {given_run_id} could not be claimed")
                     launch_lease.registered(repo.name, str(tid))
                     return given_run_id
-                if task_num is None:
-                    with db.tx() as c:
-                        if task_store.has_identity_expand(c):
-                            task_num, issue_key = task_store.TaskStore.task_for_ticket(
-                                c, repo, tid, principals.current(), cfg=cfg,
-                            )
-                            lock = run_store.run_lock("pipeline", task=int(task_num))
-                return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    task_id=task_num, issue_key=issue_key,
-                                    only_step=only, dry_run=int(dry_run), resolution=pin_res,
-                                    continues=continues_id, restart=restart_kind,
-                                    adw=pin_res.adw, adw_version=pin_res.adw_version, adw_rule=pin_res.adw_rule,
-                                    **retry_of)
+                from . import configrepo
+
+                with (configrepo.maybe_instance_fence() if not db.in_write() else nullcontext()), db.tx() as c:
+                    if task_num is None and task_store.has_identity_expand(c):
+                        task_num, issue_key = task_store.TaskStore.task_for_ticket(
+                            c, repo, tid, principals.current(), cfg=cfg,
+                        )
+                        lock = run_store.run_lock("pipeline", task=int(task_num))
+                    if projects_store.available(c):
+                        if not resolved_line_id:
+                            found_line = lines_mod.resolve_line_for_ticket(c, repo.name, tid, cfg=cfg)
+                            if found_line is not None:
+                                resolved_line_id = found_line["id"]
+                        if resolved_line_id:
+                            lines_mod.assert_line_active(c, resolved_line_id)
+                            line_extra = {"line": resolved_line_id}
+                    return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
+                                        task_id=task_num, issue_key=issue_key,
+                                        only_step=only, dry_run=int(dry_run), resolution=pin_res,
+                                        continues=continues_id, restart=restart_kind,
+                                        adw=pin_res.adw, adw_version=pin_res.adw_version, adw_rule=pin_res.adw_rule,
+                                        **line_extra, **retry_of)
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -7212,17 +7240,41 @@ def live_pipeline_runs() -> list[dict]:
     return slots.holding(run_store.runs_marked_running(), "pipeline")
 
 
-def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: int) -> str:
-    if going[repo_name] >= cfg.max_parallel_per_repo:
-        return (f"{repo_name} already has {util.count(going[repo_name], 'run')} going "
-                f"(max_parallel_per_repo {cfg.max_parallel_per_repo})")
+def line_held_back(line: dict | None, going: Counter, wip: Counter | None = None) -> str:
+    if line is None:
+        return ""
+    lid = str(line["id"])
+    if line.get("archived"):
+        return f"{lid} is archived"
+    if line.get("paused"):
+        why = str(line.get("paused_why") or "").strip()
+        return f"{lid} is paused: {why}" if why else f"{lid} is paused"
+    conc = int(line.get("concurrency") or 1)
+    running = int(going[lid])
+    if running >= conc:
+        return f"{lid} already has {util.count(running, 'run')} going (concurrency {conc})"
+    wip_limit = line.get("wip_limit")
+    if wip_limit is not None:
+        in_progress = int((wip or Counter())[lid])
+        if in_progress >= int(wip_limit):
+            return f"{lid} holds {util.count(in_progress, 'task')} in progress (wip_limit {int(wip_limit)})"
+    return ""
+
+
+def held_back(cfg: config.Config, line: dict | None, going: Counter, free_slots: int,
+              wip: Counter | None = None) -> str:
+    if why := line_held_back(line, going, wip):
+        return why
     return slots.no_free_slot(cfg.max_parallel) if free_slots <= 0 else ""
 
 
 def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: int = 0,
               continues: str | None = None, restart: str = "", cfg: config.Config | None = None,
-              repo: config.Repo | None = None, **extra) -> str:
+              repo: config.Repo | None = None, line: str = "", **extra) -> str:
+    from . import configrepo
+    from . import lines as lines_mod
     from .store import db as foundation
+    from .store import projects as projects_store
     from .store import tasks as task_store
 
     loaded_cfg = cfg
@@ -7240,7 +7292,7 @@ def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: i
         with suppress(ValueError):
             norm_tid = tracker.for_ticket(loaded_cfg, resolved_repo, norm_tid).normalize(norm_tid)
 
-    with foundation.tx() as c:
+    with (configrepo.maybe_instance_fence() if not foundation.in_write() else nullcontext()), foundation.tx() as c:
         task_num = extra.pop("task_id", None)
         issue_key = extra.pop("issue_key", None)
         if task_store.has_identity_expand(c) and (task_num is None or issue_key is None):
@@ -7251,11 +7303,22 @@ def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: i
                 task_num = resolved_num
             if issue_key is None:
                 issue_key = resolved_key
+        resolved_line = str(line or "").strip()
+        if projects_store.available(c):
+            if not resolved_line:
+                found_line = lines_mod.resolve_line_for_ticket(c, repo_name, norm_tid, cfg=loaded_cfg)
+                if found_line is not None:
+                    resolved_line = found_line["id"]
+            if resolved_line:
+                lines_mod.assert_line_active(c, resolved_line)
         lock = (
             run_store.run_lock("pipeline", task=int(task_num))
             if task_num is not None
             else run_store.run_lock("pipeline", repo_name, norm_tid)
         )
+        run_fields = {**extra}
+        if resolved_line:
+            run_fields["line"] = resolved_line
         return record.start(
             "pipeline",
             tag=f"{repo_name}-{norm_tid}",
@@ -7270,19 +7333,37 @@ def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: i
             dry_run=dry_run,
             continues=continues,
             restart=restart,
-            **extra,
+            **run_fields,
         )
 
 
+def invoke_spawn(spawn_fn, repo_name: str, tid: str | int, *args, line: str = "", **kwargs):
+    import inspect
+
+    if line:
+        target = getattr(spawn_fn, "side_effect", None)
+        inspect_fn = target if callable(target) else spawn_fn
+        try:
+            sig = inspect.signature(inspect_fn)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is None or "line" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            kwargs["line"] = line
+    return spawn_fn(repo_name, tid, *args, **kwargs)
+
+
 def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False,
-              run_id: str = "") -> subprocess.Popen:
+              run_id: str = "", line: str = "") -> subprocess.Popen:
     cfg, problem = config.load_or_problem()
     if problem:
         raise control.Refused(problem)
     if why := config.repo_paused(cfg, repo_name):
         raise control.Refused(why)
     cmd = run_command(repo_name, tid, force, **({"spec": True} if spec else {}),
-                      **({"run_id": run_id} if run_id else {}))
+                      **({"run_id": run_id} if run_id else {}),
+                      **({"line": line} if line else {}))
     if run_id:
         record.write_launch(run_id, cmd, RUNS_LOG)
     return control.launch(cmd, RUNS_LOG)

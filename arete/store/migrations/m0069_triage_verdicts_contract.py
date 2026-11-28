@@ -97,7 +97,7 @@ WHERE COALESCE(rs.delivered, '') != ''
 
 def apply(conn) -> None:
     from arete.store import db
-    from arete.store.migrations.m0066_triage_verdicts_expand import backfill_triage_rows
+    from arete.store.migrations.m0068_triage_verdicts_expand import backfill_triage_rows
 
     backfill_triage_rows(conn)
 

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import json
+import platform
 import re
 import secrets
 import zlib
 from collections import Counter
-import concurrent.futures
+from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
 from . import (
-    api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo, contract, control,
-    credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals, secretstore, settings,
-    tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
+    IMPORTED_NS, __version__, api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo,
+    contract, control, credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals,
+    secretstore, settings, stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
 )
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import devices as device_store
+from .store import idempotency as claims_store
 from .store import tasks as task_store
 from .store import tokens, writes
 
@@ -89,7 +92,13 @@ def meta():
         stream = events.metadata(conn)
     deprecated = sorted(f"{entry['method']} {entry['path']}" for entry in contract.ALIASES if entry.get("deprecated"))
     return {"api": {"version": contract.VERSION, "minor": contract.MINOR, "contract_sha": contract.digest()},
-            "server": {"engine_sha": codebase.STAMP}, "oldest_client": contract.OLDEST_CLIENT,
+            "server": {"engine_sha": codebase.STAMP,
+                       "version": __version__,
+                       "started": util.iso(datetime.fromtimestamp(IMPORTED_NS / 1_000_000_000, tz=UTC)),
+                       "python": platform.python_version(),
+                       "state_dir": paths.short_path(paths.STATE_DIR),
+                       "config_file": paths.short_path(paths.CONFIG_FILE)},
+            "oldest_client": contract.OLDEST_CLIENT,
             "instance": {k: data[f"instance_{k}"] for k in ("id", "tag", "name", "created")},
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
@@ -99,14 +108,36 @@ def meta():
             "push": {"vapid_public_key": _vapid_public_key()}}
 
 
-def projection(name, identity=""):
+def projection(name, identity="", *, project=None, include_archived=False):
     if name == "board":
-        rows = task_rows()
+        from . import lines as lines_mod
+
+        saved_view = None
+        if identity:
+            saved_view = needed(lines_mod.get_view(identity), identity)
+            with foundation.reader() as conn:
+                rows = [serialize(r, contract.TASK) for r in lines_mod.query_view_tasks(conn, saved_view)]
+        else:
+            rows = task_rows()
         counts = Counter(row["state"] for row in rows)
         states = dict.fromkeys((*BOARD_STATES, *counts))
         running_ids = [row["id"] for row in runs.runs_marked_running(connect=foundation.reader)]
-        return {"tasks": rows, "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
-                "running_ids": running_ids}
+        shown_project = project or (saved_view["project"] if saved_view else None)
+        with foundation.reader() as conn:
+            board_lines = lines_mod.board_lines_summary(
+                conn,
+                project=shown_project,
+                include_archived=bool(include_archived),
+            )
+        out = {
+            "tasks": rows,
+            "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
+            "running_ids": running_ids,
+            "lines": board_lines,
+        }
+        if saved_view is not None:
+            out["saved_view"] = saved_view
+        return out
     return provider(None, "get_" + ("run" if name == "run" else name), identity, {})
 
 
@@ -117,17 +148,20 @@ def provider(handler, name, rest, query):
 
 
 def resources(name, values):
+    from . import lines as lines_mod
+
     cfg = config.load_or_problem()[0]
     if name == "run":
         return [run_object(r) for r in runs.runs(limit=500)]
     if name == "project":
-        return [{"id": r.name, "name": r.name, "github": r.github, "path": str(r.path)} for r in cfg.repos]
+        return lines_mod.list_projects(cfg)
     if name == "line":
-        return ([{"id": r.name, "kind": "pipeline", "repo": r.name, "enabled": True} for r in cfg.repos]
-                + [{"id": "loop:" + r["name"], "kind": "loop", "repo": "", "enabled": r["enabled"]}
-                   for r in control.loop_views()])
+        return lines_mod.list_lines(
+            project=values.get("project"),
+            include_archived=bool(values.get("include_archived", False)),
+        )
     if name == "view":
-        return [{"id": k, "label": v} for k, v in VIEWS.items()]
+        return lines_mod.list_views(project=values.get("project"))
     if name == "step":
         needed(runs.run_get(values["run"]), values["run"])
         inputs_by_step = runs.step_inputs_by_run(values["run"])
@@ -332,6 +366,7 @@ def event_timestamp(value, field):
 
 
 def execute(name, values, handler=None):
+    api_http.set_etag_context(None)
     prepare(name, values)
     if name == "batch.run" and handler is not None:
         for request in values["requests"]:
@@ -348,12 +383,23 @@ def execute(name, values, handler=None):
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
         if name == "batch.run":
-            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler)} for r in reads]
+            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler, conn=conn)} for r in reads]
             return {"seq": seq, "results": results}
-        return {"seq": seq, **read(name, values, handler)}
+        payload, validator = read_with_validator(name, values, handler, conn=conn)
+        if validator is not None and handler is not None:
+            api_http.set_etag_context((seq, validator))
+        return {"seq": seq, **payload}
 
 
-def read(name, values, handler):
+def read_with_validator(name, values, handler, *, conn=None):
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)
+    if name.startswith("config."):
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)
+    return read(name, values, handler, conn=conn), None
+
+
+def read(name, values, handler, *, conn=None):
     if name == "factory.get":
         from .store import factory
         return {"factory": factory.view()}
@@ -453,8 +499,17 @@ def read(name, values, handler):
             raise contract.Problem("not_found" if view == "board" else "invalid_input", f"Unknown view {view}")
         if view == "task":
             needed(task_store.task_get(values.get("id", "")), values.get("id", ""))
-        return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(),
-                "view": projection(view, values.get("id", ""))}
+        view_data = (
+            projection(
+                "board",
+                values.get("id", ""),
+                project=values.get("project"),
+                include_archived=bool(values.get("include_archived", False)),
+            )
+            if view == "board"
+            else projection(view, values.get("id", ""))
+        )
+        return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(), "view": view_data}
     if name == "settings.get":
         return {"settings": settings.current()}
     if name == "settings.resolved":
@@ -492,8 +547,10 @@ def read(name, values, handler):
             "data": encoded,
             "encoding": encoding,
         }}
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)[0]
     if name.startswith("config."):
-        return read_config(name.removeprefix("config."), values)
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)[0]
     if name == "draft.list":
         rows = drafts.list_drafts(
             state=values.get("state"),
@@ -629,7 +686,36 @@ def read(name, values, handler):
         except (OSError, ValueError, zlib.error) as error:
             raise contract.Problem("unavailable", f"Turn {target_n} cannot be decoded: {error}") from None
         return {"turn": serialize(decoded, contract.TURN_DETAIL)}
+    if name in ("project.history", "line.history", "view.history"):
+        from . import lines as lines_mod
+
+        raw_limit = values.get("limit", "100")
+        if not raw_limit.isascii() or not raw_limit.isdecimal() or not (1 <= int(raw_limit) <= 500):
+            raise contract.Problem("invalid_input", "limit must be an integer between 1 and 500")
+        raw_after = values.get("after")
+        after_seq = None
+        if raw_after is not None:
+            if not raw_after.isascii() or not raw_after.isdecimal() or len(raw_after) > 18:
+                raise contract.Problem("invalid_input", "after must be a nonnegative integer cursor")
+            after_seq = int(raw_after)
+        try:
+            if name == "project.history":
+                evs, next_after = lines_mod.project_history(values["project"], limit=int(raw_limit), after=after_seq)
+            elif name == "line.history":
+                evs, next_after = lines_mod.line_history(values["line"], limit=int(raw_limit), after=after_seq)
+            else:
+                evs, next_after = lines_mod.view_history(values["view"], limit=int(raw_limit), after=after_seq)
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        return {"events": evs, "next_after": next_after}
     if name == "task.list":
+        if view_id := values.get("view"):
+            from . import lines as lines_mod
+
+            saved_view = needed(lines_mod.get_view(view_id), view_id)
+            with foundation.reader() as conn:
+                rows = [serialize(r, contract.TASK) for r in lines_mod.query_view_tasks(conn, saved_view)]
+            return {"tasks": rows}
         return {"tasks": task_rows()}
     resource, action = name.split(".")
     if action == "get" and resource == "run":
@@ -640,6 +726,18 @@ def read(name, values, handler):
     if action == "get" and resource == "task":
         task = needed(task_store.task_get(identity), identity)
         return {"task": serialize(task, contract.TASK)}
+    if action == "get" and resource == "project":
+        from . import lines as lines_mod
+
+        return {"project": serialize(needed(lines_mod.get_project(identity), identity), contract.PROJECT)}
+    if action == "get" and resource == "line":
+        from . import lines as lines_mod
+
+        return {"line": serialize(needed(lines_mod.get_line(identity), identity), contract.LINE)}
+    if action == "get" and resource == "view":
+        from . import lines as lines_mod
+
+        return {"view": serialize(needed(lines_mod.get_view(identity), identity), contract.VIEW)}
     rows = [serialize(row, contract.RESOURCE[resource]) for row in resources(resource, values)]
     if action == "list":
         return {contract.PLURALS[resource]: rows}
@@ -647,28 +745,79 @@ def read(name, values, handler):
     if resource in ("loop", "incident", "chat"):
         detail = projection(resource, identity)
         row = {**row, "detail": detail["incident"] if resource == "incident" else detail}
-    if resource == "view":
-        row = {**row, "data": projection(identity)}
     return {resource: serialize(row, contract.RESOURCE[resource])}
 
 
-def read_config(verb, values):
+def _config_validator_parts(item: dict[str, object]) -> dict[str, object]:
+    content = item.get("content")
+    raw = content.encode("utf-8") if isinstance(content, str) else api_http.json_bytes(content)
+    return {
+        "kind": item.get("kind"),
+        "name": item.get("name"),
+        "path": item.get("path"),
+        "version": item.get("version"),
+        "content_version": item.get("content_version"),
+        "level": item.get("level"),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def read_adw_stats(name: str, *, conn=None) -> tuple[dict[str, object], str]:
+    if conn is None:
+        with foundation.one_read() as read_conn:
+            return read_adw_stats(name, conn=read_conn)
+    found = configitems.item("adw", name, conn=conn)
+    item = configitems.read(found, conn=conn)
+    usage, rev = stats.adw_stats_snapshot(conn, name)
+    return usage, stats.validator_token(_config_validator_parts(item), rev)
+
+
+def read_config_with_validator(verb, values, *, conn=None):
     if verb == "kinds":
-        return {"kinds": configitems.kinds()}
+        return {"kinds": configitems.kinds()}, None
     kind = values["kind"]
     if verb == "list":
-        return {"items": configitems.listing(kind)}
-    found = configitems.item(kind, values["name"], level=values.get("level"))
+        return {"items": configitems.listing(kind, conn=conn)}, None
+    if conn is None and verb == "read" and kind in ("prompt", "adw"):
+        with foundation.one_read() as read_conn:
+            return read_config_with_validator(verb, values, conn=read_conn)
+    historical = verb == "versions" or (
+        verb == "read" and (values.get("version") is not None or values.get("from") not in (None, "working"))
+    )
+    found = (
+        configitems.item_or_historical(kind, values["name"], level=values.get("level"), conn=conn)
+        if historical
+        else configitems.item(kind, values["name"], level=values.get("level"), conn=conn)
+    )
     if verb == "read":
-        return {"item": configitems.read(found, version=values.get("version"), level=values.get("level"),
-                                         from_ref=values.get("from"), file=values.get("file"))}
+        item = configitems.read(found, version=values.get("version"), level=values.get("level"),
+                                from_ref=values.get("from"), file=values.get("file"), conn=conn)
+        if kind == "prompt":
+            usage, rev = stats.prompt_stats_snapshot(conn, values["name"])
+            enriched = {**item, **usage}
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        if kind == "adw":
+            adw_usage, rev = stats.adw_stats_snapshot(conn, values["name"])
+            enriched = {
+                **item,
+                "runs7d": adw_usage["runs"],
+                "passRate": adw_usage["passRate"],
+                "costPerRunNusd": adw_usage["costPerRunNusd"],
+                "costPerRun": adw_usage["costPerRun"],
+            }
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        return {"item": item}, None
     if verb == "versions":
-        shas, entries = configitems.versions(found)
-        return {"versions": shas, "entries": entries}
-    diff = configitems.diff(found, values.get("from"), values.get("to"))
+        shas, entries = configitems.versions(found, conn=conn)
+        return {"versions": shas, "entries": entries}, None
+    diff = configitems.diff(found, values.get("from"), values.get("to"), conn=conn)
     if diff is None:
         raise contract.Problem("unavailable", "No config Git diff is available")
-    return {"diff": diff}
+    return {"diff": diff}, None
+
+
+def read_config(verb, values):
+    return read_config_with_validator(verb, values)[0]
 
 
 def _resolve_activate_draft_id(values: dict) -> str:
@@ -696,7 +845,20 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
             return {"draft_id": draft_row["id"], "gate": "C", "check_report": report}
         return None
     if name == "config.rollback":
-        found = configitems.item(values["kind"], values["name"])
+        found = configitems.item_or_historical(values["kind"], values["name"])
+        if configitems.is_tombstone_selector(found, str(values["to"])):
+            raise contract.Problem(
+                "validation",
+                f"Version {values['to']} of {values['kind']}/{values['name']} is a deletion tombstone and cannot be rolled back to as file bytes.",
+            )
+        live_row = drafts._current_ver_row(values["kind"], values["name"], found["path"])
+        live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        if not drafts._matches_base_version(values["base_version"], live_ver, live_row):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {values['kind']}/{values['name']} is at version {live_ver}, not {values['base_version']}.",
+                current={"kind": values["kind"], "name": values["name"], "version": live_ver},
+            )
         target = configitems.read(found, version=str(values["to"]))
         content = target["content"]
         if not isinstance(content, str):
@@ -708,6 +870,12 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
         )
         if report["ok"] and report["gate"] == "C":
             return {"kind": values["kind"], "name": values["name"], "to": values["to"],
+                    "gate": "C", "check_report": report}
+        return None
+    if name == "config.delete":
+        _, _, report = drafts.inspect_delete(values["kind"], values["name"], values["base_version"], actor, root=root)
+        if report["gate"] == "C":
+            return {"kind": values["kind"], "name": values["name"], "delete": True,
                     "gate": "C", "check_report": report}
         return None
     if name == "settings.update":
@@ -765,9 +933,22 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
 
 
 def dispatch(handler, op, path_values, query):
+    api_http.set_etag_context(None)
     name, method = op["name"], op["method"]
     identity = {k: unquote(v) for k, v in path_values.items()}
-    values = {**query, **identity}
+    coerced_query = dict(query)
+    if method == "GET":
+        props = op["input"].get("properties", {})
+        for key, raw in list(coerced_query.items()):
+            prop = props.get(key)
+            if isinstance(prop, dict) and prop.get("type") == "boolean" and isinstance(raw, str):
+                if raw == "true":
+                    coerced_query[key] = True
+                elif raw == "false":
+                    coerced_query[key] = False
+                else:
+                    raise contract.Problem("invalid_input", f"input.{key} must be boolean ('true' or 'false')")
+    values = {**coerced_query, **identity}
     write = contract.keyed_write(op)
     if method != "GET":
         body = {} if name in ("secret.set", "inbox.upload_evidence", "blob.put") else handler.body()
@@ -802,19 +983,25 @@ def dispatch(handler, op, path_values, query):
                 return upload_inbox_evidence(handler, op, identity)
             if name == "blob.put":
                 return put_blob(handler, op, identity)
-            if (name in ("config.activate", "config.rollback", "settings.update")
+            if (name in ("config.activate", "config.rollback", "config.delete", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values, handler)
-                if extra_detail is not None:
-                    if handler.credential is None or "Idempotency-Key" not in handler.headers:
-                        credential_http.require_presence(handler.credential)
-                    return inbox.defer_presence(
-                        handler,
-                        op,
-                        values,
-                        path_values,
-                        extra_detail=extra_detail,
-                    )
+                idem_key = handler.headers.get("Idempotency-Key")
+                actor_claim = claims_store.lookup(handler.actor, idem_key) if idem_key else None
+                if actor_claim is not None and actor_claim["status"]:
+                    return inbox.defer_presence(handler, op, values, path_values)
+                person_claim = claims_store.lookup(handler.person, idem_key) if idem_key else None
+                if person_claim is None or not person_claim["status"]:
+                    extra_detail = _needs_config_presence(name, values, handler)
+                    if extra_detail is not None:
+                        if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                            credential_http.require_presence(handler.credential)
+                        return inbox.defer_presence(
+                            handler,
+                            op,
+                            values,
+                            path_values,
+                            extra_detail=extra_detail,
+                        )
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])
@@ -852,11 +1039,14 @@ def dispatch(handler, op, path_values, query):
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
     "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
-    "task.create", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair", "run.step",
+    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
-    "config.draft", "config.check", "config.activate", "config.rollback", "config.try",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
     "config.ask", "config.promote", "draft.discard",
+    "project.create", "project.update", "project.restore",
+    "line.create", "line.update", "line.restore", "line.delete",
+    "view.create", "view.update", "view.restore",
 ))
 
 
@@ -1003,6 +1193,21 @@ def mutation(name, values, handler):
                 values["base_version"],
                 _config_actor(handler),
                 idem=key,
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.delete":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        try:
+            result = drafts.delete_item(
+                values["kind"],
+                values["name"],
+                values["base_version"],
+                _config_actor(handler),
+                idem=key,
+                why=str(values.get("why") or ""),
                 presence_passed=presence_ok,
             )
         except drafts.PresenceRequired:
@@ -1410,6 +1615,8 @@ def mutation(name, values, handler):
     elif name == "inbox.shelve":
         result = {"item": inbox.shelve(values["item"], base_version=values["base_version"],
                                        reason=values["reason"], until=values.get("until"))}
+    elif name == "inbox.reopen":
+        result = {"item": inbox.reopen(values["item"], base_version=values["base_version"])}
     elif name == "inbox.resolve":
         result = inbox.resolve(
             values["item"],
@@ -1497,6 +1704,56 @@ def mutation(name, values, handler):
         except refusals.Upstream as error:
             raise contract.Problem("upstream_failed", str(error)) from None
         result = {"data": item}
+    elif name in (
+        "project.create", "project.update", "project.restore",
+        "line.create", "line.update", "line.restore", "line.delete",
+        "view.create", "view.update", "view.restore",
+    ):
+        from . import lines as lines_mod
+
+        try:
+            if name == "project.create":
+                result = lines_mod.create_project(values)
+            elif name == "project.update":
+                fields = {k: v for k, v in values.items() if k not in ("project", "base_version")}
+                result = lines_mod.update_project(values["project"], values["base_version"], fields)
+            elif name == "project.restore":
+                result = lines_mod.restore_project(values["project"], values["seq"], values["base_version"])
+            elif name == "line.create":
+                result = lines_mod.create_line(values)
+            elif name == "line.update":
+                fields = {k: v for k, v in values.items() if k not in ("line", "base_version")}
+                result = lines_mod.update_line(values["line"], values["base_version"], fields)
+            elif name == "line.restore":
+                result = lines_mod.restore_line(values["line"], values["seq"], values["base_version"])
+            elif name == "line.delete":
+                result = lines_mod.delete_line(values["line"], values["base_version"])
+            elif name == "view.create":
+                result = lines_mod.create_view(values)
+            elif name == "view.update":
+                fields = {k: v for k, v in values.items() if k not in ("view", "base_version")}
+                result = lines_mod.update_view(values["view"], values["base_version"], fields)
+            else:
+                result = lines_mod.restore_view(values["view"], values["seq"], values["base_version"])
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("validation", str(error)) from None
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except lines_mod.LineInUse as error:
+            raise contract.Problem("line_in_use", str(error), blockers=error.blockers) from None
+        except lines_mod.IncompatibleWriters as error:
+            raise contract.Problem(
+                "incompatible_writers",
+                str(error),
+                blockers=error.blockers,
+                retry_guidance=error.retry_guidance,
+            ) from None
+        if handler is not None and result.get("event_seq"):
+            handler.write_receipt = {
+                "event_seq": result["event_seq"],
+                "subject": result["subject"],
+                "ver": result["ver"],
+            }
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)
@@ -1515,12 +1772,17 @@ def change_task(name, values):
     if ("kind" in values and kind not in config.KINDS) or (name == "task.create" and not body) or ("body" in values and not body):
         raise contract.Problem("invalid_input", "A task needs a body and a supported kind")
     if name == "task.create":
+        from . import lines as lines_mod
+
         repo = tasks.repo_named(config.load(), values["repo"])
         extra = {k: values[k] for k in task_store.WRITABLE_TASK_EXTRA_FIELDS if k in values}
-        identity = task_store.task_add(
-            repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
-            kind=kind, extra=extra,
-        )
+        try:
+            identity = task_store.task_add(
+                repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
+                kind=kind, extra=extra,
+            )
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("invalid_fields", str(error)) from None
     else:
         identity = values.get("task", values.get("id", "")).strip()
         if name == "task.close":
@@ -1542,11 +1804,15 @@ def change_task(name, values):
             if not task_store.task_comment(identity, author, body):
                 raise control.NotFound(f"no task {identity}")
         else:
+            from . import lines as lines_mod
+
             fields = {key: value for key, value in values.items() if key not in ("id", "base_version")}
             if not fields or ("state" in fields and fields["state"] not in config.ALL_TASK_STATES):
                 raise contract.Problem("invalid_input", "Send at least one editable field and a supported state")
             try:
                 changed = task_store.task_update(identity, values["base_version"], fields)
+            except lines_mod.ValidationError as error:
+                raise contract.Problem("invalid_fields", str(error)) from None
             except writes.VersionConflict as error:
                 raise contract.Problem("task_version_conflict", str(error),
                                        current=serialize(error.current, contract.TASK)) from error

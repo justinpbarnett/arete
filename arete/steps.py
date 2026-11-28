@@ -476,31 +476,32 @@ def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_ti
     layer = layer or config.RepoLayer(dir=Path())
     repo_name = _repo_name_for_layer(cfg, layer)
     deferred = defer_tiers and not (layer.tier_map or cfg.tier_map) and len(set(cfg.tiers) | set(layer.tiers)) > 1
-    if not deferred and not config.paused(cfg, repo=repo_name, layer=layer):
-        tier_map(cfg, layer)
-    for kind in ("", *config.KINDS):
-        for role in config.STEP_ROLES:
-            if config.paused(cfg, repo=repo_name, role=role, kind=kind, layer=layer):
-                continue
-            if deferred:
-                found = merged(cfg, layer, role, kind, {})
-                if found.get("tier") and not found.get("model"):
+    with config.prompt_binding_scope(cfg):
+        if not deferred and not config.paused(cfg, repo=repo_name, layer=layer):
+            tier_map(cfg, layer)
+        for kind in ("", *config.KINDS):
+            for role in config.STEP_ROLES:
+                if config.paused(cfg, repo=repo_name, role=role, kind=kind, layer=layer):
                     continue
-            try:
-                resolve(cfg, layer, role, kind)
-            except config.Paused:
+                if deferred:
+                    found = merged(cfg, layer, role, kind, {})
+                    if found.get("tier") and not found.get("model"):
+                        continue
+                try:
+                    resolve(cfg, layer, role, kind)
+                except config.Paused:
+                    continue
+        tests = experiments(cfg, layer)
+        config.ab_clash(tests)
+        for name, test in tests.items():
+            if deferred and "tier" in test["arm"] and "model" not in test["arm"]:
                 continue
-    tests = experiments(cfg, layer)
-    config.ab_clash(tests)
-    for name, test in tests.items():
-        if deferred and "tier" in test["arm"] and "model" not in test["arm"]:
-            continue
-        for kind in (test["kind"],) if test["kind"] else ("", *config.KINDS):
-            if config.paused(cfg, repo=repo_name, role=test["step"], kind=kind, layer=layer):
-                continue
-            try:
-                resolve(cfg, layer, test["step"], kind, side="arm")
-            except config.Paused:
-                continue
-            except ValueError as e:
-                raise ValueError(f"[ab.{name}]: {e}") from None
+            for kind in (test["kind"],) if test["kind"] else ("", *config.KINDS):
+                if config.paused(cfg, repo=repo_name, role=test["step"], kind=kind, layer=layer):
+                    continue
+                try:
+                    resolve(cfg, layer, test["step"], kind, side="arm")
+                except config.Paused:
+                    continue
+                except ValueError as e:
+                    raise ValueError(f"[ab.{name}]: {e}") from None

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import tomllib
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -457,6 +458,8 @@ def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> N
 
 @contextmanager
 def instance_fence():
+    if foundation.in_write():
+        raise ConfigRepoError("cannot acquire instance fence inside a SQLite write transaction")
     if _ACTIVE_FENCE.get() is not None:
         raise RuntimeError("instance fence is already held in this context; pass the existing fence instead of reacquiring")
     with util.lock(INSTANCE_LOCK, wait=True):
@@ -466,6 +469,19 @@ def instance_fence():
             yield fence
         finally:
             _ACTIVE_FENCE.reset(tok)
+
+
+def current_fence() -> Fence | None:
+    return _ACTIVE_FENCE.get()
+
+
+@contextmanager
+def maybe_instance_fence():
+    if (existing := _ACTIVE_FENCE.get()) is not None:
+        yield existing
+        return
+    with instance_fence() as owned:
+        yield owned
 
 
 def _verify_fence(fence: Fence | None) -> Fence | None:
@@ -973,10 +989,48 @@ def _status_paths(root: Path) -> list[str]:
     return sorted(dict.fromkeys(out))
 
 
+_PUBLICATION_VALIDATORS: dict[str, Callable[[dict[str, bytes | None], Path], None]] = {}
+
+
+def register_publication_validator(name: str, fn: Callable[[dict[str, bytes | None], Path], None]) -> None:
+    _PUBLICATION_VALIDATORS[name] = fn
+
+
+def unregister_publication_validator(name: str) -> None:
+    _PUBLICATION_VALIDATORS.pop(name, None)
+
+
+def live_tree_files(root: Path | None = None) -> dict[str, bytes]:
+    target = _root() if root is None else root
+    if not is_repo(target) or not live_sha(target):
+        return {}
+    ref = branch_name(target)
+    done = _git(["ls-tree", "-r", "-z", "--name-only", ref], target, check=False, text=False)
+    if done.returncode != 0:
+        raise ConfigRepoError(f"cannot list live config tree at {ref}")
+    out: dict[str, bytes] = {}
+    for entry in done.stdout.split(b"\0"):
+        if not entry:
+            continue
+        rel = entry.decode("utf-8", errors="replace")
+        if rel == ".gitignore" or _is_secret_rel(rel):
+            continue
+        blob = _git(["cat-file", "blob", f"{ref}:{rel}"], target, check=False, text=False)
+        if blob.returncode != 0:
+            raise ConfigRepoError(f"cannot read live config blob {ref}:{rel}")
+        out[rel] = blob.stdout
+    return out
+
+
 def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: str, source: str, *,
                          run_id: str = "", idem: str = "", note: str = "", draft_id: str = "",
                          activate_c: bool = False, fence: Fence,
                          modes: dict[str, int] | None = None, write_files: bool = True) -> str:
+    from . import lines as lines_mod
+
+    lines_mod.validate_config_line_references(changes, root)
+    for validator in tuple(_PUBLICATION_VALIDATORS.values()):
+        validator(changes, root)
     paths_sorted = sorted(changes)
     old_blobs = {rel: _live_blob(root, rel) for rel in paths_sorted}
     previous_working: dict[str, bytes | None] = {}
@@ -1039,7 +1093,8 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
             kind, name = classify_path(rel)
             origin = origin_of(rel)
             if raw is None:
-                config_store.record_deleted(
+                tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                ver = config_store.record_deleted(
                     conn,
                     kind=kind,
                     name=name,
@@ -1055,6 +1110,7 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                     f"config.{kind}.changed",
                     f"config:{kind}/{name}",
                     cls="durable",
+                    ver=ver,
                     data={
                         "path": rel,
                         "commit": sha,
@@ -1063,6 +1119,9 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                         "kind": kind,
                         "name": name,
                         "origin": origin,
+                        "version": ver,
+                        "deleted": True,
+                        "tombstone": tombstone,
                         "source": meta["source"],
                     },
                     connection=conn,
@@ -1234,32 +1293,38 @@ def _walk_history_rows(root: Path) -> list[dict]:
                 if prev := live_key.pop(op, None):
                     rows[prev]["live"] = 0
                 kind, name = classify_path(rel)
-                item_live_sha.pop((kind, name), None)
-                del_key = (origin, rel, ABSENT)
-                if del_key in rows:
-                    rows[del_key].update(
+                kn = (kind, name)
+                item_live_sha.pop(kn, None)
+                ver = item_ver.get(kn, 0)
+                if origin != "engine":
+                    ver += 1
+                    item_ver[kn] = ver
+                tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                key = (origin, rel, "")
+                if key in rows:
+                    rows[key].update(
                         kind=kind,
                         name=name,
-                        version=f"{kind}/{name}@absent",
+                        version=tombstone,
                         commit_sha=sha,
                         author=meta["author"],
                         source=meta["source"],
                         note=meta["note"],
                         at=meta["at"],
                         live=0,
-                        fields="{}",
-                        ver=0,
+                        fields='{"deleted":true}',
+                        ver=ver if origin != "engine" else 0,
                     )
                 else:
                     n = max_n.get(op, 0) + 1
                     max_n[op] = n
-                    rows[del_key] = {
+                    rows[key] = {
                         "kind": kind,
                         "name": name,
                         "origin": origin,
                         "path": rel,
-                        "sha256": ABSENT,
-                        "version": f"{kind}/{name}@absent",
+                        "sha256": "",
+                        "version": tombstone,
                         "n": n,
                         "commit_sha": sha,
                         "author": meta["author"],
@@ -1267,8 +1332,8 @@ def _walk_history_rows(root: Path) -> list[dict]:
                         "note": meta["note"],
                         "at": meta["at"],
                         "live": 0,
-                        "fields": "{}",
-                        "ver": 0,
+                        "fields": '{"deleted":true}',
+                        "ver": ver if origin != "engine" else 0,
                     }
                 continue
             blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
@@ -1373,7 +1438,13 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                     origin = origin_of(rel)
                     if status == "D":
                         kind, name = classify_path(rel)
-                        config_store.record_deleted(
+                        tombstone = f"{kind}/{name}{config_store.DELETED_SUFFIX}"
+                        old_blob = ABSENT
+                        if parent:
+                            prev = _git(["rev-parse", "--verify", f"{parent}:{rel}"], root, check=False)
+                            if prev.returncode == 0:
+                                old_blob = prev.stdout.strip()
+                        ver = config_store.record_deleted(
                             conn,
                             kind=kind,
                             name=name,
@@ -1384,6 +1455,26 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                             source=meta["source"],
                             note=meta["note"],
                             at=meta["at"],
+                        )
+                        events.emit(
+                            f"config.{kind}.changed",
+                            f"config:{kind}/{name}",
+                            cls="durable",
+                            ver=ver,
+                            data={
+                                "path": rel,
+                                "commit": sha,
+                                "old_blob": old_blob,
+                                "new_blob": ABSENT,
+                                "kind": kind,
+                                "name": name,
+                                "origin": origin,
+                                "version": ver,
+                                "deleted": True,
+                                "tombstone": tombstone,
+                                "source": meta["source"],
+                            },
+                            connection=conn,
                         )
                         continue
                     blob = _git(["cat-file", "blob", f"{sha}:{rel}"], root, check=False, text=False)
@@ -1616,7 +1707,26 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
     prev_sha = ""
     for sha in commits:
         blob = _git(["cat-file", "blob", f"{sha}:{path}"], root, check=False, text=False)
+        meta = _parse_commit_meta(root, sha)
         if blob.returncode != 0:
+            ver += 1
+            prev_sha = ""
+            if "" not in seen_n:
+                seen_n[""] = len(seen_n) + 1
+            entries.append({
+                "version": ver,
+                "content_version": f"{kind}/{name}{config_store.DELETED_SUFFIX}",
+                "commit_sha": sha,
+                "sha256": "",
+                "origin": origin,
+                "path": path,
+                "n": seen_n[""],
+                "author": meta["author"],
+                "source": meta["source"],
+                "note": meta["note"],
+                "at": meta["at"],
+                "live": False,
+            })
             continue
         raw = blob.stdout
         digest = hashlib.sha256(raw).hexdigest()
@@ -1625,7 +1735,6 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
             prev_sha = digest
         if digest not in seen_n:
             seen_n[digest] = len(seen_n) + 1
-        meta = _parse_commit_meta(root, sha)
         entries.append({
             "version": ver,
             "content_version": f"{kind}/{name}@{digest[:12]}",
@@ -1640,7 +1749,7 @@ def version_history(kind: str, name: str, path: str) -> list[dict]:
             "at": meta["at"],
             "live": False,
         })
-    if entries:
+    if entries and entries[-1]["sha256"]:
         entries[-1]["live"] = True
     entries.reverse()
     return entries

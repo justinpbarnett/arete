@@ -577,12 +577,30 @@ class Check:
             )
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
+        from . import configrepo as configrepo_mod
         from . import drafts as drafts_mod
+        from . import lines as lines_mod
 
+        lines_mod.ensure(config.load())
+        with principals.acting(principals.owner() or "hand"):
+            if lines_mod.get_line(f"{replay.SAMPLE_REPO}-pipeline") is None:
+                lines_mod.create_line({
+                    "id": f"{replay.SAMPLE_REPO}-pipeline",
+                    "project": replay.SAMPLE_REPO,
+                    "name": replay.SAMPLE_REPO,
+                    "kind": "pipeline",
+                    "repo": replay.SAMPLE_REPO,
+                })
+            if lines_mod.get_view("fixture-view") is None:
+                lines_mod.create_view({"id": "fixture-view", "name": "Fixture View", "filter": "state = ready"})
         cur_cfg_text = paths.CONFIG_FILE.read_text()
         alt_cfg_text = cur_cfg_text.replace("max_parallel = 3", "max_parallel = 4", 1)
         if alt_cfg_text == cur_cfg_text:
             alt_cfg_text = cur_cfg_text.replace("max_parallel = 2", "max_parallel = 4", 1)
+        scratch_dev = paths.CONFIG_DIR / "devices" / "scratch.toml"
+        scratch_dev.parent.mkdir(parents=True, exist_ok=True)
+        scratch_dev.write_text('kind = "ssh"\nhost = "scratch.invalid"\n', encoding="utf-8")
+        configrepo_mod.commit_hand_edits()
         draft_for_activate, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture activate")
         draft_for_try, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture try")
         draft_for_discard, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture discard")
@@ -591,7 +609,8 @@ class Check:
                       "n": "1", "ticket": send_ticket.ref, "ref": fixture_ref_link["ref"],
                       "link": str(fixture_link["id"]), "comment": str(fixture_comment["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
-                      "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
+                      "project": replay.SAMPLE_REPO, "line": f"{replay.SAMPLE_REPO}-pipeline", "view": "fixture-view",
+                      "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
                       "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
@@ -601,6 +620,7 @@ class Check:
             resource = name.partition(".")[0]
             ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
+                      "line": "demo-secondary" if name == "line.delete" else identities["line"],
                       "chat": (str(chat_for_file) if name == "chat.file"
                                else str(chat_for_send) if name in ("chat.send", "chat.session_start")
                                else identities["chat"]),
@@ -617,12 +637,23 @@ class Check:
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
                 values["base_version"] = row["version"]
+            if name in ("project.update", "line.update", "view.update"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                values["base_version"] = row["version"]
+            if name in ("project.restore", "line.restore", "view.restore"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                hist = self.read(f"/api/v1/{resource}s/{identities[resource]}/history")["events"]
+                values["base_version"] = row["version"]
+                values["seq"] = hist[0]["seq"]
+            if name == "line.delete":
+                row = self.read("/api/v1/lines/demo-secondary")["line"]
+                values["base_version"] = row["version"]
             if name == "comment.update":
                 values["base_version"] = fixture_comment["version"]
             if name == "task.restore":
                 # task.close just closed self.task right before task.restore in OPERATIONS order.
                 pass
-            if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
+            if name in ("inbox.snooze", "inbox.shelve", "inbox.reopen", "inbox.resolve"):
                 values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
             if resource == "outbox" and method != "GET":
                 cur_ob = self.read(f"/api/v1/outbox/{ob_item}")["item"]
@@ -641,6 +672,8 @@ class Check:
             if name == "config.rollback":
                 values["to"] = 2
                 values["base_version"] = self.read("/api/v1/config/step_settings/defaults")["item"]["version"]
+            if name == "config.delete":
+                values["base_version"] = self.read("/api/v1/config/device/scratch")["item"]["version"]
             if name == "config.try":
                 values["draft"] = draft_for_try["id"]
                 values["steps"] = ["plan"]
@@ -821,7 +854,7 @@ def worker(lifeline):
             codebase.load()
             children = []
 
-            def spawn(repo, tid, force=False, *, run_id=""):
+            def spawn(repo, tid, force=False, *, run_id="", line=""):
                 entry = "from arete.api_check import fixture_child; fixture_child(*sys.argv[1:])"
                 child = control.launch(child_command(SOURCE, entry, repo, str(tid), run_id), start_new_session=False)
                 children.append(child)

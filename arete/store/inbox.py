@@ -123,29 +123,34 @@ def raise_item(
     run_id: str = "",
     line: str = "",
 ) -> tuple[dict, int | None, bool]:
+    from . import projects as projects_store
+
     now = util.iso()
+    line_str = str(line or "")
+    initial_state = "paused" if (line_str and projects_store.line_is_paused(c, line_str)) else "open"
     cur = c.execute(
         "INSERT OR IGNORE INTO inbox "
         "(kind, subject, task_id, run_id, line, priority, title, detail, verbs, options, state, raised, version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, 1)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
         (
             kind,
             subject,
             str(task_id or ""),
             str(run_id or ""),
-            str(line or ""),
+            line_str,
             int(priority),
             str(title or ""),
             _encode_json(detail if detail is not None else {}),
             _encode_json(list(verbs or ())),
             _encode_json(list(options or ())),
+            initial_state,
             now,
         ),
     )
     if cur.rowcount == 1:
         row = c.execute("SELECT * FROM inbox WHERE id = ?", (cur.lastrowid,)).fetchone()
         seq = _emit(c, "inbox.raised", row)
-        if row["priority"] == 1:
+        if row["priority"] == 1 and initial_state == "open":
             _queue_high_push(row["id"])
         return decode(row), seq, True
     existing = c.execute(
@@ -153,6 +158,29 @@ def raise_item(
         (kind, subject),
     ).fetchone()
     return decode(existing), None, False
+
+
+def set_line_paused(c, line_id: str, paused: bool) -> list[dict]:
+    if not line_id or not available(c):
+        return []
+    from_state, to_state = ("open", "paused") if paused else ("paused", "open")
+    rows = c.execute(
+        "SELECT * FROM inbox WHERE line = ? AND state = ? ORDER BY id ASC",
+        (line_id, from_state),
+    ).fetchall()
+    moved: list[dict] = []
+    for row in rows:
+        new_ver = int(row["version"]) + 1
+        changed = c.execute(
+            "UPDATE inbox SET state = ?, version = ? WHERE id = ? AND state = ?",
+            (to_state, new_ver, row["id"], from_state),
+        ).rowcount
+        if not changed:
+            continue
+        after = c.execute("SELECT * FROM inbox WHERE id = ?", (row["id"],)).fetchone()
+        _emit(c, "inbox.changed", after, {"line_paused": paused})
+        moved.append(decode(after))
+    return moved
 
 
 def update_item(
@@ -346,6 +374,71 @@ def shelve_item(
     if not changed:
         return decode(after), None, False
     seq = _emit(c, "inbox.changed", after, {"shelve_reason": reason, "shelve_until": until})
+    return decode(after), seq, True
+
+
+def latest_transition_at(c, numeric_id: int) -> str | None:
+    row = c.execute(
+        "SELECT at FROM events_log WHERE subject = ? AND kind IN ('inbox.changed', 'inbox.resolved') "
+        "ORDER BY seq DESC LIMIT 1",
+        (f"inbox:{numeric_id}",),
+    ).fetchone()
+    return str(row["at"]) if row and row["at"] else None
+
+
+def other_open_by_kind_and_subject(c, kind: str, subject: str, exclude_id: int) -> dict | None:
+    row = c.execute(
+        "SELECT * FROM inbox WHERE kind = ? AND subject = ? AND state != 'resolved' AND id != ? "
+        "ORDER BY id DESC LIMIT 1",
+        (kind, subject, exclude_id),
+    ).fetchone()
+    return decode(row)
+
+
+def reopen_item(
+    c,
+    numeric_id: int,
+    *,
+    base_version: int,
+) -> tuple[dict | None, int | None, bool]:
+    row = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
+    if row is None or row["version"] != base_version:
+        return decode(row), None, False
+    state = row["state"]
+    new_ver = row["version"] + 1
+    if state == "snoozed":
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
+            "version = ? WHERE id = ? AND state = 'snoozed' AND version = ?",
+            (new_ver, numeric_id, base_version),
+        ).rowcount
+    elif state == "shelved":
+        enc_detail = row["detail"]
+        if row["kind"] == "fault":
+            detail = json.loads(row["detail"] or "{}")
+            if isinstance(detail, dict):
+                detail.pop("shelved_reason", None)
+                detail.pop("shelve_until", None)
+                enc_detail = _encode_json(detail)
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', shelve_reason = '', shelve_until = '', "
+            "shelves = MAX(0, shelves - 1), detail = ?, version = ? "
+            "WHERE id = ? AND state = 'shelved' AND version = ?",
+            (enc_detail, new_ver, numeric_id, base_version),
+        ).rowcount
+    elif state == "resolved":
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', answer = '', answered_by = '', answered_at = '', "
+            "resolution = '', resolved = '', snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
+            "shelve_until = '', version = ? WHERE id = ? AND state = 'resolved' AND version = ?",
+            (new_ver, numeric_id, base_version),
+        ).rowcount
+    else:
+        return decode(row), None, False
+    after = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
+    if not changed:
+        return decode(after), None, False
+    seq = _emit(c, "inbox.changed", after, {"reopened": True})
     return decode(after), seq, True
 
 
