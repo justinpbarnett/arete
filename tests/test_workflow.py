@@ -32,9 +32,9 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
-from adws import feature, single_worker
 from arete import (
-    accounts, api_check, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh,
+    accounts, adw, api_check, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows,
+    gh,
     guard, install, jev, journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks,
     paths, pipeline, poll, principals, prompt_loader, queueing, record, repairs, routing, runlimits, runner, sandbox,
     serve, serve_guard, slots, tailnet, tasks, tracker, util, verify, workspace,
@@ -604,7 +604,7 @@ class PipelineNoSlotTests(unittest.TestCase):
 
     def record_feedback(self, path="orchestrate", tid="765"):
         url = f"https://github.com/{self.repo.github}/pull/{tid}"
-        run = record.start("pipeline", repo=self.repo.name, issue=tid)
+        run = record.start("pipeline", repo=self.repo.name, issue=tid, adw=None if path == "classic" else path)
         self.assertTrue(record.move(run, "pr", ("running",), pr_url=url))
         with redirect_stdout(StringIO()):
             pipeline.run_lines.write(run, "execution", path=path)
@@ -2014,7 +2014,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
             return self.git(args, cwd)
 
         def start(repo_name, tid):
-            command = ["orchestrate", repo.name, self.run.tid]
+            command = [repo.name, self.run.tid]
             self.assertEqual(pipeline.run_command(repo_name, tid), command)
             with (mock.patch.object(pipeline, "pending_feedback", return_value=[{"pr_url": c.pr}]),
                   mock.patch.object(pipeline, "recorded_path", return_value="orchestrate")):
@@ -2060,7 +2060,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         with (mock.patch.object(config, "load", return_value=cfg),
               mock.patch.object(pipeline, "wanted", return_value=pipeline.ORCHESTRATED),
-              mock.patch.object(pipeline, "script_command", side_effect=lambda _, *args: list(args)),
+              mock.patch.object(pipeline, "adw_command", side_effect=lambda *args: list(args)),
               mock.patch.object(pipeline, "SKIPPED_FILE", state / "skipped.json"),
               mock.patch.object(tasks, "spawn_pending", side_effect=launch_pending),
               mock.patch.object(poll, "spawn_run", side_effect=start) as spawn,
@@ -4575,7 +4575,7 @@ class SingleWorkerPublicationTests(PublicationFixture):
                       mock.patch.object(pipeline, "release_workspace"),
                       mock.patch.object(pipeline, "commit_and_push", side_effect=AssertionError("unexpected push")) as push,
                       mock.patch.object(gh, "pr_set_draft", side_effect=AssertionError("unexpected draft change")) as draft):
-                    ending = single_worker.single_worker(controller.flow)
+                    ending = orchestration.single_worker(controller.flow)
                 publication = ledger.actions(controller.lease)[-1]
                 self.assertEqual((publication["op"], publication["state"], publication["result"]["error"]),
                                  ("publication.request", "failed", error))
@@ -5111,11 +5111,46 @@ class LateRepairOrderingTests(CarriedRepairFixture):
 
     def run_script(self, repair, review, observe, *, patch=False):
         flow, delivered = self.controller.flow, ("done", "fixture", "")
+        loaded = adw.load(None, "patch" if patch else "feature")
+        # Build a stripped ADW starting after prepare/plan/build (matching prepared=True).
+        post_build = adw.Adw(
+            name=loaded.name,
+            steps=tuple(s for s in loaded.steps if s.get("do") not in ("prepare", "plan", "patch")
+                        and not (s.get("do") == "implement" and s.get("round") == "build")),
+            path=loaded.path, level=loaded.level, raw=loaded.raw, sha256=loaded.sha256, version=loaded.version,
+        )
+        # Seed patch mode when patch=True by running through a thin ADW with a passing non-escalating patch step.
+        if patch:
+            post_build = adw.Adw(
+                name="patch",
+                steps=({"do": "prepare", "end": True}, *post_build.steps),
+                path=loaded.path, level=loaded.level, raw=loaded.raw, sha256=loaded.sha256, version=loaded.version,
+            )
+        extra_steps = {}
+        if patch:
+            extra_steps["prepare"] = lambda fl, tree: factory.Outcome("pass")
+            extra_steps["patch"] = lambda fl, tree: factory.Outcome("pass", data={"escalate": ""})
+        def fake_step(fl, name, **kw):
+            if name == "learn" and kw.get("apply"):
+                return factory.Outcome("pass")
+            if name in ("pr", "ci", "publish"):
+                return factory.Outcome("pass")
+            if name in extra_steps:
+                return extra_steps[name](fl, kw.get("tree", ""))
+            return real_step(fl, name, **kw)
+        real_step = flows.step
         with (mock.patch.object(self.build, "resume", side_effect=repair), mock.patch.object(pipeline, "_review", side_effect=review),
               mock.patch.object(pipeline, "check_in_use", side_effect=observe) as verification,
-              mock.patch.object(pipeline.record, "note"), mock.patch.object(feature, "deliver", return_value=delivered) as deliver):
-            self.assertEqual(feature.built(flow, [], prepared=True, patch=patch), delivered)
-        deliver.assert_called_once_with(flow)
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(flows, "step", side_effect=fake_step),
+              mock.patch.object(flows, "documents", return_value=False),
+              mock.patch.object(flows, "ended", return_value=delivered),
+              mock.patch.dict(factory.STEPS, {
+                  "pr": lambda fl, tree: factory.Outcome("pass"),
+                  "ci": lambda fl, tree: factory.Outcome("pass"),
+                  "publish": lambda fl: factory.Outcome("pass"),
+              })):
+            self.assertEqual(adw.drive(post_build)(flow), delivered)
         return verification.call_count
 
     def test_scripted_late_check_repair_routes_red_regression_before_another_full_suite_or_review(self):
@@ -5192,8 +5227,8 @@ class LateRepairOrderingTests(CarriedRepairFixture):
             return verify.Verified("pass", checks=[{"passed": True}], observed_trees=trees)
 
         with (mock.patch.object(pipeline, "check_in_use", side_effect=mutate), mock.patch.object(pipeline, "_review") as review):
-            why, _ = feature.final_blocker(self.controller.flow, str(self.root), patch=False, fixed=True, skipped=False,
-                                           review_needed=False)
+            why, _ = flows.final_blocker(self.controller.flow, str(self.root), patch=False, fixed=True, skipped=False,
+                                         review_needed=False)
         self.assertIn("requires new behavioral evidence", why)
         self.assertTrue(b.full_checks_current(pipeline.verification_trees(b)))
         review.assert_not_called()
@@ -11781,7 +11816,7 @@ class PromptSnapshotTests(unittest.TestCase):
         self.assertEqual(prompt_loader.template("bad", self.prompts).template, "repaired")
 
     def test_run_child_command_snapshots_templates(self):
-        command = pipeline.script_command(config.Config(), "feature")
+        command = pipeline.adw_command("sample", "1")
 
         self.assertIn("codebase.load(templates=True)", command[3])
 

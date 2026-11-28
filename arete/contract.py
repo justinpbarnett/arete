@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 19
+MINOR = 20
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -39,7 +39,7 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
             "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
             "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
-            "restart", "started_by", "payer")
+            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
 RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},

@@ -21,8 +21,8 @@ from string import Template
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from adws import feature
 from arete import (
+    adw,
     codebase,
     config,
     control,
@@ -1018,6 +1018,13 @@ class ReviewRetryTests(Isolated):
                 "draft_why": flow.ctx.held_reason, "report_body": "", "summary": "",
             })
 
+        loaded = adw.load(None, "feature")
+        post_build = adw.Adw(
+            name=loaded.name,
+            steps=tuple(s for s in loaded.steps if s.get("do") not in ("prepare", "plan")
+                        and not (s.get("do") == "implement" and s.get("round") == "build")),
+            path=loaded.path, level=loaded.level, raw=loaded.raw, sha256=loaded.sha256, version=loaded.version,
+        )
         with (patch.object(pipeline.runner, "run", side_effect=replies) as agent,
               patch.object(factory, "fingerprint", return_value="fixture-tree"),
               patch.object(pipeline, "verification_trees", return_value={"": "fixture-tree"}),
@@ -1031,7 +1038,7 @@ class ReviewRetryTests(Isolated):
                   "respond": lambda _, ending, **kw: factory.Outcome("pass", data={
                       "status": ending, "summary": kw.get("why", ""), "pr_url": "", **kw}),
               })):
-            ending = feature.built(flow, [], prepared=True)
+            ending = adw.drive(post_build)(flow)
         self.assertEqual(ending, ("pr", "", self.PR))
         return flow, agent.call_args_list
 
@@ -3233,6 +3240,7 @@ class BudgetTests(Isolated):
             run_store.save_environment_hold(parent.id, [(project, 1, url, head)])
             run_store.set_environment_waits(parent.id, {gap.signature.key: (project, number)})
             run_lines.write(parent.id, "execution", path="feature")
+            record.note(parent.id, adw="feature")
             script = pipeline.Script("feature", drive, continues=parent.id, again="verify", environment_release=sha)
             with patch.object(config, "load", return_value=self.cfg), \
                     patch.object(pipeline, "run_refusal", return_value=(True, "")), \
@@ -3297,6 +3305,8 @@ class FeedbackRevisionBudgetFixture(PollFixture):
         record.note(parent.id, active_seconds=61 * 60, verify_seconds=21 * 60, repair_calls=3)
         url = f"https://github.com/owner/fixture/pull/{number}"
         run_lines.write(parent.id, "execution", path=path)
+        if path != "classic":
+            record.note(parent.id, adw=path)
         record.settle(parent.id, "pr", pr_url=url)
         self.feedback_row = {"pr_url": url, "repo": self.repo.name, "issue": self.ticket, "kind": "comment",
                              "gh_id": 1, "body": "Please revise", "pr_state": "OPEN", "status": "new", "at_once": 0,
@@ -3413,7 +3423,7 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
         url = self.feedback_row["pr_url"]
         self.local.label(self.ticket, add=["pr"])
         interrupted = self.made_run(parent.id)
-        record.note(interrupted.id, pid=None)
+        record.note(interrupted.id, pid=None, adw="orchestrate")
         run_lines.write(interrupted.id, "execution", path="orchestrate")
         insights_store.take_feedback(insights_store.open_feedback([url]), interrupted.id)
         with patch.object(record, "SETTLE_GRACE_SECONDS", 0):
@@ -3446,7 +3456,7 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
         self.feedback_ticket()
         url = self.feedback_row["pr_url"]
         interrupted = self.made_run()
-        record.note(interrupted.id, active_seconds=1200, verify_seconds=300, repair_calls=3)
+        record.note(interrupted.id, active_seconds=1200, verify_seconds=300, repair_calls=3, adw="orchestrate")
         insights_store.take_feedback(insights_store.open_feedback([url]), interrupted.id)
         run_lines.write(interrupted.id, "execution", path="orchestrate")
         run_lines.write(interrupted.id, "step_start", step="revise")
@@ -3480,6 +3490,7 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
         self.assertEqual(run_store.newest_whole_run(self.repo.name, self.ticket)["id"], parked["id"])
 
         retry = self.made_run(parked["id"])
+        record.note(retry.id, adw="orchestrate")
         run_lines.write(retry.id, "execution", path="orchestrate")
         record.settle(retry.id, "interrupted")
         self.assertEqual(runlimits.latest_park(self.repo.name, self.ticket)[0]["id"], parked["id"])
@@ -3575,47 +3586,61 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
 
 
 class AdwFeedbackScopeTests(FeedbackRevisionBudgetFixture):
-    def test_due_feedback_uses_recorded_custom_feature_without_revise_script(self):
+    def test_due_feedback_routes_through_configured_adw_and_revises(self):
         parent = self.feedback_ticket(path="feature")
         record.note(parent.id, active_seconds=12 * 60)
-        self.cfg.adws = self.root / "custom"
-        self.cfg.adws.mkdir()
-        script = self.cfg.adws / "feature.py"
-        script.write_text(
-            "def feature(flow):\n"
-            "    flow.step('revise')\n"
-            "    return 'pr', 'revised', flow.ctx.run.feedback_prs[0]\n"
+        custom_dir = paths.CONFIG_DIR / "adws"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        (custom_dir / "revise.toml").write_text(
+            'schema = 1\nname = "revise"\n'
+            '[[steps]]\ndo = "revise"\nend = true\n'
+            '[[steps]]\ndo = "publish"\nend = true\n'
+            '[[steps]]\nfinish = "last"\n'
         )
         reached = []
 
-        def revise(flow):
+        def revise(flow, tree):
             run = flow.ctx.run
             reached.append([row["gh_id"] for row in run.feedback])
             self.assertEqual((flow.continues, run.repairs), ("", ""))
             self.assertEqual(run.budget.prior_repairs, 3)
             row, = insights_store.open_feedback(run.feedback_prs)
             self.assertEqual((row["status"], row["run_id"]), ("taken", run.id))
-            return factory.Outcome("pass")
+            return factory.Outcome("pass", data={"plan": "", "goal": "", "left_for_a_person": "", "summary": "revised", "replies": []})
+
+        def publish(flow):
+            return factory.Outcome("pass", data={"ending": "pr", "summary": "revised", "prs": {"": flow.ctx.run.feedback_prs[0]}})
 
         def spawn(repo, tid):
             command = pipeline.run_command(repo, tid)
-            self.assertIn(str(script), command)
+            self.assertEqual(command[-2:], [repo, tid])
             _, env = launch_lease.child_environment(())
             with patch.dict(os.environ, env), patch.object(launch_lease, "registered"), \
                     patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                    patch.dict(factory.STEPS, {"revise": revise}):
+                    patch.object(pipeline, "record_prs", return_value=self.feedback_row["pr_url"]), \
+                    patch.object(pipeline, "release_workspace"), \
+                    patch.dict(factory.STEPS, {"revise": revise, "publish": publish}):
                 with self.assertRaises(SystemExit) as result:
-                    factory.main(pipeline.flow_function(self.cfg, "feature"), command[-2:])
+                    factory.main(command[-2:])
                 self.assertEqual(result.exception.code, 0)
 
         self.assertEqual(self.poll_with(self.cfg, spawn), 0)
         revised = run_store.newest_whole_run(self.repo.name, self.ticket)
+        self.assertEqual((revised["adw"], revised["adw_rule"]), ("revise", "feedback-revise"))
         interrupted = self.made_run(revised["id"])
+        record.note(interrupted.id, adw="repair")
         run_lines.write(interrupted.id, "execution", path="repair")
         run_lines.write(interrupted.id, "repair", source=revised["id"])
         run_lines.write(interrupted.id, "step_start", step="prepare")
         record.settle(interrupted.id, "interrupted")
         insights_store.add_feedback([{**self.feedback_row, "gh_id": 2}])
+        routes_dir = paths.CONFIG_DIR / "routes"
+        routes_dir.mkdir(parents=True, exist_ok=True)
+        (routes_dir / "adw.toml").write_text(
+            'schema = 1\n'
+            '[[rule]]\nid = "feedback-revise"\nwhen = { event = "feedback" }\nadw = "revise"\n'
+            '[[rule]]\nid = "default"\nadw = "feature"\n'
+        )
 
         self.assertEqual(self.poll_with(self.cfg, spawn), 0)
         self.assertEqual(reached, [[1], [2]])
@@ -3623,27 +3648,26 @@ class AdwFeedbackScopeTests(FeedbackRevisionBudgetFixture):
 
     def test_standalone_verify_with_pending_feedback_keeps_inherited_budget(self):
         parent = self.feedback_ticket(path="feature")
-        record.note(parent.id, active_seconds=12 * 60)
+        record.note(parent.id, active_seconds=12 * 60, adw="feature")
         run_lines.write(parent.id, "task", path="feature")
         run_lines.write(parent.id, "step_start", step="verify")
         verified = []
 
-        def verify(flow):
+        def verify(flow, tree):
             with flow.ctx.run.budget.verifying():
                 verified.append(flow.run_id)
             return factory.Outcome("pass")
 
         def drive(flow):
-            flow.step("verify")
+            flow.step("verify", tree=str(flow.ctx.ws))
             return "step", "", ""
 
         with patch.object(config, "load", return_value=self.cfg), \
                 patch.object(pipeline, "run_refusal", return_value=(True, "")), \
                 patch.dict(factory.STEPS, {"verify": verify}), \
-                patch.object(pipeline, "flow_function", return_value=drive):
-            fn, argv = factory.earlier([parent.id, "verify"])
+                patch.object(adw, "drive", return_value=drive):
             with self.assertRaises(SystemExit) as result:
-                factory.main(fn, argv)
+                factory.main([self.repo.name, str(self.ticket), "--continue", parent.id, "--only", "verify"])
             self.assertEqual(result.exception.code, 1)
 
         newest = run_store.ticket_runs(self.repo.name, self.ticket, limit=1)[0]
@@ -3708,7 +3732,7 @@ class AdwFeedbackScopeTests(FeedbackRevisionBudgetFixture):
                 script = pipeline.Script("revise", drive)
 
                 def spawn(repo, tid):
-                    self.assertEqual(pipeline.run_command(repo, tid), pipeline.script_command(self.cfg, "revise", repo, tid))
+                    self.assertEqual(pipeline.run_command(repo, tid), pipeline.adw_command(repo, tid))
                     _, env = launch_lease.child_environment(())
                     with patch.dict(os.environ, env), patch.object(launch_lease, "registered"):
                         self.assertEqual(pipeline.run_issue(repo, tid, script=script), 0)
@@ -3816,6 +3840,7 @@ class FeedbackRevisionRegressionTests(FeedbackRevisionBudgetFixture):
     def test_interrupted_adw_feature_can_resume_during_the_feedback_quiet_period(self):
         parent = self.feedback_ticket(path="feature")
         interrupted = self.made_run(parent.id)
+        record.note(interrupted.id, adw="feature")
         run_lines.write(interrupted.id, "execution", path="feature")
         record.settle(interrupted.id, "interrupted")
 
@@ -3848,18 +3873,20 @@ class BuiltInFeedbackPublicationTests(FeedbackRevisionBudgetFixture):
         record.note(parent.id, active_seconds=0, verify_seconds=0)
         url = self.feedback_row["pr_url"]
 
-        def publish(flow, *args, **kwargs):
+        def drive_prepare_and_pr(flow):
+            ws = str(flow.ctx.ws)
+            if not (outcome := flows.step(flow, "prepare", tree=ws)).passed:
+                return flows.ended(flow, outcome)
             self.assertEqual(flow.ctx.run.feedback, [])
-            return flows.step(flow, "pr", tree=str(flow.ctx.ws))
+            return flows.ended(flow, flows.step(flow, "pr", tree=ws))
 
-        script = pipeline.Script("feature", feature.feature)
+        script = pipeline.Script("feature", drive_prepare_and_pr)
         with (patch.object(config, "load", return_value=self.cfg),
               patch.object(pipeline, "run_refusal", return_value=(True, "")),
               patch.object(flows, "local_workspace", return_value=[]),
               patch.object(pipeline, "settle_starts"),
               patch.object(pipeline, "furnish", return_value=""),
               patch.object(workspace, "note_made"),
-              patch.object(feature, "built", side_effect=publish),
               patch.object(gh, "pr_view", side_effect=[{"state": "OPEN"}, {"state": "CLOSED"}]) as pr_view,
               patch.object(flows, "settle_unpushed_checkouts") as settle,
               patch.object(pipeline, "commit_and_push") as push):
@@ -3891,6 +3918,7 @@ class OwnerAnswerBudgetFixture(PollFixture):
         asks = [{"ask_id": "ask-fixture", "step": "review", "call": "review", "questions": [
             {"kind": "text", "header": "CI log", "question": question}]}] if structured else None
         if structured:
+            record.note(asked.id, adw="feature")
             run_lines.write(asked.id, "execution", path="feature")
         with patch.object(pipeline, "release_workspace"), patch.object(pipeline.alerts, "ask_notice"):
             status, summary, _ = pipeline._ask(asked, self.repo.path, [], question, question, asks,
@@ -3930,7 +3958,7 @@ class OwnerAnswerBudgetFixture(PollFixture):
         self.assertEqual(run.answers_due, [])
 
     def run_polled_answer(self, repo, tid, asked, work):
-        self.assertEqual(pipeline.run_command(repo, tid)[-2:], ["--continue", asked.id])
+        self.assertEqual(pipeline.run_command(repo, tid), pipeline.adw_command(repo, tid))
         script = pipeline.Script("feature", lambda flow: work(flow.ctx.run), continues=asked.id)
         self.assertEqual(self.run_polled_ticket(repo, tid, lambda *_: self.fail("started an ordinary run"), script), 0)
 
@@ -4201,9 +4229,8 @@ class PrAnswerFixture(PollFixture):
         exit_codes = []
 
         def spawn(repo, tid):
-            self.assertEqual(pipeline.run_command(repo, tid),
-                             pipeline.script_command(self.cfg, path, repo, str(tid), "--continue", asked.id))
-            script = pipeline.Script(path, pipeline.flow_function(self.cfg, path), continues=asked.id)
+            self.assertEqual(pipeline.run_command(repo, tid), pipeline.adw_command(repo, str(tid)))
+            script = pipeline.Script("", None)
             exit_codes.append(self.run_polled_ticket(repo, tid, lambda *_: self.fail("started an ordinary run"), script))
 
         self.assertEqual(self.poll_with(self.cfg, spawn), 0)
@@ -4375,10 +4402,12 @@ class AdwRevisionFeedbackTests(AdwPrFixture):
         self.configure_adw()
         pr = "https://github.com/owner/project/pull/1"
         published = self.made_run()
+        record.note(published.id, adw="feature")
         run_lines.write(published.id, "execution", path="feature")
         record.settle(published.id, "pr", pr_url=pr)
         asked = self.made_run(published.id)
         asked.path = "revise"
+        record.note(asked.id, adw="revise")
         run_lines.write(asked.id, "execution", path="revise")
         original, fresh = "Please rename the button.", "Please also move the icon."
         self.add_pr_comment(pr, original, util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES + 3))
@@ -4422,8 +4451,7 @@ class AdwRevisionFeedbackTests(AdwPrFixture):
                 with (patch.object(config, "load", return_value=self.cfg),
                       patch.object(pipeline, "has_origin", return_value=True),
                       self.assertRaises(SystemExit) as result):
-                    factory.main(pipeline.flow_function(self.cfg, "revise"),
-                                 [self.repo.name, self.ticket, "--continue", asked.id, "--only", "review"])
+                    factory.main([self.repo.name, self.ticket, "--continue", asked.id, "--only", "review"])
                 rerun = next(row for row in run_store.ticket_runs(self.repo.name, self.ticket) if row["only_step"])
                 self.assertEqual(result.exception.code, 0, rerun["summary"])
             else:
@@ -4475,6 +4503,7 @@ class AdwRepairContinuationTests(AdwPrFixture):
         record.settle(published.id, "pr", pr_url=pr, branch="fixture")
         asked = self.made_run(published.id)
         asked.path, asked.repairs = "repair", published.id
+        record.note(asked.id, adw="repair")
         run_lines.write(asked.id, "execution", path="repair")
         run_lines.write(asked.id, "repair", source=published.id)
         prior = flows.start(self.cfg, asked, {})
@@ -5138,7 +5167,7 @@ class HeldRepairDraftTests(HeldRepairDraftFixture):
               patch.object(job.run.budget, "verifying", side_effect=contextlib.nullcontext),
               patch.object(pipeline, "check_in_use", side_effect=[pipeline.verify.Verified("fail"), gap]),
               patch.object(pipeline.Build, "push")):
-            self.assertIsNone(feature.final_blocker(flow, str(job.ws), patch=False, fixed=True, skipped=False, review_needed=False))
+            self.assertIsNone(flows.final_blocker(flow, str(job.ws), patch=False, fixed=True, skipped=False, review_needed=False))
             self.assertNotEqual(job.review.trees, before)
             self.assertEqual(job.review.trees, pipeline.verification_trees(job.b))
             published = self.publish_fixture()
@@ -5634,6 +5663,7 @@ class FailedPollBudgetTests(ReadmissionFixture):
     def assert_fresh_feedback_logged_on_lookup_failure(self, *, timeout):
         url = "https://github.com/owner/fixture/pull/1"
         failed = self.failed_with_spent_repairs(pr_url=url)
+        record.note(failed.id, adw="orchestrate")
         run_lines.write(failed.id, "execution", path="orchestrate")
         record.note(failed.id, active_seconds=180, verify_seconds=60)
         insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
@@ -5653,7 +5683,7 @@ class FailedPollBudgetTests(ReadmissionFixture):
 
         def spawn(repo, tid):
             command = pipeline.run_command(repo, tid)
-            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
+            self.assertEqual(command[-2:], [repo, tid])
             script = pipeline.Script("orchestrate", lambda _: self.fail("started work after lookup failure"),
                                      continues=failed.id)
             with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
@@ -5692,6 +5722,7 @@ class FailedPollBudgetTests(ReadmissionFixture):
     def test_poll_continuation_drops_spent_repairs_after_specification_edit(self):
         url = "https://github.com/owner/fixture/pull/1"
         failed = self.failed_with_spent_repairs(pr_url=url)
+        record.note(failed.id, adw="orchestrate")
         run_lines.write(failed.id, "execution", path="orchestrate")
         insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
                                       "kind": "comment", "gh_id": 1, "body": "Please revise", "pr_state": "OPEN",
@@ -5714,8 +5745,8 @@ class FailedPollBudgetTests(ReadmissionFixture):
 
         def spawn(repo, tid):
             command = pipeline.run_command(repo, tid)
-            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
-            script = pipeline.Script("orchestrate", drive, continues=command[-1])
+            self.assertEqual(command[-2:], [repo, tid])
+            script = pipeline.Script("orchestrate", drive, continues=failed.id)
             timer = Mock()
 
             def slow_lookup(*_):

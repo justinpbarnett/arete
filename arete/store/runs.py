@@ -10,6 +10,7 @@ from ..agent import billing_of
 from . import events, writes
 from ._rows import json_dict, validate_columns
 from .db import (
+    RUNS_ADW_SCHEMA,
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
     RUNS_PROMPT_BINDING_SCHEMA,
@@ -22,6 +23,7 @@ from .db import (
 STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind", "auth_mode"))
 PINS_RUN_FIELDS = frozenset(("config_commit", "resolved_sha"))
 LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "payer", "seq"))
+ADW_RUN_FIELDS = frozenset(("adw", "adw_version", "adw_rule"))
 
 
 def has_pins(c) -> bool:
@@ -34,6 +36,10 @@ def has_prompt_binding(c) -> bool:
 
 def has_lineage(c) -> bool:
     return migration_applied(RUNS_LINEAGE_SCHEMA, c)
+
+
+def has_adw(c) -> bool:
+    return migration_applied(RUNS_ADW_SCHEMA, c)
 
 
 def seq_col(c, alias: str = "") -> str:
@@ -52,6 +58,8 @@ def filter_run_fields(c, fields: dict) -> dict:
         drop |= PINS_RUN_FIELDS
     if not has_lineage(c):
         drop |= LINEAGE_RUN_FIELDS
+    if not has_adw(c):
+        drop |= ADW_RUN_FIELDS
     if not drop:
         return fields
     return {k: v for k, v in fields.items() if k not in drop}

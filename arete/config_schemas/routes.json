@@ -1,83 +1,43 @@
 {
   "type": "object",
   "properties": {
-    "fallback": {"type": "boolean"},
-    "payment_modes": {
+    "schema": {"type": "integer", "enum": [1]},
+    "rule": {
       "type": "array",
-      "items": {"type": "string", "enum": ["subscription", "api_key", "local"]},
-      "x-arete-reach": true
-    },
-    "capabilities": {"$ref": "#/$defs/capabilities"},
-    "floors": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {"type": "string"}
-      },
-      "x-arete-reach": true
-    },
-    "paid": {"$ref": "#/$defs/paid"}
+      "items": {"$ref": "#/$defs/rule"}
+    }
   },
+  "required": ["schema", "rule"],
   "additionalProperties": false,
-  "x-arete-reach": true,
   "$defs": {
-    "tier_entry": {
+    "string_or_list": {
+      "type": ["string", "array"],
+      "items": {"type": "string"}
+    },
+    "when": {
       "type": "object",
       "properties": {
-        "runner": {"type": "string"},
-        "provider": {"type": "string"},
-        "model": {"type": "string"}
+        "event": {"$ref": "#/$defs/string_or_list"},
+        "repaired_by": {"type": "boolean"},
+        "repo": {"$ref": "#/$defs/string_or_list"},
+        "kind": {"$ref": "#/$defs/string_or_list"}
       },
       "additionalProperties": false
     },
-    "tier": {
-      "type": ["object", "array"],
-      "properties": {
-        "runner": {"type": "string"},
-        "provider": {"type": "string"},
-        "model": {"type": "string"}
-      },
-      "additionalProperties": false,
-      "items": {"$ref": "#/$defs/tier_entry"},
-      "x-arete-reach": true
-    },
-    "tiers": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": {"$ref": "#/$defs/tier"}
-      },
-      "x-arete-reach": true
-    },
-    "capability": {
+    "rule": {
       "type": "object",
       "properties": {
-        "modalities": {
-          "type": "array",
-          "items": {"type": "string"}
-        },
-        "context": {"type": "integer"},
-        "structured_output": {"type": "boolean"},
-        "data_handling": {"type": "string"}
+        "id": {"type": "string"},
+        "when": {"$ref": "#/$defs/when"},
+        "adw": {"type": "string"},
+        "set": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "integer", "number", "boolean", "array"]
+          }
+        }
       },
-      "additionalProperties": false,
-      "x-arete-reach": true
-    },
-    "capabilities": {
-      "type": "object",
-      "additionalProperties": {"$ref": "#/$defs/capability"},
-      "x-arete-reach": true
-    },
-    "paid": {
-      "type": "object",
-      "properties": {
-        "providers": {
-          "type": "array",
-          "items": {"type": "string"}
-        },
-        "max_input": {"type": "number"},
-        "max_output": {"type": "number"}
-      },
+      "required": ["id", "adw"],
       "additionalProperties": false
     }
   }

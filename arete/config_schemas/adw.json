@@ -1,1 +1,13 @@
-{"type": "string", "x-arete-read-only": true}
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "name": {"type": "string"},
+    "steps": {
+      "type": "array",
+      "items": {"type": "object"}
+    }
+  },
+  "required": ["schema", "name", "steps"],
+  "additionalProperties": false
+}

@@ -26,7 +26,9 @@ class Resolution:
     layer: config.RepoLayer | None
     repo: config.Repo | None
     task_kind: str
-    adw: dict | None
+    adw: str | None
+    adw_version: str | None
+    adw_rule: str | None
     settings: dict[str, steps.Settings]
     settings_provenance: dict[str, dict[str, dict]]
     settings_snapshots: dict[str, str]
@@ -174,8 +176,7 @@ def _rebase_cfg(cfg: config.Config, live_root: Path, pinned_root: Path) -> confi
         for r in cfg.repos
     ]
     loop_dirs = [_rebase_path(d, live_root, pinned_root) or d for d in cfg.loop_dirs]
-    adws = _rebase_path(cfg.adws, live_root, pinned_root)
-    return replace(cfg, repos=repos, loop_dirs=loop_dirs, adws=adws)
+    return replace(cfg, repos=repos, loop_dirs=loop_dirs)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -417,24 +418,20 @@ def _load_schemas(engine_sha: str, *, config_dir: Path | None = None, config_com
     return objects, meta
 
 
-def _adw_info(cfg: config.Config, adw_path: str, engine_sha: str, config_dir: Path,
-              repo_root: Path | None) -> dict | None:
-    if not adw_path:
-        return None
-    candidates = []
-    if cfg.adws:
-        candidates.append(cfg.adws / f"{adw_path}.py")
-    candidates.append(paths.ADWS_DIR / f"{adw_path}.py")
-    for candidate in candidates:
-        if candidate.is_file():
-            raw = candidate.read_bytes()
-            sha = hashlib.sha256(raw).hexdigest()
-            return {
-                "path": relative_path(candidate, repo_root=repo_root, config_dir=config_dir),
-                "version": f"adw/{adw_path}@{sha[:12]}",
-                "sha256": sha,
-            }
-    return {"path": adw_path, "version": f"adw/{adw_path}@{engine_sha[:12]}" if engine_sha else adw_path}
+def _adw_fields(adw_name: str, adw_version: str, adw_rule: str, engine_sha: str,
+                config_dir: Path) -> tuple[str | None, str | None, str | None]:
+    if not adw_name or adw_name == "classic":
+        return None, None, None
+    resolved_ver = adw_version
+    if not resolved_ver:
+        for candidate in (config_dir / "adws" / f"{adw_name}.toml", paths.ENGINE_ADWS_DIR / f"{adw_name}.toml"):
+            if candidate.is_file():
+                sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                resolved_ver = f"adw/{adw_name}@{sha[:12]}"
+                break
+        else:
+            resolved_ver = f"adw/{adw_name}@{engine_sha[:12]}" if engine_sha else f"adw/{adw_name}@engine"
+    return adw_name, resolved_ver or None, adw_rule or None
 
 
 def _collect_loop_files(cfg: config.Config, loop_name: str, config_dir: Path,
@@ -503,24 +500,35 @@ def _collect_harness(repo: config.Repo | None, layer: config.RepoLayer | None, h
     }
 
 
+def pin_config(*, cfg: config.Config | None = None, config_commit: str | None = None,
+               config_dir: Path | None = None) -> tuple[str, Path, config.Config]:
+    live_root = paths.CONFIG_DIR.resolve()
+    commit = config_commit if config_commit is not None else (configrepo.live_sha() if configrepo.is_repo() else "")
+    if commit:
+        pinned_dir = config_dir if config_dir is not None else config_checkout(commit)
+        pinned_cfg = cfg if (cfg is not None and config_dir is not None) else _rebase_cfg(
+            config.load(pinned_dir / "config.toml", base_dir=pinned_dir), live_root, pinned_dir,
+        )
+        return commit, pinned_dir, pinned_cfg
+    pinned_dir = config_dir if config_dir is not None else live_root
+    pinned_cfg = cfg if cfg is not None else config.load()
+    return "", pinned_dir, pinned_cfg
+
+
 def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.RepoLayer | Path | None = None,
             overrides: dict[str, dict] | None = None, arm: dict | None = None,
             task_kind: str = "", prompts_dir: Path | None = None, prompts_level: str = "",
             prompts_from: str = "", ab_ticket: tuple[str, str] | None = None,
             ab_held: dict[str, tuple[str, str, dict]] | None = None,
-            harness_source=None, adw_path: str = "", loop_name: str = "",
-            cfg: config.Config | None = None, engine_sha: str | None = None,
+            harness_source=None, adw_path: str = "", adw_name: str = "", adw_version: str = "",
+            adw_rule: str = "", loop_name: str = "",
+            cfg: config.Config | None = None, config_commit: str | None = None,
+            config_dir: Path | None = None, engine_sha: str | None = None,
             draft_id: str = "") -> Resolution:
     engine_sha = codebase.STAMP if engine_sha is None else engine_sha
     schema_version = foundation.LATEST
-    config_commit = configrepo.live_sha() if configrepo.is_repo() else ""
     live_root = paths.CONFIG_DIR.resolve()
-    if config_commit:
-        config_dir = config_checkout(config_commit)
-        pinned_cfg = _rebase_cfg(config.load(config_dir / "config.toml", base_dir=config_dir), live_root, config_dir)
-    else:
-        config_dir = live_root
-        pinned_cfg = cfg if cfg is not None else config.load()
+    config_commit, config_dir, pinned_cfg = pin_config(cfg=cfg, config_commit=config_commit, config_dir=config_dir)
 
     resolved_repo: config.Repo | None = None
     if isinstance(repo, str) and repo:
@@ -642,7 +650,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             "sha256": hashlib.sha256(_canonical_json_bytes(loaded_prices)).hexdigest(),
         }
 
-    adw_meta = _adw_info(pinned_cfg, adw_path, engine_sha, config_dir, repo_root)
+    resolved_adw, resolved_adw_version, resolved_adw_rule = _adw_fields(
+        adw_name or adw_path, adw_version, adw_rule, engine_sha, config_dir,
+    )
     loop_files = _collect_loop_files(pinned_cfg, loop_name, config_dir, repo_root)
     harness_meta = _collect_harness(resolved_repo, resolved_layer, harness_source, blobs_out)
 
@@ -655,7 +665,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         }
 
     resolved_doc = {
-        "adw": adw_meta,
+        "adw": resolved_adw,
+        "adw_rule": resolved_adw_rule,
+        "adw_version": resolved_adw_version,
         "arm": arm_summary,
         "config_commit": config_commit,
         "engine_sha": engine_sha,
@@ -690,7 +702,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         layer=resolved_layer,
         repo=resolved_repo,
         task_kind=task_kind,
-        adw=adw_meta,
+        adw=resolved_adw,
+        adw_version=resolved_adw_version,
+        adw_rule=resolved_adw_rule,
         settings=resolved_settings,
         settings_provenance=settings_prov,
         settings_snapshots=snapshots,

@@ -726,7 +726,7 @@ class Discovery:
         sources: dict[str, str] = {}
 
         def take(values: dict, source: str, only_missing: bool = False) -> None:
-            for key in configschema.keys(configschema.schema("routes", "$defs", "capability")):
+            for key in configschema.keys(configschema.schema("routing", "$defs", "capability")):
                 if values.get(key) is not None and not (only_missing and key in found):
                     found[key], sources[key] = values[key], source
 

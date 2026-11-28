@@ -120,8 +120,10 @@ def child():
     ticket = task_store.task_add(repo.name, spec["prompt"], spec["title"], "feat")
     layer = config.load_layer(repo.layer_dir)
     budget = CandidateBudget(spec["limits"], repo.name, ticket, root, layer.orchestration.max_workers)
+    from .. import adw
+
     path = {"fixed": "feature", "single-worker": "single_worker", "orchestrated": "orchestrate"}[spec["executor"]]
-    drive = pipeline.flow_function(cfg, path)
+    drive = adw.drive_named(cfg, path)
     if "max_builders" in spec:
         from .. import orchestration
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import errno
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -2276,8 +2275,8 @@ def split_comment(estimate: int, limit: int, split: list[dict], queue_hint: str,
 
 @dataclass
 class Script:
-    path: str
-    drive: Callable
+    path: str = ""
+    drive: Callable | None = None
     continues: str = ""
     only: str = ""
     overrides: dict[str, dict] = field(default_factory=dict)
@@ -2288,6 +2287,9 @@ class Script:
     environment_release: str = ""
     settings_args: tuple[str, ...] = ()
     restart: str = ""
+    adw: str = ""
+    rule: str = ""
+    adw_version: str = ""
 
     @property
     def run_fields(self) -> dict:
@@ -2295,35 +2297,11 @@ class Script:
                 "action": self.action, "action_only": self.action_only, "environment_release": self.environment_release}
 
 
-def script_file(cfg: config.Config, name: str) -> Path:
-    folder = paths.ADWS_DIR if name in ("orchestrate", "single_worker") else cfg.adws or paths.ADWS_DIR
-    if not folder.is_dir():
-        raise FileNotFoundError(f"adws folder {folder} does not exist")
-    if not (found := folder / f"{name}.py").is_file():
-        raise FileNotFoundError(f"no adw script {found}")
-    return found
-
-
-def flow_function(cfg: config.Config, name: str) -> Callable:
-    found = script_file(cfg, name)
-    if str(found.parent) not in sys.path:
-        sys.path.insert(0, str(found.parent))
-    spec = importlib.util.spec_from_file_location(f"adws_{name}", found)
-    module = sys.modules[spec.name] = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if (fn := getattr(module, name, None)) is None:
-        raise AttributeError(f"{found} defines no function {name}, which a script in adws/ names after its file")
-    return fn
-
-
-def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
-    script = script_file(cfg, name).resolve()
-    if script.parent == paths.ADWS_DIR.resolve():
-        entrypoint = (f"import sys, runpy; sys.path[:0] = {[str(paths.PACKAGE_DIR.parent), str(script.parent)]!r}; "
-                      "from arete import codebase; codebase.load(templates=True); "
-                      f"runpy.run_path({str(script)!r}, run_name='__main__')")
-        return [sys.executable, "-I", "-c", entrypoint, *args]
-    return sandbox.protected_command([sys.executable, str(script), *args])
+def adw_command(*args: str) -> list[str]:
+    entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+                  "from arete import codebase, factory; codebase.load(templates=True); "
+                  "factory.main()")
+    return [sys.executable, "-I", "-c", entrypoint, *args]
 
 
 def answer_text(asked_id: str) -> str:
@@ -2334,26 +2312,14 @@ def answer_text(asked_id: str) -> str:
 
 
 def recorded_path(run_id: str) -> str:
+    row = run_store.run_get(run_id)
+    if row and row.get("adw"):
+        return str(row["adw"])
     from .store import orchestration
 
     if found := orchestration.find(run_id):
-        return found["data"].get("mode", "orchestrate")
-    for read in factory.chain(run_id):
-        if execution := factory.first(read, "execution"):
-            return str(execution.get("path") or "classic")
-        if path := factory.first(read, "task").get("path"):
-            return str(path)
+        return str(found["data"].get("mode") or "orchestrate")
     return "classic"
-
-
-def custom_revision_feature(cfg: config.Config) -> bool:
-    return bool(cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve()
-                and (cfg.adws / "feature.py").is_file() and not (cfg.adws / "revise.py").is_file())
-
-
-def custom_feedback_fallback(cfg: config.Config, mode: str, feedback: list[dict]) -> bool:
-    return (custom_revision_feature(cfg) and insights_store.has_new_feedback(feedback)
-            and (mode == ADW or mode == "repair" and not (cfg.adws / "repair.py").is_file()))
 
 
 def dispatch_path(repo: config.Repo, tid: str) -> str:
@@ -2371,47 +2337,15 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
     repo = cfg.repo(repo_name)
     if not tracker.is_task_id(tid) and (spec or spec_store.find(repo.name, str(tid))):
-        return script_command(cfg, "orchestrate", repo.name, str(tid), *flags)
+        return adw_command(repo.name, str(tid), "--adw", "orchestrate", *flags)
     mode = dispatch_path(repo, str(tid))
-    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
-        mode = recorded_path(asked["id"])
-        if mode != "classic":
-            return script_command(cfg, mode, repo_name, str(tid), *flags, "--continue", asked["id"])
     if mode == "classic":
+        if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+            asked_mode = recorded_path(asked["id"])
+            if asked_mode != "classic":
+                return adw_command(repo_name, str(tid), *flags)
         return control.command(["run", repo_name, str(tid), "--local", *flags])
-    if mode in (ORCHESTRATED, "orchestrate"):
-        from . import requeue
-        from .store import orchestration
-
-        newest = run_store.newest_whole_run(repo_name, str(tid))
-        source = newest if newest and newest["status"] == "interrupted" else (
-            next(iter(run_store.open_runs(repo_name, str(tid))), None)
-            if not force and pending_feedback(repo_name, str(tid)) else None)
-        if (requeue.policy_retry(run_store.newest_live_whole_run(repo_name, str(tid)))
-                or dry_run and run_store.held_environment_branch(repo_name, str(tid))):
-            source = None
-        previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
-        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
-                              *(["--continue", previous] if previous else []))
-    if mode in (ADW, "repair") and custom_feedback_fallback(cfg, mode, pending_feedback(repo_name, str(tid))):
-        return script_command(cfg, "feature", repo_name, str(tid), *flags)
-    if mode != ADW:
-        return script_command(cfg, mode, repo_name, str(tid), *flags)
-    newest = run_store.newest_whole_run(repo_name, str(tid))
-    if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
-        return script_command(cfg, "repair", repo_name, str(tid), *flags)
-    name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
-    return script_command(cfg, name, repo_name, str(tid), *flags)
-
-
-def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
-    try:
-        command = run_command(repo_name, tid, force, dry_run)
-    except FileNotFoundError as e:
-        print(e)
-        return 1
-    sys.stdout.flush()
-    os.execv(command[0], command)
+    return adw_command(repo.name, str(tid), *flags)
 
 
 def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script, dry_run: bool = False) -> str:
@@ -2424,9 +2358,7 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
         if (not reruns_verify or not script.continues or dry_run or script.only or script.action_only
                 or script.repairs or pending_feedback(repo.name, tid)
                 or environment_gaps.live_release() != script.environment_release
-                or recorded_path(script.continues) != script.path
-                or (script.path in environment_gaps.STEP_PATHS and cfg.adws
-                    and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+                or recorded_path(script.continues) != script.path):
             return "the verification retry requires its selected release to be live and the PR to be awaiting verification"
     if script.action and (script.path != "orchestrate" or not script.continues or script.only or script.again):
         return "--action needs an orchestrated --continue without --only or --from"
@@ -2666,10 +2598,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         recovery_child = launch_lease.recovery(repo.name, str(tid))
         parent = os.getenv(factory_state.CONTINUATION)
         continuing_classic = parent and recorded_path(parent) == "classic"
-        adw = not (recovery_child or continuing_classic) and dispatch_path(repo, str(tid)) != "classic"
-    if adw and not script:
-        return exec_script(repo.name, tid, dry_run, force)
-    if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
+        if not (recovery_child or continuing_classic) and dispatch_path(repo, str(tid)) != "classic":
+            script = Script("", None)
+    if script and script.drive is not None and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
         print(refusal)
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
@@ -2678,6 +2609,52 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        from . import adw as adw_mod
+        from . import pins
+
+        config_commit, config_dir, cfg = pins.pin_config(cfg=cfg)
+        with suppress(config.UnknownRepo):
+            repo = cfg.repo(repo.name)
+        try:
+            pinned_layer = config.load_layer(repo.layer_dir)
+        except (ValueError, TypeError, OSError):
+            pinned_layer = None
+        if script is not None and script.drive is None:
+            try:
+                routed = adw_mod.route(
+                    cfg, repo, tid,
+                    requested=script.adw,
+                    continues=script.continues,
+                    repairs=script.repairs,
+                    dry_run=dry_run,
+                    force=force,
+                    config_dir=config_dir,
+                    spec=bool(not tracker.is_task_id(tid) and spec_store.find(repo.name, str(tid))),
+                    layer=pinned_layer,
+                )
+            except (adw_mod.UnknownAdw, adw_mod.AdwError) as error:
+                print(str(error))
+                return 2
+            script.adw = routed.adw
+            script.path = routed.adw
+            script.rule = routed.rule
+            script.adw_version = routed.version
+            script.drive = (adw_mod.drive(routed.loaded) if routed.loaded is not None
+                            else adw_mod.drive_named(cfg, routed.adw, config_dir=config_dir))
+            if routed.continues and not script.continues:
+                script.continues = routed.continues
+                if routed.answered and not script.restart:
+                    script.restart = "answer"
+            if routed.overrides:
+                merged = {role: dict(vals) for role, vals in routed.overrides.items()}
+                for role, vals in script.overrides.items():
+                    merged.setdefault(role, {}).update(vals)
+                script.overrides = merged
+            if refusal := script_refusal(cfg, repo, tid, script, dry_run):
+                print(refusal)
+                return 2
+        elif script is not None and not script.adw and script.path and script.path != "classic":
+            script.adw = script.path
         try:
             poll_launch = launch_lease.from_poll(repo.name, str(tid))
             ordinary_launch = poll_launch or bool(script and script.environment_release)
@@ -2787,9 +2764,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     raise tracker.TaskError("a spec cannot adopt the ordinary builder's history")
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             latest = budget_history[0] if budget_history else None
-            custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
-                script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
+                script is None or not script.repairs and script.path in ("orchestrate", "revise"))
             feedback = pending_feedback(repo.name, tid) if may_revise else []
             ticket_fb = feedback_store.pending_worker_comments(repo.name, tid) if may_revise else []
             if spec_claim.get("state") == "published" and not (insights_store.has_new_feedback(feedback) or ticket_fb):
@@ -2879,12 +2855,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 feedback = pending_feedback(repo.name, tid)
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
+            restarting_other_adw = bool(
+                restarting and script and not (only or script.continues or script.repairs)
+                and script.path and earlier.get("adw") and str(earlier["adw"]) != script.path
+            )
+            if restarting_other_adw:
+                restarting = False
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
-            revising_over_repair = (mending and custom_feature and not (only or script.continues)
-                                    and insights_store.has_new_feedback(feedback))
-            if revising_over_repair:
-                mending = ""
             if pilot.is_pilot_task(str(tid)):
                 try:
                     pilot.require(pilot.task_admission(str(tid), repo.name) == permit,
@@ -2916,15 +2894,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 script.continues or script.repairs if script else ""
             )
             carried_ab = run_store.ab_held(held_from) if held_from else {}
-            from . import pins
-
             pin_res = pins.resolve(
                 "pipeline",
                 repo=repo.name,
                 overrides=script.overrides if script else None,
                 ab_ticket=(repo.name, str(tid)),
                 ab_held=carried_ab,
-                adw_path=script.path if script else "classic",
+                adw_name=(script.adw or script.path) if script else "",
+                adw_version=script.adw_version if script else "",
+                adw_rule=script.rule if script else "",
+                cfg=cfg,
+                config_commit=config_commit,
+                config_dir=config_dir,
             )
             pin_stack.enter_context(pins.use(pin_res))
             cfg = pin_res.cfg
@@ -2934,7 +2915,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                     only_step=only, dry_run=int(dry_run), resolution=pin_res,
-                                    continues=continues_id, restart=restart_kind, **retry_of)
+                                    continues=continues_id, restart=restart_kind,
+                                    adw=pin_res.adw, adw_version=pin_res.adw_version, adw_rule=pin_res.adw_rule,
+                                    **retry_of)
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -3020,7 +3003,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       tracker=tk, tid=tid, force=force, from_poll=poll_launch,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       ticket_feedback=[] if mending and not repair_with_feedback else ticket_fb,
-                      claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
+                      claim_feedback_on_revise=bool(script and script.path == "revise"),
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
@@ -3080,7 +3063,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     run.log(f"restarting after run {earlier['id']} was interrupted")
                 if zte_grant:
                     check_handoff()
-                flow = (flows.start(cfg, run, (earlier or {}) if not revising_over_repair else {},
+                flow = (flows.start(cfg, run, (earlier or {}) if not restarting_other_adw else {},
                                     slot, spec_previous if spec_ticket else script.continues,
                                     script.only, script.again) if script else None)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:

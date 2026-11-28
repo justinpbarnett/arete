@@ -22,7 +22,6 @@ RELEASE = ""
 
 def code_files() -> list[Path]:
     found = [p for p in (CHECKOUT / "arete").rglob("*.py") if "__pycache__" not in p.parts]
-    found += (CHECKOUT / "adws").glob("*.py")
     found += (CHECKOUT / "arete" / "prompts").glob("*.md")
     found += (CHECKOUT / "arete" / "schemas").glob("*.json")
     found += (CHECKOUT / "arete" / "durable").glob("*.mjs")
@@ -33,7 +32,12 @@ def code_files() -> list[Path]:
 
 def config_data_files() -> list[Path]:
     package = CHECKOUT / "arete"
-    return [*(package / "defaults").glob("*.toml"), *(package / "config_schemas").glob("*.json")]
+    return [
+        *(package / "defaults").glob("*.toml"),
+        *(package / "adws").glob("*.toml"),
+        *(package / "routes").glob("*.toml"),
+        *(package / "config_schemas").glob("*.json"),
+    ]
 
 
 def inventory() -> tuple[str, int]:
@@ -89,7 +93,7 @@ def serve_revisions(beat: dict) -> str:
 
 def head_and_dirt() -> tuple[str, bool]:
     head = checkout_head()
-    status = git("status", "--porcelain", "--", "arete", "adws") if head else None
+    status = git("status", "--porcelain", "--", "arete") if head else None
     return head, any("__pycache__" not in line for line in (status or "").splitlines())
 
 

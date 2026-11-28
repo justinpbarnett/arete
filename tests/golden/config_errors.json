@@ -10,8 +10,8 @@
       "[server] url must be a URL string"
     ],
     "factory folder": [
-      "TypeError",
-      "[factory] adws must be a folder path, not False"
+      "ValueError",
+      "[factory]: unknown key adws; use tier_map"
     ],
     "tier keys": [
       "ValueError",

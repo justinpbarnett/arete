@@ -3,8 +3,8 @@
   "properties": {
     "steps": {"$ref": "step_settings.json#/$defs/steps"},
     "kinds": {"$ref": "step_settings.json#/$defs/kinds"},
-    "tiers": {"$ref": "routes.json#/$defs/tiers"},
-    "routing": {"$ref": "routes.json"},
+    "tiers": {"$ref": "routing.json#/$defs/tiers"},
+    "routing": {"$ref": "routing.json"},
     "ab": {"$ref": "experiment.json#/$defs/experiments"},
     "document": {
       "type": "object",
@@ -81,8 +81,7 @@
     "factory": {
       "type": "object",
       "properties": {
-        "tier_map": {"type": "string"},
-        "adws": {"type": "string"}
+        "tier_map": {"type": "string"}
       },
       "additionalProperties": false
     },

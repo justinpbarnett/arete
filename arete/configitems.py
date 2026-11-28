@@ -160,6 +160,20 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 }),
                 "_engine_file": str(target),
             }
+    if kind == "adw" and re.fullmatch(configkinds.NAME_PATTERN, name):
+        target = paths.ENGINE_ADWS_DIR / f"{name}.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": f"arete/adws/{name}.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "routes" and name == "adw":
+        target = paths.ENGINE_ROUTES_DIR / "adw.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/routes/adw.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
     return None
 
 

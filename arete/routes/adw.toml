@@ -1,0 +1,15 @@
+schema = 1
+
+[[rule]]
+id = "interrupted-repair"
+when = { event = "interrupted", repaired_by = true }
+adw = "repair"
+
+[[rule]]
+id = "feedback-revise"
+when = { event = "feedback" }
+adw = "revise"
+
+[[rule]]
+id = "default"
+adw = "feature"
