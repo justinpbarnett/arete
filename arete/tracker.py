@@ -37,7 +37,8 @@ MAX_IMAGES = ticket_media.MAX_MEDIA_ITEMS
 MAX_IMAGE_BYTES = ticket_media.MAX_IMAGE_BYTES
 MAX_VIDEO_BYTES = ticket_media.MAX_VIDEO_BYTES
 ARETE_TAG = "[arete]"
-TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
+TASK_ID = re.compile(r"T-[0-9]+")
+OLD_TASK_ID = re.compile(r"t-[0-9a-f]{4,}")
 DEPENDENCY_WAIT = "dependency_wait"
 
 
@@ -119,13 +120,22 @@ def jira_issue_identity(site: str, issue_id) -> str:
     return f"jira:{url.scheme.casefold()}://{url.netloc.casefold()}{url.path.rstrip('/')}:{int(raw)}"
 
 
+def is_legacy_task_id(tid) -> bool:
+    return bool(OLD_TASK_ID.fullmatch(str(tid or "").strip()))
+
+
 def is_task_id(tid) -> bool:
-    return bool(TASK_ID.fullmatch(str(tid or "").strip()))
+    s = str(tid or "").strip()
+    if TASK_ID.fullmatch(s):
+        return True
+    if OLD_TASK_ID.fullmatch(s):
+        return not tasks_store.is_contracted()
+    return False
 
 
 def ref_for(issue) -> str:
     s = str(issue or "")
-    return s if jira.KEY_RE.match(s) or is_task_id(s) else f"#{s}"
+    return s if jira.KEY_RE.match(s) or is_task_id(s) or is_legacy_task_id(s) else f"#{s}"
 
 
 def ticket_name(repo: str, ref: str) -> str:
@@ -192,7 +202,7 @@ def for_repo(cfg: config.Config, repo: config.Repo) -> Tracker:
 
 
 def for_ticket(cfg: config.Config, repo: config.Repo, tid: str | int) -> Tracker:
-    return LocalTracker(repo) if is_task_id(tid) else for_repo(cfg, repo)
+    return LocalTracker(repo) if (is_task_id(tid) or is_legacy_task_id(tid)) else for_repo(cfg, repo)
 
 
 class GitHubTracker:
@@ -918,22 +928,45 @@ class LocalTracker:
         return state
 
     def normalize(self, tid: str | int) -> str:
-        s = str(tid).strip().lower()
-        if not is_task_id(s):
-            raise ValueError(f"'{tid}' is not a task id like t-1a2b")
-        return s
+        s = str(tid).strip()
+        if TASK_ID.fullmatch(s):
+            return s
+        if OLD_TASK_ID.fullmatch(s):
+            if tasks_store.is_contracted():
+                raise ValueError(tasks_store.LEGACY_TASK_REFUSAL)
+            num = tasks_store.parse_task_num(s)
+            return tasks_store.format_task_id(num) if num is not None else s
+        raise ValueError(f"'{tid}' is not a task id like T-1")
 
     def ref(self, tid: str) -> str:
         return tid
 
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
-        rows = tasks_store.tasks(self.repo.name, "todo")
-        if parked:
-            rows.extend(row for row in tasks_store.tasks(self.repo.name, "failed") if parked(row["id"]))
-        return [task_ticket(row) for row in rows]
+        rows = tasks_store.local_todo_tasks(self.repo.name, include_failed=bool(parked))
+        out = []
+        for row in rows:
+            is_failed = row["state"] == "needs-you" and int(row.get("fault") or 0) == 1
+            if is_failed and not (parked and parked(row["id"])):
+                continue
+            out.append(task_ticket(row))
+        return out
 
     def by_owner(self, item: dict) -> bool:
         return True
+
+    def _waits_for_row(self, row: dict) -> list[str]:
+        num = row.get("num")
+        if num is not None:
+            from .store import db as foundation
+
+            with foundation.reader() as c:
+                if tasks_store.has_identity_expand(c):
+                    links = tasks_store.TaskStore.task_links(c, int(num), kind="waits_on")
+                    return [
+                        link["other_task"] if link["other_task"] is not None else str(link["other_key"])
+                        for link in links
+                    ]
+        return waits_on_tasks(row["body"])
 
     def blocker(self, tid: str) -> str:
         return self.blocker_info(tid)[0]
@@ -941,7 +974,7 @@ class LocalTracker:
     def blocker_info(self, tid: str) -> tuple[str, str]:
         if (row := tasks_store.task_get(tid)) is None:
             return f"there is no task {tid}", ""
-        waited, kind = task_wait_blocker_info(waits_on_tasks(row["body"]), task_state)
+        waited, kind = task_wait_blocker_info(self._waits_for_row(row), task_state)
         if waited:
             return waited, kind
         return environment_blocker_info(self.repo.name, tid)
@@ -966,13 +999,14 @@ class LocalTracker:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
         history = tasks_store.task_comments(tid)
-        comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "") for c in history]
-        directed = [text for c, text in zip(history, comments, strict=True) if c["author"] != "arete" and principals.is_person(c["author"])]
+        comments = [("Owner" if principals.is_person(c["author"]) else "Arete", c["ts"] or "", c["body"] or "")
+                    for c in history]
+        directed = [text for c, text in zip(history, comments, strict=True) if principals.is_person(c["author"])]
         blocker_kind = ""
         if row["repo"] != self.repo.name:
             blocker = f"it is a task of {row['repo']}, not {self.repo.name}"
         else:
-            blocker, blocker_kind = task_wait_blocker_info(waits_on_tasks(row["body"]), task_state)
+            blocker, blocker_kind = task_wait_blocker_info(self._waits_for_row(row), task_state)
         if include_environment and not blocker:
             blocker, blocker_kind = environment_blocker_info(self.repo.name, tid)
         return replace(task_ticket(row, comments_text(comments), blocker), blocker_kind=blocker_kind,
@@ -982,18 +1016,19 @@ class LocalTracker:
         return []
 
     def approve(self, tid: str) -> None:
-        if not tasks_store.task_set_state(tid, "todo"):
+        if not tasks_store.task_set_state(tid, "ready", 0):
             raise TaskError(f"no task {tid}")
 
     def label(self, tid: str, add=(), remove=(), *, run_id: str = "") -> str:
         if tasks_store.task_get(tid) is None:
             return f"no task {tid}"
         if add:
-            if add[0] not in config.TASK_STATES:
+            if add[0] not in config.ALL_TASK_STATES:
                 return f"'{add[0]}' is not a task state; use {', '.join(config.TASK_STATES)}"
-            tasks_store.task_set_state(tid, add[0])
+            state, fault = config.canonical_task_state(add[0])
+            tasks_store.task_set_state(tid, state, fault)
         elif remove:
-            tasks_store.task_set_state(tid, "todo", from_states=tuple(remove))
+            tasks_store.task_set_state(tid, "ready", 0, from_states=tuple(remove))
         return ""
 
     def comment(self, tid: str, body: str, *, run_id: str = "") -> str:
@@ -1350,7 +1385,7 @@ WAIT_GITHUB = re.compile(
     r"#([1-9][0-9]{0,18})(?![0-9]))",
     re.IGNORECASE,
 )
-WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
+WAIT_TASK = re.compile(r"(?<![\w-])(?:T-[0-9]+|t-[0-9a-f]{4,})(?![\w-])")
 WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
@@ -1384,7 +1419,7 @@ def github_waits(body: str, repo: str) -> list[tuple[str, int]]:
 
 
 def waits_on_tasks(body: str) -> list[str]:
-    found = [tid.lower() for rest in WAIT_LINE.findall(body or "") for tid in WAIT_TASK.findall(rest)]
+    found = [tid for rest in WAIT_LINE.findall(body or "") for tid in WAIT_TASK.findall(rest)]
     return list(dict.fromkeys(found))
 
 

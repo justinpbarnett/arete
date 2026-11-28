@@ -532,6 +532,7 @@ class RecoveryDiscussion:
 class Run(AgentRun):
     tracker: tracker.Tracker
     tid: str
+    task_id: int | None = None
     force: bool = False
     from_poll: bool = False
     feedback: list[dict] = field(default_factory=list)
@@ -798,6 +799,25 @@ class Run(AgentRun):
             return f"Continue it with `arete resume {self.id}`"
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
+    def _mirror_task_state(self, status: str, *, leaving: bool = False) -> None:
+        from .store import db as foundation
+        from .store import tasks as task_store
+
+        tnum = self.task_id
+        if tnum is None:
+            try:
+                with foundation.reader() as c:
+                    tnum = task_store.TaskStore.find_task_num(c, self.repo, self.tid)
+            except Exception:
+                tnum = None
+        if tnum is None:
+            return
+        if leaving:
+            task_store.task_set_state(tnum, "ready", 0, from_states=(status,))
+        else:
+            canon, fault = config.canonical_task_state(status)
+            task_store.task_set_state(tnum, canon, fault)
+
     def enter(self, status: str) -> None:
         if self.dry_run:
             return
@@ -827,11 +847,14 @@ class Run(AgentRun):
                     task_id=f"{self.repo.name}#{int(self.tid)}",
                     summary=f"label {self.tracker.repo.github}#{int(self.tid)} {self.tracker.label_name(status)}",
                 )
+                self._mirror_task_state(status)
             self.log(f"drafted OB-{item_id}")
             if moved := self.tracker.move(self.tid, status):
                 self.log(f"tracker: {util.first_line(moved, 300)}")
             return
         labeled = self.tracker.label(self.tid, add=[status], remove=others, run_id=self.id)
+        if not isinstance(self.tracker, tracker.LocalTracker):
+            self._mirror_task_state(status)
         if not isinstance(self.tracker, tracker.JiraTracker):
             record.note(self.id, label_pending=status if labeled else "")
         from . import release_proof
@@ -875,10 +898,13 @@ class Run(AgentRun):
                     task_id=f"{self.repo.name}#{int(self.tid)}",
                     summary=f"remove {self.tracker.label_name(status)} on {self.tracker.repo.github}#{int(self.tid)}",
                 )
+                self._mirror_task_state(status, leaving=True)
             self.log(f"drafted OB-{item_id}")
             return
         if err := self.tracker.label(self.tid, remove=[status], run_id=self.id):
             self.log(f"tracker: {util.first_line(err, 300)}")
+        if not isinstance(self.tracker, tracker.LocalTracker):
+            self._mirror_task_state(status, leaving=True)
 
     def say(self, body: str, *, on_ticket: bool = False) -> str:
         if self.dry_run:
@@ -2613,9 +2639,30 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     if script and script.drive is not None and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
         print(refusal)
         return 2
+    from .store import tasks as task_store
+
+    task_num: int | None = None
+    issue_key: str | None = None
+    if given_run_id:
+        existing_run = run_store.run_get(given_run_id)
+        if existing_run is not None:
+            task_num = existing_run.get("task_id")
+            issue_key = existing_run.get("issue_key")
+    elif persist_run:
+        with db.reader() as c:
+            if task_store.has_identity_expand(c):
+                task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg)
+                if task_num is not None:
+                    issue_key = task_store.canonical_issue_key(repo, tid, task_num)
     name = tracker.ticket_name(repo.name, tk.ref(tid))
-    lock = run_store.run_lock("pipeline", repo.name, tid)
-    with workspaces.ticket_lock(repo.name, tid) as got, ExitStack() as pin_stack:
+    lock = (
+        run_store.run_lock("pipeline", task=int(task_num))
+        if task_num is not None
+        else run_store.run_lock("pipeline", repo.name, tid)
+    )
+    with workspaces.ticket_lock(
+        repo.name, tid, task_id=task_num, lookup=not (persist_run or given_run_id),
+    ) as got, ExitStack() as pin_stack:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -2836,15 +2883,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not slot_admission.enter_context(slots.admitting(wait=zte_grant is None)):
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
-            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             due_from = spec_previous or (script.continues if script else "")
             due = asks_store.asks_due([due_from]) if due_from and not only else []
             if recovery and slots.slots_free_to_start(cfg.max_parallel) == 0:
                 print(f"{name}: recovery is waiting for a run slot")
                 return SLOT_QUEUE_FAILED_EXIT
+            need_slot = False
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
-                    slot.hold()
+                    need_slot = True
                 elif not due or zte_store.activation_pending():
                     slot_admission.close()
                     can_queue = not zte_grant and issue_state in ("OPEN", "CLOSED", "MERGED")
@@ -2867,6 +2914,21 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         print(f"{refusal} Wait for a run to finish or raise max_parallel in "
                               f"{paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
+            if persist_run and task_num is None:
+                with db.tx() as c:
+                    if task_store.has_identity_expand(c):
+                        task_num, issue_key = task_store.TaskStore.task_for_ticket(
+                            c, repo, tid, principals.current(), cfg=cfg,
+                        )
+                        lock = run_store.run_lock("pipeline", task=int(task_num))
+                if task_num is not None and not pin_stack.enter_context(
+                    workspaces.ticket_lock(repo.name, tid, task_id=task_num)
+                ):
+                    print(f"{name} is already running")
+                    return 0
+            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel, task_id=task_num)
+            if need_slot:
+                slot.hold()
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
             if settled and may_revise:
@@ -2931,6 +2993,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             layer = pin_res.layer or layer
 
             def start():
+                nonlocal task_num, issue_key, lock
                 if not persist_run:
                     return given_run_id or record.new_id("pip", f"{repo.name}-{tid}")
                 if given_run_id:
@@ -2941,7 +3004,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         raise RuntimeError(f"run {given_run_id} could not be claimed")
                     launch_lease.registered(repo.name, str(tid))
                     return given_run_id
+                if task_num is None:
+                    with db.tx() as c:
+                        if task_store.has_identity_expand(c):
+                            task_num, issue_key = task_store.TaskStore.task_for_ticket(
+                                c, repo, tid, principals.current(), cfg=cfg,
+                            )
+                            lock = run_store.run_lock("pipeline", task=int(task_num))
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
+                                    task_id=task_num, issue_key=issue_key,
                                     only_step=only, dry_run=int(dry_run), resolution=pin_res,
                                     continues=continues_id, restart=restart_kind,
                                     adw=pin_res.adw, adw_version=pin_res.adw_version, adw_rule=pin_res.adw_rule,
@@ -3028,7 +3099,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, cfg=cfg, layer=layer,
-                      tracker=tk, tid=tid, force=force, from_poll=poll_launch,
+                      tracker=tk, tid=tid, task_id=task_num, force=force, from_poll=poll_launch,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       ticket_feedback=[] if mending and not repair_with_feedback else ticket_fb,
                       claim_feedback_on_revise=bool(script and script.path == "revise"),
@@ -6982,7 +7053,7 @@ def sync_labels(cfg: config.Config) -> None:
             continue
         seen.add(key)
         want = r["label_pending"]
-        if not want or r["status"] == "running" or util.lock_is_held(run_store.run_lock("pipeline", *key)):
+        if not want or r["status"] == "running" or slots.holding([r], "pipeline"):
             continue
         if r["status"] == "interrupted":
             record.note(r["id"], label_pending="")
@@ -7110,22 +7181,58 @@ def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: in
 
 
 def queue_run(repo_name: str, tid: str | int, *, only_step: str = "", dry_run: int = 0,
-              continues: str | None = None, restart: str = "", **extra) -> str:
-    lock = run_store.run_lock("pipeline", repo_name, tid)
-    return record.start(
-        "pipeline",
-        tag=f"{repo_name}-{tid}",
-        lock=lock,
-        repo=repo_name,
-        issue=tid,
-        status="queued",
-        pid=None,
-        only_step=only_step,
-        dry_run=dry_run,
-        continues=continues,
-        restart=restart,
-        **extra,
-    )
+              continues: str | None = None, restart: str = "", cfg: config.Config | None = None,
+              repo: config.Repo | None = None, **extra) -> str:
+    from .store import db as foundation
+    from .store import tasks as task_store
+
+    loaded_cfg = cfg
+    resolved_repo = repo
+    if resolved_repo is None:
+        if loaded_cfg is None:
+            try:
+                loaded_cfg, _ = config.load_or_problem()
+            except Exception:
+                loaded_cfg = None
+        if loaded_cfg is not None:
+            resolved_repo = next((r for r in loaded_cfg.repos if r.name == repo_name), None)
+    norm_tid = str(tid).strip()
+    if resolved_repo is not None and loaded_cfg is not None:
+        with suppress(ValueError):
+            norm_tid = tracker.for_ticket(loaded_cfg, resolved_repo, norm_tid).normalize(norm_tid)
+
+    with foundation.tx() as c:
+        task_num = extra.pop("task_id", None)
+        issue_key = extra.pop("issue_key", None)
+        if task_store.has_identity_expand(c) and (task_num is None or issue_key is None):
+            resolved_num, resolved_key = task_store.TaskStore.task_for_ticket(
+                c, resolved_repo or repo_name, norm_tid, principals.current(), cfg=loaded_cfg,
+            )
+            if task_num is None:
+                task_num = resolved_num
+            if issue_key is None:
+                issue_key = resolved_key
+        lock = (
+            run_store.run_lock("pipeline", task=int(task_num))
+            if task_num is not None
+            else run_store.run_lock("pipeline", repo_name, norm_tid)
+        )
+        return record.start(
+            "pipeline",
+            tag=f"{repo_name}-{norm_tid}",
+            lock=lock,
+            repo=repo_name,
+            issue=norm_tid,
+            task_id=task_num,
+            issue_key=issue_key,
+            status="queued",
+            pid=None,
+            only_step=only_step,
+            dry_run=dry_run,
+            continues=continues,
+            restart=restart,
+            **extra,
+        )
 
 
 def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = False,

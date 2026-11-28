@@ -340,7 +340,8 @@ def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_se
 
 def record_server(node: Node, port: int, front: Front) -> None:
     fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": list(node.addresses), "port": port,
-              "scheme": front.scheme, "host": node.name,
+              "scheme": front.scheme, "host": node.name, "schema": db.LATEST,
+              "capabilities": list(db.PROCESS_CAPABILITIES),
               "default_token_dir": paths.TOKEN_CLIENT_DIR == paths.DEFAULT_TOKEN_CLIENT_DIR}
     if fields["default_token_dir"] and paths.DB_FILE.is_file():
         fields["instance"] = db.schema_metadata()["instance_id"]

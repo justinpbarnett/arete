@@ -158,7 +158,7 @@ class FakeGitHubSource(tracker.GitHubTracker):
 
 
 def add_run(run_id, repo_name, issue, status="merged", *, summary=""):
-    record.start("pipeline", run_id=run_id, repo=repo_name, issue=str(issue))
+    support.start_pipeline(run_id=run_id, repo=repo_name, issue=str(issue))
     if status != "running":
         record.settle(run_id, status, summary=summary)
 

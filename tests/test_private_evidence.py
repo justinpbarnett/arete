@@ -5,6 +5,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from tests import support
 from http.client import HTTPConnection
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,6 @@ from arete import (
     poll,
     private_evidence,
     prompt_loader,
-    record,
     tailnet,
     ticket_feedback,
     ticket_media,
@@ -206,7 +206,7 @@ class JiraPrivateTriageUploadTests(_PrivateEvidenceDbCase):
         )
         tk = self._jira_tracker(client)
         ticket = tk.get("APP-12", include_environment=False)
-        run_id = record.start("pipeline", repo="app", issue="APP-12")
+        run_id = support.start_pipeline(repo="app", issue="APP-12")
         run_dir = paths.RUNS_DIR / run_id
         run = pipeline.Run(run_id, self.repo, run_dir, tracker=tk, tid="APP-12", cfg=self.cfg)
 

@@ -1,6 +1,7 @@
 import contextlib
 import tempfile
 import unittest
+from tests import support
 from pathlib import Path
 from unittest import mock
 
@@ -12,7 +13,6 @@ from arete import (
     gh,
     jira,
     paths,
-    record,
     ticket_feedback as tf,
     ticket_followups as tfu,
     tracker,
@@ -347,7 +347,7 @@ class ClassificationAndSplittingTests(unittest.TestCase):
 
 class GitHubFollowUpTests(_FollowUpDbCase):
     def _seed_completed_ticket(self, repo: config.Repo, tid: str) -> tracker.Ticket:
-        rid = record.start("pipeline", repo=repo.name, issue=tid, status="merged")
+        rid = support.start_pipeline(repo=repo.name, issue=tid, status="merged")
         with foundation.tx() as c:
             c.execute("UPDATE runs SET started = ? WHERE id = ?", ("2026-11-27T09:00:00Z", rid))
         identity = tracker.github_issue_identity(repo.github, tid)
@@ -645,7 +645,7 @@ class PartialFailureReconciliationTests(_FollowUpDbCase):
         cfg = config.Config(repos=[repo])
         client = _FakeJira(project="TEAM", start_num=71)
         client.seed_issue("TEAM-70", "Persist settings on Save", "Save preserves selected values.", done=True)
-        rid = record.start("pipeline", repo="teamapp", issue="TEAM-70", status="merged")
+        rid = support.start_pipeline(repo="teamapp", issue="TEAM-70", status="merged")
         spec_store.bind("jira:https://jira.example.test:20000", "teamapp", "TEAM-70", "", lambda: rid)
         spec_store.advance("jira:https://jira.example.test:20000", rid, "building", "complete", {"retro": "done"})
 

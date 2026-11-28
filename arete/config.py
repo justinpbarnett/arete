@@ -193,8 +193,46 @@ class Repo:
 STATES = ("running", "pr", "failed", "needs-info")
 DELIVERED = "done"
 RUN_LABELS = (*STATES, DELIVERED)
-TASK_STATES = ("todo", *STATES, DELIVERED, "closed")
+CANONICAL_TASK_STATES = ("intake", "ready", "running", "needs-you", "review", "done", "closed")
+LEGACY_TASK_STATES: dict[str, tuple[str, int]] = {
+    "todo": ("ready", 0),
+    "running": ("running", 0),
+    "pr": ("review", 0),
+    "needs-info": ("needs-you", 0),
+    "failed": ("needs-you", 1),
+    "done": ("done", 0),
+    "closed": ("closed", 0),
+}
+CANONICAL_TO_LEGACY_TASK_STATE: dict[tuple[str, int], str] = {
+    ("intake", 0): "todo",
+    ("ready", 0): "todo",
+    ("running", 0): "running",
+    ("review", 0): "pr",
+    ("needs-you", 0): "needs-info",
+    ("needs-you", 1): "failed",
+    ("done", 0): "done",
+    ("closed", 0): "closed",
+}
+TASK_STATES = CANONICAL_TASK_STATES
+ALL_TASK_STATES = tuple(dict.fromkeys((*CANONICAL_TASK_STATES, *LEGACY_TASK_STATES)))
 TASK_FINISHED = (DELIVERED, "closed")
+
+
+def canonical_task_state(state: str, fault: int = 0) -> tuple[str, int]:
+    raw = (state or "").strip()
+    if raw in LEGACY_TASK_STATES:
+        mapped_state, mapped_fault = LEGACY_TASK_STATES[raw]
+        return mapped_state, 1 if (mapped_fault or fault) else 0
+    if raw in CANONICAL_TASK_STATES:
+        return raw, 1 if fault else 0
+    return "ready", 1 if fault else 0
+
+
+def legacy_task_state(state: str, fault: int = 0) -> str:
+    canonical, norm_fault = canonical_task_state(state, fault)
+    if canonical == "needs-you":
+        return "failed" if norm_fault else "needs-info"
+    return CANONICAL_TO_LEGACY_TASK_STATE.get((canonical, 0), "todo")
 
 
 @dataclass

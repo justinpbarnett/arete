@@ -122,11 +122,31 @@ def feedback_keys(pr_url: str) -> set[tuple[str, int]]:
 
 
 def add_feedback(rows: list[dict]) -> int:
+    from . import tasks as task_store
+
     with db() as c:
         before = c.total_changes
-        c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "  # noqa: S608
-                      f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
-                      [(*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), util.iso()) for r in rows])
+        if task_store.has_identity_expand(c):
+            cols = (*FEEDBACK_COLUMNS, "task_id")
+            now = util.iso()
+            prepared = []
+            for r in rows:
+                tnum = r.get("task_id")
+                if tnum is None and r.get("run_id"):
+                    rrow = c.execute("SELECT task_id FROM runs WHERE id = ?", (r["run_id"],)).fetchone()
+                    if rrow and rrow["task_id"] is not None:
+                        tnum = int(rrow["task_id"])
+                if tnum is None and r.get("repo") and r.get("issue"):
+                    tnum = task_store.TaskStore.find_task_num(c, str(r["repo"]), str(r["issue"]))
+                prepared.append((*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), now, tnum))
+            c.executemany(
+                f"INSERT OR IGNORE INTO feedback ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",  # noqa: S608
+                prepared,
+            )
+        else:
+            c.executemany(f"INSERT OR IGNORE INTO feedback ({', '.join(FEEDBACK_COLUMNS)}) "  # noqa: S608
+                          f"VALUES ({', '.join('?' * len(FEEDBACK_COLUMNS))})",
+                          [(*(r.get(k) for k in FEEDBACK_COLUMNS[:-1]), util.iso()) for r in rows])
         return c.total_changes - before
 
 
@@ -252,10 +272,21 @@ def research_get(ref: str, connect=reader) -> dict | None:
 
 
 def research_set(ref: str, **fields) -> None:
+    from .. import principals
+    from . import tasks as task_store
+
     row = {**(research_get(ref) or {"ref": ref, "cost": 0.0}), **fields, "ts": util.iso()}
     with db() as c:
-        c.execute(insert_sql("research", RESEARCH_COLUMNS, "INSERT OR REPLACE"),
-                  tuple(row.get(k) for k in RESEARCH_COLUMNS))
+        if task_store.has_identity_expand(c):
+            cols = (*RESEARCH_COLUMNS, "ref_id")
+            ref_id = row.get("ref_id")
+            if ref_id is None:
+                ref_id = task_store.TaskStore.ref_for_triage(c, row, actor=principals.current())
+            row["ref_id"] = ref_id
+            c.execute(insert_sql("research", cols, "INSERT OR REPLACE"), tuple(row.get(k) for k in cols))
+        else:
+            c.execute(insert_sql("research", RESEARCH_COLUMNS, "INSERT OR REPLACE"),
+                      tuple(row.get(k) for k in RESEARCH_COLUMNS))
 
 
 def research_keep(ref: str, **fields) -> None:

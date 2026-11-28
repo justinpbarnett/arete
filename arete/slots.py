@@ -25,9 +25,25 @@ SLOT_POLL_SECONDS = 30
 CHECK_SLOT_POLL_SECONDS = 0.25
 
 
+def _row_holds_lock(row: dict, lock_kind: str) -> bool:
+    task_id = row.get("task_id")
+    if lock_kind == "pipeline" and row.get("kind") == "pipeline" and row.get("lock"):
+        if util.lock_is_held(row["lock"]):
+            return True
+    if task_id is not None:
+        if util.lock_is_held(run_store.run_lock(lock_kind, task=int(task_id))):
+            return True
+        from .store import tasks as task_store
+
+        if not task_store.is_contracted():
+            if util.lock_is_held(run_store.run_lock(lock_kind, row["repo"], row["issue"])):
+                return True
+        return False
+    return util.lock_is_held(run_store.run_lock(lock_kind, row["repo"], row["issue"]))
+
+
 def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
-    return [r for r in rows
-            if r["kind"] in kinds and util.lock_is_held(run_store.run_lock(lock_kind, r["repo"], r["issue"]))]
+    return [r for r in rows if r["kind"] in kinds and _row_holds_lock(r, lock_kind)]
 
 
 def chat_sessions_going(running: list[dict]) -> list[dict]:
@@ -75,10 +91,19 @@ class RunSlot:
     repo: str
     tid: str
     max_parallel: int
+    task_id: int | None = None
     held: TextIO | None = None
+    held_extra: TextIO | None = None
 
     def hold(self) -> None:
-        self.held = hold(self.repo, self.tid)
+        if self.task_id is not None:
+            from .store import tasks as task_store
+
+            if not task_store.is_contracted():
+                self.held_extra = hold(self.repo, self.tid)
+            self.held = util.hold_lock(run_store.run_lock("slot", task=int(self.task_id)))
+        else:
+            self.held = hold(self.repo, self.tid)
 
     def take(self, log: Callable[[str], None],
              waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:
@@ -95,7 +120,14 @@ class RunSlot:
                         return
                     if not waiting:
                         waiting = True
-                        stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", self.repo, self.tid)))
+                        if self.task_id is not None:
+                            from .store import tasks as task_store
+
+                            if not task_store.is_contracted():
+                                stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", self.repo, self.tid)))
+                            stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", task=int(self.task_id))))
+                        else:
+                            stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", self.repo, self.tid)))
                         stack.enter_context(waits("slot"))
                         log(f"{what}: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
                 time.sleep(SLOT_POLL_SECONDS)
@@ -104,6 +136,9 @@ class RunSlot:
         if self.held:
             self.held.close()
             self.held = None
+        if self.held_extra:
+            self.held_extra.close()
+            self.held_extra = None
 
 
 def no_free_slot(max_parallel: int) -> str:
@@ -234,7 +269,15 @@ def take_merge_lease(run, github: str, *, slot: RunSlot | None = None) -> TextIO
                 if util.flock_now(lease):
                     util.mark_holder(lease, os.getpid())
                     return lease
-                stack.enter_context(util.hold_lock(run_store.run_lock("merge-wait", run.repo.name, run.tid)))
+                task_id = getattr(run, "task_id", None)
+                if isinstance(task_id, int) and not isinstance(task_id, bool):
+                    from .store import tasks as task_store
+
+                    if not task_store.is_contracted():
+                        stack.enter_context(util.hold_lock(run_store.run_lock("merge-wait", run.repo.name, run.tid)))
+                    stack.enter_context(util.hold_lock(run_store.run_lock("merge-wait", task=task_id)))
+                else:
+                    stack.enter_context(util.hold_lock(run_store.run_lock("merge-wait", run.repo.name, run.tid)))
                 resume = slot if slot is not None and slot.held else None
                 if resume is not None:
                     resume.free()

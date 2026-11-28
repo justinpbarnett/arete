@@ -90,7 +90,7 @@ def approval(source, t) -> tuple[bool, int]:
         return False, 0
     if isinstance(source, tracker.LocalTracker):
         row = tasks_store.task_get(t.id) or {}
-        return row.get("repo") == source.repo.name and row.get("state") in config.TASK_STATES[:-2], row.get("version", 0)
+        return row.get("repo") == source.repo.name and row.get("state") not in config.TASK_FINISHED, row.get("version", 0)
     return tracker.LABEL in t.labels and (not t.blocker or t.blocker.startswith("it waits on ")), 0
 
 

@@ -508,7 +508,10 @@ class Check:
             failure_detail="HTTP 403 access denied",
         )
         fixture_evidence_item = inbox_store.get_open_by_subject(f"evidence:{ev_id}")
-        fault_run = record.start("pipeline", repo=replay.SAMPLE_REPO, issue=self.task, status="failed")
+        fault_run = record.start(
+            "pipeline", repo=replay.SAMPLE_REPO, issue=self.task,
+            task_id=task_store.parse_task_num(self.task), issue_key=self.task, status="failed",
+        )
         record.step(fault_run, "verify", agent.Result(ok=False, error="AssertionError: fixture", runner="replay"), 0.1)
         fixture_fault_item = inbox_store.get_open_by_kind_and_subject("fault", f"step:{fault_run}/verify")
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
@@ -530,6 +533,16 @@ class Check:
         stopped = record.start("loop", pid=0)
         session = record.start("session")
         run_task = task_store.task_add(replay.SAMPLE_REPO, "Task to start via task.run", "Run me", "feat")
+        task_store.task_comment(self.task, principals.owner(), "Initial comment for check")
+        fixture_comment = task_store.task_comments(self.task)[0]
+        with db.tx() as conn:
+            fixture_ref_link = task_store.TaskStore.link_ref(
+                conn, self.task, "slack:C1/1700000000.000001", {"role": "related", "interpretation": "Fixture ref"},
+                principals.owner(),
+            )
+            fixture_link = task_store.TaskStore.create_link(
+                conn, self.task, "relates", other_key="github:sample/replay#42", origin="person",
+            )
         fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
         secretstore.put("global", "DEMO_KEY", "fixture-contract-key", "api_key", "hand")
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
@@ -562,7 +575,8 @@ class Check:
         draft_for_discard, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture discard")
         identities = {"task": self.task, "run": self.run, "step": str(turn_step["id"]),
                       "node": str(turn_step.get("node") or turn_step["step"]), "try": str(turn_step.get("try") or 1),
-                      "n": "1", "ticket": send_ticket.ref,
+                      "n": "1", "ticket": send_ticket.ref, "ref": fixture_ref_link["ref"],
+                      "link": str(fixture_link["id"]), "comment": str(fixture_comment["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
@@ -588,6 +602,11 @@ class Check:
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
                 values["base_version"] = row["version"]
+            if name == "comment.update":
+                values["base_version"] = fixture_comment["version"]
+            if name == "task.restore":
+                # task.close just closed self.task right before task.restore in OPERATIONS order.
+                pass
             if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
                 values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
             if resource == "outbox" and method != "GET":
@@ -825,13 +844,17 @@ def worker(lifeline):
 
 def fixture_child(repo, ticket, run_id=""):
     with offline():
-        from . import launch_lease, record
+        from . import launch_lease, principals, record
+        from .store import db as foundation
+        from .store import tasks as task_store
 
         launch_lease.verify(repo, ticket)
         if run_id:
             record.claim(run_id)
         else:
-            record.start("pipeline", repo=repo, issue=ticket)
+            with foundation.tx() as c:
+                task_num, issue_key = task_store.TaskStore.task_for_ticket(c, repo, ticket, principals.current())
+                record.start("pipeline", repo=repo, issue=ticket, task_id=task_num, issue_key=issue_key)
         threading.Event().wait()
 
 

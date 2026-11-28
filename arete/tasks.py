@@ -204,7 +204,21 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
             foundation.require_workspace_contract()
         except foundation.IncompatibleSchema as e:
             raise control.Refused(str(e)) from e
-        run_id = pipeline.queue_run(repo.name, tid)
+        from contextlib import nullcontext
+
+        with foundation.tx() as c:
+            if task_store.has_identity_expand(c):
+                task_num, issue_key = task_store.TaskStore.task_for_ticket(
+                    c, repo, tid, principals.current(), cfg=cfg,
+                )
+                existing = run_store.running_run(task_num, connect=lambda: nullcontext(c))
+                if existing and (existing["status"] == "queued" or slots.holding([existing], "pipeline")):
+                    return answer(tid, repo.name, existing["id"], "running", "already running")
+                run_id = pipeline.queue_run(
+                    repo.name, tid, cfg=cfg, repo=repo, task_id=task_num, issue_key=issue_key,
+                )
+            else:
+                run_id = pipeline.queue_run(repo.name, tid, cfg=cfg, repo=repo)
         from . import inbox
 
         if missing := inbox.check_run_missing_secrets(run_id, repo=repo.name):
@@ -391,7 +405,12 @@ def command_run(run_id, base_version):
 
 
 def no_later_run(row: dict, *, live: bool = False) -> None:
-    if later := run_store.later_run(row["repo"], row["issue"], row["id"], live=live):
+    later = (
+        run_store.later_run(int(row["task_id"]), row["id"], live=live)
+        if row.get("task_id") is not None
+        else run_store.later_run(row["repo"], row["issue"], row["id"], live=live)
+    )
+    if later:
         raise control.Refused(f"run {row['id']} is not the ticket's latest run: run {later['id']} "
                               f"({later['status']}) came after it")
 
@@ -695,7 +714,7 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
                   admission=admission, continues=row["id"], restart="answer")
 
 
-def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
+def kept_folder_removed(repo: config.Repo, tid: str, run_id: str, *, task_id: int | None = None) -> workspace.Release | None:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
     with workspaces.folder_lock(ws):
         row = workspaces.open_for(ws.name)
@@ -704,7 +723,11 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.R
         if row["owner_run"] != run_id or row["kept_reason"] in (workspaces.LEGACY_RESUME, "operator"):
             return None
         if row["kept_reason"] == workspaces.LEGACY_WAITING:
-            latest = run_store.newest_whole_run(repo.name, tid)
+            latest = (
+                run_store.newest_whole_run(int(task_id))
+                if task_id is not None
+                else run_store.newest_whole_run(repo.name, tid)
+            )
             if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, tid):
                 return workspaces.remove_imported_waiting(ws, row)
             return None
@@ -732,9 +755,13 @@ def saved_checkout_head(made: dict, checkout: workspace.Checkout) -> bool:
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
-    tid, run_id = str(row["issue"]), row["id"]
+    raw_tid, run_id = str(row["issue"]), row["id"]
+    task_id = row.get("task_id")
+    tid = str(row.get("issue_key") or raw_tid)
+    if tracker.is_legacy_task_id(tid) and task_id is not None:
+        tid = task_store.format_task_id(int(task_id))
     name = tracker.issue_name(repo.name, tid)
-    with workspaces.ticket_lock(repo.name, tid) as got:
+    with workspaces.ticket_lock(repo.name, tid, task_id=task_id) as got:
         if not got:
             raise control.Busy(f"a run of {name}")
         if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
@@ -742,11 +769,15 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         if status == "closed" and not record.move(run_id, "stopped", expect=("needs-info",), summary=TICKET_CLOSED):
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         ask_store.asks_retire(run_id, "stopped" if status == "closed" else status)
-        latest = not run_store.later_run(repo.name, tid, run_id)
+        latest = not (
+            run_store.later_run(int(task_id), run_id)
+            if task_id is not None
+            else run_store.later_run(repo.name, tid, run_id)
+        )
         removed = False
         folder = "its work folder was left in place"
         try:
-            release = kept_folder_removed(repo, tid, run_id) if latest else None
+            release = kept_folder_removed(repo, raw_tid, run_id, task_id=task_id) if latest else None
         except (OSError, sqlite3.Error, foundation.IncompatibleSchema, migrations.Refused) as e:
             folder += f" (removal failed: {util.first_line(str(e), 300)})"
         else:
@@ -758,7 +789,8 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         if status == "closed":
             pipeline.write_report(run_store.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")
-        run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
+        run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid),
+                           tid=tid, task_id=task_id)
         run.dir.mkdir(parents=True, exist_ok=True)
         if status == "stopped":
             run.give_up("was stopped by its owner instead of an answer")
@@ -1061,15 +1093,23 @@ def task_summaries() -> list[dict]:
 
 def view(task_id: str, repo_name: str = "") -> dict:
     tid = task_id.strip()
+    if tracker.is_legacy_task_id(tid) and task_store.is_contracted():
+        raise control.Refused(task_store.LEGACY_TASK_REFUSAL)
     if tracker.is_task_id(tid):
-        tid = tid.lower()
         if (row := task_store.task_get(tid, connect=foundation.reader)) is None:
             raise control.NotFound(f"no task {tid}")
-        item, repo, refs = {**row, "comments": task_store.task_comments(tid, connect=foundation.reader)}, row["repo"], [tid]
+        item = {**row, "comments": task_store.task_comments(row["id"], connect=foundation.reader)}
+        repo = row["repo"]
+        refs = [row["id"]]
+        runs = (
+            run_store.ticket_runs(int(row["num"]), limit=50, connect=foundation.reader)
+            if row.get("num") is not None
+            else run_store.ticket_runs(repo, row["id"], limit=50, connect=foundation.reader)
+        )
     else:
         item, repo = tracker_item(config.load(), tid, repo_name.strip())
         refs = [item["id"], item["ref"]]
-    runs = run_store.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
+        runs = run_store.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
     paid = run_store.paid_by_run([r["id"] for r in runs], connect=foundation.reader)
     children = {c["id"]: c for ref in dict.fromkeys(refs) for c in task_store.task_children(ref, connect=foundation.reader)}
     return {**item,

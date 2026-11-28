@@ -34,19 +34,47 @@ class SnapshotUnavailable(OSError):
 
 
 @contextmanager
-def ticket_lock(repo: str, ticket: str | int):
-    name = runs.run_lock("pipeline", repo, ticket)
+def ticket_lock(repo: str, ticket: str | int, *, task_id: int | None = None, lookup: bool = True):
+    from contextlib import ExitStack
+    from . import tasks as task_store
+
+    resolved = task_id
+    contracted = False
+    if resolved is None:
+        if lookup:
+            try:
+                with reader() as c:
+                    resolved = task_store.TaskStore.find_task_num(c, repo, ticket)
+                    if resolved is not None:
+                        contracted = task_store.is_contracted(c)
+            except Exception:
+                resolved = None
+    else:
+        contracted = task_store.is_contracted()
+    if resolved is not None:
+        new_name = runs.run_lock("pipeline", task=int(resolved))
+        old_name = runs.run_lock("pipeline", repo, ticket)
+        names = (new_name,) if contracted else (old_name, new_name)
+    else:
+        names = (runs.run_lock("pipeline", repo, ticket),)
     held = TICKET_LOCKS.get()
-    if name in held:
+    needed = [n for n in names if n not in held]
+    if not needed:
         yield True
         return
-    with util.lock(name) as got:
-        token = TICKET_LOCKS.set(held | {name}) if got else None
+    with ExitStack() as stack:
+        acquired = []
+        for n in needed:
+            got = stack.enter_context(util.lock(n))
+            if not got:
+                yield False
+                return
+            acquired.append(n)
+        token = TICKET_LOCKS.set(held | set(acquired))
         try:
-            yield got
+            yield True
         finally:
-            if token is not None:
-                TICKET_LOCKS.reset(token)
+            TICKET_LOCKS.reset(token)
 
 
 @contextmanager

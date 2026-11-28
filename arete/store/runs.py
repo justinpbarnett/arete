@@ -17,6 +17,7 @@ from .db import (
     RUNS_PINS_SCHEMA,
     RUNS_PROMPT_BINDING_SCHEMA,
     STEPS_LIFECYCLE_SCHEMA,
+    TASK_IDENTITY_EXPAND_SCHEMA,
     db,
     migration_applied,
     reader,
@@ -27,6 +28,7 @@ STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind"
 PINS_RUN_FIELDS = frozenset(("config_commit", "resolved_sha"))
 LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "payer", "seq"))
 ADW_RUN_FIELDS = frozenset(("adw", "adw_version", "adw_rule"))
+TASK_IDENTITY_RUN_FIELDS = frozenset(("task_id", "issue_key", "capabilities"))
 _CHAT_STEP_RE = re.compile(r"^chat (\d+)(?: (.+))?$")
 
 
@@ -52,6 +54,25 @@ def has_steps_lifecycle(c) -> bool:
 
 def has_record_turns(c) -> bool:
     return migration_applied(RECORD_TURNS_SCHEMA, c)
+
+
+def has_task_identity(c) -> bool:
+    return migration_applied(TASK_IDENTITY_EXPAND_SCHEMA, c) or (
+        "task_id" in {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+    )
+
+
+def _resolve_task_target(c, repo_or_task: str | int, issue: int | str | None = None) -> tuple[int | None, str | None, int | str | None]:
+    if isinstance(repo_or_task, int) and not isinstance(repo_or_task, bool) and issue is None:
+        return repo_or_task, None, None
+    repo = str(repo_or_task)
+    if has_task_identity(c):
+        from . import tasks as task_store
+
+        tnum = task_store.TaskStore.find_task_num(c, repo, issue)
+        if tnum is not None:
+            return tnum, repo, issue
+    return None, repo, issue
 
 
 def step_node_and_chat(step_name: str, chat_id: int | None = None) -> tuple[str, int | None]:
@@ -86,6 +107,8 @@ def filter_run_fields(c, fields: dict) -> dict:
         drop |= LINEAGE_RUN_FIELDS
     if not has_adw(c):
         drop |= ADW_RUN_FIELDS
+    if not has_task_identity(c):
+        drop |= TASK_IDENTITY_RUN_FIELDS
     if not drop:
         return fields
     return {k: v for k, v in fields.items() if k not in drop}
@@ -239,10 +262,16 @@ def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict
                                            "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
 
 
-def open_runs(repo: str, issue: int | str) -> list[dict]:
+def open_runs(repo: str | int, issue: int | str | None = None) -> list[dict]:
     with reader() as c:
+        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
+        if tnum is not None:
+            return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? AND {OPEN_PR_RUN} "  # noqa: S608
+                                               "ORDER BY started DESC", (tnum,))]
+        if repo_name is None:
+            return []
         return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "  # noqa: S608
-                                           "ORDER BY started DESC", (repo, issue))]
+                                           "ORDER BY started DESC", (repo_name, raw_issue))]
 
 
 DRAFT_READY = "run.draft-review.ready"
@@ -433,7 +462,14 @@ def claim_environment_budget_resets(repo: str, issue: str, run_id: str,
             (repo, issue, project, number, run_id)).rowcount]
 
 
-def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
+def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None, *, task: int | None = None) -> str:
+    if task is not None:
+        return {
+            "pipeline": f"run-T{int(task)}",
+            "slot": f"slot-T{int(task)}",
+            "slot-wait": f"slot-wait-T{int(task)}",
+            "merge-wait": f"merge-wait-T{int(task)}",
+        }[kind]
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
             "merge-wait": f"merge-wait-{repo}-{issue}",
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
@@ -727,29 +763,62 @@ def live_chat_run(chat_id: int, connect=reader) -> dict | None:
         return dict(r) if r else None
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False,
+def ticket_runs(repo: str | int, issue: int | str | None = None, limit: int = 10, connect=reader, whole: bool = False,
                 live: bool = False, *, include_queued: bool | None = None) -> list[dict]:
     show_queued = (not whole and not live) if include_queued is None else include_queued
+    extra = (
+        (f"AND {WHOLE_RUN} " if whole else "")
+        + (f"AND {LIVE_RUN} " if live else "")
+        + ("" if show_queued else "AND status != 'queued' AND NOT (pid IS NULL AND status = 'stopped' AND stop_asked IS NULL) ")
+    )
     with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
-                                           + (f"AND {WHOLE_RUN} " if whole else "")
-                                           + (f"AND {LIVE_RUN} " if live else "")
-                                           + ("" if show_queued else "AND status != 'queued' AND NOT (pid IS NULL AND status = 'stopped' AND stop_asked IS NULL) ")
-                                           + f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?", (repo, issue, limit))]
+        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
+        if tnum is not None:
+            return [dict(r) for r in c.execute(
+                f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? {extra}"  # noqa: S608
+                f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?",
+                (tnum, limit),
+            )]
+        if repo_name is None:
+            return []
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? {extra}"  # noqa: S608
+            f"ORDER BY started DESC, {seq_col(c)} DESC LIMIT ?",
+            (repo_name, raw_issue, limit),
+        )]
 
 
-def newest_whole_run(repo: str, issue: int | str) -> dict | None:
+def newest_whole_run(repo: str | int, issue: int | str | None = None) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
 
 
-def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
+def newest_live_whole_run(repo: str | int, issue: int | str | None = None) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
 
 
-def failed_ticket_runs_since(repo: str, issue: int | str, since: str) -> list[dict]:
+def failed_ticket_runs_since(repo: str | int, issue: int | str | None, since: str | None = None) -> list[dict]:
+    if isinstance(repo, int) and not isinstance(repo, bool) and since is None:
+        since_val = str(issue)
+        target_repo: str | int = repo
+        target_issue: int | str | None = None
+    else:
+        since_val = str(since or "")
+        target_repo, target_issue = repo, issue
     with reader() as c:
-        return [dict(r) for r in c.execute("SELECT failure FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND status = 'failed' AND finished > ?", (repo, issue, since))]
+        tnum, repo_name, raw_issue = _resolve_task_target(c, target_repo, target_issue)
+        if tnum is not None:
+            return [dict(r) for r in c.execute(
+                "SELECT failure FROM runs WHERE kind = 'pipeline' AND task_id = ? "
+                "AND status = 'failed' AND finished > ?",
+                (tnum, since_val),
+            )]
+        if repo_name is None:
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT failure FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+            "AND status = 'failed' AND finished > ?",
+            (repo_name, raw_issue, since_val),
+        )]
 
 
 def pr_gate_refreshes(repo: str, issue: str) -> list[dict]:
@@ -817,11 +886,20 @@ def note_requeue_comment(run: dict, *, capped: bool = False) -> None:
                       (run["id"],))
 
 
-def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
+def ticket_runs_marked_running(repo: str | int, issue: int | str | None = None, connect=reader) -> list[dict]:
     with connect() as c:
+        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
+        if tnum is not None:
+            return [dict(r) for r in c.execute(
+                f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? "  # noqa: S608
+                f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
+                (tnum,),
+            )]
+        if repo_name is None:
+            return []
         return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                                            f"AND status = 'running' ORDER BY started ASC, {seq_col(c)} ASC",
-                                           (repo, issue))]
+                                           (repo_name, raw_issue))]
 
 
 def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
@@ -846,27 +924,71 @@ def ab_held(run_id: str, connect=reader) -> dict[str, tuple[str, str, dict]]:
             if isinstance(held, (list, tuple))} if row else {}
 
 
-def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -> list[dict]:
+def ticket_runs_since(repo: str | int, issue: int | str | None, since: str | None = None, connect=reader) -> list[dict]:
+    if isinstance(repo, int) and not isinstance(repo, bool) and since is None:
+        since_val = str(issue)
+        target_repo: str | int = repo
+        target_issue: int | str | None = None
+    else:
+        since_val = str(since or "")
+        target_repo, target_issue = repo, issue
     with connect() as c:
+        tnum, repo_name, raw_issue = _resolve_task_target(c, target_repo, target_issue)
+        if tnum is not None:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? AND started >= ? ORDER BY started",
+                (tnum, since_val),
+            )]
+        if repo_name is None:
+            return []
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND started >= ? ORDER BY started", (repo, issue, since))]
+                                           "AND started >= ? ORDER BY started", (repo_name, raw_issue, since_val))]
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False,
+def later_run(repo: str | int, issue: int | str | None, run_id: str | None = None, connect=reader, *, live: bool = False,
               candidate: str = "") -> dict | None:
+    if isinstance(repo, int) and not isinstance(repo, bool) and run_id is None:
+        target_run_id = str(issue)
+        target_repo: str | int = repo
+        target_issue: int | str | None = None
+    else:
+        target_run_id = str(run_id or "")
+        target_repo, target_issue = repo, issue
     with connect() as c:
         k = seq_col(c)
+        tnum, repo_name, raw_issue = _resolve_task_target(c, target_repo, target_issue)
+        if tnum is not None:
+            r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? AND {WHOLE_RUN} "  # noqa: S608
+                          + (f"AND {LIVE_RUN} " if live else "")
+                          + ("AND id = ? " if candidate else "")
+                          + f"AND {k} > (SELECT {k} FROM runs WHERE id = ?) ORDER BY {k} LIMIT 1",  # noqa: S608
+                          (tnum, *([candidate] if candidate else []), target_run_id)).fetchone()
+            return dict(r) if r else None
+        if repo_name is None:
+            return None
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "  # noqa: S608
                       + (f"AND {LIVE_RUN} " if live else "")
                       + ("AND id = ? " if candidate else "")
                       + f"AND {k} > (SELECT {k} FROM runs WHERE id = ?) ORDER BY {k} LIMIT 1",  # noqa: S608
-                      (repo, issue, *([candidate] if candidate else []), run_id)).fetchone()
+                      (repo_name, raw_issue, *([candidate] if candidate else []), target_run_id)).fetchone()
         return dict(r) if r else None
 
 
 def interrupted_tickets(repo: str) -> list[str]:
     with reader() as c:
         k = seq_col(c)
+        if has_task_identity(c):
+            rows = c.execute(
+                f"SELECT COALESCE(issue_key, CAST(issue AS TEXT)) AS ticket, status FROM runs "  # noqa: S608
+                f"WHERE kind = 'pipeline' AND repo = ? AND task_id IS NOT NULL AND {WHOLE_RUN} "
+                f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
+                f"AND r2.task_id = runs.task_id AND {WHOLE_RUN} AND {LIVE_RUN} "
+                f"AND r2.status != 'queued' "
+                f"ORDER BY r2.started DESC, r2.{k} DESC LIMIT 1) "
+                f"ORDER BY started, {k}",
+                (repo,),
+            ).fetchall()
+            return [str(r["ticket"]) for r in rows if r["status"] == "interrupted"]
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "  # noqa: S608
                          f"AND {k} = (SELECT r2.{k} FROM runs r2 WHERE r2.kind = 'pipeline' "
                          f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
@@ -882,12 +1004,21 @@ def last_pipeline_starts() -> dict[str, str]:
                                               "GROUP BY repo")}
 
 
-def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
+def running_run(repo: str | int, issue: int | str | None = None, connect=reader) -> dict | None:
     with connect() as c:
+        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
+        if tnum is not None:
+            r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND task_id = ? "  # noqa: S608
+                          f"AND status IN ('running', 'queued') "
+                          f"ORDER BY status = 'running' DESC, started DESC, {seq_col(c)} DESC LIMIT 1",
+                          (tnum,)).fetchone()
+            return dict(r) if r else None
+        if repo_name is None:
+            return None
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "  # noqa: S608
                       f"AND status IN ('running', 'queued') "
                       f"ORDER BY status = 'running' DESC, started DESC, {seq_col(c)} DESC LIMIT 1",
-                      (repo, issue)).fetchone()
+                      (repo_name, raw_issue)).fetchone()
         return dict(r) if r else None
 
 
@@ -902,10 +1033,18 @@ def pending_label(repo: str, issue: int | str) -> str:
         return r["label_pending"] if r else ""
 
 
-def issue_running(repo: str, issue: int | str) -> bool:
+def issue_running(repo: str | int, issue: int | str | None = None) -> bool:
     with reader() as c:
+        tnum, repo_name, raw_issue = _resolve_task_target(c, repo, issue)
+        if tnum is not None:
+            return c.execute(
+                "SELECT 1 FROM runs WHERE kind = 'pipeline' AND task_id = ? AND status IN ('running', 'queued') LIMIT 1",
+                (tnum,),
+            ).fetchone() is not None
+        if repo_name is None:
+            return False
         return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status IN ('running', 'queued') LIMIT 1",
-                         (repo, issue)).fetchone() is not None
+                         (repo_name, raw_issue)).fetchone() is not None
 
 
 def pin_record(run_id: str, *, require_record_dir: Callable[[], bool] | None = None) -> bool:

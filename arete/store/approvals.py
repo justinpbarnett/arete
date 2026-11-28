@@ -131,9 +131,25 @@ def settle_approval(approval_id: int, status: str, outcome: str, result: str = "
 
 
 def add_mined(pr_url: str, repo: str, issue: str, run_id: str, status: str, why: str = "", task: str = "") -> None:
+    from . import tasks as task_store
+
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts) "
-                  "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
+        if task_store.has_identity_expand(c):
+            tnum: int | None = None
+            if run_id:
+                rrow = c.execute("SELECT task_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if rrow and rrow["task_id"] is not None:
+                    tnum = int(rrow["task_id"])
+            if tnum is None and repo and issue:
+                tnum = task_store.TaskStore.find_task_num(c, repo, str(issue))
+            c.execute(
+                "INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts, task_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (pr_url, repo, issue, run_id, status, why, task, util.iso(), tnum),
+            )
+        else:
+            c.execute("INSERT OR REPLACE INTO mined (pr_url, repo, issue, run_id, status, why, task, ts) "
+                      "VALUES (?,?,?,?,?,?,?,?)", (pr_url, repo, issue, run_id, status, why, task, util.iso()))
 
 
 def mined_row(pr_url: str) -> dict:

@@ -86,7 +86,9 @@ class DurableCostTests(unittest.TestCase):
             patches.enter_context(mock.patch.object(module, name, side_effect=AssertionError("unexpected external call")))
 
     def start(self, rid):
-        run_store.insert_run(rid, {"kind": "pipeline", "status": "running", "started": util.iso()})
+        task_id, issue_key = support.ensure_task_id("fixture", rid)
+        run_store.insert_run(rid, {"kind": "pipeline", "task_id": task_id, "issue_key": issue_key,
+                                   "status": "running", "started": util.iso()})
         return rid
 
     def attempt(self, rid, which="claude", *, cfg=None, **kw):

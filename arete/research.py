@@ -344,7 +344,18 @@ def source_of(cfg: config.Config, r: dict) -> triage.TriageSource | None:
 
 
 def candidate(r: dict) -> triage.Candidate:
-    tid = triage.issue_id(r["tracker"], r["ref"])
+    tid = ""
+    if r.get("ref_id") is not None:
+        from .store import db as foundation
+        from .store import tasks as task_store
+
+        with foundation.reader() as c:
+            ref_row = task_store.TaskStore.ref_get(c, int(r["ref_id"]))
+        if ref_row is not None:
+            key = str(ref_row["key"])
+            tid = key.rsplit("#", 1)[1] if ref_row["system"] == "github" and "#" in key else key
+    if not tid:
+        tid = triage.issue_id(r["tracker"], r["ref"])
     return triage.Candidate(r["ref"], tid, r["title"], r["url"], r["updated"])
 
 
