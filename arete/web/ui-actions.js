@@ -85,7 +85,9 @@ const retryRoutes = { stop: "stop", retry: "resume", "repair-run": "repair" };
 
 export function runPageContext(run, { refresh, go, openLink }) {
   const routes = runRoutes(run.id);
-  const target = (action) => routes[retryRoutes[action.name]];
+  const target = (action) => action.name === "stop" && run.version == null
+    ? `/api/runs/${encodeURIComponent(run.id)}/stop`
+    : routes[retryRoutes[action.name]];
   const settled = (action, result) => {
     refresh();
     if (action.name !== "stop" && typeof result.run === "string" && result.run) go(result.run);

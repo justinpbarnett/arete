@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 32
+MINOR = 33
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -1077,7 +1077,12 @@ RUN_SANDBOX = envelope({
     "lease": NULL_TEXT,
     "address": STRING,
     "facts": {**mapping(JSON), "type": ["object", "null"]},
-})
+    "takeover": NULL_TEXT,
+    "branch": NULL_TEXT,
+    "base": NULL_TEXT,
+    "egress": STRING,
+    "tail": array(STRING),
+}, required=["seq", "device", "lease", "address", "facts"])
 
 OPERATIONS += [
     operation("device.list", "devices", envelope({"devices": array(DEVICE)})),

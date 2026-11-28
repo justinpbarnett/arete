@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -930,3 +931,31 @@ def device_get_view(name: str) -> dict | None:
     probe_row = device_store.latest_device_probe(d.name)
     open_leases = [f"L-{row['id']}" for row in device_store.leases_list(device=d.name, only_open=True)]
     return device_view(d, probe_row=probe_row, open_leases=open_leases)
+
+
+def leased_device(lease_row: dict | None) -> Device | None:
+    if lease_row is None or lease_row.get("released"):
+        return None
+    try:
+        d = device_at_version(lease_row["device"], lease_row.get("device_version") or "")
+    except DeviceError:
+        return None
+    if not d.remote:
+        return d
+    address = str(lease_row.get("address") or "").strip()
+    if d.kind in ("exe", "proxmox"):
+        if not address:
+            return None
+        return replace(d, host=address, port=None)
+    if address:
+        return replace(d, host=address)
+    return d
+
+
+def takeover_command(device: Device | None, run: dict) -> str | None:
+    if device is None or not device.remote or device.kind not in ("ssh", "exe", "proxmox") or not device.host:
+        return None
+    argv = ssh.ssh_argv(device)
+    remote = ssh.remote_dir(device.dir or "~")
+    command = f"cd {remote} && exec $SHELL"
+    return shlex.join([*argv[:-1], "-t", argv[-1], command])

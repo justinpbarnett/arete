@@ -9,6 +9,7 @@ import re
 import secrets
 import zlib
 from collections import Counter
+from contextlib import suppress
 from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
@@ -80,6 +81,55 @@ def _vapid_public_key() -> str:
         return webpush.public_key()
     except webpush.KeyFault:
         return ""
+
+
+def _run_workspace_refs(run_row: dict) -> tuple[str | None, str | None]:
+    run_id = run_row["id"]
+    branch = str(run_row.get("branch") or "").strip() or None
+    base: str | None = None
+    found = record.read_run(run_id)
+    if found:
+        for mark in reversed(found.get("marks") or ()):
+            if mark.get("kind") in ("clone", "worktree", "base_merge"):
+                if branch is None and isinstance(mark.get("branch"), str) and mark["branch"].strip():
+                    branch = mark["branch"].strip()
+                if base is None and isinstance(mark.get("base"), str) and mark["base"].strip():
+                    base = mark["base"].strip()
+            if branch is not None and base is not None:
+                break
+    if run_row.get("kind") == "session" and (branch is None or base is None):
+        from . import sessions
+
+        with suppress(ValueError, OSError):
+            spec = util.read_json(sessions.spec_file(run_id), {})
+            if isinstance(spec, dict):
+                if branch is None and isinstance(spec.get("branch"), str) and spec["branch"].strip():
+                    branch = spec["branch"].strip()
+                if base is None and isinstance(spec.get("base"), str) and spec["base"].strip():
+                    base = spec["base"].strip()
+    if base is None:
+        with foundation.reader() as c:
+            has_ws = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspaces'"
+            ).fetchone() is not None
+            ws_row = (
+                c.execute(
+                    "SELECT repo, onto FROM workspaces WHERE owner_run = ? ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if has_ws
+                else None
+            )
+        if ws_row is not None:
+            onto = json.loads(ws_row["onto"]) if ws_row["onto"] else {}
+            if isinstance(onto, dict):
+                base = next((str(v).strip() for v in onto.values() if isinstance(v, str) and v.strip()), None)
+            if base is None and ws_row["repo"]:
+                cfg, _ = config.load_or_problem()
+                with suppress(config.UnknownRepo, OSError, ValueError):
+                    repo_obj = cfg.repo(ws_row["repo"])
+                    base = repo_obj.target_branch or config.load_layer(repo_obj.layer_dir).base_branch or None
+    return branch, base
 
 
 def meta():
@@ -451,11 +501,27 @@ def read(name, values, handler, *, conn=None):
         device_name = lease_row["device"] if lease_row else (run_row.get("device") or "local")
         probe_row = device_store.latest_device_probe(device_name)
         facts = probe_row["facts"] if probe_row else None
+        leased = devices.leased_device(lease_row)
+        configured = None
+        with suppress(devices.DeviceError):
+            configured = (
+                devices.device_at_version(lease_row["device"], lease_row.get("device_version") or "")
+                if lease_row
+                else devices.get(device_name)
+            )
+        branch, base = _run_workspace_refs(run_row)
+        egress = configured.egress if configured is not None else ""
+        tail = [line[:400] for line in board.log_lines(run_row)[-14:]]
         return {
             "device": device_name,
             "lease": f"L-{lease_row['id']}" if lease_row else None,
             "address": lease_row["address"] if lease_row else "",
             "facts": facts,
+            "takeover": devices.takeover_command(leased, run_row),
+            "branch": branch,
+            "base": base,
+            "egress": egress,
+            "tail": tail,
         }
     if name == "outbox.list":
         return {"items": outbox.list_items(state=values.get("state"), task=values.get("task"), run=values.get("run"))}
