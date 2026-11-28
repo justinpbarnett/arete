@@ -24,6 +24,8 @@ from . import (
     settings,
     steps,
 )
+from .store import db as foundation
+from .store import devices as device_store
 from .store import runs as run_store
 
 VALIDATOR = "configcheck.v1"
@@ -85,7 +87,7 @@ REACH_KEYS = frozenset((
 
 # Keys that are Gate A from an owner/hand on step_settings / config.toml (within ceilings).
 STEP_SETTINGS_A_LEAF_KEYS = frozenset(("model", "effort", "timeout_minutes", "tries"))
-CONFIG_ROOT_A_KEYS = frozenset(("max_parallel", "max_parallel_per_repo"))
+CONFIG_ROOT_A_KEYS = frozenset(("max_parallel",))
 SOURCE_A_KEYS = frozenset(("every", "enabled"))
 LOOP_A_KEYS = frozenset(("enabled",))
 KIND_A_DEFAULTS = frozenset(("prompt", "sound", "attention", "models", "prices", "retention", "schema"))
@@ -193,7 +195,7 @@ def _is_reach_change(kind: str, dotted: str, old_val: object, new_val: object) -
     if leaf == "tries" and isinstance(new_val, int) and not isinstance(new_val, bool):
         if new_val > TRIES_CEILING:
             return True
-    if leaf in ("max_parallel", "max_parallel_per_repo") and isinstance(new_val, int) and not isinstance(new_val, bool):
+    if leaf == "max_parallel" and isinstance(new_val, int) and not isinstance(new_val, bool):
         if new_val > settings.PARALLEL_MAX:
             return True
     # Rule kind with approve/remember/audience
@@ -298,10 +300,20 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
         except (ValueError, TypeError, tomllib.TOMLDecodeError) as error:
             problems.append(f"{where}: {error}")
     elif kind == "attention" and isinstance(parsed, dict):
+        from . import attention
+
         try:
-            config.ask_table(parsed)
+            attention.parse_thresholds(parsed, where=where)
+            ask_part = {k: v for k, v in parsed.items() if k in attention.ASK_KEYS}
+            if ask_part:
+                config.ask_table(ask_part)
         except (ValueError, TypeError) as error:
             problems.append(f"{where}: {error}")
+    elif kind == "source":
+        from . import sources as sources_mod
+
+        if not sources_mod.SOURCE_ID_RE.fullmatch(name):
+            problems.append(f"{where}: source id {name!r} must match ^[a-z0-9][a-z0-9-]{{0,63}}$")
     return problems
 
 
@@ -401,6 +413,47 @@ def _validate_references(
                         problems.append(
                             f"{where}: drops required field(s) {', '.join(dropped)} from engine schema {name}"
                         )
+    elif kind == "source" and isinstance(parsed, dict):
+        from . import sources as sources_mod
+        from .store import db as foundation
+        from .store import projects as projects_store
+
+        cfg = config.load_or_problem()[0]
+        stype = parsed.get("type")
+        if stype not in sources_mod.SOURCES:
+            problems.append(f"{where}: source type {stype!r} is not one of {', '.join(sources_mod.SOURCES)}")
+        else:
+            problems.extend(f"{where}: {p}" for p in sources_mod.SOURCES[stype].problems(parsed, None, cfg))
+        raw_line = parsed.get("line")
+        if isinstance(raw_line, str) and raw_line.strip() and paths.DB_FILE.exists():
+            lid = raw_line.strip()
+            with foundation.reader() as conn:
+                if projects_store.available(conn):
+                    row = projects_store.get_line(conn, lid)
+                    if row is None:
+                        problems.append(f"{where}: unknown line '{lid}'")
+                    elif row["archived"]:
+                        problems.append(f"{where}: line '{lid}' is archived")
+    elif kind == "loop" and isinstance(parsed, dict):
+        from .store import db as foundation
+        from .store import projects as projects_store
+
+        raw_sources = parsed.get("source")
+        if isinstance(raw_sources, list) and paths.DB_FILE.exists():
+            line_ids = [
+                entry["line"].strip()
+                for entry in raw_sources
+                if isinstance(entry, dict) and isinstance(entry.get("line"), str) and entry["line"].strip()
+            ]
+            if line_ids:
+                with foundation.reader() as conn:
+                    if projects_store.available(conn):
+                        for lid in line_ids:
+                            row = projects_store.get_line(conn, lid)
+                            if row is None:
+                                problems.append(f"{where}: unknown line '{lid}'")
+                            elif row["archived"]:
+                                problems.append(f"{where}: line '{lid}' is archived")
     elif kind == "prompt" and isinstance(parsed, str):
         if not name.endswith(".append") and not path.startswith("layers/"):
             cfg_file = config_dir / "config.toml"
@@ -426,6 +479,55 @@ def _validate_references(
             except ValueError as error:
                 problems.append(f"{where}: {error}")
     return problems, warnings
+
+
+def _source_list_gate(loop_name: str, old_val: object, new_val: object) -> tuple[str, bool, list[str]]:
+    """Compute (gate, all_a, exposes) for inline [[source]] table edits inside a loop."""
+    from . import sources as sources_mod
+
+    old_list = old_val if isinstance(old_val, list) else []
+    new_list = new_val if isinstance(new_val, list) else []
+    old_by_id = {
+        sources_mod.table_source_id(loop_name, entry): entry
+        for entry in old_list
+        if isinstance(entry, dict)
+    }
+    new_by_id = {
+        sources_mod.table_source_id(loop_name, entry): entry
+        for entry in new_list
+        if isinstance(entry, dict)
+    }
+    gate = "A"
+    all_a = True
+    exposes: list[str] = []
+    for sid in sorted(old_by_id.keys() | new_by_id.keys()):
+        old_tbl = old_by_id.get(sid)
+        new_tbl = new_by_id.get(sid)
+        if old_tbl is None:
+            all_a = False
+            gate = _raise_gate(gate, "B")
+            for sub_dotted, ov, nv in _diff_paths({}, new_tbl):
+                if _is_reach_change("source", sub_dotted, ov, nv):
+                    exposes.append(f"source.{sid}.{sub_dotted}")
+                    gate = "C"
+            continue
+        if new_tbl is None:
+            all_a = False
+            gate = _raise_gate(gate, "B")
+            for sub_dotted, ov, nv in _diff_paths(old_tbl, {}):
+                if _is_reach_change("source", sub_dotted, ov, nv):
+                    exposes.append(f"source.{sid}.{sub_dotted}")
+                    gate = "C"
+            continue
+        for sub_dotted, ov, nv in _diff_paths(old_tbl, new_tbl):
+            if _is_reach_change("source", sub_dotted, ov, nv):
+                exposes.append(f"source.{sid}.{sub_dotted}")
+                gate = "C"
+                all_a = False
+            elif not _is_a_only_change("source", sub_dotted):
+                all_a = False
+                gate = _raise_gate(gate, "B")
+    return gate, all_a, exposes
 
 
 def _compute_floor(
@@ -484,8 +586,17 @@ def _compute_floor(
         else:
             all_a = True
             gate = default_gate
+            if kind == "source" and old_bytes is None:
+                all_a = False
+                gate = _raise_gate(gate, "B")
             for dotted, old_v, new_v in changes:
-                if _is_reach_change(kind, dotted, old_v, new_v):
+                if kind == "loop" and dotted == "source":
+                    s_gate, s_all_a, s_exposes = _source_list_gate(name, old_v, new_v)
+                    exposes.extend(s_exposes)
+                    gate = _raise_gate(gate, s_gate)
+                    if not s_all_a:
+                        all_a = False
+                elif _is_reach_change(kind, dotted, old_v, new_v):
                     exposes.append(dotted)
                     gate = "C"
                     all_a = False
@@ -507,7 +618,237 @@ def _compute_floor(
     return gate, exposes, notes
 
 
-def _overlay_config_dir(base_dir: Path, path: str, raw_bytes: bytes, dest: Path) -> None:
+def _read_toml_table(path: Path) -> dict:
+    try:
+        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def _iter_loop_tomls(root: Path) -> list[tuple[str, dict]]:
+    found: list[tuple[str, dict]] = []
+    loops_dir = root / "loops"
+    if loops_dir.is_dir():
+        for path in sorted(loops_dir.glob("*/loop.toml")):
+            if path.is_file():
+                found.append((path.parent.name, _read_toml_table(path)))
+    layers_dir = root / "layers"
+    if layers_dir.is_dir():
+        for path in sorted(layers_dir.glob("*/loops/*/loop.toml")):
+            if path.is_file():
+                repo = path.parents[2].name
+                found.append((f"{repo}.{path.parent.name}", _read_toml_table(path)))
+    return found
+
+
+def _iter_config_tomls(root: Path) -> list[tuple[str, dict]]:
+    found: list[tuple[str, dict]] = []
+    cfg_file = root / "config.toml"
+    if cfg_file.is_file():
+        found.append(("config.toml", _read_toml_table(cfg_file)))
+    layers_dir = root / "layers"
+    if layers_dir.is_dir():
+        for path in sorted(layers_dir.glob("*/config.toml")):
+            if path.is_file():
+                found.append((path.relative_to(root).as_posix(), _read_toml_table(path)))
+    return found
+
+
+def _iter_rule_tomls(root: Path) -> list[tuple[str, dict]]:
+    found: dict[str, dict] = {}
+    defaults_dir = paths.DEFAULTS_DIR / "rules"
+    if defaults_dir.is_dir():
+        for path in sorted(defaults_dir.glob("*.toml")):
+            if path.is_file():
+                found[path.stem] = _read_toml_table(path)
+    user_dir = root / "rules"
+    if user_dir.is_dir():
+        for path in sorted(user_dir.glob("*.toml")):
+            if path.is_file():
+                found[path.stem] = _read_toml_table(path)
+    return sorted(found.items())
+
+
+def _iter_target_tomls(root: Path) -> list[tuple[str, dict]]:
+    found: dict[str, dict] = {}
+    defaults_dir = paths.DEFAULTS_DIR / "targets"
+    if defaults_dir.is_dir():
+        for path in sorted(defaults_dir.glob("*.toml")):
+            if path.is_file():
+                found[path.stem] = _read_toml_table(path)
+    user_dir = root / "targets"
+    if user_dir.is_dir():
+        for path in sorted(user_dir.glob("*.toml")):
+            if path.is_file():
+                found[path.stem] = _read_toml_table(path)
+    return sorted(found.items())
+
+
+def _iter_route_tomls(root: Path) -> list[tuple[str, dict]]:
+    found: dict[str, dict] = {}
+    eng = paths.ENGINE_ROUTES_DIR / "adw.toml"
+    if eng.is_file():
+        found["adw"] = _read_toml_table(eng)
+    user_dir = root / "routes"
+    if user_dir.is_dir():
+        for path in sorted(user_dir.glob("*.toml")):
+            if path.is_file():
+                found[path.stem] = _read_toml_table(path)
+    return sorted(found.items())
+
+
+def _step_tables(parsed: dict) -> list[dict]:
+    tables: list[dict] = []
+    if isinstance(parsed.get("defaults"), dict):
+        tables.append(parsed["defaults"])
+    raw_steps = parsed.get("steps")
+    if isinstance(raw_steps, dict):
+        tables.extend(v for v in raw_steps.values() if isinstance(v, dict))
+    raw_kinds = parsed.get("kinds")
+    if isinstance(raw_kinds, dict):
+        for kind_tbl in raw_kinds.values():
+            if isinstance(kind_tbl, dict) and isinstance(kind_tbl.get("steps"), dict):
+                tables.extend(v for v in kind_tbl["steps"].values() if isinstance(v, dict))
+    return tables
+
+
+def _db_table_exists(c, table: str) -> bool:
+    return c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
+
+
+def find_delete_references(kind: str, name: str, config_dir: Path | None = None) -> list[str]:
+    root = (config_dir or paths.CONFIG_DIR).resolve()
+    refs: set[str] = set()
+    if kind == "device":
+        if paths.DB_FILE.exists():
+            try:
+                with foundation.reader() as c:
+                    if _db_table_exists(c, "leases"):
+                        for row in c.execute(
+                            "SELECT id, run_id FROM leases WHERE device = ? AND released IS NULL ORDER BY id",
+                            (name,),
+                        ):
+                            refs.add(f"lease:L-{row['id']}")
+                            if row["run_id"]:
+                                refs.add(f"run:{row['run_id']}")
+                    if _db_table_exists(c, "runs"):
+                        for row in c.execute(
+                            "SELECT id FROM runs WHERE device = ? AND status IN ('queued', 'running') ORDER BY id",
+                            (name,),
+                        ):
+                            refs.add(f"run:{row['id']}")
+                    for wait in device_store.open_waits_for_blocker(c, f"device:{name}"):
+                        refs.add(f"wait:{wait['subject']}")
+            except (foundation.NoDatabase, foundation.IncompatibleSchema):
+                pass
+        for loop_name, parsed in _iter_loop_tomls(root):
+            run_tbl = parsed.get("run")
+            if isinstance(run_tbl, dict) and run_tbl.get("device") == name:
+                refs.add(f"loop:{loop_name}")
+        for rel, parsed in _iter_config_tomls(root):
+            if any(tbl.get("device") == name for tbl in _step_tables(parsed)):
+                refs.add(f"config:{rel}")
+            for repo_tbl in parsed.get("repo", ()) if isinstance(parsed.get("repo"), list) else ():
+                if isinstance(repo_tbl, dict) and repo_tbl.get("device") == name:
+                    refs.add(f"config:{rel}")
+    elif kind == "source":
+        for rule_name, parsed in _iter_rule_tomls(root):
+            sources_val = parsed.get("sources")
+            when_tbl = parsed.get("when")
+            when_src = when_tbl.get("source") if isinstance(when_tbl, dict) else None
+            if (
+                parsed.get("source") == name
+                or (isinstance(sources_val, list) and name in sources_val)
+                or when_src == name
+                or (isinstance(when_src, list) and name in when_src)
+            ):
+                refs.add(f"rule:{rule_name}")
+        for route_name, parsed in _iter_route_tomls(root):
+            for rule in parsed.get("rule", ()) if isinstance(parsed.get("rule"), list) else ():
+                if not isinstance(rule, dict):
+                    continue
+                when_tbl = rule.get("when")
+                when_src = when_tbl.get("source") if isinstance(when_tbl, dict) else None
+                if rule.get("source") == name or when_src == name or (isinstance(when_src, list) and name in when_src):
+                    refs.add(f"routes:{route_name}")
+        for loop_name, parsed in _iter_loop_tomls(root):
+            for src in parsed.get("source", ()) if isinstance(parsed.get("source"), list) else ():
+                if isinstance(src, dict) and (src.get("name") == name or src.get("source") == name):
+                    refs.add(f"loop:{loop_name}")
+        for rel, parsed in _iter_config_tomls(root):
+            for repo_tbl in parsed.get("repo", ()) if isinstance(parsed.get("repo"), list) else ():
+                if isinstance(repo_tbl, dict) and repo_tbl.get("source") == name:
+                    refs.add(f"config:{rel}")
+            triage_tbl = parsed.get("triage")
+            if isinstance(triage_tbl, dict) and triage_tbl.get("source") == name:
+                refs.add(f"config:{rel}")
+    elif kind == "target" and not (paths.DEFAULTS_DIR / "targets" / f"{name}.toml").is_file():
+        for rule_name, parsed in _iter_rule_tomls(root):
+            if parsed.get("target") == name:
+                refs.add(f"rule:{rule_name}")
+        if paths.DB_FILE.exists():
+            try:
+                with foundation.reader() as c:
+                    if _db_table_exists(c, "outbox"):
+                        for row in c.execute(
+                            "SELECT id FROM outbox WHERE target = ? "
+                            "AND state IN ('draft', 'edited', 'approved', 'held', 'sending', 'failed') ORDER BY id",
+                            (name,),
+                        ):
+                            refs.add(f"outbox:OB-{row['id']}")
+            except (foundation.NoDatabase, foundation.IncompatibleSchema):
+                pass
+    elif kind == "connector":
+        for target_name, parsed in _iter_target_tomls(root):
+            if parsed.get("connector") == name:
+                refs.add(f"target:{target_name}")
+    elif kind == "adw" and not (paths.ENGINE_ADWS_DIR / f"{name}.toml").is_file():
+        for route_name, parsed in _iter_route_tomls(root):
+            for rule in parsed.get("rule", ()) if isinstance(parsed.get("rule"), list) else ():
+                if isinstance(rule, dict) and rule.get("adw") == name:
+                    refs.add(f"routes:{route_name}")
+        if paths.DB_FILE.exists():
+            try:
+                with foundation.reader() as c:
+                    if _db_table_exists(c, "runs"):
+                        cols = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+                        if "adw" in cols:
+                            for row in c.execute(
+                                "SELECT id FROM runs WHERE adw = ? AND status IN ('queued', 'running') ORDER BY id",
+                                (name,),
+                            ):
+                                refs.add(f"run:{row['id']}")
+            except (foundation.NoDatabase, foundation.IncompatibleSchema):
+                pass
+    elif kind == "prompt" and not (paths.PROMPTS_DIR / f"{name}.md").is_file():
+        for rel, parsed in _iter_config_tomls(root):
+            if any(tbl.get("prompt") == name for tbl in _step_tables(parsed)):
+                refs.add(f"config:{rel}")
+        for loop_name, parsed in _iter_loop_tomls(root):
+            run_tbl = parsed.get("run")
+            if isinstance(run_tbl, dict) and run_tbl.get("prompt") == name:
+                refs.add(f"loop:{loop_name}")
+    elif kind == "schema":
+        for rel, parsed in _iter_config_tomls(root):
+            if any(tbl.get("schema") == name for tbl in _step_tables(parsed)):
+                refs.add(f"config:{rel}")
+    elif kind == "loop" and not (paths.PACKAGE_DIR / "loops" / name / "loop.toml").is_file():
+        if paths.DB_FILE.exists():
+            try:
+                with foundation.reader() as c:
+                    if _db_table_exists(c, "runs"):
+                        for row in c.execute(
+                            "SELECT id FROM runs WHERE loop = ? AND status IN ('queued', 'running') ORDER BY id",
+                            (name,),
+                        ):
+                            refs.add(f"run:{row['id']}")
+            except (foundation.NoDatabase, foundation.IncompatibleSchema):
+                pass
+    return sorted(refs)
+
+
+def _overlay_config_dir(base_dir: Path, path: str, raw_bytes: bytes | None, dest: Path) -> None:
     if base_dir.is_dir():
         shutil.copytree(
             base_dir,
@@ -516,15 +857,19 @@ def _overlay_config_dir(base_dir: Path, path: str, raw_bytes: bytes, dest: Path)
             ignore=shutil.ignore_patterns(".git", "secrets", "hooks", "verification-authority", "*.tmp", "*.arete-tmp"),
         )
     target = dest / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(raw_bytes)
+    if raw_bytes is None:
+        if target.is_file():
+            target.unlink()
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw_bytes)
 
 
 def _stage_resolve(
     kind: str,
     name: str,
     path: str,
-    raw_bytes: bytes,
+    raw_bytes: bytes | None,
     config_dir: Path,
 ) -> tuple[list[str], list[str], config.Config | None, Path | None]:
     problems: list[str] = []
@@ -584,9 +929,29 @@ def _stage_dry_run(
     raw_bytes: bytes,
     config_dir: Path,
     author: str,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], dict | None]:
     problems: list[str] = []
     notes: list[str] = []
+
+    if kind == "source" and isinstance(parsed, dict):
+        from . import sources as sources_mod
+
+        cfg = config.load_or_problem()[0]
+        if parsed.get("type") == "pipeline":
+            dr = {"source": name, "dry_run": True, "ok": True, "error": None, "items": [], "would_rescope": False, "check": None}
+            notes.append("pipeline source: no fetch")
+            return problems, notes, dr
+        try:
+            src = sources_mod.build_file_src(name, parsed, raw_bytes, cfg, config_dir=config_dir)
+            dr = sources_mod.dry_run(src, cfg)
+        except Exception as error:
+            problems.append(f"dry_run source failed: {error}")
+            return problems, notes, None
+        if not dr.get("ok"):
+            problems.append(f"dry_run source failed: {dr.get('error') or 'unknown error'}")
+        else:
+            notes.append(f"items: {len(dr.get('items') or ())}, would_rescope: {bool(dr.get('would_rescope'))}")
+        return problems, notes, dr
 
     if kind == "prompt":
         try:
@@ -599,16 +964,16 @@ def _stage_dry_run(
             notes.append(f"rendered sample task for {len(lines)} line(s) ({len(rendered)} chars)")
         except Exception as error:
             problems.append(f"dry_run prompt render failed: {error}")
-        return problems, notes
+        return problems, notes, None
 
     if kind == "schema":
         if not isinstance(parsed, dict):
             problems.append("dry_run schema must be a JSON object")
-            return problems, notes
+            return problems, notes, None
         cfg = config.load_or_problem()[0]
         lines = [r.name for r in cfg.repos] or ["default"]
         notes.append(f"validated sample schema binding for {len(lines)} line(s)")
-        return problems, notes
+        return problems, notes, None
 
     if kind in ("step_settings", "models"):
         with tempfile.TemporaryDirectory(prefix="arete-check-dryrun-") as tmp:
@@ -655,7 +1020,7 @@ def _stage_dry_run(
                     problems.append(f"dry_run diff failed: {error}")
             else:
                 notes.append("dry_run skipped (no live config.toml)")
-        return problems, notes
+        return problems, notes, None
 
     if kind in ("adw", "routes"):
         with tempfile.TemporaryDirectory(prefix="arete-check-adw-") as tmp:
@@ -666,7 +1031,7 @@ def _stage_dry_run(
                 res = adw.check_draft(kind, parsed, cfg=cfg, config_dir=overlay, where=path, actor=author)
             except Exception as error:
                 problems.append(f"dry_run {kind} failed: {error}")
-                return problems, notes
+                return problems, notes, None
             if res.get("status") != "valid":
                 problems.extend(res.get("errors") or [f"{kind} dry run failed"])
             else:
@@ -675,17 +1040,17 @@ def _stage_dry_run(
                     notes.append(f"outline: {len(dr.get('outline') or ())} node(s)")
                 else:
                     notes.append(f"route changes: {len(dr.get('changes') or ())} ticket(s)")
-        return problems, notes
+        return problems, notes, None
 
     notes.append("skipped")
-    return problems, notes
+    return problems, notes, None
 
 
 def check(
     kind: str,
     name: str,
     path: str,
-    body: str | bytes,
+    body: str | bytes | None,
     *,
     author: str = "hand",
     config_dir: Path | None = None,
@@ -700,6 +1065,46 @@ def check(
     warnings: list[dict[str, str]] = []
     gate = "B"
     exposes: list[str] = []
+
+    if body is None:
+        stages.append(_stage("parse", True, [], ["delete file"]))
+        if stop_after <= 1:
+            return {"validator": VALIDATOR, "ok": True, "stages": stages, "gate": gate, "exposes": exposes}
+        schema_problems: list[str] = []
+        if kind == "library":
+            schema_problems.append(f"{path or kind}: config kind 'library' is read only")
+        elif kind == "attention" or path == "config.toml":
+            schema_problems.append(f"{path or kind}: root config.toml cannot be deleted")
+        stages.append(_stage("schema", not schema_problems, schema_problems))
+        if schema_problems or stop_after <= 2:
+            return {"validator": VALIDATOR, "ok": not schema_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        refs = find_delete_references(kind, name, root)
+        ref_problems = [f"{path or f'{kind}/{name}'} is referenced by {', '.join(refs)}"] if refs else []
+        stages.append(_stage("references", not ref_problems, ref_problems))
+        if ref_problems or stop_after <= 3:
+            return {"validator": VALIDATOR, "ok": not ref_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        if old_bytes is None and path:
+            if configrepo.is_repo(root):
+                old_bytes = configrepo.live_bytes(path, root)
+            elif (root / path).is_file():
+                old_bytes = (root / path).read_bytes()
+        empty_parsed: object = {} if kind in TOML_KINDS or kind in JSON_KINDS else ""
+        gate, exposes, floor_notes = _compute_floor(kind, name, path, empty_parsed, b"", old_bytes, author)
+        stages.append(_stage("floor", True, [], [f"gate {gate}", *floor_notes]))
+        if stop_after <= 4:
+            return {"validator": VALIDATOR, "ok": True, "stages": stages, "gate": gate, "exposes": exposes}
+        res_problems, res_notes, _, _ = _stage_resolve(kind, name, path, None, root)
+        stages.append(_stage("resolve", not res_problems, res_problems, res_notes))
+        if res_problems or stop_after <= 5:
+            return {"validator": VALIDATOR, "ok": not res_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        stages.append(_stage("dry_run", True, [], ["delete"]))
+        return {
+            "validator": f"{VALIDATOR}@{codebase.STAMP}",
+            "ok": True,
+            "stages": stages,
+            "gate": gate,
+            "exposes": exposes,
+        }
 
     if isinstance(body, bytes):
         try:
@@ -752,10 +1157,10 @@ def check(
         return {"validator": VALIDATOR, "ok": not res_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 6: dry_run
-    dry_problems, dry_notes = _stage_dry_run(kind, name, path, parsed, raw_bytes, root, author)
+    dry_problems, dry_notes, dry_report = _stage_dry_run(kind, name, path, parsed, raw_bytes, root, author)
     stages.append(_stage("dry_run", not dry_problems, dry_problems, dry_notes))
     ok = not dry_problems
-    return {
+    report: dict[str, object] = {
         "validator": f"{VALIDATOR}@{codebase.STAMP}",
         "ok": ok,
         "stages": stages,
@@ -763,6 +1168,9 @@ def check(
         "exposes": exposes,
         "warnings": warnings,
     }
+    if dry_report is not None:
+        report["dry_run"] = dry_report
+    return report
 
 
 def check_staged_files(staged_blobs: dict[str, bytes], root: Path) -> tuple[bool, str, list[str]]:

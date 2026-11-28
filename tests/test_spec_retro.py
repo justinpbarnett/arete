@@ -37,16 +37,18 @@ class SpecRetroTests(unittest.TestCase):
         response = [{"data": {"repository": {"issues": {"nodes": notes}}}}]
         with (mock.patch.object(gh, "me", return_value="Owner"),
               mock.patch.object(gh, "gh_json", return_value=response)):
-            self.assertEqual(sources.poll(self.loop, 0, self.cfg), ([], []))
+            src = next(s for s in sources.load_all(self.cfg, [self.loop]) if s.id == "mine-github-specs")
+            self.assertEqual(sources.poll(src, self.cfg), ([], []))
             notes.extend([page(2), page(3, parent={"id": "12"}), page(4, owner="contributor")])
-            events, items = sources.poll(self.loop, 0, self.cfg)
+            events, items = sources.poll(src, self.cfg)
             self.assertEqual([e["key"] for e in events], ["org/product#2"])
             self.assertEqual(len(items), 1)
             notes.clear()
-            self.assertEqual(sources.poll(self.loop, 0, self.cfg), ([], []))
+            self.assertEqual(sources.poll(src, self.cfg), ([], []))
             notes.extend([page(1), page(2)])
             reloaded = loops.load(self.loop.dir, "arete", "", self.cfg)
-            self.assertEqual(sources.poll(reloaded, 0, self.cfg), ([], []))
+            reloaded_src = next(s for s in sources.load_all(self.cfg, [reloaded]) if s.id == "mine-github-specs")
+            self.assertEqual(sources.poll(reloaded_src, self.cfg), ([], []))
 
     def test_jira_done_parent_requires_owner_and_routes_within_shared_project(self):
         first = config.Repo("app", self.folder, tracker="jira", pipeline=True, jira_project="PROJ")

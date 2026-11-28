@@ -516,28 +516,41 @@ class Check:
         fixture_fault_item = inbox_store.get_open_by_kind_and_subject("fault", f"step:{fault_run}/verify")
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
-        triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
+        triage_store.record_verdict(
+            triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"),
+            ensure_listed=True,
+            key_override="demo/repo#7",
+        )
         sample_cfg = config.load()
         sample_repo = sample_cfg.repo(replay.SAMPLE_REPO)
         send_src = triage.GitHubSource(sample_repo.github or f"owner/{sample_repo.name}", [sample_repo])
         send_ticket = triage.Candidate(f"{sample_repo.name}#9", "9", "Fixture send ticket", "https://example.invalid/9", "old")
-        triage_store.triage_put({
-            **triage.row(send_src, send_ticket, updated="old"),
-            "repo": sample_repo.name,
-            "repos": [sample_repo.name],
-            "ready": True,
-            "code": 1,
-            "questions": [],
-        })
+        triage_store.record_verdict(
+            {
+                **triage.row(send_src, send_ticket, updated="old"),
+                "repo": sample_repo.name,
+                "repos": [sample_repo.name],
+                "ready": True,
+                "code": 1,
+                "questions": [],
+            },
+            ensure_listed=True,
+            key_override=f"{send_src.key}#9",
+        )
         insights.research_set(ticket.ref, status="done", title="Fixture research")
         stopped = record.start("loop", pid=0)
         session = record.start("session")
         run_task = task_store.task_add(replay.SAMPLE_REPO, "Task to start via task.run", "Run me", "feat")
+        sync_task = task_store.task_add(replay.SAMPLE_REPO, "Task to sync via task.sync", "Sync me", "feat")
         task_store.task_comment(self.task, principals.owner(), "Initial comment for check")
         fixture_comment = task_store.task_comments(self.task)[0]
         with db.tx() as conn:
             fixture_ref_link = task_store.TaskStore.link_ref(
                 conn, self.task, "slack:C1/1700000000.000001", {"role": "related", "interpretation": "Fixture ref"},
+                principals.owner(),
+            )
+            task_store.TaskStore.link_ref(
+                conn, sync_task, "slack:C1/1700000000.000002", {"role": "primary", "interpretation": "Sync ref"},
                 principals.owner(),
             )
             fixture_link = task_store.TaskStore.create_link(
@@ -564,12 +577,30 @@ class Check:
             )
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
+        from . import configrepo as configrepo_mod
         from . import drafts as drafts_mod
+        from . import lines as lines_mod
 
+        lines_mod.ensure(config.load())
+        with principals.acting(principals.owner() or "hand"):
+            if lines_mod.get_line(f"{replay.SAMPLE_REPO}-pipeline") is None:
+                lines_mod.create_line({
+                    "id": f"{replay.SAMPLE_REPO}-pipeline",
+                    "project": replay.SAMPLE_REPO,
+                    "name": replay.SAMPLE_REPO,
+                    "kind": "pipeline",
+                    "repo": replay.SAMPLE_REPO,
+                })
+            if lines_mod.get_view("fixture-view") is None:
+                lines_mod.create_view({"id": "fixture-view", "name": "Fixture View", "filter": "state = ready"})
         cur_cfg_text = paths.CONFIG_FILE.read_text()
         alt_cfg_text = cur_cfg_text.replace("max_parallel = 3", "max_parallel = 4", 1)
         if alt_cfg_text == cur_cfg_text:
             alt_cfg_text = cur_cfg_text.replace("max_parallel = 2", "max_parallel = 4", 1)
+        scratch_dev = paths.CONFIG_DIR / "devices" / "scratch.toml"
+        scratch_dev.parent.mkdir(parents=True, exist_ok=True)
+        scratch_dev.write_text('kind = "ssh"\nhost = "scratch.invalid"\n', encoding="utf-8")
+        configrepo_mod.commit_hand_edits()
         draft_for_activate, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture activate")
         draft_for_try, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture try")
         draft_for_discard, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture discard")
@@ -578,21 +609,26 @@ class Check:
                       "n": "1", "ticket": send_ticket.ref, "ref": fixture_ref_link["ref"],
                       "link": str(fixture_link["id"]), "comment": str(fixture_comment["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
-                      "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
+                      "project": replay.SAMPLE_REPO, "line": f"{replay.SAMPLE_REPO}-pipeline", "view": "fixture-view",
+                      "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
-                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
+                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"],
+                      "source": "pipeline"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
             resource = name.partition(".")[0]
             ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
+                      "line": "demo-secondary" if name == "line.delete" else identities["line"],
                       "chat": (str(chat_for_file) if name == "chat.file"
                                else str(chat_for_send) if name in ("chat.send", "chat.session_start")
                                else identities["chat"]),
                       "item": ob_item if resource == "outbox" else identities["item"],
-                      "task": run_task if name == "task.run" else identities["task"],
+                      "task": (run_task if name == "task.run"
+                               else sync_task if name == "task.sync"
+                               else identities["task"]),
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -602,12 +638,26 @@ class Check:
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
                 values["base_version"] = row["version"]
+            if name in ("project.update", "line.update", "view.update"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                values["base_version"] = row["version"]
+            if name in ("project.restore", "line.restore", "view.restore"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                hist = self.read(f"/api/v1/{resource}s/{identities[resource]}/history")["events"]
+                values["base_version"] = row["version"]
+                values["seq"] = hist[0]["seq"]
+            if name == "line.delete":
+                row = self.read("/api/v1/lines/demo-secondary")["line"]
+                values["base_version"] = row["version"]
+            if name == "derived.recompute":
+                row = self.read(f"/api/v1/lines/{identities['line']}")["line"]
+                values["base_version"] = row["version"]
             if name == "comment.update":
                 values["base_version"] = fixture_comment["version"]
             if name == "task.restore":
                 # task.close just closed self.task right before task.restore in OPERATIONS order.
                 pass
-            if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
+            if name in ("inbox.snooze", "inbox.shelve", "inbox.reopen", "inbox.resolve"):
                 values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
             if resource == "outbox" and method != "GET":
                 cur_ob = self.read(f"/api/v1/outbox/{ob_item}")["item"]
@@ -626,6 +676,8 @@ class Check:
             if name == "config.rollback":
                 values["to"] = 2
                 values["base_version"] = self.read("/api/v1/config/step_settings/defaults")["item"]["version"]
+            if name == "config.delete":
+                values["base_version"] = self.read("/api/v1/config/device/scratch")["item"]["version"]
             if name == "config.try":
                 values["draft"] = draft_for_try["id"]
                 values["steps"] = ["plan"]
@@ -690,6 +742,9 @@ class Check:
                                                 status=op["success_status"])
                 elif name in ("task.run", "session.start", "chat.session_start", "loop.start", "loop.try",
                               "loop.draft", "config.ask"):
+                    if name == "task.run":
+                        for live_pip in pipeline.live_pipeline_runs():
+                            record.settle(live_pip["id"], "done")
                     dummy_proc = type("_P", (), {
                         "pid": 0, "poll": lambda self: None, "terminate": lambda self: None,
                         "kill": lambda self: None, "wait": lambda self, timeout=None: 0,
@@ -730,6 +785,11 @@ class Check:
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 elif name == "incident.scan":
                     with patch.object(oncall, "scan", return_value={"seen": 0}):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "source.poll":
+                    from . import loop_run as loop_run_mod
+
+                    with patch.object(loop_run_mod, "launch", return_value={"id": "poll-check", "status": "done", "picks": []}):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
@@ -796,7 +856,7 @@ def worker(lifeline):
             require(not paths.DB_FILE.exists(), "state database already exists")
             (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
-            body = ("max_parallel_per_repo = 3\n" + "\n".join(config)
+            body = ("\n".join(config)
                     + '\ngithub = "sample/replay"\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
             config_fixture_git("init", "-q", "-b", "main")
@@ -813,7 +873,7 @@ def worker(lifeline):
             codebase.load()
             children = []
 
-            def spawn(repo, tid, force=False, *, run_id=""):
+            def spawn(repo, tid, force=False, *, run_id="", line=""):
                 entry = "from arete.api_check import fixture_child; fixture_child(*sys.argv[1:])"
                 child = control.launch(child_command(SOURCE, entry, repo, str(tid), run_id), start_new_session=False)
                 children.append(child)

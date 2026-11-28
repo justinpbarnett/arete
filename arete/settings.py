@@ -13,7 +13,7 @@ from .store import config as config_store
 from .store import writes
 
 PARALLEL_MAX = 8
-RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per repo"}
+RUN_LIMITS = {"max_parallel": "Runs at once"}
 MODEL_ALIASES = ("opus", "sonnet", "haiku")
 MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+|"
                       r"(?:codex:)?(?:gpt-|codex-)[A-Za-z0-9._:-]+|codex:[A-Za-z0-9._-]+")

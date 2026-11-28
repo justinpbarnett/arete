@@ -83,4 +83,13 @@ export function outbox() { return { title: "Outbox", subtitle: "Drafts and deliv
 export function prompts() { return { title: "Prompts", subtitle: "Prompt library", queue: "Prompts", focus: "Editor", extra: "Details" }; }
 export function adws() { return { title: "ADWs", subtitle: "Agent development workflows", queue: "ADWs", focus: "Canvas", extra: "Properties" }; }
 export function insights() { return { title: "Insights", subtitle: "Work over time", queue: "Charts", focus: "Chart" }; }
-export function settings() { return { title: "Settings", subtitle: "Health and configuration", queue: "Sections", focus: "Health" }; }
+const settingsTitles = {
+  health: "Health", credentials: "Credentials", connectors: "Connectors", devices: "Devices",
+  models: "Models and routing", lines: "Lines", sources: "Sources", attention: "Attention budget",
+  "outbox rules": "Outbox rules", "outbox-rules": "Outbox rules", "intake rules": "Intake rules",
+  "intake-rules": "Intake rules", sound: "Sound", display: "Display and density", about: "About",
+};
+export function settings(route) {
+  return { title: "Settings", subtitle: "Health and configuration", queue: "Sections",
+    focus: settingsTitles[route?.path?.[0] || "health"] ?? "Health" };
+}

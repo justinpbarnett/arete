@@ -411,6 +411,8 @@ class Server:
         self.errors: dict[str, str] = {}
         self.waiting: dict[int, str] = {}
         self.pool = factory_control.WorkPool(POLL_THREADS, thread_name_prefix="poll")
+        sources.set_poll_pool(self.pool)
+        self.sources_backfilled = False
         self.db_future: Future | None = None
         self.db_lock = threading.Lock()
         self.db_health = {**dbstats.empty_collection(), "status": "initial", "requested_at": None,
@@ -534,6 +536,9 @@ class Server:
         every_loop = loops.load_all(cfg)
         self.every_loop = every_loop
         self.live = [x for x in every_loop if x.enabled and not x.error]
+        if not self.sources_backfilled and paths.DB_FILE.exists():
+            sources.backfill(cfg, every_loop)
+            self.sources_backfilled = True
         self.config_good = True
         return True
 
@@ -586,6 +591,7 @@ class Server:
             self.settle("loop:", {x.name for x in self.live})
             self.loaded = True
         stages = (
+            ("sources", self.poll, ()),
             ("forget", self.forget_unpolled_errors, (self.live,)),
             ("oncall", self.watch_oncall, ()), ("zte", self.zte_when_due, ()),
             ("unblock", self.unblock_when_due, ()),
@@ -678,7 +684,6 @@ class Server:
 
     def step_loop(self, loop: Loop, st: dict, now: datetime) -> None:
         self.schedule(loop, st, now)
-        self.poll(loop)
 
     def zte_when_due(self) -> None:
         from . import zte, zte_delivery
@@ -1130,22 +1135,38 @@ class Server:
             loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
-    def poll(self, loop: Loop) -> None:
-        for i, source in enumerate(loop.sources):
-            sid = sources.source_id(loop, i)
+    def poll(self) -> None:
+        poll_sources = [
+            src
+            for src in sources.load_all(self.cfg, self.live)
+            if (
+                src.enabled
+                and src.definition.get("type") != "pipeline"
+                and src.feeds != "pipeline"
+                and src.loops
+            )
+        ]
+        if not poll_sources:
+            return
+        now_iso = util.iso()
+        now_mono = time.monotonic()
+        try:
+            cursors_by_id = {c["source"]: c for c in source_store.cursors()}
+        except foundation.NoDatabase:
+            cursors_by_id = {}
+        for src in poll_sources:
+            sid = src.id
             running = self.polls.get(sid)
             if running and not running.done():
                 continue
-            if source.get("name") and self.slot_polling(loop):
+            cur = cursors_by_id.get(sid)
+            if cur and cur.get("backoff_until") and str(cur["backoff_until"]) > now_iso:
                 continue
-            if time.monotonic() - self.tried.get(sid, -1e9) < sources.every(source):
+            if now_mono - self.tried.get(sid, -1e9) < sources.every(src.definition):
                 continue
-            self.tried[sid] = time.monotonic()
-            self.polls[sid] = future = self.pool.submit(self.poll_source, loop, i)
+            self.tried[sid] = now_mono
+            self.polls[sid] = future = self.pool.submit(self.poll_source, src)
             future.add_done_callback(lambda done, sid=sid: self.poll_ended(sid, done))
-
-    def slot_polling(self, loop: Loop) -> bool:
-        return any(sources.is_slot(loop, sid) and not future.done() for sid, future in self.polls.items())
 
     def poll_ended(self, sid: str, done: Future) -> None:
         if done.cancelled():
@@ -1154,7 +1175,11 @@ class Server:
             self.say(f"{sid}: poll failed: {type(error).__name__}: {util.first_line(str(error), 300)}")
 
     def forget_unpolled_errors(self, live: list[Loop]) -> None:
-        polled = {sources.source_id(loop, i) for loop in live for i in range(len(loop.sources))}
+        polled = {
+            src.id
+            for src in sources.load_all(self.cfg, live)
+            if src.enabled and src.definition.get("type") != "pipeline" and src.feeds != "pipeline"
+        }
         for sid in set(self.errors) - polled:
             self.errors.pop(sid, None)
 
@@ -1206,22 +1231,20 @@ class Server:
             self.say(f"{run_id}: {text}")
         return log
 
-    def poll_source(self, loop: Loop, index: int) -> None:
-        with principals.acting(f"rule:{loop.name}"):
-            return self.poll_source_as_rule(loop, index)
+    def poll_source(self, src: sources.Src) -> None:
+        actor = f"rule:{src.loops[0]}" if src.loops else "hand"
+        with principals.acting(actor):
+            return self.poll_source_as_rule(src)
 
-    def poll_source_as_rule(self, loop: Loop, index: int) -> None:
-        sid = sources.source_id(loop, index)
+    def poll_source_as_rule(self, src: sources.Src) -> None:
+        sid = src.id
+        live_by_name = {loop.name: loop for loop in self.live} if self.live else None
         try:
-            found, items = sources.poll(loop, index, self.cfg, say=self.say)
+            found, items = sources.poll(src, self.cfg, say=self.say, fire_loops=live_by_name)
         except Exception as e:
-            text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             if isinstance(e, factory_state.Off):
                 return
-            with foundation.tx() as connection:
-                factory_state.admit(connection)
-                if (c := source_store.cursor(sid)) is not None:
-                    source_store.set_cursor(sid, c["value"], False, text)
+            text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
             if self.errors.get(sid) != text:
                 self.say(f"{sid}: poll failed: {text}")
             self.errors[sid] = text
@@ -1686,6 +1709,12 @@ def run(with_dashboard: bool = True, *, worker_port: int | None = None) -> NoRet
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()
+            if not server.config_problem:
+                from . import lines as lines_mod
+
+                server.guard("stage:lines-ensure", lambda: lines_mod.ensure(server.cfg))
+                if server.guard("stage:sources-backfill", lambda: sources.backfill(server.cfg)) is not None:
+                    server.sources_backfilled = True
             server.guard("stage:derived-start", server.start_derived)
             if not server.config_problem:
                 server.guard("stage:secret-move", server.move_secrets_when_due)

@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import json
+import platform
 import re
 import secrets
+import time
 import zlib
 from collections import Counter
-import concurrent.futures
+from contextlib import nullcontext
+from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
 from . import (
-    api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo, contract, control,
-    credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals, secretstore, settings,
-    tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
+    IMPORTED_NS, __version__, api_http, attention, bands, board, codebase, config, configcheck, configitems,
+    configkinds, configrepo, contract, control, credential_http, devices, drafts, events, floor, inbox, leases,
+    loop_run, loops, outbox, paths, pi, record, refusals, secretstore, settings, sources, stats, tasks, ticket_media,
+    tool_events, triage, util, webhooks, webpush,
 )
+from . import principals as actor_principals
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import devices as device_store
+from .store import idempotency as claims_store
+from .store import sources as source_store
 from .store import tasks as task_store
 from .store import tokens, writes
 
@@ -38,7 +46,7 @@ def prefer_wait(handler, *, default: float = 2.0, maximum: float = 10.0) -> floa
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
-         "board": "Board"}
+         "board": "Board", "floor": "Floor", "shell": "Shell"}
 BOARD_STATES = ("needs-you", "needs-info", "failed", "running", "review", "pr", "ready", "todo", "intake", "done", "closed")
 
 
@@ -57,6 +65,10 @@ def run_object(row):
 
 
 def serialize(value, schema):
+    if isinstance(value, dict) and "anyOf" in schema:
+        for branch in schema["anyOf"]:
+            if isinstance(branch, dict) and "properties" in branch:
+                return serialize(value, branch)
     if isinstance(value, dict) and "properties" in schema:
         additional = schema.get("additionalProperties")
         return {k: serialize(v, schema["properties"].get(k, additional)) for k, v in value.items()
@@ -85,7 +97,13 @@ def meta():
         stream = events.metadata(conn)
     deprecated = sorted(f"{entry['method']} {entry['path']}" for entry in contract.ALIASES if entry.get("deprecated"))
     return {"api": {"version": contract.VERSION, "minor": contract.MINOR, "contract_sha": contract.digest()},
-            "server": {"engine_sha": codebase.STAMP}, "oldest_client": contract.OLDEST_CLIENT,
+            "server": {"engine_sha": codebase.STAMP,
+                       "version": __version__,
+                       "started": util.iso(datetime.fromtimestamp(IMPORTED_NS / 1_000_000_000, tz=UTC)),
+                       "python": platform.python_version(),
+                       "state_dir": paths.short_path(paths.STATE_DIR),
+                       "config_file": paths.short_path(paths.CONFIG_FILE)},
+            "oldest_client": contract.OLDEST_CLIENT,
             "instance": {k: data[f"instance_{k}"] for k in ("id", "tag", "name", "created")},
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
@@ -95,14 +113,50 @@ def meta():
             "push": {"vapid_public_key": _vapid_public_key()}}
 
 
-def projection(name, identity=""):
+def projection(name, identity="", *, project=None, include_archived=False):
+    if name == "shell":
+        with foundation.reader() as conn:
+            return floor.shell_screen(conn)
+    if name == "floor":
+        with foundation.reader() as conn:
+            return floor.floor_screen(conn, project=project, include_archived=bool(include_archived))
     if name == "board":
-        rows = task_rows()
+        from . import lines as lines_mod
+
+        saved_view = None
+        if identity:
+            saved_view = needed(lines_mod.get_view(identity), identity)
+            with foundation.reader() as conn:
+                rows = [serialize(r, contract.TASK) for r in lines_mod.query_view_tasks(conn, saved_view)]
+        else:
+            rows = task_rows()
         counts = Counter(row["state"] for row in rows)
         states = dict.fromkeys((*BOARD_STATES, *counts))
         running_ids = [row["id"] for row in runs.runs_marked_running(connect=foundation.reader)]
-        return {"tasks": rows, "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
-                "running_ids": running_ids}
+        shown_project = project or (saved_view["project"] if saved_view else None)
+        with foundation.reader() as conn:
+            board_lines = lines_mod.board_lines_summary(
+                conn,
+                project=shown_project,
+                include_archived=bool(include_archived),
+            )
+            andon_data = attention.andon(conn)
+            ny = attention.needs_you(conn)
+        task_ny = ny["tasks"]
+        for row in rows:
+            ids = list(task_ny.get(row["id"], ()))
+            row["needs_you"] = len(ids)
+            row["needs_you_ids"] = ids
+        out = {
+            "tasks": rows,
+            "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
+            "running_ids": running_ids,
+            "lines": board_lines,
+            "andon": andon_data,
+        }
+        if saved_view is not None:
+            out["saved_view"] = saved_view
+        return out
     return provider(None, "get_" + ("run" if name == "run" else name), identity, {})
 
 
@@ -113,20 +167,26 @@ def provider(handler, name, rest, query):
 
 
 def resources(name, values):
+    from . import lines as lines_mod
+
     cfg = config.load_or_problem()[0]
     if name == "run":
         return [run_object(r) for r in runs.runs(limit=500)]
     if name == "project":
-        return [{"id": r.name, "name": r.name, "github": r.github, "path": str(r.path)} for r in cfg.repos]
+        return lines_mod.list_projects(cfg)
     if name == "line":
-        return ([{"id": r.name, "kind": "pipeline", "repo": r.name, "enabled": True} for r in cfg.repos]
-                + [{"id": "loop:" + r["name"], "kind": "loop", "repo": "", "enabled": r["enabled"]}
-                   for r in control.loop_views()])
+        return lines_mod.list_lines(
+            project=values.get("project"),
+            include_archived=bool(values.get("include_archived", False)),
+        )
     if name == "view":
-        return [{"id": k, "label": v} for k, v in VIEWS.items()]
+        return lines_mod.list_views(project=values.get("project"))
     if name == "step":
-        needed(runs.run_get(values["run"]), values["run"])
+        run_row = needed(runs.run_get(values["run"]), values["run"])
         inputs_by_step = runs.step_inputs_by_run(values["run"])
+        with foundation.reader() as rconn:
+            line_band = bands.line_band_for_run(rconn, run_row)
+            step_ny = attention.needs_you(rconn)["steps"]
         snapshots: dict[str, dict | None] = {}
         out = []
         for r in runs.steps(values["run"]):
@@ -134,7 +194,8 @@ def resources(name, values):
             if snap_sha and snap_sha not in snapshots:
                 snapshots[snap_sha] = runs.settings_snapshot(snap_sha)
             step_inputs = inputs_by_step.get(r["id"])
-            out.append({
+            node_name = r.get("node") or r["step"] or ""
+            entry = {
                 "id": r["id"], "run_id": values["run"], "name": r["step"], "model": r["model"] or "",
                 "runner": r["runner"] or "", "cost_usd": r["cost_usd"] or 0, "seconds": r["seconds"] or 0,
                 "settings_sha": snap_sha,
@@ -143,7 +204,7 @@ def resources(name, values):
                 "prompt_version": r.get("prompt_version") or None,
                 "prompt_level": r.get("prompt_level") or None,
                 "schema_version": r.get("schema_version") or None,
-                "node": r.get("node") or r["step"] or "",
+                "node": node_name,
                 "try": int(r.get("try") or 0),
                 "status": r.get("status") or ("done" if r.get("ok") else "fault"),
                 "queued_at": r.get("queued_at") or r.get("ts"),
@@ -154,7 +215,11 @@ def resources(name, values):
                 "version": int(r.get("version") or 1),
                 "runner_version": r.get("runner_version"),
                 "unread": int(r.get("unread") or 0),
-            })
+                "needs_you": int(step_ny.get((values["run"], node_name), 0)),
+            }
+            if node_name in line_band:
+                entry["band"] = list(line_band[node_name])
+            out.append(entry)
         return out
     if name == "loop":
         return [{"id": r["name"], "enabled": r["enabled"], "detail": r} for r in control.loop_views()]
@@ -328,6 +393,7 @@ def event_timestamp(value, field):
 
 
 def execute(name, values, handler=None):
+    api_http.set_etag_context(None)
     prepare(name, values)
     if name == "batch.run" and handler is not None:
         for request in values["requests"]:
@@ -344,12 +410,23 @@ def execute(name, values, handler=None):
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
         if name == "batch.run":
-            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler)} for r in reads]
+            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler, conn=conn)} for r in reads]
             return {"seq": seq, "results": results}
-        return {"seq": seq, **read(name, values, handler)}
+        payload, validator = read_with_validator(name, values, handler, conn=conn)
+        if validator is not None and handler is not None:
+            api_http.set_etag_context((seq, validator))
+        return {"seq": seq, **payload}
 
 
-def read(name, values, handler):
+def read_with_validator(name, values, handler, *, conn=None):
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)
+    if name.startswith("config."):
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)
+    return read(name, values, handler, conn=conn), None
+
+
+def read(name, values, handler, *, conn=None):
     if name == "factory.get":
         from .store import factory
         return {"factory": factory.view()}
@@ -368,12 +445,35 @@ def read(name, values, handler):
         return {"events": inbox.history(values["item"])}
     if name == "triage_screen.get":
         return inbox.triage_screen()
+    if name == "shell_screen.get":
+        with foundation.reader() as c:
+            return floor.shell_screen(c)
+    if name == "floor_screen.get":
+        with foundation.reader() as c:
+            return floor.floor_screen(
+                c,
+                project=values.get("project"),
+                include_archived=bool(values.get("include_archived", False)),
+            )
+    if name == "board_screen.get":
+        return projection(
+            "board",
+            values.get("id", ""),
+            project=values.get("project"),
+            include_archived=bool(values.get("include_archived", False)),
+        )
     if name == "push.list":
         return {"subscriptions": webpush.list_v1()}
     if name == "device.list":
         return {"devices": devices.device_views()}
     if name == "device.get":
         return {"device": needed(devices.device_get_view(values["device"]), values["device"])}
+    if name == "source.list":
+        connect = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return {"sources": sources.views(connect=connect, poll_limit=20)}
+    if name == "source.get":
+        connect = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return {"source": needed(sources.view_for(values["source"], connect=connect, poll_limit=50), values["source"])}
     if name == "lease.list":
         only_open: bool | None = None
         if "open" in values:
@@ -394,6 +494,8 @@ def read(name, values, handler):
         lease_num = leases.parse_id(values["lease"])
         row = device_store.lease_get(lease_num) if lease_num is not None else None
         return {"lease": leases.view(needed(row, values["lease"]))}
+    if name == "run.steps":
+        return {"steps": [serialize(row, contract.RESOURCE["step"]) for row in resources("step", values)]}
     if name == "run.sandbox":
         run_id = values["run"]
         run_row = needed(runs.run_get(run_id), run_id)
@@ -449,8 +551,17 @@ def read(name, values, handler):
             raise contract.Problem("not_found" if view == "board" else "invalid_input", f"Unknown view {view}")
         if view == "task":
             needed(task_store.task_get(values.get("id", "")), values.get("id", ""))
-        return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(),
-                "view": projection(view, values.get("id", ""))}
+        view_data = (
+            projection(
+                view,
+                values.get("id", ""),
+                project=values.get("project"),
+                include_archived=bool(values.get("include_archived", False)),
+            )
+            if view in ("board", "floor")
+            else projection(view, values.get("id", ""))
+        )
+        return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(), "view": view_data}
     if name == "settings.get":
         return {"settings": settings.current()}
     if name == "settings.resolved":
@@ -488,8 +599,10 @@ def read(name, values, handler):
             "data": encoded,
             "encoding": encoding,
         }}
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)[0]
     if name.startswith("config."):
-        return read_config(name.removeprefix("config."), values)
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)[0]
     if name == "draft.list":
         rows = drafts.list_drafts(
             state=values.get("state"),
@@ -578,6 +691,7 @@ def read(name, values, handler):
         return {
             "ref": serialize(ref_row, contract.REF),
             "tasks": [serialize(t, contract.REF_TASK_LINK) for t in linked],
+            "fields": [serialize(f, contract.REF_FIELD) for f in ref_row.get("fields", [])],
         }
     if name == "ref.history":
         with foundation.reader() as c:
@@ -624,17 +738,70 @@ def read(name, values, handler):
         except (OSError, ValueError, zlib.error) as error:
             raise contract.Problem("unavailable", f"Turn {target_n} cannot be decoded: {error}") from None
         return {"turn": serialize(decoded, contract.TURN_DETAIL)}
+    if name in ("project.history", "line.history", "view.history"):
+        from . import lines as lines_mod
+
+        raw_limit = values.get("limit", "100")
+        if not raw_limit.isascii() or not raw_limit.isdecimal() or not (1 <= int(raw_limit) <= 500):
+            raise contract.Problem("invalid_input", "limit must be an integer between 1 and 500")
+        raw_after = values.get("after")
+        after_seq = None
+        if raw_after is not None:
+            if not raw_after.isascii() or not raw_after.isdecimal() or len(raw_after) > 18:
+                raise contract.Problem("invalid_input", "after must be a nonnegative integer cursor")
+            after_seq = int(raw_after)
+        try:
+            if name == "project.history":
+                evs, next_after = lines_mod.project_history(values["project"], limit=int(raw_limit), after=after_seq)
+            elif name == "line.history":
+                evs, next_after = lines_mod.line_history(values["line"], limit=int(raw_limit), after=after_seq)
+            else:
+                evs, next_after = lines_mod.view_history(values["view"], limit=int(raw_limit), after=after_seq)
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        return {"events": evs, "next_after": next_after}
     if name == "task.list":
+        if view_id := values.get("view"):
+            from . import lines as lines_mod
+
+            saved_view = needed(lines_mod.get_view(view_id), view_id)
+            with foundation.reader() as conn:
+                rows = [serialize(r, contract.TASK) for r in lines_mod.query_view_tasks(conn, saved_view)]
+            return {"tasks": rows}
         return {"tasks": task_rows()}
     resource, action = name.split(".")
     if action == "get" and resource == "run":
         proj = projection("run", identity)
         run_view = run_object(proj["run"])
-        steps = [serialize(s, contract.RUN_STEP_SUMMARY) for s in proj.get("steps", ())]
-        return {"run": run_view, "steps": steps}
+        raw_steps = runs.steps(identity)
+        with foundation.reader() as c:
+            line_band = bands.line_band_for_run(c, proj["run"])
+            step_ny = attention.needs_you(c)["steps"]
+        eta, eta_partial = bands.run_eta(raw_steps, line_band)
+        steps = []
+        for s in proj.get("steps", ()):
+            entry = serialize(s, contract.RUN_STEP_SUMMARY)
+            node_name = entry.get("node") or ""
+            entry["needs_you"] = int(step_ny.get((identity, node_name), 0))
+            if node_name in line_band:
+                entry["band"] = list(line_band[node_name])
+            steps.append(entry)
+        return {"run": run_view, "steps": steps, "eta": eta, "eta_partial": eta_partial}
     if action == "get" and resource == "task":
         task = needed(task_store.task_get(identity), identity)
         return {"task": serialize(task, contract.TASK)}
+    if action == "get" and resource == "project":
+        from . import lines as lines_mod
+
+        return {"project": serialize(needed(lines_mod.get_project(identity), identity), contract.PROJECT)}
+    if action == "get" and resource == "line":
+        from . import lines as lines_mod
+
+        return {"line": serialize(needed(lines_mod.get_line(identity), identity), contract.LINE)}
+    if action == "get" and resource == "view":
+        from . import lines as lines_mod
+
+        return {"view": serialize(needed(lines_mod.get_view(identity), identity), contract.VIEW)}
     rows = [serialize(row, contract.RESOURCE[resource]) for row in resources(resource, values)]
     if action == "list":
         return {contract.PLURALS[resource]: rows}
@@ -642,28 +809,79 @@ def read(name, values, handler):
     if resource in ("loop", "incident", "chat"):
         detail = projection(resource, identity)
         row = {**row, "detail": detail["incident"] if resource == "incident" else detail}
-    if resource == "view":
-        row = {**row, "data": projection(identity)}
     return {resource: serialize(row, contract.RESOURCE[resource])}
 
 
-def read_config(verb, values):
+def _config_validator_parts(item: dict[str, object]) -> dict[str, object]:
+    content = item.get("content")
+    raw = content.encode("utf-8") if isinstance(content, str) else api_http.json_bytes(content)
+    return {
+        "kind": item.get("kind"),
+        "name": item.get("name"),
+        "path": item.get("path"),
+        "version": item.get("version"),
+        "content_version": item.get("content_version"),
+        "level": item.get("level"),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def read_adw_stats(name: str, *, conn=None) -> tuple[dict[str, object], str]:
+    if conn is None:
+        with foundation.one_read() as read_conn:
+            return read_adw_stats(name, conn=read_conn)
+    found = configitems.item("adw", name, conn=conn)
+    item = configitems.read(found, conn=conn)
+    usage, rev = stats.adw_stats_snapshot(conn, name)
+    return usage, stats.validator_token(_config_validator_parts(item), rev)
+
+
+def read_config_with_validator(verb, values, *, conn=None):
     if verb == "kinds":
-        return {"kinds": configitems.kinds()}
+        return {"kinds": configitems.kinds()}, None
     kind = values["kind"]
     if verb == "list":
-        return {"items": configitems.listing(kind)}
-    found = configitems.item(kind, values["name"], level=values.get("level"))
+        return {"items": configitems.listing(kind, conn=conn)}, None
+    if conn is None and verb == "read" and kind in ("prompt", "adw"):
+        with foundation.one_read() as read_conn:
+            return read_config_with_validator(verb, values, conn=read_conn)
+    historical = verb == "versions" or (
+        verb == "read" and (values.get("version") is not None or values.get("from") not in (None, "working"))
+    )
+    found = (
+        configitems.item_or_historical(kind, values["name"], level=values.get("level"), conn=conn)
+        if historical
+        else configitems.item(kind, values["name"], level=values.get("level"), conn=conn)
+    )
     if verb == "read":
-        return {"item": configitems.read(found, version=values.get("version"), level=values.get("level"),
-                                         from_ref=values.get("from"), file=values.get("file"))}
+        item = configitems.read(found, version=values.get("version"), level=values.get("level"),
+                                from_ref=values.get("from"), file=values.get("file"), conn=conn)
+        if kind == "prompt":
+            usage, rev = stats.prompt_stats_snapshot(conn, values["name"])
+            enriched = {**item, **usage}
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        if kind == "adw":
+            adw_usage, rev = stats.adw_stats_snapshot(conn, values["name"])
+            enriched = {
+                **item,
+                "runs7d": adw_usage["runs"],
+                "passRate": adw_usage["passRate"],
+                "costPerRunNusd": adw_usage["costPerRunNusd"],
+                "costPerRun": adw_usage["costPerRun"],
+            }
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        return {"item": item}, None
     if verb == "versions":
-        shas, entries = configitems.versions(found)
-        return {"versions": shas, "entries": entries}
-    diff = configitems.diff(found, values.get("from"), values.get("to"))
+        shas, entries = configitems.versions(found, conn=conn)
+        return {"versions": shas, "entries": entries}, None
+    diff = configitems.diff(found, values.get("from"), values.get("to"), conn=conn)
     if diff is None:
         raise contract.Problem("unavailable", "No config Git diff is available")
-    return {"diff": diff}
+    return {"diff": diff}, None
+
+
+def read_config(verb, values):
+    return read_config_with_validator(verb, values)[0]
 
 
 def _resolve_activate_draft_id(values: dict) -> str:
@@ -691,7 +909,20 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
             return {"draft_id": draft_row["id"], "gate": "C", "check_report": report}
         return None
     if name == "config.rollback":
-        found = configitems.item(values["kind"], values["name"])
+        found = configitems.item_or_historical(values["kind"], values["name"])
+        if configitems.is_tombstone_selector(found, str(values["to"])):
+            raise contract.Problem(
+                "validation",
+                f"Version {values['to']} of {values['kind']}/{values['name']} is a deletion tombstone and cannot be rolled back to as file bytes.",
+            )
+        live_row = drafts._current_ver_row(values["kind"], values["name"], found["path"])
+        live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        if not drafts._matches_base_version(values["base_version"], live_ver, live_row):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {values['kind']}/{values['name']} is at version {live_ver}, not {values['base_version']}.",
+                current={"kind": values["kind"], "name": values["name"], "version": live_ver},
+            )
         target = configitems.read(found, version=str(values["to"]))
         content = target["content"]
         if not isinstance(content, str):
@@ -703,6 +934,12 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
         )
         if report["ok"] and report["gate"] == "C":
             return {"kind": values["kind"], "name": values["name"], "to": values["to"],
+                    "gate": "C", "check_report": report}
+        return None
+    if name == "config.delete":
+        _, _, report = drafts.inspect_delete(values["kind"], values["name"], values["base_version"], actor, root=root)
+        if report["gate"] == "C":
+            return {"kind": values["kind"], "name": values["name"], "delete": True,
                     "gate": "C", "check_report": report}
         return None
     if name == "settings.update":
@@ -760,9 +997,22 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
 
 
 def dispatch(handler, op, path_values, query):
+    api_http.set_etag_context(None)
     name, method = op["name"], op["method"]
     identity = {k: unquote(v) for k, v in path_values.items()}
-    values = {**query, **identity}
+    coerced_query = dict(query)
+    if method == "GET":
+        props = op["input"].get("properties", {})
+        for key, raw in list(coerced_query.items()):
+            prop = props.get(key)
+            if isinstance(prop, dict) and prop.get("type") == "boolean" and isinstance(raw, str):
+                if raw == "true":
+                    coerced_query[key] = True
+                elif raw == "false":
+                    coerced_query[key] = False
+                else:
+                    raise contract.Problem("invalid_input", f"input.{key} must be boolean ('true' or 'false')")
+    values = {**coerced_query, **identity}
     write = contract.keyed_write(op)
     if method != "GET":
         body = {} if name in ("secret.set", "inbox.upload_evidence", "blob.put") else handler.body()
@@ -797,19 +1047,25 @@ def dispatch(handler, op, path_values, query):
                 return upload_inbox_evidence(handler, op, identity)
             if name == "blob.put":
                 return put_blob(handler, op, identity)
-            if (name in ("config.activate", "config.rollback", "settings.update")
+            if (name in ("config.activate", "config.rollback", "config.delete", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values, handler)
-                if extra_detail is not None:
-                    if handler.credential is None or "Idempotency-Key" not in handler.headers:
-                        credential_http.require_presence(handler.credential)
-                    return inbox.defer_presence(
-                        handler,
-                        op,
-                        values,
-                        path_values,
-                        extra_detail=extra_detail,
-                    )
+                idem_key = handler.headers.get("Idempotency-Key")
+                actor_claim = claims_store.lookup(handler.actor, idem_key) if idem_key else None
+                if actor_claim is not None and actor_claim["status"]:
+                    return inbox.defer_presence(handler, op, values, path_values)
+                person_claim = claims_store.lookup(handler.person, idem_key) if idem_key else None
+                if person_claim is None or not person_claim["status"]:
+                    extra_detail = _needs_config_presence(name, values, handler)
+                    if extra_detail is not None:
+                        if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                            credential_http.require_presence(handler.credential)
+                        return inbox.defer_presence(
+                            handler,
+                            op,
+                            values,
+                            path_values,
+                            extra_detail=extra_detail,
+                        )
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])
@@ -846,12 +1102,17 @@ def dispatch(handler, op, path_values, query):
 
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
-    "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
-    "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
+    "device.probe", "source.poll", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
+    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair",
+    "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
-    "config.draft", "config.check", "config.activate", "config.rollback", "config.try",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
     "config.ask", "config.promote", "draft.discard",
+    "project.create", "project.update", "project.restore",
+    "line.create", "line.update", "line.restore", "line.delete",
+    "view.create", "view.update", "view.restore",
+    "derived.recompute",
 ))
 
 
@@ -1002,6 +1263,21 @@ def mutation(name, values, handler):
             )
         except drafts.PresenceRequired:
             raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.delete":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        try:
+            result = drafts.delete_item(
+                values["kind"],
+                values["name"],
+                values["base_version"],
+                _config_actor(handler),
+                idem=key,
+                why=str(values.get("why") or ""),
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
     elif name == "config.try":
         result = drafts.try_draft(
             values["kind"],
@@ -1109,6 +1385,10 @@ def mutation(name, values, handler):
             raise contract.Problem("validation", str(error)) from None
         result = {"comment": serialize(needed(updated, raw_cid), contract.TASK_COMMENT)}
     elif name == "task_ref.link":
+        from contextlib import suppress
+
+        from . import sync as sync_mod
+
         with foundation.tx() as c:
             try:
                 linked = task_store.TaskStore.link_ref(c, values["task"], values, values, principals.current())
@@ -1120,7 +1400,44 @@ def mutation(name, values, handler):
                 raise contract.Problem("not_found", str(error)) from None
             except ValueError as error:
                 raise contract.Problem("validation", str(error)) from None
+        if ref_row is not None and not ref_row.get("fetched_at") and ref_row.get("system") in ("github", "jira"):
+            with suppress(Exception):
+                fetched = sync_mod.fetch(ref_row["num"])
+                if fetched is not None:
+                    ref_row = fetched
         result = {"task_ref": serialize(linked, contract.TASK_REF), "ref": serialize(ref_row, contract.REF)}
+    elif name == "task.sync":
+        from . import sync as sync_mod
+        from . import tracker as tracker_mod
+
+        task_row = needed(task_store.task_get(values["task"]), values["task"])
+        primary_ref = task_row.get("primary_ref")
+        if not primary_ref:
+            raise contract.Problem("invalid_state", f"Task {task_row['id']} has no primary ref")
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        future = sync_mod.fetch_async(primary_ref["num"], idem=key)
+        try:
+            synced_ref = future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+            result = {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "task": task_row["id"],
+            }
+        except tracker_mod.ERRORS as error:
+            raise contract.Problem("upstream_failed", str(error)) from None
+        except LookupError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        else:
+            updated_task = needed(task_store.task_get(task_row["id"]), task_row["id"])
+            result = {
+                "task": serialize(updated_task, contract.TASK),
+                "ref": serialize(synced_ref, contract.REF),
+                "fields": [serialize(f, contract.REF_FIELD) for f in synced_ref.get("fields", [])],
+            }
     elif name == "task_ref.update":
         with foundation.tx() as c:
             try:
@@ -1226,8 +1543,6 @@ def mutation(name, values, handler):
         _set_run_location(handler, run_id, created=True)
         result = {"run": run_object(runs.run_get(run_id))}
     elif name == "loop.start":
-        from . import loop_run
-
         ev_list = _resolve_events_input(values.get("events"))
         row = loop_run.launch(values["loop"], events=ev_list, wait=False)
         _set_run_location(handler, row["id"], created=True)
@@ -1370,6 +1685,8 @@ def mutation(name, values, handler):
     elif name == "inbox.shelve":
         result = {"item": inbox.shelve(values["item"], base_version=values["base_version"],
                                        reason=values["reason"], until=values.get("until"))}
+    elif name == "inbox.reopen":
+        result = {"item": inbox.reopen(values["item"], base_version=values["base_version"])}
     elif name == "inbox.resolve":
         result = inbox.resolve(
             values["item"],
@@ -1413,6 +1730,110 @@ def mutation(name, values, handler):
         else:
             dev_view = needed(devices.device_get_view(device_name), device_name)
             result = {"device": dev_view, "probe": dev_view["last_probe"]}
+    elif name == "source.poll":
+        sid = values["source"]
+        dry_run = bool(values.get("dry_run", False))
+        cfg = config.load_or_problem()[0]
+        all_loops = loops.load_all(cfg)
+        src = next((s for s in sources.load_all(cfg, all_loops) if s.id == sid), None)
+        if src is None:
+            if not sid.startswith("oncall:") and source_store.cursor(sid) is not None:
+                raise contract.Problem("invalid_state", f"source '{sid}' is disabled")
+            raise contract.Problem("not_found", f"No source {sid}")
+        if not src.enabled:
+            raise contract.Problem("invalid_state", f"source '{sid}' is disabled")
+        if not dry_run and src.feeds == "pipeline":
+            raise contract.Problem("invalid_state", f"source '{sid}' feeds the pipeline; poll pipeline or use dry_run")
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        if src.definition.get("type") == "pipeline":
+            run = loop_run.launch("poll", trial=True) if dry_run else loop_run.launch("poll")
+            run_id = str(run["id"])
+            status = str(run.get("status") or "")
+            summary = str(run.get("summary") or "")
+            if status in ("queued", "running") and wait_seconds > 0:
+                deadline = time.monotonic() + wait_seconds
+                while time.monotonic() < deadline:
+                    row = runs.run_get(run_id)
+                    if row is not None and row["status"] not in ("queued", "running"):
+                        status = str(row["status"])
+                        summary = str(row.get("summary") or "")
+                        break
+                    time.sleep(0.05)
+            if status in ("queued", "running"):
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": run_id,
+                }
+            else:
+                if "picks" in run and isinstance(run["picks"], list):
+                    picks = [str(p) for p in run["picks"]]
+                else:
+                    feed_rows = runs.feed(run_id) if runs.run_get(run_id) is not None else []
+                    picks = [str(ln["text"]) for ln in feed_rows if ln.get("kind") == "out"]
+                ok_run = status in ("done", "skipped")
+                result = {
+                    "source": sid,
+                    "dry_run": dry_run,
+                    "ok": ok_run,
+                    "error": None if ok_run else (summary or status),
+                    "picks": picks,
+                    "op": run_id,
+                }
+        elif dry_run:
+            future = sources.submit_poll(sources.dry_run, src, cfg)
+            try:
+                result = future.result(timeout=wait_seconds)
+            except concurrent.futures.TimeoutError:
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": None,
+                }
+        else:
+            actor = actor_principals.current()
+
+            def _do_poll(target_src=src, target_cfg=cfg, target_actor=actor, target_sid=sid) -> dict:
+                with actor_principals.acting(target_actor):
+                    try:
+                        found, queued = sources.poll(target_src, target_cfg)
+                    except Exception as err:
+                        return {
+                            "source": target_sid,
+                            "dry_run": False,
+                            "ok": False,
+                            "error": f"{type(err).__name__}: {util.first_line(str(err), 300)}",
+                            "events": [],
+                            "queued": [],
+                        }
+                    return {
+                        "source": target_sid,
+                        "dry_run": False,
+                        "ok": True,
+                        "error": None,
+                        "events": found,
+                        "queued": queued,
+                    }
+
+            future = sources.submit_poll(_do_poll)
+            try:
+                result = future.result(timeout=wait_seconds)
+            except concurrent.futures.TimeoutError:
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": None,
+                }
     elif name == "push.subscribe":
         result = {"subscription": webpush.subscribe_v1(values, principals.contact(handler.person))}
     elif name == "push.remove":
@@ -1457,6 +1878,75 @@ def mutation(name, values, handler):
         except refusals.Upstream as error:
             raise contract.Problem("upstream_failed", str(error)) from None
         result = {"data": item}
+    elif name in (
+        "project.create", "project.update", "project.restore",
+        "line.create", "line.update", "line.restore", "line.delete",
+        "view.create", "view.update", "view.restore",
+    ):
+        from . import lines as lines_mod
+
+        try:
+            if name == "project.create":
+                result = lines_mod.create_project(values)
+            elif name == "project.update":
+                fields = {k: v for k, v in values.items() if k not in ("project", "base_version")}
+                result = lines_mod.update_project(values["project"], values["base_version"], fields)
+            elif name == "project.restore":
+                result = lines_mod.restore_project(values["project"], values["seq"], values["base_version"])
+            elif name == "line.create":
+                result = lines_mod.create_line(values)
+            elif name == "line.update":
+                fields = {k: v for k, v in values.items() if k not in ("line", "base_version")}
+                result = lines_mod.update_line(values["line"], values["base_version"], fields)
+            elif name == "line.restore":
+                result = lines_mod.restore_line(values["line"], values["seq"], values["base_version"])
+            elif name == "line.delete":
+                result = lines_mod.delete_line(values["line"], values["base_version"])
+            elif name == "view.create":
+                result = lines_mod.create_view(values)
+            elif name == "view.update":
+                fields = {k: v for k, v in values.items() if k not in ("view", "base_version")}
+                result = lines_mod.update_view(values["view"], values["base_version"], fields)
+            else:
+                result = lines_mod.restore_view(values["view"], values["seq"], values["base_version"])
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("validation", str(error)) from None
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except lines_mod.LineInUse as error:
+            raise contract.Problem("line_in_use", str(error), blockers=error.blockers) from None
+        except lines_mod.IncompatibleWriters as error:
+            raise contract.Problem(
+                "incompatible_writers",
+                str(error),
+                blockers=error.blockers,
+                retry_guidance=error.retry_guidance,
+            ) from None
+        if handler is not None and result.get("event_seq"):
+            handler.write_receipt = {
+                "event_seq": result["event_seq"],
+                "subject": result["subject"],
+                "ver": result["ver"],
+            }
+    elif name == "derived.recompute":
+        from . import lines as lines_mod
+
+        try:
+            result = bands.recompute(values["line"], values["base_version"])
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("validation", str(error)) from None
+        except lines_mod.NotFound as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except bands.GateRefused as error:
+            raise contract.Problem("gate_refused", str(error)) from None
+        except bands.SourceMoved as error:
+            raise contract.Problem("conflict", str(error)) from None
+        if handler is not None and result.get("event_seq"):
+            handler.write_receipt = {
+                "event_seq": result["event_seq"],
+                "subject": result["subject"],
+                "ver": result["ver"],
+            }
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)
@@ -1475,12 +1965,17 @@ def change_task(name, values):
     if ("kind" in values and kind not in config.KINDS) or (name == "task.create" and not body) or ("body" in values and not body):
         raise contract.Problem("invalid_input", "A task needs a body and a supported kind")
     if name == "task.create":
+        from . import lines as lines_mod
+
         repo = tasks.repo_named(config.load(), values["repo"])
         extra = {k: values[k] for k in task_store.WRITABLE_TASK_EXTRA_FIELDS if k in values}
-        identity = task_store.task_add(
-            repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
-            kind=kind, extra=extra,
-        )
+        try:
+            identity = task_store.task_add(
+                repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
+                kind=kind, extra=extra,
+            )
+        except lines_mod.ValidationError as error:
+            raise contract.Problem("invalid_fields", str(error)) from None
     else:
         identity = values.get("task", values.get("id", "")).strip()
         if name == "task.close":
@@ -1502,11 +1997,15 @@ def change_task(name, values):
             if not task_store.task_comment(identity, author, body):
                 raise control.NotFound(f"no task {identity}")
         else:
+            from . import lines as lines_mod
+
             fields = {key: value for key, value in values.items() if key not in ("id", "base_version")}
             if not fields or ("state" in fields and fields["state"] not in config.ALL_TASK_STATES):
                 raise contract.Problem("invalid_input", "Send at least one editable field and a supported state")
             try:
                 changed = task_store.task_update(identity, values["base_version"], fields)
+            except lines_mod.ValidationError as error:
+                raise contract.Problem("invalid_fields", str(error)) from None
             except writes.VersionConflict as error:
                 raise contract.Problem("task_version_conflict", str(error),
                                        current=serialize(error.current, contract.TASK)) from error

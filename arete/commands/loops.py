@@ -174,8 +174,13 @@ def loop_status(args) -> int:
         print(f"  emits {', '.join(d['emits'])}")
     if d["webhook_path"]:
         print(f"  webhook POST {d['webhook_path']}")
-    for c in d["cursors"]:
-        print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['detail'] or ''} at {when(c['polled'])}")
+    for s in d.get("sources") or ():
+        if isinstance(s, dict):
+            streak = int(s.get("error_streak") or 0)
+            state = f"FAILING (streak {streak})" if streak else "ok"
+            last_ok = when(s["last_ok"]) if s.get("last_ok") else "never"
+            note = s.get("note") or ""
+            print(f"  source {s['id']}: {state}, last ok {last_ok}" + (f" — {note}" if note and note != "ok" else ""))
     if d["waiting"]:
         print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
     for item in d["dead"]:

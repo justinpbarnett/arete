@@ -1,0 +1,18 @@
+schema = 1
+state_labels = ["agent-running", "agent-pr", "agent-failed", "agent-needs-info"]
+
+[fields]
+title = "remote"
+body = "remote"
+status = "remote"
+assignee = "remote"
+parent = "remote"
+priority = "local"
+labels = "remote"
+
+[priority_map]
+Highest = 1
+High = 2
+Medium = 3
+Low = 4
+Lowest = 5

@@ -5,7 +5,7 @@ description = "Run the pipeline on the oldest approved ticket in each pipeline r
 every = "5m"
 
 [run]
-command = "arete poll"
-try_command = "arete poll --dry-run"
+command = "arete poll --local"
+try_command = "arete poll --dry-run --local"
 timeout_minutes = 240
 stale_hours = 1

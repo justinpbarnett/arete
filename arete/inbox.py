@@ -53,6 +53,7 @@ _HTTP_STATUS_RE = re.compile(r"\b(?:HTTP\s+)?([45]\d{2})\b")
 _NON_WORD_RE = re.compile(r"[^a-z0-9]+")
 
 PRESENCE_TTL_MINUTES = 10
+REOPEN_WINDOW_SECONDS = 10
 RESERVED_MANUAL_PREFIXES = (
     "presence:",
     "approval:",
@@ -71,6 +72,11 @@ RESERVED_MANUAL_PREFIXES = (
     "outbox:",
     "secret:",
     "step:",
+    "ref:",
+    "project:",
+    "line:",
+    "view:",
+    "source:",
 )
 
 
@@ -174,14 +180,15 @@ def _asks_items(c) -> list[dict]:
 
 
 def _runs_items(c) -> list[dict]:
+    ic = run_store.issue_col(c)
     private_clause = (
-        "AND NOT EXISTS (SELECT 1 FROM private_evidence e WHERE e.repo = r.repo "
-        "  AND e.ticket = CAST(r.issue AS TEXT) AND e.status = 'open') "
+        f"AND NOT EXISTS (SELECT 1 FROM private_evidence e WHERE e.repo = r.repo "  # noqa: S608
+        f"  AND e.ticket = CAST(r.{ic} AS TEXT) AND e.status = 'open') "
         if evidence_store.available(c)
         else ""
     )
     rows = [
-        dict(r)
+        run_store.run_row(r)
         for r in c.execute(
             f"SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.status = 'needs-info' "  # noqa: S608
             f"AND {run_store.WHOLE_RUN} AND {run_store.LIVE_RUN} "
@@ -189,7 +196,7 @@ def _runs_items(c) -> list[dict]:
             "  AND (a.status = 'open' OR (a.status = 'answered' AND a.taken_by = ''))) "
             f"{private_clause}"
             "AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline' "
-            f"  AND later.repo = r.repo AND later.issue = r.issue AND {run_store.WHOLE_RUN} "
+            f"  AND later.repo = r.repo AND later.{ic} = r.{ic} AND {run_store.WHOLE_RUN} "
             f"  AND {run_store.LIVE_RUN} AND {run_store.later_than(c, 'later', 'r')}) "
             f"ORDER BY r.started, {run_store.seq_col(c, 'r')}"
         )
@@ -312,9 +319,10 @@ def _proposals_items(c) -> list[dict]:
 
 
 def _skipped_items(c) -> list[dict]:
+    ic = run_store.issue_col(c)
     running = {
-        (r["repo"], str(r["issue"]))
-        for r in c.execute("SELECT repo, issue FROM runs WHERE status = 'running' AND issue IS NOT NULL")
+        (r["repo"], str(r[ic]))
+        for r in c.execute(f"SELECT repo, {ic} FROM runs WHERE status = 'running' AND {ic} IS NOT NULL")  # noqa: S608
     }
     cfg, problem = config.load_or_problem()
     unblock_repos = set() if problem else set(cfg.unblock_repos)
@@ -664,7 +672,7 @@ def _config_items(c) -> list[dict]:
             if rel:
                 disk = paths.CONFIG_DIR / rel
                 try:
-                    if not disk.is_file() or disk.read_bytes() != d["body"].encode("utf-8"):
+                    if d["body"] is None or not disk.is_file() or disk.read_bytes() != d["body"].encode("utf-8"):
                         continue
                 except OSError:
                     continue
@@ -1501,7 +1509,12 @@ def open_count(connect=foundation.reader) -> int:
 
 
 def triage_screen(connect=foundation.reader) -> dict:
-    items = inbox_store.list_items(state="open", connect=connect)
+    from . import attention
+
+    with connect() as c:
+        items = inbox_store.list_items(state="open", connect=lambda: nullcontext(c))
+        counts = inbox_store.counts_by_state(connect=lambda: nullcontext(c))
+        andon = attention.andon(c)
     return {
         "items": items,
         "by_priority": {
@@ -1509,7 +1522,8 @@ def triage_screen(connect=foundation.reader) -> dict:
             "med": [i for i in items if i["priority"] == 2],
             "low": [i for i in items if i["priority"] == 3],
         },
-        "counts": inbox_store.counts_by_state(connect=connect),
+        "counts": counts,
+        "andon": andon,
     }
 
 
@@ -1575,6 +1589,10 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
             if sep and run_id and node:
                 steps_found = _node_terminal_steps(c, run_id, node)
                 return steps_found[0] if steps_found else None
+        if kind == "ref" and ident.isdecimal():
+            from .store import tasks as task_store
+
+            return task_store.TaskStore.ref_get(c, int(ident))
     return None
 
 
@@ -1712,6 +1730,91 @@ def shelve(item_id: str | int, *, base_version: int, reason: str, until: str | N
         updated, _, ok = inbox_store.shelve_item(
             c, numeric, base_version=base_version, reason=reason_text, until=until_text
         )
+        if not ok:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=updated)
+        return updated
+
+
+def _approval_was_sent(c, item: dict) -> bool:
+    subject = item["subject"]
+    if subject.startswith("presence:"):
+        return True
+    if subject.startswith("approval:"):
+        ident = subject.removeprefix("approval:")
+        if ident.isdecimal():
+            from .store import outbox as outbox_store
+
+            row = outbox_store.get_by_legacy_approval(c, int(ident)) or outbox_store.get_row(c, int(ident))
+            if row is not None:
+                return row["state"] != "failed"
+        return True
+    if subject.startswith("outbox:"):
+        ident = subject.removeprefix("outbox:")
+        if ident.isdecimal():
+            from .store import outbox as outbox_store
+
+            row = outbox_store.get_row(c, int(ident))
+            if row is not None:
+                return row["state"] in ("sent", "sending") or bool(row["sent_at"])
+        return False
+    return True
+
+
+def reopen(item_id: str | int, *, base_version: int) -> dict:
+    numeric = inbox_store.parse_id(item_id)
+    if numeric is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    with foundation.tx() as c:
+        current = inbox_store.get(numeric, connect=lambda: nullcontext(c))
+        if current is None:
+            raise contract.Problem("not_found", f"No inbox item {item_id}")
+        if current["version"] != base_version:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=current)
+        state = current["state"]
+        if state == "open":
+            raise contract.Problem("already_open", f"Inbox item {current['id']} is already open.", item=current["id"])
+        if state in ("snoozed", "shelved"):
+            pass
+        elif state == "resolved":
+            if current["kind"] == "candidate" and current["resolution"] in ("declined", "decline"):
+                pass
+            elif current["kind"] == "approval" and (
+                current["resolution"] == "approved" or current["answer"] == "approve"
+            ):
+                if _approval_was_sent(c, current):
+                    raise contract.Problem("already_sent", f"Inbox item {current['id']} was already sent.")
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+            elif current["kind"] == "outbox" and (
+                current["resolution"] == "approved" or current["answer"] == "approve"
+            ):
+                if _approval_was_sent(c, current):
+                    raise contract.Problem("already_sent", f"Inbox item {current['id']} was already sent.")
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+            else:
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+        else:
+            raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+
+        last_at = inbox_store.latest_transition_at(c, numeric)
+        if not last_at:
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.")
+        try:
+            elapsed = (util.now() - util.parse_iso(last_at)).total_seconds()
+        except (ValueError, TypeError):
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.") from None
+        if elapsed > REOPEN_WINDOW_SECONDS:
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.")
+
+        if state == "resolved":
+            other = inbox_store.other_open_by_kind_and_subject(c, current["kind"], current["subject"], numeric)
+            if other is not None:
+                raise contract.Problem(
+                    "already_open",
+                    f"Another inbox item {other['id']} is already open for {current['kind']} {current['subject']}.",
+                    item=other["id"],
+                )
+
+        updated, _, ok = inbox_store.reopen_item(c, numeric, base_version=base_version)
         if not ok:
             raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=updated)
         return updated
@@ -1938,6 +2041,19 @@ def _execute_pending_command(req: dict, secret_value: str | None) -> tuple[int, 
             presence_passed=True,
         )
         return 200, api.with_seq(rolled)
+    if op_name == "config.delete":
+        from . import drafts
+
+        deleted = drafts.delete_item(
+            values["kind"],
+            values["name"],
+            values["base_version"],
+            actor,
+            idem=req.get("idem", ""),
+            why=str(values.get("why") or ""),
+            presence_passed=True,
+        )
+        return 200, api.with_seq(deleted)
     if op_name == "settings.update":
         from . import settings
 
@@ -2062,7 +2178,7 @@ def _resolve_presence(
             raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=resolved)
 
         req = {**pending["request"], "idem": key}
-        run_outside_tx = req["operation"] in ("config.activate", "config.rollback", "settings.update")
+        run_outside_tx = req["operation"] in ("config.activate", "config.rollback", "config.delete", "settings.update")
         if req["operation"] in ("outbox.approve", "outbox.retry", "outbox.reject"):
             from .store import outbox as outbox_store
 
@@ -2091,6 +2207,118 @@ def _resolve_presence(
     last_seq = collected[-1][0] if collected else approval_seq
     claims_store.overwrite(actor, key, cmd_status, api_http.json_bytes(cmd_result), last_seq, expected_status=202)
     return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
+
+
+def raise_rescope(c, src, held_events: builtins.list[dict]) -> dict | None:
+    if not inbox_store.available(c) or not held_events:
+        return None
+    sid = src.id
+    subject = f"source:{sid}"
+    title = f"{sid}: {len(held_events)} older matches after a scope change"
+    detail = {
+        "source": sid,
+        "held": builtins.list(held_events),
+        "keys": [str(e.get("key", "")) for e in held_events],
+    }
+    item, _, created = inbox_store.raise_item(
+        c,
+        kind="rescope",
+        subject=subject,
+        priority=2,
+        title=title,
+        detail=detail,
+        verbs=["fire", "dismiss"],
+        options=[],
+        line=src.line or "",
+    )
+    if created or item is None:
+        return item
+    existing_detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    existing_held = builtins.list(existing_detail.get("held") or ())
+    seen_keys = {str(e.get("key", "")) for e in existing_held if isinstance(e, dict)}
+    merged = builtins.list(existing_held)
+    for ev in held_events:
+        k = str(ev.get("key", ""))
+        if k not in seen_keys:
+            seen_keys.add(k)
+            merged.append(ev)
+    numeric = inbox_store.parse_id(item["id"])
+    if numeric is None:
+        return item
+    new_title = f"{sid}: {len(merged)} older matches after a scope change"
+    new_detail = {
+        **existing_detail,
+        "source": sid,
+        "held": merged,
+        "keys": [str(e.get("key", "")) for e in merged],
+    }
+    updated = inbox_store.update_item(
+        c,
+        numeric,
+        title=new_title,
+        detail=new_detail,
+        priority=2,
+        verbs=["fire", "dismiss"],
+        options=[],
+        task_id="",
+        run_id="",
+        line=src.line or str(item.get("line") or ""),
+    )
+    return updated[0] if updated is not None else item
+
+
+def _resolve_rescope(
+    item: dict,
+    *,
+    numeric_id: int,
+    base_version: int,
+    verb: str,
+) -> dict:
+    from . import loops as loops_mod
+    from . import sources as sources_mod
+
+    sid = item["subject"].removeprefix("source:")
+    actor = principals.current()
+    now = util.iso()
+    if verb == "fire":
+        held = builtins.list((item.get("detail") or {}).get("held") or ())
+        cfg = config.load_or_problem()[0]
+        all_loops = loops_mod.load_all(cfg)
+        live_by_name = {loop.name: loop for loop in all_loops if loop.enabled and not loop.error}
+        src = next((s for s in sources_mod.load_all(cfg, all_loops) if s.id == sid), None)
+        target_loops = [live_by_name[name] for name in src.loops if name in live_by_name] if src else []
+        queued: builtins.list[int] = []
+        with foundation.tx() as c:
+            updated, _, ok = inbox_store.resolve_item(
+                c,
+                numeric_id,
+                resolution="fired",
+                answer="fire",
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not ok:
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+            for loop_obj in target_loops:
+                if held:
+                    queued.extend(sources_mod.fire(loop_obj, "event", held))
+        return {"item": updated, "result": {"source": sid, "fired": len(held), "items": queued}}
+    if verb == "dismiss":
+        with foundation.tx() as c:
+            updated, _, ok = inbox_store.resolve_item(
+                c,
+                numeric_id,
+                resolution="dismissed",
+                answer="dismiss",
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not ok:
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=updated)
+        return {"item": updated, "result": {"source": sid, "dismissed": True}}
+    raise contract.Problem("validation", f"Verb {verb!r} is not allowed on {item['id']}.")
 
 
 def _resolve_queue_dead(
@@ -2274,6 +2502,38 @@ def resolve(
             base_version=base_version,
             actor=principals.current(),
         )
+    if item["kind"] == "rescope" or subject.startswith("source:"):
+        return _resolve_rescope(
+            item,
+            numeric_id=numeric,
+            base_version=base_version,
+            verb=verb,
+        )
+    if subject.startswith("ref:") and item["kind"] == "conflict":
+        from . import sync as sync_mod
+
+        ident_ref = subject.partition(":")[2]
+        if not ident_ref.isdecimal():
+            raise contract.Problem("validation", f"Invalid conflict subject {subject!r}")
+        actor = principals.current()
+        now = util.iso()
+        with foundation.tx() as c:
+            res_data = sync_mod.resolve_conflict(c, int(ident_ref), verb, actor=actor)
+            resolved_item, _, changed = inbox_store.resolve_item(
+                c,
+                numeric,
+                resolution=verb,
+                answer=verb,
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not changed:
+                current = inbox_store.get(numeric, connect=lambda: nullcontext(c)) or item
+                if current["state"] == "resolved":
+                    raise contract.Problem("already_resolved", f"Inbox item {item['id']} is already resolved.", current=current)
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=current)
+        return {"item": resolved_item, "result": res_data}
 
     if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:
         if credential is None or credential.kind != "session":

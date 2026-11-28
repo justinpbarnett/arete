@@ -5,7 +5,6 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections import Counter
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -168,11 +167,31 @@ def run_ids(repo: str, tid: str) -> list[str]:
     return [r["id"] for r in run_store.ticket_runs(repo, tid)]
 
 
-def held(cfg: config.Config, repo: config.Repo) -> str:
-    if why := config.repo_paused(cfg, repo.name):
+def held(cfg: config.Config, line_or_repo: dict | str | config.Repo | None, tid: str = "") -> str:
+    from . import lines as lines_mod
+
+    repo_name = ""
+    line_row: dict | None = None
+    if isinstance(line_or_repo, dict):
+        line_row = line_or_repo
+        repo_name = str(line_row.get("repo") or "")
+    elif isinstance(line_or_repo, str):
+        line_row = lines_mod.get_line(line_or_repo)
+        repo_name = str(line_row.get("repo") or "") if line_row else ""
+    elif line_or_repo is not None:
+        repo_name = line_or_repo.name
+        line_row = lines_mod.resolve_line_read(repo_name, tid, cfg=cfg)
+    if repo_name and (why := config.repo_paused(cfg, repo_name)):
         return why
-    going = Counter(r["repo"] for r in pipeline.live_pipeline_runs())
-    return pipeline.held_back(cfg, repo.name, going, slots.slots_free_to_start(cfg.max_parallel))
+    from collections import Counter
+
+    going = lines_mod.live_runs_by_line() if line_row is not None else Counter()
+    wip = (
+        lines_mod.wip_counts_by_line()
+        if line_row is not None and line_row.get("wip_limit") is not None
+        else Counter()
+    )
+    return pipeline.held_back(cfg, line_row, going, slots.slots_free_to_start(cfg.max_parallel), wip)
 
 
 def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
@@ -222,8 +241,10 @@ def _settle_ticket_dead_in_tx(c, repo: config.Repo, tid: str, task_num: int | No
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
     from contextlib import nullcontext
 
-    from . import leases
+    from . import configrepo, leases
+    from . import lines as lines_mod
     from .store import factory as factory_state
+    from .store import projects as projects_store
 
     factory_state.admit()
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
@@ -238,7 +259,8 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
             settled_before = _settle_ticket_dead_in_tx(c, repo, tid, pre_task_num)
         if settled_before:
             _finish_settled_at_launch(cfg, settled_before, one_step=False)
-        if why := held(cfg, repo):
+        resolved_line = lines_mod.resolve_line_read(repo.name, tid, cfg=cfg)
+        if why := held(cfg, resolved_line if resolved_line is not None else repo, tid):
             return queued(repo, tid, why, poller_picks)
         if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
                                       runlimits.Policy.of(config.load_layer(repo.layer_dir)), force).reason:
@@ -248,8 +270,16 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         except foundation.IncompatibleSchema as e:
             raise control.Refused(str(e)) from e
 
+        # Hold the instance fence across parent admission validation and queued-run insert,
+        # releasing both transaction and fence before child launch or any external wait.
         lease_settled: list[dict] = list(settled_before)
-        with foundation.tx() as c:
+        line_id = ""
+        with configrepo.maybe_instance_fence(), foundation.tx() as c:
+            if projects_store.available(c):
+                line_row = lines_mod.resolve_line_for_ticket(c, repo.name, tid, cfg=cfg)
+                if line_row is not None:
+                    lines_mod.assert_line_active(c, line_row["id"])
+                    line_id = line_row["id"]
             if task_store.has_identity_expand(c):
                 task_num, issue_key = task_store.TaskStore.task_for_ticket(
                     c, repo, tid, principals.current(), cfg=cfg,
@@ -273,7 +303,7 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                 restart_kind = "lease" if continues_id else ""
                 run_id = pipeline.queue_run(
                     repo.name, tid, cfg=cfg, repo=repo, task_id=task_num, issue_key=issue_key,
-                    continues=continues_id, restart=restart_kind,
+                    continues=continues_id, restart=restart_kind, line=line_id,
                 )
             else:
                 more_settled = _settle_ticket_dead_in_tx(c, repo, tid, None)
@@ -285,18 +315,22 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                 continues_id = interrupted_settled[-1]["id"] if interrupted_settled else None
                 restart_kind = "lease" if continues_id else ""
                 run_id = pipeline.queue_run(
-                    repo.name, tid, cfg=cfg, repo=repo, continues=continues_id, restart=restart_kind,
+                    repo.name, tid, cfg=cfg, repo=repo, continues=continues_id, restart=restart_kind, line=line_id,
                 )
         if len(lease_settled) > len(settled_before):
             _finish_settled_at_launch(cfg, lease_settled[len(settled_before):], one_step=False)
         from . import inbox
 
         if missing := inbox.check_run_missing_secrets(run_id, repo=repo.name):
-            cmd = pipeline.run_command(repo.name, tid, force, run_id=run_id)
+            cmd = pipeline.run_command(repo.name, tid, force, run_id=run_id, line=line_id)
             record.write_launch(run_id, cmd, pipeline.RUNS_LOG)
             names = ", ".join(f"{s['scope']}/{s['name']}" for s in missing)
             return answer(tid, repo.name, run_id, "queued", f"waiting on missing secret {names}")
-        spawn_queued(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force, run_id=run_id))
+        spawn_queued(
+            repo.name,
+            tid,
+            lambda: pipeline.invoke_spawn(pipeline.spawn_run, repo.name, tid, force, run_id=run_id, line=line_id),
+        )
         result = answer(tid, repo.name, run_id, "running", "started")
         if owner_forcing:
             from . import cohorts
@@ -381,7 +415,7 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
     if why := config.repo_paused(cfg, repo.name):
         raise control.Refused(why + after)
-    if not ahead and (why := held(cfg, repo)):
+    if not ahead and (why := held(cfg, repo, tid)):
         raise slots.NoFreeSlot(why + after)
     if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
                                   runlimits.Policy.of(config.load_layer(repo.layer_dir)), True).reason:
@@ -390,6 +424,10 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
 
 def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False,
            admission=None, *, continues: str | None = None, restart: str = "", only_step: str = "") -> dict:
+    from . import configrepo
+    from . import lines as lines_mod
+    from .store import projects as projects_store
+
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         settled_before: list[dict] = []
         with foundation.tx() as c:
@@ -402,15 +440,23 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
             foundation.require_workspace_contract()
         except foundation.IncompatibleSchema as e:
             raise control.Refused(str(e)) from e
-        with writes.atomic() as c:
+        line_id = ""
+        with configrepo.maybe_instance_fence(), writes.atomic() as c:
             if admission and not writes.check_run(*admission, public=True):
                 raise control.NotFound(f"no run {admission[0]}")
             task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg) if task_store.has_identity_expand(c) else None
             more_settled = _settle_ticket_dead_in_tx(c, repo, tid, task_num)
-            run_id = pipeline.queue_run(repo.name, tid, continues=continues, restart=restart, only_step=only_step)
+            if projects_store.available(c):
+                line_row = lines_mod.resolve_line_for_ticket(c, repo.name, tid, cfg=cfg)
+                if line_row is not None:
+                    lines_mod.assert_line_active(c, line_row["id"])
+                    line_id = line_row["id"]
+            run_id = pipeline.queue_run(
+                repo.name, tid, continues=continues, restart=restart, only_step=only_step, line=line_id,
+            )
         if more_settled:
             _finish_settled_at_launch(cfg, more_settled, one_step=bool(only_step))
-        full_command = [*command, "--run-id", run_id]
+        full_command = [*command, "--run-id", run_id, *(["--line", line_id] if line_id else [])]
         record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
         from . import inbox
 
@@ -431,7 +477,7 @@ def launch_recovery(cfg: config.Config, repo: config.Repo, row: dict, attempt: d
         with util.lock(STEER_LOCK, wait=True), PENDING_LOCK, util.lock(START_LOCK, wait=True):
             if pending := pending_start(repo.name, tid):
                 return pending
-            if live_run(repo.name, tid) or held(cfg, repo):
+            if live_run(repo.name, tid) or held(cfg, repo, tid):
                 return answer(tid, repo.name, "", "queued", "Waiting for an available run slot")
             if tid in oncall.parked(repo.name):
                 raise control.Refused("on-call already owns this ticket")
@@ -796,6 +842,12 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str, *, task_id: int | None = None) -> workspace.Release | None:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{tid}"
+    ws_ticket = tid
+    if not os.path.lexists(ws) and workspaces.open_for(ws.name) is None:
+        owner_row = workspaces.for_owner_run(run_id)
+        if owner_row and owner_row["repo"] == repo.name and owner_row["name"] != ws.name:
+            ws = paths.WORKTREES_DIR / owner_row["name"]
+            ws_ticket = owner_row["ticket"]
     with workspaces.folder_lock(ws):
         row = workspaces.open_for(ws.name)
         if not row:
@@ -808,7 +860,7 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str, *, task_id: in
                 if task_id is not None
                 else run_store.newest_whole_run(repo.name, tid)
             )
-            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, tid):
+            if latest and latest["id"] == run_id and (row["repo"], row["ticket"]) == (repo.name, ws_ticket):
                 return workspaces.remove_imported_waiting(ws, row)
             return None
         try:

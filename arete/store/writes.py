@@ -16,7 +16,7 @@ FIELDS = {
                        "grp", "lock", "moved", "wait_minutes", "engine_sha", "failure", "dry_run",
                        "environment_retry_of", "config_commit", "resolved_sha", "continues", "chain", "restart",
                        "started_by", "payer", "seq", "adw", "adw_version", "adw_rule",
-                       "task_id", "issue_key", "capabilities", "lease_id")),
+                       "task_id", "issue_key", "capabilities", "line", "lease_id")),
     "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated",
                         "num", "project", "line", "fault", "fault_detail", "priority", "rank",
                         "owner", "origin", "delegate", "estimate", "answer")),
@@ -53,7 +53,12 @@ def current(c, table, identity):
         raise ValueError(f"invalid versioned table: {table!r}")
     column = _identity_column(c, table)
     row = c.execute(f"SELECT {column}, * FROM {table} WHERE {column} = ?", (identity,)).fetchone()  # noqa: S608
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    if table == "runs" and "issue" not in d and "issue_key" in d:
+        d["issue"] = d["issue_key"]
+    return d
 
 
 @contextmanager
@@ -85,7 +90,7 @@ def fields_for(table, fields):
 def emit(c, table, identity, row, kind):
     data = row
     subject_id = identity
-    task_tag = row.get("issue", row.get("task", row.get("id")))
+    task_tag = row.get("issue_key", row.get("issue", row.get("task", row.get("id"))))
     if table == "runs":
         data = {**row, "run": identity}
         if row.get("task_id") is not None:
@@ -102,7 +107,7 @@ def emit(c, table, identity, row, kind):
                 td["id"] = f"T-{td.get('num', td['id'])}"
                 data["board_task"] = td
         else:
-            issue = row.get("issue")
+            issue = row.get("issue_key") or row.get("issue")
             if isinstance(issue, str) and issue.startswith("t-"):
                 task = c.execute("SELECT id, state, updated, version FROM tasks WHERE id = ? AND repo = ?",
                                  (issue, row["repo"])).fetchone()

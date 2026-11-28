@@ -12,6 +12,7 @@ from pathlib import Path
 from .. import drafts, paths, record, retention, run_lines, util
 from . import blobs as blob_store
 from . import devices, events, idempotency, incidents, loops, orchestration, runs, writes
+from . import sources as sources_store
 from .db import (
     BLOBS_RETENTION_SCHEMA,
     RECORD_TURNS_SCHEMA,
@@ -289,10 +290,11 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
 
         # Load remaining runs for folder & record phases.
         rec_col = "records_purged" if has_records_purged else "NULL AS records_purged"
+        ic = runs.issue_col(c)
         all_runs = [
             dict(r)
             for r in c.execute(
-                f"SELECT id, kind, repo, issue, status, started, finished, files_purged, {rec_col} FROM runs"  # noqa: S608
+                f"SELECT id, kind, repo, {ic} AS issue, status, started, finished, files_purged, {rec_col} FROM runs"  # noqa: S608
             ).fetchall()
         ]
         all_ids = {r["id"] for r in all_runs}
@@ -479,6 +481,11 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             keep_days=policy.incidents.keep_days,
         )
         rows_removed += devices.prune(c)
+        rows_removed += sources_store.prune(
+            c,
+            polls_days=policy.source_polls.days,
+            unused_days=policy.sources.unused_days,
+        )
 
     return RowsPruned(
         rows=rows_removed,

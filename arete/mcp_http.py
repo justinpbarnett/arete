@@ -20,7 +20,7 @@ RESEARCH_ROW = contract.obj({"id": {}, "detail": contract.obj({**contract.RESEAR
 SCREEN_LOOP = contract.obj({key: {} for key in (
     *contract.LOOP["properties"], "origin", "description", "repo", "trigger", "sources", "runner", "device", "queue",
     "budget_usd", "daily_budget_usd", "emits", "dir", "error", "next_due", "last_fire", "spent_24h", "last",
-    "findings", "waiting", "cursors", "webhook_path",
+    "findings", "waiting", "webhook_path",
 )})
 
 

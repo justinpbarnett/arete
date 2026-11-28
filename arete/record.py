@@ -205,7 +205,7 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
         util.write_durably(resolved_file, resolution.resolved_bytes, 0o600)
     # A nested writer has not committed yet; retain its lease until exit.
     if kind in TICKET_KINDS and not nested:
-        launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
+        launch_lease.registered(row.get("repo", ""), str(row.get("issue_key") or row.get("issue") or ""))
     return minted
 
 
@@ -436,10 +436,11 @@ def dead_status_in_tx(c, row: dict) -> str:
         from contextlib import nullcontext
 
         target = int(row["task_id"]) if row.get("task_id") is not None else row["repo"]
+        issue_val = row.get("issue_key") or row.get("issue") or ""
         earlier = [r for r in (
             run_store.ticket_runs(target, limit=2, whole=True, live=True, connect=lambda: nullcontext(c))
             if isinstance(target, int)
-            else run_store.ticket_runs(row["repo"], row["issue"], limit=2, whole=True, live=True,
+            else run_store.ticket_runs(row["repo"], issue_val, limit=2, whole=True, live=True,
                                        connect=lambda: nullcontext(c))
         ) if r["id"] != row["id"]]
         unfinished = False
@@ -447,7 +448,7 @@ def dead_status_in_tx(c, row: dict) -> str:
             if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spec_deliveries'").fetchone():
                 unfinished = c.execute(
                     "SELECT 1 FROM spec_deliveries WHERE repo = ? AND issue = ? AND state != 'complete' LIMIT 1",
-                    (row.get("repo"), str(row.get("issue") or "")),
+                    (row.get("repo"), str(issue_val)),
                 ).fetchone() is not None
             if not unfinished:
                 return "failed"

@@ -41,13 +41,14 @@ group = "repo"                 # events that share this field wait in line one a
 trust = "untrusted"            # refuse events below this trust: untrusted | internal | owner; a refused webhook gets 403
 
 [[source]]                     # polled by serve; new events fire the loop; the first read only sets a baseline
-name = "issues"                # a source's history follows its name; needed on each source when a loop has more than one
-type = "github"                # github | jira | log | command
+id = "issues"                  # stable id matching ^[a-z0-9][a-z0-9-]{0,63}$; omit to derive <loop-slug>[-<name>]
+type = "github"                # github | jira | log | command | closed-specs | pipeline
 repos = ["arete"]              # config repo names or owner/name; [run] repo when left out
 watch = ["ci_red", "issue", "advisory"]
 label = "bug"                  # issue: only issues with this label
 branch = "main"                # ci_red: the default branch when left out
 every = "5m"                   # how often to poll; 5m when left out
+# A table with only `id = "shared"` loads `sources/shared.toml` (or `arete/defaults/sources/shared.toml`).
 
 # type = "jira":    jql = "project = ABC AND status = Open", limit = 50, on_update = false
 # type = "log":     path = "~/logs/*.log", pattern = "ERROR|Traceback" (a regex); one event per new error signature
@@ -95,11 +96,15 @@ Ticket emits use GitHub by default. Set `tracker = "configured"` to use the targ
 
 ## Source history
 
-A source's history (which events it has seen, and where a log was read to) follows its `name`, or its position in the `[[source]]` list when it has none. A loop with more than one source needs a name on each: lowercase letters, digits and dashes, not only digits, not `webhook`, and not repeated in the loop.
+Every source has a stable `id` matching `^[a-z0-9][a-z0-9-]{0,63}$`. When a `[[source]]` table sets `id`, that id is used directly. Otherwise its derived id is `<loop-slug>-<name>` when `name` is set, else `<loop-slug>`, where `<loop-slug>` lowercases the loop name and replaces non-alphanumeric characters with `-` (for example `repo/folder` becomes `repo-folder`). At most one `[[source]]` per loop may omit both `id` and `name`, and a derived id over 64 characters requires an explicit `id`. Renaming a loop changes any derived id that is not explicit, so set an explicit `id` when you want history to survive a loop rename.
 
-The scope keys of a source say what it watches: github `repos`, `watch`, `label`, `branch`; jira `jql`, `on_update`; command `command`; log `path`, `pattern`. An edit to any other key (`every`, `timeout`, `trust`, `limit`, `repo`, `name`) keeps everything and the next poll carries on. An edit to a scope key keeps the seen keys, and the next poll fires the events stamped since the last good poll (less two minutes); older matches are taken as seen and named in serve.log. A log source keeps its offsets for files it read before and starts newly matched files at their end. A command row can carry `data.at` (an ISO time) so it can catch up across a command change; a row without a time is taken as seen.
+A `[[source]]` table with keys beside `id` defines the source inline (inheriting the loop's `[run] repo` and folder). A `[[source]]` table with only `id` references a file source at `sources/<id>.toml` in the config repo, else `arete/defaults/sources/<id>.toml`. A file source carries its own `repos` and `repo`, runs commands in the config folder, and may be named by multiple loops; one poll fires to each live loop that references it under that loop's trust rules. One id has one definition across inline tables and files.
 
-A new name starts from a baseline. Naming a source that has no name keeps its history only when its scope keys stay the same in that change, so put a name in a change of its own. Adding or reordering sources is safe once each has a name: a named source picks up the history of the unnamed source with the same scope keys.
+Each source's `scope_sha` hashes its type, its resolved scope keys — github `repos`, `watch`, `label`, `branch`; jira `jql`, `on_update`; command `command`; log `path`, `pattern`; closed-specs `tracker`; pipeline none — together with its effective binding (connector identity, service/driver, normalized endpoint/tenant and stable account/principal identity, excluding secret bytes and token rotations). Edits outside those effective values (`every`, `enabled`, `timeout`, `trust`, `limit`, `repo`, `why`, or credential rotation) keep cursor and history and carry on normally.
+
+When `scope_sha` changes, seen keys stay: for github, jira and command sources, unseen events stamped at or after `last_ok` minus two minutes go on immediately, while older or unstamped unseen matches are marked seen and held on a `rescope` inbox item (`subject = source:<id>`, verbs `fire` and `dismiss`) rather than silently dropped. A log source keeps offsets for files it has already read and starts newly matched files at their end. A command row can carry top-level `at` or `data.at` (an ISO timestamp) to participate in catch-up.
+
+A brand-new id (or one whose cursor has no `last_ok` yet) starts from a logged baseline that marks existing events seen and names up to five skipped keys in serve.log. Removing a source keeps its rows as an unused id (`enabled: false`) until retention (`[sources] unused_days`, default 90) removes them; naming that id again before retention resumes from its cursor and seen set.
 
 ## What a run can read
 

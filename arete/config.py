@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import math
 import os
 import pwd
@@ -449,7 +450,6 @@ class Config:
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
-    max_parallel_per_repo: int = 1
     max_parallel_checks: int = 2
     dashboard_port: int = paths.DASHBOARD_PORT
     server_url: str = ""
@@ -560,8 +560,7 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
 
 
 def remove_controller_only_settings(data: dict) -> None:
-    for name in ("max_parallel", "max_parallel_per_repo"):
-        data.pop(name, None)
+    data.pop("max_parallel", None)
     if "jev" in data:
         for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
             data["jev"].pop(name, None)
@@ -958,6 +957,10 @@ def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
     if (not isinstance(contact, str) or len(contact) > 200 or re.search(r"\s", contact)
             or contact and not contact.startswith(("mailto:", "https://"))):
         raise ValueError("[ask] push_contact must be empty or a mailto: or https:// address without spaces, at most 200 characters")
+    for key in ("newPer10Min", "floodBurst", "standingLimit", "standingAim",
+                "highOnScreen", "shelvedLimit", "demoteAfterShelves", "needsYouPerDay"):
+        if key in table:
+            whole(table[key], f"[ask] {key}", least=1, bound="of at least 1")
     return AskConfig(max_per_run=limit, settle=settle, expire_days=days, remind_hours=hours, push_contact=contact)
 
 
@@ -1509,7 +1512,6 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
         max_parallel=max(1, int(data.get("max_parallel", 1))),
-        max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
         server_url=server_url(data),
@@ -1936,6 +1938,25 @@ def _scope_matches(scope: str, *, repo: str = "", role: str = "", kind: str = ""
     return False
 
 
+_PROMPT_PROBLEMS_SCOPE: ContextVar[tuple[int, tuple] | None] = ContextVar("arete_prompt_problems_scope", default=None)
+
+
+@contextlib.contextmanager
+def prompt_binding_scope(cfg: Config):
+    cached = _PROMPT_PROBLEMS_SCOPE.get()
+    if cached is not None and cached[0] == id(cfg):
+        yield cached[1]
+        return
+    from . import prompts
+
+    probs = tuple(prompts.binding_problems(cfg))
+    tok = _PROMPT_PROBLEMS_SCOPE.set((id(cfg), probs))
+    try:
+        yield probs
+    finally:
+        _PROMPT_PROBLEMS_SCOPE.reset(tok)
+
+
 def paused(cfg: Config, repo: str = "", role: str = "", kind: str = "", mcp: tuple[str, ...] | list[str] = (),
            *, oncall: bool = False, layer: RepoLayer | None = None) -> str:
     problems = (*cfg.problems, *(layer.problems if layer else ()))
@@ -1943,9 +1964,14 @@ def paused(cfg: Config, repo: str = "", role: str = "", kind: str = "", mcp: tup
         if _scope_matches(problem.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
             return problem.text()
     if role:
-        from . import prompts
+        cached = _PROMPT_PROBLEMS_SCOPE.get()
+        if cached is not None and cached[0] == id(cfg):
+            prompt_probs = cached[1]
+        else:
+            from . import prompts
 
-        for pp in prompts.binding_problems(cfg):
+            prompt_probs = prompts.binding_problems(cfg)
+        for pp in prompt_probs:
             if _scope_matches(pp.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
                 return pp.message
     return ""
@@ -1975,14 +2001,12 @@ def repo_paused(cfg: Config, repo_name: str, *, kind: str = "") -> str:
             return f"{type(e).__name__}: {e}"
         if why := paused(cfg, repo=repo_name, layer=layer):
             return why
-    from . import prompts
-
-    prompt_probs = prompts.binding_problems(cfg)
-    if not cfg.problems and not (layer and layer.problems) and not prompt_probs:
-        return ""
-    for k in (kind,) if kind else ("", *KINDS):
-        for role in STEP_ROLES:
-            mcps = _configured_mcps(cfg, layer, role, k)
-            if why := paused(cfg, repo=repo_name, role=role, kind=k, mcp=mcps, layer=layer):
-                return why
+    with prompt_binding_scope(cfg) as prompt_probs:
+        if not cfg.problems and not (layer and layer.problems) and not prompt_probs:
+            return ""
+        for k in (kind,) if kind else ("", *KINDS):
+            for role in STEP_ROLES:
+                mcps = _configured_mcps(cfg, layer, role, k)
+                if why := paused(cfg, repo=repo_name, role=role, kind=k, mcp=mcps, layer=layer):
+                    return why
     return ""

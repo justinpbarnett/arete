@@ -199,7 +199,7 @@ def owns_lock(run_id: str, lock: str, conn=None) -> bool:
         lease_row = device_store.lease_get(int(row_dict["lease_id"]), connect=lambda: nullcontext(c))
         if lease_row is None:
             return False
-        return lease_row["released"] is None and lease_row["expires"] >= util.iso()
+        return lease_row["released"] is None
 
 
 def ensure_run_lease(
@@ -256,6 +256,9 @@ def release_run_lease_in_tx(
         return None
     lid = int(row["id"])
     final_outcome = outcome if outcome in ("released", "expired", "revoked", "deleted", "") else "released"
+    cols = {r[1] for r in c.execute("PRAGMA table_info(leases)")}
+    if "line_shape" not in cols and final_outcome in ("released", "revoked"):
+        final_outcome = ""
     c.execute(
         "UPDATE leases SET epoch = epoch + 1, released = ?, outcome = ?, token_hash = '', "
         "version = version + 1 WHERE id = ? AND released IS NULL",
@@ -279,7 +282,7 @@ def settle_dead_on_lock(c, lock: str, *, now_iso: str | None = None) -> list[dic
     now = now_iso or util.iso()
     seq = run_store.seq_col(c)
     rows = [
-        dict(r)
+        {**dict(r), "issue": r["issue_key"] if "issue_key" in r.keys() else r["issue"] if "issue" in r.keys() else None}
         for r in c.execute(
             f"SELECT * FROM runs WHERE lock = ? AND status = 'running' ORDER BY started ASC, {seq} ASC, id ASC",  # noqa: S608
             (lock,),
@@ -789,9 +792,11 @@ def lapse(
             updated = dict(c.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone())
             emit_changed(c, updated)
             if updated["run_id"]:
+                from .store import runs as run_store
+
                 run_row = c.execute("SELECT * FROM runs WHERE id = ?", (updated["run_id"],)).fetchone()
                 if run_row is not None and run_row["status"] == "running":
-                    record.interrupt(dict(run_row))
+                    record.interrupt(run_store.run_row(run_row))
             lapsed.append(int(updated["id"]))
     for lid in lapsed:
         wake(lid)

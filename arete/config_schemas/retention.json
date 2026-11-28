@@ -75,6 +75,20 @@
       },
       "additionalProperties": false
     },
+    "source_polls": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "sources": {
+      "type": "object",
+      "properties": {
+        "unused_days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
     "db": {
       "type": "object",
       "properties": {

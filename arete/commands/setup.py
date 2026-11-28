@@ -135,7 +135,7 @@ def print_status(cfg, problem, views, snap, records, server_url):
         print(f"config problems: {'; '.join(p.text() for p in cfg.problems)}")
     if cfg.ignored:
         print(f"config names this engine ignores: {', '.join(cfg.ignored)}")
-    print(f"max_parallel {cfg.max_parallel}, max_parallel_per_repo {cfg.max_parallel_per_repo}")
+    print(f"max_parallel {cfg.max_parallel}")
     print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
@@ -273,6 +273,37 @@ def cmd_doctor(args) -> int:
     for r in results:
         print(doctor.line(r))
     return 1 if any(r.failing for r in results) else 0
+
+
+def cmd_derived(args) -> int:
+    from urllib.parse import quote
+
+    from .. import bands
+    from .. import lines as lines_mod
+
+    if args.derived_action != "recompute":
+        print(f"arete derived: unsupported action {args.derived_action!r}", file=sys.stderr)
+        return 1
+    try:
+        line_id = bands.parse_provider_target(args.target)
+    except lines_mod.ValidationError as error:
+        print(f"arete derived recompute: {error}", file=sys.stderr)
+        return 1
+    if type(args.base_version) is not int or args.base_version < 1:
+        print("arete derived recompute: --base-version must be an integer >= 1", file=sys.stderr)
+        return 1
+    result = client.call(
+        "POST",
+        f"/api/v1/derived/band/{quote(line_id, safe='')}/recompute",
+        {"base_version": args.base_version},
+        key=args.idempotency_key or None,
+    )
+    if args.json:
+        client.emit(result)
+    else:
+        state = "changed" if result.get("changed") else "unchanged"
+        print(f"band:{line_id} v{result.get('ver')} {state}")
+    return 0
 
 
 def cmd_prompts(args) -> int:
@@ -458,6 +489,16 @@ def register(sub) -> None:
     p.add_argument("checks", nargs="*", metavar="CHECK",
                    help="optional check names (including derived:<name>); omit to run all checks")
     p.set_defaults(fn=cmd_doctor, local_read=True)
+
+    d = sub.add_parser("derived", help="recompute supported derived projections through the authenticated API")
+    d_actions = d.add_subparsers(dest="derived_action", required=True)
+    dr = d_actions.add_parser("recompute", help="recompute band:<line> from the last 30 done tries per node")
+    dr.add_argument("target", metavar="band:<line>", help="derived target (only band:<line> is supported)")
+    dr.add_argument("--base-version", type=int, required=True, help="current version of the line")
+    dr.add_argument("--idempotency-key", "--key", dest="idempotency_key", default="",
+                    help="explicit Idempotency-Key for safe replay")
+    dr.add_argument("--json", action="store_true", help="print the command receipt as JSON")
+    dr.set_defaults(fn=cmd_derived)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
     p.add_argument("--port", type=int, default=None, help="the port to listen on; the config's [dashboard] port by default")

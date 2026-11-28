@@ -266,8 +266,13 @@ def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
     if not loop.fed_by_events or loop.error:
         return []
     taken, refusals = [], []
-    for i in range(len(loop.sources)):
-        judged = [(e, loop.trigger.refusal(e)) for e in sources.peek(loop, i, cfg)]
+    loaded = {s.id: s for s in sources.load_all(cfg, [loop])}
+    for table in loop.sources:
+        sid = sources.table_source_id(loop.name, table)
+        src = loaded.get(sid)
+        if src is None or src.definition.get("type") == "pipeline":
+            continue
+        judged = [(e, loop.trigger.refusal(e)) for e in sources.peek(src, cfg)]
         taken += [e for e, refusal in judged if not refusal][-SAMPLE_EVENTS:]
         refusals += [refusal for _, refusal in judged if refusal]
     if taken:

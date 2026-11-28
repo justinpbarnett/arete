@@ -263,7 +263,8 @@ def sync_moves(cfg: config.Config) -> None:
         return
     seen: set[tuple[str, str]] = set()
     for r in run_store.runs(kind="pipeline", limit=200):
-        key = (r["repo"] or "", str(r["issue"]))
+        ikey = str(r.get("issue_key") or r.get("issue") or "")
+        key = (r["repo"] or "", ikey)
         if key in seen:
             continue
         seen.add(key)
@@ -275,7 +276,7 @@ def sync_moves(cfg: config.Config) -> None:
             repo = cfg.repo(r["repo"])
         except KeyError:
             continue
-        tk = tracker.for_ticket(cfg, repo, str(r["issue"]))
+        tk = tracker.for_ticket(cfg, repo, ikey)
         if not isinstance(tk, tracker.JiraTracker):
             continue
         try:

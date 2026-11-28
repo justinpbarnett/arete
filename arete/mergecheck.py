@@ -59,7 +59,7 @@ def events(cfg: config.Config, since_cursor: bool = True) -> list[dict]:
     if os.environ.get("ARETE_SOURCE_SAMPLE") == "1":
         rows = [r for repo in cfg.repos for r in [i for i in rows if i["repo"] == repo.name][-2:]]
     elif since_cursor:
-        seen = source_store.source_seen(os.environ.get("ARETE_SOURCE") or "merge-check#merged")
+        seen = source_store.source_seen(os.environ.get("ARETE_SOURCE") or "merge-check-merged")
         rows = [r for r in rows if r["key"] not in seen]
     return [{**r, "type": "command", "title": f"Merged {r['repo']} PR #{r['pr']}",
              "data": {**r, "at": r["merged_at"]}} for r in rows]

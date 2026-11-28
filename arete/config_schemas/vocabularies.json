@@ -1,1 +1,34 @@
-{"type": "object", "x-arete-read-only": true}
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "minimum": 1},
+    "task_states": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "terminal": {"type": "boolean"},
+          "description": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "legacy": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["intake", "ready", "running", "needs-you", "review", "done", "closed"]
+          },
+          "fault": {"type": "boolean"}
+        },
+        "required": ["state"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["task_states", "legacy"],
+  "additionalProperties": false
+}

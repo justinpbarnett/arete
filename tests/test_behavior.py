@@ -4,6 +4,7 @@ import base64
 import hmac
 import json
 import os
+import platform
 import shutil
 import sqlite3
 import ssl
@@ -2239,8 +2240,8 @@ stopped = runner.Stopped(SimpleNamespace(session=saved, turns=2), SimpleNamespac
 assert runner.continues(stopped, picked, True)
 
 with db.tx() as c:
-    c.execute("INSERT INTO runs (id, kind, repo, issue, task_id, status, started) VALUES "
-              "('old-run', 'pipeline', 'fixture', 1, 1, 'needs-info', ?)", (util.iso(),))
+    c.execute("INSERT INTO runs (id, kind, repo, issue_key, task_id, status, started) VALUES "
+              "('old-run', 'pipeline', 'fixture', '1', 1, 'needs-info', ?)", (util.iso(),))
 asks.ask_add('old-ask', 'old-run', 'fixture', '1', 'build', 'call', '', '', [], asdict(saved))
 assert heartbeat.check_legacy_accounts()[0].detail == '0 active v1 holds, 1 unfinished runs with v1 sessions'
 """)
@@ -7325,7 +7326,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "ask", "promote")
+            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "ask", "promote", "delete")
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
                        for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
@@ -7651,8 +7652,12 @@ class _CliThroughServeCase(unittest.TestCase):
         "oncall cancel 1": "POST /api/incidents/{id}/cancel",
         "oncall dismiss 1": "POST /api/incidents/{id}/dismiss",
         "oncall retry 1": "POST /api/incidents/{id}/retry",
+        "poll": "POST /api/v1/sources/{source}/poll",
+        "jira-check": "GET /api/v1/sources",
+        "derived recompute band:demo --base-version 1": "POST /api/v1/derived/band/{line}/recompute",
     }
     ONLINE_VARIANTS = {
+        "poll --dry-run": "POST /api/v1/sources/{source}/poll",
         "status --json r1": "GET /api/runs/{run}/events",
         "status --json": "GET /api/live",
         "record pin r1": None,
@@ -7669,7 +7674,7 @@ class _CliThroughServeCase(unittest.TestCase):
     CREDENTIAL_COMMANDS = ("login --token-stdin", "logout", "pair")
     READS = (
         "ab", "backup --check", "benchmark report missing", "costs", "devices", "doctor", "events",
-        "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
+        "experiment summary missing", "jev report", "loop feed r1", "loop list", "loop status poll",
         "merged", "oncall list", "oncall show 1", "prices diff", "prices recompute r1 build", "prompts",
         "hold", "record r1", "research", "secrets replay-sample", "session list", "session report r1",
         "steps --repo replay-sample", "triage", "verifiers report missing",
@@ -7690,7 +7695,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
         "mcp": "mcp_stdio", "mcp-ask": "owner_asks", "mcp-config": "commands.api",
         "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
-        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
+        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "prices import": "prices",
         "release enroll": "release_proof", "release observe": "release_proof", "release status": "release_proof",
         "release-journeys": "releasejourneys", "replay sample": "replay",
         "repo enroll": "commands.setup", "repo publish": "commands.setup", "repo publish-pair": "commands.setup",
@@ -7709,6 +7714,7 @@ class _CliThroughServeCase(unittest.TestCase):
     LOCAL_VARIANTS = {
         "run replay-sample 7 --dry-run": "pipeline.run_issue / record.start",
         "run replay-sample 7 --local": "pipeline.run_issue", "file-rule 1 --local": "miner.file_rule",
+        "poll --local": "poll.poll",
         "loop new --run-id r1 work": "scaffold.draft", "loop start example --events sample.json": "loop_run.launch",
         "session start --task work": "sessions.launch", "session start --task --draft-pr work": "sessions.launch",
         "research --next": "research.next_due", "research replay-sample#7 --run": "research.run_now",
@@ -9469,8 +9475,8 @@ class VersionedApiTests(unittest.TestCase):
         self.cfg.arete_repo = self.repo.name
         source = triage.GitHubSource(self.repo.github, [self.repo])
         ticket = triage.Candidate("fixture#7", "7", "Question", gh.issue_url(self.repo.github, 7), "old")
-        triage_store.triage_put(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
-                                         questions=["What happened?"]))
+        triage_store.record_verdict(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
+                                               questions=["What happened?"]), ensure_listed=True)
         chat_id = chats_store.chat_add(self.repo.name)
         chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Draft", draft_body="Chat issue body")
         approval_emit = {"type": "ticket", "item": {"repo": self.repo.name, "title": "Delivery",
@@ -9727,8 +9733,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 155)
-        self.assertEqual(len({op["name"] for op in operations}), 155)
+        self.assertEqual(len(operations), 180)
+        self.assertEqual(len({op["name"] for op in operations}), 180)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -9806,7 +9812,11 @@ class VersionedApiTests(unittest.TestCase):
         self.assertEqual(before["seq"], response["Arete-Seq"])
         view = before["view"]
         listed, _ = request("/api/v1/tasks")
-        self.assertEqual(view["tasks"], listed["tasks"])
+        self.assertEqual(
+            [{k: v for k, v in row.items() if k not in ("needs_you", "needs_you_ids")} for row in view["tasks"]],
+            listed["tasks"],
+        )
+        self.assertTrue(all(row["needs_you"] == 0 and row["needs_you_ids"] == [] for row in view["tasks"]))
         self.assertEqual(view["running_ids"], [])
         self.assertEqual({col["state"]: col["count"] for col in view["columns"]},
                          {row["state"]: sum(r["state"] == row["state"] for r in listed["tasks"]) for row in listed["tasks"]})
@@ -12967,13 +12977,13 @@ class InboxTests(_InboxCase):
             poll.save_skips(skips)
 
             # 3. 1 ready triage ticket.
-            triage_store.triage_put({
+            triage_store.record_verdict({
                 "ref": "fixture/repo#301", "source": "GitHub fixture/repo", "tracker": "github", "repo": "ghfixture",
                 "route": "triage", "title": "Ready ticket", "url": "https://github.com/fixture/repo/issues/301",
                 "updated": util.iso(), "ready": 1, "code": 1, "size": "s", "questions": [],
                 "plan": ["Plan"], "why": "Ready", "cost": 0.0, "ts": util.iso(), "kind": "feat",
                 "repos": ["ghfixture"], "assumptions": [], "in_sprint": 0, "parent": "", "closed": "", "checks": [],
-            })
+            }, ensure_listed=True)
 
             # 4. 2 chat drafts.
             c1 = chats_store.chat_add("Draft one")
@@ -17735,9 +17745,9 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
     start_after = item_row(start_item["id"])["state"]
     labels_after_discard = sorted(fake.labels[("acme/sample", 9)])
 
-    # Part 2: finished run with unsent label items -> poll.next_ticket skips naming OB-<id>
+    # Part 2: finished run with unsent label items -> poll.next_ticket skips by task state
     fake.seed_issue("acme/sample", 10, title="Waiting ticket", labels=("agent",))
-    rid2 = support.start_pipeline(repo="sample", issue="10")
+    rid2 = support.start_pipeline(repo=repo, issue="10")
     rdir2 = paths.RUNS_DIR / rid2
     rdir2.mkdir(parents=True, exist_ok=True)
     run2 = pipeline.Run(rid2, repo, rdir2, cfg=cfg, tracker=tk, tid="10")
@@ -17768,7 +17778,8 @@ emit_result({
         self.assertEqual(result["start_after"], "discarded")
         self.assertEqual(result["labels_after_discard"], ["agent", "agent:pr"])
         self.assertIsNone(result["picked_before"])
-        self.assertTrue(any(result["pending_id"] in line for line in result["skip_lines_before"]), result["skip_lines_before"])
+        self.assertIsNone(result["picked_after"])
+        self.assertFalse(any("not sent yet" in line for line in result["skip_lines_before"]), result["skip_lines_before"])
         self.assertFalse(any("not sent yet" in line for line in result["skip_lines_after"]), result["skip_lines_after"])
 
     def test_run_say_feedback_prs_and_store_answer_route_through_outbox(self):
@@ -17983,7 +17994,7 @@ src_name = triage.sources(cfg)[0].name
 fake.seed_issue("acme/sample", 30, title="Triage item", labels=("triage",), updated_at="2026-11-28T00:00:00Z")
 owner = principals.seed_owner("owner@example.test")
 
-triage_store.triage_put({
+triage_store.record_verdict({
     "ref": "gh:acme/sample#30",
     "source": src_name,
     "tracker": "github",
@@ -18007,7 +18018,7 @@ triage_store.triage_put({
     "parent": "",
     "closed": "",
     "checks": [],
-})
+}, ensure_listed=True)
 
 with mock.patch.object(gh, "gh", side_effect=fake), \
         mock.patch.object(outbound, "keep_configured_private"), \
@@ -18134,7 +18145,7 @@ emit_result({
 
 class _PromptReplayCase(unittest.TestCase):
     def run_prompt_child(self, body: str) -> dict:
-        with tempfile.TemporaryDirectory(prefix="arete-prompt-behavior-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="arete-prompt-behavior-", ignore_cleanup_errors=True) as tmp:
             root = Path(tmp).resolve()
             env = {
                 "ARETE_CONFIG_DIR": str(root / "config"),
@@ -19503,7 +19514,7 @@ with api_server() as (port, _, req):
         record.settle(json.loads(raw)["id"], "done")
         # /api/triage/{ref}/research
         cand = triage.Candidate("demo#7", "7", "Demo", "https://example.invalid/7", "old")
-        triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), cand, updated="old"))
+        triage_store.record_verdict(triage.row(triage.GitHubSource("demo/repo", []), cand, updated="old"), ensure_listed=True)
         with mock.patch.object(research, "ticket", return_value={"ref": "demo#7"}), \
              mock.patch.object(research, "run_now", return_value=0):
             st, hdr, raw = req("POST", "/api/triage/demo%237/research", {}, headers={"Idempotency-Key": "alias-triage-res"})
@@ -19877,15 +19888,15 @@ repo = cfg.repo(replay.SAMPLE_REPO)
 with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
     src = triage.JiraSource("APP", [repo], jira_cfg=cfg.jira)
     cand = triage.Candidate("APP-7", "APP-7", "Fix login", src.client.browse_url("APP-7"), "2026-11-28T00:00:00.000+0000")
-    triage_store.triage_put(triage.row(
+    triage_store.record_verdict(triage.row(
         src, cand, updated="2026-11-28T00:00:00.000+0000", ready=0, code=1, repo=repo.name,
         questions=["Which endpoint?", "What status code?"],
-    ))
+    ), ensure_listed=True)
     initial = next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")
     v1 = int(initial["version"])
 
     # Update row once so v1 becomes stale, then call api.triage_send with stale v1 -> 409 version_conflict.
-    triage_store.triage_put({**initial, "summary": "Refreshed triage"})
+    triage_store.record_verdict({**initial, "summary": "Refreshed triage"}, ensure_listed=True)
     v2 = int(next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")["version"])
     assert v2 > v1
     with mock.patch.object(triage, "sources", return_value=[src]):
@@ -22120,6 +22131,13 @@ with live_dashboard() as (_, port):
     assert st_rs == 200 and rs["task"]["state"] == "ready", (st_rs, rs)
 
     # Round-trip EVERY added writable Task field through create -> update -> get.
+    for pid, lid in (("alpha", "core"), ("beta", "edge")):
+        st_p, _ = http_json(port, "POST", "/api/v1/projects", token=bearer, key=f"pr-{pid}",
+                            body={"id": pid, "name": pid.title(), "repo": "sample"})
+        assert st_p == 201, st_p
+        st_l, _ = http_json(port, "POST", "/api/v1/lines", token=bearer, key=f"ln-{lid}",
+                            body={"id": lid, "project": pid, "name": lid.title(), "kind": "pipeline", "repo": "sample"})
+        assert st_l == 201, st_l
     st_cr, cr = http_json(port, "POST", "/api/v1/tasks", token=bearer, key="wr-1", body={
         "repo": "sample", "title": "Full fields", "body": "body", "kind": "feat",
         "project": "alpha", "line": "core", "priority": 2, "rank": 1.5,
@@ -22325,7 +22343,8 @@ with principals.acting(owner), mock.patch.object(config, "load", return_value=cf
     triage_row = {"ref": "old-name#42", "repo": "old-name", "source": "github", "title": "Widget bug",
                   "url": "https://github.com/acme/widget/issues/42",
                   "kind": "fix", "size": "S", "score": 8, "reason": "good", "state": "open", "reviewed": util.iso()}
-    triage_store.triage_put(triage_row)
+    triage_store.record_verdict(triage_row, ensure_listed=True)
+    stored_triage = triage_store.triage_rows()[0]
     triage_store.triage_approve(triage_row, owner)
     insights_store.research_set(
         "old-name#42", repo="old-name", ticket="42",
@@ -22347,7 +22366,7 @@ with db.reader() as c:
         nulls = c.execute(f"SELECT count(*) FROM {tbl} {where}").fetchone()[0]
         assert nulls == 0, (tbl, nulls)
     ref_ids = {}
-    for tbl in ("triage", "triage_approvals", "research"):
+    for tbl in ("triage_verdicts", "triage_approvals", "research"):
         rows = [dict(r) for r in c.execute(f"SELECT * FROM {tbl}")]
         assert rows and all(r["ref_id"] is not None for r in rows), (tbl, rows)
         ref_ids[tbl] = rows[0]["ref_id"]
@@ -22356,7 +22375,6 @@ with db.reader() as c:
 with mock.patch.object(config, "load", return_value=cfg_new):
     sent_rows = triage.sent()
     assert any(row["run"] and row["run"]["id"] == w_run for row in sent_rows), sent_rows
-    stored_triage = triage_store.triage_rows()[0]
     cand = research.candidate(stored_triage)
     assert cand is not None and cand.id == "42", cand
 
@@ -22550,7 +22568,7 @@ with db.reader() as c:
 paths.SERVER_FILE.unlink()
 
 # 5. Once every live process meets task_admission_v1, final catch-up + contract succeeds!
-assert db.migrate() is False
+assert db.migrate(through=59) is False
 with db.reader() as c:
     assert c.execute("PRAGMA user_version").fetchone()[0] >= db.TASK_IDENTITY_CONTRACT_SCHEMA
     tinfo = {r[1]: r[2] for r in c.execute("PRAGMA table_info(tasks)")}
@@ -23126,6 +23144,2491 @@ assert ask_store.ask_get("ask-reconcile-b")["status"] == "merged"
 with db.reader() as c:
     assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_1,)).fetchone()[0] == "merged"
     assert c.execute("SELECT ext_state FROM refs WHERE url = ?", (pr_url_2,)).fetchone()[0] == "merged"
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class ProjectsLinesViewsTests(_TaskIdentityChildCase):
+    def test_two_browsers_restore_backfill_and_task_validation(self):
+        res = self.run_identity_child(r"""
+from arete import configrepo, lines as lines_mod, viewfilter
+from arete.store import events as event_store, projects as projects_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo1_dir = sample_dir / "repo"
+    repo2_dir = ROOT / "repo-two"
+    repo2_dir.mkdir()
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n'
+        'max_parallel_per_repo = 3\n\n'
+        '[[repo]]\n'
+        'name = "My_Repo"\n'
+        f'path = "{repo1_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = true\n\n'
+        '[[repo]]\n'
+        'name = "docs-only"\n'
+        f'path = "{repo2_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = false\n'
+    )
+
+    # Backfill test: migrate through m0059, seed two tasks and one finished run, then migrate to m0060.
+    db.migrate(through=59)
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, write_token = token_store.issue(owner, "write-client", ["read", "task:write"])
+
+    with principals.acting(owner):
+        t1 = task_store.task_add("My_Repo", "Task one body", "Task one", "feat")
+        t2 = task_store.task_add("My_Repo", "Task two body", "Task two", "fix")
+        r1 = record.start("pipeline", repo="My_Repo", issue=t1, task_id=1)
+        record.settle(r1, "done")
+
+    assert db.migrate() is False
+    with db.reader() as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+        projs = {r["id"]: r for r in projects_store.list_projects(c)}
+        assert set(projs) == {"my-repo", "docs-only"}, projs
+        lns = {r["id"]: r for r in projects_store.list_lines(c)}
+        assert set(lns) == {"my-repo-pipeline"}, lns
+        pl = lns["my-repo-pipeline"]
+        assert pl["kind"] == "pipeline" and pl["concurrency"] == 3 and pl["wip_limit"] is None, pl
+        for tid in (t1, t2):
+            trow = task_store.task_get(tid)
+            assert trow["project"] == "my-repo" and trow["line"] == "my-repo-pipeline", trow
+        rrow = run_store.run_get(r1)
+        assert rrow["line"] == "my-repo-pipeline", rrow
+        for subj in ("project:my-repo", "project:docs-only", "line:my-repo-pipeline"):
+            evs = c.execute(
+                "SELECT ver, kind, class FROM events_log WHERE subject = ? ORDER BY seq", (subj,)
+            ).fetchall()
+            assert len(evs) == 1 and evs[0]["ver"] == 1 and evs[0]["class"] == "durable", (subj, evs)
+        max_seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+
+    # Second migrate() writes nothing.
+    assert db.migrate() is False
+    with db.reader() as c:
+        assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == max_seq_before
+
+    # Clamping max_parallel_per_repo = 20 -> concurrency 8 in a fresh DB.
+    clamp_db = ROOT / "clamp.db"
+    clamp_ws = ROOT / "clamp-ws"
+    clamp_ws.mkdir()
+    old_cfg = paths.CONFIG_FILE.read_text()
+    paths.CONFIG_FILE.write_text(old_cfg.replace("max_parallel_per_repo = 3", "max_parallel_per_repo = 20"))
+    with mock.patch.object(paths, "DB_FILE", clamp_db):
+        db._CHECKED.clear()
+        assert db.migrate(workspace_snapshots=clamp_ws) is False
+        with db.reader() as c:
+            clamped = projects_store.get_line(c, "my-repo-pipeline")
+            assert clamped["concurrency"] == 8, clamped
+    paths.CONFIG_FILE.write_text(old_cfg)
+    db._CHECKED.clear()
+
+    # lines.ensure(cfg) creates project+line for new pipeline repo and skips archived project.
+    repo3_dir = ROOT / "repo-three"
+    repo3_dir.mkdir()
+    repo4_dir = ROOT / "repo-four"
+    repo4_dir.mkdir()
+    paths.CONFIG_FILE.write_text(
+        old_cfg +
+        '\n[[repo]]\nname = "new-pipe"\n' + f'path = "{repo3_dir}"\ntracker = "local"\npipeline = true\n' +
+        '\n[[repo]]\nname = "archived-pipe"\n' + f'path = "{repo4_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    with principals.acting(owner):
+        lines_mod.create_project({"id": "archived-pipe", "name": "archived-pipe", "repo": "archived-pipe", "archived": True})
+        lines_mod.ensure(config.load())
+    assert lines_mod.get_line("new-pipe-pipeline")["concurrency"] == 1
+    assert lines_mod.get_line("archived-pipe-pipeline") is None
+
+    # Live dashboard checks: Two browsers SSE/events, version conflict, View Restore, Canonical task validation.
+    with live_dashboard() as (_, port):
+        with db.reader() as c:
+            head_cursor = event_store.metadata(c)["head"]
+        sse_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        sse_conn.request(
+            "GET",
+            "/api/v1/events?subject=line:my-repo-pipeline",
+            headers={
+                "Accept": "text/event-stream",
+                "Authorization": f"Bearer {write_token}",
+                "Last-Event-ID": head_cursor,
+            },
+        )
+        sse_resp = sse_conn.getresponse()
+        assert sse_resp.status == 200
+        assert sse_resp.readline() == b"retry: 2000\n"
+        assert sse_resp.readline() == b"\n"
+        try:
+            st_p, patched = http_json(
+                port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-1",
+                body={"base_version": 1, "wip_limit": 3},
+            )
+            assert st_p == 200, (st_p, patched)
+            assert patched["data"]["wip_limit"] == 3 and patched["ver"] == 2 and patched["replayed"] is False
+            assert patched["subject"] == "line:my-repo-pipeline" and patched["vers"] == {"line:my-repo-pipeline": 2}
+            sse_id = sse_resp.readline().removeprefix(b"id: ").strip().decode()
+            sse_ev = json.loads(sse_resp.readline().removeprefix(b"data: "))
+            assert sse_resp.readline() == b"\n"
+            assert sse_id == sse_ev["id"]
+            assert sse_ev["kind"] == "line.changed" and sse_ev["subject"] == "line:my-repo-pipeline"
+            assert sse_ev["ver"] == 2 and sse_ev["data"]["fields"]["wip_limit"] == {"old": None, "new": 3}
+        finally:
+            sse_resp.close()
+            sse_conn.close()
+
+        st_rep, replayed = http_json(
+            port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-1",
+            body={"base_version": 1, "wip_limit": 3},
+        )
+        assert st_rep == 200 and replayed["replayed"] is True and replayed["ver"] == 2
+        st_lg, lg = http_json(port, "GET", "/api/v1/lines/my-repo-pipeline", token=write_token)
+        assert st_lg == 200 and lg["line"]["wip_limit"] == 3
+        st_conf, conf = http_json(
+            port, "PATCH", "/api/v1/lines/my-repo-pipeline", token=write_token, key="line-wip-stale",
+            body={"base_version": 1, "wip_limit": 5},
+        )
+        assert st_conf == 409 and conf["code"] == "version_conflict", (st_conf, conf)
+        assert conf["current"]["version"] == 2 and conf["current"]["wip_limit"] == 3
+
+        # Restore: view created -> filter changed -> renamed -> restored to create seq.
+        st_vc, vc = http_json(
+            port, "POST", "/api/v1/views", token=write_token, key="view-cr-1",
+            body={"id": "ops-view", "name": "Ops", "filter": "state = ready"},
+        )
+        assert st_vc == 201, (st_vc, vc)
+        v1_filter_sql = vc["data"]["filter_sql"]
+        st_vh0, vh0 = http_json(port, "GET", "/api/v1/views/ops-view/history", token=write_token)
+        create_seq = vh0["events"][0]["seq"]
+        st_vu1, vu1 = http_json(
+            port, "PATCH", "/api/v1/views/ops-view", token=write_token, key="view-up-1",
+            body={"base_version": 1, "filter": "state = running"},
+        )
+        assert st_vu1 == 200 and vu1["ver"] == 2
+        st_vu2, vu2 = http_json(
+            port, "PATCH", "/api/v1/views/ops-view", token=write_token, key="view-up-2",
+            body={"base_version": 2, "name": "Ops Renamed"},
+        )
+        assert st_vu2 == 200 and vu2["ver"] == 3
+        st_vr, vr = http_json(
+            port, "POST", "/api/v1/views/ops-view/restore", token=write_token, key="view-rs-1",
+            body={"seq": create_seq, "base_version": 3},
+        )
+        assert st_vr == 200 and vr["ver"] == 4, (st_vr, vr)
+        st_vg, vg = http_json(port, "GET", "/api/v1/views/ops-view", token=write_token)
+        assert st_vg == 200 and vg["view"]["version"] == 4
+        assert vg["view"]["name"] == "Ops" and vg["view"]["filter"] == "state = ready"
+        assert vg["view"]["filter_sql"] == v1_filter_sql
+        st_vh, vh = http_json(port, "GET", "/api/v1/views/ops-view/history", token=write_token)
+        assert st_vh == 200 and len(vh["events"]) == 4
+        assert vh["events"][-1]["data"]["restored_from"] == create_seq
+        other_seq = sse_ev["seq"]
+        st_bad_r, bad_r = http_json(
+            port, "POST", "/api/v1/views/ops-view/restore", token=write_token, key="view-rs-bad",
+            body={"seq": other_seq, "base_version": 4},
+        )
+        assert st_bad_r == 422 and bad_r["code"] == "validation", (st_bad_r, bad_r)
+
+        # Canonical task validation (create, update, internal TaskStore.create) + rollback without event.
+        with db.reader() as c:
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_tbad1, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-1",
+            body={"repo": "My_Repo", "body": "bad proj", "project": "no-such-proj"},
+        )
+        assert st_tbad1 == 422
+        st_tbad2, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-2",
+            body={"repo": "My_Repo", "body": "bad line", "project": "my-repo", "line": "no-such-line"},
+        )
+        assert st_tbad2 == 422
+        st_tbad3, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-bad-3",
+            body={"repo": "My_Repo", "body": "mismatch", "project": "docs-only", "line": "my-repo-pipeline"},
+        )
+        assert st_tbad3 == 422
+        t1_cur = task_store.task_get(t1)
+        st_tbad4, _ = http_json(
+            port, "PATCH", f"/api/v1/tasks/{t1}", token=write_token, key="t-bad-4",
+            body={"base_version": t1_cur["version"], "project": "docs-only"},
+        )
+        assert st_tbad4 == 422
+        try:
+            with db.tx() as c:
+                task_store.TaskStore.create(
+                    c, {"repo": "My_Repo", "body": "internal bad", "project": "my-repo", "line": "ghost-line"}, owner,
+                )
+            raise AssertionError("expected ValidationError")
+        except lines_mod.ValidationError:
+            pass
+        with db.reader() as c:
+            seq_after = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        assert seq_after == seq_before, (seq_before, seq_after)
+        st_tnull, tnull = http_json(
+            port, "POST", "/api/v1/tasks", token=write_token, key="t-null-1",
+            body={"repo": "My_Repo", "body": "unset ok", "project": None, "line": None},
+        )
+        assert st_tnull == 200 and tnull["task"]["project"] is None and tnull["task"]["line"] is None
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_view_filters_and_board_reads(self):
+        res = self.run_identity_child(r"""
+from arete import lines as lines_mod, viewfilter
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n\n[[repo]]\nname = "demo"\n'
+        f'path = "{repo_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "view-client", ["read", "task:write"])
+
+    assert viewfilter.compile("") == "1=1"
+    sql_prec = viewfilter.compile('state = ready or state = running and label = "o\'brien"')
+    assert "OR" in sql_prec and "AND" in sql_prec and "'o''brien'" in sql_prec, sql_prec
+
+    with principals.acting(owner):
+        t_a = task_store.task_add("demo", "Ready UI task A", "A", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 2.0})
+        t_b = task_store.task_add("demo", "Running UI task B", "B", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 1.0})
+        t_c = task_store.task_add("demo", "Done UI task C", "C", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 0.5})
+        t_d = task_store.task_add("demo", "Ready backend task D", "D", "feat", extra={"project": "demo", "line": "demo-pipeline", "rank": 0.1})
+        task_store.task_set_state(t_b, "running")
+        task_store.task_set_state(t_c, "done")
+        with db.tx() as c:
+            for tid, lbl in ((t_a, "ui"), (t_b, "ui"), (t_c, "ui"), (t_d, "backend")):
+                num = task_store.parse_task_num(tid, c)
+                c.execute("INSERT INTO task_labels (task, label) VALUES (?, ?)", (num, lbl))
+
+    with live_dashboard() as (_, port):
+        with db.reader() as c:
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_bad, bad = http_json(
+            port, "POST", "/api/v1/views", token=token, key="vf-bad-1",
+            body={"id": "bad-view", "name": "Bad", "filter": "state = = ready"},
+        )
+        assert st_bad == 422 and bad["code"] == "validation" and "position" in bad["detail"], (st_bad, bad)
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_before
+            assert lines_mod.get_view("bad-view") is None
+
+        st_ok, created = http_json(
+            port, "POST", "/api/v1/views", token=token, key="vf-ok-1",
+            body={
+                "id": "ui-active",
+                "name": "UI Active",
+                "project": "demo",
+                "filter": "state in (ready, running) and label = ui",
+                "sort": "rank",
+                "layout": "board",
+                "columns": ["state", "priority", "label"],
+            },
+        )
+        assert st_ok == 201, (st_ok, created)
+        st_tl, tl = http_json(port, "GET", "/api/v1/tasks?view=ui-active", token=token)
+        assert st_tl == 200, (st_tl, tl)
+        st_sb, sb = http_json(port, "GET", "/api/v1/screen?view=board&id=ui-active", token=token)
+        assert st_sb == 200, (st_sb, sb)
+        ids_tasks = [t["id"] for t in tl["tasks"]]
+        ids_board = [t["id"] for t in sb["view"]["tasks"]]
+        assert ids_tasks == [t_b, t_a], ids_tasks
+        assert ids_board == ids_tasks, (ids_board, ids_tasks)
+        board_lines = sb["view"]["lines"]
+        assert len(board_lines) == 1 and board_lines[0]["id"] == "demo-pipeline"
+        assert board_lines[0]["concurrency"] == 1 and board_lines[0]["tasks_in_progress"] == 1
+        st_all, all_board = http_json(port, "GET", "/api/v1/screen?view=board", token=token)
+        assert st_all == 200 and len(all_board["view"]["tasks"]) == 4
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_line_limits_poll_start_paused_inbox_and_one_limit(self):
+        res = self.run_identity_child(r"""
+import arete
+from arete import lines as lines_mod, pins, poll
+from arete.store import inbox as inbox_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n'
+        'max_parallel_per_repo = 1\n\n'
+        '[[repo]]\n'
+        'name = "demo"\n'
+        f'path = "{repo_dir}"\n'
+        'tracker = "local"\n'
+        'pipeline = true\n\n'
+        '[replay]\n'
+        'all = true\n'
+    )
+    loaded_cfg = config.load()
+    assert not hasattr(loaded_cfg, "max_parallel_per_repo")
+
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "limits-client", ["*"])
+
+    with live_dashboard() as (_, port):
+        st_l2, l2 = http_json(
+            port, "POST", "/api/v1/lines", token=token, key="l2-create",
+            body={"id": "demo-fast", "project": "demo", "name": "Fast", "kind": "pipeline", "repo": "demo", "concurrency": 2},
+        )
+        assert st_l2 == 201, (st_l2, l2)
+
+        with principals.acting(owner):
+            t1 = task_store.task_add("demo", "Line 1 task", "L1", "feat", extra={"project": "demo", "line": "demo-pipeline"})
+            t2 = task_store.task_add("demo", "Line 2 task", "L2", "feat", extra={"project": "demo", "line": "demo-pipeline"})
+        t2_row = task_store.task_get(t2)
+        st_tu, tu = http_json(
+            port, "PATCH", f"/api/v1/tasks/{t2}", token=token, key="tu-line2",
+            body={"base_version": t2_row["version"], "line": "demo-fast"},
+        )
+        assert st_tu == 200 and tu["task"]["line"] == "demo-fast"
+
+        def run_poll_capture(cfg_obj, live_runs):
+            started = []
+            buf = StringIO()
+            with (
+                mock.patch.object(config, "load", return_value=cfg_obj),
+                mock.patch.object(poll, "runnable", return_value=True),
+                mock.patch.object(poll, "network_up_or_skip", return_value=True),
+                mock.patch.object(poll, "live_pipeline_runs", return_value=live_runs),
+                mock.patch.object(pipeline, "live_pipeline_runs", return_value=live_runs),
+                mock.patch.object(poll, "slots_free_to_start", return_value=max(0, cfg_obj.max_parallel - len(live_runs))),
+                mock.patch.object(slots, "slots_free_to_start", return_value=max(0, cfg_obj.max_parallel - len(live_runs))),
+                mock.patch.object(poll, "settle_abandoned_runs"),
+                mock.patch.object(poll, "retry_scratch"),
+                mock.patch.object(poll, "mark_loop"),
+                mock.patch.object(poll.outcomes, "sync_outcomes"),
+                mock.patch.object(poll.outcomes, "sync_moves"),
+                mock.patch.object(poll.outcomes, "sync_landings"),
+                mock.patch.object(poll, "spawn_unparked", side_effect=lambda r, tid, *_a, line="", **_kw: started.append((r, str(tid), line)) or True),
+                mock.patch.object(pipeline, "SKIPPED_FILE", ROOT / "skipped.json"),
+                redirect_stdout(buf),
+            ):
+                rc = poll.poll()
+            return rc, started, buf.getvalue()
+
+        cfg_4 = config.load()
+        fake_live_l1 = [{"id": "pip-live-1", "repo": "demo", "line": "demo-pipeline", "status": "running"}]
+
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0, out
+        assert "demo-pipeline" in out and "concurrency 1" in out, out
+        assert started == [("demo", t2, "demo-fast")], (started, out)
+
+        st_wl, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-wip1",
+            body={"base_version": 1, "wip_limit": 1},
+        )
+        assert st_wl == 200
+        with principals.acting(owner):
+            t_rev = task_store.task_add("demo", "In review", "Rev", "feat", extra={"project": "demo", "line": "demo-fast"})
+            task_store.task_set_state(t_rev, "review")
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+        assert "demo-fast" in out and "wip_limit 1" in out, out
+
+        st_ps, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-pause",
+            body={"base_version": 2, "paused": 1, "paused_why": "release freeze"},
+        )
+        assert st_ps == 200
+        rc, started, out = run_poll_capture(cfg_4, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+        assert "demo-fast" in out and "release freeze" in out, out
+
+        with (
+            mock.patch.object(pipeline, "live_pipeline_runs", return_value=fake_live_l1),
+            mock.patch.object(slots, "slots_free_to_start", return_value=3),
+            mock.patch.object(pipeline, "run_refusal", return_value=(False, "")),
+        ):
+            st_q, qres = http_json(
+                port, "POST", "/api/tasks", token=token, key="post-task-held",
+                body={"repo": "demo", "ticket": t2},
+            )
+        assert st_q == 200 and qres["state"] == "queued" and "release freeze" in qres["why"], (st_q, qres)
+
+        st_unp, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-unpause",
+            body={"base_version": 3, "paused": 0, "wip_limit": None},
+        )
+        assert st_unp == 200
+        cfg_1 = config.Config(repos=cfg_4.repos, max_parallel=1, replay=cfg_4.replay)
+        rc, started, out = run_poll_capture(cfg_1, fake_live_l1)
+        assert rc == 0 and started == [], (started, out)
+
+        l2_now = lines_mod.get_line("demo-fast")
+        pin_res = pins.resolve("pipeline", repo="demo", cfg=cfg_4, line=l2_now)
+        resolved_json = json.loads(pin_res.resolved_bytes.decode("utf-8"))
+        assert resolved_json["line"] == {
+            "id": "demo-fast",
+            "version": l2_now["version"],
+            "concurrency": l2_now["concurrency"],
+            "wip_limit": l2_now["wip_limit"],
+        }, resolved_json["line"]
+
+        with db.tx() as c, principals.acting(owner):
+            it1, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-1", title="One", line="demo-fast")
+            it2, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-2", title="Two", line="demo-fast")
+        st_p2, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-pause-inbox",
+            body={"base_version": l2_now["version"], "paused": 1, "paused_why": "maintenance"},
+        )
+        assert st_p2 == 200
+        assert inbox_store.get(it1["id"])["state"] == "paused"
+        assert inbox_store.get(it2["id"])["state"] == "paused"
+        st_il, il = http_json(port, "GET", "/api/v1/inbox", token=token)
+        assert st_il == 200 and not any(x["id"] in (it1["id"], it2["id"]) for x in il["items"])
+        with db.tx() as c, principals.acting(owner):
+            it3, _, _ = inbox_store.raise_item(c, kind="alert", subject="alert:l2-3", title="Three", line="demo-fast")
+        assert it3["state"] == "paused"
+        st_u2, _ = http_json(
+            port, "PATCH", "/api/v1/lines/demo-fast", token=token, key="l2-unpause-inbox",
+            body={"base_version": l2_now["version"] + 1, "paused": 0},
+        )
+        assert st_u2 == 200
+        for iid in (it1["id"], it2["id"], it3["id"]):
+            assert inbox_store.get(iid)["state"] == "open"
+
+        st_sg, sg = http_json(port, "GET", "/api/v1/settings", token=token)
+        assert st_sg == 200
+        assert "max_parallel_per_repo" not in sg["settings"]
+        assert "max_parallel_per_repo" not in sg["settings"]["values"]
+        st_su, su = http_json(
+            port, "PATCH", "/api/v1/settings", token=token, key="settings-bad-limit",
+            body={"base_version": max(1, sg["settings"]["version"]), "values": {"max_parallel_per_repo": 2}},
+        )
+        assert st_su == 422 and su["code"] == "unknown_field", (st_su, su)
+        st_al, al = http_json(
+            port, "POST", "/api/settings", token=token, key="alias-bad-limit",
+            body={"max_parallel_per_repo": 2},
+        )
+        assert st_al == 422 and al["code"] == "unknown_field", (st_al, al)
+
+    pkg_dir = Path(arete.__file__).resolve().parent
+    hits = [
+        p.relative_to(pkg_dir).as_posix()
+        for p in sorted(pkg_dir.rglob("*.py"))
+        if "max_parallel_per_repo" in p.read_text(encoding="utf-8")
+    ]
+    assert hits == ["store/projects.py"], hits
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_line_removal_gates_references_concurrency_and_undo(self):
+        res = self.run_identity_child(r"""
+from arete import configrepo, lines as lines_mod
+from arete.store import projects as projects_store
+
+with api_check.offline():
+    paths.ensure_dirs()
+    sample_dir = ROOT / "sample"
+    replay.sample(sample_dir, adw=True)
+    repo_dir = sample_dir / "repo"
+    paths.CONFIG_FILE.write_text(
+        'max_parallel = 4\n\n[[repo]]\nname = "demo"\n'
+        f'path = "{repo_dir}"\ntracker = "local"\npipeline = true\n'
+    )
+    db.migrate()
+    owner = principals.seed_owner("owner@example.test")
+    token_store.init_owner()
+    _, token = token_store.issue(owner, "delete-client", ["read", "task:write"])
+    with principals.acting(owner):
+        configrepo.init()
+
+    with db.tx():
+        try:
+            with configrepo.instance_fence():
+                raise AssertionError("expected ConfigRepoError inside SQLite write tx")
+        except configrepo.ConfigRepoError:
+            pass
+
+    with live_dashboard() as (_, port):
+        st_c, created = http_json(
+            port, "POST", "/api/v1/lines", token=token, key="del-cr-1",
+            body={"id": "demo-extra", "project": "demo", "name": "Extra", "kind": "pipeline", "repo": "demo"},
+        )
+        assert st_c == 201, (st_c, created)
+        with principals.acting(owner):
+            t_hist = task_store.task_add("demo", "Historical task", "Hist", "feat", extra={"project": "demo", "line": "demo-extra"})
+            task_store.task_set_state(t_hist, "done")
+            with db.reader() as c:
+                t_hist_num = task_store.parse_task_num(t_hist, c)
+            hist_run = record.start("pipeline", repo="demo", issue=t_hist, task_id=t_hist_num, line="demo-extra")
+            record.settle(hist_run, "done")
+
+        st_arch_up, arch_up = http_json(
+            port, "PATCH", "/api/v1/lines/demo-extra", token=token, key="del-arch-up",
+            body={"base_version": 1, "archived": False},
+        )
+        assert st_arch_up == 422, (st_arch_up, arch_up)
+
+        with db.tx() as c:
+            c.execute(
+                "INSERT INTO runs (id, kind, repo, issue_key, task_id, status, started, schema_version, capabilities) "
+                "VALUES ('old-queued-writer', 'pipeline', 'demo', ?, ?, 'queued', ?, 59, ?)",
+                (t_hist, t_hist_num, util.iso(), json.dumps(["task_admission_v1"])),
+            )
+            seq_before = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_iw, iw = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-incompat-1",
+            body={"base_version": 1},
+        )
+        assert st_iw == 409 and iw["code"] == "incompatible_writers", (st_iw, iw)
+        assert any("old-queued-writer" in b for b in iw.get("blockers", [])), iw
+        assert iw.get("retry_guidance")
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_before
+            assert lines_mod.get_line("demo-extra")["archived"] is False
+
+        with db.tx() as c:
+            c.execute("UPDATE runs SET status = 'done', finished = ? WHERE id = 'old-queued-writer'", (util.iso(),))
+
+        with principals.acting(owner):
+            t_ref = task_store.task_add("demo", "Active task", "Active", "feat", extra={"project": "demo", "line": "demo-extra"})
+        st_inuse_t, inuse_t = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-task",
+            body={"base_version": 1},
+        )
+        assert st_inuse_t == 409 and inuse_t["code"] == "line_in_use"
+        assert any(b.get("kind") == "task" and b.get("id") == t_ref for b in inuse_t.get("blockers", [])), inuse_t
+        task_store.task_set_state(t_ref, "done")
+
+        with principals.acting(owner):
+            q_run = pipeline.queue_run("demo", t_ref, line="demo-extra")
+        st_inuse_r, inuse_r = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-run",
+            body={"base_version": 1},
+        )
+        assert st_inuse_r == 409 and inuse_r["code"] == "line_in_use"
+        assert any(b.get("kind") == "run" and b.get("id") == q_run for b in inuse_r.get("blockers", [])), inuse_r
+        record.settle(q_run, "done")
+
+        _, base_blob = configrepo.read("loops/check.toml")
+        loop_text = 'name = "check"\nline = "demo-extra"\n'
+        configrepo.commit({"loops/check.toml": loop_text}, {"loops/check.toml": base_blob}, owner, "dashboard", note="ref line")
+        st_inuse_c, inuse_c = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ref-cfg",
+            body={"base_version": 1},
+        )
+        assert st_inuse_c == 409 and inuse_c["code"] == "line_in_use"
+        assert any(b.get("kind") == "config" and b.get("path") == "loops/check.toml" for b in inuse_c.get("blockers", [])), inuse_c
+        _, blob_c = configrepo.read("loops/check.toml")
+        configrepo.commit({"loops/check.toml": None}, {"loops/check.toml": blob_c}, owner, "dashboard", note="drop ref")
+
+        lines_mod.register_reference_reader("failing_reader", lambda _r, _l: (_ for _ in ()).throw(RuntimeError("corrupt source")))
+        try:
+            st_fc, fc = http_json(
+                port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-fail-closed",
+                body={"base_version": 1},
+            )
+            assert st_fc == 409 and fc["code"] == "line_in_use", (st_fc, fc)
+        finally:
+            lines_mod.unregister_reference_reader("failing_reader")
+
+        st_stale, stale = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-stale",
+            body={"base_version": 99},
+        )
+        assert st_stale == 409 and stale["code"] == "version_conflict"
+
+        st_del, deleted = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-1",
+            body={"base_version": 1},
+        )
+        assert st_del == 200, (st_del, deleted)
+        assert deleted["data"]["archived"] is True and deleted["ver"] == 2 and deleted["replayed"] is False
+        pre_seq = deleted["pre_removal_seq"]
+        assert isinstance(pre_seq, int) and pre_seq >= 1
+        tomb_seq = int(deleted["event_seq"].rsplit(".", 1)[1])
+
+        assert run_store.run_get(hist_run)["line"] == "demo-extra"
+
+        with db.reader() as c:
+            seq_after_del = c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0]
+        st_del_rep1, del_rep1 = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-1",
+            body={"base_version": 1},
+        )
+        assert st_del_rep1 == 200 and del_rep1["replayed"] is True and del_rep1["event_seq"] == deleted["event_seq"]
+        st_del_rep2, del_rep2 = http_json(
+            port, "DELETE", "/api/v1/lines/demo-extra", token=token, key="del-ok-2-fresh-key",
+            body={"base_version": 2},
+        )
+        assert st_del_rep2 == 200 and del_rep2["replayed"] is True and del_rep2["event_seq"] == deleted["event_seq"]
+        with db.reader() as c:
+            assert c.execute("SELECT MAX(seq) FROM events_log").fetchone()[0] == seq_after_del
+
+        st_ll, ll = http_json(port, "GET", "/api/v1/lines", token=token)
+        assert st_ll == 200 and [x["id"] for x in ll["lines"]] == ["demo-pipeline"]
+        st_ll_all, ll_all = http_json(port, "GET", "/api/v1/lines?include_archived=true", token=token)
+        assert st_ll_all == 200 and {x["id"] for x in ll_all["lines"]} == {"demo-pipeline", "demo-extra"}
+        st_bad_q, _ = http_json(port, "GET", "/api/v1/lines?include_archived=yes", token=token)
+        assert st_bad_q == 400
+        st_lg, lg = http_json(port, "GET", "/api/v1/lines/demo-extra", token=token)
+        assert st_lg == 200 and lg["line"]["archived"] is True
+        st_lh, lh = http_json(port, "GET", "/api/v1/lines/demo-extra/history", token=token)
+        assert st_lh == 200 and len(lh["events"]) == 2
+        st_sb, sb = http_json(port, "GET", "/api/v1/screen?view=board", token=token)
+        assert [x["id"] for x in sb["view"]["lines"]] == ["demo-pipeline"]
+        st_sb_all, sb_all = http_json(port, "GET", "/api/v1/screen?view=board&include_archived=true", token=token)
+        assert {x["id"] for x in sb_all["view"]["lines"]} == {"demo-pipeline", "demo-extra"}
+        with principals.acting(owner):
+            lines_mod.ensure(config.load())
+        assert lines_mod.get_line("demo-extra")["archived"] is True
+
+        st_last, last_ref = http_json(
+            port, "DELETE", "/api/v1/lines/demo-pipeline", token=token, key="del-last-pipe",
+            body={"base_version": 1},
+        )
+        assert st_last == 409 and last_ref["code"] == "line_in_use", (st_last, last_ref)
+        assert any(b.get("kind") == "last_pipeline_line" and b.get("repo") == "demo" for b in last_ref.get("blockers", [])), last_ref
+
+        st_t_arch, _ = http_json(
+            port, "POST", "/api/v1/tasks", token=token, key="assign-arch-line",
+            body={"repo": "demo", "body": "should fail", "project": "demo", "line": "demo-extra"},
+        )
+        assert st_t_arch == 422
+        try:
+            with principals.acting(owner):
+                pipeline.queue_run("demo", "T-1", line="demo-extra")
+            raise AssertionError("expected archived line admission refusal")
+        except lines_mod.ValidationError:
+            pass
+        try:
+            _, b2 = configrepo.read("loops/late.toml")
+            configrepo.commit({"loops/late.toml": 'name = "late"\nline = "demo-extra"\n'}, {"loops/late.toml": b2}, owner, "dashboard")
+            raise AssertionError("expected configrepo refusal for archived line")
+        except configrepo.ConfigRepoError:
+            pass
+
+        st_r_tomb, r_tomb = http_json(
+            port, "POST", "/api/v1/lines/demo-extra/restore", token=token, key="restore-tomb",
+            body={"seq": tomb_seq, "base_version": 2},
+        )
+        assert st_r_tomb == 422 and r_tomb["code"] == "validation", (st_r_tomb, r_tomb)
+
+        st_undo, undo = http_json(
+            port, "POST", "/api/v1/lines/demo-extra/restore", token=token, key="restore-undo",
+            body={"seq": pre_seq, "base_version": 2},
+        )
+        assert st_undo == 200 and undo["ver"] == 3 and undo["data"]["archived"] is False, (st_undo, undo)
+        st_ll_back, ll_back = http_json(port, "GET", "/api/v1/lines", token=token)
+        assert {x["id"] for x in ll_back["lines"]} == {"demo-pipeline", "demo-extra"}
+
+        # Concurrent barrier tests under the shared instance fence in both orders.
+        fence_held = threading.Event()
+        del_outcome = {}
+
+        def _contend_delete():
+            fence_held.wait(timeout=5)
+            try:
+                with principals.acting(owner):
+                    del_outcome["ok"] = lines_mod.delete_line("demo-extra", 3)
+            except Exception as exc:
+                del_outcome["err"] = exc
+
+        th = threading.Thread(target=_contend_delete)
+        th.start()
+        with configrepo.instance_fence():
+            fence_held.set()
+            time.sleep(0.05)
+            with principals.acting(owner):
+                t_race = task_store.task_add("demo", "Race task", "Race", "feat", extra={"project": "demo", "line": "demo-extra"})
+        th.join(timeout=5)
+        assert isinstance(del_outcome.get("err"), lines_mod.LineInUse), del_outcome
+
+        task_store.task_set_state(t_race, "done")
+        fence_held2 = threading.Event()
+        admit_outcome = {}
+
+        def _contend_admit():
+            fence_held2.wait(timeout=5)
+            try:
+                with principals.acting(owner):
+                    admit_outcome["run"] = pipeline.queue_run("demo", t_race, line="demo-extra")
+            except Exception as exc:
+                admit_outcome["err"] = exc
+
+        th2 = threading.Thread(target=_contend_admit)
+        th2.start()
+        with configrepo.instance_fence():
+            fence_held2.set()
+            time.sleep(0.05)
+            with principals.acting(owner):
+                lines_mod.delete_line("demo-extra", 3)
+        th2.join(timeout=5)
+        assert isinstance(admit_outcome.get("err"), lines_mod.ValidationError), admit_outcome
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class SettingsShellTests(unittest.TestCase):
+    def test_settings_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-settings.js"
+        css_path = web / "ui-settings.css"
+        js_text = js_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-settings.js", served)
+        self.assertIn("/ui-settings.css", served)
+        self.assertEqual(served["/ui-settings.js"][0], js_path.read_bytes())
+        self.assertEqual(served["/ui-settings.css"][0], css_path.read_bytes())
+        for needle in (
+            "/api/v1/health",
+            "/api/v1/health/check",
+            "/api/v1/serve/install",
+            "/api/v1/push/subscriptions",
+            "/api/v1/meta",
+            "/api/usage?days=1",
+            "data-density",
+        ):
+            self.assertIn(needle, js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+            self.assertNotIn(forbidden, css_text)
+        boot_text = (web / "ui-boot.js").read_text(encoding="utf-8")
+        self.assertIn("`ui-${", boot_text)
+        for screen in ("floor", "triage", "board", "task", "run", "intake", "outbox", "prompts", "adws", "insights", "settings"):
+            self.assertIsNotNone(dashboard.USAGE_NAME.fullmatch(f"ui-{screen}"))
+
+    def test_meta_get_reports_server_environment(self):
+        db.migrate()
+        result = api.execute("meta.get", {})
+        server = result["server"]
+        self.assertEqual(server["python"], platform.python_version())
+        self.assertEqual(server["state_dir"], paths.short_path(paths.STATE_DIR))
+        self.assertEqual(server["config_file"], paths.short_path(paths.CONFIG_FILE))
+        self.assertEqual(server["engine_sha"], codebase.STAMP)
+        self.assertTrue(server["version"])
+        self.assertTrue(server["started"])
+        contract.validate(result, contract.BY_NAME["meta.get"]["result"], "meta.get")
+
+    def test_settings_prefs_storage_and_density_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { initSettingsPrefs, setDensity, setSound, density, sound, resolveSection, SECTIONS } from "./arete/web/ui-settings.js";
+
+            const attrs = new Map();
+            globalThis.document = { documentElement: { setAttribute(k, v) { attrs.set(k, v); }, getAttribute(k) { return attrs.get(k) ?? null; } } };
+            const store = new Map();
+            globalThis.localStorage = {
+              getItem(k) { return store.has(k) ? store.get(k) : null; },
+              setItem(k, v) { store.set(k, String(v)); },
+              removeItem(k) { store.delete(k); },
+            };
+            let fetches = 0;
+            globalThis.fetch = async () => { fetches += 1; return Response.json({}); };
+
+            initSettingsPrefs();
+            assert.equal(sound.value, false);
+            assert.equal(density.value, "compact");
+            assert.equal(attrs.get("data-density"), "compact");
+
+            setDensity("comfortable");
+            assert.equal(attrs.get("data-density"), "comfortable");
+            setDensity("compact");
+            assert.equal(attrs.get("data-density"), "compact");
+            initSettingsPrefs();
+            assert.equal(attrs.get("data-density"), "compact");
+
+            setSound(true);
+            assert.equal(sound.value, true);
+            initSettingsPrefs();
+            assert.equal(sound.value, true);
+            assert.equal(fetches, 0);
+
+            globalThis.localStorage = {
+              getItem() { throw new Error("blocked"); },
+              setItem() { throw new Error("blocked"); },
+              removeItem() { throw new Error("blocked"); },
+            };
+            initSettingsPrefs();
+            setDensity("comfortable");
+            setSound(false);
+            assert.equal(resolveSection("display")[0], "display");
+            assert.equal(resolveSection("unknown")[0], "health");
+            assert.equal(SECTIONS.length, 13);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class SourceConfigTests(unittest.TestCase):
+    class_timeout = 30
+
+    def _run_source_child(self, script: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-sources-") as tmp:
+            root = Path(tmp).resolve()
+            env = api_check.isolated_env(root)
+            env["ARETE_TEST_FAST_SYNC"] = "1"
+            env["ARETE_DRIVE_FLUSH"] = "0"
+            preamble = (
+                "import hashlib, http.client, json, os, shutil, socket, sqlite3, subprocess, sys, threading, time\n"
+                "from contextlib import contextmanager, redirect_stdout\n"
+                "from datetime import UTC, datetime, timedelta\n"
+                "from http.server import ThreadingHTTPServer\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "import urllib.request\n"
+                "from arete import (\n"
+                "    accounts, api, api_check, cli, client, config, configcheck, configrepo, control,\n"
+                "    credential_files, dashboard, gh, inbox, jira, lines as lines_mod, loop_run, loops,\n"
+                "    paths, poll as poll_mod, principals, record, retention, serve, sources, tailnet, util,\n"
+                ")\n"
+                "from arete.store import (\n"
+                "    db, inbox as inbox_store, loops as loop_store, retention as retention_store,\n"
+                "    runs as run_store, sources as source_store, tokens as token_store,\n"
+                ")\n"
+                "def _forbid(*a, **kw):\n"
+                "    raise RuntimeError('external transport forbidden in SourceConfigTests')\n"
+                "mock.patch.object(urllib.request, 'urlopen', _forbid).start()\n"
+                "mock.patch.object(accounts, 'read', _forbid).start()\n"
+                "mock.patch.object(gh, 'gh', _forbid).start()\n"
+                "ROOT = Path.cwd()\n"
+                "def emit(val):\n"
+                "    print('BEHAVIOR_RESULT=' + json.dumps(val), flush=True)\n"
+                "@contextmanager\n"
+                "def live_dashboard(login='owner@example.test'):\n"
+                "    logins = tailnet.Logins(mock.Mock())\n"
+                "    logins.of = lambda _: login\n"
+                "    with mock.patch('socket.getfqdn', return_value='127.0.0.1'):\n"
+                "        srv = ThreadingHTTPServer(('127.0.0.1', 0), dashboard.Handler)\n"
+                "    srv.node = SimpleNamespace(names={'127.0.0.1'})\n"
+                "    srv.logins = logins\n"
+                "    srv.tls = object()\n"
+                "    srv.pending_secrets = {}\n"
+                "    t = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)\n"
+                "    t.start()\n"
+                "    try:\n"
+                "        yield srv, srv.server_address[1]\n"
+                "    finally:\n"
+                "        srv.shutdown()\n"
+                "        srv.server_close()\n"
+                "        t.join(timeout=2)\n"
+                "def http_req(port, method, path, *, token, body=None, key=None, extra_headers=None):\n"
+                "    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)\n"
+                "    headers = {'Authorization': 'Bearer ' + token}\n"
+                "    if extra_headers:\n"
+                "        headers.update(extra_headers)\n"
+                "    payload = None\n"
+                "    if body is not None:\n"
+                "        headers['Content-Type'] = 'application/json'\n"
+                "        payload = json.dumps(body).encode()\n"
+                "    if key:\n"
+                "        headers['Idempotency-Key'] = key if len(key) >= 8 else f'idem-key-{key}'\n"
+                "    try:\n"
+                "        conn.request(method, path, body=payload, headers=headers)\n"
+                "        resp = conn.getresponse()\n"
+                "        raw = resp.read().decode()\n"
+                "        return resp.status, dict(resp.getheaders()), (json.loads(raw) if raw.strip() else None)\n"
+                "    finally:\n"
+                "        conn.close()\n"
+                "def write_loop(name, text):\n"
+                "    folder = paths.CONFIG_DIR / 'loops' / name\n"
+                "    folder.mkdir(parents=True, exist_ok=True)\n"
+                "    (folder / 'loop.toml').write_text(text, encoding='utf-8')\n"
+                "    return folder\n"
+                "def append_jsonl(path, rows):\n"
+                "    with open(path, 'a', encoding='utf-8') as f:\n"
+                "        for r in rows:\n"
+                "            f.write(json.dumps(r) + '\\n')\n"
+                "def say_poll(srv_obj, src):\n"
+                "    buf = StringIO()\n"
+                "    with redirect_stdout(buf):\n"
+                "        srv_obj.poll_source(src)\n"
+                "    return buf.getvalue()\n"
+            )
+            cmd = api_check.child_command(Path(__file__).resolve().parents[1], preamble + "\n" + script)
+            done = subprocess.run(
+                cmd, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT, check=False,
+            )
+            if done.returncode != 0:
+                self.fail(f"source child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+            for line in reversed(done.stdout.splitlines()):
+                if line.startswith("BEHAVIOR_RESULT="):
+                    return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            self.fail(f"missing BEHAVIOR_RESULT= line:\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+
+    def test_health_reorder_insert_edit_unused_and_new_ids(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n[jira]\nbase_url = "https://jira.example.test"\nemail = "bot@example.test"\n')
+db.migrate()
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+    names = {r["name"] for r in c.execute("SELECT name FROM schema_migrations")}
+    assert "m0070_sources_durable_expand.py" in names
+    assert "m0071_sources_durable_backfill.py" in names
+configrepo.init()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+
+a_file = ROOT / "a.jsonl"
+b_file = ROOT / "b.jsonl"
+c_file = ROOT / "c.jsonl"
+append_jsonl(a_file, [{"key": "a1", "title": "A1"}])
+append_jsonl(b_file, [{"key": "b1", "title": "B1"}])
+append_jsonl(c_file, [{"key": "c1", "title": "C1"}, {"key": "c2", "title": "C2"}])
+
+class FakeJira:
+    def __init__(self, issues, refused_jql="", rate=None, retry_after=None):
+        self.base = "https://jira.example.test"
+        self._issues = issues
+        self._refused_jql = refused_jql
+        self.rate = dict(rate or {"remaining": None, "retry_after": None})
+        self._retry_after = retry_after
+
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+
+    def search(self, jql, fields, limit=50):
+        if self._refused_jql and jql == self._refused_jql:
+            raise jira.JiraError("bad jql", 429, retry_after=self._retry_after)
+        return self._issues[:limit]
+
+now_iso = util.iso()
+fake_jira = FakeJira([{"key": "ABC-1", "fields": {"summary": "First", "updated": now_iso}}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+why = "watch local events"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status = Ready"
+every = "10s"
+''')
+
+srv = serve.Server()
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    out_a = say_poll(srv, by_id["a"])
+    out_j1 = say_poll(srv, by_id["j"])
+    assert "a1" in out_a and "baseline" in out_a
+    assert "ABC-1" in out_j1 and "baseline" in out_j1
+    first_ok = source_store.cursor("j")["last_ok"]
+
+    fake_jira._refused_jql = "status = Ready"
+    fake_jira.rate = {"remaining": 40, "retry_after": 30}
+    fake_jira._retry_after = 30
+    say_poll(srv, by_id["j"])
+    say_poll(srv, by_id["j"])
+
+with live_dashboard() as (_, port):
+    st_loop, _, loop_body = http_req(port, "GET", "/api/loops/demo", token=token)
+    assert st_loop == 200
+    loop_sources = {s["id"]: s for s in loop_body["sources"]}
+    assert set(loop_sources) == {"a", "j"}
+    j_row = loop_sources["j"]
+    a_row = loop_sources["a"]
+    assert j_row["subject"] == "source:j" and j_row["version"] >= 3 and j_row["source_version"].startswith("source/j@")
+    assert j_row["last_ok"] == first_ok
+    assert j_row["error_streak"] == 2
+    assert j_row["rate_limit"]["remaining"] == 40 and j_row["rate_limit"]["retry_after"] == 30
+    assert len(j_row["polls"]) == 3
+    backoff_delta = (util.parse_iso(j_row["backoff_until"]) - util.now()).total_seconds()
+    assert backoff_delta >= 25, backoff_delta
+    assert j_row["note"] != "ok" and "bad jql" in j_row["note"]
+    assert j_row["every"] == "10s" and j_row["why"] is None
+    assert j_row["counts"] == {"polls": 3, "read": 1, "new": 1}, j_row["counts"]
+    assert a_row["note"] == "ok" and a_row["every"] == "5m" and a_row["why"] == "watch local events"
+    assert a_row["counts"] == {"polls": 1, "read": 1, "new": 1}
+
+    st_list, hdrs_list, list_body = http_req(port, "GET", "/api/v1/sources", token=token)
+    assert st_list == 200 and hdrs_list.get("ETag") and list_body.get("seq")
+    st_304, _, _ = http_req(port, "GET", "/api/v1/sources", token=token, extra_headers={"If-None-Match": hdrs_list["ETag"]})
+    assert st_304 == 304
+    v1_by_id = {s["id"]: s for s in list_body["sources"]}
+    assert "a" in v1_by_id and "j" in v1_by_id
+    assert v1_by_id["j"]["error_streak"] == 2 and v1_by_id["j"]["rate_limit"]["remaining"] == 40
+    st_get, hdrs_get, get_body = http_req(port, "GET", "/api/v1/sources/j", token=token)
+    assert st_get == 200 and hdrs_get.get("ETag") and get_body["source"]["id"] == "j"
+    st_404, _, _ = http_req(port, "GET", "/api/v1/sources/nope", token=token)
+    assert st_404 == 404
+
+with db.reader() as c:
+    ev_kinds = [r["kind"] for r in c.execute("SELECT kind FROM events_log WHERE subject = 'source:j' ORDER BY seq")]
+    assert ev_kinds == ["source.polled", "source.failed", "source.failed"], ev_kinds
+
+# Reorder, insert, edit non-scope keys
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+say_poll(srv, by_id["b"])
+append_jsonl(a_file, [{"key": "a5", "title": "A5"}])
+append_jsonl(b_file, [{"key": "b2", "title": "B2"}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "c"
+type = "command"
+command = "cat {c_file}"
+every = "5m"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "2m"
+timeout = 60
+trust = "owner"
+limit = 10
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+said_c = say_poll(srv, by_id["c"])
+assert "baseline" in said_c and "c1" in said_c and "c2" in said_c
+a_events, _ = sources.poll(by_id["a"], srv.cfg)
+b_events, _ = sources.poll(by_id["b"], srv.cfg)
+assert [e["key"] for e in a_events] == ["a5"]
+assert [e["key"] for e in b_events] == ["b2"]
+assert source_store.source_seen("a") == {"a1", "a5"}
+assert source_store.source_seen("b") == {"b1", "b2"}
+
+# Unused id stays, restoring it catches up without baseline; new id baselines
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+''')
+srv.load()
+unused_a = sources.view_for("a", srv.cfg, srv.live)
+assert unused_a is not None and unused_a["enabled"] is False and unused_a["source_version"].startswith("source/a@")
+append_jsonl(a_file, [{"key": "a7", "title": "A7"}])
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+[[source]]
+id = "brand-new"
+type = "command"
+command = "cat {c_file}"
+every = "5m"
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+a_resumed, _ = sources.poll(by_id["a"], srv.cfg)
+assert [e["key"] for e in a_resumed] == ["a7"]
+said_new = say_poll(srv, by_id["brand-new"])
+assert "baseline" in said_new and "c1" in said_new
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_outage_fix_rescope_inbox_and_log_rescope(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n[jira]\nbase_url = "https://jira.example.test"\nemail = "bot@example.test"\n')
+db.migrate()
+configrepo.init()
+principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+
+now = util.now()
+recent_ts = util.iso(now)
+month_ago = util.iso(now - timedelta(days=30))
+
+class FakeJira:
+    def __init__(self, issues):
+        self.base = "https://jira.example.test"
+        self.issues = issues
+        self.rate = {"remaining": 90, "retry_after": None}
+
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+
+    def search(self, jql, fields, limit=50):
+        return self.issues[:limit]
+
+fake_jira = FakeJira([{"key": "ABC-1", "fields": {"summary": "Base", "updated": recent_ts}}])
+
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status = Ready"
+every = "5m"
+''')
+
+srv = serve.Server()
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+
+# Fix JQL (scope change): 5 recent tickets + 1 older ticket updated a month ago
+fake_jira.issues = [
+    {"key": "ABC-1", "fields": {"summary": "Base", "updated": recent_ts}},
+    *[{"key": f"ABC-{i}", "fields": {"summary": f"Recent {i}", "updated": util.iso(util.now())}} for i in range(2, 7)],
+    {"key": "ABC-OLD", "fields": {"summary": "Month old", "updated": month_ago}},
+]
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    said = say_poll(srv, src_j)
+assert "TR-" in said and "ABC-OLD" in said and "skipped" in said, said
+
+pending = loop_store.pending()
+assert len(pending) == 1
+assert [e["key"] for e in json.loads(pending[0]["payload"])] == [f"ABC-{i}" for i in range(2, 7)]
+
+item1 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+assert item1 is not None and item1["priority"] == 2 and item1["verbs"] == ["fire", "dismiss"]
+assert [e["key"] for e in item1["detail"]["held"]] == ["ABC-OLD"]
+ver1 = item1["version"]
+
+# Second scope change while rescope item is open merges keys and bumps version
+fake_jira.issues.append({"key": "ABC-OLDER", "fields": {"summary": "Older still", "updated": month_ago}})
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged, Backlog)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+
+item2 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+assert item2["id"] == item1["id"] and item2["version"] == ver1 + 1
+assert [e["key"] for e in item2["detail"]["held"]] == ["ABC-OLD", "ABC-OLDER"]
+
+# Resolve with verb="fire" queues 1 item holding both and resolves as fired; next poll queues nothing
+with live_dashboard() as (_, port):
+    st_res, _, body_res = http_req(
+        port, "POST", f"/api/v1/inbox/{item2['id']}/resolve",
+        token=token, key="fire-rescope-1",
+        body={"base_version": item2["version"], "verb": "fire"},
+    )
+    assert st_res == 200, (st_res, body_res)
+    assert body_res["item"]["state"] == "resolved" and body_res["item"]["resolution"] == "fired"
+
+pending_after = loop_store.pending()
+assert len(pending_after) == 2
+assert [e["key"] for e in json.loads(pending_after[-1]["payload"])] == ["ABC-OLD", "ABC-OLDER"]
+
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    more, more_items = sources.poll(src_j, srv.cfg)
+assert more == [] and more_items == []
+
+# Also verify dismiss verb
+fake_jira.issues.append({"key": "ABC-DISMISS", "fields": {"summary": "Dismiss me", "updated": month_ago}})
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged, Backlog, Hold)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+item3 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+with live_dashboard() as (_, port):
+    st_dis, _, body_dis = http_req(
+        port, "POST", f"/api/v1/inbox/{item3['id']}/resolve",
+        token=token, key="dismiss-rescope-1",
+        body={"base_version": item3["version"], "verb": "dismiss"},
+    )
+    assert st_dis == 200 and body_dis["item"]["resolution"] == "dismissed"
+assert len(loop_store.pending()) == 2
+
+# Log source rescope: wider path glob + pattern edit keeps file1 offset and starts file2 at end
+log_dir = ROOT / "logs_src"
+log_dir.mkdir()
+f1 = log_dir / "app1.log"
+f2 = log_dir / "app2.log"
+f1.write_text("INFO startup\n", encoding="utf-8")
+write_loop("logdemo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "app-log"
+type = "log"
+path = "{log_dir}/app1.log"
+pattern = "ERROR"
+every = "5m"
+''')
+srv.load()
+src_log = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "app-log")
+sources.poll(src_log, srv.cfg)
+
+with open(f1, "a", encoding="utf-8") as fh:
+    fh.write("ERROR disk full on node\n")
+f2.write_text("ERROR ancient crash in file2\n", encoding="utf-8")
+write_loop("logdemo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "app-log"
+type = "log"
+path = "{log_dir}/*.log"
+pattern = "ERROR|WARN"
+every = "5m"
+''')
+srv.load()
+src_log = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "app-log")
+ev_log1, _ = sources.poll(src_log, srv.cfg)
+assert len(ev_log1) == 1 and "disk full" in ev_log1[0]["title"], ev_log1
+
+with open(f2, "a", encoding="utf-8") as fh:
+    fh.write("WARN new warning in file2\n")
+ev_log2, _ = sources.poll(src_log, srv.cfg)
+assert len(ev_log2) == 1 and "new warning" in ev_log2[0]["title"], ev_log2
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_backfill_checks_retention_and_shared_file_source(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n')
+db.migrate()
+configrepo.init()
+principals.seed_owner("owner@example.test")
+
+a_file = ROOT / "a.jsonl"
+b_file = ROOT / "b.jsonl"
+append_jsonl(a_file, [{"key": "k1", "title": "K1"}, {"key": "k2", "title": "K2"}])
+append_jsonl(b_file, [{"key": "x1", "title": "X1"}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "other"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+''')
+
+old_settings = {"type": "command", "command": f"cat {a_file}"}
+old_hash = hashlib.sha256(json.dumps(old_settings, sort_keys=True, default=str).encode()).hexdigest()
+old_polled = "2026-11-20T12:00:00Z"
+with db.tx() as c:
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#0', NULL, ?, 1, 'old', NULL)", (old_polled,))
+    c.execute("INSERT INTO seen (source, key, ts) VALUES ('demo#0', 'k1', ?), ('demo#0', 'k2', ?)", (old_polled, old_polled))
+    c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#0', ?)", (old_hash,))
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#1', NULL, ?, 1, 'stale', ?)", (old_polled, old_polled))
+    c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#1', 'unmatched-owner')")
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('oncall:scan', '{}', ?, 1, 'ok', ?)", (old_polled, old_polled))
+
+moved1 = sources.backfill()
+assert moved1 == 1, moved1
+with db.reader() as c:
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'demo#0'").fetchone() is None
+    cur_a = dict(c.execute("SELECT * FROM cursors WHERE source = 'a'").fetchone())
+    assert cur_a["scope_sha"] and cur_a["source_version"].startswith("source/a@") and cur_a["last_ok"] == old_polled
+    assert {r[0] for r in c.execute("SELECT key FROM seen WHERE source = 'a'")} == {"k1", "k2"}
+    assert c.execute("SELECT fingerprint FROM source_owners WHERE source = 'a'").fetchone()[0] == old_hash
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
+
+cfg = config.load()
+demo1_view = sources.view_for("demo#1", cfg)
+assert demo1_view is not None and demo1_view["enabled"] is False
+
+assert sources.backfill() == 0
+
+append_jsonl(a_file, [{"key": "k3", "title": "K3"}])
+src_a = next(s for s in sources.load_all(cfg) if s.id == "a")
+said_lines = []
+ev_a, _ = sources.poll(src_a, cfg, say=said_lines.append)
+assert [e["key"] for e in ev_a] == ["k3"] and not any("baseline" in ln for ln in said_lines)
+
+before_a = source_store.cursor("a")
+source_store.set_cursor("oncall:scan", '{"n": 1}', True, "scanned")
+source_store.set_cursor("a", '{"v": 1}', True, "manual")
+after_a = source_store.cursor("a")
+assert after_a["scope_sha"] == before_a["scope_sha"]
+assert after_a["last_ok"] == before_a["last_ok"]
+assert after_a["version"] == before_a["version"] + 1
+
+shared_file = ROOT / "shared.jsonl"
+append_jsonl(shared_file, [{"key": "s1", "title": "S1"}])
+(paths.CONFIG_DIR / "sources").mkdir(parents=True, exist_ok=True)
+(paths.CONFIG_DIR / "sources" / "shared-src.toml").write_text(f'type = "command"\ncommand = "cat {shared_file}"\nevery = "5m"\n')
+write_loop("l1", 'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "shared-src"\n')
+write_loop("l2", 'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "shared-src"\n')
+src_shared = next(s for s in sources.load_all(cfg) if s.id == "shared-src")
+assert set(src_shared.loops) == {"l1", "l2"}
+sources.poll(src_shared, cfg)
+append_jsonl(shared_file, [{"key": "s2", "title": "S2"}])
+ev_sh, items_sh = sources.poll(src_shared, cfg)
+assert [e["key"] for e in ev_sh] == ["s2"] and len(items_sh) == 2
+
+def expect_invalid(loop_obj, needle):
+    try:
+        loops.validate(loop_obj, cfg)
+    except loops.LoopError as e:
+        assert needle in str(e), (needle, str(e))
+    else:
+        raise AssertionError(f"expected LoopError containing {needle!r}")
+
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "A_b", "type": "command", "command": "true"}]), "A_b")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"type": "command", "command": "true"}, {"type": "command", "command": "true"}]), "omit both id and name")
+expect_invalid(loops.Loop("other-loop", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "a", "type": "command", "command": "true"}]), "demo")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "shared-src", "type": "command", "command": "true"}]), "shared-src.toml")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "no-such-file"}]), "names no file")
+
+old_91 = util.iso(util.now() - timedelta(days=91))
+keep_89 = util.iso(util.now() - timedelta(days=89))
+with db.tx() as c:
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (old_91, old_91))
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (keep_89, keep_89))
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok, version) VALUES ('stale-unused', NULL, ?, 1, 'old', ?, 1)", (old_91, old_91))
+    c.execute("INSERT INTO seen (source, key, ts) VALUES ('stale-unused', 'u1', ?)", (old_91,))
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('stale-unused', ?, ?, 1, 0, 0)", (old_91, old_91))
+policy = retention.parse_bytes(b"[source_polls]\ndays = 90\n[sources]\nunused_days = 90\n")
+retention_store.prune_rows(policy, retention_store.measure())
+with db.reader() as c:
+    starts_a = {r[0] for r in c.execute("SELECT started FROM source_polls WHERE source = 'a'")}
+    assert old_91 not in starts_a and keep_89 in starts_a
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM seen WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM source_polls WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_poll_route_cli_gates_config_events_and_active_line_hooks(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+repo_dir = ROOT / "sample-repo"
+repo_dir.mkdir()
+subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo_dir, env=os.environ, check=True)
+(repo_dir / "README.md").write_text("demo\n", encoding="utf-8")
+subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@e", "add", "."], cwd=repo_dir, env=os.environ, check=True)
+subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-qm", "init"], cwd=repo_dir, env=os.environ, check=True)
+paths.CONFIG_FILE.write_text(f'''
+max_parallel = 2
+[jira]
+base_url = "https://jira.example.test"
+email = "bot@example.test"
+[jira.transitions]
+running = "Done"
+pr = "NoSuchStatus"
+[[repo]]
+name = "app"
+path = "{repo_dir}"
+github = "org/app"
+tracker = "jira"
+jira_project = "APP"
+pipeline = true
+''')
+db.migrate()
+configrepo.init()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+_, read_only_token = token_store.issue(owner, "read-only", ["read"])
+
+a_file = ROOT / "a.jsonl"
+append_jsonl(a_file, [{"key": "a1", "title": "A1"}])
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+''')
+(paths.CONFIG_DIR / "sources").mkdir(parents=True, exist_ok=True)
+(paths.CONFIG_DIR / "sources" / "off-src.toml").write_text(f'type = "command"\ncommand = "cat {a_file}"\nenabled = false\n')
+
+cfg = config.load()
+src_a = next(s for s in sources.load_all(cfg) if s.id == "a")
+sources.poll(src_a, cfg)
+append_jsonl(a_file, [{"key": "a2", "title": "A2"}])
+
+class FakeJiraCheck:
+    def __init__(self):
+        self.base = "https://jira.example.test"
+        self.rate = {"remaining": 50, "retry_after": None}
+
+    def me(self):
+        return {"displayName": "Bot User"}
+
+    def search(self, jql, fields, limit=100):
+        return [{"key": "APP-1"}, {"key": "APP-2"}]
+
+    def statuses(self, project):
+        return {"Done", "To Do"}
+
+launch_calls = []
+def fake_launch(name, **kw):
+    launch_calls.append((name, kw))
+    return {"id": f"poll-run-{len(launch_calls)}", "status": "done", "picks": ["picked APP-1"]}
+
+with live_dashboard() as (_, port):
+    before_seen = source_store.source_seen("a")
+    before_cur = source_store.cursor("a")
+    with db.reader() as c:
+        before_polls = c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0]
+    st_dr, _, body_dr = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=token, key="poll-dry-1", body={"dry_run": True}, extra_headers={"Prefer": "wait=5"},
+    )
+    assert st_dr == 200 and body_dr["ok"] is True and body_dr["dry_run"] is True
+    flags = {it["key"]: it["seen"] for it in body_dr["items"]}
+    assert flags == {"a1": True, "a2": False}, flags
+    assert source_store.source_seen("a") == before_seen
+    assert source_store.cursor("a") == before_cur
+    with db.reader() as c:
+        assert c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0] == before_polls
+
+    st_real, _, body_real = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=token, key="poll-real-1", body={"dry_run": False}, extra_headers={"Prefer": "wait=5"},
+    )
+    assert st_real == 200 and [e["key"] for e in body_real["events"]] == ["a2"] and len(body_real["queued"]) == 1
+
+    st_403, _, body_403 = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=read_only_token, key="poll-403-1", body={"dry_run": False},
+    )
+    assert st_403 == 403 and body_403["code"] == "scope_missing", (st_403, body_403)
+
+    st_off, _, body_off = http_req(
+        port, "POST", "/api/v1/sources/off-src/poll", token=token, key="poll-off-1", body={"dry_run": False},
+    )
+    assert st_off == 409 and body_off["code"] == "invalid_state"
+    st_feed, _, body_feed = http_req(
+        port, "POST", "/api/v1/sources/jira-app/poll", token=token, key="poll-feed-1", body={"dry_run": False},
+    )
+    assert st_feed == 409 and body_feed["code"] == "invalid_state"
+
+    with mock.patch.object(loop_run, "launch", side_effect=fake_launch):
+        st_p1, _, body_p1 = http_req(
+            port, "POST", "/api/v1/sources/pipeline/poll",
+            token=token, key="pipe-real-1", body={"dry_run": False}, extra_headers={"Prefer": "wait=5"},
+        )
+        st_p2, _, body_p2 = http_req(
+            port, "POST", "/api/v1/sources/pipeline/poll",
+            token=token, key="pipe-dry-1", body={"dry_run": True}, extra_headers={"Prefer": "wait=5"},
+        )
+    assert st_p1 == 200 and body_p1["op"] == "poll-run-1"
+    assert st_p2 == 200 and body_p2["picks"] == ["picked APP-1"]
+    assert launch_calls == [("poll", {}), ("poll", {"trial": True})], launch_calls
+
+    server_info = {
+        "scheme": "http", "host": "127.0.0.1", "port": port,
+        "addresses": ["127.0.0.1"], "pid": os.getpid(), **paths.state_and_config(),
+    }
+    util.write_json(paths.SERVER_FILE, server_info)
+    with mock.patch.object(loop_run, "launch", side_effect=fake_launch):
+        buf_poll = StringIO()
+        with redirect_stdout(buf_poll):
+            rc_poll = cli.main(["poll", "--dry-run"])
+        assert rc_poll == 0 and "picked APP-1" in buf_poll.getvalue()
+        assert launch_calls[-1] == ("poll", {"trial": True})
+
+    local_calls = []
+    with mock.patch.object(poll_mod, "poll", side_effect=lambda dry_run=False: (local_calls.append(dry_run), 0)[1]):
+        assert cli.main(["poll", "--local"]) == 0
+    assert local_calls == [False]
+
+    cli_jira_calls = []
+    def server_only_jira(jcfg):
+        cli_jira_calls.append(threading.current_thread().name)
+        return FakeJiraCheck()
+    with mock.patch.object(jira.Client, "from_env", side_effect=server_only_jira):
+        buf_jc = StringIO()
+        with redirect_stdout(buf_jc):
+            rc_jc = cli.main(["jira-check"])
+    assert rc_jc == 0
+    jc_out = buf_jc.getvalue()
+    assert "APP: 2 labeled" in jc_out and "NoSuchStatus" in jc_out and "jira ok" in jc_out, jc_out
+    assert cli_jira_calls and all(t != threading.current_thread().name for t in cli_jira_calls), cli_jira_calls
+paths.SERVER_FILE.unlink(missing_ok=True)
+
+poll_loop = loops.find("poll", cfg)
+rid = record.start("loop", loop="poll", loop_kind="command", trigger="every")
+loop_run.settle(loop_run.LoopRun(poll_loop, rid, cfg), "done", "exit 0")
+pipe_view = sources.view_for("pipeline", cfg)
+assert pipe_view["last_ok"] is not None and len(pipe_view["polls"]) == 1 and pipe_view["polls"][0]["ok"] is True
+
+old_src_bytes = f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'.encode()
+r_new = configcheck.check("source", "s1", "sources/s1.toml", old_src_bytes, old_bytes=None)
+assert r_new["ok"] and r_new["gate"] == "B" and r_new["dry_run"]["ok"] and len(r_new["dry_run"]["items"]) == 2
+r_a = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file}"\nevery = "10m"\nenabled = true\n',
+                        old_bytes=old_src_bytes)
+assert r_a["ok"] and r_a["gate"] == "A"
+r_b = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file} # changed"\nevery = "5m"\n',
+                        old_bytes=old_src_bytes)
+assert r_b["gate"] == "B"
+r_c = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\ntrust = "owner"\n',
+                        old_bytes=old_src_bytes)
+assert r_c["gate"] == "C"
+
+old_loop = f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'.encode()
+lr_a = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "1m"\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_a["gate"] == "A", lr_a
+lr_b = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nlimit = 5\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_b["gate"] == "B", lr_b
+lr_c = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nquarantine = true\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_c["gate"] == "C", lr_c
+
+with principals.acting(owner):
+    _, b_s1 = configrepo.read("sources/s1.toml")
+    configrepo.commit({"sources/s1.toml": f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'},
+                      {"sources/s1.toml": b_s1}, owner, "dashboard")
+    _, b_lp = configrepo.read("loops/demo/loop.toml")
+    configrepo.commit({"loops/demo/loop.toml": f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "2m"\n'},
+                      {"loops/demo/loop.toml": b_lp}, owner, "dashboard")
+with db.reader() as c:
+    src_changed = {r["subject"] for r in c.execute("SELECT subject FROM events_log WHERE kind = 'config.source.changed'")}
+    assert "config:source/s1" in src_changed and "config:source/a" in src_changed, src_changed
+
+with principals.acting(owner):
+    lines_mod.ensure(cfg)
+    extra = lines_mod.create_line({"id": "app-extra", "project": "app", "name": "Extra", "kind": "loops", "repo": "app"})["data"]
+    _, b_ls = configrepo.read("sources/line-src.toml")
+    configrepo.commit({"sources/line-src.toml": f'type = "command"\ncommand = "cat {a_file}"\nline = "app-extra"\n'},
+                      {"sources/line-src.toml": b_ls}, owner, "dashboard")
+    try:
+        lines_mod.delete_line("app-extra", extra["version"])
+        raise AssertionError("expected LineInUse for active source reference")
+    except lines_mod.LineInUse as exc:
+        assert any(b.get("kind") == "source" and "line-src" in b.get("detail", "") for b in exc.blockers), exc.blockers
+
+    bad_ref = configcheck.check("source", "bad-line", "sources/bad-line.toml",
+                                f'type = "command"\ncommand = "cat {a_file}"\nline = "no-such-line"\n', stop_after=3)
+    assert not bad_ref["ok"] and any("no-such-line" in p for p in bad_ref["stages"][-1]["problems"])
+    try:
+        _, b_bl = configrepo.read("sources/bad-line.toml")
+        configrepo.commit({"sources/bad-line.toml": f'type = "command"\ncommand = "cat {a_file}"\nline = "no-such-line"\n'},
+                          {"sources/bad-line.toml": b_bl}, owner, "dashboard")
+        raise AssertionError("expected ConfigRepoError for unknown line")
+    except configrepo.ConfigRepoError:
+        pass
+
+    _, b_ls2 = configrepo.read("sources/line-src.toml")
+    configrepo.commit({"sources/line-src.toml": None}, {"sources/line-src.toml": b_ls2}, owner, "dashboard")
+    bad_src_file = paths.CONFIG_DIR / "sources" / "broken-src.toml"
+    bad_src_file.write_text("type = [unclosed\n", encoding="utf-8")
+    try:
+        lines_mod.delete_line("app-extra", extra["version"])
+        raise AssertionError("expected LineInUse fail-closed for unreadable source file")
+    except lines_mod.LineInUse as exc:
+        assert any(b.get("kind") == "unreadable_config" and "broken-src.toml" in b.get("detail", "") for b in exc.blockers), exc.blockers
+    finally:
+        bad_src_file.unlink(missing_ok=True)
+    lines_mod.delete_line("app-extra", extra["version"])
+    arch_ref = configcheck.check("source", "arch-line", "sources/arch-line.toml",
+                                 f'type = "command"\ncommand = "cat {a_file}"\nline = "app-extra"\n', stop_after=3)
+    assert not arch_ref["ok"] and any("archived" in p for p in arch_ref["stages"][-1]["problems"])
+
+openapi = json.loads((paths.PACKAGE_DIR.parent / "docs" / "openapi.json").read_text(encoding="utf-8"))
+list_ref = openapi["paths"]["/api/v1/sources"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+src_schema = openapi["components"]["schemas"][list_ref.rsplit("/", 1)[-1]]["properties"]["sources"]["items"]
+for nullable_field in ("source_version", "kind", "line", "feeds", "last_ok", "polled", "advanced", "backoff_until", "every", "why"):
+    field_type = src_schema["properties"][nullable_field]["type"]
+    assert isinstance(field_type, list) and "null" in field_type, (nullable_field, field_type)
+assert {"type": "null"} in src_schema["properties"]["rate_limit"]["anyOf"]
+assert src_schema["properties"]["note"]["type"] == "string"
+assert set(src_schema["properties"]["counts"]["properties"]) == {"polls", "read", "new"}
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class SyncTests(unittest.TestCase):
+    """End-to-end acceptance tests for #305, #889, #890, and #891."""
+
+    class_timeout = 30
+
+    def _run_sync_child(self, body: str) -> dict:
+        prelude = r"""
+import concurrent.futures
+import contextlib
+import http.client
+import json
+import os
+import re
+import socket
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from arete import (
+    accounts,
+    api,
+    api_check,
+    config,
+    contract,
+    dashboard,
+    gh,
+    inbox,
+    jira,
+    mcp_http,
+    outbox,
+    paths,
+    pipeline,
+    poll,
+    principals,
+    record,
+    replay,
+    research,
+    sync as sync_mod,
+    tailnet,
+    tasks,
+    tracker,
+    triage,
+    util,
+)
+from arete.store import (
+    asks as ask_store,
+    blobs as blob_store,
+    db,
+    inbox as inbox_store,
+    insights as insights_store,
+    outbox as outbox_store,
+    runs as run_store,
+    tasks as task_store,
+    tokens as token_store,
+    triage as triage_store,
+)
+
+ROOT = Path(os.environ["ARETE_STATE_DIR"]).parent
+replay.sample(ROOT / "repos" / "sample")
+
+def _forbid(name):
+    def _deny(*_args, **_kwargs):
+        raise AssertionError(f"forbidden outside call: {name}")
+    return _deny
+
+_FORBID_PATCHES = [
+    mock.patch.object(urllib.request, "urlopen", side_effect=_forbid("urllib.request.urlopen")),
+    mock.patch.object(accounts, "read", side_effect=_forbid("accounts.read")),
+    mock.patch.object(gh, "gh", side_effect=_forbid("gh.gh")),
+]
+for _p in _FORBID_PATCHES:
+    _p.start()
+
+@contextlib.contextmanager
+def live_dashboard(login="owner@example.test"):
+    logins = tailnet.Logins(mock.Mock())
+    logins.of = lambda _: login
+    with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    server.node = SimpleNamespace(names={"127.0.0.1"})
+    server.logins = logins
+    server.tls = object()
+    server.pending_secrets = {}
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield server, port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+def http_json(port, method, path, body=None, *, token="", headers=None):
+    hdrs = dict(headers or {})
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    raw = None
+    if body is not None:
+        raw = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        conn.request(method, path, body=raw, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        return resp.status, json.loads(data) if data else {}
+    finally:
+        conn.close()
+
+def emit(payload):
+    print("BEHAVIOR_RESULT=" + json.dumps(payload))
+"""
+        root, env = isolated_behavior_environment(self)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        command = api_check.child_command(api_check.SOURCE, prelude + "\n" + body)
+        done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(done.returncode, 0, f"sync child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+        for line in reversed(done.stdout.splitlines()):
+            if line.startswith("BEHAVIOR_RESULT="):
+                return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+        self.fail(f"missing BEHAVIOR_RESULT in stdout:\n{done.stdout}\n{done.stderr}")
+
+    def test_sync_link_conflicts_primary_related_state_as_truth_and_retry(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+with db.tx() as c:
+    token_store.ensure_key(c)
+    token_row, bearer = token_store.issue(owner, "sync-test", ["*"])
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo(
+    "sample", repo_dir, github="owner/sample", tracker="github", pipeline=True,
+    jira_project="ABC", parts=[config.Part("", "owner/sample")],
+)
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+# Fake Jira store editable between calls
+jira_issues = {
+    "ABC-7": {
+        "key": "ABC-7",
+        "fields": {
+            "summary": "Remote title",
+            "description": "Remote body",
+            "status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-alice"},
+            "labels": ["agent", "backend"],
+        },
+    },
+    "ABC-11": {
+        "key": "ABC-11",
+        "fields": {
+            "summary": "Shared ref R initial",
+            "description": "",
+            "status": {"name": "Open"},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-bob"},
+            "labels": [],
+        },
+    },
+    "ABC-12": {
+        "key": "ABC-12",
+        "fields": {
+            "summary": "Related only S",
+            "description": "",
+            "status": {"name": "Open"},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-carol"},
+            "labels": [],
+        },
+    },
+}
+jira_changelogs = {k: [] for k in jira_issues}
+
+class FakeJiraClient:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def issue(self, key, fields=None):
+        return json.loads(json.dumps(jira_issues[key]))
+    def changelog(self, key):
+        return list(jira_changelogs.get(key, ()))
+    def search(self, jql, fields=None, limit=20, include=None):
+        return []
+
+fake_jira = FakeJiraClient()
+
+# Fake GitHub store editable between polls
+gh_issues = {
+    7: {
+        "number": 7,
+        "title": "GH Ticket 7",
+        "body": "Body 7",
+        "state": "OPEN",
+        "url": "https://github.com/owner/sample/issues/7",
+        "createdAt": "2026-11-28T00:00:00Z",
+        "updatedAt": "2026-11-28T01:00:00Z",
+        "author": {"login": "owner"},
+        "labels": [{"name": "agent"}],
+    }
+}
+
+def fake_gh_issues(repo_slug, label, limit=50):
+    return [json.loads(json.dumps(v)) for v in gh_issues.values() if any(lb["name"] == label for lb in v["labels"])]
+
+def fake_gh_issue(repo_slug, num):
+    return json.loads(json.dumps(gh_issues[int(num)]))
+
+with (
+    mock.patch.object(config, "load", return_value=cfg),
+    mock.patch.object(config, "load_or_problem", return_value=(cfg, "")),
+    mock.patch.object(jira.Client, "from_env", return_value=fake_jira),
+    mock.patch.object(gh, "issues", side_effect=fake_gh_issues),
+    mock.patch.object(gh, "issue", side_effect=fake_gh_issue),
+    mock.patch.object(gh, "open_issue_blockers", return_value=[]),
+    live_dashboard() as (_, port),
+):
+    # 1. Link Jira ABC-7 as primary on T through POST /api/v1/tasks/T/refs
+    with principals.acting(owner):
+        tid = task_store.task_add("sample", "Initial body", title="Initial local title")
+    task_before = task_store.task_get(tid)
+    state_before = task_before["state"]
+
+    st, linked = http_json(
+        port, "POST", f"/api/v1/tasks/{tid}/refs",
+        {"system": "jira", "key": "ABC-7", "role": "primary"},
+        token=bearer, headers={"Idempotency-Key": "sync-link-1"},
+    )
+    assert st in (200, 201), (st, linked)
+    ref_id_str = linked["ref"]["id"]
+    ref_num = int(ref_id_str.removeprefix("R-"))
+
+    st, ref_resp = http_json(port, "GET", f"/api/v1/refs/{ref_id_str}", token=bearer)
+    assert st == 200, (st, ref_resp)
+    ref_obj = ref_resp["ref"]
+    assert ref_obj["ext_state"] == "In Review", ref_obj
+    assert ref_obj["sync"] == "synced", ref_obj
+    fields_by_name = {f["field"]: f for f in ref_obj["fields"]}
+    assert "title" in fields_by_name, fields_by_name
+    assert fields_by_name["title"]["owner"] == "remote", fields_by_name["title"]
+    assert fields_by_name["title"]["base"] == fields_by_name["title"]["remote"] == "Remote title", fields_by_name["title"]
+
+    st, task_resp = http_json(port, "GET", f"/api/v1/tasks/{tid}", token=bearer)
+    assert st == 200, (st, task_resp)
+    assert task_resp["task"]["title"] == "Remote title", task_resp["task"]
+    assert task_resp["task"]["state"] == state_before, task_resp["task"]
+
+    # 2. PATCH /api/v1/tasks/T -> local edit drafts outbox item with ref_id, left unsent
+    t_ver = task_resp["task"]["version"]
+    st, patched = http_json(
+        port, "PATCH", f"/api/v1/tasks/{tid}",
+        {"title": "Local title", "base_version": t_ver},
+        token=bearer, headers={"Idempotency-Key": "sync-patch-1"},
+    )
+    assert st == 200, (st, patched)
+    assert patched["task"]["title"] == "Local title"
+    with db.reader() as c:
+        drafts = [dict(r) for r in c.execute("SELECT * FROM outbox WHERE kind = 'issue' AND ref_id = ?", (ref_num,))]
+    assert len(drafts) == 1 and drafts[0]["state"] == "draft", drafts
+
+    # Remote edits summary with newer stamp; POST /api/v1/tasks/T/sync called twice with Prefer: wait=10
+    jira_issues["ABC-7"]["fields"]["summary"] = "Remote edit"
+    jira_issues["ABC-7"]["fields"]["updated"] = "2026-11-28T02:00:00.000+0000"
+    for idx in (1, 2):
+        st, sync_res = http_json(
+            port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+            token=bearer, headers={"Idempotency-Key": f"sync-call-{idx}", "Prefer": "wait=10"},
+        )
+        assert st == 200, (st, sync_res)
+
+    with db.reader() as c:
+        open_conflicts = [
+            dict(r) for r in c.execute(
+                "SELECT * FROM inbox WHERE kind = 'conflict' AND subject = ? AND state = 'open'",
+                (f"ref:{ref_num}",),
+            )
+        ]
+        rf_title = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        ref_row = dict(c.execute("SELECT * FROM refs WHERE id = ?", (ref_num,)).fetchone())
+    assert len(open_conflicts) == 1, open_conflicts
+    assert rf_title["conflict"] == 1, rf_title
+    assert ref_row["sync"] == "conflict", ref_row
+    assert task_store.task_get(tid)["title"] == "Local title"
+
+    # Resolve first conflict with take_remote
+    conflict_id = inbox_store.format_id(open_conflicts[0]["id"])
+    st, res_tr = http_json(
+        port, "POST", f"/api/v1/inbox/{conflict_id}/resolve",
+        {"verb": "take_remote", "base_version": open_conflicts[0]["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-res-tr"},
+    )
+    assert st == 200, (st, res_tr)
+    assert task_store.task_get(tid)["title"] == "Remote edit"
+    with db.reader() as c:
+        rf_after_tr = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        draft_after_tr = dict(c.execute("SELECT * FROM outbox WHERE id = ?", (drafts[0]["id"],)).fetchone())
+    assert rf_after_tr["base"] == "Remote edit" and rf_after_tr["conflict"] == 0, rf_after_tr
+    assert draft_after_tr["state"] == "discarded", draft_after_tr
+
+    # Second conflict resolved with keep_local
+    t_now = task_store.task_get(tid)
+    st, patched2 = http_json(
+        port, "PATCH", f"/api/v1/tasks/{tid}",
+        {"title": "Local title 2", "base_version": t_now["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-patch-2"},
+    )
+    assert st == 200, (st, patched2)
+    jira_issues["ABC-7"]["fields"]["summary"] = "Remote edit 2"
+    jira_issues["ABC-7"]["fields"]["updated"] = "2026-11-28T03:00:00.000+0000"
+    st, _ = http_json(
+        port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+        token=bearer, headers={"Idempotency-Key": "sync-call-3", "Prefer": "wait=10"},
+    )
+    assert st == 200
+    with db.reader() as c:
+        conflict2 = dict(c.execute(
+            "SELECT * FROM inbox WHERE kind = 'conflict' AND subject = ? AND state = 'open'",
+            (f"ref:{ref_num}",),
+        ).fetchone())
+        draft2 = dict(c.execute(
+            "SELECT * FROM outbox WHERE kind = 'issue' AND ref_id = ? AND state = 'draft' ORDER BY id DESC LIMIT 1",
+            (ref_num,),
+        ).fetchone())
+    st, res_kl = http_json(
+        port, "POST", f"/api/v1/inbox/{inbox_store.format_id(conflict2['id'])}/resolve",
+        {"verb": "keep_local", "base_version": conflict2["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-res-kl"},
+    )
+    assert st == 200, (st, res_kl)
+    assert task_store.task_get(tid)["title"] == "Local title 2"
+    with db.reader() as c:
+        rf_after_kl = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        draft2_after = dict(c.execute("SELECT * FROM outbox WHERE id = ?", (draft2["id"],)).fetchone())
+    assert rf_after_kl["base"] == "Remote edit 2" and rf_after_kl["conflict"] == 0, rf_after_kl
+    assert draft2_after["state"] == "draft", draft2_after
+
+    # Verify task.sync 202 watch path when outside work exceeds Prefer: wait, and MCP full profile
+    slow_fut = concurrent.futures.Future()
+    with mock.patch.object(sync_mod, "fetch_async", return_value=slow_fut):
+        st202, body202 = http_json(
+            port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+            token=bearer, headers={"Idempotency-Key": "sync-slow-202", "Prefer": "wait=0"},
+        )
+    assert st202 == 202 and body202.get("watch") == "/api/v1/events?idem=sync-slow-202", (st202, body202)
+    from types import SimpleNamespace
+    full_cred = SimpleNamespace(profile="full", commands=None, allows=lambda _s: True)
+    remote_cred = SimpleNamespace(profile="remote", commands=None, allows=lambda _s: True)
+    full_tools = {t["name"] for t in mcp_http.tool_list(full_cred)["tools"]}
+    remote_tools = {t["name"] for t in mcp_http.tool_list(remote_cred)["tools"]}
+    assert "task__sync" in full_tools and "task__sync" not in remote_tools
+
+    # 3. Primary vs related refs: R primary on T1 and related on T2; S related on T3 only
+    with principals.acting(owner):
+        t1 = task_store.task_add("sample", "", title="T1 orig")
+        t2 = task_store.task_add("sample", "", title="T2 orig")
+        t3 = task_store.task_add("sample", "", title="T3 orig")
+        with db.tx() as c:
+            r_ref, _ = task_store.TaskStore.ensure_ref(c, "jira", "ABC-11", kind="ticket", actor=owner)
+            s_ref, _ = task_store.TaskStore.ensure_ref(c, "jira", "ABC-12", kind="ticket", actor=owner)
+            task_store.TaskStore.link_ref(c, t1, r_ref["num"], {"role": "primary"}, owner)
+            task_store.TaskStore.link_ref(c, t2, r_ref["num"], {"role": "related"}, owner)
+            task_store.TaskStore.link_ref(c, t3, s_ref["num"], {"role": "related"}, owner)
+    sync_mod.fetch(r_ref["num"], cfg=cfg)
+    assert task_store.task_get(t1)["title"] == "Shared ref R initial"
+    assert task_store.task_get(t2)["title"] == "T2 orig"
+
+    jira_issues["ABC-11"]["fields"]["summary"] = "Shared ref R updated"
+    jira_issues["ABC-11"]["fields"]["updated"] = "2026-11-28T04:00:00.000+0000"
+    jira_issues["ABC-11"]["fields"]["updateAuthor"] = {"accountId": "jira-dave"}
+    sync_mod.fetch(r_ref["num"], cfg=cfg)
+    assert task_store.task_get(t1)["title"] == "Shared ref R updated"
+    assert task_store.task_get(t2)["title"] == "T2 orig"
+    with db.reader() as c:
+        t1_events = [dict(r) for r in c.execute("SELECT actor FROM events_log WHERE task = ? ORDER BY seq DESC", (t1,))]
+    assert any(e["actor"] == "ext:jira:jira-dave" for e in t1_events), t1_events
+
+    with db.reader() as c:
+        inbox_before_s = c.execute("SELECT count(*) FROM inbox WHERE kind = 'conflict'").fetchone()[0]
+    sync_mod.fetch(s_ref["num"], cfg=cfg)
+    assert task_store.task_get(t3)["title"] == "T3 orig"
+    with db.reader() as c:
+        inbox_after_s = c.execute("SELECT count(*) FROM inbox WHERE kind = 'conflict'").fetchone()[0]
+        s_row = dict(c.execute("SELECT * FROM refs WHERE id = ?", (s_ref["num"],)).fetchone())
+        s_fields = [dict(r) for r in c.execute("SELECT * FROM ref_fields WHERE ref = ?", (s_ref["num"],))]
+    assert inbox_after_s == inbox_before_s
+    assert s_row["title"] == "Related only S" and any(f["field"] == "title" for f in s_fields)
+
+    # 4. GitHub state as truth: review task with unsent label items (held, then failed exhausted) -> next_ticket None
+    for prior_tid in (tid, t1, t2, t3):
+        task_store.task_set_state(prior_tid, "done")
+    tk = tracker.GitHubTracker(repo)
+    with principals.acting(owner), db.tx() as c:
+        gh_tnum, gh_ikey = task_store.TaskStore.task_for_ticket(c, repo, "7", owner, cfg=cfg)
+    gh_tid = task_store.format_task_id(gh_tnum)
+    rid = record.start("pipeline", repo=repo.name, issue="7", task_id=gh_tnum, issue_key=gh_ikey)
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tk, tid="7", task_id=gh_tnum)
+    run.enter("running")
+    run.enter("pr")
+    record.settle(rid, "pr", "opened")
+    assert task_store.task_get(gh_tid)["state"] == "review"
+    with db.reader() as c:
+        ob_ids = [int(r["id"]) for r in c.execute("SELECT id FROM outbox WHERE object = 'github:owner/sample#7' AND kind = 'label' ORDER BY id")]
+    assert len(ob_ids) == 2, ob_ids
+
+    # Case 4a: both label items held
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'held' WHERE id IN (?, ?)", tuple(ob_ids))
+    assert poll.next_ticket(repo, tk, pipeline.SkipLog({})) is None
+
+    # Case 4b: both label items failed with attempts used up
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'failed', attempts = 5 WHERE id IN (?, ?)", tuple(ob_ids))
+    assert poll.next_ticket(repo, tk, pipeline.SkipLog({})) is None
+
+    # 5. Start item sent, final item held; fake shows agent + agent:running -> tasks.view and GET /api/v1/tasks/T both answer review
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'sent', sent_ref = 'label:agent:running', sent_at = ? WHERE id = ?", (util.iso(), ob_ids[0]))
+        c.execute("UPDATE outbox SET state = 'held' WHERE id = ?", (ob_ids[1],))
+    gh_issues[7]["labels"] = [{"name": "agent"}, {"name": "agent:running"}]
+    view_res = tasks.view("7", "sample")
+    assert view_res["state"] == "review", view_res
+    st, api_task_res = http_json(port, "GET", f"/api/v1/tasks/{gh_tid}", token=bearer)
+    assert st == 200 and api_task_res["task"]["state"] == "review", api_task_res
+
+    # 6. Retry via label removal: task is needs-you (fault=1), final label item (add agent:failed) sent;
+    #    fake drops agent:failed, keeps agent, newer stamp from another login -> next poll returns T to ready (fault=0)
+    rid_fail = record.start("pipeline", repo=repo.name, issue="7", task_id=gh_tnum, issue_key=gh_ikey)
+    rdir_fail = paths.RUNS_DIR / rid_fail
+    rdir_fail.mkdir(parents=True, exist_ok=True)
+    run_fail = pipeline.Run(rid_fail, repo, rdir_fail, cfg=cfg, tracker=tk, tid="7", task_id=gh_tnum)
+    run_fail.enter("failed")
+    record.settle(rid_fail, "failed", "boom")
+    assert (task_store.task_get(gh_tid)["state"], task_store.task_get(gh_tid)["fault"]) == ("needs-you", 1)
+    with db.tx() as c:
+        c.execute(
+            "UPDATE outbox SET state = 'discarded' WHERE object = 'github:owner/sample#7' AND kind = 'label' AND state = 'held'"
+        )
+        newest_ob = c.execute(
+            "SELECT id FROM outbox WHERE object = 'github:owner/sample#7' AND kind = 'label' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        c.execute("UPDATE outbox SET state = 'sent', sent_ref = 'label:agent:failed', sent_at = ? WHERE id = ?", (util.iso(), newest_ob))
+
+    gh_issues[7]["labels"] = [{"name": "agent"}]
+    gh_issues[7]["updatedAt"] = "2026-11-28T05:00:00Z"
+    gh_issues[7]["updatedBy"] = {"login": "octo-reviewer"}
+    picked = poll.next_ticket(repo, tk, pipeline.SkipLog({}))
+    assert picked is not None and picked.id == "7", picked
+    t_after_retry = task_store.task_get(gh_tid)
+    assert (t_after_retry["state"], t_after_retry["fault"]) == ("ready", 0), t_after_retry
+    with db.reader() as c:
+        retry_events = [dict(r) for r in c.execute("SELECT actor FROM events_log WHERE task = ? ORDER BY seq DESC", (gh_tid,))]
+    assert any(e["actor"] == "ext:github:octo-reviewer" for e in retry_events), retry_events
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_runs_issue_key_contract_indexes_guards_and_query_plans(self):
+        res = self._run_sync_child(r"""
+# Seed DB right before m0065_runs_issue_key_contract
+db.migrate(through=64)
+with db.tx() as c:
+    # Verify pre-m0063 indexes are on runs.issue
+    idx_before = {
+        name: [r[2] for r in c.execute(f"PRAGMA index_info({name})")]
+        for name in ("runs_ticket", "runs_ticket_seq")
+    }
+    assert idx_before["runs_ticket"] == ["repo", "issue", "kind", "started"], idx_before
+    assert idx_before["runs_ticket_seq"] == ["repo", "issue", "seq"], idx_before
+
+    # Seed 5 integer and 3 text issue rows with issue_key filled
+    owner_p = principals.seed_owner("owner@example.test")
+    seed_keys = [101, 102, 103, 104, 105, "ABC-7", "T-7", "proj-9"]
+    for i, val in enumerate(seed_keys, 1):
+        c.execute(
+            "INSERT INTO tasks (id, repo, title, body, kind, state, owner, origin, created, updated) "
+            "VALUES (?, 'sample', ?, '', 'feat', 'done', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (i, f"Task {val}", owner_p, f"u:{owner_p}"),
+        )
+        c.execute(
+            "INSERT INTO runs (id, kind, repo, issue, issue_key, task_id, status, started, finished, seq) "
+            "VALUES (?, 'pipeline', 'sample', ?, ?, ?, 'done', ?, ?, ?)",
+            (f"r-{i}", val, str(val), i, f"2026-01-01T00:00:0{i}Z", f"2026-01-01T00:01:0{i}Z", i),
+        )
+    # 1. Running process older than #303 expand (schema_version < 57) blocks contract
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, issue_key, status, started, pid, schema_version, seq) "
+        "VALUES ('r-old-live', 'loop', '', NULL, NULL, 'running', '2026-01-01T00:05:00Z', ?, 56, 99)",
+        (os.getpid(),),
+    )
+
+assert db.migrate() is True
+with db.reader() as c:
+    cols = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+    assert "issue" in cols, cols
+
+# 2. Settle old process, corrupt 1 issue_key -> contract migration refuses and leaves issue column
+with db.tx() as c:
+    c.execute("UPDATE runs SET status = 'done', finished = '2026-01-01T00:06:00Z' WHERE id = 'r-old-live'")
+    c.execute("UPDATE runs SET issue_key = 'WRONG' WHERE id = 'r-1'")
+
+refused = False
+try:
+    db.migrate()
+except RuntimeError as exc:
+    refused = "disagrees" in str(exc)
+assert refused, "expected m0065 to refuse mismatched issue_key"
+with db.reader() as c:
+    assert "issue" in {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+
+# 3. Fix issue_key and run db.migrate() -> drops runs.issue, rebuilds indexes on issue_key
+with db.tx() as c:
+    c.execute("UPDATE runs SET issue_key = '101' WHERE id = 'r-1'")
+assert db.migrate() is False
+
+with db.reader() as c:
+    cols_after = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+    assert "issue" not in cols_after, cols_after
+    idx_after = {
+        name: [r[2] for r in c.execute(f"PRAGMA index_info({name})")]
+        for name in ("runs_ticket", "runs_ticket_seq")
+    }
+    assert idx_after["runs_ticket"] == ["repo", "issue_key", "kind", "started"], idx_after
+    assert idx_after["runs_ticket_seq"] == ["repo", "issue_key", "seq"], idx_after
+
+# All 8 keys read back, the 3 text ones exact
+expected_keys = ["101", "102", "103", "104", "105", "ABC-7", "T-7", "proj-9"]
+got_keys = [run_store.run_get(f"r-{i}")["issue"] for i in range(1, 9)]
+assert got_keys == expected_keys, (got_keys, expected_keys)
+for key in ("ABC-7", "T-7", "proj-9"):
+    found = run_store.ticket_runs("sample", key)
+    assert len(found) == 1 and found[0]["issue"] == key, (key, found)
+
+# 4. EXPLAIN QUERY PLAN checks for runs_ticket and runs_ticket_seq
+with db.reader() as c:
+    plan_ticket = "\n".join(
+        r[3] for r in c.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue_key = ? "
+            "ORDER BY started DESC LIMIT 1",
+            ("sample", "ABC-7"),
+        )
+    )
+    plan_later = "\n".join(
+        r[3] for r in c.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue_key = ? "
+            f"AND {run_store.WHOLE_RUN} AND seq > (SELECT seq FROM runs WHERE id = ?) ORDER BY seq LIMIT 1",
+            ("sample", "ABC-7", "r-6"),
+        )
+    )
+    plan_asks = "\n".join(
+        r[3] for r in c.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM asks WHERE status = 'open' AND {ask_store._latest(c)} ORDER BY asked, rowid"
+        )
+    )
+assert "USING INDEX runs_ticket (repo=? AND issue_key=?" in plan_ticket, plan_ticket
+assert "USING INDEX runs_ticket_seq (repo=? AND issue_key=?" in plan_later, plan_later
+assert "USING INDEX runs_ticket_seq (repo=? AND issue_key=?" in plan_asks, plan_asks
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_triage_verdicts_board_view_overflow_toggle_own_move_and_to_pipeline(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo(
+    "sample", repo_dir, tracker="jira", jira_project="ABC", pipeline=True,
+    parts=[config.Part("", "owner/sample")],
+)
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+U1 = "2026-11-28T01:00:00.000+0000"
+U2 = "2026-11-28T02:00:00.000+0000"
+listed_issues = [
+    {"key": "ABC-7", "fields": {"summary": "Ticket 7", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+    {"key": "ABC-8", "fields": {"summary": "Ticket 8", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+]
+
+class FakeJira:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def search(self, jql, fields=None, limit=50, include=None):
+        return [json.loads(json.dumps(x)) for x in listed_issues[:limit]]
+    def issue(self, key, fields=None):
+        for item in listed_issues:
+            if item["key"] == key:
+                return json.loads(json.dumps(item))
+        return {"key": key, "fields": {"summary": key, "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}}
+    def changelog(self, key):
+        return []
+    def comments(self, key):
+        return []
+    def me(self):
+        return {"accountId": "me-1"}
+
+fake_jira = FakeJira()
+triage_calls = {}
+staged_calls = {}
+
+def fake_triage_one(cfg_arg, src, cand, ticket_text="", **kw):
+    triage_calls[cand.ref] = triage_calls.get(cand.ref, 0) + 1
+    return (
+        {
+            "ready": True,
+            "code": True,
+            "size": "s",
+            "kind": "feat",
+            "repos": ["sample"],
+            "why": f"Verdict #{triage_calls[cand.ref]}",
+            "plan": ["Step 1"],
+            "questions": [],
+            "assumptions": [],
+            "checks": [],
+        },
+        0.25,
+        "",
+    )
+
+def fake_staged(cfg_arg, row, **kw):
+    staged_calls[row["ref"]] = staged_calls.get(row["ref"], 0) + 1
+    return "report"
+
+with (
+    mock.patch.object(jira.Client, "from_env", return_value=fake_jira),
+    mock.patch.object(triage, "triage_one", side_effect=fake_triage_one),
+    mock.patch.object(research, "staged", side_effect=fake_staged),
+    principals.acting(owner),
+):
+    # 1. Read ABC-7 and ABC-8 at U1; write DONE research row for ABC-7
+    triage.refresh(cfg, False)
+    assert triage_calls.get("ABC-7") == 1 and triage_calls.get("ABC-8") == 1, triage_calls
+    insights_store.research_set(
+        "ABC-7", repo="sample", ticket="ABC-7",
+        url=fake_jira.browse_url("ABC-7"), title="Ticket 7",
+        updated=triage_store.iso_updated(U1), status="done", report="Paid report for ABC-7",
+    )
+    res_before = insights_store.research_get("ABC-7")
+    assert res_before is not None and res_before["report"] == "Paid report for ABC-7"
+
+    # 2. Fake lists 50 newer tickets (pushing ABC-7 and ABC-8 out); refresh + research.tidy
+    listed_issues[:] = [
+        {"key": f"ABC-{100 + i}", "fields": {"summary": f"New {i}", "updated": U2, "status": {"name": "To Do"}, "labels": ["triage"]}}
+        for i in range(50)
+    ]
+    triage.refresh(cfg, False)
+    research.tidy()
+    assert "ABC-7" not in {r["ref"] for r in triage_store.triage_rows()}
+
+    # 3. ABC-7 returns at U1 -> back on board with first verdict, no new triage_one call, research unchanged
+    listed_issues[:] = [
+        {"key": "ABC-7", "fields": {"summary": "Ticket 7", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+    ]
+    triage.refresh(cfg, False)
+    research.tidy()
+    board_by_ref = {r["ref"]: r for r in triage_store.triage_rows()}
+    assert "ABC-7" in board_by_ref and board_by_ref["ABC-7"]["why"] == "Verdict #1", board_by_ref
+    assert triage_calls["ABC-7"] == 1, triage_calls
+    assert staged_calls.get("ABC-7", 0) == 0, staged_calls
+    res_after = insights_store.research_get("ABC-7")
+    assert res_after["report"] == "Paid report for ABC-7" and res_after["report_blob"] == res_before["report_blob"]
+
+    # 4. Turn off repo in config -> refresh -> board empty; turn back on -> refresh -> ABC-7 back with old verdict
+    repo.pipeline = False
+    triage.refresh(cfg, False)
+    assert triage_store.triage_rows() == []
+    repo.pipeline = True
+    triage.refresh(cfg, False)
+    board_after_toggle = {r["ref"]: r for r in triage_store.triage_rows()}
+    assert "ABC-7" in board_after_toggle and board_after_toggle["ABC-7"]["why"] == "Verdict #1"
+    assert triage_calls["ABC-7"] == 1, triage_calls
+    assert insights_store.research_get("ABC-7")["report"] == "Paid report for ABC-7"
+
+    # 5. ABC-8 was pushed out of read; research.own_move({"ref": "ABC-8"}, Moved(U1, U2)); ABC-8 listed at U2 -> no triage_one, copy verdict cost=0, judged_updated=U2
+    research.own_move({"ref": "ABC-8"}, tracker.Moved(before=U1, after=U2))
+    listed_issues.append(
+        {"key": "ABC-8", "fields": {"summary": "Ticket 8", "updated": U2, "status": {"name": "To Do"}, "labels": ["triage"]}}
+    )
+    triage.refresh(cfg, False)
+    assert triage_calls["ABC-8"] == 1, triage_calls
+    with db.reader() as c:
+        v8 = [dict(r) for r in c.execute("SELECT * FROM triage_verdicts WHERE ref = 'ABC-8' ORDER BY id")]
+    assert len(v8) == 2, v8
+    assert v8[-1]["cost"] == 0.0 and v8[-1]["judged_updated"] == triage_store.iso_updated(U2), v8[-1]
+
+    # 6. triage.to_pipeline on ABC-7 removes it from triage_rows() immediately while triage_verdicts rows stay
+    src = triage.JiraSource("ABC", [repo], jira_cfg=cfg.jira)
+    row_7 = next(r for r in triage_store.triage_rows() if r["ref"] == "ABC-7")
+    with mock.patch.object(src, "approve", return_value=None):
+        triage.to_pipeline(src, row_7, owner)
+    assert "ABC-7" not in {r["ref"] for r in triage_store.triage_rows()}
+    with db.reader() as c:
+        v7 = [dict(r) for r in c.execute("SELECT * FROM triage_verdicts WHERE ref = 'ABC-7'")]
+    assert len(v7) >= 1, v7
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_research_keep_blobs_and_no_delete_sql(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo("sample", repo_dir, tracker="jira", jira_project="ABC", pipeline=True, parts=[config.Part("", "owner/sample")])
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+class EmptyJira:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def search(self, jql, fields=None, limit=50, include=None):
+        return []
+
+delivered_8_days_ago = "2026-11-20T00:00:00Z"
+report_text = "# Paid Research Report for ABC-9\n\nFindings preserved in blobs."
+with principals.acting(owner), mock.patch.object(jira.Client, "from_env", return_value=EmptyJira()):
+    insights_store.research_set(
+        "ABC-9",
+        repo="sample",
+        ticket="ABC-9",
+        url="https://jira.example.test/browse/ABC-9",
+        title="Closed research ticket",
+        updated=delivered_8_days_ago,
+        status="done",
+        delivered=delivered_8_days_ago,
+        report=report_text,
+    )
+    md_file = paths.STATE_DIR / "research" / "ABC-9.md"
+    md_file.parent.mkdir(parents=True, exist_ok=True)
+    md_file.write_text(report_text)
+
+    # Refresh (ABC-9 no longer listed) + research.tidy() + delete research/ABC-9.md
+    triage.refresh(cfg, False)
+    research.tidy()
+    if md_file.exists():
+        md_file.unlink()
+    assert not md_file.exists()
+
+    # research.shown("ABC-9") returns report text from blobs
+    shown_text = research.shown("ABC-9")
+    assert shown_text == report_text, shown_text
+
+    # Verify research table has no report column and stores report_blob pointing into blobs
+    with db.reader() as c:
+        rcols = {r[1] for r in c.execute("PRAGMA table_info(research)")}
+        assert "report" not in rcols and "report_blob" in rcols, rcols
+        sha = c.execute("SELECT report_blob FROM research WHERE ref = 'ABC-9'").fetchone()[0]
+    assert sha and blob_store.read(sha).decode() == report_text
+
+# Scan every file under arete/ for DELETE FROM triage_verdicts|research
+arete_dir = Path(sync_mod.__file__).resolve().parent
+pattern = re.compile(r"DELETE\s+FROM\s+(?:triage_verdicts|research)\b", re.IGNORECASE)
+matches = []
+for p in sorted(arete_dir.rglob("*")):
+    if not p.is_file() or "__pycache__" in p.parts:
+        continue
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        continue
+    if pattern.search(text):
+        matches.append(str(p.relative_to(arete_dir)))
+assert matches == [], f"forbidden DELETE SQL found in: {matches}"
 
 emit({"ok": True})
 """)

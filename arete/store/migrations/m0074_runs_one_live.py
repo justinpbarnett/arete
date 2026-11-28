@@ -33,14 +33,17 @@ def _dead_status_in_conn(conn, row: dict) -> str:
                 (int(row["task_id"]), row["id"]),
             ).fetchone()
         else:
+            issue_val = row.get("issue_key") or row.get("issue")
             earlier = conn.execute(
-                "SELECT id, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                "SELECT id, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue_key = ? "
                 "AND COALESCE(only_step, '') = '' AND dry_run = 0 AND status != 'dry-run' "
                 "AND status != 'queued' AND id != ? "
                 "ORDER BY started DESC, COALESCE(seq, 0) DESC, id DESC LIMIT 1",
-                (row.get("repo"), row.get("issue"), row["id"]),
+                (row.get("repo"), issue_val, row["id"]),
             ).fetchone()
-        if earlier and earlier["status"] == "interrupted" and not _specgraph_unfinished(conn, row.get("repo"), row.get("issue")):
+        if earlier and earlier["status"] == "interrupted" and not _specgraph_unfinished(
+            conn, row.get("repo"), row.get("issue_key") or row.get("issue"),
+        ):
             return "failed"
         return "interrupted"
     return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
@@ -78,6 +81,6 @@ def apply(conn) -> None:
         "CREATE UNIQUE INDEX runs_one_live ON runs (lock) WHERE status = 'running' AND lock IS NOT NULL"
     )
     conn.execute(
-        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 64 "
-        "THEN '64' ELSE value END WHERE key = 'oldest_writer'"
+        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 74 "
+        "THEN '74' ELSE value END WHERE key = 'oldest_writer'"
     )
