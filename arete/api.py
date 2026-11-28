@@ -11,10 +11,9 @@ import concurrent.futures
 from urllib.parse import quote, unquote
 
 from . import (
-    api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, devices,
-    events, inbox, leases, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage,
-    util,
-    webhooks, webpush,
+    api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo, contract, control,
+    credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals, secretstore, settings,
+    tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
 )
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -473,6 +472,16 @@ def read(name, values, handler):
         }}
     if name.startswith("config."):
         return read_config(name.removeprefix("config."), values)
+    if name == "draft.list":
+        rows = drafts.list_drafts(
+            state=values.get("state"),
+            kind=values.get("kind"),
+            name=values.get("name"),
+            author=values.get("author"),
+        )
+        return {"drafts": [drafts.public(r) for r in rows]}
+    if name == "draft.get":
+        return {"draft": drafts.public(needed(drafts.get(values["draft"]), values["draft"]))}
     if name == "health.get":
         return {"health": board.health_board(include_held=False)}
     if name == "hook_event.list":
@@ -570,6 +579,99 @@ def read_config(verb, values):
     return {"diff": diff}
 
 
+def _resolve_activate_draft_id(values: dict) -> str:
+    if values.get("draft"):
+        return str(values["draft"])
+    found = drafts.list_drafts(state="valid", kind=values["kind"], name=values["name"], limit=1)
+    if not found:
+        raise contract.Problem("not_found", f"No valid draft for {values['kind']}/{values['name']}")
+    return found[0]["id"]
+
+
+def _needs_config_presence(name: str, values: dict) -> dict | None:
+    """Return extra_detail dict if this config/settings write requires Gate C presence, else None."""
+    actor = principals.current()
+    root = paths.CONFIG_DIR.resolve()
+    if name == "config.activate":
+        draft_id = _resolve_activate_draft_id(values)
+        draft_row = drafts.get(draft_id)
+        if draft_row is None:
+            raise contract.Problem("not_found", f"No config draft {draft_id}")
+        report, _ = drafts._validate_base_and_check_for_activation(
+            draft_row, actor, values["base_version"], root=root
+        )
+        if report["gate"] == "C":
+            return {"draft_id": draft_row["id"], "gate": "C", "check_report": report}
+        return None
+    if name == "config.rollback":
+        found = configitems.item(values["kind"], values["name"])
+        target = configitems.read(found, version=str(values["to"]))
+        content = target["content"]
+        if not isinstance(content, str):
+            return None
+        old_bytes = configrepo.live_bytes(found["path"], root) if configrepo.is_repo(root) else None
+        report = configcheck.check(
+            values["kind"], values["name"], found["path"], content,
+            author=actor, config_dir=root, old_bytes=old_bytes,
+        )
+        if report["ok"] and report["gate"] == "C":
+            return {"kind": values["kind"], "name": values["name"], "to": values["to"],
+                    "gate": "C", "check_report": report}
+        return None
+    if name == "settings.update":
+        import tomllib
+
+        vals = values["values"]
+        if not isinstance(vals, dict):
+            return None
+        if "models" in vals and "roles" in vals:
+            return None
+        try:
+            wanted_limits = {key: settings.run_limit_from(key, vals[key]) for key in settings.RUN_LIMITS if key in vals}
+            wanted_models: dict[str, str] = {}
+            if "models" in vals:
+                models = vals.get("models") or {}
+                if not isinstance(models, dict):
+                    return None
+                wanted_models = {role: settings.model_from(role, m) for role, m in models.items()}
+            role_patches = settings._validate_role_patches(vals["roles"]) if "roles" in vals else []
+        except settings.Refused:
+            return None
+        text, _ = configrepo.read("config.toml")
+        lines = text.splitlines(keepends=True)
+        for key, limit in wanted_limits.items():
+            settings.set_key(lines, None, key, str(limit))
+        for role, model in wanted_models.items():
+            if model:
+                settings.set_key(lines, "models", role, json.dumps(model, ensure_ascii=False))
+            else:
+                settings.drop_key(lines, "models", role)
+        try:
+            if role_patches:
+                settings._apply_role_patches(lines, role_patches)
+            updated = "".join(lines)
+            tomllib.loads(updated)
+        except Exception:
+            return None
+        old_bytes = configrepo.live_bytes("config.toml", root) if configrepo.is_repo(root) else text.encode("utf-8")
+        report = configcheck.check(
+            "step_settings", "defaults", "config.toml", updated,
+            author=actor, config_dir=root, old_bytes=old_bytes,
+        )
+        if report["ok"] and report["gate"] == "C":
+            # Verify version conflict and strict settings check before deferring presence.
+            live_ver = settings.current_version()
+            if values["base_version"] != live_ver:
+                raise writes.VersionConflict(settings.current())
+            try:
+                settings.check_draft(updated, strict_steps=bool(role_patches))
+            except settings.Refused as error:
+                raise contract.Problem("invalid_fields", str(error)) from error
+            return {"kind": "step_settings", "name": "defaults", "gate": "C", "check_report": report}
+        return None
+    return None
+
+
 def dispatch(handler, op, path_values, query):
     name, method = op["name"], op["method"]
     identity = {k: unquote(v) for k, v in path_values.items()}
@@ -608,6 +710,19 @@ def dispatch(handler, op, path_values, query):
                 return upload_inbox_evidence(handler, op, identity)
             if name == "blob.put":
                 return put_blob(handler, op, identity)
+            if (name in ("config.activate", "config.rollback", "settings.update")
+                    and (handler.credential is None or handler.credential.kind != "session")):
+                extra_detail = _needs_config_presence(name, values)
+                if extra_detail is not None:
+                    if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                        credential_http.require_presence(handler.credential)
+                    return inbox.defer_presence(
+                        handler,
+                        op,
+                        values,
+                        path_values,
+                        extra_detail=extra_detail,
+                    )
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])
@@ -648,6 +763,7 @@ _NON_ATOMIC_COMMANDS = frozenset((
     "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.try", "draft.discard",
 ))
 
 
@@ -709,6 +825,17 @@ def remove_secret(scope, name):
     return secret_result(scope, name, secretstore.remove(scope, name, principals.current()))
 
 
+def _config_actor(handler) -> str:
+    cred = getattr(handler, "credential", None) if handler is not None else None
+    if cred is not None:
+        if cred.actor.startswith("run:"):
+            return cred.actor
+        if cred.principal.startswith("u:"):
+            return cred.principal
+        return cred.actor
+    return principals.current()
+
+
 def mutation(name, values, handler):
     from . import dashboard
 
@@ -717,12 +844,81 @@ def mutation(name, values, handler):
         result = {"factory": factory_control.request(values["enabled"], values["base_version"])}
     elif name == "settings.update":
         key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
         try:
             saved = settings.save(values["values"], base_version=values["base_version"],
-                                  actor=principals.current(), source="dashboard", idem=key)
+                                  actor=principals.current(), source="dashboard", idem=key,
+                                  presence_passed=presence_ok)
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
         except (settings.Refused, ValueError, configrepo.ConfigRepoError) as error:
             raise contract.Problem("invalid_fields", str(error)) from error
         result = {"settings": saved}
+    elif name == "config.draft":
+        draft_row, report = drafts.create_and_check(
+            values["kind"],
+            values["name"],
+            values["body"],
+            author=_config_actor(handler),
+            path=values.get("path", ""),
+            base_version=values.get("base_version"),
+            why=values.get("why", ""),
+            instruction=values.get("instruction", ""),
+            model=values.get("model", ""),
+            run_check=values.get("check", True),
+        )
+        result = {"draft": drafts.public(draft_row), "report": report}
+    elif name == "config.check":
+        if values.get("draft"):
+            draft_row, report = drafts.recheck(values["draft"])
+            result = {"report": report, "draft": drafts.public(draft_row)}
+        elif "body" in values:
+            rel = drafts.default_path(values["kind"], values["name"])
+            report = configcheck.check(
+                values["kind"], values["name"], rel, values["body"], author=_config_actor(handler)
+            )
+            result = {"report": report, "draft": None}
+        else:
+            raise contract.Problem("validation", "Provide draft or body to config.check.")
+    elif name == "config.activate":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        draft_id = _resolve_activate_draft_id(values)
+        try:
+            result = drafts.activate(
+                draft_id,
+                _config_actor(handler),
+                values["base_version"],
+                idem=key,
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.rollback":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        try:
+            result = drafts.rollback(
+                values["kind"],
+                values["name"],
+                values["to"],
+                values["base_version"],
+                _config_actor(handler),
+                idem=key,
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.try":
+        result = drafts.try_draft(
+            values["kind"],
+            values["name"],
+            values["draft"],
+            values["steps"],
+            _config_actor(handler),
+        )
+    elif name == "draft.discard":
+        result = {"draft": drafts.public(drafts.discard(values["draft"], reason=values.get("reason")))}
     elif name in ("loop.enable", "loop.disable"):
         key = handler.headers.get("Idempotency-Key", "") if handler else ""
         control.switch(values["loop"], name == "loop.enable", idem=key)

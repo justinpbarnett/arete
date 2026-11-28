@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import board, check_proposals, config, miner, util
-from arete.store import approvals, insights
+from arete import board, check_proposals, config, dashboard, drafts, miner, util
+from arete.store import insights
 from tests import support
 
 
@@ -116,7 +116,7 @@ class EnforcementProposalTests(unittest.TestCase):
         self.assertFalse((self.repo.layer_dir / "config.toml").exists())
         self.assertFalse((self.repo.path / "pyproject.toml").exists())
         self.assertEqual((self.repo.path / "example.py").read_text().strip(), rule["known_bad"])
-        self.assertTrue(approvals.forget_proposal(rows[0]["id"]))
+        self.assertEqual(dashboard.forget_proposal(rows[0]["id"]), {"id": rows[0]["id"]})
         self.assertEqual(report.read_text(), text)
 
     def test_check_proposal_stays_out_of_review_when_both_examples_pass(self):
@@ -125,7 +125,7 @@ class EnforcementProposalTests(unittest.TestCase):
         _, apply = self.mine([proposal])
         self.assertEqual(apply, [])
         self.assertFalse(self.repo.layer_dir.exists())
-        self.assertFalse(any(p["repo"] == self.repo.name for p in approvals.proposals()))
+        self.assertFalse(any(p["repo"] == self.repo.name for p in drafts.miner_drafts()))
 
     def test_check_proposal_requires_the_verified_implementation_and_comparable_examples(self):
         rule = self.proposal["enforcement"]
@@ -139,7 +139,7 @@ class EnforcementProposalTests(unittest.TestCase):
         _, apply = self.mine(proposals)
         self.assertEqual(apply, [])
         self.assertFalse(self.repo.layer_dir.exists())
-        self.assertFalse(any(p["repo"] == self.repo.name for p in approvals.proposals()))
+        self.assertFalse(any(p["repo"] == self.repo.name for p in drafts.miner_drafts()))
 
     def test_multipart_feedback_counts_only_distinct_comments_on_the_target_parts_prs(self):
         self.repo.parts = [config.Part("app/client", "Fixture/Client"), config.Part("app/server", "fixture/server")]
@@ -163,7 +163,7 @@ class EnforcementProposalTests(unittest.TestCase):
         invalid.append(valid | {"file": "app/client-extra/pyproject.toml"})
         self.mine(invalid)
         self.assertFalse(self.repo.layer_dir.exists())
-        self.assertFalse(any(p["repo"] == self.repo.name for p in approvals.proposals()))
+        self.assertFalse(any(p["repo"] == self.repo.name for p in drafts.miner_drafts()))
 
         self.repo.parts.append(config.Part("app", "fixture/parent"))
         self.mine([valid])
@@ -186,22 +186,22 @@ class EnforcementProposalTests(unittest.TestCase):
 
         self.mine([self.proposal])
         self.assertEqual(report.read_bytes(), pending_edit)
-        self.assertEqual(approvals.proposal(row["id"])["status"], "hand")
-        self.assertTrue(approvals.forget_proposal(row["id"]))
+        self.assertEqual(drafts.get(row["id"])["state"], "valid")
+        self.assertEqual(dashboard.forget_proposal(row["id"]), {"id": row["id"]})
 
         filed_edit = pending_edit + b"Owner notes after review.\r\n"
         report.write_bytes(filed_edit)
         self.mine([self.proposal])
         self.assertEqual(report.read_bytes(), filed_edit)
-        self.assertEqual([p for p in approvals.proposals() if p["repo"] == self.repo.name],
-                         [approvals.proposal(row["id"])])
-        self.assertEqual(approvals.proposal(row["id"])["status"], "filed")
+        self.assertEqual([p["id"] for p in drafts.miner_drafts() if p["repo"] == self.repo.name],
+                         [row["id"]])
+        self.assertEqual(drafts.get(row["id"])["state"], "discarded")
         self.assertFalse(any(p["repo"] == self.repo.name for p in board.proposals()["hand"]))
 
     def test_only_material_revisions_return_for_review(self):
         self.mine([self.proposal])
         first, = [p for p in board.proposals()["hand"] if p["repo"] == self.repo.name]
-        self.assertTrue(approvals.forget_proposal(first["id"]))
+        self.assertEqual(dashboard.forget_proposal(first["id"]), {"id": first["id"]})
 
         repeat = self.proposal | {"confidence": 0.99, "evidence": [self.earlier, self.recent]}
         self.mine([repeat])
@@ -212,7 +212,7 @@ class EnforcementProposalTests(unittest.TestCase):
         second, = [p for p in board.proposals()["hand"] if p["repo"] == self.repo.name]
         self.assertNotEqual(second["file"], first["file"])
         self.assertIn(update["file"], (self.repo.layer_dir / second["file"]).read_text())
-        self.assertEqual(approvals.proposal(first["id"])["status"], "filed")
+        self.assertEqual(drafts.get(first["id"])["state"], "discarded")
 
         self.mine([self.proposal])
         current, = [p for p in board.proposals()["hand"] if p["repo"] == self.repo.name]
@@ -221,7 +221,7 @@ class EnforcementProposalTests(unittest.TestCase):
         self.mine([update | {"why": "The compiler reports literal identity at compile time."}])
         third, = [p for p in board.proposals()["hand"] if p["repo"] == self.repo.name]
         self.assertNotEqual(third["id"], second["id"])
-        self.assertFalse(approvals.forget_proposal(second["id"]))
+        self.assertEqual(drafts.get(second["id"])["state"], "discarded")
 
     def test_incomplete_or_misscoped_enforcement_does_not_fall_back_to_apply(self):
         foreign = self.feedback(33, self.since, "Compare status by equality.", github="fixture/other")
@@ -237,7 +237,7 @@ class EnforcementProposalTests(unittest.TestCase):
         _, apply = self.mine(proposals)
         self.assertEqual(apply, [])
         self.assertFalse(self.repo.layer_dir.exists())
-        self.assertFalse(any(p["repo"] == self.repo.name for p in approvals.proposals()))
+        self.assertFalse(any(p["repo"] == self.repo.name for p in drafts.miner_drafts()))
 
     def test_architecture_proposal_needs_no_executable_examples_and_dry_run_only_previews(self):
         proposal = self.proposal | {
@@ -247,7 +247,7 @@ class EnforcementProposalTests(unittest.TestCase):
         _, apply = self.mine([proposal], dry_run=True)
         self.assertEqual(apply, [])
         self.assertFalse(self.repo.layer_dir.exists())
-        self.assertFalse(any(p["repo"] == self.repo.name for p in approvals.proposals()))
+        self.assertFalse(any(p["repo"] == self.repo.name for p in drafts.miner_drafts()))
         _, apply = self.mine([proposal])
         self.assertEqual(apply, [])
         report, = (self.repo.layer_dir / check_proposals.DIRECTORY).glob("*.md")

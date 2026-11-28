@@ -529,7 +529,9 @@ def _apply_role_patches(lines: list[str], patches: list[dict]) -> dict[str, dict
 
 
 def save(values: dict, *, base_version: int | None = None, actor: str | None = None,
-         source: str = "dashboard", idem: str = "") -> dict:
+         source: str = "dashboard", idem: str = "", presence_passed: bool = False) -> dict:
+    from . import drafts
+
     if not isinstance(values, dict):
         raise Refused("Settings values must be an object.")
     if "models" in values and "roles" in values:
@@ -549,9 +551,9 @@ def save(values: dict, *, base_version: int | None = None, actor: str | None = N
         configrepo.ensure_repo(fence=fence)
         configrepo.reconcile(fence=fence)
         configrepo.commit_hand_edits(fence=fence)
+        live_ver = current_version()
         if base_version is not None:
             writes.validate_version(base_version)
-            live_ver = current_version()
             if base_version != live_ver:
                 raise writes.VersionConflict(current())
         text, base_blob = configrepo.read("config.toml")
@@ -565,18 +567,57 @@ def save(values: dict, *, base_version: int | None = None, actor: str | None = N
                 drop_key(lines, "models", role)
         expected_overrides = _apply_role_patches(lines, role_patches) if role_patches else {}
         updated = "".join(lines)
-        replace_config(
-            updated,
-            wanted_limits,
-            wanted_models,
-            expected_overrides=expected_overrides,
-            base=base_blob,
-            actor=actor,
-            source=source,
-            idem=idem,
-            fence=fence,
-            strict_steps=bool(role_patches),
-        )
+
+        def refusal(cfg: config.Config) -> str:
+            if any(getattr(cfg, key) != limit for key, limit in wanted_limits.items()) or any(
+                    cfg.models.get(role, "") != model for role, model in wanted_models.items()):
+                return "The new config read back other values than the ones saved, so config.toml is unchanged."
+            if expected_overrides:
+                parsed = tomllib.loads(updated)
+                for role, expected in expected_overrides.items():
+                    if role_overrides_from(parsed, role) != expected:
+                        return f"Role '{role}' did not round trip cleanly through config.toml."
+            return ""
+
+        check_draft(updated, refusal, strict_steps=bool(role_patches))
+
+        if paths.DB_FILE.exists() and drafts.available():
+            caller = actor or principals.current()
+            draft_row, report = drafts.create_and_check(
+                "step_settings",
+                "defaults",
+                updated,
+                author=caller,
+                path="config.toml",
+                base_version=live_ver,
+                why="settings update",
+                run_check=True,
+            )
+            if not report or not report["ok"]:
+                probs = [p for st in (report or {}).get("stages", ()) for p in st.get("problems", ())]
+                raise Refused("; ".join(probs) or "The new config failed configcheck.")
+            drafts.activate(
+                draft_row["id"],
+                caller,
+                live_ver,
+                idem=idem,
+                presence_passed=presence_passed,
+                source=source,
+                fence=fence,
+            )
+        else:
+            replace_config(
+                updated,
+                wanted_limits,
+                wanted_models,
+                expected_overrides=expected_overrides,
+                base=base_blob,
+                actor=actor,
+                source=source,
+                idem=idem,
+                fence=fence,
+                strict_steps=bool(role_patches),
+            )
     return current()
 
 

@@ -34,7 +34,6 @@ from . import (
     workspace,
 )
 from .alerts import issue_link, opened_in
-from .store import approvals as approvals_store
 from .store import asks as asks_store
 from .store import db as foundation
 from .store import devices as devices_store
@@ -567,9 +566,15 @@ def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
 
 
 def proposals() -> dict:
-    return {kind: [{k: p[k] for k in ("id", "repo", "file", "change", "status")}
-                   for p in approvals_store.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=foundation.reader)]
-            for kind, statuses in (("memory", ["memory"]), ("hand", ["hand"]), ("approve", ["approve", "filing"]))}
+    from . import drafts, miner
+
+    cfg = config.load_or_problem()[0]
+    buckets: dict[str, list[dict]] = {"memory": [], "hand": [], "approve": [], "pending": []}
+    for p in drafts.miner_drafts(states=["valid"], has_pr=False, limit=PROPOSALS_SHOWN, connect=foundation.reader):
+        bucket = miner.classify_draft(cfg, p)
+        if bucket in buckets:
+            buckets[bucket].append({k: p[k] for k in ("id", "repo", "file", "change", "status")})
+    return buckets
 
 
 def run_log(run_id: str) -> list[str]:
@@ -627,8 +632,8 @@ def inbox_needs_you(running: list[dict]) -> dict:
     skipped_rows = []
     ready_rows = []
     evidence_rows = []
-    proposals_by_kind: dict[str, list[dict]] = {"memory": [], "hand": [], "approve": []}
-    drafts = []
+    proposals_by_kind: dict[str, list[dict]] = {"memory": [], "hand": [], "approve": [], "pending": []}
+    drafts_chat = []
     for item in open_items:
         subj = item["subject"]
         detail = item["detail"]
@@ -646,19 +651,18 @@ def inbox_needs_you(running: list[dict]) -> dict:
                 skipped_rows.append({k: v for k, v in detail.items() if k != "stamp"})
         elif subj.startswith("ticket:"):
             ready_rows.append({k: v for k, v in detail.items() if k != "stamp"})
-        elif subj.startswith("proposal:"):
-            status = detail.get("status", "")
-            bucket = "approve" if status in ("approve", "filing") else status
+        elif subj.startswith("draft:") and item["kind"] == "proposal" and detail.get("kind") == "miner":
+            bucket = detail.get("bucket") or detail.get("status") or ""
             if bucket in proposals_by_kind:
                 proposals_by_kind[bucket].append({k: detail.get(k, "") for k in ("id", "repo", "file", "change", "status")})
         elif subj.startswith("chat:") and subj.endswith("/draft"):
-            drafts.append(detail)
+            drafts_chat.append(detail)
     approvals.sort(key=lambda a: a.get("id", 0), reverse=True)
     for bucket in proposals_by_kind.values():
         bucket.sort(key=lambda p: p.get("id", 0), reverse=True)
     draft = None
-    if drafts:
-        newest = max(drafts, key=lambda d: (d.get("updated", ""), d.get("chat", 0)))
+    if drafts_chat:
+        newest = max(drafts_chat, key=lambda d: (d.get("updated", ""), d.get("chat", 0)))
         draft = {k: newest[k] for k in ("chat", "title", "body", "repo", "fingerprint") if k in newest}
     return {"approvals": {"rows": approvals}, "evidence": {"rows": evidence_rows}, "skipped": {"rows": skipped_rows},
             "proposals": {"rows": proposals_by_kind}, "ready": {"rows": ready_rows}, "draft": draft}

@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from .. import paths, record, retention, run_lines, util
-from . import approvals, devices, events, idempotency, incidents, loops, orchestration, runs, writes
+from .. import drafts, paths, record, retention, run_lines, util
+from . import devices, events, idempotency, incidents, loops, orchestration, runs, writes
 from .db import (
     RECORD_TURNS_SCHEMA,
     RUN_RETENTION_SCHEMA,
@@ -24,8 +24,6 @@ from .db import (
 GB = 10 ** 9
 LIVE_SECONDS = 3600
 PROTECTED_STATUSES = frozenset(("queued", "running", "pr", "needs-info"))
-FOLDER_RELEASING_PROPOSALS = frozenset(("merged", "rejected", "skipped", "filed", "superseded"))
-RECORD_RELEASING_PROPOSALS = frozenset(approvals.RELEASING_PROPOSALS)
 
 
 @dataclass(frozen=True)
@@ -121,27 +119,8 @@ def measure() -> Measured:
     return Measured(runs_bytes, folder_bytes, record_bytes, record_written, continues_edges)
 
 
-def _cited_runs(c, releasing: frozenset[str], candidate_ids: set[str]) -> set[str]:
-    if not candidate_ids:
-        return set()
-    marks = ",".join("?" * len(releasing))
-    rows = c.execute(
-        f"SELECT run_id, evidence FROM proposals WHERE status IS NULL OR status NOT IN ({marks})",  # noqa: S608
-        tuple(sorted(releasing)),
-    ).fetchall()
-    if not rows:
-        return set()
-    cited: set[str] = set()
-    for row in rows:
-        direct = row["run_id"] or ""
-        if direct in candidate_ids:
-            cited.add(direct)
-        evidence = row["evidence"] or ""
-        if evidence:
-            for rid in candidate_ids:
-                if rid in evidence:
-                    cited.add(rid)
-    return cited
+def _cited_runs(c, candidate_ids: set[str]) -> set[str]:
+    return drafts.cited_runs(c, candidate_ids)
 
 
 def _chain_kept(c, recent_runs: set[str], continues_edges: dict[str, str]) -> set[str]:
@@ -272,7 +251,7 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             (firings_since,),
         ).fetchall()
         firing_ids = {r["id"] for r in firing_rows}
-        firing_cited = _cited_runs(c, FOLDER_RELEASING_PROPOSALS, firing_ids)
+        firing_cited = _cited_runs(c, firing_ids)
         for row in firing_rows:
             rid = row["id"]
             if rid in pinned or rid in open_asks or rid in firing_cited:
@@ -322,8 +301,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
                 if r["repo"] and r["issue"] not in (None, "")
             }
 
-        folder_cited = _cited_runs(c, FOLDER_RELEASING_PROPOSALS, all_ids)
-        record_cited = _cited_runs(c, RECORD_RELEASING_PROPOSALS, all_ids)
+        folder_cited = _cited_runs(c, all_ids)
+        record_cited = folder_cited
 
         # 2. Folders / lines past [folders] days.
         lines_purged_now: set[str] = set()

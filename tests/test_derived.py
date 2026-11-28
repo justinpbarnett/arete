@@ -236,7 +236,7 @@ class DerivedStoreFrameworkTests(unittest.TestCase):
     def test_migration_creates_strict_derived_table(self) -> None:
         self._seed_full_db()
         with foundation.reader() as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], foundation.DERIVED_SCHEMA)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], foundation.LATEST)
             self.assertTrue(derived_store.available(c))
             cols = [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
                     for r in c.execute("PRAGMA table_info(derived)")]
@@ -623,7 +623,7 @@ class DerivedStoreFrameworkTests(unittest.TestCase):
         self.assertFalse(server.contracts_waiting)
         self.assertTrue(server.derived_started)
         with foundation.reader() as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], foundation.DERIVED_SCHEMA)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], foundation.LATEST)
             self.assertTrue(derived_store.available(c))
 
 

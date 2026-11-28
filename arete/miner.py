@@ -15,6 +15,7 @@ from . import (
     config,
     devices,
     diffguard,
+    drafts,
     evals,
     gh,
     jev,
@@ -31,7 +32,6 @@ from . import (
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
-from .store import approvals as approvals_store
 from .store import db
 from .store import insights as insights_store
 from .store import runs as run_store
@@ -444,16 +444,18 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> tuple[str, dict[str,
 
 
 def sync_feedback() -> None:
-    applied = dict.fromkeys(p["pr_url"] for p in approvals_store.proposals(status=["applied"]) if p.get("pr_url"))
+    applied = dict.fromkeys(
+        p["pr_url"] for p in drafts.miner_drafts(states=["valid"], has_pr=True) if p.get("pr_url")
+    )
     for url in applied:
         try:
             pr = gh.pr_view(url)
         except gh.GhError:
             continue
         if pr.get("mergedAt") or pr.get("state") == "MERGED":
-            approvals_store.set_proposal_status_by_pr(url, "merged")
+            drafts.set_miner_status_by_pr(url, "active")
         elif pr.get("state") == "CLOSED":
-            approvals_store.set_proposal_status_by_pr(url, "rejected")
+            drafts.set_miner_status_by_pr(url, "declined", reason="PR closed")
 
 
 def _fmt(props: list[dict]) -> str:
@@ -808,7 +810,7 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be closed"):
             return refusal
         gh.pr_close(url)
-        approvals_store.set_proposal_status_by_pr(url, "rejected")
+        drafts.set_miner_status_by_pr(url, "declined", reason="closed for an eval regression")
         return "closed for an eval regression"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
@@ -827,7 +829,7 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
         return refusal
     gh.pr_squash(repo.github, pr.number, pr.head)
-    approvals_store.set_proposal_status_by_pr(url, "merged")
+    drafts.set_miner_status_by_pr(url, "active")
     return "merged"
 
 
@@ -916,20 +918,70 @@ def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
     return repo == cfg.global_repo and file == GLOBAL_RULES
 
 
-def file_rule(proposal_id: int) -> str:
+def classify_draft(cfg: config.Config, draft: dict) -> str:
+    """Recompute the miner's own classification for a miner draft: memory, hand, approve, or pending."""
+    layer = draft.get("layer") if "layer" in draft else draft.get("name", "")
+    repo = draft.get("repo") if "repo" in draft else str(draft.get("origin") or "").removeprefix("repo:")
+    file_path = draft.get("file") if "file" in draft else draft.get("path", "")
+    if layer == "memory":
+        return "memory"
+    if file_path.startswith(f"{check_proposals.DIRECTORY}/") or util.matches_any(file_path, diffguard.CLAUDE_CODE_GUARDED):
+        return "hand"
+    if awaits_approval(cfg, repo, file_path) or (layer == "global" and file_path == GLOBAL_RULES):
+        return "approve"
+    return "pending"
+
+
+def apply_miner_draft(draft_id: int | str) -> dict:
+    """Open the miner's PR for a valid allowed repo draft and record its pr_url."""
+    row = drafts.get(draft_id)
+    if row is None or row["kind"] != "miner" or row["state"] != "valid":
+        raise LookupError(f"#{draft_id} is not an open miner proposal")
+    cfg = config.load()
+    if classify_draft(cfg, row) != "pending":
+        raise LookupError(f"#{draft_id} is not an allowed repo proposal")
+    p = drafts.miner_view(row)
+    repo = cfg.repo(p["repo"])
+    run_id = p["run_id"] or record.new_id("min")
+    url, landed, _ = apply_repo(cfg, run_id, repo, [p], miner_branch())
+    if url and landed:
+        drafts.set_pr_url(row["numeric_id"], url)
+        return {"id": row["numeric_id"], "pr_url": url}
+    drafts.move(row["numeric_id"], "valid", "declined", reason="did not apply")
+    return {"id": row["numeric_id"], "pr_url": ""}
+
+
+def file_rule(proposal_id: int | str) -> str:
     db.require_workspace_contract()
     with util.lock(RULE_LOCK, wait=True):
-        p = approvals_store.proposal(proposal_id)
-        if not p or not approvals_store.move_proposal(proposal_id, ("approve", "filing"), "filing"):
+        if not drafts.available():
+            with db.db() as c:
+                row = c.execute("SELECT * FROM proposals WHERE id = ?", (int(proposal_id),)).fetchone()
+                if not row or row["status"] not in ("approve", "filing"):
+                    raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
+                p = dict(row)
+                c.execute("UPDATE proposals SET status = 'filing' WHERE id = ?", (int(proposal_id),))
+            cfg = config.load()
+            repo = cfg.repo(p["repo"])
+            try:
+                base = push_rule(cfg, repo, p)
+            except Exception:
+                with db.db() as c:
+                    c.execute("UPDATE proposals SET status = 'approve' WHERE id = ?", (int(proposal_id),))
+                raise
+            with db.db() as c:
+                c.execute("UPDATE proposals SET status = 'merged' WHERE id = ?", (int(proposal_id),))
+            return catch_up(repo, base)
+        row = drafts.get(proposal_id)
+        if row is None or row["kind"] != "miner" or row["state"] != "valid":
             raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
         cfg = config.load()
+        p = drafts.miner_view(row)
+        if classify_draft(cfg, row) != "approve":
+            raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
         repo = cfg.repo(p["repo"])
-        try:
-            base = push_rule(cfg, repo, p)
-        except Exception:
-            approvals_store.move_proposal(proposal_id, ("filing",), "approve")
-            raise
-        approvals_store.move_proposal(proposal_id, ("filing",), "merged")
+        base = push_rule(cfg, repo, p)
+        drafts.move(row["numeric_id"], "valid", "active")
         return catch_up(repo, base)
 
 
@@ -1152,16 +1204,16 @@ def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict
     report = check_proposals.review_text(p, diagnostic).encode()
     relative = check_proposals.revision_name(family, report)
     legacy_relative = check_proposals.revision_name(legacy_family, report)
-    legacy = approvals_store.check_proposal_revisions(p["layer"], p["repo"], str(legacy_family),
-                                                       check_proposals.revision_glob(legacy_family))
+    legacy = drafts.check_proposal_revisions(p["layer"], p["repo"], str(legacy_family),
+                                             check_proposals.revision_glob(legacy_family))
     if any(row["file"] == str(legacy_relative) for row in legacy):
         relative = legacy_relative
     path = check_proposals.save(repo, relative, report)
     change = f"Review {relative} in the repo layer. {behavior}"
-    legacy_ids = [row["id"] for row in legacy if row["status"] == "hand"
+    legacy_ids = [row["id"] for row in legacy if row["status"] == "valid"
                   and check_proposals.evidence_matches_github(row["evidence"], github)]
-    approvals_store.record_check_proposal(run_id, dict(p, file=str(relative), change=change),
-                                          str(family), check_proposals.revision_glob(family), legacy_ids)
+    drafts.record_check_proposal(run_id, dict(p, file=str(relative), change=change),
+                                 str(family), check_proposals.revision_glob(family), legacy_ids)
     print(f"  {paths.short_path(path)}")
 
 
@@ -1198,9 +1250,9 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     text = prompts.render_engine(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS, check_adoption=check_proposals.ADOPTION_CHANGE,
-        pending=_fmt(approvals_store.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
-        done=_fmt(approvals_store.proposals(status=["memory", "filed", "merged"])),
-        rejected=_fmt(approvals_store.proposals(status=["rejected", "skipped"])),
+        pending=_fmt(drafts.miner_drafts(states=["draft", "valid"])),
+        done=_fmt(drafts.miner_drafts(states=["active", "discarded"])),
+        rejected=_fmt(drafts.miner_drafts(states=["declined"])),
         events=render_events(cfg, since, until), digest=digest, audit=auditor.latest_findings(),
         feedback=feedback, earlier_feedback=earlier_text, records=records, since=since_iso,
     )
@@ -1245,8 +1297,11 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
             continue
         if status == "pending" and apply:
             by_repo[p["repo"]].append(p)
+        elif status == "skipped":
+            reason = note.strip().removeprefix("[skip:").removesuffix("]").strip()
+            drafts.add_miner_draft(run_id, p, state="declined", decline_reason=reason)
         else:
-            approvals_store.add_proposal(run_id, p, status)
+            drafts.add_miner_draft(run_id, p, state="valid")
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
@@ -1260,9 +1315,9 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
             print(failures[-1])
         for p in ps:
             if p in landed:
-                approvals_store.add_proposal(run_id, p, "applied", url)
+                drafts.add_miner_draft(run_id, p, state="valid", pr_url=url)
             else:
-                approvals_store.add_proposal(run_id, p, "skipped")
+                drafts.add_miner_draft(run_id, p, state="declined", decline_reason="did not apply")
         if url:
             opened.append(url)
             print(f"{name}: {url}")

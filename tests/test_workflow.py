@@ -12204,16 +12204,16 @@ class MinerLifecycleTests(unittest.TestCase):
         self.compare_prompts = evals.compare_prompts
         self.eval = self.enterContext(mock.patch.object(evals, "compare_prompts",
                                                         return_value=evals.Comparison("eval table", complete=True)))
-        self.proposals = self.enterContext(mock.patch.object(miner.approvals_store, "set_proposal_status_by_pr",
+        self.proposals = self.enterContext(mock.patch.object(miner.drafts, "set_miner_status_by_pr",
                                                              side_effect=self.forget_applied))
-        self.enterContext(mock.patch.object(miner.approvals_store, "proposals", side_effect=lambda **kw: self.stored))
-        self.enterContext(mock.patch.object(miner.approvals_store, "add_proposal", side_effect=self.store_applied))
+        self.enterContext(mock.patch.object(miner.drafts, "miner_drafts", side_effect=lambda **kw: self.stored))
+        self.enterContext(mock.patch.object(miner.drafts, "add_miner_draft", side_effect=self.store_applied))
 
-    def store_applied(self, run_id, proposal, status, url=""):
-        if status == "applied":
-            self.stored.append({**proposal, "pr_url": url})
+    def store_applied(self, run_id, proposal, *, state="valid", pr_url="", decline_reason=""):
+        if state == "valid" and pr_url:
+            self.stored.append({**proposal, "pr_url": pr_url})
 
-    def forget_applied(self, url, status):
+    def forget_applied(self, url, state, *, reason=None):
         self.stored = [p for p in self.stored if p["pr_url"] != url]
 
     def github_read(self, args, **kwargs):
@@ -12368,7 +12368,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertEqual(self.ci_reads, [self.HEAD])
         self.assertEqual(self.calls[-1], ("merge", self.HEAD))
         self.assertEqual({call.args[0][0] for call in self.git_mock.call_args_list}, {"fetch", "rev-parse", "merge-base", "show"})
-        self.proposals.assert_called_once_with(self.URL, "merged")
+        self.proposals.assert_called_once_with(self.URL, "active")
 
     def test_previous_pr_is_decided_on_noop_run(self):
         self.prs = [{"html_url": self.URL, "pull_request": {}}]
@@ -12631,7 +12631,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertEqual(graded, [("base skill", "current helper"), ("candidate skill", "current helper")] * 3)
         self.assertEqual(stale.read_text(), "old helper")
         self.assertEqual(self.calls[-1], ("merge", self.HEAD))
-        self.proposals.assert_called_once_with(self.url, "merged")
+        self.proposals.assert_called_once_with(self.url, "active")
 
     def test_head_or_base_change_during_evals_holds(self):
         for field in ("head", "base"):
@@ -12760,7 +12760,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertIn("Incomplete eval tasks: `unavailable-task`", table)
         self.assertEqual(self.calls[1], ("pr", "close", self.URL))
         self.assertFalse(self.merged)
-        self.proposals.assert_called_once_with(self.URL, "rejected")
+        self.proposals.assert_called_once_with(self.URL, "declined", reason="closed for an eval regression")
 
     def test_mixed_pr_closes_for_external_regression_with_both_edits_in_place(self):
         self.repo.path = self.root / "arete"
@@ -13702,7 +13702,7 @@ class MinerLifecycleTests(unittest.TestCase):
                         self.assertEqual(decision, "closed for an eval regression")
                         self.assertEqual(self.calls[1:], [("pr", "close", self.URL)])
                         self.assertIn("Closing because `held-out-behavior`", self.calls[0][2])
-                        self.proposals.assert_called_once_with(self.URL, "rejected")
+                        self.proposals.assert_called_once_with(self.URL, "declined", reason="closed for an eval regression")
                     else:
                         self.assertEqual(judge.call_args.args[-1], ["build.md"])
                         self.assertEqual(decision, "the eval comparison is incomplete")
@@ -13752,7 +13752,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.calls], ["comment", "merge"])
         self.assertIn("JEV answered yes", self.calls[0][2])
         self.assertEqual(self.calls[1], ("merge", self.HEAD))
-        self.proposals.assert_called_once_with(self.URL, "merged")
+        self.proposals.assert_called_once_with(self.URL, "active")
 
     def test_jev_errors_preserve_existing_incomplete_feedback_until_a_verdict(self):
         self.eval.return_value = evals.Comparison("partial table", incomplete=["`first-task`"])
@@ -13779,7 +13779,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertNotIn("first-task", self.comments[1]["body"])
         self.assertIn("JEV answered yes", self.comments[1]["body"])
         self.assertEqual(self.labels, {miner.MINER_LABEL})
-        self.proposals.assert_called_once_with(self.URL, "merged")
+        self.proposals.assert_called_once_with(self.URL, "active")
 
     def test_unavailable_invalid_or_uncertain_jev_verdicts_do_not_request_human_review(self):
         self.eval.return_value = evals.Comparison("Not measured.", unmeasured=["build.md"], complete=True)

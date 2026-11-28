@@ -24,9 +24,10 @@ from .store import db as foundation
 
 ABSENT = "absent"
 BRANCH = "live"
-SOURCES = frozenset(("dashboard", "hand", "agent", "revert", "merge", "engine"))
+SOURCES = frozenset(("dashboard", "hand", "agent", "revert", "merge", "engine", "draft"))
 FENCE_ENV = "ARETE_CONFIG_FENCE"
 FENCE_FILE = ".arete-fence"
+ACTIVATE_C_ENV = "ARETE_ACTIVATE_C"
 INSTANCE_LOCK = "instance-mutation"
 REPO_LOCK = "config-repo"
 GITIGNORE_LINES = (
@@ -90,7 +91,8 @@ def _root() -> Path:
     return paths.CONFIG_DIR.resolve()
 
 
-def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: bool = False) -> dict[str, str]:
+def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: bool = False,
+             activate_c: bool = False) -> dict[str, str]:
     from . import environment
 
     env = {
@@ -115,6 +117,10 @@ def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: b
         env[FENCE_ENV] = fence_token
     elif FENCE_ENV in env:
         env.pop(FENCE_ENV, None)
+    if activate_c:
+        env[ACTIVATE_C_ENV] = "1"
+    else:
+        env.pop(ACTIVATE_C_ENV, None)
     if not use_hooks:
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
@@ -123,7 +129,7 @@ def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: b
 
 
 def _git(args: list[str], cwd: Path, *, actor: str = "", fence_token: str = "", use_hooks: bool = False,
-         check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
+         activate_c: bool = False, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
     cmd = ["git", "--no-pager", "--no-replace-objects"]
     if use_hooks:
         cmd.extend(["-c", f"core.hooksPath={cwd / '.git' / 'hooks'}"])
@@ -133,7 +139,7 @@ def _git(args: list[str], cwd: Path, *, actor: str = "", fence_token: str = "", 
     done = subprocess.run(
         cmd,
         cwd=cwd,
-        env=_git_env(cwd, actor=actor, fence_token=fence_token, use_hooks=use_hooks),
+        env=_git_env(cwd, actor=actor, fence_token=fence_token, use_hooks=use_hooks, activate_c=activate_c),
         capture_output=True,
         text=text,
         timeout=30,
@@ -518,6 +524,8 @@ def _install_hook(root: Path) -> None:
 
 
 def verify_pre_commit_hook() -> int:
+    from . import configcheck
+
     root = Path(os.getcwd()).resolve()
     done = _git(["diff", "--cached", "--name-status", "-z", "--diff-filter=ACM"], root, check=False, text=False)
     if done.returncode != 0:
@@ -543,6 +551,16 @@ def verify_pre_commit_hook() -> int:
             print(f"configrepo pre-commit hook: could not read staged {rel}", file=sys.stderr)
             return 1
         staged_blobs[rel] = blob.stdout
+    ok, max_gate, problems = configcheck.check_staged_files(staged_blobs, root)
+    if not ok:
+        print("; ".join(problems) or "configrepo pre-commit hook: configcheck failed", file=sys.stderr)
+        return 1
+    if max_gate == "C" and os.environ.get(ACTIVATE_C_ENV) != "1":
+        print(
+            "configrepo pre-commit hook: refused gate C change (requires ARETE_ACTIVATE_C=1)",
+            file=sys.stderr,
+        )
+        return 1
     try:
         _validate_batch(staged_blobs, root)
     except ConfigRepoError as e:
@@ -557,7 +575,7 @@ def verify_pre_commit_hook() -> int:
             expected = marker.read_text().strip()
         except OSError:
             expected = ""
-        if not token or not expected or token != expected:
+        if (expected or token) and token != expected:
             print(
                 "Refused unfenced commit on branch live. Leave edits in the working tree for arete "
                 "(or commit through arete/configrepo) so instance and config-repo locks are held.",
@@ -584,9 +602,12 @@ def _set_enabled_toml(text: str, enabled: bool) -> str:
     return "".join(lines)
 
 
-def _format_commit_message(note: str, actor: str, source: str, run_id: str = "", idem: str = "") -> str:
+def _format_commit_message(note: str, actor: str, source: str, run_id: str = "", idem: str = "",
+                           draft_id: str = "") -> str:
     subject = (note or "config update").splitlines()[0].strip() or "config update"
     trailers = [f"Arete-Actor: {actor}", f"Arete-Source: {source}"]
+    if draft_id:
+        trailers.append(f"Arete-Draft: {draft_id}")
     if run_id:
         trailers.append(f"Arete-Run: {run_id}")
     if idem:
@@ -615,6 +636,7 @@ def _parse_commit_meta(root: Path, sha: str) -> dict:
         "at": at,
         "author": actor,
         "source": source,
+        "draft_id": trailers.get("Arete-Draft", ""),
         "run_id": trailers.get("Arete-Run", ""),
         "idem": trailers.get("Arete-Idempotency-Key", ""),
     }
@@ -662,6 +684,57 @@ def live_bytes(path: str | Path, root: Path | None = None) -> bytes | None:
     return _live_bytes(root or _root(), _normalize_rel(path))
 
 
+def commit_bytes(commit_sha: str, path: str | Path, root: Path | None = None) -> bytes | None:
+    base = root or _root()
+    if not is_repo(base) or not commit_sha:
+        return None
+    rel = _normalize_rel(path)
+    done = _git(["cat-file", "blob", f"{commit_sha}:{rel}"], base, check=False, text=False)
+    return done.stdout if done.returncode == 0 else None
+
+
+def commit_draft_ref(draft_id: str, path: str | Path, data: bytes, actor: str,
+                     root: Path | None = None) -> tuple[str, str]:
+    """Commit draft bytes over live onto refs/drafts/<draft_id> without touching live or working tree."""
+    base = root or _root()
+    if not is_repo(base):
+        init()
+    rel = _normalize_rel(path)
+    actor = validate_actor(actor)
+    parent = live_sha(base)
+    if not parent:
+        raise ConfigRepoError("config repo has no live commit")
+    ref_name = f"refs/drafts/{draft_id}"
+    with tempfile.TemporaryDirectory(prefix="arete-draft-ref-") as tmp:
+        idx_file = Path(tmp) / "index"
+        env = _git_env(base, actor=actor)
+        env["GIT_INDEX_FILE"] = str(idx_file)
+        subprocess.run(
+            ["git", "--no-pager", "read-tree", parent],
+            cwd=base, env=env, capture_output=True, check=True, timeout=30,
+        )
+        hashed = subprocess.run(
+            ["git", "--no-pager", "hash-object", "-w", "--stdin"],
+            cwd=base, env=env, input=data, capture_output=True, check=True, timeout=30,
+        ).stdout.decode("ascii").strip()
+        mode = "100644"
+        subprocess.run(
+            ["git", "--no-pager", "update-index", "--add", "--cacheinfo", f"{mode},{hashed},{rel}"],
+            cwd=base, env=env, capture_output=True, check=True, timeout=30,
+        )
+        tree_sha = subprocess.run(
+            ["git", "--no-pager", "write-tree"],
+            cwd=base, env=env, capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+        msg = _format_commit_message(f"try draft {draft_id}: {rel}", actor, "draft", draft_id=draft_id)
+        commit_sha = subprocess.run(
+            ["git", "--no-pager", "commit-tree", tree_sha, "-p", parent],
+            cwd=base, env=env, input=msg, capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+        _git(["update-ref", ref_name, commit_sha], base, actor=actor)
+    return ref_name, commit_sha
+
+
 def _migrate_retention_locked(root: Path, fence: Fence) -> str:
     live_cfg = _live_bytes(root, "config.toml")
     if live_cfg is None or (b"retention" not in live_cfg and b"keep_days" not in live_cfg):
@@ -692,6 +765,7 @@ def _migrate_retention_locked(root: Path, fence: Fence) -> str:
         fence=fence,
         modes={"config.toml": 0o600},
         write_files=True,
+        activate_c=True,
     )
 
 
@@ -900,7 +974,8 @@ def _status_paths(root: Path) -> list[str]:
 
 
 def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: str, source: str, *,
-                         run_id: str = "", idem: str = "", note: str = "", fence: Fence,
+                         run_id: str = "", idem: str = "", note: str = "", draft_id: str = "",
+                         activate_c: bool = False, fence: Fence,
                          modes: dict[str, int] | None = None, write_files: bool = True) -> str:
     paths_sorted = sorted(changes)
     old_blobs = {rel: _live_blob(root, rel) for rel in paths_sorted}
@@ -923,10 +998,16 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: st
         _git(["rm", "-q", "-f", "--ignore-unmatch", "--", *to_del], root)
     if _git(["diff", "--cached", "--quiet", "--", *paths_sorted], root, check=False).returncode == 0:
         return live_sha(root)
-    msg = _format_commit_message(note or f"config: update {', '.join(paths_sorted)}", actor, source, run_id, idem)
+    msg = _format_commit_message(
+        note or f"config: update {', '.join(paths_sorted)}",
+        actor, source, run_id, idem, draft_id=draft_id,
+    )
     try:
         with _active_hook_fence(root, fence) as token:
-            _git(["commit", "-q", "-m", msg, "--", *paths_sorted], root, actor=actor, fence_token=token, use_hooks=True)
+            _git(
+                ["commit", "-q", "-m", msg, "--", *paths_sorted],
+                root, actor=actor, fence_token=token, use_hooks=True, activate_c=activate_c,
+            )
     except ConfigRepoError:
         for rel in paths_sorted:
             live_data = _live_bytes(root, rel)
@@ -947,6 +1028,8 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                   old_blobs: dict[str, str]) -> None:
     if not paths.DB_FILE.exists() or not config_store.available():
         return
+    from . import drafts
+
     meta = _parse_commit_meta(root, sha)
     with foundation.tx() as conn, principals.acting(meta["author"]):
         for rel in paths_sorted:
@@ -1011,11 +1094,14 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                 },
                 connection=conn,
             )
+        if meta.get("draft_id"):
+            drafts.finalize_activated_draft(conn, meta["draft_id"], sha)
 
 
 def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: str, source: str,
-           run_id: str = "", idem: str = "", *, note: str = "", fence: Fence | None = None,
-           modes: dict[str, int] | None = None) -> str:
+           run_id: str = "", idem: str = "", *, note: str = "", draft_id: str = "",
+           activate_c: bool = False, fence: Fence | None = None,
+           modes: dict[str, int] | None = None, write_files: bool = True) -> str:
     actor = validate_actor(actor)
     if source not in SOURCES:
         raise ConfigRepoError(f"invalid config commit source {source!r}")
@@ -1049,26 +1135,34 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
         # Check each path independently for uncommitted hand edits and stale base.
         for rel in sorted(normalized):
             live_blob = _live_blob(root, rel)
-            target = root / rel
-            wt_bytes = target.read_bytes() if target.is_file() else None
-            wt_blob = _git_blob_sha(wt_bytes) if wt_bytes is not None else ABSENT
-            if wt_blob != live_blob:
-                if wt_bytes is None:
-                    raise HandEditInvalid(rel, "working tree file was removed")
-                try:
-                    _validate_content(rel, wt_bytes, root)
-                except ConfigRepoError as e:
-                    raise HandEditInvalid(rel, str(e)) from e
-                _commit_files_locked(
-                    root,
-                    {rel: wt_bytes},
-                    "hand",
-                    "hand",
-                    note=f"hand edit: {rel}",
-                    fence=owned,
-                    write_files=False,
-                )
-                live_blob = _live_blob(root, rel)
+            if write_files:
+                target = root / rel
+                wt_bytes = target.read_bytes() if target.is_file() else None
+                wt_blob = _git_blob_sha(wt_bytes) if wt_bytes is not None else ABSENT
+                if wt_blob != live_blob:
+                    if wt_bytes is None:
+                        raise HandEditInvalid(rel, "working tree file was removed")
+                    try:
+                        _validate_content(rel, wt_bytes, root)
+                    except ConfigRepoError as e:
+                        raise HandEditInvalid(rel, str(e)) from e
+                    from . import configcheck
+
+                    ok_h, gate_h, probs_h = configcheck.check_staged_files({rel: wt_bytes}, root)
+                    if not ok_h:
+                        raise HandEditInvalid(rel, "; ".join(probs_h) or "configcheck failed")
+                    if gate_h == "C":
+                        raise HandEditInvalid(rel, "working tree has uncommitted gate C hand edit")
+                    _commit_files_locked(
+                        root,
+                        {rel: wt_bytes},
+                        "hand",
+                        "hand",
+                        note=f"hand edit: {rel}",
+                        fence=owned,
+                        write_files=False,
+                    )
+                    live_blob = _live_blob(root, rel)
             if norm_base[rel] != live_blob:
                 raise StaleBase(rel, norm_base[rel], live_blob)
         # Validate every new file BEFORE touching the working tree.
@@ -1081,9 +1175,11 @@ def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: 
             run_id=run_id,
             idem=idem,
             note=note,
+            draft_id=draft_id,
+            activate_c=activate_c,
             fence=owned,
             modes=norm_modes,
-            write_files=True,
+            write_files=write_files,
         )
 
 
@@ -1278,6 +1374,10 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                         },
                         connection=conn,
                     )
+                if meta.get("draft_id"):
+                    from . import drafts
+
+                    drafts.finalize_activated_draft(conn, meta["draft_id"], sha)
             reconciled += 1
     return reconciled
 
@@ -1290,15 +1390,45 @@ def reconcile(*, fence: Fence | None = None) -> int:
         return _reconcile_locked(root, owned)
 
 
+def _log_invalid_hand_once(root: Path, rel: str, blob_sha: str, detail: str) -> None:
+    key = (str(root), rel)
+    with _LOG_GUARD:
+        if _INVALID_HAND_LOGGED.get(key) != blob_sha:
+            _INVALID_HAND_LOGGED[key] = blob_sha
+            print(f"config hand edit not committed ({rel}): {util.first_line(detail, 200)}",
+                  file=sys.stderr, flush=True)
+
+
 def commit_hand_edits(*, fence: Fence | None = None) -> list[str]:
+    from . import configcheck, drafts, inbox
+
     root = _root()
     if not is_repo(root):
         return []
     committed: list[str] = []
+    has_drafts = paths.DB_FILE.exists() and drafts.available()
     with writer_lock(fence) as owned:
         if paths.DB_FILE.exists() and config_store.available():
             _reconcile_locked(root, owned)
-        for rel in _status_paths(root):
+        dirty_list = _status_paths(root)
+        if has_drafts:
+            dirty_set = set(dirty_list)
+            stale_hands = [
+                d for d in drafts.list_drafts(state=("draft", "valid", "invalid"), author="hand", limit=100)
+                if d["path"] and d["path"] not in dirty_set
+            ]
+            if stale_hands:
+                with foundation.tx() as c, principals.acting("hand"):
+                    for prior in stale_hands:
+                        if prior["state"] == "valid":
+                            drafts.move(c, prior["numeric_id"], "valid", "discarded",
+                                        reason="hand edit reverted to live", sync_inbox=False)
+                        elif prior["state"] in ("draft", "invalid"):
+                            drafts.move(c, prior["numeric_id"], prior["state"], "discarded",
+                                        reason="hand edit reverted to live", sync_inbox=False)
+                    inbox.sync(c, "proposals")
+                    inbox.sync(c, "config")
+        for rel in dirty_list:
             target = root / rel
             if not target.is_file():
                 continue
@@ -1308,14 +1438,93 @@ def commit_hand_edits(*, fence: Fence | None = None) -> list[str]:
             if blob_sha == live_blob:
                 continue
             key = (str(root), rel)
+            classified = configkinds.classify(rel)
+            if has_drafts and classified is not None:
+                kind, item_name = classified
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    _log_invalid_hand_once(root, rel, blob_sha, str(error))
+                    continue
+                # Skip if an identical open hand draft already exists for this path and base.
+                existing_open = [
+                    d for d in drafts.list_drafts(state=("draft", "valid", "invalid"), author="hand", limit=50)
+                    if d["path"] == rel
+                ]
+                same = next(
+                    (d for d in existing_open if d["body"] == text and d["base_version"] == live_blob),
+                    None,
+                )
+                if same is not None:
+                    if same["state"] == "invalid":
+                        probs = [
+                            p for st in (same.get("check_report") or {}).get("stages", ())
+                            for p in st.get("problems", ())
+                        ]
+                        _log_invalid_hand_once(root, rel, blob_sha, "; ".join(probs) or "invalid hand edit")
+                    continue
+                old_bytes = _live_bytes(root, rel)
+                report = configcheck.check(
+                    kind, item_name, rel, text, author="hand", config_dir=root, old_bytes=old_bytes
+                )
+                diff_text = drafts._unified_diff(rel, old_bytes, text)
+                with foundation.tx() as c, principals.acting("hand"):
+                    for prior in existing_open:
+                        if prior["state"] == "valid":
+                            drafts.move(c, prior["numeric_id"], "valid", "superseded",
+                                        reason="replaced by newer hand edit", sync_inbox=False)
+                        elif prior["state"] in ("draft", "invalid"):
+                            drafts.move(c, prior["numeric_id"], prior["state"], "discarded",
+                                        reason="replaced by newer hand edit", sync_inbox=False)
+                    draft_num = drafts.add(
+                        c,
+                        kind=kind,
+                        name=item_name,
+                        origin=origin_of(rel),
+                        path=rel,
+                        base_version=live_blob,
+                        body=text,
+                        diff=diff_text,
+                        author="hand",
+                        why=f"hand edit: {rel}",
+                        gate=report["gate"],
+                        check_report=report,
+                        validator=str(report.get("validator") or ""),
+                        state="draft",
+                        evidence=[],
+                        sync_inbox=False,
+                    )
+                    if report["ok"]:
+                        drafts.move(c, draft_num, "draft", "valid", sync_inbox=False)
+                    else:
+                        drafts.move(c, draft_num, "draft", "invalid", sync_inbox=False)
+                    inbox.sync(c, "proposals")
+                    inbox.sync(c, "config")
+                if not report["ok"]:
+                    probs = [p for st in report["stages"] for p in st.get("problems", ())]
+                    _log_invalid_hand_once(root, rel, blob_sha, "; ".join(probs) or "configcheck failed")
+                    continue
+                with _LOG_GUARD:
+                    _INVALID_HAND_LOGGED.pop(key, None)
+                if report["gate"] in ("A", "B"):
+                    sha = _commit_files_locked(
+                        root,
+                        {rel: raw},
+                        "hand",
+                        "hand",
+                        note=f"hand edit: {rel}",
+                        draft_id=drafts.format_id(draft_num),
+                        fence=owned,
+                        write_files=False,
+                    )
+                    committed.append(sha)
+                # Gate C hand draft stays valid with one proposal item and live unchanged.
+                continue
+
             try:
                 _validate_content(rel, raw, root)
             except ConfigRepoError as e:
-                with _LOG_GUARD:
-                    if _INVALID_HAND_LOGGED.get(key) != blob_sha:
-                        _INVALID_HAND_LOGGED[key] = blob_sha
-                        print(f"config hand edit not committed ({rel}): {util.first_line(str(e), 200)}",
-                              file=sys.stderr, flush=True)
+                _log_invalid_hand_once(root, rel, blob_sha, str(e))
                 continue
             with _LOG_GUARD:
                 _INVALID_HAND_LOGGED.pop(key, None)

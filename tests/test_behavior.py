@@ -4352,18 +4352,18 @@ class WorkspaceRuleWorkerTests(_WorkspaceChildCase):
     def test_approval_launches_rule_worker_with_its_own_workspace_owner(self):
         self.run_child(WORKSPACE_REPO + r"""
 from types import SimpleNamespace
-from arete import control, dashboard, gh, miner
+from arete import control, dashboard, drafts, gh, miner
 from arete.commands.tasks import cmd_file_rule
-from arete.store import approvals
 
 rid = record.start("miner", status="done")
-approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
-                                change="Add a rule", why="fixture"), "approve")
-proposal, = approvals.proposals(status=["approve"])
+pid = drafts.add_miner_draft(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
+                                       change="Add a rule", why="fixture"), state="valid")
+proposal = drafts.miner_view(drafts.get(pid))
 ws = paths.WORKTREES_DIR / f"{repo.name}-rule-{proposal['id']}"
 assert "ARETE_RUN_ID" not in os.environ
 spawn = Mock(return_value=SimpleNamespace(pid=1, wait=lambda: 0))
-with patch.object(control, "subprocess", SimpleNamespace(Popen=spawn, DEVNULL=-3, STDOUT=-2)):
+with (patch.object(config, "load_or_problem", return_value=(cfg, "")),
+      patch.object(control, "subprocess", SimpleNamespace(Popen=spawn, DEVNULL=-3, STDOUT=-2))):
     assert dashboard.approve_rule(proposal["id"]) == {"id": proposal["id"]}
 spawn.assert_called_once()
 assert spawn.call_args.args[0] == control.command(["file-rule", str(proposal["id"]), "--local"])
@@ -4385,7 +4385,7 @@ with (patch.dict(os.environ, env, clear=True),
 row, = workspaces.by_state("removed")
 assert row["name"] == ws.name and row["owner_run"] == worker_run
 assert not ws.exists() and not registered(ws)
-assert approvals.proposal(proposal["id"])["status"] == "approve"
+assert drafts.get(proposal["id"])["state"] == "valid"
 """)
 
 
@@ -5535,21 +5535,25 @@ class WorkspaceRuleMigrationTests(_WorkspaceChildCase):
 from argparse import Namespace
 from arete import control, miner
 from arete.commands.tasks import cmd_file_rule
-from arete.store import approvals
 
 repo = config.Repo("sample", paths.WORKTREES_DIR)
 legacy = paths.STATE_DIR / "workspaces"
 legacy.mkdir(exist_ok=True)
 cfg = config.Config(repos=[repo], workspace_snapshots=legacy)
 rid = record.start("miner", status="done")
-approvals.add_proposal(rid, dict(repo=repo.name, layer="global", file=miner.GLOBAL_RULES,
-                                change="Add a rule", why="fixture"), "approve")
-proposal, = approvals.proposals(status=["approve"])
+with db.db() as c:
+    pid = c.execute(
+        "INSERT INTO proposals (run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (rid, "global", repo.name, miner.GLOBAL_RULES, "Add a rule", "fixture", "[]", 0.9, "approve", "", util.iso()),
+    ).lastrowid
+proposal = {"id": pid}
 assert schema_version() == 24
 
 def push(cfg, repo, p):
     assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
-    assert approvals.proposal(p["id"])["status"] == "filing"
+    with db.reader() as c:
+        assert c.execute("SELECT status FROM proposals WHERE id = ?", (p["id"],)).fetchone()["status"] == "filing"
     workspaces.claim(paths.WORKTREES_DIR / "rule-fixture", repo.name, "", rid)
     assert schema_version() == db.WORKSPACE_CONTRACT_SCHEMA
     return "main"
@@ -5560,7 +5564,8 @@ with (patch.dict(os.environ, {control.WORKER_ENV: "file-rule"}), patch.object(db
     assert cmd_file_rule(Namespace(id=proposal["id"], local=True)) == 0
     pushed.assert_called_once()
     caught_up.assert_called_once_with(repo, "main")
-assert approvals.proposal(proposal["id"])["status"] == "merged"
+with db.reader() as c:
+    assert c.execute("SELECT status FROM proposals WHERE id = ?", (proposal["id"],)).fetchone()["status"] == "merged"
 """)
 
 
@@ -7318,7 +7323,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == ("kinds", *configkinds.VERBS)
+            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try")
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
                        for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
@@ -7349,7 +7354,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
                 with mock.patch("sys.stdin", stdin), redirect_stdout(StringIO()) as output:
                     assert parser.parse_args(["mcp-config"]).fn(None) == 0
             tools, selected = (json.loads(line)["result"] for line in output.getvalue().splitlines())
-            assert {tool["name"] for tool in tools["tools"]} == {"config_" + verb for verb in ops}
+            assert {tool["name"] for tool in tools["tools"]} == {"config_" + verb for verb in ("kinds", *configkinds.VERBS)}
             assert all(tuple(tool["inputSchema"]["properties"]["kind"]["enum"]) == kinds
                        for tool in tools["tools"] if tool["name"] != "config_kinds")
             assert not selected["isError"]
@@ -8283,8 +8288,10 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
         with self.serve_at(seen), mock.patch.object(control, "detach", side_effect=detach), \
                 mock.patch.object(control, "subprocess", child), \
                 mock.patch.object(miner, "file_rule", return_value="filed") as file_rule:
-            approvals_store.add_proposal("", {"repo": "replay-sample"}, "approve")
-            number = approvals_store.proposals()[0]["id"]
+            from arete import drafts
+
+            cfg_cur = config.load()
+            number = drafts.add_miner_draft("", {"layer": "global", "repo": cfg_cur.global_repo, "file": miner.GLOBAL_RULES}, state="valid")
             code, lines, err = self.cli(f"file-rule {number}")
             self.assertEqual(code, 0, (lines, err))
             file_rule.assert_called_once_with(number)
@@ -9715,8 +9722,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 129)
-        self.assertEqual(len({op["name"] for op in operations}), 129)
+        self.assertEqual(len(operations), 137)
+        self.assertEqual(len({op["name"] for op in operations}), 137)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -11864,8 +11871,11 @@ with record_config_writes() as callers:
               'settings': winner_set, 'inheritors': winner_inh}
     with redirect_stdout(StringIO()):
         assert optimize.apply_winner(exp_dir, trail, [search_ev, end_ev], end_ev) == 0
-    assert config.load().steps['build']['effort'] == 'low'
+    assert config.load().steps['build']['effort'] == 'medium'
     applied_events = [json.loads(line) for line in trail.read_text().splitlines() if line.strip()]
+    from arete import drafts as drafts_mod
+    drafts_mod.activate(applied_events[-1]['draft'], 'hand', settings.current_version())
+    assert config.load().steps['build']['effort'] == 'low'
     with redirect_stdout(StringIO()):
         assert optimize.roll_back(exp_dir, trail, [search_ev, end_ev, *applied_events]) == 0
     assert config.load().steps['build']['effort'] == 'medium'
@@ -12284,21 +12294,32 @@ with api_server(scopes=('read', 'config:activate')) as (api, _):
     assert parsed['steps']['implement']['tier'] == 'fast' and parsed['steps']['implement']['provider'] == 'anthropic'
     assert '# keep this comment' in paths.CONFIG_FILE.read_text()
 
-    # Reset clears owned fields at [steps.implement] while keeping table & unrelated fields
+    # Reset clears owned fields at [steps.implement] (touches runner -> Gate C -> 202 awaiting_presence, then session approve)
     _, raw2 = api.request('PATCH', '/api/v1/settings', {
         'base_version': after_patch['version'],
         'values': {'roles': [{'role': 'build', 'runner': None, 'model': None, 'effort': None}]},
-    }, headers={'Idempotency-Key': 'role-reset-1'})
-    after_reset = json.loads(raw2)['settings']
+    }, headers={'Idempotency-Key': 'role-reset-1'}, status=202)
+    def2 = json.loads(raw2)
+    assert def2['state'] == 'awaiting_presence'
+    from arete import inbox as inbox_mod
+    from arete.store import tokens as tok_store
+    sess_cred = tok_store.Credential('sess1', 'u:owner', 'owner', 'u:owner', 'session', frozenset({'*'}), '', '', '', None)
+    item2 = api.read(def2['watch'])['item']
+    inbox_mod.resolve(item2['id'], base_version=item2['version'], verb='approve', credential=sess_cred)
+    after_reset = api.read('/api/v1/settings')['settings']
     b_reset = {r['role']: r for r in after_reset['values']['roles']}['build']
     assert b_reset['overrides'] == {'models': {}, 'steps': {'implement': {}}}
 
-    # Atomic restore puts back exact alias key, simultaneous legacy+step models, raw strings, and keeps non-owned fields
+    # Atomic restore puts back exact alias key, simultaneous legacy+step models, raw strings, and keeps non-owned fields (touches runner -> Gate C)
     _, raw3 = api.request('PATCH', '/api/v1/settings', {
         'base_version': after_reset['version'],
         'values': {'roles': [{'role': 'build', 'restore': snap_build}]},
-    }, headers={'Idempotency-Key': 'role-restore-1'})
-    after_restore = json.loads(raw3)['settings']
+    }, headers={'Idempotency-Key': 'role-restore-1'}, status=202)
+    def3 = json.loads(raw3)
+    assert def3['state'] == 'awaiting_presence'
+    item3 = api.read(def3['watch'])['item']
+    inbox_mod.resolve(item3['id'], base_version=item3['version'], verb='approve', credential=sess_cred)
+    after_restore = api.read('/api/v1/settings')['settings']
     b_restored = {r['role']: r for r in after_restore['values']['roles']}['build']
     assert b_restored['overrides'] == snap_build
     parsed3 = tomllib.loads(paths.CONFIG_FILE.read_text())
@@ -12944,13 +12965,21 @@ class InboxTests(_InboxCase):
             c2 = chats_store.chat_add("Draft two")
             chats_store.chat_say(c2, "assistant", "draft", draft_title="Second draft", draft_body="Body 2")
 
-            # 5. 4 proposals (memory, hand, approve, filing).
-            for status, title in (("memory", "Mem"), ("hand", "Hand"), ("approve", "Appr"), ("filing", "File")):
-                approvals_store.add_proposal(
-                    f"r-p-{status}",
-                    {"layer": "repo", "repo": "fixture", "file": f"{status}.md",
-                     "change": f"Change {title}", "why": f"Detail {status}"},
-                    status,
+            # 5. 4 miner drafts (memory, hand, approve, pending).
+            from arete import drafts as drafts_mod
+            from arete import miner as miner_mod
+            cfg_cur = config.load_or_problem()[0]
+            for layer, repo_n, fname, title in (
+                ("memory", "fixture", "memory.md", "Mem"),
+                ("repo", "fixture", ".claude/settings.json", "Hand"),
+                ("global", cfg_cur.global_repo, miner_mod.GLOBAL_RULES, "Appr"),
+                ("repo", "fixture", "pending.md", "Pend"),
+            ):
+                drafts_mod.add_miner_draft(
+                    f"r-p-{title}",
+                    {"layer": layer, "repo": repo_n, "file": fname,
+                     "change": f"Change {title}", "why": f"Detail {title}"},
+                    state="valid",
                 )
 
             # 6. 1 open choice ask.
@@ -12987,7 +13016,7 @@ class InboxTests(_InboxCase):
             self.assertEqual(sum(it["subject"].startswith("skipped:") for it in by_kind["candidate"]), 2)
             self.assertEqual(sum(it["subject"].startswith("ticket:") for it in by_kind["candidate"]), 1)
             self.assertEqual(sum(it["subject"].startswith("chat:") for it in by_kind["proposal"]), 2)
-            self.assertEqual(sum(it["subject"].startswith("proposal:") for it in by_kind["proposal"]), 4)
+            self.assertEqual(sum(it["subject"].startswith("draft:") for it in by_kind["proposal"]), 4)
             self.assertEqual(len(by_kind["choice"]), 1)
             self.assertEqual(len(by_kind["freeform"]), 1)
             self.assertEqual({it["subject"] for it in by_kind["alert"]}, {"alert:disk_low", f"incident:{inc_id}"})
@@ -13079,11 +13108,11 @@ class InboxTests(_InboxCase):
         a2 = approvals_store.add_approval(
             "demo", "r2", {"type": "push", "item": {"title": "A2", "about": "Two", "files": ["b.py"]}}, "A2"
         )
-        approvals_store.add_proposal(
-            "r-p1", {"layer": "repo", "repo": "fixture", "file": "flow.md",
-                     "change": "Improve flow", "why": "Details"}, "hand",
+        from arete import drafts as drafts_mod
+        pid = drafts_mod.add_miner_draft(
+            "r-p1", {"layer": "repo", "repo": "fixture", "file": ".claude/settings.json",
+                     "change": "Improve flow", "why": "Details"}, state="valid",
         )
-        pid = approvals_store.proposals()[0]["id"]
         inbox.sync_all()
 
         with db.reader() as c:
@@ -13099,7 +13128,7 @@ class InboxTests(_InboxCase):
             cookie, _ = self.pair_and_client(server1)
             items = self.http(server1, "GET", self.INBOX, cookie=cookie)[0]["items"]
             by_sub = {it["subject"]: it for it in items}
-            appr1, appr2, prop = by_sub[f"approval:{a1}"], by_sub[f"approval:{a2}"], by_sub[f"proposal:{pid}"]
+            appr1, appr2, prop = by_sub[f"approval:{a1}"], by_sub[f"approval:{a2}"], by_sub[f"draft:{pid}"]
             self.assertEqual(self.http(server1, "GET", "/api/sidebar", cookie=cookie)[0]["needs_you"], 3)
 
             snoozed, _ = self.http(server1, "POST", f"{self.INBOX}/{appr1['id']}/snooze",
@@ -13113,7 +13142,7 @@ class InboxTests(_InboxCase):
             live, _ = self.http(server1, "GET", "/api/live", cookie=cookie)
             self.assertEqual(set(live["needs_you"]), {"approvals", "evidence", "skipped", "proposals", "ready", "draft"})
             self.assertEqual([a["id"] for a in live["needs_you"]["approvals"]["rows"]], [a2])
-            self.assertEqual(live["needs_you"]["proposals"]["rows"], {"memory": [], "hand": [], "approve": []})
+            self.assertEqual(live["needs_you"]["proposals"]["rows"], {"memory": [], "hand": [], "approve": [], "pending": []})
 
             # Snooze a2 with until_changed, then update review text -> reopens with higher version.
             watched, _ = self.http(server1, "POST", f"{self.INBOX}/{appr2['id']}/snooze",
@@ -13195,11 +13224,15 @@ class InboxLifecycleTests(_InboxCase):
                            [{"kind": "choice", "header": "P2", "question": "P2",
                              "options": [{"label": "x", "recommended": True}, {"label": "y"}]}], {})
         record.move(r2, "needs-info", ("running",))
-        approvals_store.add_proposal("r-rej", {"layer": "repo", "repo": "fixture", "file": "rej.md", "change": "Rej", "why": "d"}, "approve")
-        approvals_store.add_proposal("r-app", {"layer": "repo", "repo": "fixture", "file": "app.md", "change": "App", "why": "d"}, "approve")
-        approvals_store.add_proposal("r-fil", {"layer": "repo", "repo": "fixture", "file": "fil.md", "change": "Fil", "why": "d"}, "filing")
-        by_file = {p["file"]: p["id"] for p in approvals_store.proposals()}
-        p_rej, p_app, p_fil = by_file["rej.md"], by_file["app.md"], by_file["fil.md"]
+        from arete import drafts as drafts_mod
+        from arete import miner as miner_mod
+        cfg_cur = config.load_or_problem()[0]
+        p_rej = drafts_mod.add_miner_draft(
+            "r-rej", {"layer": "global", "repo": cfg_cur.global_repo, "file": miner_mod.GLOBAL_RULES, "change": "Rej", "why": "d"}, state="valid",
+        )
+        p_app = drafts_mod.add_miner_draft(
+            "r-app", {"layer": "global", "repo": cfg_cur.global_repo, "file": miner_mod.GLOBAL_RULES, "change": "App", "why": "d"}, state="valid",
+        )
         inbox.sync_all()
 
         from arete import launch_lease
@@ -13242,29 +13275,23 @@ class InboxLifecycleTests(_InboxCase):
 
             # POST /api/proposals/{id}/reject
             self.http(server, "POST", f"/api/proposals/{p_rej}/reject", body={}, cookie=cookie)
-            self.assertEqual(approvals_store.proposal(p_rej)["status"], "rejected")
+            self.assertEqual(drafts_mod.get(p_rej)["state"], "declined")
             rej_item = next(it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
-                            if it["subject"] == f"proposal:{p_rej}")
+                            if it["subject"] == f"draft:{p_rej}")
             self.assertEqual(rej_item["resolution"], "declined")
 
-            # accept on approve proposal leaves item open with answer set; moving to applied resolves cleared.
+            # accept on approve proposal leaves item open with answer set; moving to active resolves cleared.
             open_props = {it["subject"]: it for it in self.http(server, "GET", f"{self.INBOX}?kind=proposal", cookie=cookie)[0]["items"]}
-            app_it = open_props[f"proposal:{p_app}"]
+            app_it = open_props[f"draft:{p_app}"]
             self.http(server, "POST", f"{self.INBOX}/{app_it['id']}/resolve",
                       body={"verb": "accept", "base_version": app_it["version"]}, cookie=cookie)
             detached.assert_called_once()
             still_open, _ = self.http(server, "GET", f"{self.INBOX}/{app_it['id']}", cookie=cookie)
             self.assertEqual(still_open["item"]["state"], "open")
             self.assertTrue(still_open["item"]["answer"])
-            approvals_store.move_proposal(p_app, ("approve", "filing"), "applied")
+            drafts_mod.move(p_app, "valid", "active")
             done_prop, _ = self.http(server, "GET", f"{self.INBOX}/{app_it['id']}", cookie=cookie)
             self.assertEqual((done_prop["item"]["state"], done_prop["item"]["resolution"]), ("resolved", "cleared"))
-
-            # decline on filing proposal -> 409 invalid_state.
-            fil_it = open_props[f"proposal:{p_fil}"]
-            self.http(server, "POST", f"{self.INBOX}/{fil_it['id']}/resolve",
-                      body={"verb": "decline", "base_version": fil_it["version"]}, cookie=cookie,
-                      status=409, code="invalid_state")
 
 
 class InboxConflictTests(_InboxCase):
@@ -17320,10 +17347,10 @@ class _PromptReplayCase(unittest.TestCase):
                 "    paths.CONFIG_FILE.write_text('\\n'.join(cfg_lines) + '\\n', encoding='utf-8')\n"
                 "    configrepo.init()\n"
                 "    return sample_dir, layer_dest\n"
-                "def commit_cfg(rel, content, note='update'):\n"
+                "def commit_cfg(rel, content, note='update', activate_c=False):\n"
                 "    _, base_sha = configrepo.read(rel)\n"
                 "    with configrepo.writer_lock() as fence:\n"
-                "        return configrepo.commit({rel: content}, {rel: base_sha}, actor='hand', source='hand', note=note, fence=fence)\n"
+                "        return configrepo.commit({rel: content}, {rel: base_sha}, actor='hand', source='hand', note=note, fence=fence, activate_c=activate_c)\n"
                 "def rendered_for(run_id, step_name):\n"
                 "    by_step = run_store.step_inputs_by_run(run_id)\n"
                 "    step_row = next(s for s in run_store.steps(run_id) if s['step'] == step_name)\n"
@@ -17389,7 +17416,7 @@ _, layer_dest = setup_sample(adw=True)
 
 # 1. Config-level [steps.verify] prompt = { verify = "grade" } rebinds verify to grade while keeping other defaults.
 base_cfg = paths.CONFIG_FILE.read_text(encoding='utf-8')
-commit_cfg('config.toml', base_cfg + '\n[steps.verify]\nprompt = { verify = "grade" }\n', 'bind verify to grade')
+commit_cfg('config.toml', base_cfg + '\n[steps.verify]\nprompt = { verify = "grade" }\n', 'bind verify to grade', activate_c=True)
 cfg = config.load()
 s_verify, prov_verify = steps.resolve(cfg, config.load_layer(layer_dest), 'verify', '', provenance=True)
 assert s_verify.prompts['verify'] == 'grade'
@@ -17408,7 +17435,7 @@ assert verify_row['prompt_level'] == 'engine', verify_row
 assert 'You are the grader' in verify_rendered, verify_rendered[:200]
 
 # 2. Setting prompt or schema in the sample layer config.toml is a Problem naming the layer and key, and is not applied.
-commit_cfg('config.toml', base_cfg, 'restore default bindings')
+commit_cfg('config.toml', base_cfg, 'restore default bindings', activate_c=True)
 layer_file = layer_dest / 'config.toml'
 orig_layer = layer_file.read_text(encoding='utf-8')
 layer_file.write_text(orig_layer + '\n[steps.verify]\nprompt = { verify = "grade" }\nschema = { verify = "plan" }\n', encoding='utf-8')
@@ -19603,3 +19630,824 @@ assert blockers, "expected live schema_version=48 process to block m0051 contrac
 result = {"ok": True}
 """)
         self.assertTrue(result["ok"])
+
+
+class _ConfigDraftsCase(unittest.TestCase):
+    def run_drafts_child(self, body: str) -> None:
+        import textwrap
+
+        root, env = isolated_behavior_environment(self)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        preamble = textwrap.dedent("""\
+            import hashlib, http.client, json, os, re, shutil, sqlite3, subprocess, sys, threading, tomllib
+            from contextlib import contextmanager, redirect_stdout
+            from datetime import timedelta
+            from io import StringIO
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest import mock
+
+            from arete import (
+                api, config, configcheck, configitems, configrepo, control, dashboard, drafts,
+                gh, inbox, miner, paths, pins, pipeline, principals, record, replay, runner,
+                serve, settings, steps, tailnet, util,
+            )
+            from arete.commands import setup as setup_cmd
+            from arete.lab import optimize
+            from arete.store import (
+                blobs as blob_store,
+                config as config_store,
+                db,
+                inbox as inbox_store,
+                retention as retention_store,
+                runs as run_store,
+                tasks as task_store,
+                tokens as token_store,
+            )
+        """)
+        run_isolated_behavior_child(self, root, env, preamble + "\n" + textwrap.dedent(body))
+
+
+class ConfigDraftsMigrationAndPinsTests(_ConfigDraftsCase):
+    def test_migration_from_proposals_legacy_view_and_inbox(self):
+        self.run_drafts_child(r"""
+            # Migrate through m0055 (just before m0056_config_drafts).
+            chain = db.migrations.load()
+            with mock.patch.object(db.migrations, "load", return_value=chain[:55]):
+                db.migrate()
+            now = util.iso()
+            words = [
+                ("applied", "https://github.com/acme/app/pull/42"),
+                ("pending", ""),
+                ("hand", ""),
+                ("memory", ""),
+                ("approve", ""),
+                ("filing", ""),
+                ("merged", "https://github.com/acme/app/pull/7"),
+                ("rejected", "https://github.com/acme/app/pull/8"),
+                ("skipped", ""),
+                ("filed", ""),
+                (None, ""),
+                ("merge", ""),
+            ]
+            ids_by_word = {}
+            with db.tx() as c:
+                for idx, (status_word, pr_url) in enumerate(words, 1):
+                    cur = c.execute(
+                        "INSERT INTO proposals (run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"min-{idx}", "global" if status_word == "approve" else "repo", "app",
+                         miner.GLOBAL_RULES if status_word == "approve" else f"CLAUDE-{idx}.md",
+                         f"change {idx}", f"why {idx}", json.dumps([f"run-{idx}"]), 0.9,
+                         status_word, pr_url, now),
+                    )
+                    ids_by_word[status_word] = int(cur.lastrowid)
+                # Open legacy proposal:<id> inbox item for the approve row.
+                approve_id = ids_by_word["approve"]
+                inbox_store.raise_item(
+                    c,
+                    kind="proposal",
+                    subject=f"proposal:{approve_id}",
+                    priority=2,
+                    title="Approve global rule",
+                    detail={"id": approve_id, "status": "approve"},
+                    verbs=["accept", "decline"],
+                    options=[],
+                    line="app",
+                )
+
+            # Apply m0055 via migrator.
+            db.migrate()
+
+            expected_states = {
+                "applied": "valid",
+                "pending": "valid",
+                "hand": "valid",
+                "memory": "valid",
+                "approve": "valid",
+                "filing": "valid",
+                "merged": "active",
+                "rejected": "declined",
+                "skipped": "declined",
+                "filed": "discarded",
+                None: "draft",
+                "merge": "draft",
+            }
+            open_items = inbox.list(state="open")
+            assert not any(i["subject"].startswith("proposal:") for i in open_items), open_items
+            by_subject = {}
+            for item in open_items:
+                by_subject.setdefault(item["subject"], []).append(item)
+
+            for word, pid in ids_by_word.items():
+                d = drafts.get(pid)
+                assert d is not None, (word, pid)
+                assert d["legacy_proposal"] == pid, (word, d)
+                assert d["state"] == expected_states[word], (word, d["state"])
+                subj = f"draft:{pid}"
+                if d["state"] in ("active", "declined", "discarded"):
+                    assert subj not in by_subject, (word, by_subject[subj])
+                elif word == "applied":
+                    assert d["pr_url"] == "https://github.com/acme/app/pull/42"
+                    assert subj not in by_subject, by_subject[subj]
+                else:
+                    assert len(by_subject.get(subj, [])) == 1, (word, by_subject.get(subj))
+                    if word is None:
+                        assert "NULL" in by_subject[subj][0]["title"], by_subject[subj][0]
+                    elif word == "merge":
+                        assert "merge" in by_subject[subj][0]["title"], by_subject[subj][0]
+
+            # Legacy proposals VIEW & INSTEAD OF triggers.
+            with db.reader() as c:
+                view_rows = c.execute("SELECT status FROM proposals").fetchall()
+            assert len(view_rows) == 12, len(view_rows)
+
+            with db.tx() as c:
+                c.execute(
+                    "INSERT INTO proposals (run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created) "
+                    "VALUES ('min-view', 'repo', 'app', 'CLAUDE.md', 'via view', 'test', '[]', 0.85, 'pending', '', ?)",
+                    (now,),
+                )
+            inserted = [d for d in drafts.list_drafts(limit=50) if d["body"] == "via view"]
+            assert len(inserted) == 1 and inserted[0]["state"] == "valid", inserted
+
+            with db.tx() as c:
+                c.execute(
+                    "UPDATE proposals SET status = 'merged' WHERE pr_url = ?",
+                    ("https://github.com/acme/app/pull/42",),
+                )
+            applied_after = drafts.get(ids_by_word["applied"])
+            assert applied_after["state"] == "active", applied_after
+        """)
+
+    def test_miner_draft_pins_cited_run_raw_unknown_state_does_not_and_invalid_moves_refuse(self):
+        self.run_drafts_child(r"""
+            db.migrate()
+            repo_dir = paths.STATE_DIR / "app"
+            repo_dir.mkdir(parents=True)
+            util.git(["init", "-q", "-b", "main"], repo_dir)
+            (repo_dir / "CLAUDE.md").write_text("# Rules\n", encoding="utf-8")
+            util.git(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgSign=false", "add", "."], repo_dir)
+            util.git(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgSign=false", "commit", "-qm", "init"], repo_dir)
+
+            paths.CONFIG_FILE.write_text(
+                'alert_repo = "acme/alerts"\n'
+                '[[repo]]\n'
+                'name = "app"\n'
+                f'path = {json.dumps(str(repo_dir))}\n'
+                'github = "acme/app"\n'
+                'mine = true\n',
+                encoding="utf-8",
+            )
+            configrepo.init()
+
+            # Seed a recorded run to cite from miner.run(hours=2, dry_run=False, apply=False).
+            cited_run = record.start("pipeline", repo="app", issue="10")
+            record.settle(cited_run, "done", summary="ok")
+            (paths.RUNS_DIR / cited_run / "record").mkdir(parents=True, exist_ok=True)
+            (paths.RUNS_DIR / cited_run / "record" / "transcript.jsonl").write_text('{"x":1}\n', encoding="utf-8")
+
+            fake_res = runner.Result(
+                ok=True,
+                text="",
+                structured={
+                    "proposals": [{
+                        "layer": "repo",
+                        "repo": "app",
+                        "file": "CLAUDE.md",
+                        "change": "Document test helper rule",
+                        "why": "Observed in recorded run",
+                        "evidence": [cited_run],
+                        "confidence": 0.95,
+                    }],
+                },
+            )
+            fake_recorded = [{
+                "session": cited_run,
+                "kind": "pipeline",
+                "status": "done",
+                "minutes": 1.0,
+                "signals": ["repaired"],
+                "repo": "app",
+                "issue": "10",
+                "items": ["HUMAN: fix test helper"],
+                "signal": 5,
+                "cwd": str(repo_dir),
+            }]
+            with (mock.patch.object(miner, "collect", return_value=[]),
+                  mock.patch.object(miner, "collect_runs", return_value=(fake_recorded, 0)),
+                  mock.patch.object(miner, "worth_mining", side_effect=lambda cfg, rid, sess, recorded=False: sess),
+                  mock.patch.object(runner, "run", return_value=fake_res),
+                  mock.patch.object(gh, "gh", side_effect=AssertionError("gh forbidden"))):
+                rc = miner.run(hours=2, dry_run=False, apply=False)
+            assert rc == 0, rc
+
+            mined = drafts.list_drafts(kind="miner", state="valid")
+            assert len(mined) == 1, mined
+            d1 = mined[0]
+            open_props = [i for i in inbox.list(state="open", kind="proposal") if i["subject"] == f"draft:{d1['numeric_id']}"]
+            assert len(open_props) == 1, open_props
+
+            # Backdate cited_run 40 days -> survives retention prune while draft is valid.
+            old_ts = util.iso(util.now() - timedelta(days=40))
+            with db.tx() as c:
+                c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (old_ts, old_ts, cited_run))
+            rec_dir = paths.RUNS_DIR / cited_run / "record"
+            old_mtime = (util.now() - timedelta(days=40)).timestamp()
+            for entry in list(rec_dir.rglob("*")) + [rec_dir]:
+                os.utime(entry, (old_mtime, old_mtime))
+
+            from arete import retention as ret_mod
+            live_pol = ret_mod.load()
+            retention_store.prune_rows(live_pol, retention_store.measure())
+            retention_store.prune_files()
+            assert rec_dir.is_dir()
+            assert run_store.run_get(cited_run)["records_purged"] is None
+
+            # Invalid transitions raise ValueError and leave state, version, and events_log unchanged.
+            with db.reader() as c:
+                ev_before = c.execute("SELECT count(*) FROM events_log").fetchone()[0]
+            ver_before = d1["version"]
+            for bad_from, bad_to in (("valid", "merge"), ("declined", "active")):
+                try:
+                    drafts.move(d1["numeric_id"], bad_from, bad_to)
+                    raise AssertionError(f"expected ValueError for {bad_from}->{bad_to}")
+                except ValueError:
+                    pass
+            d1_after_bad = drafts.get(d1["numeric_id"])
+            assert d1_after_bad["state"] == "valid" and d1_after_bad["version"] == ver_before
+            with db.reader() as c:
+                assert c.execute("SELECT count(*) FROM events_log").fetchone()[0] == ev_before
+
+            # Resolve inbox item with decline -> next prune removes cited_run's record!
+            inbox.resolve(open_props[0]["id"], base_version=open_props[0]["version"],
+                          verb="decline", reason="not needed", allow_legacy_auth=True)
+            assert drafts.get(d1["numeric_id"])["state"] == "declined"
+            pruned_r = retention_store.prune_rows(live_pol, retention_store.measure())
+            pruned_f = retention_store.prune_files()
+            assert not rec_dir.is_dir(), (pruned_r, pruned_f, run_store.run_get(cited_run), drafts.list_drafts(), list(rec_dir.iterdir()))
+            assert run_store.run_get(cited_run)["records_purged"] is not None
+
+            # Raw SQL state='merge' on a draft citing a 40-day-old run does NOT pin it past prune!
+            raw_run = record.start("pipeline", repo="app", issue="11")
+            record.settle(raw_run, "done", summary="ok")
+            raw_rec_dir = paths.RUNS_DIR / raw_run / "record"
+            raw_rec_dir.mkdir(parents=True, exist_ok=True)
+            (raw_rec_dir / "transcript.jsonl").write_text('{"x":2}\n', encoding="utf-8")
+            for entry in list(raw_rec_dir.rglob("*")) + [raw_rec_dir]:
+                os.utime(entry, (old_mtime, old_mtime))
+            with db.tx() as c:
+                c.execute("UPDATE runs SET started = ?, finished = ? WHERE id = ?", (old_ts, old_ts, raw_run))
+            raw_draft_id = drafts.add(
+                kind="miner",
+                name="repo",
+                origin="repo:app",
+                path="CLAUDE.md",
+                body="bogus state",
+                author="miner",
+                gate="B",
+                state="valid",
+                evidence={"run": raw_run, "cites": [raw_run], "confidence": 0.9},
+            )
+            with db.tx() as c:
+                c.execute("UPDATE config_drafts SET state = 'merge' WHERE id = ?", (raw_draft_id,))
+            retention_store.prune_rows(live_pol, retention_store.measure())
+            retention_store.prune_files()
+            assert not raw_rec_dir.is_dir()
+            assert run_store.run_get(raw_run)["records_purged"] is not None
+        """)
+
+
+class ConfigDraftsCheckGateActivationTests(_ConfigDraftsCase):
+    def test_run_gate_c_refused_check_constraint_and_owner_presence_flow(self):
+        self.run_drafts_child(r"""
+            db.migrate()
+            owner = principals.seed_owner("owner@example.com")
+            with db.tx() as c:
+                token_store.ensure_key(c)
+                _, owner_token = token_store.insert(c, owner, "owner-cli", ["*"])
+                _, sess_text = token_store.insert(
+                    c, owner, "owner-session", ["*"], kind="session",
+                    expires=token_store.session_lifetime(util.now()),
+                )
+            cookie = f"{dashboard.credential_http.COOKIE}={sess_text}"
+
+            paths.CONFIG_FILE.write_text(
+                'alert_repo = "acme/alerts"\nmax_parallel = 2\n[steps.build]\ntimeout_minutes = 30\n',
+                encoding="utf-8",
+            )
+            configrepo.init()
+            live_before = configrepo.live_bytes("config.toml")
+            log_before = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+            with db.reader() as c:
+                idx_before = c.execute("SELECT count(*) FROM config_index").fetchone()[0]
+
+            tool_body = (
+                'alert_repo = "acme/alerts"\nmax_parallel = 2\n'
+                '[steps.build]\ntimeout_minutes = 30\ntools = ["Read", "Write"]\n'
+            )
+            # 1. Draft by run:<id>/build adding a tool passes check with gate C and stays draft.
+            run_draft, report = drafts.create_and_check(
+                "step_settings", "defaults", tool_body, author="run:r-101/build", why="add Bash",
+            )
+            assert report["ok"] is True and report["gate"] == "C", report
+            assert run_draft["state"] == "draft", run_draft
+            for bad_actor in ("run:r-101/build", owner):
+                try:
+                    drafts.activate(run_draft["id"], bad_actor, run_draft["base_version"], presence_passed=True)
+                    raise AssertionError(f"expected refusal for {bad_actor}")
+                except Exception:
+                    pass
+            assert configrepo.live_bytes("config.toml") == live_before
+            assert util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines() == log_before
+            with db.reader() as c:
+                assert c.execute("SELECT count(*) FROM config_index").fetchone()[0] == idx_before
+            # Raw UPDATE to valid violates CHECK constraint!
+            try:
+                with db.tx() as c:
+                    c.execute("UPDATE config_drafts SET state = 'valid' WHERE id = ?", (run_draft["numeric_id"],))
+                raise AssertionError("expected sqlite3.IntegrityError")
+            except sqlite3.IntegrityError:
+                pass
+
+            # 2. Same body drafted via HTTP with owner token -> 202 awaiting_presence -> paired session approve commits!
+            class QuietHandler(dashboard.Handler):
+                def log_request(self, *_):
+                    pass
+
+                def admit(self, method, path):
+                    self.server.tls = object()
+                    try:
+                        return super().admit(method, path)
+                    finally:
+                        self.server.tls = None
+
+            address = "127.0.0.1"
+            node = tailnet.Node((address,), frozenset({address}), address)
+            logins = tailnet.Logins(mock.Mock())
+            with mock.patch.object(logins, "of", return_value="owner@example.com"), \
+                 mock.patch("socket.getfqdn", return_value=address):
+                server = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+                server.daemon_threads = False
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+                thread.start()
+                try:
+                    def req(method, path, body=None, *, headers=None, expected=200):
+                        conn = http.client.HTTPConnection(address, server.server_port, timeout=10)
+                        try:
+                            hdrs = {"Content-Type": "application/json", **(headers or {})}
+                            conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                            resp = conn.getresponse()
+                            raw = resp.read()
+                            data = json.loads(raw) if raw else {}
+                            assert resp.status == expected, (method, path, resp.status, data)
+                            return data, resp
+                        finally:
+                            conn.close()
+
+                    auth_tok = {"Authorization": f"Bearer {owner_token}"}
+                    auth_sess = {"Cookie": cookie, "X-Arete": "1"}
+                    read_res, _ = req("GET", "/api/v1/config/step_settings/defaults", headers=auth_tok)
+                    base_ver = read_res["item"]["version"]
+
+                    draft_res, draft_resp = req(
+                        "PUT", "/api/v1/config/step_settings/defaults/draft",
+                        {"body": tool_body, "why": "owner add Bash"},
+                        headers={**auth_tok, "Idempotency-Key": "draft-tool-1"},
+                        expected=201,
+                    )
+                    assert draft_resp.getheader("ETag"), "missing ETag on config.draft"
+                    owner_draft = draft_res["draft"]
+                    assert owner_draft["gate"] == "C" and owner_draft["state"] == "valid", owner_draft
+
+                    pend, _ = req(
+                        "POST", "/api/v1/config/step_settings/defaults/activate",
+                        {"draft": owner_draft["id"], "base_version": base_ver},
+                        headers={**auth_tok, "Idempotency-Key": "act-tool-1"},
+                        expected=202,
+                    )
+                    assert pend["state"] == "awaiting_presence", pend
+                    pres_item = req("GET", pend["watch"], headers=auth_sess)[0]["item"]
+                    assert pres_item["detail"].get("check_report", {}).get("gate") == "C", pres_item["detail"]
+
+                    req(
+                        "POST", f"/api/v1/inbox/{pres_item['id']}/resolve",
+                        {"verb": "approve", "base_version": pres_item["version"]},
+                        headers={**auth_sess, "Idempotency-Key": "approve-tool-1"},
+                    )
+                    after_draft = drafts.get(owner_draft["id"])
+                    assert after_draft["state"] == "active" and after_draft["activated_commit"], after_draft
+                    live_parsed = tomllib.loads(configrepo.live_bytes("config.toml").decode("utf-8"))
+                    assert live_parsed["steps"]["build"]["tools"] == ["Read", "Write"], live_parsed
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+        """)
+
+    def test_draft_activate_rollback_replay_resolved_and_hand_edits(self):
+        self.run_drafts_child(r"""
+            db.migrate()
+            owner = principals.seed_owner("owner@example.com")
+            with db.tx() as c:
+                token_store.ensure_key(c)
+                _, owner_token = token_store.issue(owner, "owner-cli", ["*"])
+
+            sample_root = paths.STATE_DIR / "sample-root"
+            replay.sample(sample_root)
+            sample_repo = sample_root / "repo"
+
+            base_cfg = (
+                'alert_repo = "acme/alerts"\n'
+                'max_parallel = 2\n'
+                '[steps.build]\n'
+                'timeout_minutes = 25\n'
+                '[[repo]]\n'
+                f'name = "{replay.SAMPLE_REPO}"\n'
+                f'path = {json.dumps(str(sample_repo))}\n'
+                'github = "acme/sample"\n'
+            )
+            paths.CONFIG_FILE.write_text(base_cfg, encoding="utf-8")
+            configrepo.init()
+
+            class QuietHandler(dashboard.Handler):
+                def log_request(self, *_):
+                    pass
+
+            address = "127.0.0.1"
+            node = tailnet.Node((address,), frozenset({address}), address)
+            logins = tailnet.Logins(mock.Mock())
+            with mock.patch.object(logins, "of", return_value="owner@example.com"), \
+                 mock.patch("socket.getfqdn", return_value=address):
+                server = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+                server.daemon_threads = False
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+                thread.start()
+                try:
+                    def req(method, path, body=None, *, headers=None, expected=200):
+                        conn = http.client.HTTPConnection(address, server.server_port, timeout=10)
+                        try:
+                            hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {owner_token}", **(headers or {})}
+                            conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                            resp = conn.getresponse()
+                            raw = resp.read()
+                            data = json.loads(raw) if raw else {}
+                            assert resp.status == expected, (method, path, resp.status, data)
+                            return data, resp
+                        finally:
+                            conn.close()
+
+                    read0 = req("GET", "/api/v1/config/step_settings/defaults")[0]["item"]
+                    ver0 = read0["version"]
+                    cfg_41 = base_cfg.replace("timeout_minutes = 25", "timeout_minutes = 41")
+                    draft_res, _ = req(
+                        "PUT", "/api/v1/config/step_settings/defaults/draft",
+                        {"body": cfg_41, "why": "raise build timeout to 41"},
+                        headers={"Idempotency-Key": "draft-41"},
+                        expected=201,
+                    )
+                    d41 = draft_res["draft"]
+                    assert d41["gate"] == "A" and d41["state"] == "valid", d41
+
+                    act_res, act_resp = req(
+                        "POST", "/api/v1/config/step_settings/defaults/activate",
+                        {"draft": d41["id"], "base_version": ver0},
+                        headers={"Idempotency-Key": "activate-41"},
+                    )
+                    assert act_resp.getheader("ETag"), "missing ETag on config.activate"
+                    commit41 = act_res["commit"]
+                    ver41 = act_res["version"]
+                    assert act_res["draft"]["state"] == "active"
+                    assert act_res["draft"]["activated_commit"] == commit41
+
+                    # Check commit trailers: Arete-Draft: CD-<id> and Arete-Actor: u:<8 hex>.
+                    commit_msg = util.git(["show", "-s", "--format=%B", commit41], paths.CONFIG_DIR)
+                    assert f"Arete-Draft: {d41['id']}" in commit_msg, commit_msg
+                    assert re.search(r"Arete-Actor: u:[0-9a-f]{8}\b", commit_msg), commit_msg
+
+                    # One draft.changed event per move (draft->valid, valid->active).
+                    num41 = drafts.parse_id(d41["id"])
+                    with db.reader() as c:
+                        moves = [
+                            json.loads(r["data"])
+                            for r in c.execute(
+                                "SELECT data FROM events_log WHERE kind = 'draft.changed' AND subject = ? ORDER BY seq",
+                                (f"draft:{num41}",),
+                            ).fetchall()
+                        ]
+                    assert [(m["from"], m["to"]) for m in moves] == [("draft", "valid"), ("valid", "active")], moves
+
+                    # Next replay run's resolved.json has 41, level config, from config.toml@commit41.
+                    pin41 = pins.resolve("pipeline", repo=replay.SAMPLE_REPO)
+                    r41 = record.start("pipeline", repo=replay.SAMPLE_REPO, resolution=pin41)
+                    resolved41 = json.loads((paths.RUNS_DIR / r41 / "resolved.json").read_text(encoding="utf-8"))
+                    b41 = resolved41["settings"]["build"]["timeout_minutes"]
+                    assert b41["value"] == 41 and b41["level"] == "config", b41
+                    assert b41["from"] == f"config.toml@{commit41}", b41
+
+                    # Second activate with stale old ver returns 409 version_conflict.
+                    d_dup = req(
+                        "PUT", "/api/v1/config/step_settings/defaults/draft",
+                        {"body": base_cfg.replace("timeout_minutes = 25", "timeout_minutes = 42")},
+                        headers={"Idempotency-Key": "draft-42"},
+                        expected=201,
+                    )[0]["draft"]
+                    conflict, _ = req(
+                        "POST", "/api/v1/config/step_settings/defaults/activate",
+                        {"draft": d_dup["id"], "base_version": ver0},
+                        headers={"Idempotency-Key": "act-42-stale"},
+                        expected=409,
+                    )
+                    assert conflict["code"] == "version_conflict", conflict
+
+                    # Rollback to ver0 adds 1 commit, earlier commit stays reachable, next resolved.json reads 25,
+                    # and config_index keeps earlier rows with higher ver.
+                    commits_before_rb = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+                    with db.reader() as c:
+                        idx_rows_before = c.execute("SELECT ver, commit_sha FROM config_index WHERE path = 'config.toml'").fetchall()
+                    rb_res, _ = req(
+                        "POST", "/api/v1/config/step_settings/defaults/rollback",
+                        {"to": str(ver0), "base_version": ver41},
+                        headers={"Idempotency-Key": "rb-to-ver0"},
+                    )
+                    commits_after_rb = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+                    assert len(commits_after_rb) == len(commits_before_rb) + 1
+                    assert commit41 in commits_after_rb, "earlier commit must stay reachable"
+                    assert rb_res["version"] > ver41
+                    with db.reader() as c:
+                        idx_rows_after = c.execute("SELECT ver, commit_sha FROM config_index WHERE path = 'config.toml'").fetchall()
+                    assert len(idx_rows_after) >= len(idx_rows_before)
+                    assert max(r["ver"] for r in idx_rows_after) == rb_res["version"]
+
+                    pin_rb = pins.resolve("pipeline", repo=replay.SAMPLE_REPO)
+                    r_rb = record.start("pipeline", repo=replay.SAMPLE_REPO, resolution=pin_rb)
+                    resolved_rb = json.loads((paths.RUNS_DIR / r_rb / "resolved.json").read_text(encoding="utf-8"))
+                    assert resolved_rb["settings"]["build"]["timeout_minutes"]["value"] == 25
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+
+            # Hand edit of timeout_minutes becomes an active draft with author="hand" before control.launch spawns.
+            paths.CONFIG_FILE.write_text(base_cfg.replace("timeout_minutes = 25", "timeout_minutes = 29"), encoding="utf-8")
+            spawn_mock = mock.Mock(return_value=SimpleNamespace(pid=12345, wait=lambda: 0))
+            with mock.patch.object(control, "subprocess", SimpleNamespace(Popen=spawn_mock, DEVNULL=-3, STDOUT=-2)):
+                control.launch(["status"])
+            spawn_mock.assert_called_once()
+            hand_active = [
+                d for d in drafts.list_drafts(author="hand", state="active", kind="step_settings")
+                if "timeout_minutes = 29" in d["body"]
+            ]
+            assert len(hand_active) == 1 and hand_active[0]["activated_commit"], hand_active
+            assert tomllib.loads(configrepo.live_bytes("config.toml").decode("utf-8"))["steps"]["build"]["timeout_minutes"] == 29
+
+            # Hand edit adding a tool stays valid with 1 proposal item and live unchanged;
+            # git commit in config repo is refused by hook unless ARETE_ACTIVATE_C=1 is set.
+            live_before_c = configrepo.live_bytes("config.toml")
+            paths.CONFIG_FILE.write_text(
+                base_cfg.replace("timeout_minutes = 25", 'timeout_minutes = 29\ntools = ["Read", "Write"]'),
+                encoding="utf-8",
+            )
+            committed_c = configrepo.commit_hand_edits()
+            assert committed_c == [], committed_c
+            assert configrepo.live_bytes("config.toml") == live_before_c
+            hand_c = [
+                d for d in drafts.list_drafts(author="hand", state="valid", kind="step_settings")
+                if d["gate"] == "C"
+            ]
+            assert len(hand_c) == 1, hand_c
+            c_items = [i for i in inbox.list(state="open", kind="proposal") if i["subject"] == f"draft:{hand_c[0]['numeric_id']}"]
+            assert len(c_items) == 1, c_items
+
+            # Direct git commit with hook enabled refuses without ARETE_ACTIVATE_C=1, succeeds with ARETE_ACTIVATE_C=1.
+            hook_env = {
+                k: v for k, v in os.environ.items()
+                if not k.startswith("GIT_CONFIG_") and k != "ARETE_ACTIVATE_C"
+            }
+            hook_env.update({
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_AUTHOR_NAME": "hand",
+                "GIT_AUTHOR_EMAIL": "hand",
+                "GIT_COMMITTER_NAME": "hand",
+                "GIT_COMMITTER_EMAIL": "hand",
+            })
+            subprocess.run(["git", "add", "config.toml"], cwd=paths.CONFIG_DIR, env=hook_env, check=True)
+            refused = subprocess.run(
+                ["git", "commit", "-qm", "direct gate C"],
+                cwd=paths.CONFIG_DIR, env=hook_env, capture_output=True, text=True,
+            )
+            assert refused.returncode != 0 and "ARETE_ACTIVATE_C=1" in (refused.stderr + refused.stdout), (refused.returncode, refused.stderr)
+            allowed = subprocess.run(
+                ["git", "commit", "-qm", "direct gate C allowed"],
+                cwd=paths.CONFIG_DIR, env={**hook_env, "ARETE_ACTIVATE_C": "1"}, capture_output=True, text=True,
+            )
+            assert allowed.returncode == 0, allowed.stderr
+        """)
+
+
+class OptimizeDraftWatchAndTryTests(_ConfigDraftsCase):
+    def test_optimize_apply_writes_draft_and_rollback_uses_config_rollback(self):
+        self.run_drafts_child(r"""
+            db.migrate()
+            owner = principals.seed_owner("owner@example.com")
+            sample_dir = paths.STATE_DIR / "opt-repo"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            base_cfg = (
+                'alert_repo = "acme/alerts"\nmax_parallel = 2\n'
+                '[steps.build]\nmodel = "sonnet"\ntimeout_minutes = 20\n'
+                '[[repo]]\nname = "sample"\n'
+                f'path = {json.dumps(str(sample_dir))}\ngithub = "acme/sample"\n'
+            )
+            paths.CONFIG_FILE.write_text(base_cfg, encoding="utf-8")
+            configrepo.init()
+            live_before = configrepo.live_bytes("config.toml")
+            disk_before = paths.CONFIG_FILE.read_text(encoding="utf-8")
+
+            cfg_loaded = config.load()
+            empty_layer = config.load_layer(cfg_loaded.repo("sample").layer_dir)
+            baseline_build = optimize.settled_now(cfg_loaded, empty_layer, "build")
+            new_build = "haiku-fast-override"
+            folder = paths.STATE_DIR / "opt-search"
+            folder.mkdir(parents=True, exist_ok=True)
+            trail = folder / "search.jsonl"
+            found = [
+                {
+                    "event": "search",
+                    "design": {"atom": "build", "repo": "sample"},
+                    "baseline": {"settings": baseline_build, "inheritors": {}},
+                },
+                {"event": "trial", "run_id": "trial-1"},
+                {"event": "trial", "run_id": "trial-2"},
+            ]
+            end = {
+                "event": "done",
+                "promotable": True,
+                "why": "better score",
+                "champion": "haiku-fast",
+                "overrides": {"model": "haiku", "effort": "low"},
+                "settings": new_build,
+                "inheritors": {},
+            }
+            with mock.patch.object(optimize, "refusal_for", return_value=lambda _cfg: ""):
+                rc_apply = optimize.apply_winner(folder, trail, found, end)
+            assert rc_apply == 0, rc_apply
+            opt_drafts = drafts.list_drafts(author="optimize", state="valid", kind="step_settings")
+            assert len(opt_drafts) == 1, opt_drafts
+            opt_draft = opt_drafts[0]
+            assert opt_draft["state"] == "valid", opt_draft
+            assert opt_draft["author"] == "optimize", opt_draft
+            assert opt_draft["gate"] == "B", opt_draft
+            assert opt_draft["evidence"] == ["trial-1", "trial-2"], opt_draft["evidence"]
+            assert configrepo.live_bytes("config.toml") == live_before
+            assert paths.CONFIG_FILE.read_text(encoding="utf-8") == disk_before
+            prop_items = [i for i in inbox.list(state="open", kind="proposal") if i["subject"] == f"draft:{opt_draft['numeric_id']}"]
+            assert len(prop_items) == 1, prop_items
+
+            # Activate that draft, then verify optimize.roll_back() rolls back via config.rollback (new commit).
+            ver_before = config_store.live_item("step_settings", "defaults")["ver"]
+            drafts.activate(opt_draft["id"], owner, ver_before)
+            assert tomllib.loads(configrepo.live_bytes("config.toml").decode("utf-8"))["steps"]["build"]["model"] == "haiku"
+            commits_before = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+            trail_events = [json.loads(line) for line in trail.read_text(encoding="utf-8").splitlines() if line.strip()]
+            with principals.acting(owner):
+                rb_rc = optimize.roll_back(folder, trail, [*found, *trail_events])
+            assert rb_rc == 0, rb_rc
+            commits_after = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+            assert len(commits_after) == len(commits_before) + 1
+            assert configrepo.live_bytes("config.toml") == live_before
+        """)
+
+    def test_watch_regression_and_config_try_on_draft_ref(self):
+        self.run_drafts_child(r"""
+            db.migrate()
+            owner = principals.seed_owner("owner@example.com")
+            with db.tx() as c:
+                token_store.ensure_key(c)
+                _, owner_token = token_store.issue(owner, "owner-cli", ["*"])
+
+            base_cfg = 'alert_repo = "acme/alerts"\nmax_parallel = 2\n[steps.build]\ntimeout_minutes = 20\n'
+            paths.CONFIG_FILE.write_text(base_cfg, encoding="utf-8")
+            configrepo.init()
+            old_item = config_store.live_item("step_settings", "defaults")
+            old_bytes = configrepo.live_bytes("config.toml")
+
+            # Activate a step_settings change (timeout_minutes = 35).
+            new_cfg = base_cfg.replace("timeout_minutes = 20", "timeout_minutes = 35")
+            d, _ = drafts.create_and_check("step_settings", "defaults", new_cfg, author=owner, why="raise timeout")
+            act = drafts.activate(d["id"], owner, old_item["ver"])
+            new_item = config_store.live_item("step_settings", "defaults")
+
+            def seed_settled(status: str, ver_row: dict, idx: int) -> str:
+                rid = record.start("pipeline", repo="sample", issue=f"w-{idx}")
+                run_store.insert_steps(
+                    rid,
+                    "build",
+                    [(runner.Result(ok=(status == "done"), text="", runner="", model=""), 1.0)],
+                    inputs=[{
+                        "role": "step_settings",
+                        "name": "defaults",
+                        "version": ver_row["version"],
+                        "level": "config",
+                        "sha256": ver_row["sha256"],
+                        "call": 1,
+                    }],
+                )
+                record.settle(rid, status, summary=status)
+                return rid
+
+            # Seed 10 passed runs pinning old version, then 10 failed runs pinning new version.
+            for i in range(10):
+                seed_settled("done", old_item, i)
+            for i in range(10, 20):
+                seed_settled("failed", new_item, i)
+
+            live_before_watch = configrepo.live_bytes("config.toml")
+            watch_res = drafts.watch_tick()
+            assert len(watch_res) == 1 and watch_res[0]["watch"] == "drop", watch_res
+            assert configrepo.live_bytes("config.toml") == live_before_watch
+
+            watch_items = inbox.list(state="open", kind="watch")
+            assert len(watch_items) == 1, watch_items
+            wi = watch_items[0]
+            assert wi["subject"] == f"draft:{d['numeric_id']}"
+            assert wi["verbs"] == ["roll_back", "continue"], wi["verbs"]
+
+            # 11th failed run raises no second watch item and no second watch event!
+            seed_settled("failed", new_item, 21)
+            assert drafts.watch_tick() == []
+            assert len(inbox.list(state="open", kind="watch")) == 1
+            with db.reader() as c:
+                watch_events = c.execute(
+                    "SELECT count(*) FROM events_log WHERE kind = 'draft.changed' AND subject = ? "
+                    "AND json_extract(data, '$.watch') IS NOT NULL",
+                    (f"draft:{d['numeric_id']}",),
+                ).fetchone()[0]
+            assert watch_events == 1, watch_events
+
+            # Resolve watch item with roll_back -> adds 1 commit back to old bytes.
+            commits_before = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+            with principals.acting(owner):
+                inbox.resolve(wi["id"], base_version=wi["version"], verb="roll_back", allow_legacy_auth=True)
+            commits_after = util.git(["log", "--format=%H", "live"], paths.CONFIG_DIR).strip().splitlines()
+            assert len(commits_after) == len(commits_before) + 1
+            assert configrepo.live_bytes("config.toml") == old_bytes
+
+            # Test POST /api/v1/config/step_settings/defaults/try -> commits on refs/drafts/CD-<id>, never live,
+            # starts trial run(s) pinned to that commit delivering nothing, records IDs in draft.evidence.
+            class QuietHandler(dashboard.Handler):
+                def log_request(self, *_):
+                    pass
+
+            address = "127.0.0.1"
+            node = tailnet.Node((address,), frozenset({address}), address)
+            logins = tailnet.Logins(mock.Mock())
+            with mock.patch.object(logins, "of", return_value="owner@example.com"), \
+                 mock.patch("socket.getfqdn", return_value=address):
+                server = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+                server.daemon_threads = False
+                thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+                thread.start()
+                try:
+                    def req(method, path, body=None, *, headers=None, expected=200):
+                        conn = http.client.HTTPConnection(address, server.server_port, timeout=10)
+                        try:
+                            hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {owner_token}", **(headers or {})}
+                            conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                            resp = conn.getresponse()
+                            raw = resp.read()
+                            data = json.loads(raw) if raw else {}
+                            assert resp.status == expected, (method, path, resp.status, data)
+                            return data, resp
+                        finally:
+                            conn.close()
+
+                    live_tip_before = util.git(["rev-parse", "live"], paths.CONFIG_DIR).strip()
+                    try_cfg = base_cfg.replace("timeout_minutes = 20", "timeout_minutes = 33")
+                    try_draft_row = req(
+                        "PUT", "/api/v1/config/step_settings/defaults/draft",
+                        {"body": try_cfg, "why": "try 33"},
+                        headers={"Idempotency-Key": "draft-try-33"},
+                        expected=201,
+                    )[0]["draft"]
+                    try_res, _ = req(
+                        "POST", "/api/v1/config/step_settings/defaults/try",
+                        {"draft": try_draft_row["id"], "steps": ["build"]},
+                        headers={"Idempotency-Key": "try-draft-33"},
+                        expected=201,
+                    )
+                    assert util.git(["rev-parse", "live"], paths.CONFIG_DIR).strip() == live_tip_before
+                    assert try_res["ref"] == f"refs/drafts/{try_draft_row['id']}"
+                    ref_sha = util.git(["rev-parse", try_res["ref"]], paths.CONFIG_DIR).strip()
+                    assert ref_sha == try_res["commit"] and ref_sha != live_tip_before
+                    assert len(try_res["runs"]) == 1
+                    trial_id = try_res["runs"][0]
+                    trial_run = run_store.run_get(trial_id)
+                    assert trial_run["config_commit"] == ref_sha and not trial_run.get("pr_url"), trial_run
+                    reloaded = drafts.get(try_draft_row["id"])
+                    assert trial_id in reloaded["evidence"], reloaded["evidence"]
+                finally:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+        """)

@@ -551,6 +551,15 @@ class Check:
             )
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
+        from . import drafts as drafts_mod
+
+        cur_cfg_text = paths.CONFIG_FILE.read_text()
+        alt_cfg_text = cur_cfg_text.replace("max_parallel = 3", "max_parallel = 4", 1)
+        if alt_cfg_text == cur_cfg_text:
+            alt_cfg_text = cur_cfg_text.replace("max_parallel = 2", "max_parallel = 4", 1)
+        draft_for_activate, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture activate")
+        draft_for_try, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture try")
+        draft_for_discard, _ = drafts_mod.create_and_check("step_settings", "defaults", alt_cfg_text, author="hand", why="fixture discard")
         identities = {"task": self.task, "run": self.run, "step": str(turn_step["id"]),
                       "node": str(turn_step.get("node") or turn_step["step"]), "try": str(turn_step.get("try") or 1),
                       "n": "1", "ticket": send_ticket.ref,
@@ -558,7 +567,7 @@ class Check:
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
-                      "device": "local", "lease": fixture_lease.label}
+                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
@@ -590,6 +599,17 @@ class Check:
                     values["rev"] = cur_ob["rev"]
             if name == "config.diff":
                 values["from"], values["to"] = "1", "2"
+            if name in ("config.draft", "config.check"):
+                values["body"] = alt_cfg_text
+            if name == "config.activate":
+                values["draft"] = draft_for_activate["id"]
+                values["base_version"] = self.read("/api/v1/config/step_settings/defaults")["item"]["version"]
+            if name == "config.rollback":
+                values["to"] = 2
+                values["base_version"] = self.read("/api/v1/config/step_settings/defaults")["item"]["version"]
+            if name == "config.try":
+                values["draft"] = draft_for_try["id"]
+                values["steps"] = ["plan"]
             if name == "settings.update":
                 values["base_version"] = self.read("/api/v1/settings")["settings"]["version"]
             if name == "task.create":
