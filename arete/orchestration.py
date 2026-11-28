@@ -2032,7 +2032,7 @@ class Controller(worker_turns.WorkerTurns):
             if catch_up:
                 for c in changed:
                     pipeline.publish_gate_evidence(self.run, self.job.ticket, c, self.job.verified, self.job.review)
-        failure = self.publication_ci(changed) if self.run.repo.parts else None
+        failure = self.publication_ci(changed) if self.run.repo.parts and not flows.direct_push_info(self.job) else None
         if publication:
             publication.recheck(during="before recording publication")
             self.data["publication"] = outcome.data
