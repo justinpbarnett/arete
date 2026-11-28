@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 151)
-        self.assertEqual(len({op["name"] for op in operations}), 151)
+        self.assertEqual(len(operations), 152)
+        self.assertEqual(len({op["name"] for op in operations}), 152)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

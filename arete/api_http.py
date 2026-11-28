@@ -145,8 +145,26 @@ def problem(status, answer):
             "status": status, "detail": answer["error"]}
 
 
+_ETAG_CONTEXT = threading.local()
+
+
+def set_etag_context(token: tuple[str, str] | None) -> None:
+    _ETAG_CONTEXT.token = token
+
+
+def take_etag_context(seq: str) -> str | None:
+    token = getattr(_ETAG_CONTEXT, "token", None)
+    _ETAG_CONTEXT.token = None
+    if isinstance(token, tuple) and len(token) == 2 and token[0] == seq:
+        return token[1]
+    return None
+
+
 def etag(payload, kind, seq):
+    extra = take_etag_context(seq)
     key = f"{kind}\0{seq}\0".encode() + payload
+    if extra is not None:
+        key += b"\0" + extra.encode("utf-8")
     return f'"{hashlib.sha256(key).hexdigest()}"'
 
 
