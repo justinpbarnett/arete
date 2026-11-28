@@ -27,7 +27,8 @@ from arete import (
 from arete.store import db as foundation
 from arete.store import feedback as feedback_store
 
-isolate_live_state()
+def setUpModule():
+    isolate_live_state()
 
 
 def _serve_env(test: unittest.TestCase, state: dict) -> str:
@@ -44,8 +45,9 @@ def _serve_env(test: unittest.TestCase, state: dict) -> str:
         def log_message(self, *args):
             pass
 
-    server = test.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), API))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+        server = test.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), API))
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     test.addCleanup(thread.join, 5)
     test.addCleanup(server.shutdown)
