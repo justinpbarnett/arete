@@ -40,6 +40,7 @@ from . import (
     diffguard,
     document,
     environment,
+    external_evidence,
     factory,
     gh,
     intake,
@@ -3528,15 +3529,12 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     elif t.blocker and not run.force:
         return "skipped", t.blocker, ""
     try:
-        images = tk.save_images(t, run.dir / "images")
+        attachments, attachment_dirs, _manifest = collect_ticket_attachments(tk, t, run.dir, log=run.log)
     except tracker.ERRORS as e:
         return "failed", f"could not download the images on {run.ref}: {e}", ""
-    if images.paths:
-        run.add_dirs.append(run.dir / "images")
-        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
-    if images.left_out:
-        run.log(f"images: left out {', '.join(images.left_out)}")
-    attachments = images_note(images)
+    for d in attachment_dirs:
+        if d not in run.add_dirs:
+            run.add_dirs.append(d)
 
     main_layer = checked_layer(cfg, repo.layer_dir)
     branch = run.preview_branch or open_branch(run) or prompt_loader.fill_template(
@@ -5728,15 +5726,90 @@ def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
         run.log(f"ci: could not comment on {c.pr} for head {c.lease}: {util.first_line(str(e), 300)}")
 
 
-def images_note(images: tracker.SavedImages) -> str:
-    rows = []
-    if images.paths:
-        rows += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
-        rows += [f"- `{p}`" for p in images.paths]
-    if images.left_out:
-        rows += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
-                      f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+def images_note(images: tracker.SavedImages, *, ticket_ref: str = "") -> str:
+    if not images.outcomes:
+        rows = []
+        if images.paths:
+            rows += ["## Images on the issue", "", "Open each one with Read; they show what the issue describes.", ""]
+            rows += [f"- `{p}`" for p in images.paths]
+        if images.left_out:
+            rows += ["", (f"Not downloaded, over the {tracker.MAX_IMAGES} image or "
+                          f"{tracker.MAX_IMAGE_BYTES // 2**20} MB cap: {', '.join(images.left_out)}")]
+        return "\n".join(rows).strip()
+
+    label = f" on {ticket_ref}" if ticket_ref else " on the issue"
+    resolved = [o for o in images.outcomes if o.ok]
+    unresolved = [o for o in images.outcomes if not o.ok]
+    rows = [f"## Media{label}"]
+    if resolved:
+        rows += ["", "Open each screenshot or extracted recording frame with Read; they show what the ticket describes.", ""]
+        for outcome in resolved:
+            source_label = "ticket description" if outcome.ref.source == "body" else "ticket comment"
+            if outcome.media_kind == "video":
+                dur = f", {outcome.duration_seconds:.1f}s" if outcome.duration_seconds else ""
+                rows.append(f"- Recording (from {source_label}{dur}): `{outcome.path}`")
+                if outcome.keyframes:
+                    rows.append("  - Extracted frames in chronological order (inspect each with Read):")
+                    rows.extend(f"    - `{frame}`" for frame in outcome.keyframes)
+                if outcome.detail:
+                    rows.append(f"  - Note: {outcome.detail}")
+            else:
+                rows.append(f"- Screenshot (from {source_label}): `{outcome.path}`")
+    if unresolved:
+        rows += ["", "### Unreadable or inaccessible media", ""]
+        for outcome in unresolved:
+            source_label = "ticket description" if outcome.ref.source == "body" else "ticket comment"
+            name = outcome.ref.name or outcome.ref.attachment_id or outcome.ref.url or "attachment"
+            detail = f": {outcome.detail}" if outcome.detail else ""
+            rows.append(f"- `{outcome.status}` (from {source_label}) {name}{detail}")
     return "\n".join(rows).strip()
+
+
+def collect_ticket_attachments(
+    tk: tracker.Tracker,
+    t: tracker.Ticket,
+    run_dir: Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    external_kwargs: dict | None = None,
+) -> tuple[str, list[Path], dict]:
+    ticket_ref = t.ref or t.id
+    images = tk.save_images(t, run_dir / "images")
+    evidence = external_evidence.resolve_ticket_evidence(t, run_dir / "evidence", **(external_kwargs or {}))
+    add_dirs: list[Path] = []
+    if images.paths:
+        add_dirs.append(run_dir / "images")
+        if log:
+            log(f"images: saved {util.count(len(images.paths), 'media file')} from {ticket_ref}")
+    if images.left_out and log:
+        log(f"images: left out {', '.join(images.left_out)}")
+    unresolved_media = [o for o in images.outcomes if not o.ok]
+    if unresolved_media and log:
+        summary = ", ".join(f"{o.ref.name or o.ref.attachment_id or 'media'} ({o.status})" for o in unresolved_media)
+        log(f"images: unresolved media on {ticket_ref}: {summary}")
+    if evidence.paths:
+        add_dirs.append(run_dir / "evidence")
+        if log:
+            log(f"evidence: resolved {util.count(len(evidence.resolved()), 'linked source')} from {ticket_ref}")
+    unresolved_ext = evidence.unresolved()
+    if unresolved_ext and log:
+        summary = ", ".join(f"{o.ref.provider} ({o.status})" for o in unresolved_ext)
+        log(f"evidence: unresolved links on {ticket_ref}: {summary}")
+
+    manifest = {
+        "ticket": ticket_ref,
+        "media": [o.to_dict() for o in images.outcomes],
+        "external": [o.to_dict() for o in evidence.outcomes],
+    }
+    if images.outcomes or evidence.outcomes:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "evidence-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    sections = [
+        images_note(images, ticket_ref=ticket_ref),
+        external_evidence.format_evidence_note(evidence, ticket_ref=ticket_ref),
+    ]
+    return "\n\n".join(part for part in sections if part).strip(), add_dirs, manifest
 
 
 def open_branch(run: Run) -> str:
