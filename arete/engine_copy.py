@@ -38,20 +38,24 @@ def copy_path(sha: str) -> Path:
     return engine_dir() / safe_sha(sha)
 
 
-def _make_readonly(root: Path) -> None:
+def _strip_write(path: Path) -> None:
+    mode = path.lstat().st_mode
+    os.chmod(path, stat.S_IMODE(mode) & ~0o222)
+
+
+def _make_readonly(root: Path, *, include_root: bool = True) -> None:
     dirs: list[Path] = []
     for current, _sub, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
-        dirs.append(current_path)
+        if include_root or current_path != root:
+            dirs.append(current_path)
         for name in files:
             entry = current_path / name
             if entry.is_symlink():
                 continue
-            mode = entry.lstat().st_mode
-            os.chmod(entry, stat.S_IMODE(mode) & ~0o222)
+            _strip_write(entry)
     for d in reversed(dirs):
-        mode = d.lstat().st_mode
-        os.chmod(d, stat.S_IMODE(mode) & ~0o222)
+        _strip_write(d)
 
 
 def _remove_tree(root: Path) -> None:
@@ -141,7 +145,7 @@ def ensure(sha: str, source_root: Path | None = None) -> Path:
             if not _extract_git_tree(src, sha, stage):
                 _copy_working_tree(src, stage)
             (stage / ".engine_sha").write_text(f"{sha}\n", encoding="utf-8")
-            _make_readonly(stage)
+            _make_readonly(stage, include_root=False)
             try:
                 os.rename(stage, target)
             except OSError:
@@ -149,6 +153,7 @@ def ensure(sha: str, source_root: Path | None = None) -> Path:
                     _remove_tree(stage)
                     return target
                 raise
+            _strip_write(target)
             return target
         except BaseException:
             _remove_tree(stage)

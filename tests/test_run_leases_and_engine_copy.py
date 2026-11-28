@@ -526,12 +526,18 @@ try:
             assert st1 == 200 and first.get("run"), (st1, first)
             tid, r1 = first["task"], first["run"]
 
-            # Wait until r1 reaches "build: starting" and has recorded its pid + claimed lease.
+            # Wait until r1 reaches "build: starting" and its build step is running (inside replay sleep, no DB tx held).
             r1_log = paths.RUNS_DIR / r1 / "run.log"
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 row1 = run_store.run_get(r1)
-                if row1 and row1.get("pid") and r1_log.exists() and "build: starting" in r1_log.read_text():
+                if (
+                    row1
+                    and row1.get("pid")
+                    and r1_log.exists()
+                    and "build: starting" in r1_log.read_text()
+                    and any(s["step"] == "build" and s.get("status") == "running" for s in run_store.steps(r1))
+                ):
                     r1_pid = int(row1["pid"])
                     break
                 time.sleep(0.03)
@@ -828,13 +834,14 @@ try:
     copy_a = engine_copy.ensure(sha_a, source_root=src_checkout)
     assert copy_a == paths.ENGINE_DIR / sha_a and (copy_a / "arete" / "cli.py").is_file(), copy_a
     assert (copy_a / ".engine_sha").read_text().strip() == sha_a
-    # Read-only check: creating a file inside copy_a/arete must raise PermissionError.
-    ro_blocked = False
-    try:
-        (copy_a / "arete" / "mutate.txt").write_text("nope")
-    except PermissionError:
-        ro_blocked = True
-    assert ro_blocked, "engine copy was not read-only"
+    # Read-only check: creating a file inside copy_a or copy_a/arete must raise PermissionError.
+    for probe_path in (copy_a / "mutate.txt", copy_a / "arete" / "mutate.txt"):
+        ro_blocked = False
+        try:
+            probe_path.write_text("nope")
+        except PermissionError:
+            ro_blocked = True
+        assert ro_blocked, f"engine copy path {probe_path} was not read-only"
 
     # Second ensure for same sha_a reuses existing copy without rebuilding.
     assert engine_copy.ensure(sha_a, source_root=src_checkout) == copy_a
