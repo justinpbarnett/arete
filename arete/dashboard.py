@@ -35,12 +35,14 @@ from . import (
     events,
     gh,
     idempotency,
+    inbox,
     install_files,
     jira,
     mcp_http,
     mcp_protocol,
     loop_run,
     oncall,
+    owner_asks,
     paths,
     pipeline,
     scrub,
@@ -65,6 +67,7 @@ from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import events as event_store
 from .store import idempotency as claims
+from .store import inbox as inbox_store
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import tokens, writes
@@ -401,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
             self.read_seq = None
             self.parsed_body = None
             self.credential = None
+            self.awaiting_presence = False
             self.set_cookie = None
             self.success_status = 200
             self.instance_header = None
@@ -1287,7 +1291,20 @@ def post_run(handler, rest, query):
     if action == "stop":
         return stop_run(handler, run_id, base_version, public=True)
     elif action == "answer":
-        result = tasks.reply(run_id, str(body.get("text") or ""))
+        text = str(body.get("text") or "")
+        from .store import asks as ask_store
+
+        if not ask_store.asks_of(run_id, "open") and (item := inbox_store.get_open_by_subject(f"run:{run_id}")):
+            result = inbox.resolve(
+                item["id"],
+                base_version=item["version"],
+                verb="answer",
+                answer=text,
+                credential=handler.credential,
+                allow_legacy_auth=True,
+            )["result"]
+        else:
+            result = tasks.reply(run_id, text)
     elif action == "resume":
         result = tasks.resume(run_id, str(body.get("step") or ""), base_version)
     elif action == "repair":
@@ -1332,18 +1349,72 @@ def post_push_test(handler, rest, query):
     return webpush.send_test(config.load_or_problem()[0])
 
 
+def _ask_alias_answers(ask: dict, body: dict) -> list[dict]:
+    remaining = owner_asks.unstaged(ask)
+    try:
+        resolved = owner_asks.answers_for(remaining, body)
+    except (ValueError, TypeError) as e:
+        raise control.Refused(str(e)) from None
+    raw_answers = body.get("answers") if isinstance(body.get("answers"), list) else []
+    converted = []
+    for i, (q, ans) in enumerate(zip(remaining["questions"], resolved, strict=True)):
+        if ans.get("declined"):
+            converted.append({"declined": True})
+        elif q["kind"] == "secret" and i < len(raw_answers) and isinstance(raw_answers[i], dict) and "secret" in raw_answers[i]:
+            converted.append({"secret": raw_answers[i]["secret"]})
+        elif "picked" in ans:
+            converted.append({"choice": ans["picked"] if q.get("multiple") else ans["picked"][0]})
+        elif ans.get("done"):
+            converted.append({"done": True})
+        else:
+            converted.append({"text": ans.get("text", "")})
+    return converted
+
+
 def post_ask(handler, rest, query):
     ask_id, _, action = unquote(rest).partition("/")
-    if action == "answer":
-        return tasks.answer_ask(ask_id, handler.body())
-    raise NoRoute
+    if action != "answer":
+        raise NoRoute
+    body = handler.body()
+    if isinstance(body, dict) and "stop" in body:
+        return tasks.answer_ask(ask_id, body)
+    item = inbox_store.get_open_by_subject(f"ask:{ask_id}")
+    if item is not None:
+        from .store import asks as ask_store
+
+        ask = ask_store.ask_get(ask_id)
+        if ask is not None and ask["status"] == "open":
+            answers = _ask_alias_answers(ask, body)
+            verb = "choose" if item["kind"] == "choice" else "answer"
+            return inbox.resolve(
+                item["id"],
+                base_version=item["version"],
+                verb=verb,
+                answers=answers,
+                credential=handler.credential,
+                allow_legacy_auth=True,
+            )["result"]
+    return tasks.answer_ask(ask_id, body)
 
 
 def post_approval(handler, rest, query):
     number = whole_number(unquote(rest))
     yes = handler.body().get("approve") is True
-    return handler.publish("/api/approvals/{id}", {"id": str(number)},
-                           lambda publication=None: control.decide(number, yes, publication=publication))
+
+    def _decide(publication=None):
+        item = inbox_store.get_open_by_subject(f"approval:{number}")
+        if item is not None:
+            return inbox.resolve(
+                item["id"],
+                base_version=item["version"],
+                verb="approve" if yes else "reject",
+                credential=handler.credential,
+                publication=publication,
+                allow_legacy_auth=True,
+            )["result"]
+        return control.decide(number, yes, publication=publication)
+
+    return handler.publish("/api/approvals/{id}", {"id": str(number)}, _decide)
 
 
 def post_task(handler, rest, query):
@@ -1403,13 +1474,24 @@ def post_skipped(handler, rest, query):
 
 def post_proposal(handler, rest, query):
     proposal_id, _, action = unquote(rest).rpartition("/")
+    if action not in ("done", "approve", "reject"):
+        raise NoRoute
+    pid = whole_number(proposal_id)
+    item = inbox_store.get_open_by_subject(f"proposal:{pid}")
+    if item is not None:
+        verb = "decline" if action == "reject" else "accept"
+        return inbox.resolve(
+            item["id"],
+            base_version=item["version"],
+            verb=verb,
+            credential=handler.credential,
+            allow_legacy_auth=True,
+        )["result"]
     if action == "done":
-        return forget_proposal(whole_number(proposal_id))
+        return forget_proposal(pid)
     if action == "approve":
-        return approve_rule(whole_number(proposal_id))
-    if action == "reject":
-        return reject_rule(whole_number(proposal_id))
-    raise NoRoute
+        return approve_rule(pid)
+    return reject_rule(pid)
 
 
 def post_serve_install(handler, rest, query):
@@ -1424,8 +1506,7 @@ CLI_ALIASES = (post_ask, post_chat, post_incident_switch, post_incident, post_lo
 
 def atomic_alias(route, rest):
     return ((route is post_chat and rest.endswith("/drop"))
-            or (route is post_session and rest.endswith("/send"))
-            or (route is post_proposal and rest.endswith(("/done", "/reject"))))
+            or (route is post_session and rest.endswith("/send")))
 
 
 def handlers() -> tailnet.Handlers:
@@ -1466,6 +1547,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
     accepting = not installed or factory.view()["phase"] == "on"
     if accepting:
         chat.recover()
+        inbox.on_server_start()
     if accepting and inside_serve:
         capture.recover()
     elif accepting:

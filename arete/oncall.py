@@ -124,6 +124,10 @@ def commit_scan(incident_rows: list[Sighting], cursor_rows: list[tuple[str, str,
             if new and row.fingerprint in (marks or {}):
                 fields, note = marks[row.fingerprint]
                 incident_store.write_mark(c, incident_id, fields, note)
+                if "phase" in fields or "state" in fields:
+                    from . import inbox
+
+                    inbox.sync(c, "incidents")
         for source, value, ok, detail in cursor_rows:
             source_store.write_scan_cursor(c, source, value, ok, detail)
         return opened

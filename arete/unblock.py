@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from . import (alerts, config, delegation, environment, factory, flows, gh, jira, launch_lease, outbound,
                owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, queueing, record,
-               run_lines, runlimits, steps, tracker, util, vault, webpush, workspace, zte)
+               run_lines, runlimits, steps, tracker, util, vault, workspace, zte)
 from .agent import json_from_text
 from .store import asks as asks_store
 from .store import db
@@ -424,8 +424,6 @@ def route_owner(cfg, row, asks, text: str) -> None:
         if not ids or not ledger.notice(row["id"]):
             return
     alerts.ask_notice(tracker.run_ticket_name(row), text)
-    for note in webpush.ask_opened(cfg, ids):
-        runs_store.add_feed(row["id"], "unblock", note)
 
 
 def missing_secret(repo, q) -> bool:

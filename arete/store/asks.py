@@ -34,6 +34,13 @@ def ask_row(r) -> dict:
             "answers": json.loads(r["answers"] or "[]"), "staged_answers": json.loads(r["staged_answers"])}
 
 
+def _sync_inbox(c, *sources: str) -> None:
+    from .. import inbox
+
+    for source in sources:
+        inbox.sync(c, source)
+
+
 def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
             questions: list[dict], session: dict, *, recovery_route: str = "owner") -> bool:
     with db() as c:
@@ -43,6 +50,7 @@ def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str,
                   "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
                    json.dumps(session), recovery_route))
+        _sync_inbox(c, "asks", "runs")
         return first
 
 
@@ -122,14 +130,20 @@ def ready_runner_tickets(repo: str) -> list[str]:
 
 def stage(ask_id: str, answers: dict) -> bool:
     with db() as c:
-        return bool(c.execute("UPDATE asks SET staged_answers=? WHERE id=? AND status='open'",
-                              (json.dumps(answers), ask_id)).rowcount)
+        changed = bool(c.execute("UPDATE asks SET staged_answers=? WHERE id=? AND status='open'",
+                                 (json.dumps(answers), ask_id)).rowcount)
+        if changed:
+            _sync_inbox(c, "asks")
+        return changed
 
 
 def route_to_owner(ask_id: str) -> bool:
     with db() as c:
-        return bool(c.execute("UPDATE asks SET recovery_route='owner' WHERE id=? AND status='open' "
-                              "AND recovery_route='unblock'", (ask_id,)).rowcount)
+        changed = bool(c.execute("UPDATE asks SET recovery_route='owner' WHERE id=? AND status='open' "
+                                 "AND recovery_route='unblock'", (ask_id,)).rowcount)
+        if changed:
+            _sync_inbox(c, "asks")
+        return changed
 
 
 def asks_due(run_ids) -> list[dict]:
@@ -153,6 +167,7 @@ def ask_close(ask_id: str, status: str, answers: list[dict] | None = None) -> bo
                 and answers[0] == {"header": "macOS runner", "kind": "done", "done": True}):
             c.execute(f"UPDATE asks SET status='answered', answered=?, answers=? "  # noqa: S608
                       f"WHERE status='open' AND call=? AND {LATEST}", (now, encoded, owner_asks.CHECK_RUNNER_CALL))
+        _sync_inbox(c, "asks")
         return True
 
 
@@ -160,6 +175,7 @@ def asks_retire(run_id: str, status: str) -> None:
     with db() as c:
         c.execute("UPDATE asks SET status = ?, answered = COALESCE(answered, ?) WHERE run = ? AND "
                   "(status = 'open' OR (status = 'answered' AND taken_by = ''))", (status, util.iso(), run_id))
+        _sync_inbox(c, "asks")
 
 
 def asks_taken(ids: list[str], run_id: str) -> None:

@@ -5,7 +5,7 @@ from urllib.parse import unquote
 
 from . import (
     api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, events,
-    pi, record, refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks,
+    inbox, pi, record, refusals, secretstore, settings, tasks, tool_events, triage, util, webhooks, webpush,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -38,6 +38,13 @@ def needed(row, identity):
     return row
 
 
+def _vapid_public_key() -> str:
+    try:
+        return webpush.public_key()
+    except webpush.KeyFault:
+        return ""
+
+
 def meta():
     with foundation.reader() as conn:
         data = foundation.metadata(conn)
@@ -47,7 +54,9 @@ def meta():
             "instance": {k: data[f"instance_{k}"] for k in ("id", "tag", "name", "created")},
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
-            "stream": stream}
+            "stream": stream,
+            "features": {"inbox": True},
+            "push": {"vapid_public_key": _vapid_public_key()}}
 
 
 def projection(name, identity=""):
@@ -158,6 +167,10 @@ def set_secret(handler, op, target):
         raise contract.Problem("invalid_input", "The value must be valid UTF-8.") from None
     kind, _ = secret_set_options(scope, name)
     secret_input(secretstore.validate_set, scope, name, value, kind)
+    fp = secretstore.fingerprint(value)
+    if getattr(handler, "awaiting_presence", False):
+        return inbox.defer_presence(handler, op, target, target, hash_body={"fingerprint": fp},
+                                    secret_value=value, fingerprint=fp)
 
     def change():
         kind, provider = secret_set_options(scope, name)
@@ -165,7 +178,7 @@ def set_secret(handler, op, target):
         return with_seq(secret_result(scope, name, row))
 
     return handler.keyed_action(op["method"], op["path"], target, change, atomic=True, status=op["success_status"],
-                                hash_body={"fingerprint": secretstore.fingerprint(value)})
+                                hash_body={"fingerprint": fp})
 
 
 def prepare(name, values):
@@ -232,6 +245,23 @@ def read(name, values, handler):
     if name == "factory.get":
         from .store import factory
         return {"factory": factory.view()}
+    if name == "inbox.list":
+        prio = values.get("priority")
+        if prio is not None:
+            if not (prio.isascii() and prio.isdecimal() and int(prio) in (1, 2, 3)):
+                raise contract.Problem("invalid_input", "priority must be 1, 2, or 3")
+            prio = int(prio)
+        return {"items": inbox.list(state=values.get("state", "open"), kind=values.get("kind"),
+                                    priority=prio, task=values.get("task"), run=values.get("run"),
+                                    line=values.get("line"))}
+    if name == "inbox.get":
+        return inbox.get(values["item"])
+    if name == "inbox.history":
+        return {"events": inbox.history(values["item"])}
+    if name == "triage_screen.get":
+        return inbox.triage_screen()
+    if name == "push.list":
+        return {"subscriptions": webpush.list_v1()}
     if name == "cohort.get":
         from . import cohorts
 
@@ -353,6 +383,21 @@ def dispatch(handler, op, path_values, query):
                 secretstore.migrate_registry()
             if name == "secret.set":
                 return set_secret(handler, op, identity)
+            if getattr(handler, "awaiting_presence", False):
+                if name == "secret.remove":
+                    secret_set_options(identity["scope"], identity["name"])
+                elif name == "token.issue":
+                    credential_http.issue_grants(values)
+                elif name == "push.subscribe":
+                    try:
+                        webpush.checked_endpoint(values.get("endpoint"))
+                        keys = values.get("keys") or {}
+                        for v in (keys.get("p256dh"), keys.get("auth")):
+                            if not isinstance(v, str) or not webpush.KEY_FIELD.fullmatch(v):
+                                raise webpush.Refused("The subscription's keys are missing or not valid.")
+                    except webpush.Refused as error:
+                        raise contract.Problem("validation", str(error)) from None
+                return inbox.defer_presence(handler, op, values, identity if name.startswith("secret.") else path_values)
             result = command(handler, op, values, identity if name.startswith("secret.") else path_values)
             if name == "pairing.claim":
                 credential_http.finish_pairing_claim(handler)
@@ -378,7 +423,7 @@ def command(handler, op, values, path_values, *, claim=None):
     action = (lambda: mutation(name, values, handler)) if contract.keyed_write(op) else (
         lambda: execute(name, values, handler))
     return handler.keyed_action(op["method"], op["path"], path_values, action,
-                                atomic=not read_only and name not in ("run.stop", "serve.install",
+                                atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
                                                                       "settings.update", "loop.enable", "loop.disable"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
@@ -437,6 +482,30 @@ def mutation(name, values, handler):
     elif name == "hook.ingest":
         result = {"received": tool_events.ingest(values["origin"], values.get("stream", ""),
                                                  values["offset"], values["events"])}
+    elif name == "inbox.raise":
+        result = {"item": inbox.raise_manual(values, credential=handler.credential)}
+    elif name == "inbox.snooze":
+        result = {"item": inbox.snooze(values["item"], base_version=values["base_version"],
+                                       until=values.get("until"), until_changed=bool(values.get("until_changed")))}
+    elif name == "inbox.shelve":
+        result = {"item": inbox.shelve(values["item"], base_version=values["base_version"],
+                                       reason=values["reason"], until=values.get("until"))}
+    elif name == "inbox.resolve":
+        result = inbox.resolve(
+            values["item"],
+            base_version=values["base_version"],
+            verb=values["verb"],
+            option=values.get("option"),
+            answer=values.get("answer"),
+            answers=values.get("answers"),
+            reason=values.get("reason"),
+            credential=handler.credential,
+            pending_secrets=inbox.server_secrets(handler.server),
+        )
+    elif name == "push.subscribe":
+        result = {"subscription": webpush.subscribe_v1(values, principals.contact(handler.person))}
+    elif name == "push.remove":
+        result = webpush.remove_v1(values["subscription"])
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)

@@ -505,6 +505,7 @@ class Server:
             ("prune", self.prune_when_due, ()), ("sweep", self.sweep_when_due, ()),
             ("workspaces", self.sweep_workspaces_when_due, ()),
             ("asks", self.expire_asks, ()), ("closed", self.release_closed_when_due, ()),
+            ("inbox", self.sync_inbox, ()),
             ("remind", self.remind, ()),
         )
         for name, action, args in stages:
@@ -635,8 +636,13 @@ class Server:
             for note in tasks.release_closed(self.cfg):
                 self.say(note)
 
+    def sync_inbox(self) -> None:
+        from . import inbox
+
+        inbox.tick()
+
     def remind(self) -> None:
-        for note in webpush.remind(self.cfg):
+        for note in webpush.remind_inbox(self.cfg):
             self.say(note)
 
     def run_pass(self) -> None:
@@ -1438,6 +1444,9 @@ def run(with_dashboard: bool = True) -> NoReturn:
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()
+            from . import inbox
+
+            server.guard("stage:inbox-start", inbox.on_server_start)
         for note in start_notes(server.cfg):
             server.say(note)
         factory_control.notify()

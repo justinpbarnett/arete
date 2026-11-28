@@ -132,14 +132,16 @@ ref = secretstore.Reference(row['store'], db.schema_metadata()['instance_tag'], 
 settings = config.secret_settings()
 route = root + '/repo%3Ademo/' + name
 before = repo_file.read_bytes()
-with cli_over_http() as trace, mock.patch.object(client, 'configured_server', return_value=None):
+cookie = browser_session()
+with cli_over_http() as trace, mock.patch.object(client, 'configured_server', return_value=None), \
+        resolve_presence_in_background(cookie, 'reject'):
     status, out, err = run_cli('secrets', 'rm', 'demo', name)
-    assert status == 1 and json.loads(out)['reason'] == 'presence_required', (status, out, err)
-    assert 'paired owner browser' in json.loads(out)['hint'] and repo_value not in out + err
-assert ('DELETE', route, 403) in trace, trace
+    assert status == 1 and json.loads(out)['code'] == 'gate_refused', (status, out, err)
+    assert 'TR-' in err and repo_value not in out + err
+assert ('DELETE', route, 202) in trace and ('DELETE', route, 403) in trace, trace
 assert repo_file.read_bytes() == before and secretstore.read_item(ref, settings) == repo_value.encode()
 
-_, result = request('DELETE', route, cookie=browser_session(), key='remove-repo-answer')
+_, result = request('DELETE', route, cookie=cookie, key='remove-repo-answer')
 assert result['secret']['present'] is False and repo_value not in json.dumps(result)
 assert secretstore.read_item(ref, settings) is None
 assert json.loads(repo_file.read_text()) == {'KEEP': 'fixture-retained-key'}

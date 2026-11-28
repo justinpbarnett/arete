@@ -71,6 +71,10 @@ def chat_say(chat_id: int, sender: str, text: str, cost: float = 0.0, *, paid_us
                   (chat_id, sender, text, reported_cost, paid_usd, ts))
         c.execute(f"UPDATE chats SET {''.join(f'{k} = ?, ' for k in fields)}updated = ?, spent = spent + ? WHERE id = ?",  # noqa: S608
                   (*fields.values(), ts, reported_cost, chat_id))
+        if "draft_title" in fields or "draft_body" in fields:
+            from .. import inbox
+
+            inbox.sync(c, "chats")
 
 
 CHAT_SESSION_COLUMNS = ("l.run_id, l.chat_id, l.budget_usd, l.told, r.status, r.started, r.finished, r.repo, "
@@ -127,6 +131,9 @@ def chat_drop_draft(chat_id: int, title: str, body: str) -> None:
     with db() as c:
         c.execute("UPDATE chats SET draft_title = '', draft_body = '' WHERE id = ? AND draft_title = ? AND draft_body = ?",
                   (chat_id, title, body))
+        from .. import inbox
+
+        inbox.sync(c, "chats")
 
 
 def chat_newest_draft() -> dict | None:
