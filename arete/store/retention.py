@@ -282,6 +282,8 @@ def prune_rows(policy: retention.Policy, measured: Measured) -> RowsPruned:
             if has_turn_index:
                 rows_removed += c.execute("DELETE FROM turn_index WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM steps WHERE run_id = ?", (rid,)).rowcount
+            rows_removed += c.execute("DELETE FROM verdicts WHERE run_id = ?", (rid,)).rowcount
+            rows_removed += c.execute("DELETE FROM evals WHERE run_id = ?", (rid,)).rowcount
             rows_removed += c.execute("DELETE FROM feed WHERE run_id = ?", (rid,)).rowcount
             writes.update("runs", rid, {}, delete=True, kind="run.deleted")
             rows_removed += 1

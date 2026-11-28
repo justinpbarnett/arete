@@ -664,9 +664,12 @@ class Server:
         self.secrets_checked_at = now
 
     def lapse_leases(self) -> None:
+        from . import engine_copy
+
         lapsed = leases.lapse()
         if lapsed:
             self.say(f"lapsed {util.count(len(lapsed), 'expired lease')}")
+        engine_copy.prune_unused()
 
     def reap(self) -> None:
         recover_queued(self.say)
@@ -1647,11 +1650,12 @@ def recover_queued(say: Callable[[str], None] = lambda text: None, *, min_age: f
     return handled
 
 
-def run(with_dashboard: bool = True) -> NoReturn:
+def run(with_dashboard: bool = True, *, worker_port: int | None = None) -> NoReturn:
     codebase.load()
     rotation_notes = install.rotate_own_log()
     with principals.acting("hand"):
         held = take_serve_lock()
+        worker_server = None
         try:
             inherited = startup_beat()
             try:
@@ -1674,7 +1678,18 @@ def run(with_dashboard: bool = True) -> NoReturn:
             server.contracts_waiting = contracts_waiting
             server.lock = held
             server.with_dashboard = with_dashboard
+            from . import worker_listener
+
+            try:
+                worker_server, worker_url = worker_listener.start(port=worker_port)
+                server.say(f"worker listener ready at {worker_url}")
+            except OSError as e:
+                server.say(f"worker listener unavailable: {e}")
         except BaseException:
+            if worker_server is not None:
+                from . import worker_listener
+
+                worker_listener.stop(worker_server)
             held.close()
             raise
         server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")

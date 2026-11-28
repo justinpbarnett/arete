@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -597,7 +598,8 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
 
 def main(argv: list[str] | None = None) -> None:
     codebase.load()
-    from . import flows, pipeline
+    from . import flows, pipeline, worker_lease
+    from .store import db as foundation
 
     p = argparse.ArgumentParser(description="run a configured ADW flow on one ticket")
     p.add_argument("repo")
@@ -632,9 +634,21 @@ def main(argv: list[str] | None = None) -> None:
                              args.repairs, args.action, args.only_action, args.environment_release, tuple(args.sets),
                              restart, adw=args.adw)
     try:
-        with principals.acting(principals.cli_actor()):
+        with principals.acting(principals.cli_actor()), worker_lease.adopted_if_present():
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script,
                                       run_id=args.run_id, line=args.line)
+    except foundation.LeaseFenced as e:
+        line = f"[{util.iso()}] lease L-{e.lease_id} epoch {e.epoch} {e.code}\n"
+        if e.run_id:
+            log_file = paths.RUNS_DIR / e.run_id / "run.log"
+            try:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with log_file.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
+        print(line.strip(), file=sys.stderr)
+        raise SystemExit(3) from None
     except config.UnknownRepo as e:
         raise SystemExit(str(e)) from None
     raise SystemExit(code)

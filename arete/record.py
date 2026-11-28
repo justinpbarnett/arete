@@ -111,7 +111,7 @@ def _resolve_payer(started_by: str, *, restart: str, continues: str | None,
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolution=None,
           continues: str | None = None, restart: str = "", started_by: str | None = None,
-          payer=_UNSET, loop_payer: str = "", repo_payer: str = "", **fields) -> str:
+          payer=_UNSET, loop_payer: str = "", repo_payer: str = "", take_lease: bool = True, **fields) -> str:
     nested = foundation.in_write()
     actor = started_by if started_by is not None else _resolve_started_by(principals.current())
     continues_val = continues or None
@@ -154,6 +154,7 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
     if kind in TICKET_KINDS:
         row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
                    measured_at=row["started"])
+    want_lease = take_lease and row.get("status") in ("running", "queued") and "lease_id" not in row
     with (blob_store.lock() if resolution is not None else contextlib.nullcontext()):
         if resolution is not None:
             blob_rows = resolution.write_blobs()
@@ -167,11 +168,37 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
                             blob_store.record_row(c, sha, blob_kind, size)
                         if resolution is not None and resolution.settings_snapshots:
                             run_store.save_settings_snapshots(c, resolution.settings_snapshots)
+                    if want_lease and c.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'"
+                    ).fetchone():
+                        from . import leases
+
+                        lease_id = leases.ensure_run_lease(
+                            c,
+                            minted,
+                            device=str(row_with_chain.get("device") or "local"),
+                            engine_sha=str(row_with_chain.get("engine_sha") or ""),
+                            schema_version=row_with_chain.get("schema_version"),
+                        )
+                        row_with_chain["lease_id"] = lease_id
                     run_store.insert_run(minted, row_with_chain)
             except sqlite3.IntegrityError as e:
-                if run_id or "runs.id" not in str(e):
-                    raise
-                continue
+                if not run_id and getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+                    continue
+                if getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE and "runs.lock" in str(e):
+                    from . import control
+
+                    live_id = ""
+                    if lock:
+                        with foundation.reader() as rc:
+                            live_row = rc.execute(
+                                "SELECT id FROM runs WHERE status = 'running' AND lock = ? LIMIT 1",
+                                (lock,),
+                            ).fetchone()
+                            if live_row:
+                                live_id = str(live_row["id"])
+                    raise control.Busy(f"run {live_id}" if live_id else lock, run_id=live_id) from None
+                raise
             break
     if resolution is not None:
         resolved_file = paths.RUNS_DIR / minted / "resolved.json"
@@ -179,6 +206,21 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
     # A nested writer has not committed yet; retain its lease until exit.
     if kind in TICKET_KINDS and not nested:
         launch_lease.registered(row.get("repo", ""), str(row.get("issue_key") or row.get("issue") or ""))
+    return minted
+
+
+def import_run(kind: str, *, run_id: str = "", tag: str = "", resolution=None, **fields) -> str:
+    from . import events
+
+    with foundation.tx() as c:
+        minted = start(kind, run_id=run_id, tag=tag, resolution=resolution, take_lease=False, **fields)
+        events.emit(
+            "run.import",
+            f"run:{minted}",
+            cls="durable",
+            data={"op": "run.import", "run": minted, "kind": kind},
+            connection=c,
+        )
     return minted
 
 
@@ -399,6 +441,35 @@ def failed_on_crash(run_id: str):
         why = util.first_line(f"crashed: {type(e).__name__}: {e}", 300)
         settle(run_id, "failed", end_line=f"failed: {why}", summary=why)
         raise
+
+
+def dead_status_in_tx(c, row: dict) -> str:
+    if row.get("dry_run") or row.get("stop_asked"):
+        return "stopped"
+    if row.get("only_step"):
+        return "interrupted"
+    if row["kind"] == "pipeline":
+        from contextlib import nullcontext
+
+        target = int(row["task_id"]) if row.get("task_id") is not None else row["repo"]
+        issue_val = row.get("issue_key") or row.get("issue") or ""
+        earlier = [r for r in (
+            run_store.ticket_runs(target, limit=2, whole=True, live=True, connect=lambda: nullcontext(c))
+            if isinstance(target, int)
+            else run_store.ticket_runs(row["repo"], issue_val, limit=2, whole=True, live=True,
+                                       connect=lambda: nullcontext(c))
+        ) if r["id"] != row["id"]]
+        unfinished = False
+        if earlier and earlier[0]["status"] == "interrupted":
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spec_deliveries'").fetchone():
+                unfinished = c.execute(
+                    "SELECT 1 FROM spec_deliveries WHERE repo = ? AND issue = ? AND state != 'complete' LIMIT 1",
+                    (row.get("repo"), str(issue_val)),
+                ).fetchone() is not None
+            if not unfinished:
+                return "failed"
+        return "interrupted"
+    return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
 
 
 def dead_status(row: dict) -> str:

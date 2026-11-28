@@ -1791,6 +1791,11 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
             from . import insights
 
             insights.release_interrupted_feedback(run_id)
+        if settled.get("lease_id") is not None:
+            from .. import leases
+
+            outcome = "expired" if settled["status"] == "interrupted" else "released"
+            leases.release_run_lease_in_tx(c, run_id, int(settled["lease_id"]), outcome=outcome)
         if end_line:
             insert_feed(run_id, "end", end_line)
         if settled["kind"] == "pipeline" and settled["status"] == "needs-info":

@@ -151,11 +151,15 @@ def recover_start(claim, force=True):
 
 
 def live_run(repo: str, tid: str) -> dict | None:
+    from . import leases
+
     row = run_store.running_run(repo, tid)
     if not row:
         return None
     if row["status"] == "queued":
         return row
+    if row.get("lease_id") is not None:
+        return row if leases.is_live(row) else None
     return row if slots.holding([row], "pipeline") else None
 
 
@@ -209,10 +213,35 @@ def spawn_queued(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]
         return spawn()
 
 
+def _finish_settled_at_launch(cfg: config.Config, settled: list[dict], *, one_step: bool) -> None:
+    for done in settled:
+        if one_step and not done.get("dry_run"):
+            pipeline.tell_ticket_run_died(cfg, done)
+            continue
+        if done["status"] != "stopped":
+            run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
+        pipeline.write_report(done)
+
+
+def _settle_ticket_dead_in_tx(c, repo: config.Repo, tid: str, task_num: int | None) -> list[dict]:
+    from . import leases
+
+    locks: list[str] = []
+    if task_num is not None:
+        locks.append(run_store.run_lock("pipeline", task=int(task_num)))
+    legacy_lock = run_store.run_lock("pipeline", repo.name, tid)
+    if legacy_lock not in locks:
+        locks.append(legacy_lock)
+    settled: list[dict] = []
+    for lock_name in locks:
+        settled.extend(leases.settle_dead_on_lock(c, lock_name))
+    return settled
+
+
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *, owner_forcing=False) -> dict:
     from contextlib import nullcontext
 
-    from . import configrepo
+    from . import configrepo, leases
     from . import lines as lines_mod
     from .store import factory as factory_state
     from .store import projects as projects_store
@@ -220,7 +249,16 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
     factory_state.admit()
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if run := live_run(repo.name, tid):
+            if run["status"] == "running":
+                raise control.Busy(f"run {run['id']}", run_id=run["id"])
             return answer(tid, repo.name, run["id"], "running", "already running")
+        # Settle dead/lapsed running rows BEFORE checking slots/budget/continuation.
+        settled_before: list[dict] = []
+        with foundation.tx() as c:
+            pre_task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg) if task_store.has_identity_expand(c) else None
+            settled_before = _settle_ticket_dead_in_tx(c, repo, tid, pre_task_num)
+        if settled_before:
+            _finish_settled_at_launch(cfg, settled_before, one_step=False)
         resolved_line = lines_mod.resolve_line_read(repo.name, tid, cfg=cfg)
         if why := held(cfg, resolved_line if resolved_line is not None else repo, tid):
             return queued(repo, tid, why, poller_picks)
@@ -234,6 +272,7 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
 
         # Hold the instance fence across parent admission validation and queued-run insert,
         # releasing both transaction and fence before child launch or any external wait.
+        lease_settled: list[dict] = list(settled_before)
         line_id = ""
         with configrepo.maybe_instance_fence(), foundation.tx() as c:
             if projects_store.available(c):
@@ -245,14 +284,41 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                 task_num, issue_key = task_store.TaskStore.task_for_ticket(
                     c, repo, tid, principals.current(), cfg=cfg,
                 )
+                more_settled = _settle_ticket_dead_in_tx(c, repo, tid, task_num)
+                lease_settled.extend(more_settled)
                 existing = run_store.running_run(task_num, connect=lambda: nullcontext(c))
-                if existing and (existing["status"] == "queued" or slots.holding([existing], "pipeline")):
-                    return answer(tid, repo.name, existing["id"], "running", "already running")
+                if existing:
+                    if existing["status"] == "queued":
+                        return answer(tid, repo.name, existing["id"], "running", "already running")
+                    if existing.get("lease_id") is not None:
+                        if leases.is_live(existing, conn=c):
+                            raise control.Busy(f"run {existing['id']}", run_id=existing["id"])
+                    elif slots.holding([existing], "pipeline"):
+                        raise control.Busy(f"run {existing['id']}", run_id=existing["id"])
+                interrupted_settled = [
+                    r for r in lease_settled
+                    if r.get("status") == "interrupted" and not r.get("only_step") and not r.get("dry_run")
+                ]
+                continues_id = interrupted_settled[-1]["id"] if interrupted_settled else None
+                restart_kind = "lease" if continues_id else ""
                 run_id = pipeline.queue_run(
-                    repo.name, tid, cfg=cfg, repo=repo, task_id=task_num, issue_key=issue_key, line=line_id,
+                    repo.name, tid, cfg=cfg, repo=repo, task_id=task_num, issue_key=issue_key,
+                    continues=continues_id, restart=restart_kind, line=line_id,
                 )
             else:
-                run_id = pipeline.queue_run(repo.name, tid, cfg=cfg, repo=repo, line=line_id)
+                more_settled = _settle_ticket_dead_in_tx(c, repo, tid, None)
+                lease_settled.extend(more_settled)
+                interrupted_settled = [
+                    r for r in lease_settled
+                    if r.get("status") == "interrupted" and not r.get("only_step") and not r.get("dry_run")
+                ]
+                continues_id = interrupted_settled[-1]["id"] if interrupted_settled else None
+                restart_kind = "lease" if continues_id else ""
+                run_id = pipeline.queue_run(
+                    repo.name, tid, cfg=cfg, repo=repo, continues=continues_id, restart=restart_kind, line=line_id,
+                )
+        if len(lease_settled) > len(settled_before):
+            _finish_settled_at_launch(cfg, lease_settled[len(settled_before):], one_step=False)
         from . import inbox
 
         if missing := inbox.check_run_missing_secrets(run_id, repo=repo.name):
@@ -363,6 +429,12 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
     from .store import projects as projects_store
 
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        settled_before: list[dict] = []
+        with foundation.tx() as c:
+            pre_task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg) if task_store.has_identity_expand(c) else None
+            settled_before = _settle_ticket_dead_in_tx(c, repo, tid, pre_task_num)
+        if settled_before:
+            _finish_settled_at_launch(cfg, settled_before, one_step=bool(only_step))
         free_to_start(cfg, repo, tid, ahead=ahead)
         try:
             foundation.require_workspace_contract()
@@ -372,6 +444,8 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
         with configrepo.maybe_instance_fence(), writes.atomic() as c:
             if admission and not writes.check_run(*admission, public=True):
                 raise control.NotFound(f"no run {admission[0]}")
+            task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg) if task_store.has_identity_expand(c) else None
+            more_settled = _settle_ticket_dead_in_tx(c, repo, tid, task_num)
             if projects_store.available(c):
                 line_row = lines_mod.resolve_line_for_ticket(c, repo.name, tid, cfg=cfg)
                 if line_row is not None:
@@ -380,6 +454,8 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
             run_id = pipeline.queue_run(
                 repo.name, tid, continues=continues, restart=restart, only_step=only_step, line=line_id,
             )
+        if more_settled:
+            _finish_settled_at_launch(cfg, more_settled, one_step=bool(only_step))
         full_command = [*command, "--run-id", run_id, *(["--line", line_id] if line_id else [])]
         record.write_launch(run_id, full_command, pipeline.RUNS_LOG)
         from . import inbox
@@ -1098,6 +1174,20 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                 f"input blob {blob_sha} for run {run_id} step {step} was removed on {purged_at}",
                 purged_at=purged_at,
             )
+        if row["status"] == "running":
+            from . import leases
+
+            gone = not leases.is_live(row) if row.get("lease_id") is not None else False
+            if not gone and row.get("lease_id") is None:
+                with record.dead(row) as dead_flag:
+                    gone = dead_flag
+            if gone:
+                with events.collect_receipts() as recovered:
+                    if settled := record.interrupt(row, base_version=base_version):
+                        pipeline.tell_ticket_run_died(cfg, settled)
+                if base_version is not None:
+                    base_version += sum(subject == f"run:{run_id}" for _, subject, _ in recovered)
+                row = run_store.run_get(run_id) or row
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         path = str(row.get("adw") or "")

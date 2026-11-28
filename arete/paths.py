@@ -55,12 +55,15 @@ def backups_dir() -> Path:
 
 
 RUNS_DIR = STATE_DIR / "runs"
+ENGINE_DIR = STATE_DIR / "engine"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 SERVE_BEAT_FILE = STATE_DIR / local_paths.SERVE_BEAT_NAME
 SERVER_FILE = STATE_DIR / "server.json"
+WORKER_SERVER_FILE = STATE_DIR / "worker-server.json"
 DASHBOARD_PORT = 8796
+WORKER_PORT = 8797
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
 TLS_KEY_FILE = STATE_DIR / "dashboard.key"
 PUSH_KEY_FILE = STATE_DIR / "webpush.key"
@@ -86,11 +89,19 @@ CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
 
 
-def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
+def cli_command(*args: str, flags: tuple[str, ...] = (), engine_root: Path | None = None) -> list[str]:
+    pinned_env = os.environ.get("ARETE_ENGINE_COPY", "").strip()
+    root = engine_root if engine_root is not None else (Path(pinned_env) if pinned_env else PACKAGE_DIR.parent)
+    using_copy = (
+        engine_root is not None
+        or bool(pinned_env)
+        or (PACKAGE_DIR.parent / ".engine_sha").is_file()
+    )
+    extra_flags = (*flags, "-B") if using_copy and "-B" not in flags else flags
     pinned = "" if args and args[0] in (*PER_CALL_HOOKS, "status", "serve") else "from arete import codebase; codebase.load(); "
-    entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
+    entrypoint = (f"import sys; sys.path.insert(0, {str(root)!r}); {pinned}"
                   "from arete.cli import main; raise SystemExit(main())")
-    return [sys.executable, "-I", *flags, "-c", entrypoint, *args]
+    return [sys.executable, "-I", *extra_flags, "-c", entrypoint, *args]
 
 
 def expand(p: str | Path) -> Path:

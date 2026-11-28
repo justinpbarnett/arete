@@ -16,7 +16,7 @@ FIELDS = {
                        "grp", "lock", "moved", "wait_minutes", "engine_sha", "failure", "dry_run",
                        "environment_retry_of", "config_commit", "resolved_sha", "continues", "chain", "restart",
                        "started_by", "payer", "seq", "adw", "adw_version", "adw_rule",
-                       "task_id", "issue_key", "capabilities", "line")),
+                       "task_id", "issue_key", "capabilities", "line", "lease_id")),
     "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated",
                         "num", "project", "line", "fault", "fault_detail", "priority", "rank",
                         "owner", "origin", "delegate", "estimate", "answer")),

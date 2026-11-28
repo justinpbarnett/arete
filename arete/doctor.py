@@ -26,7 +26,7 @@ UNFOLDERED_KINDS = ("session",)
 UNRECORDED_FOLDERS = ()
 UNRECORDED_PATTERNS = ("eva-*-prompts",)
 ORPHAN_TABLES = ("steps", "evals", "feed", "verdicts")
-NAMES = ("cost", "orphans", "folders", "stuck", "store", "backup")
+NAMES = ("cost", "orphans", "foreign_keys", "folders", "stuck", "store", "backup")
 DERIVED_PREFIX = "derived:"
 
 
@@ -107,6 +107,16 @@ def check_orphans(conn: sqlite3.Connection) -> Result:
             ids += [f"{table}#{r[0]}:{r[1]}" for r in rows]
     detail = ", ".join(per_table) + " with no runs row" if per_table else "every row names a run"
     return result("orphans", "fail", ids, detail, total)
+
+
+def check_foreign_keys(conn: sqlite3.Connection) -> Result:
+    rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if not rows:
+        return Result("foreign_keys", "fail", 0, [], "foreign_key_check ok")
+    ids = [f"{r[0]}#{r[1]}->{r[2]}" for r in rows]
+    tables = sorted({str(r[0]) for r in rows})
+    detail = f"{len(rows)} foreign key violation(s) in {', '.join(tables)}"
+    return result("foreign_keys", "fail", ids, detail, len(rows))
 
 
 def unrecorded(name: str) -> bool:
@@ -215,6 +225,7 @@ def run(checks: Sequence[str] | None = None) -> list[Result]:
         builtin: dict[str, Callable[[], Result]] = {
             "cost": lambda: check_cost(conn),
             "orphans": lambda: check_orphans(conn),
+            "foreign_keys": lambda: check_foreign_keys(conn),
             "folders": lambda: check_folders(conn, listing, now),
             "stuck": lambda: check_stuck(conn, now),
             "store": lambda: check_store(conn),

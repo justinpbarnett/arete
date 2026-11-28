@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 36
+MINOR = 37
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -1176,6 +1176,31 @@ LEASE = obj({
     "last_sweep_error": STRING,
     "version": INTEGER,
     "streams": array(mapping(JSON)),
+    "engine_sha": STRING,
+    "schema_version": NULL_INT,
+    "line_shape": STRING,
+}, [
+    "id", "subject", "run_id", "device", "device_version", "epoch", "created", "renewed", "expires",
+    "released", "outcome", "kept_reason", "vm_name", "vmid", "ready", "address", "host_key_fingerprint",
+    "sweep_attempts", "last_sweep", "last_sweep_error", "version", "streams",
+])
+LEASE_CONTROL = obj({
+    "id": INTEGER,
+    "kind": STRING,
+    "payload": mapping(JSON),
+    "created": STRING,
+})
+LEASE_CLAIM_RESULT = envelope({
+    "lease": LEASE,
+    "token": STRING,
+    "header": STRING,
+    "ttl_seconds": INTEGER,
+    "heartbeat_seconds": INTEGER,
+})
+LEASE_HEARTBEAT_RESULT = envelope({
+    "lease": LEASE,
+    "controls": array(LEASE_CONTROL),
+    "stop_asked": BOOLEAN,
 })
 RUN_SANDBOX = envelope({
     "device": STRING,
@@ -1195,6 +1220,21 @@ OPERATIONS += [
               obj({"run": STRING, "device": STRING, "open": STRING}, [])),
     operation("lease.get", "leases/{lease}", envelope({"lease": LEASE}),
               obj({"lease": STRING}), {"lease": "L-1"}, errors=("lease_fenced", "lease_expired")),
+    operation("lease.claim", "leases", LEASE_CLAIM_RESULT,
+              obj({"engine_sha": STRING, "line_shape": STRING, "schema_version": INTEGER,
+                   "pid": INTEGER, "device": STRING, "device_version": STRING, "node": STRING},
+                  ["engine_sha", "line_shape"]),
+              {"engine_sha": "abc123def456", "line_shape": "v1"}, "POST",
+              errors=("lease_fenced", "lease_expired"), success_status=201),
+    operation("lease.heartbeat", "leases/{lease}/heartbeat", LEASE_HEARTBEAT_RESULT,
+              obj({"lease": STRING, "hold_seconds": NUMBER, "node": STRING}, ["lease"]),
+              {"lease": "L-1"}, "POST", errors=("lease_fenced", "lease_expired")),
+    operation("lease.release", "leases/{lease}/release", envelope({"lease": LEASE}),
+              obj({"lease": STRING, "outcome": STRING, "node": STRING}, ["lease"]),
+              {"lease": "L-1"}, "POST", errors=("lease_fenced", "lease_expired")),
+    operation("lease.revoke", "leases/{lease}/revoke", envelope({"lease": LEASE}),
+              obj({"lease": STRING, "reason": STRING}, ["lease"]),
+              {"lease": "L-1"}, "POST"),
     operation("run.sandbox", "runs/{run}/sandbox", RUN_SANDBOX,
               obj({"run": STRING}), {"run": "pip-demo-1"}),
     operation("push.list", "push/subscriptions", envelope({"subscriptions": array(PUSH_SUBSCRIPTION)})),

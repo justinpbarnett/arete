@@ -207,7 +207,7 @@ def prove(bench: Bench, path: Path, clock: Clock) -> None:
     clock.check()
     pin_res = pins.resolve("eval", repo=exp.repo, layer=exp.layer, harness_source=evals.Source(exp.repo),
                            cfg=exp.cfg if not configrepo.is_repo() else None)
-    run_id = record.start("eval", tag=f"benchmark-{exp.name}-proof", repo=exp.repo.name, resolution=pin_res)
+    run_id = record.import_run("eval", tag=f"benchmark-{exp.name}-proof", repo=exp.repo.name, resolution=pin_res)
     with record.failed_on_crash(run_id), pins.use(pin_res):
         run = ProofRun(id=run_id, repo=pin_res.repo or exp.repo, dir=paths.RUNS_DIR / run_id,
                        cfg=pin_res.cfg, task="proof", clock=clock)

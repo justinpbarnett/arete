@@ -237,9 +237,13 @@ def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None, leas
         raise InvalidCredential(problem)
     person, role = row["principal"], row["role"]
     if kind in ("ask", "claim"):
-        if not row["run_id"] or not step:
+        if not row["run_id"]:
             raise InvalidCredential()
-        actor = f"run:{row['run_id']}/{step}"
+        if kind == "ask" and not step:
+            raise InvalidCredential()
+        if kind == "claim" and row["uses_left"] is not None and int(row["uses_left"]) <= 0:
+            raise InvalidCredential("token_expired")
+        actor = f"run:{row['run_id']}/{step or 'worker'}"
     elif kind == "token" and row["run_id"]:
         actor = f"run:{row['run_id']}"
     else:
@@ -248,7 +252,21 @@ def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None, leas
                       meta["token_key_ref"], meta["restore_epoch"],
                       meta["token_generation"], deadline_of(row), row["profile"],
                       frozenset(json.loads(row["commands"])) if row["commands"] is not None else None,
-                      run_id=row["run_id"])
+                      lease_id=row["lease_id"], run_id=row["run_id"])
+
+
+def consume_claim_use(c: sqlite3.Connection, token_id: str, now_iso: str) -> bool:
+    cur = c.execute(
+        "UPDATE tokens SET uses_left = CASE WHEN uses_left IS NULL THEN NULL ELSE uses_left - 1 END, "
+        "revoked_at = CASE WHEN uses_left IS NOT NULL AND uses_left <= 1 THEN ? ELSE revoked_at END, "
+        "revoke_reason = CASE WHEN uses_left IS NOT NULL AND uses_left <= 1 THEN 'exhausted' ELSE revoke_reason END, "
+        "version = version + 1 "
+        "WHERE id = ? AND kind = 'claim' AND revoked_at IS NULL "
+        "AND (expires IS NULL OR expires > ?) "
+        "AND (uses_left IS NULL OR uses_left > 0)",
+        (now_iso, token_id, now_iso),
+    )
+    return cur.rowcount == 1
 
 
 def rotation_lineage(credential):
