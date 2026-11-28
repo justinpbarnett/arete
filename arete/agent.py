@@ -265,6 +265,10 @@ class Result:
     record: str = ""
     quote: dict | None = None
     reference_usd: float | None = None
+    cost_nusd: int | None = None
+    paid_nusd: int | None = None
+    price_version: str = ""
+    reference_price_version: str = ""
 
     def add_usage(self, others: list[Result]) -> None:
         for key in USAGE:

@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from .. import run_lines, util
 from ._rows import insert_sql, json_dict, validate_columns
-from .db import db, reader, tx
+from .db import MONEY_BACKFILL_SCHEMA, MONEY_EXPAND_SCHEMA, db, migration_applied, reader, tx
 
 TABLES = {
     "usage": "configured keep_days",
@@ -69,7 +69,18 @@ EVAL_INTERIM = frozenset(("engine_sha", "prompts_sha", "prompts_from", "settings
 def add_eval(run_id: str, repo: str, task: str, passed: bool, seconds: float, cost: float, source: str = "",
              lineage: dict | None = None) -> None:
     lineage = lineage or {}
+    cost_nusd = util.nusd(cost)
     with db() as c:
+        if migration_applied(MONEY_EXPAND_SCHEMA, c):
+            cost_real = (cost_nusd / 1_000_000_000) if cost_nusd is not None else cost
+            c.execute(
+                f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, cost_nusd, ts, source, "  # noqa: S608
+                f"{', '.join(EVAL_LINEAGE)}) VALUES ({','.join('?' * 17)})",
+                (run_id, repo, task, int(passed), seconds, cost_real, cost_nusd, util.iso(), source,
+                 *("" if k in EVAL_INTERIM else lineage.get(k, 0 if k in ("after_step", "last_step") else "")
+                   for k in EVAL_LINEAGE)),
+            )
+            return
         c.execute(
             f"INSERT INTO evals (run_id, repo, task, passed, seconds, cost_usd, ts, source, {', '.join(EVAL_LINEAGE)}) "  # noqa: S608
             f"VALUES ({','.join('?' * 16)})",
@@ -97,6 +108,17 @@ def eval_rows(run_id: str) -> list[dict]:
 
 def eval_history(repo: str, limit: int = 20) -> list[dict]:
     with reader() as c:
+        if migration_applied(MONEY_BACKFILL_SCHEMA, c):
+            rows = c.execute(
+                "SELECT run_id, MIN(ts) AS ts, MAX(source) AS source, SUM(passed) AS passed, COUNT(*) AS total,"
+                " SUM(COALESCE(cost_nusd, 0)) AS cost_nusd FROM evals WHERE repo = ? "
+                "GROUP BY run_id ORDER BY ts DESC LIMIT ?",
+                (repo, limit),
+            )
+            return [
+                {**dict(r), "cost": int(r["cost_nusd"] or 0) / 1_000_000_000}
+                for r in rows
+            ]
         rows = c.execute(
             "SELECT run_id, MIN(ts) AS ts, MAX(source) AS source, SUM(passed) AS passed, COUNT(*) AS total,"
             " SUM(cost_usd) AS cost FROM evals WHERE repo = ? GROUP BY run_id ORDER BY ts DESC LIMIT ?",
@@ -332,11 +354,12 @@ def feedback_between(since: str, until: str) -> list[dict]:
 
 
 RESEARCH_COLUMNS = ("ref", "source", "title", "url", "updated", "status", "summary", "error", "run_id",
-                    "cost", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved", "delivered",
-                    "ref_id", "report_blob")
+                    "cost", "cost_nusd", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url",
+                    "moved", "delivered", "ref_id", "report_blob")
 RESEARCH_UPDATABLE_FIELDS = frozenset((*RESEARCH_COLUMNS, "report")) - {"ref"}
 CAPTURE_UPDATABLE_FIELDS = frozenset((
     "kind", "text", "expected", "actual", "steps", "context", "jev_cost_usd", "inspect_cost_usd",
+    "jev_cost_nusd", "inspect_cost_nusd",
     "written_title", "written_body", "written_print", "written_note", "delivery", "issue",
     "issue_url", "issue_title", "filed",
 ))
@@ -404,6 +427,8 @@ def _hydrate_research_row(r) -> dict:
     from . import blobs
 
     d = dict(r)
+    if d.get("cost_nusd") is not None:
+        d["cost"] = int(d["cost_nusd"]) / 1_000_000_000
     sha = d.get("report_blob")
     if sha:
         raw = blobs.read(str(sha))
@@ -446,8 +471,16 @@ def research_set(ref: str, **fields) -> None:
             existing = c.execute("SELECT * FROM research WHERE ref_id = ? LIMIT 1", (ref_id,)).fetchone()
         if existing is None:
             existing = c.execute("SELECT * FROM research WHERE ref = ? LIMIT 1", (norm,)).fetchone()
-        base = _hydrate_research_row(existing) if existing is not None else {"ref": norm, "cost": 0.0}
+        base = _hydrate_research_row(existing) if existing is not None else {"ref": norm, "cost": 0.0, "cost_nusd": 0}
         row = {**base, **fields, "ts": util.iso()}
+        if "cost_nusd" in cols_present:
+            if "cost_nusd" in fields and fields["cost_nusd"] is not None:
+                row["cost_nusd"] = int(fields["cost_nusd"])
+                row["cost"] = row["cost_nusd"] / 1_000_000_000
+            elif "cost" in fields or row.get("cost_nusd") is None:
+                row["cost_nusd"] = util.nusd(row.get("cost"))
+                if row["cost_nusd"] is not None:
+                    row["cost"] = row["cost_nusd"] / 1_000_000_000
         if ref_id is not None:
             row["ref_id"] = ref_id
         if "report_blob" in cols_present and "report" in fields:
@@ -471,6 +504,15 @@ def research_keep(ref: str, **fields) -> None:
     with blobs.lock(), db() as c:
         cols_present = {r[1] for r in c.execute("PRAGMA table_info(research)")}
         updates = dict(fields)
+        if "cost_nusd" in cols_present:
+            if "cost_nusd" in updates and updates["cost_nusd"] is not None:
+                updates["cost_nusd"] = int(updates["cost_nusd"])
+                updates["cost"] = updates["cost_nusd"] / 1_000_000_000
+            elif "cost" in updates:
+                cn = util.nusd(updates["cost"])
+                updates["cost_nusd"] = cn
+                if cn is not None:
+                    updates["cost"] = cn / 1_000_000_000
         if "report" in updates:
             report_text = str(updates["report"] or "")
             if "report_blob" in cols_present:
@@ -515,6 +557,10 @@ def capture_draft(connect=reader) -> dict | None:
         if not r:
             return None
         draft = dict(r)
+        if draft.get("jev_cost_nusd") is not None:
+            draft["jev_cost_usd"] = int(draft["jev_cost_nusd"]) / 1_000_000_000
+        if draft.get("inspect_cost_nusd") is not None:
+            draft["inspect_cost_usd"] = int(draft["inspect_cost_nusd"]) / 1_000_000_000
         draft["evidence"] = [{**dict(e), "inspection": json_dict(e["inspection"])} for e in c.execute(
             "SELECT * FROM capture_evidence WHERE capture = ? ORDER BY id", (draft["id"],))]
         draft["checks"] = {k["name"]: {**dict(k), "detail": json_dict(k["detail"])} for k in c.execute(
@@ -584,25 +630,41 @@ def capture_filing(connect=reader) -> bool:
 
 
 def capture_check_done(draft_id: int, name: str, result: str, reason: str, detail: dict, cost: float) -> bool:
+    cost_nusd = int(util.nusd(cost) or 0)
     with tx() as c:
         changed = c.execute(
             "UPDATE capture_checks SET result = ?, reason = ?, detail = ?, checked = ? WHERE capture = ? AND name = ? "
             "AND result = 'running' AND EXISTS (SELECT 1 FROM captures WHERE id = ? AND status = 'checking')",
             (result, reason, json.dumps(detail), util.iso(), draft_id, name, draft_id)).rowcount
         if changed:
-            c.execute("UPDATE captures SET jev_cost_usd = COALESCE(jev_cost_usd, 0) + ? WHERE id = ?", (cost, draft_id))
+            if migration_applied(MONEY_EXPAND_SCHEMA, c):
+                c.execute(
+                    "UPDATE captures SET jev_cost_nusd = COALESCE(jev_cost_nusd, 0) + ?, "
+                    "jev_cost_usd = (COALESCE(jev_cost_nusd, 0) + ?) / 1000000000.0 WHERE id = ?",
+                    (cost_nusd, cost_nusd, draft_id),
+                )
+            else:
+                c.execute("UPDATE captures SET jev_cost_usd = COALESCE(jev_cost_usd, 0) + ? WHERE id = ?", (cost, draft_id))
         return bool(changed)
 
 
 def capture_inspected(evidence_id: int, sha256: str, inspection: dict, cost: float) -> bool:
+    cost_nusd = int(util.nusd(cost) or 0)
     with tx() as c:
         row = c.execute("SELECT capture FROM capture_evidence WHERE id = ? AND sha256 = ?",
                         (evidence_id, sha256)).fetchone()
         if not row:
             return False
         c.execute("UPDATE capture_evidence SET inspection = ? WHERE id = ?", (json.dumps(inspection), evidence_id))
-        c.execute("UPDATE captures SET inspect_cost_usd = COALESCE(inspect_cost_usd, 0) + ? WHERE id = ?",
-                  (cost, row["capture"]))
+        if migration_applied(MONEY_EXPAND_SCHEMA, c):
+            c.execute(
+                "UPDATE captures SET inspect_cost_nusd = COALESCE(inspect_cost_nusd, 0) + ?, "
+                "inspect_cost_usd = (COALESCE(inspect_cost_nusd, 0) + ?) / 1000000000.0 WHERE id = ?",
+                (cost_nusd, cost_nusd, row["capture"]),
+            )
+        else:
+            c.execute("UPDATE captures SET inspect_cost_usd = COALESCE(inspect_cost_usd, 0) + ? WHERE id = ?",
+                      (cost, row["capture"]))
         return True
 
 

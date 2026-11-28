@@ -147,6 +147,134 @@ class StatsQueryTests(unittest.TestCase):
             finally:
                 ro.close()
 
+    def test_stored_money_integer_means_rounding_and_unknown_evidence(self) -> None:
+        now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=UTC)
+        today_start = "2026-11-28T10:00:00Z"
+        eight_days_ago = util.iso(now - timedelta(days=8))
+
+        vectors = [
+            ("v_1_2", [1, 2], 2),
+            ("v_0_1", [0, 1], 0),
+            ("v_2_3", [2, 3], 2),
+            ("v_neg_1_2", [-1, -2], -2),
+            ("v_neg_2_3", [-2, -3], -2),
+            ("v_0_neg1", [0, -1], 0),
+            ("v_neg1_1", [-1, 1], 0),
+            ("v_zero", [0, 0], 0),
+            ("v_big_pos", [10**18 + 1, 10**18 + 2], 10**18 + 2),
+            ("v_big_neg", [-(10**18 + 1), -(10**18 + 2)], -(10**18 + 2)),
+        ]
+
+        with tempfile.TemporaryDirectory(prefix="arete-stats-money-") as tmp:
+            db_path = Path(tmp) / "stats_money.db"
+            conn = _make_schema_db(db_path)
+            try:
+                conn.execute("ALTER TABLE steps ADD COLUMN cost_nusd INTEGER")
+                for label, run_costs, _expected in vectors:
+                    for idx, amount in enumerate(run_costs):
+                        rid = f"{label}_r{idx}"
+                        conn.execute(
+                            "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                            "VALUES (?, 'pipeline', 'done', ?, ?, ?)",
+                            (rid, today_start, "2026-11-28T10:01:00Z", label),
+                        )
+                        conn.execute(
+                            "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                            "VALUES (?, 'plan', 'plan', 'done', 1, 10.0, ?, ?, ?)",
+                            (rid, today_start, f"prompt/{label}@111111111111", amount),
+                        )
+
+                # Run with NULL cost_nusd only -> unknown evidence (null/null)
+                conn.execute(
+                    "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                    "VALUES ('r_unknown', 'pipeline', 'done', ?, ?, 'unknown_only')",
+                    (today_start, "2026-11-28T10:01:00Z"),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_unknown', 'plan', 'plan', 'done', 1, 10.0, ?, 'prompt/unknown_only@111111111111', NULL)",
+                    (today_start,),
+                )
+
+                # Signed correction on an eligible run (correction has NULL prompt_version)
+                conn.execute(
+                    "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                    "VALUES ('r_corr1', 'pipeline', 'done', ?, ?, 'with_corr')",
+                    (today_start, "2026-11-28T10:01:00Z"),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_corr1', 'plan', 'plan', 'done', 1, 10.0, ?, 'prompt/with_corr@111111111111', 10)",
+                    (today_start,),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_corr1', 'correction', 'correction', 'done', 1, 0.0, ?, NULL, -7)",
+                    (today_start,),
+                )
+                # Unknown run on same ADW/prompt must NOT coerce NULL to 0
+                conn.execute(
+                    "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                    "VALUES ('r_corr_null', 'pipeline', 'done', ?, ?, 'with_corr')",
+                    (today_start, "2026-11-28T10:01:00Z"),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_corr_null', 'plan', 'plan', 'done', 1, 10.0, ?, 'prompt/with_corr@111111111111', NULL)",
+                    (today_start,),
+                )
+                # 8-day-old run and NULL-ADW run must be excluded
+                conn.execute(
+                    "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                    "VALUES ('r_old', 'pipeline', 'done', ?, ?, 'v_1_2')",
+                    (eight_days_ago, eight_days_ago),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_old', 'plan', 'plan', 'done', 1, 10.0, ?, 'prompt/v_1_2@111111111111', 999999)",
+                    (eight_days_ago,),
+                )
+                conn.execute(
+                    "INSERT INTO runs (id, kind, status, started, finished, adw) "
+                    "VALUES ('r_null_adw', 'pipeline', 'done', ?, ?, NULL)",
+                    (today_start, "2026-11-28T10:01:00Z"),
+                )
+                conn.execute(
+                    "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_nusd) "
+                    "VALUES ('r_null_adw', 'plan', 'plan', 'done', 1, 10.0, ?, NULL, 999999)",
+                    (today_start,),
+                )
+                conn.commit()
+                before_bytes = db_path.read_bytes()
+            finally:
+                conn.close()
+
+            ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                for label, _run_costs, expected in vectors:
+                    pstat = stats.prompt_stats(ro, label, now)
+                    astat = stats.adw_stats(ro, label, now)
+                    self.assertEqual(pstat["costPerRunNusd"], expected, label)
+                    self.assertEqual(pstat["costPerRun"], expected / 1_000_000_000, label)
+                    self.assertEqual(astat["costPerRunNusd"], expected, label)
+                    self.assertEqual(astat["costPerRun"], expected / 1_000_000_000, label)
+
+                self.assertEqual(stats.prompt_stats(ro, "unknown_only", now)["costPerRunNusd"], None)
+                self.assertEqual(stats.prompt_stats(ro, "unknown_only", now)["costPerRun"], None)
+                self.assertEqual(stats.adw_stats(ro, "unknown_only", now)["costPerRunNusd"], None)
+                self.assertEqual(stats.adw_stats(ro, "unknown_only", now)["costPerRun"], None)
+                self.assertEqual(stats.prompt_stats(ro, "never_ran", now)["costPerRunNusd"], None)
+                self.assertEqual(stats.adw_stats(ro, "never_ran", now)["costPerRunNusd"], None)
+
+                # Signed correction: 10 + (-7) = 3 across 1 monetary run (NULL run excluded from denominator)
+                self.assertEqual(stats.prompt_stats(ro, "with_corr", now)["costPerRunNusd"], 3)
+                self.assertEqual(stats.prompt_stats(ro, "with_corr", now)["costPerRun"], 3 / 1_000_000_000)
+                self.assertEqual(stats.adw_stats(ro, "with_corr", now)["costPerRunNusd"], 3)
+                self.assertEqual(stats.adw_stats(ro, "with_corr", now)["costPerRun"], 3 / 1_000_000_000)
+            finally:
+                ro.close()
+            self.assertEqual(db_path.read_bytes(), before_bytes)
+
 
 class StatsApiTests(unittest.TestCase):
     def test_routes_window_filtering_and_etag_invalidation(self) -> None:
@@ -200,8 +328,8 @@ with db.tx() as conn:
         ],
     )
     conn.executemany(
-        "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO steps (run_id, step, node, status, ok, seconds, ts, prompt_version, cost_usd, cost_nusd) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
         [
             ("r1", "plan", "plan", "done", 1, 10.0, "2026-11-28T10:00:10Z", "prompt/plan@aaa111222333"),
             ("r1", "build", "build", "done", 1, 50.0, "2026-11-28T10:01:00Z", "prompt/build@bbb111222333"),
@@ -388,74 +516,56 @@ with (
             plan8 = json.loads(raw_plan8)["item"]
             assert etag_plan8 != etag_plan7 and plan8["runs7d"] == 2 and plan8["passRate"] == 100
 
-            with db.tx() as conn:
-                conn.execute("ALTER TABLE steps ADD COLUMN cost_nusd INTEGER")
+            # Installing the stored-money producer invalidates an earlier null-cost representation
+            # even when no step was added.
+            with mock.patch.object(stats, "MONETARY_PRODUCER", None):
+                h_stats_null, raw_stats_null = api.request("GET", "/api/v1/config/adw/feature/stats")
+                etag_stats_null = h_stats_null["ETag"]
+                assert json.loads(raw_stats_null)["costPerRunNusd"] is None
+                h_plan_null, raw_plan_null = api.request("GET", "/api/v1/config/prompt/plan")
+                etag_plan_null = h_plan_null["ETag"]
+                assert json.loads(raw_plan_null)["item"]["costPerRunNusd"] is None
+
             h_stats9, raw_stats9 = api.request(
-                "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats8}, status=200
+                "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats_null}, status=200
             )
             etag_stats9 = h_stats9["ETag"]
-            assert etag_stats9 != etag_stats8 and json.loads(raw_stats9)["costPerRunNusd"] is None
+            assert etag_stats9 != etag_stats_null and json.loads(raw_stats9)["costPerRunNusd"] is None
             h_plan9, raw_plan9 = api.request(
-                "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan8}, status=200
+                "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan_null}, status=200
             )
             etag_plan9 = h_plan9["ETag"]
-            assert etag_plan9 != etag_plan8 and json.loads(raw_plan9)["item"]["costPerRunNusd"] is None
+            assert etag_plan9 != etag_plan_null and json.loads(raw_plan9)["item"]["costPerRunNusd"] is None
 
             with db.tx() as conn:
                 conn.execute("UPDATE steps SET cost_nusd = 1250000000 WHERE run_id = 'r1' AND node = 'plan'")
-            h_stats10, _ = api.request(
+            h_stats10, raw_stats10 = api.request(
                 "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats9}, status=200
             )
             etag_stats10 = h_stats10["ETag"]
+            stats10 = json.loads(raw_stats10)
             assert etag_stats10 != etag_stats9
-            h_plan10, _ = api.request(
+            assert stats10["costPerRunNusd"] == 1_250_000_000 and stats10["costPerRun"] == 1.25
+            h_plan10, raw_plan10 = api.request(
                 "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan9}, status=200
             )
             etag_plan10 = h_plan10["ETag"]
+            plan10 = json.loads(raw_plan10)["item"]
             assert etag_plan10 != etag_plan9
+            assert plan10["costPerRunNusd"] == 1_250_000_000 and plan10["costPerRun"] == 1.25
 
-            class StubMonetary:
-                capability = "money-v1"
-
-                def __init__(self, amount_nusd: int, rev: str) -> None:
-                    self.amount_nusd = amount_nusd
-                    self.rev = rev
-
-                def for_prompt(self, conn, name, start, end):
-                    return self.amount_nusd, self.amount_nusd / 1_000_000_000, self.rev
-
-                def for_adw(self, conn, name, start, end):
-                    return self.amount_nusd, self.amount_nusd / 1_000_000_000, self.rev
-
-            stub = StubMonetary(1_250_000_000, "rev-1")
-            with mock.patch.object(stats, "MONETARY_PRODUCER", stub):
-                h_stats11, raw_stats11 = api.request(
-                    "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats10}, status=200
-                )
-                etag_stats11 = h_stats11["ETag"]
-                stats11 = json.loads(raw_stats11)
-                assert etag_stats11 != etag_stats10
-                assert stats11["costPerRunNusd"] == 1_250_000_000 and stats11["costPerRun"] == 1.25
-                h_plan11, raw_plan11 = api.request(
-                    "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan10}, status=200
-                )
-                etag_plan11 = h_plan11["ETag"]
-                plan11 = json.loads(raw_plan11)["item"]
-                assert etag_plan11 != etag_plan10
-                assert plan11["costPerRunNusd"] == 1_250_000_000 and plan11["costPerRun"] == 1.25
-
-                stub.amount_nusd = 2_000_000_000
-                stub.rev = "rev-2"
-                h_stats12, raw_stats12 = api.request(
-                    "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats11}, status=200
-                )
-                assert h_stats12["ETag"] != etag_stats11
-                assert json.loads(raw_stats12)["costPerRunNusd"] == 2_000_000_000
-                h_plan12, raw_plan12 = api.request(
-                    "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan11}, status=200
-                )
-                assert h_plan12["ETag"] != etag_plan11
-                assert json.loads(raw_plan12)["item"]["costPerRun"] == 2.0
+            with db.tx() as conn:
+                conn.execute("UPDATE steps SET cost_nusd = 2000000000 WHERE run_id = 'r1' AND node = 'plan'")
+            h_stats11, raw_stats11 = api.request(
+                "GET", "/api/v1/config/adw/feature/stats", headers={"If-None-Match": etag_stats10}, status=200
+            )
+            assert h_stats11["ETag"] != etag_stats10
+            assert json.loads(raw_stats11)["costPerRunNusd"] == 2_000_000_000
+            h_plan11, raw_plan11 = api.request(
+                "GET", "/api/v1/config/prompt/plan", headers={"If-None-Match": etag_plan10}, status=200
+            )
+            assert h_plan11["ETag"] != etag_plan10
+            assert json.loads(raw_plan11)["item"]["costPerRun"] == 2.0
         finally:
             server.shutdown()
             thread.join(timeout=5)

@@ -125,6 +125,7 @@ class Reply:
     model: str = ""
     tokens_in: int = 0
     cost_usd: float = 0.0
+    price_version: str = ""
 
 
 class Unjudged(Exception):
@@ -497,12 +498,17 @@ def retry_after(header: str | None, attempt: int) -> float:
 
 
 def parse_usage(data: dict, *, exact_cost: bool = False) -> Reply:
+    from . import prices
+
     usage = data.get("usage") or {}
     tokens = int(usage.get("input_tokens") or 0)
     cost = usage.get("cost")
     if cost is None or not (exact_cost or cost):
         cost = tokens * INPUT_USD_PER_MILLION / 1_000_000
-    return Reply(model=str(data.get("model") or ""), tokens_in=tokens, cost_usd=float(cost))
+        pv = prices.JEV_BUILTIN_PRICE_VERSION
+    else:
+        pv = "provider"
+    return Reply(model=str(data.get("model") or ""), tokens_in=tokens, cost_usd=float(cost), price_version=pv)
 
 
 def parse(data: dict, questions: dict[str, dict]) -> Reply:
@@ -541,7 +547,16 @@ def result(replies: list[Reply], error: str = "") -> Result:
     failed = [r.error for r in replies if r.error]
     if failed and not error:
         error = failed[0] if len(replies) == 1 else f"{len(failed)} of {len(replies)} calls failed: {failed[0]}"
-    return Result(ok=not error, error=error, tokens_in=tokens, cost_usd=sum(r.cost_usd for r in replies),
+    total_nusd = sum(util.nusd(r.cost_usd) or 0 for r in replies)
+    versions = {r.price_version for r in replies if r.price_version}
+    if len(versions) == 1:
+        pv = next(iter(versions))
+    elif len(versions) > 1:
+        pv = "mixed"
+    else:
+        pv = "provider"
+    return Result(ok=not error, error=error, tokens_in=tokens, cost_usd=total_nusd / 1_000_000_000,
+                  cost_nusd=total_nusd, paid_nusd=total_nusd, price_version=pv, auth_mode="api_key",
                   turns=len(replies), model=next((r.model for r in replies if r.model), "jev"), provider="openrouter",
                   runner="jev")
 

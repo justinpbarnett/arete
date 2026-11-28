@@ -594,7 +594,7 @@ def faults(exp: Experiment, run_id: str) -> dict:
 
 def usage(exp: Experiment, arm: str, run_id: str) -> dict:
     rows = run_store.steps(run_id)
-    charged = run_store.paid_by_run([run_id], local_providers=exp.cfg.local_providers).get(run_id, 0.0)
+    charged = run_store.paid_by_run([run_id]).get(run_id, 0.0)
     records = [framed(f) for f in record.record_files(run_id)]
     header, result = next(((h, r) for h, r in records if h.get("atom") == exp.atom), ({}, None))
     launched = bool(header) and not header.get("refused")
@@ -682,7 +682,7 @@ class TrialRun(evals.EvalRun):
 
     def used(self) -> Totals:
         rows = run_store.steps(self.id)
-        paid = run_store.paid_by_run([self.id], local_providers=self.config.local_providers).get(self.id, 0.0)
+        paid = run_store.paid_by_run([self.id]).get(self.id, 0.0)
         return Totals(self.before.spend + paid, self.before.calls + len(rows),
                       self.before.tokens + sum((r["tokens_in"] or 0) + (r["tokens_out"] or 0) for r in rows),
                       self.before.seconds + time.monotonic() - self.began)

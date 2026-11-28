@@ -288,9 +288,19 @@ def cmd_jev(args) -> int:
 
         return calibrate.main(args)
 
-    from .. import jev_verdicts
+    from urllib.parse import urlencode
 
-    data = jev_verdicts.summary(args.days, config.load())
+    from .. import client, insights, jev_verdicts
+
+    try:
+        if client.configured_server() is not None:
+            path = "/api/v1/insights/jev?" + urlencode({"days": str(args.days)})
+            data = client.request("GET", path)["series"]
+        else:
+            data = insights.query("jev", days=args.days)[0]["series"]
+    except Exception as e:
+        print(e, file=sys.stderr)
+        return 1
     print(json.dumps(data, indent=2) if args.json else jev_verdicts.render(data))
     return 0
 

@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "local_providers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "input": {"type": "number", "minimum": 0},
+          "output": {"type": "number", "minimum": 0},
+          "unit": {
+            "type": "string",
+            "enum": ["per_million_tokens", "per_thousand_tokens", "per_token"]
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["schema"]
+}

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from .. import jira, util
 from ._rows import insert_sql, lists_read, lists_written
-from .db import db, reader
+from .db import MONEY_EXPAND_SCHEMA, db, migration_applied, reader
 
 TABLES = {
     "triage_verdicts": "kept",
@@ -285,7 +285,9 @@ def record_verdict(
         code_raw = row.get("code")
         code_val = None if code_raw in (None, "") else int(bool(code_raw))
         at_ts = str(row.get("ts") or util.iso())
-        values = (
+        cost_val = float(row.get("cost") or 0.0)
+        cost_nusd = util.nusd(cost_val)
+        base_values = (
             ref_str,
             int(ref_id) if ref_id is not None else None,
             source,
@@ -306,10 +308,16 @@ def record_verdict(
             _json_list_str(row.get("checks")),
             _json_list_str(row.get("repos")),
             str(row.get("why") or ""),
-            float(row.get("cost") or 0.0),
+            (cost_nusd / 1_000_000_000) if cost_nusd is not None else cost_val,
             judged,
         )
-        cur = c.execute(insert_sql("triage_verdicts", VERDICT_COLUMNS), values)
+        if migration_applied(MONEY_EXPAND_SCHEMA, c):
+            cur = c.execute(
+                insert_sql("triage_verdicts", (*VERDICT_COLUMNS, "cost_nusd")),
+                (*base_values, cost_nusd),
+            )
+        else:
+            cur = c.execute(insert_sql("triage_verdicts", VERDICT_COLUMNS), base_values)
         return int(cur.lastrowid)
 
     if conn is not None:
@@ -390,33 +398,37 @@ def copy_verdict_after_move(ref: str, before: str, after: str) -> bool:
             v = dict(vrow)
             if iso_updated(v.get("judged_updated")) == before_iso:
                 now = util.iso()
-                c.execute(
-                    insert_sql("triage_verdicts", VERDICT_COLUMNS),
-                    (
-                        v["ref"],
-                        v["ref_id"],
-                        v["source"],
-                        v["tracker"],
-                        v["repo"],
-                        v["route"],
-                        v["ready"],
-                        v["code"],
-                        v["size"],
-                        v["kind"],
-                        v["reason"],
-                        v["model"],
-                        v["run_id"],
-                        now,
-                        v["questions"],
-                        v["plan"],
-                        v["assumptions"],
-                        v["checks"],
-                        v["repos"],
-                        v["why"],
-                        0.0,
-                        after_iso,
-                    ),
+                copy_values = (
+                    v["ref"],
+                    v["ref_id"],
+                    v["source"],
+                    v["tracker"],
+                    v["repo"],
+                    v["route"],
+                    v["ready"],
+                    v["code"],
+                    v["size"],
+                    v["kind"],
+                    v["reason"],
+                    v["model"],
+                    v["run_id"],
+                    now,
+                    v["questions"],
+                    v["plan"],
+                    v["assumptions"],
+                    v["checks"],
+                    v["repos"],
+                    v["why"],
+                    0.0,
+                    after_iso,
                 )
+                if migration_applied(MONEY_EXPAND_SCHEMA, c):
+                    c.execute(
+                        insert_sql("triage_verdicts", (*VERDICT_COLUMNS, "cost_nusd")),
+                        (*copy_values, 0),
+                    )
+                else:
+                    c.execute(insert_sql("triage_verdicts", VERDICT_COLUMNS), copy_values)
                 copied = True
         if ref_id is not None:
             c.execute(

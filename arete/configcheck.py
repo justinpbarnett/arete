@@ -31,11 +31,11 @@ from .store import runs as run_store
 VALIDATOR = "configcheck.v1"
 
 TOML_KINDS = frozenset((
-    "step_settings", "models", "budgets", "connector", "source", "target", "rule",
+    "step_settings", "models", "prices", "budgets", "connector", "source", "target", "rule",
     "sync", "vocabularies", "device", "loop", "attention", "experiment", "retention",
     "adw", "routes", "sound", "library",
 ))
-JSON_KINDS = frozenset(("schema", "prices"))
+JSON_KINDS = frozenset(("schema",))
 
 # Reach keys / path segments that ALWAYS require Gate C when touched.
 REACH_KEYS = frozenset((
@@ -118,6 +118,8 @@ def _schema_name_for(kind: str, path: str, name: str) -> str:
         if path.startswith("layers/"):
             return "layer_toml"
         return "step_settings"
+    if kind == "prices" and (name == "billing" or path == "prices/billing.toml"):
+        return "prices_billing"
     return kind
 
 
@@ -314,6 +316,16 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
 
         if not sources_mod.SOURCE_ID_RE.fullmatch(name):
             problems.append(f"{where}: source id {name!r} must match ^[a-z0-9][a-z0-9-]{{0,63}}$")
+    elif kind == "prices" and isinstance(parsed, dict):
+        from . import prices
+
+        try:
+            if name == "billing" or path == "prices/billing.toml":
+                prices.parse_billing(parsed)
+            else:
+                prices.parse(parsed)
+        except (ValueError, TypeError) as error:
+            problems.append(f"{where}: {error}")
     return problems
 
 
