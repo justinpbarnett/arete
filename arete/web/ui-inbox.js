@@ -1,11 +1,98 @@
 import { askHash, runHash } from "./ui-data.js";
 import { AskForm } from "./ui-asks.js";
-import { Decisions, DetailLink, Rows, Text, html } from "./ui-operations.js";
+import { notice } from "./ui-notice.js";
+import { Decisions, DetailLink, Operation, Rows, Text, html } from "./ui-operations.js";
+import { webFetch } from "./ui-request.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 
 const outboxKinds = new Set(["approval", "draft"]);
 const option = (label, path, confirm, say, body) => ({ label, path, confirm, say, body });
 const stated = (message) => () => message;
+
+function uploadKey() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+class EvidenceForm extends Operation {
+  upload = async (event) => {
+    event.preventDefault();
+    const { item, disabled, retry } = this.props;
+    if (this.state.busy || disabled) return;
+    const input = event.currentTarget.querySelector('input[type="file"]');
+    const file = input?.files?.[0];
+    if (!file) {
+      this.setState({ error: "Choose a file to upload first." });
+      input?.focus();
+      return;
+    }
+    this.setState({ busy: true, error: "" });
+    try {
+      const response = await webFetch(`/api/v1/inbox/${encodeURIComponent(item.inbox_id)}/evidence`, {
+        method: "POST",
+        headers: {
+          "X-Arete": "1",
+          "Idempotency-Key": uploadKey(),
+          "Content-Type": "application/octet-stream",
+          "X-Evidence-Filename": file.name || item.name || "evidence",
+        },
+        body: file,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        this.setState({ error: payload.detail || payload.error || `Upload failed (${response.status})` });
+        return;
+      }
+      notice.value = payload.result?.run
+        ? `Private copy saved · resumed ${payload.result.run}`
+        : "Private copy saved inside Arete";
+    } catch (fault) {
+      this.setState({ error: fault?.message || "Upload failed" });
+    } finally {
+      try { await retry(); }
+      finally { this.setState({ busy: false }); }
+    }
+  };
+
+  render({ item, disabled, retry }, { busy, error }) {
+    const resolvePath = `/api/v1/inbox/${encodeURIComponent(item.inbox_id)}/resolve`;
+    const why = [
+      `Reference: ${item.name || item.ref_key} (${item.ref_kind})`,
+      item.failure_detail ? `Reason: ${item.failure_detail}` : "",
+      item.last_error ? `Last check: ${item.last_error}` : "",
+    ].filter(Boolean).join("\n");
+    const options = [
+      option("Access restored", resolvePath, `Re-verify access to ${item.name || item.ref_key} and resume?`,
+        (r) => r.result?.resumed?.run ? `Access verified · resumed ${r.result.resumed.run}` : "Access verified",
+        { base_version: item.version, verb: "retry" }),
+      option("Dismiss", resolvePath, "Stop waiting for this missing evidence?", stated("Dismissed evidence request"),
+        { base_version: item.version, verb: "dismiss" }),
+    ];
+    return html`<section class="ops-detail">
+      <header>
+        <p class="ops-kicker">Private Evidence · ${item.repo || "No repo"}</p>
+        <h3>${item.ticket_ref || item.ticket}: ${item.name || item.ref_key}</h3>
+      </header>
+      <${Text} text=${why} />
+      <p class="muted">Private to Arete — uploaded copies and access details stay inside Arete and are never posted to the team ticket.</p>
+      <div class="ops-links">
+        ${item.run_id ? html`<a href=${runHash(item.run_id)}>Open run</a>` : null}
+        <${DetailLink} href=${item.original_url}>Original link<//>
+      </div>
+      <form class="ops-form" onSubmit=${this.upload} aria-label="Upload private evidence copy">
+        <fieldset disabled=${busy || disabled}>
+          <label class="ops-field">Upload private copy
+            <input name="file" type="file" />
+          </label>
+        </fieldset>
+        <div class="ops-actions">
+          <button type="submit" disabled=${busy || disabled}>Upload private copy & resume</button>
+        </div>
+        ${error ? html`<p class="ops-error" role="alert">${error}</p>` : null}
+      </form>
+      <${Decisions} options=${options} retry=${retry} disabled=${busy || disabled} />
+    </section>`;
+  }
+}
 
 function inbox(snapshot, screen) {
   const { asks, questions } = snapshot;
@@ -14,6 +101,7 @@ function inbox(snapshot, screen) {
     if (screen === "outbox" && !outboxKinds.has(kind)) return;
     rows.push({ id: `${kind}/${id}`, href: `#${screen}/${kind}/${encodeURIComponent(id)}`, title, state, item, kind, context: item.repo });
   };
+  for (const e of asks?.evidence?.rows ?? []) add("evidence", e.id, `${e.ticket_ref || e.ticket}: ${e.name}`, "Evidence", e);
   for (const a of questions?.data?.asks ?? []) add("ask", a.id, a.questions[0]?.header || a.questions[0]?.question || a.ticket || a.run, "Question", a);
   for (const a of asks?.approvals?.rows ?? []) add("approval", a.id, a.plain_summary || a.what, a.failed ? "Failed" : "Approval", a);
   for (const s of asks?.skipped?.rows ?? []) add("skipped", s.ticket, s.ticket, "Skipped", s);
@@ -97,6 +185,7 @@ export function InboxFocus({ snapshot, route, retry }) {
     return html`<div class="ops-detail"><p>This item is no longer in the ${outbox ? "outbox" : "inbox"}.</p></div>`;
   }
   if (row.kind === "ask") return html`<${AskForm} key=${row.id} ask=${row.item} retry=${retry} disabled=${Boolean(snapshot.questions.error)} />`;
+  if (row.kind === "evidence") return html`<${EvidenceForm} key=${row.id} item=${row.item} retry=${retry} disabled=${Boolean(snapshot.errors.live)} />`;
   const detail = detailFor(row);
   const section = ["approve", "hand", "memory"].includes(row.kind) ? "proposals" : row.kind === "approval" ? "approvals" : row.kind;
   return html`<section class="ops-detail" key=${row.id}>

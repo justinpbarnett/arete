@@ -14,7 +14,7 @@ TABLES = {
 
 KINDS = frozenset((
     "approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace", "config_invalid",
-    "queue.dead",
+    "queue.dead", "evidence",
 ))
 STATES = frozenset(("open", "snoozed", "shelved", "paused", "resolved"))
 PRIORITIES = (1, 2, 3)

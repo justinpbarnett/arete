@@ -1149,9 +1149,17 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     elif t.blocker and not run.force:
         return end_as("stop", "quiet", status="skipped", summary=t.blocker)
     try:
-        attachments, attachment_dirs, _manifest = pipeline.collect_ticket_attachments(tk, t, run.dir, log=run.log)
+        attachments, attachment_dirs, manifest = pipeline.collect_ticket_attachments(
+            tk, t, run.dir, log=run.log, repo_name=repo.name, run_id=run.id, record_missing=not run.dry_run,
+        )
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not download the images on {run.ref}: {e}")
+    if missing := manifest.get("needs_private_help"):
+        from . import private_evidence
+
+        summary = private_evidence.waiting_summary(missing)
+        run_lines.write(run.id, "private_evidence", ticket=t.ref, missing=missing)
+        return end_as("stop", "quiet", status="needs-info", summary=summary)
     main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,

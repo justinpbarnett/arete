@@ -48,7 +48,7 @@ DROPBOX_HOSTS = frozenset({"dropbox.com", "www.dropbox.com", "dl.dropboxusercont
 AUTH_REDIRECT_HINTS = ("/login", "/session", "/signin", "id.atlassian.com")
 
 TOKEN_PATTERN = re.compile(
-    r"(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|xox[baprs]-[A-Za-z0-9-]+|sl\.[A-Za-z0-9._-]{12,})",
+    r"(?:(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}|xox[baprs]-[A-Za-z0-9-]+|sl\.[A-Za-z0-9._-]{12,}|ATATT[A-Za-z0-9._-]{8,})",
     re.IGNORECASE,
 )
 
