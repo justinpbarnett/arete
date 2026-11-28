@@ -34,18 +34,23 @@ class SnapshotUnavailable(OSError):
 
 
 @contextmanager
-def ticket_lock(repo: str, ticket: str | int, *, task_id: int | None = None):
+def ticket_lock(repo: str, ticket: str | int, *, task_id: int | None = None, lookup: bool = True):
     from contextlib import ExitStack
     from . import tasks as task_store
 
     resolved = task_id
+    contracted = False
     if resolved is None:
-        try:
-            with reader() as c:
-                resolved = task_store.TaskStore.find_task_num(c, repo, ticket)
-        except Exception:
-            resolved = None
-    contracted = task_store.is_contracted()
+        if lookup:
+            try:
+                with reader() as c:
+                    resolved = task_store.TaskStore.find_task_num(c, repo, ticket)
+                    if resolved is not None:
+                        contracted = task_store.is_contracted(c)
+            except Exception:
+                resolved = None
+    else:
+        contracted = task_store.is_contracted()
     if resolved is not None:
         new_name = runs.run_lock("pipeline", task=int(resolved))
         old_name = runs.run_lock("pipeline", repo, ticket)

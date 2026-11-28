@@ -2654,19 +2654,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 task_num = task_store.TaskStore.find_task_num(c, repo, tid, cfg=cfg)
                 if task_num is not None:
                     issue_key = task_store.canonical_issue_key(repo, tid, task_num)
-        if task_num is None:
-            with suppress(sqlite3.OperationalError), db.tx(timeout=0.5) as c:
-                if task_store.has_identity_expand(c):
-                    task_num, issue_key = task_store.TaskStore.task_for_ticket(
-                        c, repo, tid, principals.current(), cfg=cfg,
-                    )
     name = tracker.ticket_name(repo.name, tk.ref(tid))
     lock = (
         run_store.run_lock("pipeline", task=int(task_num))
         if task_num is not None
         else run_store.run_lock("pipeline", repo.name, tid)
     )
-    with workspaces.ticket_lock(repo.name, tid, task_id=task_num) as got, ExitStack() as pin_stack:
+    with workspaces.ticket_lock(
+        repo.name, tid, task_id=task_num, lookup=not (persist_run or given_run_id),
+    ) as got, ExitStack() as pin_stack:
         if not got:
             print(f"{name} is already running")
             return 0
@@ -2887,15 +2883,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not slot_admission.enter_context(slots.admitting(wait=zte_grant is None)):
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
-            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel, task_id=task_num)
             due_from = spec_previous or (script.continues if script else "")
             due = asks_store.asks_due([due_from]) if due_from and not only else []
             if recovery and slots.slots_free_to_start(cfg.max_parallel) == 0:
                 print(f"{name}: recovery is waiting for a run slot")
                 return SLOT_QUEUE_FAILED_EXIT
+            need_slot = False
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
-                    slot.hold()
+                    need_slot = True
                 elif not due or zte_store.activation_pending():
                     slot_admission.close()
                     can_queue = not zte_grant and issue_state in ("OPEN", "CLOSED", "MERGED")
@@ -2918,6 +2914,21 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         print(f"{refusal} Wait for a run to finish or raise max_parallel in "
                               f"{paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
+            if persist_run and task_num is None:
+                with db.tx() as c:
+                    if task_store.has_identity_expand(c):
+                        task_num, issue_key = task_store.TaskStore.task_for_ticket(
+                            c, repo, tid, principals.current(), cfg=cfg,
+                        )
+                        lock = run_store.run_lock("pipeline", task=int(task_num))
+                if task_num is not None and not pin_stack.enter_context(
+                    workspaces.ticket_lock(repo.name, tid, task_id=task_num)
+                ):
+                    print(f"{name} is already running")
+                    return 0
+            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel, task_id=task_num)
+            if need_slot:
+                slot.hold()
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
             if settled and may_revise:
