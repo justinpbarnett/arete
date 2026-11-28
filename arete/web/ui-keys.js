@@ -5,6 +5,7 @@ import { paletteKey, paletteRouteChanged } from "./ui-palette.js";
 import { notice } from "./ui-notice.js";
 import { actions, perform, repeat, reasonBox, cancelReason, confirmReason } from "./ui-actions.js";
 import { undo } from "./ui-undo.js";
+import { consoleOpen, toggleConsole, closeConsole } from "./ui-console.js";
 export { notice };
 
 export const screenKeys = [
@@ -40,13 +41,14 @@ export const sheetGroups = [
     [["."], "repeat on the next item"],
   ]],
   ["Anywhere", [
+    [["gc"], "Chat with Arete"],
     [[":", "Cmd K"], "command palette"], [["?"], "this sheet"],
     [["Esc"], "leave insert, close; never changes screens"],
   ]],
   ["Palette only", [[[":"], "snooze 1 hour or to Monday, redirect, batch send, revert a prompt, merge, reply, show done, display"]]],
 ];
 
-const panes = ["sidebar", "queue", "focus"];
+const panes = ["sidebar", "queue", "focus", "console"];
 const textTypes = ["", "text", "search", "url", "email", "tel", "password", "number"];
 const tabSelector = '[role="tab"]:not([disabled]):not([aria-disabled="true"])';
 const fixed = { "Enter": "open", "-": "up", "[": "previous", "]": "next", "/": "search", "i": "insert", "G": "last", "j": "down", "k": "up-row", "h": "left", "l": "right" };
@@ -160,6 +162,7 @@ export function syncList(list) {
 }
 
 export function marks() {
+  if (pane.value === "console" && !paneElements("console").length) pane.value = "queue";
   const app = narrowRun() ? document.querySelector('.ui-app[data-screen="run"]') : null;
   if (app) {
     if (pane.value !== "sidebar") app.dataset.runPane = pane.value;
@@ -273,13 +276,26 @@ function escape() {
   if (field?.isConnected && field.value) {
     field.value = "";
     field.dispatchEvent(new Event("input", { bubbles: true }));
+    searched = null;
+    return;
   }
   searched = null;
+  if (consoleOpen.peek()) {
+    closeConsole();
+    if (pane.peek() === "console") activatePane("queue");
+  }
 }
 
 function chord(key) {
   const prefix = pending.value;
   pending.value = "";
+  if (prefix === "g" && key === "c") {
+    const wasOpen = consoleOpen.peek();
+    toggleConsole();
+    if (!wasOpen) activatePane("console");
+    else if (pane.peek() === "console") activatePane("queue");
+    return true;
+  }
   if (prefix === "g" && key === "g") { move(0, false); return true; }
   if (prefix === "g" && key === "t") { tab(1); return true; }
   if (prefix === "g" && key === "T") { tab(-1); return true; }

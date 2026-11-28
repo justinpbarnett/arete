@@ -46,9 +46,10 @@ Projects and saved views have no letter. They sit in the sidebar with a blank sl
 | [, ] | Previous, next run on the run screen |
 | gt, gT | Next, previous tab or display where a pane has them (focus pane tabs, Floor displays) |
 | / | Search the focused list. Esc closes the search and keeps the text; Esc again clears it |
+| gc | Chat with Arete: open or close the right chat dock |
 | : or Cmd+K | Command palette, closed by default. Everything without a key lives here (snooze until a set time, revert a prompt, batch send, redirect, filter and sort presets) |
 | ? | Key sheet |
-| Esc | Leave INSERT, close the palette, a menu, the key sheet or a reason box, fold an expanded turn. Esc never changes screens |
+| Esc | Leave INSERT, close the palette, a menu, the key sheet, the chat dock or a reason box, fold an expanded turn. Esc never changes screens |
 
 ## Act
 

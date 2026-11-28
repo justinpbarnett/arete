@@ -5,8 +5,14 @@ import { mode, pane, pending, sheet, notice, connection, readRetry, hints, sheet
 import { Connectivity } from "./ui-states.js";
 
 import { openFeedback } from "./ui-feedback.js";
+import { openConsole } from "./ui-console.js";
 
 const html = htm.bind(h);
+
+function openChat() {
+  toggleSheet();
+  openConsole();
+}
 
 function sendFeedback() {
   toggleSheet();
@@ -52,6 +58,10 @@ export function KeySheet() {
         <div class="sheet-grid">${entries.map(([keys, label]) => html`<div class="sheet-entry" key=${keys.join(" ")}>
           <span class="sheet-caps">${caps(keys)}</span><span>${label}</span></div>`)}</div>
       </section>`)}
+      <section class="sheet-group">
+        <h3>Chat</h3>
+        <button type="button" class="sheet-action" data-act="chat-with-arete" onClick=${openChat}>Chat with Arete</button>
+      </section>
       <section class="sheet-group">
         <h3>Feedback</h3>
         <button type="button" class="sheet-action" data-act="send-feedback" onClick=${sendFeedback}>Send feedback</button>
