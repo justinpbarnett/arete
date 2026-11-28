@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from urllib.parse import unquote, urlsplit
 
 from . import api_http, config, contract, idempotency, principals, util
@@ -56,9 +56,9 @@ class Traffic:
         now = time.monotonic()
         with self.lock:
             if now - self.swept >= 60:
-                self.failed = {k: v for k, v in self.failed.items() if v[-1] > now - 300}
+                self.failed = {k: v for k, v in self.failed.items() if v and v[-1] > now - 300}
                 self.blocked = {k: v for k, v in self.blocked.items() if v > now}
-                self.issues = {k: v for k, v in self.issues.items() if v[-1] > now - 600}
+                self.issues = {k: v for k, v in self.issues.items() if v and v[-1] > now - 600}
                 for pairing in self.pairings.values():
                     if pairing.deadline <= now:
                         pairing.code = None
@@ -166,10 +166,19 @@ def registry_operation(name):
 
 
 def origin_of(scheme, host):
+    if not isinstance(scheme, str) or not isinstance(host, str):
+        return None
+    scheme = scheme.strip().lower()
+    if (scheme not in ("http", "https") or not host
+            or any(ord(c) <= 0x20 or ord(c) == 0x7f or c in "@/?#\\" for c in host)):
+        return None
     try:
         parsed = urlsplit(f"{scheme}://{host}")
-        if parsed.hostname and not (parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
+        if (parsed.hostname and parsed.username is None and parsed.password is None
+                and not (parsed.path or parsed.query or parsed.fragment)):
             port = parsed.port
+            if port == 0:
+                return None
             return scheme, parsed.hostname, port if port is not None else (443 if scheme == "https" else 80)
     except ValueError:
         pass
@@ -178,10 +187,10 @@ def origin_of(scheme, host):
 
 def check_origin(handler):
     origins = handler.headers.get_all("Origin", [])
-    if any(site.lower() == "cross-site" for site in handler.headers.get_all("Sec-Fetch-Site", [])):
+    if any(site.strip().lower() == "cross-site" for site in handler.headers.get_all("Sec-Fetch-Site", [])):
         raise problem("bad_origin")
     if origins:
-        scheme, _, host = origins[0].partition("://")
+        scheme, _, host = origins[0].strip().partition("://")
         if len(origins) != 1 or origin_of(scheme, host) != handler.origin:
             raise problem("bad_origin")
 
@@ -240,7 +249,8 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
     principals.admit(handler.actor)
 
     write = method in WRITES and name != "batch.run" and (method != "PUT" or op is not None)
-    if mcp or write and (credential or claim):
+    origin_checked = mcp or (method in WRITES and (method != "PUT" or op is not None)) and (credential or claim)
+    if origin_checked:
         check_origin(handler)
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
@@ -283,7 +293,7 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
         raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":
         raise problem("unauthenticated")
-    if name in ("session.end", "pairing.start") or (name == "token.revoke" and credential.kind == "token"
+    if name == "session.end" or (name == "token.revoke" and credential.kind == "token"
             and unquote(handler.operation[1]["token"]) == credential.id):
         return
     scope = op["scope"] if op else "read"
@@ -319,8 +329,11 @@ def issue_grants(values):
             raise contract.Problem("invalid_input", "Expires must be a timestamp within the next 365 days.") from None
     cap = None
     if "spend_cap_usd" in values:
-        nanos = Decimal(str(values["spend_cap_usd"])) * 10**9
-        if nanos > 2**63 - 1 or nanos != nanos.to_integral_value():
+        try:
+            nanos = Decimal(str(values["spend_cap_usd"])) * 10**9
+        except InvalidOperation:
+            raise contract.Problem("invalid_input", "Spend cap must fit in whole nano-US dollars.") from None
+        if not nanos.is_finite() or nanos < 0 or nanos > 2**63 - 1 or nanos != nanos.to_integral_value():
             raise contract.Problem("invalid_input", "Spend cap must fit in whole nano-US dollars.")
         cap = int(nanos)
     return label, {"expires": util.iso(expires), "profile": values.get("profile", "remote"),

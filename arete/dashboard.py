@@ -85,11 +85,11 @@ CHAT_SESSION_RUN_PATH = re.compile(r"/api/chats/[^/]+/sessions/([^/]+)/(?:report
 STEP_RESOURCE_PATH = re.compile(r"/api/v1/steps(?:/[^/]+)?")
 EVENTS_TYPE = "application/x-ndjson"
 EVIDENCE_PATH = "/api/capture/evidence"
-EVIDENCE_ITEM = re.compile(r"/api/capture/evidence/(\d+)")
-EVIDENCE_DROP = re.compile(r"/api/capture/evidence/(\d+)/drop")
-EVIDENCE_RANGE = re.compile(r"bytes=(\d*)-(\d*)")
+EVIDENCE_ITEM = re.compile(r"/api/capture/evidence/([0-9]+)")
+EVIDENCE_DROP = re.compile(r"/api/capture/evidence/([0-9]+)/drop")
+EVIDENCE_RANGE = re.compile(r"bytes=([0-9]{0,18})-([0-9]{0,18})")
 SKIP_CHUNK = 1024 * 1024
-RUN_ID = re.compile(r"\w[\w.-]*")
+RUN_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}")
 END_GRACE_SECONDS = 5
 INSTALL_SECONDS = 120
 READY_PATH = "/_arete/ready"
@@ -179,9 +179,10 @@ POSTS_IN_FLIGHT = Gauge()
 
 
 def whole_number(text: str) -> int:
-    if not str(text).strip().isdecimal():
-        raise Refusal(400, f"'{text}' is not a whole number.")
-    return int(text)
+    cleaned = str(text).strip()
+    if not cleaned.isascii() or not cleaned.isdecimal() or len(cleaned) > 18:
+        raise Refusal(400, f"'{text[:32]}' is not a whole number.")
+    return int(cleaned)
 
 
 RESTART_RETRY_SECONDS = 2
@@ -432,9 +433,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = b"" if fault.status in (204, 205, 304) else fault_body(fault, path, query)
                 return self.send(fault.status, body, kind, "no-store")
             if method == "GET" and path in WEB_BY_PATH:
+                payload, kind = WEB_BY_PATH[path]
                 if path == "/ui.html":
                     writes.activate_grace()
-                return self.send(200, *WEB_BY_PATH[path], "no-cache")
+                    if self.verify_controls is not None:
+                        payload = payload.replace(b"</head>", b'<meta name="arete-scratch" content="1">\n</head>', 1)
+                return self.send(200, payload, kind, "no-cache")
             if method == "POST" and path == "/api/tasks" and "Idempotency-Key" in self.headers:
                 return self.keyed_start()
             if method == "GET" and path in EVENT_STREAM_PATHS:
@@ -444,7 +448,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and path == EVIDENCE_PATH:
                 return self.send_json(200, self.stage_evidence(query))
             if method == "GET" and (item := EVIDENCE_ITEM.fullmatch(path)):
-                return self.send_evidence(int(item[1]))
+                return self.send_evidence(whole_number(item[1]))
             if method == "GET" and (run_events := EVENTS_PATH.fullmatch(path)):
                 return self.send_events(unquote(run_events[1]), query)
             if self.operation and (method == "GET" or self.operation[0]["name"] == "batch.run"):
@@ -812,7 +816,7 @@ class Handler(BaseHTTPRequestHandler):
         total = path.stat().st_size
         first, last, status = 0, total - 1, 200
         wanted = EVIDENCE_RANGE.fullmatch((self.headers.get("Range") or "").strip())
-        if wanted and (wanted[1] or wanted[2]):
+        if total > 0 and wanted and (wanted[1] or wanted[2]):
             if wanted[1]:
                 start, end = int(wanted[1]), int(wanted[2] or total - 1)
             else:
@@ -836,13 +840,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def hook_body(self) -> bytes:
-        length = (self.headers.get("Content-Length") or "0").strip()
-        if not length.isdigit():
-            raise Refusal(400, "Content-Length takes a whole number of bytes.")
-        size = int(length)
-        if size > webhooks.MAX_HOOK_BODY:
-            raise Refusal(413, f"A request body holds at most {webhooks.MAX_HOOK_BODY // 1024} KB.")
-        return self.rfile.read(size)
+        size = api_http.content_length(self.headers, required=False)
+        return api_http.read_body(self.rfile, size, webhooks.MAX_HOOK_BODY)
 
     def body(self) -> dict:
         if self.parsed_body is None:
@@ -909,6 +908,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             super().end_headers()
 
+    def send_security_headers(self) -> None:
+        self.send_header("Content-Security-Policy", PAGE_POLICY)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
         self.send_response(status)
         if status != 304:
@@ -925,9 +930,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Idempotent-Replayed", "true")
         if 200 <= status < 300 and getattr(self, "write_receipt", None):
             self.send_header("Arete-Seq", self.write_receipt["event_seq"])
-        self.send_header("Content-Security-Policy", PAGE_POLICY)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_security_headers()
 
     def _scrub_payload(self, status: int, payload: bytes, kind: str) -> bytes:
         if not payload:
@@ -988,10 +991,14 @@ class Redirect(Handler):
             error = credential_http.problem("tls_required")
             return self.send_json(error.status, refusal_answer(error))
         node: tailnet.Node = self.server.node
-        path = self.path if self.path.startswith("/") else "/"
+        target = self.path if self.path.startswith("/") and not any(ord(c) < 0x21 or ord(c) == 0x7f for c in self.path) else "/"
+        if target.startswith("//"):
+            target = "/" + target.lstrip("/")
         self.send_response(308)
-        self.send_header("Location", f"https://{node.name}:{self.server.server_port}{path}")
+        self.send_header("Location", f"https://{node.name}:{self.server.server_port}{target}")
         self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_security_headers()
         self.end_headers()
 
 
@@ -1216,7 +1223,7 @@ def post_capture_discard(handler, rest, query):
 
 def post_capture_evidence(handler, rest, query):
     if drop := EVIDENCE_DROP.fullmatch(f"{EVIDENCE_PATH}/{rest}"):
-        return capture.drop_evidence(int(drop[1]))
+        return capture.drop_evidence(whole_number(drop[1]))
     raise NoRoute
 
 

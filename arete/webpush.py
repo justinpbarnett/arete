@@ -215,7 +215,8 @@ def subscription_state() -> dict:
 
 
 def checked_endpoint(endpoint) -> str:
-    if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 2048:
+    if (not isinstance(endpoint, str) or not endpoint or len(endpoint) > 2048
+            or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in endpoint)):
         raise Refused("The subscription needs an endpoint address of at most 2048 characters.")
     try:
         parts = urlsplit(endpoint)

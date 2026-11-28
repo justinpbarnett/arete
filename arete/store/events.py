@@ -114,10 +114,13 @@ def trim():
         c.execute("DELETE FROM events_log WHERE class = ? AND seq <= ?", (cls, mark))
 
 
+MAX_FILTER_ITEMS = 100
+
+
 def cursor(value):
     if value is None:
         return None, None
-    if not re.fullmatch(r"(?:[0-9]+\.)?[0-9]+", value):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9]{1,18}\.)?[0-9]{1,18}", value):
         raise ValueError("invalid event cursor")
     parts = value.rsplit(".", 1)
     return (parts[0], int(parts[1])) if len(parts) == 2 else (None, int(value))
@@ -126,16 +129,21 @@ def cursor(value):
 def filters(query):
     clauses, args = [], []
     classes = query.get("class", "").split(",") if query.get("class") else list(CLASSES)
-    if any(c not in CLASSES for c in classes):
+    if len(classes) > MAX_FILTER_ITEMS or any(c not in CLASSES for c in classes):
         raise ValueError("invalid event class")
     for key, column in (("subject", "subject"), ("task", "task"), ("class", "class"), ("idem", "idem")):
         if query.get(key):
             values = query[key].split(",")
+            if len(values) > MAX_FILTER_ITEMS:
+                raise ValueError(f"too many {key} filters")
             clauses.append(f"e.{column} IN ({','.join('?' for _ in values)})")
             args.extend(values)
     if query.get("kinds"):
+        kind_values = query["kinds"].split(",")
+        if len(kind_values) > MAX_FILTER_ITEMS:
+            raise ValueError("too many kinds filters")
         kinds = []
-        for kind in query["kinds"].split(","):
+        for kind in kind_values:
             family = kind.endswith(".*")
             kinds.append("e.kind LIKE ? ESCAPE '\\'" if family else "e.kind = ?")
             args.append(kind[:-1].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -145,6 +153,8 @@ def filters(query):
         clauses.append("(e.subject = ? OR json_extract(e.data, '$.run') = ?)")
         args.extend((f"run:{query['run']}", query["run"]))
     turns = query.get("turns", "").split(",") if query.get("turns") else []
+    if len(turns) > MAX_FILTER_ITEMS:
+        raise ValueError("too many turns filters")
     clauses.append("(e.kind != 'turn.appended'" +
                    (f" OR json_extract(e.data, '$.run') IN ({','.join('?' for _ in turns)})" if turns else "") + ")")
     args.extend(turns)

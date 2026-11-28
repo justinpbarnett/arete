@@ -5,7 +5,15 @@ import { notice } from "./ui-notice.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 
 export const html = htm.bind(h);
-export const safeLink = (url) => typeof url === "string" && /^https?:\/\//i.test(url) ? url : undefined;
+export function safeLink(url) {
+  if (typeof url !== "string" || !url || /[\u0000-\u0020\u007f]/.test(url)) return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function Read({ resource, what, retry, children }) {
   return html`${resource?.error ? html`<${Fault} what=${what} fault=${resource.error} retry=${retry} />` : null}

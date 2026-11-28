@@ -211,6 +211,9 @@ def event_timestamp(value, field):
 
 def execute(name, values, handler=None):
     prepare(name, values)
+    if name == "batch.run" and handler is not None:
+        for request in values["requests"]:
+            credential_http.require_scope(handler.credential, contract.BY_NAME[request["operation"]]["scope"])
     if name == "usage.record":
         from . import dashboard
 
@@ -281,7 +284,7 @@ def read(name, values, handler):
         return {"snapshot": board.snapshot(int(limit)), "loops": control.loop_views(), "records": board.panel(record.store)}
     if name == "line_stream.read":
         after = values.get("after", "0")
-        if not after.isdecimal():
+        if not after.isascii() or not after.isdecimal() or len(after) > 18:
             raise contract.Problem("invalid_input", "after must be a nonnegative decimal cursor")
         found = control.feed(values["run"], int(after))
         return {"lines": found["lines"], "after": max([int(after), *[r["id"] for r in found["lines"]]])}
