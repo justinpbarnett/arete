@@ -13,11 +13,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 from contextlib import ExitStack, closing, suppress
-from fnmatch import fnmatch
+from fnmatch import fnmatchcase
 from pathlib import Path
 
-from . import paths
+from . import local_paths, paths
 
 SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
@@ -155,25 +156,44 @@ def linux_worker_relay(env, parent, state, descriptors, *command):
             return int(receipt.read() or b"125")
 
 
+def sbpl_quote(value: str) -> str:
+    if not isinstance(value, str) or any(ch in value for ch in ("\x00", "\n", "\r")):
+        raise ConfinementUnavailable("invalid character in sandbox profile string")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _sbpl_param(params: list[str], name: str, value: str | Path) -> None:
+    text = str(value)
+    if "\x00" in name or "\x00" in text:
+        raise ConfinementUnavailable("sandbox parameter cannot contain null bytes")
+    params += ["-D", f"{name}={text}"]
+
+
 def secret_path(p: Path | str) -> bool:
     p = Path(p)
-    if SECRET_DIRS & set(p.parts[:-1]):
+    parts = local_paths.folded_parts(p)
+    if SECRET_DIRS.intersection(parts):
         return True
-    name = p.name
-    return any(fnmatch(name, n) for n in SECRET_NAMES) and not any(fnmatch(name, n) for n in SAFE_NAMES)
+    name = unicodedata.normalize("NFD", p.name).casefold()
+    return any(fnmatchcase(name, n) for n in SECRET_NAMES) and not any(fnmatchcase(name, n) for n in SAFE_NAMES)
 
 
 def absolute(path: Path) -> Path:
+    if local_paths.has_null(path):
+        raise ConfinementUnavailable("path cannot contain null bytes")
     try:
         return Path(path) if Path(path).is_absolute() else Path.cwd() / path
-    except OSError as e:
-        raise ConfinementUnavailable(f"{path} cannot be located: {e.strerror}") from e
+    except (OSError, ValueError) as e:
+        raise ConfinementUnavailable(f"{path} cannot be located: {e}") from e
 
 
 def canonical(path: Path) -> Path:
+    if local_paths.has_null(path):
+        raise ConfinementUnavailable("path cannot contain null bytes")
     try:
         current, missing = absolute(path).resolve(), []
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise ConfinementUnavailable(f"{path} cannot be resolved") from e
     while True:
         try:
@@ -267,7 +287,7 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
         return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
-                             keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
+                             keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + ["--", *words]
 
 
 def linux_git_metadata(source: Path) -> Path | None:
@@ -506,33 +526,38 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     if temp_writes and not private_temporary:
-        allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
+        allow += " " + " ".join(f"(subpath {sbpl_quote(p)})" for p in WRITABLE_ALWAYS)
     else:
-        allow += " " + " ".join(f'(literal "{p}")' for p in WRITABLE_DEVICES)
+        allow += " " + " ".join(f"(literal {sbpl_quote(p)})" for p in WRITABLE_DEVICES)
     profile = '(version 1)(allow default)'
     if restrict_writes:
         profile += f'(deny file-write* (subpath "/"))(allow file-write* {allow})'
     if auth_path is not None:
         profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
-    params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={real_path(root)}")]
+    params: list[str] = []
+    for i, root in enumerate(roots):
+        _sbpl_param(params, f"W{i}", real_path(root))
     if read_roots is not None:
         readable = tuple(dict.fromkeys(path for root in (*roots, *read_roots)
                                        for path in (absolute(root), real_path(root))))
-        params += [arg for i, root in enumerate(readable) for arg in ("-D", f"RD{i}={root}")]
+        for i, root in enumerate(readable):
+            _sbpl_param(params, f"RD{i}", root)
         reads = " ".join(f'(subpath (param "RD{i}"))' for i in range(len(readable)))
         # dyld opens the root directory while locating its shared cache.
         profile += f'(deny file-read* (subpath "/"))(allow file-read* (literal "/") {reads})'
         for i, path in enumerate(sorted({p for root in readable for p in root.parents})):
-            params += ["-D", f"RA{i}={path}"]
+            _sbpl_param(params, f"RA{i}", path)
             profile += f'(allow file-read* (literal (param "RA{i}")))'
     if auth_path is not None:
-        params += ["-D", f"AUTH={real_path(auth_path)}", "-D", f"LOCK={real_path(auth_path)}.lock"]
+        _sbpl_param(params, "AUTH", real_path(auth_path))
+        _sbpl_param(params, "LOCK", f"{real_path(auth_path)}.lock")
     real_hidden = [real_path(path) for path in hidden]
     for i, path in enumerate(real_hidden):
-        params += ["-D", f"H{i}={path}"]
+        _sbpl_param(params, f"H{i}", path)
         profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
     if peers:
-        params += ["-D", f"PEERS={real_path(peers)}", "-D", f"WORK={real_path(cwd)}"]
+        _sbpl_param(params, "PEERS", real_path(peers))
+        _sbpl_param(params, "WORK", real_path(cwd))
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
                     '(require-not (literal (param "PEERS"))) (require-not (subpath (param "WORK")))))'
                     '(deny file-read-data file-write* (literal (param "PEERS")))')
@@ -546,55 +571,59 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
             return "(^|/)(" + "|".join(re.escape(n).replace(r"\*", "[^/]*") for n in names) + (
                 ")($|/)" if descendants else ")$")
 
-        params += ["-D", "NAMES=" + pattern(SECRET_NAMES), "-D", "SAFE=" + pattern(SAFE_NAMES),
-                   "-D", "DIRS=" + pattern(SECRET_DIRS, True)]
+        _sbpl_param(params, "NAMES", pattern(SECRET_NAMES))
+        _sbpl_param(params, "SAFE", pattern(SAFE_NAMES))
+        _sbpl_param(params, "DIRS", pattern(SECRET_DIRS, True))
         profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
                     '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
     engine = real_path(paths.PACKAGE_DIR)
     if not _deploy:
-        params += ["-D", f"ENGINE={engine}"]
+        _sbpl_param(params, "ENGINE", engine)
         engine_filter = '(subpath (param "ENGINE"))'
         if _restore_paths:
             exceptions = ""
             for i, path in enumerate(_restore_paths):
-                params += ["-D", f"RESTORE{i}={path}"]
+                _sbpl_param(params, f"RESTORE{i}", path)
                 exceptions += f'(require-not (literal (param "RESTORE{i}")))'
             engine_filter = f"(require-all {engine_filter} {exceptions})"
         profile += f"(deny file-write* {engine_filter})"
     real_prefix = real_path(sys.prefix)
-    params += ["-D", f"RUNTIME={real_prefix}"]
+    _sbpl_param(params, "RUNTIME", real_prefix)
     profile += '(deny file-write* (subpath (param "RUNTIME")))'
     for i, root in enumerate((paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)):
-        params += ["-D", f"INSTALL{i}={real_path(root)}"]
+        _sbpl_param(params, f"INSTALL{i}", real_path(root))
         profile += f'(deny file-write* file-link (subpath (param "INSTALL{i}")))'
     ancestors = {*engine.parents, *(p for root in (*real_hidden, real_prefix) for p in root.parents)}
     for i, path in enumerate(sorted(ancestors)):
-        params += ["-D", f"A{i}={path}"]
+        _sbpl_param(params, f"A{i}", path)
         profile += f'(deny file-write* (literal (param "A{i}")))'
     if "launch" not in keeps:
         profile += '(deny lsopen)(deny appleevent-send)(deny job-creation)'
     if mach is not None:
         names, pattern = mach
-        params += ["-D", f"MACHRE={pattern}"]
-        profile += ("(deny mach-lookup)(allow mach-lookup " + "".join(f'(global-name "{n}")' for n in names)
+        _sbpl_param(params, "MACHRE", pattern)
+        profile += ("(deny mach-lookup)(allow mach-lookup " + "".join(f"(global-name {sbpl_quote(n)})" for n in names)
                     + '(global-name-regex (param "MACHRE")))')
+    unix_added = False
     if tcp_port is not None:
-        params += ["-D", f"UNIX={real_path(cwd)}"]
+        _sbpl_param(params, "UNIX", real_path(cwd))
+        unix_added = True
         profile += (f'(deny network-outbound)(allow network-outbound (remote tcp "localhost:{int(tcp_port)}") '
                     '(subpath (param "UNIX")))')
     if listen_port is not None:
         profile += ('(deny network-bind network-inbound (local ip "*:*"))'
                     f'(allow network-bind network-inbound (local ip "localhost:{int(listen_port)}"))')
     if unix_confined:
-        params += ["-D", f"UNIX={real_path(cwd)}"]
+        if not unix_added:
+            _sbpl_param(params, "UNIX", real_path(cwd))
         profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
                     '(subpath "/private/tmp") (subpath "/private/var/folders"))')
     folders, sockets = command_sockets(keeps)
     for i, folder in enumerate(folders):
-        params += ["-D", f"SF{i}={folder}"]
+        _sbpl_param(params, f"SF{i}", folder)
         profile += f'(deny network-outbound (subpath (param "SF{i}")))'
     for i, sock in enumerate(sockets):
-        params += ["-D", f"SL{i}={sock}"]
+        _sbpl_param(params, f"SL{i}", sock)
         profile += f'(deny network-outbound (literal (param "SL{i}")))'
     for port in sorted({*paths.dashboard_ports(), *denied_ports}):
         profile += f'(deny network-outbound (remote tcp "*:{int(port)}"))'
@@ -602,27 +631,32 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
 
 
 def real_path(path) -> Path:
+    if local_paths.has_null(path):
+        raise ConfinementUnavailable("path cannot contain null bytes")
     try:
         return canonical(Path(path))
     except ConfinementUnavailable:
-        return Path(path).resolve()
+        try:
+            return Path(path).resolve()
+        except (OSError, RuntimeError, ValueError) as e:
+            raise ConfinementUnavailable(f"{path} cannot be resolved") from e
 
 
 def state_denials(params: list[str], folder: Path, opened: tuple[Path, ...], *, prefix: str = "") -> str:
     folder = canonical(folder)
     kept = [canonical(Path(p)) for p in opened]
     between = sorted({folder, *(q for p in kept for q in p.parents if q.is_relative_to(folder))})
-    params += ["-D", f"{prefix}STATE={folder}"]
+    _sbpl_param(params, f"{prefix}STATE", folder)
     exempt = ""
     for i, path in enumerate(kept):
-        params += ["-D", f"{prefix}SO{i}={path}"]
-        exempt += f'(require-not (subpath (param "{prefix}SO{i}")))'
+        _sbpl_param(params, f"{prefix}SO{i}", path)
+        exempt += f"(require-not (subpath (param {sbpl_quote(f'{prefix}SO{i}')})))"
     listing = ""
     for i, path in enumerate(between):
-        params += ["-D", f"{prefix}SB{i}={path}"]
-        exempt += f'(require-not (literal (param "{prefix}SB{i}")))'
-        listing += f'(literal (param "{prefix}SB{i}"))'
-    return (f'(deny file-read* file-write* file-link (require-all (subpath (param "{prefix}STATE")) {exempt}))'
+        _sbpl_param(params, f"{prefix}SB{i}", path)
+        exempt += f"(require-not (literal (param {sbpl_quote(f'{prefix}SB{i}')})))"
+        listing += f"(literal (param {sbpl_quote(f'{prefix}SB{i}')}))"
+    return (f"(deny file-read* file-write* file-link (require-all (subpath (param {sbpl_quote(f'{prefix}STATE')})) {exempt}))"
             f"(deny file-read-data file-write* {listing})")
 
 
@@ -630,17 +664,23 @@ def command_sockets(keeps: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
     uid = os.getuid()
     folders = [f"/private/tmp/tmux-{uid}"]
     if tmpdir := os.environ.get("TMUX_TMPDIR"):
-        folders.append(str(Path(tmpdir).resolve() / f"tmux-{uid}"))
+        if not local_paths.has_null(tmpdir):
+            with suppress(OSError, RuntimeError, ValueError):
+                folders.append(str(Path(tmpdir).resolve() / f"tmux-{uid}"))
     folders += [str(paths.HOME / p) for p in (".docker/run", ".colima", ".orbstack/run", ".rd",
                                               "Library/Containers/com.docker.docker/Data")]
     sockets = []
-    if tmux := os.environ.get("TMUX", "").split(",")[0]:
+    if (tmux := os.environ.get("TMUX", "").split(",")[0]) and not local_paths.has_null(tmux):
         sockets.append(tmux)
     sockets += ["/private/var/run/docker.sock", str(Path("/var/run/docker.sock").resolve())]
     host = os.environ.get("DOCKER_HOST", "")
     if host.startswith("unix://"):
-        sockets.append(host.removeprefix("unix://"))
+        sock = host.removeprefix("unix://")
+        if sock and not local_paths.has_null(sock):
+            sockets.append(sock)
     agent = os.environ.get("SSH_AUTH_SOCK", "")
-    if agent and "ssh-agent" not in keeps and os.path.isabs(agent):
-        sockets += [agent, str(Path(agent).resolve())]
+    if agent and "ssh-agent" not in keeps and not local_paths.has_null(agent) and os.path.isabs(agent):
+        sockets.append(agent)
+        with suppress(OSError, RuntimeError, ValueError):
+            sockets.append(str(Path(agent).resolve()))
     return list(dict.fromkeys(folders)), list(dict.fromkeys(sockets))

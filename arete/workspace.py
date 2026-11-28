@@ -125,13 +125,15 @@ class Release:
 
 
 def remote_head(src: Path, branch: str) -> str:
-    out = git(["ls-remote", "origin", f"refs/heads/{branch}"], src).split()
+    util.validate_git_ref(branch, "branch")
+    out = git(["ls-remote", "--", "origin", f"refs/heads/{branch}"], src).split()
     return out[0] if out else ""
 
 
 def fetch(src: Path, ref: str) -> None:
+    util.validate_git_ref(ref, "ref")
     with util.repo_lock(src):
-        git(["fetch", "origin", ref], src)
+        git(["fetch", "--", "origin", ref], src)
 
 
 def add_worktree(c: Checkout, branch: str, start: str) -> None:
@@ -146,7 +148,7 @@ def start_of(c: Checkout, branch: str) -> str:
 def continue_from(c: Checkout, branch: str, onto: str) -> None:
     c.onto = onto
     behind = [start_of(c, branch), *([c.origin_base] if c.resumes else [])]
-    if any(git(["rev-list", "--count", f"HEAD..{ref}"], c.wt).strip() != "0" for ref in behind):
+    if any(git(["rev-list", "--count", f"HEAD..{ref}", "--"], c.wt).strip() != "0" for ref in behind):
         c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
 
 
@@ -324,7 +326,7 @@ def remove_checkouts(ws: Path, checkouts: list[Checkout], made: dict, *, exclude
                 return Release("held", [str(unsafe)])
             if attached:
                 try:
-                    git(["worktree", "remove", "--force", str(c.wt)], c.src)
+                    git(["worktree", "remove", "--force", "--", str(c.wt)], c.src)
                 except RuntimeError as e:
                     raise OSError(f"{c.wt}: {e}") from e
     if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made, after_removal=True, force=force):
@@ -932,7 +934,18 @@ def ignored_file_paths(wt: Path) -> set[str]:
 
 
 def remove_untracked(wt: Path, name: str) -> None:
-    f = wt / name
+    if not isinstance(name, str) or local_paths.has_null(name):
+        raise ValueError(f"invalid untracked path: {name!r}")
+    rel = Path(name)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"untracked path escapes worktree: {name!r}")
+    f = wt / rel
+    root = wt.resolve()
+    try:
+        if not f.parent.resolve().is_relative_to(root):
+            raise ValueError(f"untracked path escapes worktree: {name!r}")
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"untracked path cannot be resolved: {name!r}") from e
     f.unlink(missing_ok=True)
     for d in f.parents:
         if d == wt or not d.is_dir() or any(d.iterdir()):
@@ -961,6 +974,6 @@ def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str]
             else:
                 if kept and (c.wt / ".git").exists():
                     with util.repo_lock(c.src):
-                        git(["worktree", "remove", "--force", str(c.wt)], c.src)
+                        git(["worktree", "remove", "--force", "--", str(c.wt)], c.src)
                 add_worktree(c, branch, start_of(c, starting_branch))
             clone["resumed"] = c.resumes

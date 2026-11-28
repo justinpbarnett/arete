@@ -73,7 +73,7 @@ def git_unquoted(text: str) -> str:
         if body[i] != "\\" or i + 1 >= len(body):
             out += body[i].encode()
             i += 1
-        elif body[i + 1] in "01234567":
+        elif i + 3 < len(body) and all(ch in "01234567" for ch in body[i + 1:i + 4]):
             out.append(int(body[i + 1:i + 4], 8) & 0xFF)
             i += 4
         else:

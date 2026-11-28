@@ -74,9 +74,21 @@ def stage(wt: Path, deny: Sequence[str] = (), against: str = "HEAD", prefix: str
     return between(wt, "--cached", against, deny=deny, prefix=prefix, moves=True)
 
 
+DIFF_FLAGS = frozenset({"--cached", "--staged"})
+
+
 def between(wt: Path, *revs: str, deny: Sequence[str] = (), prefix: str = "", moves: bool = False) -> Diff:
+    if "--" in revs:
+        sep = revs.index("--")
+        rev_args, path_args = revs[:sep], revs[sep + 1:]
+    else:
+        rev_args, path_args = revs, ()
+    for rev in rev_args:
+        if rev not in DIFF_FLAGS:
+            util.validate_git_ref(rev, "git revision")
+    args = [*rev_args, "--", *path_args]
     diff = Diff()
-    for row in util.git_records(["diff", "--numstat", "--no-renames", *revs], wt):
+    for row in util.git_records(["diff", "--numstat", "--no-renames", *args], wt):
         added, removed, name = row.split("\t", 2)
         path = prefix + name
         lock = is_lockfile(name)
@@ -87,7 +99,7 @@ def between(wt: Path, *revs: str, deny: Sequence[str] = (), prefix: str = "", mo
             diff.denied.append(path)
     if moves and any(diff.counts.values()):
         options = ["--no-renames", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "-U0"]
-        patch = util.git(["diff", *options, *revs], wt)
+        patch = util.git(["diff", *options, *args], wt)
         for name, moved in moved_by_file(patch).items():
             path = prefix + name
             if path in diff.counts and path not in diff.locks:
@@ -181,9 +193,12 @@ def moved_lines(patch: str) -> set[int]:
 
 def header_path(line: str) -> str:
     rest = line.removeprefix("diff --git ")
-    if rest.startswith('"') or not rest.startswith("a/"):
+    if rest.startswith('"') or not rest.startswith("a/") or len(rest) < 5 or (len(rest) - 5) % 2:
         return ""
-    return rest[2:2 + (len(rest) - 5) // 2]
+    width = (len(rest) - 5) // 2
+    if rest[2 + width:2 + width + 3] != " b/":
+        return ""
+    return rest[2:2 + width]
 
 
 def moved_by_file(patch: str) -> dict[str, int]:
