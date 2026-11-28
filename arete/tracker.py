@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from . import config, gh, jira, principals, util
+from . import config, gh, jira, principals, ticket_media, util
 from .store import runs as run_store
 from .store import specs as spec_store
 from .store import tasks as tasks_store
@@ -31,8 +31,9 @@ JIRA_LABEL_ARETE_LEAVES = "agent-running"
 SEARCH_FIELDS = ["summary", "created", "labels"]
 MAX_AGENT_ISSUES = 1000
 MAX_COMMENTS = 10
-MAX_IMAGES = 6
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGES = ticket_media.MAX_MEDIA_ITEMS
+MAX_IMAGE_BYTES = ticket_media.MAX_IMAGE_BYTES
+MAX_VIDEO_BYTES = ticket_media.MAX_VIDEO_BYTES
 ARETE_TAG = "[arete]"
 TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
 
@@ -49,12 +50,17 @@ class Image:
     id: str
     name: str
     size: int
+    mime_type: str = ""
+    source: str = "body"
+    url: str = ""
+    kind: str = "image"
 
 
 @dataclass
 class SavedImages:
     paths: list[Path] = field(default_factory=list)
     left_out: list[str] = field(default_factory=list)
+    outcomes: list[ticket_media.MediaOutcome] = field(default_factory=list)
 
 
 @dataclass
@@ -338,8 +344,16 @@ class GitHubTracker:
                            if self.by_publisher(c, SPEC_LABEL in labels) and c.get("createdAt")], since,
                           strict=SPEC_LABEL in labels)
 
-    def save_images(self, t: Ticket, dest: Path) -> SavedImages:
-        return SavedImages()
+    def save_images(self, t: Ticket, dest: Path, *, fetcher=None, keyframe_extractor=None) -> SavedImages:
+        refs = _collect_url_media_refs(t, origin="github")
+        if not refs:
+            return SavedImages()
+        token = "" if fetcher is not None else ticket_media.github_token()
+        paths_out, left_out, outcomes = ticket_media.resolve_url_media(
+            refs, dest, ticket_ref=t.ref or t.id, fetcher=fetcher,
+            keyframe_extractor=keyframe_extractor, token=token,
+        )
+        return SavedImages(paths=paths_out, left_out=left_out, outcomes=outcomes)
 
     def get(self, tid: str, *, issue: dict | None = None, saved_comments: str | None = None) -> Ticket:
         i = gh.issue(self.repo.github, int(tid)) if issue is None else issue
@@ -353,10 +367,13 @@ class GitHubTracker:
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.ticket_wait_blocker(ticket)
-        ticket = replace(ticket, body=ticket.body or "(no description)", comments=comments_text(comments),
-                         owner_comments=scope_comments(comments), saved_scope_matches=same_comment_scope(comments, comments, saved_comments),
+        body = ticket.body or "(no description)"
+        owner_comments = scope_comments(comments)
+        images = _media_refs_to_images(ticket_media.extract_media_refs(body, owner_comments, origin="github"))
+        ticket = replace(ticket, body=body, comments=comments_text(comments),
+                         owner_comments=owner_comments, saved_scope_matches=same_comment_scope(comments, comments, saved_comments),
                          open=i.get("state") == "OPEN", kind="fix" if FIX_LABELS & set(labels) else "feat",
-                         updated=i.get("updatedAt") or "", blocker=blocker,
+                         updated=i.get("updatedAt") or "", blocker=blocker, images=images,
                          spec_identity=github_issue_identity(self.repo.github, i["number"]))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
@@ -530,25 +547,69 @@ class JiraTracker:
         directed = [text for c, text in zip(approved_comments, comments)
                     if not c.get("updateAuthor") or (c["updateAuthor"].get("accountId") == me)
                     or approved_at and jira.parse_time(c.get("updated") or c["created"]) <= approved_at]
-        images = [Image(str(a["id"]), a.get("filename") or "image", int(a.get("size") or 0))
-                  for a in trusted(me, approved_at, f.get("attachment") or [])
-                  if (a.get("mimeType") or "").startswith("image/")]
-        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=scope_comments(directed),
+        owner_comments = scope_comments(directed)
+        images = _jira_media_images(trusted(me, approved_at, f.get("attachment") or []), body, owner_comments)
+        images.extend(_media_refs_to_images(ticket_media.extract_media_refs(body, owner_comments, origin="jira")))
+        return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=owner_comments,
                       saved_scope_matches=same_comment_scope(comments, directed, saved_comments), open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
                       url=self.client.browse_url(tid), created=f.get("created", ""), updated=f.get("updated") or "",
                       labels=labels, blocker=blocker, images=images, spec_identity=spec_identity)
 
-    def save_images(self, t: Ticket, dest: Path) -> SavedImages:
+    def save_images(self, t: Ticket, dest: Path, *, fetcher=None, keyframe_extractor=None) -> SavedImages:
         out = SavedImages()
-        for img in t.images:
-            if len(out.paths) >= MAX_IMAGES or img.size > MAX_IMAGE_BYTES:
+        ticket_ref = t.ref or t.id
+        accepted = 0
+        for img in [item for item in t.images if not item.url]:
+            kind = ticket_media.kind_from_hint(name=img.name, mime_type=img.mime_type)
+            if kind == "unknown" and img.kind in ("image", "video"):
+                kind = img.kind
+            ref = ticket_media.MediaRef(
+                source=img.source or "body",
+                origin="jira",
+                kind=kind,
+                attachment_id=img.id,
+                name=img.name,
+                mime_type=img.mime_type,
+                size=img.size,
+            )
+            cap = MAX_VIDEO_BYTES if kind == "video" else MAX_IMAGE_BYTES
+            if accepted >= MAX_IMAGES or (img.size and img.size > cap):
                 out.left_out.append(img.name)
+                reason = (f"over the {MAX_IMAGES} media item cap" if accepted >= MAX_IMAGES
+                          else f"exceeds the {cap // (1024 * 1024)} MB cap")
+                out.outcomes.append(ticket_media.MediaOutcome(
+                    status="unsupported", ref=ref, ticket_ref=ticket_ref,
+                    media_kind="" if kind == "unknown" else kind, mime_type=img.mime_type, detail=reason,
+                ))
                 continue
-            dest.mkdir(parents=True, exist_ok=True)
-            path = dest / f"{img.id}-{safe_filename(img.name)}"
-            path.write_bytes(self.client.attachment(img.id))
-            out.paths.append(path)
+            try:
+                data = self.client.attachment(img.id)
+            except jira.JiraError as e:
+                out.outcomes.append(ticket_media.MediaOutcome(
+                    status="inaccessible", ref=ref, ticket_ref=ticket_ref,
+                    mime_type=img.mime_type, detail=ticket_media.sanitize_text(str(e)),
+                ))
+                continue
+            outcome = ticket_media.materialize_media_bytes(
+                ref, data, dest, ticket_ref=ticket_ref, prefix=img.id,
+                content_type=img.mime_type, keyframe_extractor=keyframe_extractor,
+            )
+            out.outcomes.append(outcome)
+            if outcome.ok:
+                accepted += 1
+                out.paths.extend(outcome.inspectable_paths)
+            elif outcome.status == "unsupported":
+                out.left_out.append(img.name)
+        url_refs = _collect_url_media_refs(t, origin="jira")
+        if url_refs:
+            paths_out, left_out, outcomes = ticket_media.resolve_url_media(
+                url_refs, dest, ticket_ref=ticket_ref, fetcher=fetcher,
+                keyframe_extractor=keyframe_extractor, start_count=accepted,
+            )
+            out.paths.extend(paths_out)
+            out.left_out.extend(left_out)
+            out.outcomes.extend(outcomes)
         return out
 
     def prepare(self) -> list[str]:
@@ -638,8 +699,14 @@ class LocalTracker:
         return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in tasks_store.task_comments(tid)
                            if principals.is_person(c["author"]) and c["ts"]], since)
 
-    def save_images(self, t: Ticket, dest: Path) -> SavedImages:
-        return SavedImages()
+    def save_images(self, t: Ticket, dest: Path, *, fetcher=None, keyframe_extractor=None) -> SavedImages:
+        refs = _collect_url_media_refs(t, origin="local")
+        if not refs:
+            return SavedImages()
+        paths_out, left_out, outcomes = ticket_media.resolve_url_media(
+            refs, dest, ticket_ref=t.ref or t.id, fetcher=fetcher, keyframe_extractor=keyframe_extractor,
+        )
+        return SavedImages(paths=paths_out, left_out=left_out, outcomes=outcomes)
 
     def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         if (row := tasks_store.task_get(tid)) is None:
@@ -812,6 +879,94 @@ def trusted(me: str, approved_at: datetime | None, items: list[dict]) -> list[di
 
 def safe_filename(name: str) -> str:
     return re.sub(r"[^\w.-]+", "-", name).strip(".-") or "image"
+
+
+def _ticket_media_comments(t: Ticket) -> str:
+    return t.owner_comments if t.owner_comments is not None else t.comments
+
+
+def _media_refs_to_images(refs: list[ticket_media.MediaRef]) -> list[Image]:
+    return [
+        Image(
+            id=f"url-{idx}",
+            name=ref.name or f"media-{idx}",
+            size=ref.size,
+            mime_type=ref.mime_type,
+            source=ref.source,
+            url=ref.url,
+            kind=ref.kind,
+        )
+        for idx, ref in enumerate(refs, 1)
+    ]
+
+
+def _collect_url_media_refs(t: Ticket, *, origin: str) -> list[ticket_media.MediaRef]:
+    refs: list[ticket_media.MediaRef] = []
+    seen: set[str] = set()
+    for img in t.images:
+        if not img.url or img.url in seen:
+            continue
+        seen.add(img.url)
+        kind = img.kind if img.kind in ("image", "video", "unknown") else ticket_media.kind_from_hint(
+            url=img.url, name=img.name, mime_type=img.mime_type,
+        )
+        refs.append(ticket_media.MediaRef(
+            source=img.source or "body",
+            origin=origin,
+            kind=kind,
+            url=img.url,
+            name=img.name,
+            mime_type=img.mime_type,
+            size=img.size,
+        ))
+    for ref in ticket_media.extract_media_refs(t.body, _ticket_media_comments(t), origin=origin):
+        if ref.url not in seen:
+            seen.add(ref.url)
+            refs.append(ref)
+    return refs
+
+
+def _jira_is_media_attachment(att: dict) -> bool:
+    mime = (att.get("mimeType") or "").lower()
+    if mime.startswith(("image/", "video/")):
+        return True
+    name = att.get("filename") or ""
+    return (not mime or mime == "application/octet-stream") and Path(name).suffix.lower() in ticket_media.MEDIA_EXTENSIONS
+
+
+def _jira_attachment_referenced(att: dict, text: str) -> bool:
+    if not text:
+        return False
+    att_id = str(att.get("id") or "")
+    name = att.get("filename") or ""
+    content_url = att.get("content") or ""
+    if att_id and f"[attachment {att_id}]" in text:
+        return True
+    if content_url and content_url in text:
+        return True
+    return bool(name and (f"!{name}" in text or f"[^{name}]" in text or name in text))
+
+
+def _jira_media_images(attachments: list[dict], body: str, comments: str) -> list[Image]:
+    out: list[Image] = []
+    for att in attachments:
+        if not _jira_is_media_attachment(att):
+            continue
+        mime = att.get("mimeType") or ""
+        name = att.get("filename") or "media"
+        kind = ticket_media.kind_from_hint(name=name, mime_type=mime)
+        in_comment = _jira_attachment_referenced(att, comments)
+        in_body = _jira_attachment_referenced(att, body)
+        source = "comment" if in_comment and not in_body else "body"
+        out.append(Image(
+            id=str(att["id"]),
+            name=name,
+            size=int(att.get("size") or 0),
+            mime_type=mime,
+            source=source,
+            kind="image" if kind == "unknown" else kind,
+        ))
+    return out
 
 
 def from_arete(body: str) -> bool:
