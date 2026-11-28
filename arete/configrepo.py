@@ -312,7 +312,14 @@ def validate_actor(actor: str) -> str:
     return actor
 
 
-def _validate_content(rel: str, raw: bytes, root: Path, *, staged_targets: dict[str, object] | None = None) -> None:
+def _validate_content(
+    rel: str,
+    raw: bytes,
+    root: Path,
+    *,
+    staged_targets: dict[str, object] | None = None,
+    extra_adws: set[str] | None = None,
+) -> None:
     parsed: dict | None = None
     if rel.endswith(".toml"):
         try:
@@ -363,13 +370,33 @@ def _validate_content(rel: str, raw: bytes, root: Path, *, staged_targets: dict[
                 outbox_config.validate_rule(item_name, parsed, targets=targets, where=rel)
             except ValueError as e:
                 raise ConfigRepoError(str(e)) from e
+        elif kind == "adw":
+            from . import adw
+
+            if errors := adw.validate_adw(parsed, where=rel):
+                raise ConfigRepoError(f"{rel} failed validation: {'; '.join(errors)}")
+            if parsed.get("name") != item_name:
+                raise ConfigRepoError(
+                    f"{rel} failed validation: name {parsed.get('name')!r} does not match {item_name!r}"
+                )
+        elif kind == "routes":
+            from . import adw
+
+            if errors := adw.validate_routes(parsed, config_dir=root, extra_adws=extra_adws, where=rel):
+                raise ConfigRepoError(f"{rel} failed validation: {'; '.join(errors)}")
 
 
 def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
     from . import outbox_config
 
     staged_targets: dict[str, outbox_config.OutboxTarget] = {}
+    extra_adws: set[str] = {
+        classified[1]
+        for rel, raw in files.items()
+        if raw is not None and (classified := configkinds.classify(rel)) is not None and classified[0] == "adw"
+    }
     deferred_rules: list[tuple[str, bytes]] = []
+    deferred_routes: list[tuple[str, bytes]] = []
     for rel in sorted(files):
         raw = files[rel]
         if raw is None:
@@ -378,7 +405,10 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
         if classified is not None and classified[0] == "rule":
             deferred_rules.append((rel, raw))
             continue
-        _validate_content(rel, raw, root)
+        if classified is not None and classified[0] == "routes":
+            deferred_routes.append((rel, raw))
+            continue
+        _validate_content(rel, raw, root, extra_adws=extra_adws)
         if classified is not None and classified[0] == "target":
             parsed = tomllib.loads(raw.decode("utf-8"))
             staged_targets[classified[1]] = outbox_config._target_from_data(
@@ -386,6 +416,8 @@ def _validate_batch(files: dict[str, bytes | None], root: Path) -> None:
             )
     for rel, raw in deferred_rules:
         _validate_content(rel, raw, root, staged_targets=staged_targets)
+    for rel, raw in deferred_routes:
+        _validate_content(rel, raw, root, extra_adws=extra_adws)
 
 
 def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> None:

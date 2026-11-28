@@ -45,7 +45,6 @@ from .pipeline import (
     held_back,
     live_pipeline_runs,
     pending_feedback,
-    repaired_by,
     retry_scratch,
     runnable,
     settle_abandoned_runs,
@@ -260,26 +259,52 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
         return ""
     mode = mode or pipeline.dispatch_path(repo, str(ticket.id))
     adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
-    first = ("orchestrate", "build") if adaptive else ("plan", "build")
-    if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
-            and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
-            and not patching.specification_refusal(ticket)):
-        first = ("build",)
-    newest = run_store.newest_whole_run(repo.name, ticket.id)
-    feedback = pending_feedback(repo.name, ticket.id)
-    if repairing:
-        first = ("review_repair",)
-    elif pipeline.custom_feedback_fallback(cfg, mode, feedback):
-        first = ("build",)
-    elif (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
-            and repaired_by(newest["id"])):
-        first = ("review_repair",)
-    elif feedback:
-        source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
-        if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
-            first = ("build",)
-    for role in (*first, *(("verify",) if layer.verify or ticket.is_spec else ()), "review"):
-        setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
+    overrides: dict[str, dict] = {}
+    check_verify = bool(layer.verify or ticket.is_spec)
+    check_review = True
+    if adaptive:
+        first: tuple[str, ...] = ("review_repair",) if repairing else ("orchestrate", "build")
+    elif layer.factory_path == pipeline.ADW:
+        from . import adw
+
+        routed = adw.route(
+            cfg, repo, str(ticket.id),
+            repairs="repair" if repairing else "",
+            kind=ticket.kind,
+            layer=layer,
+            read_only=True,
+        )
+        overrides = routed.overrides
+        if routed.adw == "orchestrate":
+            first = ("review_repair",) if repairing else ("orchestrate", "build")
+        elif routed.loaded is not None:
+            first = adw.first_roles(routed.loaded)
+            if (routed.adw == "feature" and len(repo.parts) <= 1
+                    and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
+                    and not patching.specification_refusal(ticket)):
+                first = ("build",)
+            check_verify = check_verify and adw._adw_has_step(routed.loaded.steps, "verify")
+            check_review = adw._adw_has_step(routed.loaded.steps, "review")
+        else:
+            first = ("plan", "build")
+    else:
+        feedback = pending_feedback(repo.name, ticket.id)
+        if repairing:
+            first = ("review_repair",)
+        elif feedback:
+            source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
+            if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
+                first = ("build",)
+            else:
+                first = ("plan", "build")
+        else:
+            first = ("plan", "build")
+    roles = (*first, *(("verify",) if check_verify else ()), *(("review",) if check_review else ()))
+    for role in dict.fromkeys(roles):
+        own = overrides.get(role)
+        inh = overrides.get(config.INHERITS.get(role, ""))
+        setting = steps.resolve(cfg, layer, role, ticket.kind, overrides=own, inherited=inh,
+                                ticket=(repo.name, str(ticket.id)))
         if setting.runner == REPLAY:
             continue
         routes = discovery.routes(setting)
@@ -367,8 +392,7 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                 if (latest.get("id") != continues or latest.get("stop_asked")
                         or orchestration_store.publication_pending(continues)):
                     return None
-                command = pipeline.script_command(config.load(), "orchestrate", repo_name, str(tid),
-                                                  "--continue", continues)
+                command = pipeline.adw_command(repo_name, str(tid), "--continue", continues)
 
             def spawn():
                 from . import principals

@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cache
 
-from . import ci, codebase, config, control, factory, gh, outbound, paths, pipeline, run_lines, tracker, util, vault
+from . import ci, codebase, config, control, factory, gh, outbound, pipeline, run_lines, tracker, util, vault
 from .store import db
 from .store import runs as run_store
 from .store import ticket_progress
@@ -549,8 +549,7 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
     path = None if retry_id else pipeline.recorded_path(run_id)
     if (retry_id or path not in RESUME_PATHS or tid in oncall.parked(repo.name) or pilot.is_pilot_task(tid)
             or zte.reserved(tid)
-            or tasks.pending_start(repo.name, tid)
-            or (path in STEP_PATHS and cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+            or tasks.pending_start(repo.name, tid)):
         if not dry_run:
             reads = prerequisite_reads(release, set(declared) | set(waits.values()), hold.heads, live_release())
             if retry_id:

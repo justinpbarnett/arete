@@ -1,0 +1,83 @@
+schema = 1
+name = "patch"
+
+[[steps]]
+do = "prepare"
+end = true
+
+[[steps]]
+do = "patch"
+end = true
+
+[[steps]]
+until = "passed"
+tries = "setting:check_repair.tries"
+  [steps.first]
+  do = "checks"
+  attempt = "{try}"
+  tries = "{tries}"
+
+  [[steps.repeat]]
+  do = "implement"
+  round = "fix{try}"
+  feedback = "@last"
+  attempt = "{try}"
+  tries = "{tries}"
+  end = true
+
+  [[steps.else]]
+  do = "learn"
+  apply = false
+
+  [[steps.else]]
+  finish = "failed"
+  why = "checks still failing after {try} attempts"
+  detail = "@last"
+
+[[steps]]
+do = "verify"
+end = true
+
+[[steps]]
+until = "passed"
+tries = "setting:review.tries"
+min = 1
+  [steps.first]
+  do = "review"
+  attempt = "{try}"
+  tries = "{tries}"
+
+  [[steps.repeat]]
+  when = "feedback"
+  then = [
+    { do = "implement", round = "review_fix{prev?}", feedback = "@last", end = true },
+    { until = "passed", tries = "setting:check_repair.tries", first = { do = "checks", after = "the review fixes" }, repeat = [{ do = "implement", round = "check_repair{outer.prev}_{try}", feedback = "@last", attempt = "{try}", tries = "{tries}", end = true }], else = [{ finish = "failed", why = "the checks failed after the review fixes", detail = "@last" }] },
+  ]
+
+[[steps]]
+do = "learn"
+apply = true
+
+[[steps]]
+when = "documents"
+do = "document"
+
+[[steps]]
+when = "dry_run"
+finish = "dry_run"
+
+[[steps]]
+do = "pr"
+end = true
+
+[[steps]]
+when = "repo.parts"
+do = "ci"
+end = true
+
+[[steps]]
+do = "publish"
+end = true
+
+[[steps]]
+finish = "last"

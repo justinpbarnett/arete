@@ -1564,6 +1564,113 @@ def direct_push_info(job) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+SKIPPED_LABEL = "refactor"
+SKIPPED_TEXT = f"Check in use skipped because the ticket is labeled `{SKIPPED_LABEL}`."
+PREDATES = "This check in use predates the review fixes."
+FOCUSED_FAILURE = "focused review regressions did not pass"
+
+
+def predating_fixes(verified: Verified) -> Verified:
+    if verified.verdict == "unverified" or PREDATES in verified.summary:
+        return verified
+    return replace(verified, summary=f"{verified.summary}\n\n{PREDATES}".strip())
+
+
+def focused_blocker(build, producer: str) -> Outcome | None:
+    if build.repair_findings and (pending := build.check_repair_findings(producer=producer)):
+        return factory.Outcome("fail", next="implement", feedback=build.repair_feedback(),
+                               data={"focused_hold": pending, "repair_state": build.repair_state()})
+    return None
+
+
+def check_candidate(flow: factory.Flow, ws: str, producer: str, **kw) -> Outcome:
+    return focused_blocker(flow.ctx.b, producer) or step(flow, "checks", tree=ws, **kw)
+
+
+def checked_after(flow: factory.Flow, ws: str, after: str, n: int, quick: bool = False) -> Outcome:
+    tries = flow.ctx.run.settings(CHECK_REPAIR).tries
+    extra = {"quick": True} if quick else {}
+    for attempt in range(1, max(1, tries) + 1):
+        outcome = check_candidate(flow, ws, f"{after}:{n}:{attempt}", after=after, **extra)
+        if outcome.passed or outcome.data.get("focused_hold") or attempt >= tries:
+            return outcome
+        repaired = step(flow, "implement", tree=ws, round=f"{CHECK_REPAIR}{n}_{attempt + 1}", feedback=outcome.feedback,
+                        attempt=attempt + 1, tries=tries)
+        if not repaired.passed:
+            return repaired
+    return outcome
+
+
+def review_after_fixes(flow: factory.Flow) -> Outcome:
+    attempt = flow.ctx.reviews + 1
+    return step(flow, "review", attempt=attempt, tries=attempt)
+
+
+def final_checks(flow: factory.Flow, ws: str, *, review_needed: bool = False) -> Outcome:
+    job = flow.ctx
+    before = pipeline.verification_trees(job.b)
+    if job.b.full_checks_current(before):
+        if pending := focused_blocker(job.b, "final-checks"):
+            return pending
+        job.b.report = job.b.checked["report"]
+        outcome = factory.Outcome("pass")
+    else:
+        outcome = checked_after(flow, ws, "the final full checks", job.reviews + 1)
+        if not outcome.passed:
+            return outcome
+        trees = pipeline.verification_trees(job.b)
+        if not job.b.full_checks_current(trees):
+            return factory.Outcome("fail", feedback="The repaired candidate lacks current full checks.")
+        if trees != before:
+            job.verified = predating_fixes(job.verified)
+            review_needed = True
+    return review_after_fixes(flow) if review_needed else outcome
+
+
+def final_blocker(flow: factory.Flow, ws: str, *, patch: bool, fixed: bool, skipped: bool,
+                  review_needed: bool, allow_verify: bool = True) -> tuple[str, Outcome | None] | None:
+    job = flow.ctx
+    before = pipeline.verification_trees(job.b)
+    if not (checked := final_checks(flow, ws, review_needed=review_needed)).passed:
+        return "the final full checks did not converge with review", checked
+    checked_trees = pipeline.verification_trees(job.b)
+    if not allow_verify or skipped or not job.review.approved() or not (patch or fixed or checked_trees != before):
+        return None
+    if not (verified := step(flow, "verify", tree=ws, return_focused_hold=True)).passed:
+        return "", verified
+    allowed_gap = patch and patching.allowed_gap(job.layer, job.ticket, job.verified)
+    trees = pipeline.verification_trees(job.b)
+    missing_evidence = "the candidate changed during or after verification and requires new behavioral evidence"
+    if not trees:
+        return missing_evidence, None
+    if trees != checked_trees:
+        checked_by_verification = job.b.full_checks_current(trees)
+        if not (checked := final_checks(flow, ws)).passed:
+            return "the verification repairs did not converge with review", checked
+        if pipeline.verification_trees(job.b) != trees:
+            return missing_evidence, None
+        if allowed_gap:
+            if not (verified := step(flow, "verify", tree=ws, single=True)).passed:
+                return "", verified
+            if pipeline.verification_trees(job.b) != trees:
+                return missing_evidence, None
+            allowed_gap = patching.allowed_gap(job.layer, job.ticket, job.verified)
+        observed = job.verified.verdict == "pass" and job.verified.observed_trees == trees
+        blocked = checked_by_verification and job.verified.verdict == "blocked"
+        if not (allowed_gap or observed or blocked):
+            return missing_evidence, None
+        if not job.b.full_checks_current(trees):
+            return "the verification repairs lack current full checks", None
+        if not (reviewed := review_after_fixes(flow)).passed:
+            return "the verification repairs need further review", reviewed
+        if not job.review.approved() or job.review.trees != trees or pipeline.verification_trees(job.b) != trees:
+            return "the verification repairs lack current independent review", None
+    if allowed_gap:
+        job.verified = replace(job.verified, verdict="unverified", summary=(
+            job.verified.markdown() + "\n\nThe owner's patch policy permits this environmental gap; it is not a pass."))
+    return None
+
+
 def deliver(flow: factory.Flow) -> tuple[str, str, str]:
     job: Job = flow.ctx
     ws = str(job.ws)
@@ -2093,8 +2200,7 @@ def end_dry_run(flow: factory.Flow, *, measurement_section: str = "") -> tuple[s
 
 def rerun_rejected_ci(flow: factory.Flow) -> tuple[str, str, str] | None:
     job: Job = flow.ctx
-    if (job.run.dry_run or job.run.path not in ("feature", "patch", "revise", "repair")
-            or (job.cfg.adws and job.cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+    if job.run.dry_run or job.run.path not in ("feature", "patch", "revise", "repair"):
         return None
     ci_at = max((i for i, line in enumerate(flow.earlier) if line.get("step") == "ci"), default=-1)
     if (ci_at < 0 or not job.continued_ci.get("ci_review")

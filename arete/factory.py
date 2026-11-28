@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import shutil
@@ -577,13 +576,14 @@ def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
     return config.step_tables(table, "--set")
 
 
-def main(fn: Callable, argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     codebase.load()
     from . import flows, pipeline
 
-    p = argparse.ArgumentParser(description=f"run the {fn.__name__} flow on one ticket")
+    p = argparse.ArgumentParser(description="run a configured ADW flow on one ticket")
     p.add_argument("repo")
     p.add_argument("ticket", help="an issue number (35), a Jira key (ABC-1234) or a task id (t-1a2b)")
+    p.add_argument("--adw", default="", metavar="NAME", help="run this named ADW instead of routing")
     p.add_argument("--force", action="store_true", help="run a ticket the approval rules would skip")
     p.add_argument("--dry-run", action="store_true", help="plan and build locally, no push, PR or tracker writes")
     p.add_argument("--continue", dest="continues", default="", metavar="RUN",
@@ -607,36 +607,12 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
     except (ValueError, TypeError) as e:
         p.error(str(e))
     restart = args.restart or ("step" if args.only else "resume" if (args.continues or args.repairs) else "")
-    script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
+    script = pipeline.Script("", None, args.continues, args.only, table, args.again,
                              args.repairs, args.action, args.only_action, args.environment_release, tuple(args.sets),
-                             restart)
+                             restart, adw=args.adw)
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
     except config.UnknownRepo as e:
         raise SystemExit(str(e)) from None
     raise SystemExit(code)
-
-
-def earlier(argv: list[str]) -> tuple[Callable, list[str]]:
-    from . import flows, pipeline
-
-    p = argparse.ArgumentParser(description="run one step of an earlier run alone, on the script that run used")
-    p.add_argument("run")
-    p.add_argument("step", choices=sorted(STEPS))
-    p.add_argument("settings", nargs="*", metavar="KEY=VALUE", help="override one setting of the step")
-    args = p.parse_args(argv)
-    if not (row := run_store.run_get(args.run)):
-        raise SystemExit(f"no run {args.run}")
-    if not (path := str(first(run_lines.read(args.run), "task").get("path") or "")):
-        raise SystemExit(f"run {args.run} did not run from a script in adws/; use arete run")
-    if args.settings and args.step not in flows.ROLE_OF:
-        p.error(f"{args.step} calls no agent, so it takes no settings")
-    if not started(args.run, args.step):
-        raise SystemExit(f"run {args.run} never started {args.step}, so it cannot run it alone")
-    try:
-        fn = pipeline.flow_function(config.load(), path)
-    except (FileNotFoundError, AttributeError) as e:
-        raise SystemExit(str(e)) from None
-    return fn, [row["repo"], str(row["issue"]), "--continue", args.run, "--only", args.step,
-                *(f"--set={args.step}.{s}" for s in args.settings)]

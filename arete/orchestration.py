@@ -125,7 +125,7 @@ LEGACY_POLICY_RETENTION = {"days": 30, "max_gb": 20, "lines_days": 90, "db_max_m
 LEGACY_ONCALL_KEEP_DAYS = 30.0
 
 
-def policy_fingerprint(cfg, layer, closed_context, *, resume=False, legacy_retention=False):
+def policy_fingerprint(cfg, layer, closed_context, *, resume=False, legacy_retention=False, legacy_adws=False):
     effective = config.policy_dict(layer)
     effective.pop("factory_path")
     effective["orchestration"].pop("max_builders", None)
@@ -142,6 +142,8 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False, legacy_reten
         policy_config["retention"] = dict(LEGACY_POLICY_RETENTION)
         if isinstance(policy_config.get("oncall"), dict):
             policy_config["oncall"] = {**policy_config["oncall"], "keep_days": LEGACY_ONCALL_KEEP_DAYS}
+    if legacy_adws:
+        policy_config["adws"] = None
     if resume:
         config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
@@ -1051,8 +1053,12 @@ class Controller(worker_turns.WorkerTurns):
             return True
         return saved in (
             policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=True, legacy_adws=True),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=False, legacy_adws=True),
             policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=True, legacy_retention=True),
             policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=False, legacy_retention=True),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=True, legacy_retention=True, legacy_adws=True),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=False, legacy_retention=True, legacy_adws=True),
         )
 
     def fingerprint(self):

@@ -69,7 +69,7 @@ STEP_MAPS = configschema.fields_of_type(STEP, "object")
 INSTRUCTIONS = configschema.enum("step_settings", "$defs", "step", "properties", "instructions", "items")
 SESSIONS = configschema.enum("step_settings", "$defs", "step", "properties", "session")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
-PAYMENT_MODES = configschema.enum("routes", "properties", "payment_modes", "items")
+PAYMENT_MODES = configschema.enum("routing", "properties", "payment_modes", "items")
 EVIDENCE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 DOCUMENT_WORDS = {"message": (20, 60), "ticket": (80, 140)}
 KINDS = configschema.keys(configschema.schema("step_settings", "$defs", "kinds"))
@@ -426,7 +426,6 @@ class Config:
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
     routing: Routing = field(default_factory=lambda: Routing(payment_modes=PAYMENT_MODES))
-    adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
@@ -782,7 +781,7 @@ def tier_maps(data, where: str, *, problems: list[Problem] | None = None, path: 
     from . import routing
 
     maps: dict[str, dict[str, tuple[dict[str, str], ...]]] = {}
-    shape = configschema.schema("routes", "$defs", "tier_entry")
+    shape = configschema.schema("routing", "$defs", "tier_entry")
     for name, tiers in table_of(data, where).items():
         maps[name] = {}
         for tier, found in table_of(tiers, f"{where}.{name}").items():
@@ -810,7 +809,7 @@ def tier_maps(data, where: str, *, problems: list[Problem] | None = None, path: 
 def capability_table(key: str, table, *, problems: list[Problem] | None = None, path: str = "",
                      scope: str = "global") -> dict:
     where = f"[routing.capabilities.{key}]"
-    table = only(table_of(table, f"routing.capabilities.{key}"), configschema.schema("routes", "$defs", "capability"),
+    table = only(table_of(table, f"routing.capabilities.{key}"), configschema.schema("routing", "$defs", "capability"),
                  where, problems=problems, path=path, scope=scope)
     found = table.get("modalities", [])
     if not (isinstance(found, list) and all(isinstance(v, str) and v for v in found)):
@@ -824,7 +823,7 @@ def capability_table(key: str, table, *, problems: list[Problem] | None = None, 
 
 
 def paid_table(data, *, problems: list[Problem] | None = None, path: str = "", scope: str = "global") -> PaidRoutes:
-    table = only(table_of(data, "routing.paid"), configschema.schema("routes", "$defs", "paid"), "[routing.paid]",
+    table = only(table_of(data, "routing.paid"), configschema.schema("routing", "$defs", "paid"), "[routing.paid]",
                  problems=problems, path=path, scope=scope, reach=True)
     providers = table.get("providers")
     if providers is not None:
@@ -1479,11 +1478,9 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),
     )
     cfg.tiers = tier_maps(data.get("tiers") or {}, "tiers", problems=problems, path=source, scope="global")
-    cfg.tier_map = str((data.get("factory") or {}).get("tier_map", ""))
-    if (adws := (data.get("factory") or {}).get("adws")) is not None:
-        if not isinstance(adws, str):
-            raise TypeError(f"[factory] adws must be a folder path, not {adws!r}")
-        cfg.adws = anchor_dir / paths.expand(adws)
+    factory_table = only(table_of(data.get("factory") or {}, "factory"), root_schema("factory"), "[factory]",
+                         ignored=ignored)
+    cfg.tier_map = str(factory_table.get("tier_map", ""))
     cfg.steps = step_tables(data.get("steps") or {}, "steps", ignored, problems=problems, path=source)
     cfg.kinds = kind_tables(data.get("kinds") or {}, "kinds", ignored, problems=problems, path=source)
     serve = data.get("serve", {})

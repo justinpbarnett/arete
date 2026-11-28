@@ -407,7 +407,7 @@ def check_python_source(rel: str, text: str) -> list[str]:
 
 def check_python_and_markers() -> list[str]:
     errors: list[str] = []
-    for path in _iter_source_files(("arete", "adws", "tests", "tools"), frozenset({".py", ".js", ".mjs", ".css", ".html"})):
+    for path in _iter_source_files(("arete", "tests", "tools"), frozenset({".py", ".js", ".mjs", ".css", ".html"})):
         rel = path.relative_to(ROOT).as_posix()
         text = path.read_text(encoding="utf-8", errors="replace")
         for lineno, line in enumerate(text.splitlines(), 1):

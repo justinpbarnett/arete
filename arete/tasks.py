@@ -346,9 +346,7 @@ def launch_recovery(cfg: config.Config, repo: config.Repo, row: dict, attempt: d
             if path == "classic":
                 command = control.command(["run", repo.name, tid, "--local"])
             else:
-                if pipeline.script_file(cfg, path).resolve().parent != paths.ADWS_DIR.resolve():
-                    raise control.Refused("recovery does not launch custom delivery scripts")
-                command = command_of(cfg, path, repo.name, tid, "--repair" if repairing else "--continue", row["id"])
+                command = pipeline.adw_command(repo.name, tid, "--repair" if repairing else "--continue", row["id"])
 
             def spawn():
                 launch_lease.CURRENT.get().recovery = attempt["id"]
@@ -393,18 +391,6 @@ def step_named(step: str) -> str:
     if step not in factory.STEPS:
         raise control.Refused(f"there is no step '{step}'; the steps are {', '.join(sorted(factory.STEPS))}")
     return step
-
-
-def script_path(row: dict) -> str:
-    path = pipeline.recorded_path(row["id"])
-    return "" if path == "classic" else path
-
-
-def command_of(cfg: config.Config, name: str, *args: str) -> list[str]:
-    try:
-        return pipeline.script_command(cfg, name, *args)
-    except FileNotFoundError as e:
-        raise control.Refused(str(e)) from None
 
 
 def reply(run_id: str, text: str) -> dict:
@@ -656,8 +642,7 @@ def parked_with_answers(row: dict) -> bool:
 
 def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
     tid = str(row["issue"])
-    path = script_path(row) or ("revise" if pipeline.pending_feedback(repo.name, tid) else "feature")
-    return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"], "--restart", "answer")
+    return pipeline.adw_command(repo.name, tid, "--force", "--continue", row["id"], "--restart", "answer")
 
 
 def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None,
@@ -815,14 +800,14 @@ def resume_factory_run(row):
         step = row["only_step"]
         select = ["--action", step, "--only-action"] if path == "orchestrate" else ["--only", step]
         settings = [f"--set={setting}" for setting in execution.get("settings", [])]
-        return launch(cfg, repo, str(row["issue"]), command_of(
-            cfg, path, repo.name, str(row["issue"]), "--continue", source, *select, *settings,
+        return launch(cfg, repo, str(row["issue"]), pipeline.adw_command(
+            repo.name, str(row["issue"]), "--continue", source, *select, *settings,
             *(["--dry-run"] if row.get("dry_run") else [])), admission=(key, row["version"]))
     path = pipeline.recorded_path(key)
     if row.get("dry_run") and path != "classic":
         cfg, repo, _ = command_run(key, row["version"])
-        return launch(cfg, repo, str(row["issue"]), command_of(
-            cfg, path, repo.name, str(row["issue"]), "--dry-run", "--continue", key), admission=(key, row["version"]))
+        return launch(cfg, repo, str(row["issue"]), pipeline.adw_command(
+            repo.name, str(row["issue"]), "--dry-run", "--continue", key), admission=(key, row["version"]))
     if path == "classic":
         with util.lock(STEER_LOCK, wait=True):
             cfg, repo, row = command_run(key, row["version"])
@@ -884,25 +869,23 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
         if path == "orchestrate":
             if step:
                 adaptive_action(row, step)
-            return launch(cfg, repo, str(row["issue"]), command_of(
-                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+            return launch(cfg, repo, str(row["issue"]), pipeline.adw_command(
+                repo.name, str(row["issue"]), "--force", "--continue", run_id,
                 *(["--action", step] if step else []),
                 *(["--environment-release", environment_release] if environment_retry else [])),
                 admission=(run_id, base_version))
         if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
-        if not path and flows.ran_on_seam(run_id):
-            path = "revise" if pipeline.pending_feedback(row["repo"], str(row["issue"])) else "feature"
-        if not path:
+        if not path and not flows.ran_on_seam(run_id):
             raise control.Refused(f"run {run_id} ran on the classic path, so it cannot resume; start the ticket again "
                                   "with POST /api/tasks")
         tid = str(row["issue"])
         if not step and row["status"] == "failed":
             step = next((str(line.get("step") or "") for line in reversed(factory.history(factory.chain(run_id)))
                          if line.get("result") != "pass"), "")
-        return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--continue", run_id,
-                                                 *(["--from", step] if step else []),
-                                                 *(["--environment-release", environment_release] if environment_retry else [])),
+        return launch(cfg, repo, tid, pipeline.adw_command(repo.name, tid, "--force", "--continue", run_id,
+                                                           *(["--from", step] if step else []),
+                                                           *(["--environment-release", environment_release] if environment_retry else [])),
                       admission=(run_id, base_version))
 
 
@@ -927,10 +910,10 @@ def repair(run_id: str, base_version=None) -> dict:
             repairs.open_heads(repo, found)
         except repairs.Refused as e:
             raise control.Refused(str(e)) from None
-        path = "orchestrate" if script_path(row) == "orchestrate" else "repair"
+        path = "orchestrate" if pipeline.recorded_path(run_id) == "orchestrate" else "repair"
         if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script(path, None, repairs=run_id)):
             raise control.Refused(refusal)
-        return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--repair", run_id),
+        return launch(cfg, repo, tid, pipeline.adw_command(repo.name, tid, "--force", "--repair", run_id),
                       admission=(run_id, base_version))
 
 
@@ -970,8 +953,14 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                                   "start the ticket again with POST /api/tasks")
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
-        if not (path := script_path(row)):
-            raise control.Refused(f"run {run_id} did not run from a script in adws/, so a step cannot run alone on it")
+        path = str(row.get("adw") or "")
+        if not path:
+            from .store import orchestration
+
+            if orchestration.find(run_id):
+                path = "orchestrate"
+        if not path:
+            raise control.Refused(f"run {run_id} has no recorded ADW, so a step cannot run alone on it")
         if path == "orchestrate":
             no_later_run(row)
             adaptive_action(row, step)
@@ -979,8 +968,8 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                 raise control.Refused(why)
             if sets:
                 raise control.Refused("adaptive action reruns keep their accepted settings; select new settings through a resumed controller")
-            return launch(cfg, repo, str(row["issue"]), command_of(
-                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+            return launch(cfg, repo, str(row["issue"]), pipeline.adw_command(
+                repo.name, str(row["issue"]), "--force", "--continue", run_id,
                 "--action", step, "--only-action"), admission=(run_id, base_version))
         step_named(step)
         if not factory.started(run_id, step):
@@ -1001,7 +990,9 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
         if gone := removed_tree(run_id, step):
             raise control.Refused(f"run {run_id} ended {row['status']} and removed its work folder {gone}, so a step "
                                   "cannot run alone on it")
-        return launch(cfg, repo, tid, command_of(cfg, "step", run_id, step, *settings), admission=(run_id, base_version))
+        return launch(cfg, repo, tid, pipeline.adw_command(
+            repo.name, tid, "--continue", run_id, "--only", step,
+            *(f"--set={step}.{s}" for s in settings)), admission=(run_id, base_version))
 
 
 def removed_tree(run_id: str, step: str) -> str:

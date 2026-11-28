@@ -776,7 +776,8 @@ def run_rows(rows: list[dict]) -> list[dict]:
              "ask_route": routes.get(r["id"], ""),
              "finished": r["finished"], "seconds": seconds_between(r["started"], r["finished"]),
              "paid": paid.get(r["id"], 0), "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
-             "loop": r.get("loop") or "", "repo": r["repo"] or ""} for r in rows]
+             "loop": r.get("loop") or "", "repo": r["repo"] or "",
+             "adw": r.get("adw"), "adw_version": r.get("adw_version"), "adw_rule": r.get("adw_rule")} for r in rows]
 
 
 def action_rerun_available(run: dict, adaptive: dict) -> bool:
@@ -824,8 +825,10 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
             adaptive["action_rerun_available"] = action_rerun_available(r, adaptive)
         recovery = unblock_store.get(r["repo"], str(r["issue"]), connect=foundation.reader) if r["issue"] else {}
         routes = asks_store.routes_of([run_id], connect=foundation.reader) if r["status"] == "needs-info" else {}
-        result = {"now": util.iso(), "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4),
-                                            "ask_route": routes.get(run_id, "")},
+        result = {"now": util.iso(), "run": {**r, "adw": r.get("adw"), "adw_version": r.get("adw_version"),
+                                             "adw_rule": r.get("adw_rule"), "ticket": ticket(r),
+                                             "paid": round(sum(m["paid"] for m in rows), 4),
+                                             "ask_route": routes.get(run_id, "")},
                   "recovery": {k: recovery[k] for k in ("phase", "cause", "detail")} if recovery else None,
                   "models": rows,
                   "orchestration": adaptive,

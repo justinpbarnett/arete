@@ -52,7 +52,7 @@ REGISTRY = {
                    Home("layers/{repo}/prompts/{name}.append.md", "{repo}.{name}.append",
                         name_pattern=PROMPT_NAME_PATTERN)),
     "schema": kind("schema", "check", Home("schemas/{name}.json")),
-    "adw": kind("adw", "review", Home("adws/{name}.py")),
+    "adw": kind("adw", "review", Home("adws/{name}.toml")),
     "routes": kind("routes", "review", Home("routes/{name}.toml")),
     "step_settings": kind("step_settings", "review", Home("config.toml", "defaults"),
                           Home("layers/{repo}/config.toml", "{repo}")),

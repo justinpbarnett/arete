@@ -15,7 +15,7 @@ FIELDS = {
                        "label_pending", "landed", "device", "attempts", "model", "runner", "log", "trigger", "queue",
                        "grp", "lock", "moved", "wait_minutes", "engine_sha", "failure", "dry_run",
                        "environment_retry_of", "config_commit", "resolved_sha", "continues", "chain", "restart",
-                       "started_by", "payer", "seq")),
+                       "started_by", "payer", "seq", "adw", "adw_version", "adw_rule")),
     "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated")),
     "task_comments": frozenset(("task", "author", "body", "ts")),
 }

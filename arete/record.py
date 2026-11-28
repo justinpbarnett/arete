@@ -143,6 +143,12 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", resolut
         blob_rows = resolution.write_blobs()
         row["config_commit"] = resolution.config_commit or None
         row["resolved_sha"] = resolution.resolved_sha
+        if "adw" not in fields and resolution.adw is not None:
+            row["adw"] = resolution.adw
+        if "adw_version" not in fields and resolution.adw_version is not None:
+            row["adw_version"] = resolution.adw_version
+        if "adw_rule" not in fields and resolution.adw_rule is not None:
+            row["adw_rule"] = resolution.adw_rule
     if kind in TICKET_KINDS:
         row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
                    measured_at=row["started"])
