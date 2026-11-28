@@ -347,7 +347,12 @@ def activations_verified(activations: list[dict], *, receipt: dict | None = None
             matched = (fields.get("/" + req["kind"]) == val_digest
                        or fields.get("/activation") == val_digest
                        or fields.get("/feature_flag") == val_digest
-                       or (bool(slug) and fields.get("/" + slug) in (val_digest, true_digest)))
+                       or fields.get("/audience") == val_digest
+                       or (bool(slug) and (
+                           fields.get("/" + slug) in (val_digest, true_digest)
+                           or fields.get("/flags/" + slug) in (val_digest, true_digest)
+                           or fields.get("/audiences/" + slug) in (val_digest, true_digest)
+                       )))
         if not matched:
             label = "Feature flag" if req["kind"] == "feature_flag" else "Activation"
             missing.append(f"{label}: {value}")
