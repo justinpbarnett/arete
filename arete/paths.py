@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import tomllib
+from functools import lru_cache
 from pathlib import Path
 
 from . import local_paths
@@ -94,10 +95,15 @@ def expand(p: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(p))))
 
 
+@lru_cache(maxsize=16)
+def parse_toml_bytes(raw: bytes) -> dict:
+    return tomllib.loads(raw.decode())
+
+
 def dashboard_ports() -> frozenset[int]:
     found = {DASHBOARD_PORT}
     try:
-        data = tomllib.loads(read_confined(CONFIG_FILE).decode())
+        data = parse_toml_bytes(read_confined(CONFIG_FILE))
         found.add(int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)))
     except (OSError, ValueError, TypeError):
         pass

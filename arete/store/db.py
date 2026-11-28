@@ -8,7 +8,8 @@ import stat
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -40,7 +41,46 @@ def nonblocking_transactions(until: float, check: Callable[[], None]):
         _TRANSACTION_DEADLINE.reset(token)
 
 
-class FixtureConnection(sqlite3.Connection):
+_SQL_TARGET = re.compile(r"\b(?:INTO|UPDATE|FROM)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _sql_subject(sql: str) -> str:
+    found = _SQL_TARGET.search(sql)
+    return found.group(1) if found else "db"
+
+
+def _scrub_sql_params(sql: str, parameters):
+    from .. import scrub
+
+    if scrub.busy():
+        return parameters
+    if isinstance(parameters, Mapping):
+        if not any(isinstance(v, str) for v in parameters.values()):
+            return parameters
+        subject = _sql_subject(sql)
+        return {k: scrub.text(v, "state", subject) if isinstance(v, str) else v for k, v in parameters.items()}
+    items = parameters if isinstance(parameters, (tuple, list)) else tuple(parameters)
+    if not any(isinstance(v, str) for v in items):
+        return items
+    subject = _sql_subject(sql)
+    return tuple(scrub.text(v, "state", subject) if isinstance(v, str) else v for v in items)
+
+
+class ScrubbingConnection(sqlite3.Connection):
+    _scrub_params: bool = False
+
+    def execute(self, sql, parameters=()):
+        if self._scrub_params and parameters:
+            parameters = _scrub_sql_params(sql, parameters)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        if self._scrub_params:
+            seq_of_parameters = [_scrub_sql_params(sql, params) for params in seq_of_parameters]
+        return super().executemany(sql, seq_of_parameters)
+
+
+class FixtureConnection(ScrubbingConnection):
     def close(self):
         try:
             super().close()
@@ -54,9 +94,14 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         raise ValueError("a streaming database connection must be read-only")
     if not paths.ISOLATED:
         mode = "ro" if readonly else "rwc" if create else "rw"
-        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30 if timeout is None else timeout)
+        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True,
+                               timeout=30 if timeout is None else timeout, factory=ScrubbingConnection)
         try:
-            conn.execute("PRAGMA synchronous=NORMAL")
+            if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA temp_store=MEMORY")
+            else:
+                conn.execute("PRAGMA synchronous=NORMAL")
             return conn
         except BaseException:
             conn.close()
@@ -101,7 +146,11 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         conn.handles = retained if streaming else handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        else:
+            conn.execute("PRAGMA synchronous=NORMAL")
         if streaming:
             handles.close()
         return conn
@@ -128,8 +177,10 @@ SPEC_DELIVERY_SCHEMA = 29
 SPEC_GRAPH_SCHEMA = 30
 FACTORY_SCHEMA = 31
 TICKET_FEEDBACK_SCHEMA = 32
-CONFIG_INDEX_SCHEMA = 33
-CONFIG_VER_SCHEMA = 34
+TICKET_FOLLOWUPS_SCHEMA = 33
+SECRET_EXPOSE_SCHEMA = 34
+CONFIG_INDEX_SCHEMA = 35
+CONFIG_VER_SCHEMA = 36
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -141,8 +192,8 @@ WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] wo
 # Unrelated writers can use older databases. Spec graph migrations are serve-owned.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
-                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, CONFIG_INDEX_SCHEMA,
-                             CONFIG_VER_SCHEMA))
+                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, TICKET_FOLLOWUPS_SCHEMA,
+                             SECRET_EXPOSE_SCHEMA, CONFIG_INDEX_SCHEMA, CONFIG_VER_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -655,6 +706,8 @@ def owned(mode, timeout, before_commit=None):
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
             _OWNER.after_commit = callbacks
+            if mode == "write" and isinstance(conn, ScrubbingConnection):
+                conn._scrub_params = True
             if bounded:
                 check()
                 conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
@@ -667,6 +720,8 @@ def owned(mode, timeout, before_commit=None):
                     check()
                 raise
             finally:
+                if mode == "write" and isinstance(conn, ScrubbingConnection):
+                    conn._scrub_params = False
                 if bounded:
                     conn.set_progress_handler(None, 0)
     finally:
@@ -734,6 +789,18 @@ def write_connection():
 def after_commit(callback: Callable[[], None]) -> None:
     write_connection()
     _OWNER.after_commit.append(callback)
+
+
+def after_transaction(callback: Callable[[], None]) -> bool:
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid() and _OWNER.after_commit is not None:
+        _OWNER.after_commit.append(callback)
+        return True
+    return False
+
+
+def isolated_busy() -> bool:
+    return bool(getattr(DB_THREAD, "active", False)) and transaction_mode() is None
 
 
 def transaction_mode():

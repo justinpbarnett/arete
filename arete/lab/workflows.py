@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -186,14 +185,18 @@ def execute(cfg, run, layer, wt, task):
         request["runtime"] = str(runtime)
         request["max_builders"] = run.max_builders
     util.write_durably(root / "request.json", json.dumps(request).encode(), 0o600)
-    environment = {**os.environ, "ARETE_CONFIG_DIR": str(private), "ARETE_STATE_DIR": str(runtime / "state"),
-                   "ARETE_LOG_DIR": str(runtime / "logs"), "ARETE_WORKTREES_DIR": str(runtime / "worktrees")}
-    environment.pop("ARETE_RUN_ID", None)
+    from .. import environment as child_environment
+
+    env = child_environment.build(child_environment.INTERNAL_ARETE, {
+        "ARETE_CONFIG_DIR": str(private), "ARETE_STATE_DIR": str(runtime / "state"),
+        "ARETE_LOG_DIR": str(runtime / "logs"), "ARETE_WORKTREES_DIR": str(runtime / "worktrees"),
+    })
+    env.pop("ARETE_RUN_ID", None)
     command = [sys.executable, "-I", "-c", (f"import sys;sys.path.insert(0,{str(paths.PACKAGE_DIR.parent)!r});"
                "from arete.lab.workflows import child;child()"), str(root)]
     run.execution = {"executor": run.executor, "usage_unknown": True, "artifacts": paths.short_path(root)}
     with (root / "execution.log").open("w") as output:
-        process = subprocess.Popen(command, env=environment, stdout=output, stderr=output, start_new_session=True)
+        process = subprocess.Popen(command, env=env, stdout=output, stderr=output, start_new_session=True)
         try:
             process.wait(timeout=max(1, limits["minutes"] * 60))
         except BaseException:

@@ -168,10 +168,13 @@ def forbidden_name(name: str) -> bool:
 
 
 def _check_config_history(root: Path) -> None:
+    from . import environment
+
     if root.is_symlink() or (root / ".git").is_symlink() or not (root / ".git").is_dir():
         raise RuntimeError("config folder is linked or has no plain .git folder, so it is not bundled")
+    env = environment.build(())
     listed = subprocess.run(["git", "log", "--all", "--root", "-m", "--no-renames", "--raw", "--format=", "-z"],
-                            check=False, cwd=root, capture_output=True, timeout=300)
+                            check=False, cwd=root, capture_output=True, timeout=300, env=env)
     if listed.returncode != 0:
         raise RuntimeError(f"listing config history failed ({listed.returncode})")
     records = iter(listed.stdout.decode(errors="replace").split("\0"))
@@ -192,6 +195,8 @@ def _check_config_history(root: Path) -> None:
 
 
 def build_bundle(day: str) -> tuple[Path, str]:
+    from . import environment
+
     root = paths.CONFIG_DIR.resolve()
     configrepo.ensure_repo()
     _check_config_history(root)
@@ -201,14 +206,15 @@ def build_bundle(day: str) -> tuple[Path, str]:
     handle, name = tempfile.mkstemp(dir=folder, prefix=f".config-{day}-", suffix=".bundle.tmp")
     os.close(handle)
     draft = Path(name)
+    env = environment.build(())
     try:
         res = subprocess.run(["git", "bundle", "create", str(draft), "--all"], check=False, cwd=root,
-                             capture_output=True, timeout=300)
+                             capture_output=True, timeout=300, env=env)
         if res.returncode != 0 or not draft.is_file() or draft.stat().st_size == 0:
             raise RuntimeError(f"git bundle create failed ({res.returncode}): "
                                f"{util.first_line(res.stderr.decode(errors='replace'), 200)}")
         verified = subprocess.run(["git", "bundle", "verify", str(draft)], check=False, cwd=root,
-                                  capture_output=True, timeout=300)
+                                  capture_output=True, timeout=300, env=env)
         if verified.returncode != 0:
             raise RuntimeError(f"git bundle verify failed ({verified.returncode}): "
                                f"{util.first_line(verified.stderr.decode(errors='replace'), 200)}")

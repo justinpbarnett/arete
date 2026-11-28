@@ -272,10 +272,12 @@ def git_location(relative: str) -> tuple[Path, str] | None:
 
 
 def git(root: Path, *args: str) -> str | None:
+    from . import environment
+
     git_dir = root / ".git"
     if git_dir.is_symlink() or not git_dir.is_dir():
         return None
-    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_OPTIONAL_LOCKS": "0"}
+    env = environment.build((), {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_OPTIONAL_LOCKS": "0"})
     try:
         done = subprocess.run(["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
                                f"--git-dir={git_dir}", f"--work-tree={root}", *args], cwd=root, env=env,

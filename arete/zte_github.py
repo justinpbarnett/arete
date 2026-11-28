@@ -462,7 +462,7 @@ class GitHub:
 
             def git(*args):
                 done = util.sh(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", *args], cwd=root,
-                               env=self.git_env(), inherit=False, timeout=self.time_left(25))
+                               env=self.git_env(), timeout=self.time_left(25))
                 pilot.require(done.returncode == 0, f"could not isolate the candidate Git object before push ({args[0]})")
                 return done.stdout.strip()
 
@@ -484,7 +484,7 @@ class GitHub:
         result = util.sh(["/usr/bin/git", "-c", "http.followRedirects=false", "-c", "core.hooksPath=/dev/null",
                           "-c", "credential.helper=", "push", "--no-follow-tags", "--recurse-submodules=no",
                           f"--force-with-lease={ref}:", url, f"{head}:{ref}"], cwd=where, env=environment,
-                         inherit=False, timeout=self.time_left(30))
+                         timeout=self.time_left(30))
         if result.returncode != 0:
             raise gh.GhUnsure("GitHub did not confirm the exact branch push; inspect without retrying")
 

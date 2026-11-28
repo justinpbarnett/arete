@@ -1218,6 +1218,8 @@ def exposure(path: Path, grants) -> Path | None:
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
+    if kwargs.get("env") is None:
+        raise ValueError("scratch.spawn requires an explicit env")
     a = PRODUCING.get()
     if a is None and actor_confined:
         return subprocess.Popen(*args, **kwargs)

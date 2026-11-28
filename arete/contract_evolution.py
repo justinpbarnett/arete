@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
 from collections import defaultdict
@@ -192,7 +191,9 @@ def from_document(document):
 
 
 def git(root, *args):
-    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_OPTIONAL_LOCKS": "0"}
+    from . import environment
+
+    env = environment.build((), {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "", "GIT_OPTIONAL_LOCKS": "0"})
     done = subprocess.run(["git", "--no-replace-objects", *args], cwd=root, env=env, capture_output=True, timeout=15)
     if done.returncode:
         raise ValueError(done.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")

@@ -91,8 +91,10 @@ def _root() -> Path:
 
 
 def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: bool = False) -> dict[str, str]:
+    from . import environment
+
     env = {
-        k: v for k, v in os.environ.items()
+        k: v for k, v in environment.build(()).items()
         if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"))
     }
     env.update({
@@ -117,7 +119,7 @@ def _git_env(root: Path, *, actor: str = "", fence_token: str = "", use_hooks: b
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
         env["GIT_CONFIG_VALUE_0"] = os.devnull
-    return env
+    return util.foreground_maintenance(env)
 
 
 def _git(args: list[str], cwd: Path, *, actor: str = "", fence_token: str = "", use_hooks: bool = False,

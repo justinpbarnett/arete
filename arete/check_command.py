@@ -55,7 +55,7 @@ def main(argv: list[str]) -> int:
     lock_dir, config_file, log_file, where, mode, command = argv
     paths.CHECK_LOCKS_DIR, paths.CONFIG_FILE = Path(lock_dir), Path(config_file)
     with slots.check_slot(ScriptRun(log_file, where), parallel=mode == PARALLEL) as lock_fds:
-        child = subprocess.Popen(["/bin/sh", "-c", command], pass_fds=lock_fds)
+        child = subprocess.Popen(["/bin/sh", "-c", command], env=os.environ, pass_fds=lock_fds)
         with forwarding(child):
             code = child.wait()
         check_process.release(lock_fds)

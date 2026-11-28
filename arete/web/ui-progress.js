@@ -1,5 +1,5 @@
 export function ticketProgressParts(progress, { element, link, stamp, pullLinks }) {
-  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing, since } = progress;
+  const { activity, blocker, next_event, follow_up, prerequisites, prerequisite_issues, updates, timing, since, spec_graph } = progress;
   const unread = Object.entries(prerequisite_issues ?? {}).filter(([, read]) => !read).map(([ref]) => ref);
   const p = (...children) => element("p", {}, ...children);
   return [
@@ -7,6 +7,11 @@ export function ticketProgressParts(progress, { element, link, stamp, pullLinks 
     blocker ? p(element("strong", {}, "Blocker:"), ` ${blocker}`) : null,
     next_event ? p(element("strong", {}, "Next:"), ` ${next_event}`) : null,
     timing ? element("section", { "aria-label": "Run lineage timing" }, timing.lines.map((line) => p(line))) : null,
+    spec_graph?.children?.length ? element("ul", { "aria-label": "Spec graph children" }, spec_graph.children.map((child) => {
+      const label = child.ticket ? `${child.ticket} (${child.key})` : child.key;
+      const wait = child.wait_reason ? ` — ${child.wait_reason}` : "";
+      return element("li", {}, `${label}: ${child.state}${wait}`);
+    })) : null,
     prerequisites?.length ? element("ul", {}, prerequisites.map((pr) => {
       const label = pr.deployed_release ? "Deployed prerequisite" : pr.state === "merged"
         ? "Merged prerequisite (deployment not confirmed)" : `Prerequisite (${pr.state})`;

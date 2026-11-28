@@ -1350,11 +1350,17 @@ class Server:
 def start_notes(cfg: config.Config) -> list[str]:
     notes = []
     if dropped := environment.dropped(cfg):
-        notes.append(f"these server variables no longer reach agents or the commands that run a repo's code: "
-                     f"{', '.join(dropped)}; add a name to [environment] pass in "
-                     f"{paths.short_path(paths.CONFIG_FILE)} or a repo's layer to pass it (a trailing * matches a "
-                     f"prefix, [\"*\"] passes all); a claude agent still gets its login and a pi agent its provider's "
-                     f"keys")
+        creds = [name for name in dropped if paths.CREDENTIAL_NAME.search(name)]
+        plain = [name for name in dropped if not paths.CREDENTIAL_NAME.search(name)]
+        if plain:
+            notes.append(f"these server variables no longer reach agents or the commands that run a repo's code: "
+                         f"{', '.join(plain)}; add a name to [environment] pass in "
+                         f"{paths.short_path(paths.CONFIG_FILE)} or a repo's layer to pass it (a trailing * matches a "
+                         f"prefix, [\"*\"] passes all)")
+        if creds:
+            notes.append(f"these credential variables never pass from the parent environment to children: "
+                         f"{', '.join(creds)}; register each secret with expose instead of adding it to "
+                         f"[environment] pass")
     if judge := runner.judge_note(cfg):
         notes.append(judge)
     return notes

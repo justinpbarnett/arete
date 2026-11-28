@@ -16,7 +16,7 @@ from arete import paths, poll, routing, run_lines, slots, tasks, tracker, util, 
 from arete.store import db
 from arete.store import orchestration as ledger
 from arete.store import runs, sources, ticket_progress
-from tests.support import workspace_state
+from tests.support import seed_db, workspace_state
 
 REPO, TICKET = "arete", 964
 PARENT, RETRY = "pip-source", "pip-retry"
@@ -136,7 +136,7 @@ class ProgressFixture(unittest.TestCase):
         parent = paths.scratch_root(paths.STATE_DIR) if paths.ISOLATED else None
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=parent))).resolve()
         self.enterContext(progress_workspace(self.root))
-        db.migrate()
+        seed_db(self.root / "state")
 
     def run_row(self, run_id, status="running", **fields):
         runs.insert_run(run_id, dict(kind="pipeline", repo=REPO, issue=self.issue, status=status, started=self.started) | fields)

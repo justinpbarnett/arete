@@ -805,7 +805,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
             kw["read_roots"] = tuple(Path(root) for root in roots)
-        kept = {} if supervisor else {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
+        kept = ({} if supervisor else
+                {n: v for n, v in environment.role_secrets(f"runner:{which}", repo=repo.name if repo else None).items()
+                 if not reserved(n)})
         if picked.selected:
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
         if kept:
@@ -897,9 +899,13 @@ def described_servers(mcp_config: str) -> dict:
 
 def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> None:
     if selected and selected.using_login:
-        hidden.add([*pi.credential_values(accounts.read(selected.owner)), *selected.refreshed_secrets])
+        refreshed = [*pi.credential_values(accounts.read(selected.owner)), *selected.refreshed_secrets]
+        hidden.add(refreshed)
+        scrub.remember(*refreshed)
     if selected:
-        hidden.add(v for path in selected.sensitive_files for v in scrub.file_secrets(path, every_value=True))
+        vals = [v for path in selected.sensitive_files for v in scrub.file_secrets(path, every_value=True)]
+        hidden.add(vals)
+        scrub.remember(*vals)
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
@@ -939,11 +945,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     selected = kw.get("selected")
     if selected:
         found.extend(selected.sensitive_files)
-    hidden = scrub.Redactions(scrub.secrets(*found, given=kw.pop("stored_values", ())), escape=bool(selected))
+    hidden = scrub.Redactions(scrub.file_values(*found, given=kw.pop("stored_values", ())), escape=True)
     if selected:
         hidden.add(selected.hidden)
         header["env"] = route["env"]
         header["provider"] = selected.provider
+    subject = f"{record_id}/{trace[1]}" if record_id else trace[1]
 
     def safe_line(line):
         refresh_redactions(hidden, selected)
@@ -967,14 +974,15 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                               for call in res.calls or [res]], effort=kw.get("effort", ""),
                              tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
         except BaseException as error:
-            rec.finish(replace(res, ok=False, error=scrub.scrub(
-                f"cost is not in steps: {record.failure(error)}; {res.error}", hidden)), time.monotonic() - started)
+            rec.finish(replace(res, ok=False, error=scrub.text(
+                f"cost is not in steps: {record.failure(error)}; {res.error}", "record", subject, extra=hidden)),
+                time.monotonic() - started)
             raise
 
     def keep_lost(error: BaseException) -> None:
         refresh_redactions(hidden, selected)
         seen = replace(meter.seen, provider=header["provider"],
-                       error=scrub.scrub(rec.exception_text(error), hidden))
+                       error=scrub.text(rec.exception_text(error), "record", subject, extra=hidden))
         seen.cost_usd = charged(seen)
         persist(seen)
         rec.finish(seen, time.monotonic() - started)
@@ -1026,11 +1034,11 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                 else:
                     quote_calls(res, which, name, at)
             refresh_redactions(hidden, selected)
-            res.error = scrub.scrub(res.error, hidden)
-            res.text = scrub.scrub(res.text, hidden)
-            res.structured = scrub.scrub_value(res.structured, hidden)
+            res.error = scrub.text(res.error, "record", subject, extra=hidden)
+            res.text = scrub.text(res.text, "record", subject, extra=hidden)
+            res.structured = scrub.value(res.structured, "record", subject, extra=hidden)
             for call in res.calls:
-                call.error = scrub.scrub(call.error, hidden)
+                call.error = scrub.text(call.error, "record", subject, extra=hidden)
             res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
             if not target.remote:
                 res.auth_generation = auth.generation

@@ -255,7 +255,8 @@ def seam_facts(run_id: str) -> dict:
 
 
 def public_text(run: AgentRun, text: str) -> str:
-    return outbound.redact(text) if run.repo.public else text
+    subject = getattr(run.repo, "name", "") or "outbound"
+    return outbound.redact(text, subject=subject) if run.repo.public else scrub.text(text, "outbound", subject)
 
 
 def provider_busy(res: Result) -> bool:
@@ -4381,6 +4382,90 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return hold
     return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base,
                             **release_proof.pr_check_options(b.run.repo, getattr(b.ticket, "id", None), c.github, c.base))
+
+
+def direct_push_refusal(repo: config.Repo, base: str, *, ticket: str = "") -> str:
+    from . import release_proof
+
+    if repo.landing == "pr":
+        return f"{repo.name} requires a PR; direct push is disabled"
+    if repo.landing != "direct-push":
+        return f"{repo.name} is not enrolled for direct-push delivery"
+    if not repo.target_branch:
+        return f"{repo.name} has no enrolled target branch for direct-push delivery"
+    if base != repo.target_branch:
+        return f"{repo.name} targets {repo.target_branch}, not {base}; direct push refused"
+    if repo.unattended_environment in ("", "none"):
+        return f"{repo.name} does not allow unattended deployment; direct push is disabled"
+    if ticket and (policy := release_proof.goal(repo.name, str(ticket))):
+        if policy["destination"] == "staging":
+            return "staging delivery requires a PR and QA handoff; direct push refused"
+        required_env = "production" if policy["destination"] == "arete-serve" else policy["destination"]
+        if not repo.allows_unattended_deploy(required_env):
+            return f"{repo.name} does not allow unattended deployment to {required_env}"
+    return ""
+
+
+def direct_push_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
+                     draft_why: str = "", left_for_a_person: str = "") -> str:
+    ticket_id = str(getattr(b.ticket, "id", "") or "")
+    if refusal := direct_push_refusal(b.run.repo, c.base, ticket=ticket_id):
+        return refusal
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be direct-pushed atomically"
+    if draft_why:
+        return draft_why
+    if left_for_a_person:
+        return "changes with work left for a person cannot be direct-pushed"
+    head = git(["rev-parse", "HEAD"], c.wt).strip()
+    if hold := merge_evidence_hold(b, c, verified, review, head):
+        return hold
+    base_sha = fetch_merge_base(c)
+    if not has_merge_base(c, head, base_sha):
+        return "the checked head does not contain the target base"
+    patch = checkout_patch(c, [], f"{base_sha}..{head}")
+    if not patch:
+        return "there is no diff to direct-push"
+    if not jev.ready(b.cfg, [b.run.repo]):
+        return "JEV risk screening is unavailable"
+    try:
+        risk = jev.risk(vault.hidden(patch), vault.hidden(about), b.cfg, trace=(b.run.id, "direct-push risk jev"))
+    except jev.Unjudged:
+        return "JEV could not judge the diff"
+    if risk.hold:
+        return risk.hold
+    return ""
+
+
+def direct_push_checkout(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
+                         draft_why: str = "", left_for_a_person: str = "", slot: slots.RunSlot | None = None) -> dict:
+    from . import release_proof
+
+    lock = (slots.take_merge_lease(b.run, c.github, slot=slot) if c.github and slot
+            else util.lock(slots.merge_lock(c.github), wait=True) if c.github
+            else util.repo_lock(c.src))
+    with lock:
+        if hold := direct_push_hold(b, c, verified, review, about, draft_why=draft_why,
+                                    left_for_a_person=left_for_a_person):
+            raise workspace.RunFailed(hold)
+        head = git(["rev-parse", "HEAD"], c.wt).strip()
+        tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+        base_sha = fetch_merge_base(c)
+        if workspace.remote_head(c.src, c.base) != base_sha:
+            raise workspace.RunFailed(f"origin/{c.base} moved before direct push; rerun checks on the latest base")
+        try:
+            git(["push", "-q", "--no-follow-tags", "--recurse-submodules=no", "origin",
+                 f"{head}:refs/heads/{c.base}"], c.wt, timeout=600, retry=False)
+        except RuntimeError as error:
+            raise workspace.RunFailed(f"direct push to {c.base} was refused by origin", str(error)) from error
+        if workspace.remote_head(c.src, c.base) != head:
+            raise workspace.RunFailed(f"origin/{c.base} did not confirm direct push of {head[:12]}")
+        c.note_pushed_head(head)
+        c.onto = ""
+        release_proof.record_direct_push(b.run.repo, str(b.ticket.id), c.base, head,
+                                         tree=tree, base_sha=base_sha, run_id=b.run.id)
+        b.run.log(f"direct-push: pushed {head[:12]} to {c.base}")
+        return {"branch": c.base, "revision": head, "tree": tree, "base": base_sha}
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,

@@ -339,7 +339,7 @@ The `codex` runner runs OpenAI models through the Codex CLI on your own `codex l
 A step picks it with `runner = "codex"` in a step table or a tier, a `codex:<model>` name, or a bare `gpt-` or `codex-` name.
 Each call runs `codex exec --json` with the folder as `-C`, the model as `-m`, the effort as `model_reasoning_effort` and the prompt on stdin.
 The step's session keeps codex's thread id with runner `codex`, and a later round resumes it with `codex exec resume <thread>`. Switching runners starts a fresh thread; repair prompts carry the saved ticket, plan and builder summary. Claude sessions never resume in Codex.
-Public PR reports and tracker comments pass through outbound redaction before publication; raw local evidence stays intact.
+Outbound text loses registry secret values and Arete tokens on every repo, public or private; public PR reports and tracker comments also pass shape redaction before publication, while raw local evidence stays intact.
 A ChatGPT login is a subscription, as claude is: the step shows `subscription`, counts nothing in paid sums, and still records its reported cost and tokens.
 An API key login is metered, priced at the model's `[pricing]` price, since codex reports no cost.
 Subscription holds follow the account and provider family: matching Codex and pi openai-codex accounts share holds. Different accounts stay independent.
@@ -722,7 +722,8 @@ The files are gzip, not zstd, because arete runs on Python 3.13 with the standar
 `zcat`, `gzip -dc` and `zless` read them.
 Each line goes to disk as its own complete gzip member the moment it is written, so a timeout, a budget stop or a killed process leaves a file that these tools and `arete record` read in full up to its last line.
 
-Before a line is written, arete replaces every secret it knows with `[redacted]`: the values of environment variables whose names hold TOKEN, SECRET, PASSW, API_KEY, ACCESS_KEY, PRIVATE_KEY or CREDENTIAL, `gh auth token`, and every value in `pi.env`.
+One shared hidden set covers records, run lines, command output, database rows, API answers, outbound text, JEV calls and process logs: registry secrets become `[secret:<scope>/<name>]`, Arete tokens become `[token:<id>]`, and unlabelled secrets (environment variables whose names hold TOKEN, SECRET, PASSW, API_KEY, ACCESS_KEY, PRIVATE_KEY or CREDENTIAL, `gh auth token`, legacy `pi.env` and secret files) and PEM private key blocks become `[redacted]`.
+A child process receives a secret only through its registry `expose` policy for that role (and repo for `repo:` secrets), never from the parent environment.
 It also reads the Jira env file, `~/.netrc`, `~/.pgpass`, `~/.npmrc`, `~/.pypirc`, `~/.aws/credentials`, and the secret files (such as `.env`) in the work folder and the folders the call may also use, down four levels and skipping `.git`, `node_modules` and virtual environments.
 From `NAME=value` lines and from `name: value` pairs (YAML, JSON, `.pypirc`) it takes each value under a name like the ones above, and each other value of 8 or more characters that is not only letters.
 From `.netrc` it takes the word after each `login`, `password` and `account`, but not the `machine` host, and from `.pgpass` the password field of each line.

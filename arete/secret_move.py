@@ -233,12 +233,12 @@ def copy_jira_fields(source, values):
             util.write_durably(paths.CONFIG_FILE, updated.encode(), mode)
 
 
-def adopt_values(scope, values, active, provider=lambda _name: None):
+def adopt_values(scope, values, active, provider=lambda _name: None, expose=lambda _name: None):
     rejected = []
     for name, value in values.items():
         try:
             secretstore.adopt(scope, name, value, "api_key", provider=provider(name), managed_by="external",
-                              settings=active)
+                              settings=active, expose=expose(name))
         except (ValueError, OSError, sqlite3.Error) as error:
             rejected.append(failure_rule(error))
     if rejected:
@@ -254,7 +254,8 @@ def adopt_file(kind, path, raw, active):
         def provider(name):
             return next((p for p, key in pi.KEY_NAMES.items() if key == name), None)
 
-        adopt_values("global", env_contents(text), active, provider)
+        adopt_values("global", env_contents(text), active, provider,
+                     expose=lambda name: [{"env": name, "roles": ["runner:pi"]}])
     elif kind == "jira":
         values = env_contents(text)
         if values.keys() - {*JIRA_FIELDS, "JIRA_API_TOKEN"}:
@@ -274,7 +275,8 @@ def adopt_file(kind, path, raw, active):
               managed_by="arete", settings=active)
     elif kind == "repo":
         repo = unquote(path.name.removesuffix(REPO_SUFFIX))
-        adopt_values(f"repo:{repo}", repo_contents(raw), active)
+        adopt_values(f"repo:{repo}", repo_contents(raw), active,
+                     expose=lambda name: [{"env": name, "roles": ["step:*", "runner:*"]}])
 
 
 def files(data):
