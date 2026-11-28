@@ -689,7 +689,7 @@ def default_path(kind: str, name: str) -> str:
             return "layers/defaults/config.toml"
         return f"layers/{name}/config.toml"
     if kind == "attention":
-        return "config.toml"
+        return "attention.toml"
     if kind == "retention":
         return "retention.toml"
     if kind == "prompt":
@@ -720,7 +720,7 @@ def _unified_diff(path: str, old_bytes: bytes | None, new_text: str) -> str:
 
 
 def _live_ver_for(kind: str, name: str, path: str, conn=None) -> int:
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and path == "config.toml" else kind
     row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(path, conn)
     if row is not None and row.get("ver") is not None:
         return int(row["ver"])
@@ -968,7 +968,7 @@ def _validate_base_and_check_for_activation(
         raise contract.Problem("invalid_state", f"Draft {draft['id']} in state {draft['state']!r} cannot be activated.")
 
     rel = draft["path"] or default_path(draft["kind"], draft["name"])
-    lookup_kind = "step_settings" if draft["kind"] == "attention" else draft["kind"]
+    lookup_kind = "step_settings" if draft["kind"] == "attention" and rel == "config.toml" else draft["kind"]
     live_row = config_store.live_item(lookup_kind, draft["name"]) or config_store.live_by_path(rel)
     live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
     if not _matches_base_version(base_version, live_ver, live_row):
@@ -1341,7 +1341,7 @@ def _runs_pinning_version(
 def _previous_and_new_version_info(draft: dict) -> tuple[dict | None, dict | None]:
     kind, name = draft["kind"], draft["name"]
     rel = draft["path"] or default_path(kind, name)
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     history = configrepo.version_history(lookup_kind, name, rel)
     activated_sha = draft["activated_commit"]
     new_entry = None
@@ -1549,7 +1549,7 @@ def start_config_ask(
 
 
 def _live_state_for_base_check(kind: str, name: str, rel: str) -> tuple[int, dict | None]:
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     live_row = config_store.live_item(lookup_kind, name) or config_store.live_by_path(rel)
     live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
     return live_ver, live_row

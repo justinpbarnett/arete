@@ -298,8 +298,13 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
         except (ValueError, TypeError, tomllib.TOMLDecodeError) as error:
             problems.append(f"{where}: {error}")
     elif kind == "attention" and isinstance(parsed, dict):
+        from . import attention
+
         try:
-            config.ask_table(parsed)
+            attention.parse_thresholds(parsed, where=where)
+            ask_part = {k: v for k, v in parsed.items() if k in attention.ASK_KEYS}
+            if ask_part:
+                config.ask_table(ask_part)
         except (ValueError, TypeError) as error:
             problems.append(f"{where}: {error}")
     return problems

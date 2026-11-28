@@ -1504,7 +1504,12 @@ def open_count(connect=foundation.reader) -> int:
 
 
 def triage_screen(connect=foundation.reader) -> dict:
-    items = inbox_store.list_items(state="open", connect=connect)
+    from . import attention
+
+    with connect() as c:
+        items = inbox_store.list_items(state="open", connect=lambda: nullcontext(c))
+        counts = inbox_store.counts_by_state(connect=lambda: nullcontext(c))
+        andon = attention.andon(c)
     return {
         "items": items,
         "by_priority": {
@@ -1512,7 +1517,8 @@ def triage_screen(connect=foundation.reader) -> dict:
             "med": [i for i in items if i["priority"] == 2],
             "low": [i for i in items if i["priority"] == 3],
         },
-        "counts": inbox_store.counts_by_state(connect=connect),
+        "counts": counts,
+        "andon": andon,
     }
 
 

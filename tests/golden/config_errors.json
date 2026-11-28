@@ -215,7 +215,7 @@
     ],
     "ask keys": [
       "ValueError",
-      "[ask]: unknown key z; use max_per_run, settle, expire_days, remind_hours, push_contact"
+      "[ask]: unknown key z; use max_per_run, settle, expire_days, remind_hours, push_contact, newPer10Min, floodBurst, standingLimit, standingAim, highOnScreen, shelvedLimit, demoteAfterShelves, needsYouPerDay"
     ],
     "ask count": [
       "ValueError",

@@ -7652,6 +7652,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "oncall cancel 1": "POST /api/incidents/{id}/cancel",
         "oncall dismiss 1": "POST /api/incidents/{id}/dismiss",
         "oncall retry 1": "POST /api/incidents/{id}/retry",
+        "derived recompute band:demo --base-version 1": "POST /api/v1/derived/band/{line}/recompute",
     }
     ONLINE_VARIANTS = {
         "status --json r1": "GET /api/runs/{run}/events",
@@ -9728,8 +9729,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 165)
-        self.assertEqual(len({op["name"] for op in operations}), 165)
+        self.assertEqual(len(operations), 170)
+        self.assertEqual(len({op["name"] for op in operations}), 170)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -9807,7 +9808,11 @@ class VersionedApiTests(unittest.TestCase):
         self.assertEqual(before["seq"], response["Arete-Seq"])
         view = before["view"]
         listed, _ = request("/api/v1/tasks")
-        self.assertEqual(view["tasks"], listed["tasks"])
+        self.assertEqual(
+            [{k: v for k, v in row.items() if k not in ("needs_you", "needs_you_ids")} for row in view["tasks"]],
+            listed["tasks"],
+        )
+        self.assertTrue(all(row["needs_you"] == 0 and row["needs_you_ids"] == [] for row in view["tasks"]))
         self.assertEqual(view["running_ids"], [])
         self.assertEqual({col["state"]: col["count"] for col in view["columns"]},
                          {row["state"]: sum(r["state"] == row["state"] for r in listed["tasks"]) for row in listed["tasks"]})

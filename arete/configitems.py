@@ -140,12 +140,12 @@ def _enrich(entry: dict, conn=None) -> dict:
         if kind == "prompt":
             out.update(_prompt_fields(name, raw, conn))
         return out
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(rel, conn)
     ver = int(row["ver"]) if row and row.get("ver") is not None else 0
     file_path = paths.CONFIG_DIR.resolve() / rel
     raw = file_path.read_bytes() if file_path.is_file() else b""
-    if row and kind != "attention":
+    if row and not (kind == "attention" and rel == "config.toml"):
         cv = row["version"]
     else:
         cv = _content_version_of(kind, name, raw)
@@ -217,6 +217,8 @@ def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
             if name is not None and item_name != name:
                 continue
             if item_name in found:
+                if kind == "attention":
+                    continue
                 first = found[item_name]["path"]
                 raise refusals.Conflict(f"Config item {kind}/{item_name} is ambiguous: {first} and {relative}")
             found[item_name] = _enrich({"kind": kind, "name": item_name, "path": relative}, conn)
@@ -346,7 +348,7 @@ def _resolve_selector(found: dict, selector: str, conn=None) -> tuple[str, int |
     """Resolve a version selector (integer ver, content_version, or full git SHA) to (commit_sha, ver, content_version)."""
     if re.fullmatch(REVISION, selector):
         return selector, None, None
-    lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+    lookup_kind = "step_settings" if found["kind"] == "attention" and found["path"] == "config.toml" else found["kind"]
     history = configrepo.version_history(lookup_kind, found["name"], found["path"])
     if selector.isdecimal():
         wanted_ver = int(selector)
@@ -415,7 +417,7 @@ def read(found: dict, *, version: str | None = None, level: str | None = None,
         raw_text = revision_text(root, commit_sha, git_rel)
         if raw_text is None:
             raise refusals.NotFound(f"The selected config revision is unavailable for {rel}")
-        if public["kind"] == "attention" and not file:
+        if public["kind"] == "attention" and public["path"] == "config.toml" and not file:
             try:
                 content = asdict(config.ask_table(tomllib.loads(raw_text).get("ask", {})))
             except (TypeError, ValueError) as error:
@@ -427,7 +429,7 @@ def read(found: dict, *, version: str | None = None, level: str | None = None,
         if matched_cv is not None:
             public["content_version"] = matched_cv
         return {**public, "content": content}
-    if public["kind"] == "attention" and not file:
+    if public["kind"] == "attention" and public["path"] == "config.toml" and not file:
         try:
             content = settings.attention()
         except FileNotFoundError:
@@ -503,7 +505,7 @@ def revisions(found: dict) -> list[str]:
 def versions(found: dict, conn=None) -> tuple[list[str], list[dict]]:
     location = git_location(found["path"])
     if location is not None and location[0] == paths.CONFIG_DIR.resolve() and configrepo.is_repo():
-        lookup_kind = "step_settings" if found["kind"] == "attention" else found["kind"]
+        lookup_kind = "step_settings" if found["kind"] == "attention" and found["path"] == "config.toml" else found["kind"]
         entries = configrepo.version_history(lookup_kind, found["name"], found["path"])
         if entries:
             return [entry["commit_sha"] for entry in entries], entries
@@ -546,7 +548,7 @@ def diff(found: dict, first: str | None, last: str | None, conn=None) -> str | N
         after = file_text(found["path"])
     if after is None:
         return None
-    if found["kind"] == "attention":
+    if found["kind"] == "attention" and found["path"] == "config.toml":
         before, after = attention_text(before), attention_text(after)
         path = "attention/defaults"
     return "".join(unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),

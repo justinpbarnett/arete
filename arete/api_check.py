@@ -628,6 +628,9 @@ class Check:
             if name == "line.delete":
                 row = self.read("/api/v1/lines/demo-secondary")["line"]
                 values["base_version"] = row["version"]
+            if name == "derived.recompute":
+                row = self.read(f"/api/v1/lines/{identities['line']}")["line"]
+                values["base_version"] = row["version"]
             if name == "comment.update":
                 values["base_version"] = fixture_comment["version"]
             if name == "task.restore":
