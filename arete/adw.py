@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import re
 import tomllib
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,6 +14,7 @@ from . import (
     config,
     configkinds,
     configschema,
+    cron,
     factory,
     flows,
     patching,
@@ -19,6 +23,7 @@ from . import (
     run_lines,
     tracker,
 )
+from .store import db as foundation
 from .store import runs as run_store
 from .store import specs as spec_store
 from .store import tasks as task_store
@@ -29,8 +34,12 @@ CONDITIONS = frozenset(("documents", "dry_run", "repo.parts", "feedback"))
 BRACE_PLACEHOLDERS = frozenset(("{try}", "{prev?}", "{tries}", "{outer.prev}"))
 AT_PLACEHOLDERS = frozenset(("@last",))
 ROUTE_EVENTS = frozenset(("interrupted", "feedback"))
-ROUTE_WHEN_KEYS = frozenset(("event", "repaired_by", "repo", "kind"))
+ROUTE_WHEN_KEYS = frozenset(("event", "repaired_by", "repo", "kind", "source"))
 RESERVED_RULES = frozenset(("@continue", "@repair", "@asked"))
+TRIGGER_KINDS = frozenset(("manual", "source", "schedule", "event"))
+_TRIGGER_META_KEYS = frozenset((
+    "id", "kind", "source", "every", "cron", "event", "rule", "ref", "name", "label", "x", "y", "params",
+))
 
 _NAME_RE = re.compile(rf"^{configkinds.NAME_PATTERN}$")
 _TRIES_RE = re.compile(r"^setting:([a-z0-9_]+)\.tries$")
@@ -57,6 +66,7 @@ class Adw:
     raw: bytes
     sha256: str
     version: str
+    triggers: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -270,7 +280,346 @@ def always_finishes(entries: list[dict]) -> bool:
     return False
 
 
-def _validate_and_steps(data: object, *, where: str = "adw") -> tuple[list[dict] | None, list[str]]:
+def trigger_rule_id(adw_name: str, trig: dict) -> str:
+    raw = trig.get("rule")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return f"{adw_name}-{trig['id']}"
+
+
+def _library_trigger_entry(trig: dict, lib_triggers: dict[str, dict], source_types: dict[str, str] | None = None) -> dict | None:
+    ref = trig.get("ref")
+    if isinstance(ref, str) and ref in lib_triggers:
+        return lib_triggers[ref]
+    kind = trig.get("kind")
+    if kind == "manual":
+        return lib_triggers.get("manual")
+    if kind == "schedule":
+        return lib_triggers.get("schedule")
+    if kind == "event":
+        ev = trig.get("event")
+        if isinstance(ev, str) and ev in lib_triggers:
+            return lib_triggers[ev]
+        return lib_triggers.get("loop-event")
+    if kind == "source":
+        sid = trig.get("source")
+        stype = (source_types or {}).get(sid) if isinstance(sid, str) else None
+        if stype and stype in lib_triggers:
+            return lib_triggers[stype]
+        if isinstance(sid, str) and sid in lib_triggers:
+            return lib_triggers[sid]
+    return None
+
+
+def _trigger_params(trig: dict, lib_entry: dict | None = None) -> dict[str, object]:
+    params: dict[str, object] = {}
+    if isinstance(trig.get("params"), dict):
+        params.update(copy.deepcopy(trig["params"]))
+    lib_param_names = {p["name"] for p in (lib_entry.get("params") or ())} if lib_entry else set()
+    for key, val in trig.items():
+        if key not in _TRIGGER_META_KEYS:
+            params.setdefault(key, copy.deepcopy(val))
+        elif key in ("every", "cron") and trig.get("kind") in ("schedule", "source"):
+            params.setdefault(key, copy.deepcopy(val))
+        elif key == "label" and (trig.get("kind") == "source" or "label" in lib_param_names):
+            params.setdefault(key, copy.deepcopy(val))
+        elif key == "event" and key in lib_param_names:
+            params.setdefault(key, copy.deepcopy(val))
+    return params
+
+
+def serialize_triggers(adw_name: str, data: object) -> list[dict[str, object]]:
+    if not isinstance(data, dict):
+        return []
+    raw_triggers = data.get("trigger")
+    if not isinstance(raw_triggers, list):
+        return []
+    out: list[dict[str, object]] = []
+    for entry in raw_triggers:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not isinstance(entry.get("kind"), str):
+            continue
+        kind = entry["kind"]
+        item: dict[str, object] = {
+            "id": entry["id"],
+            "kind": kind,
+            "params": _trigger_params(entry),
+        }
+        if isinstance(entry.get("source"), str):
+            item["source"] = entry["source"]
+        if isinstance(entry.get("every"), str):
+            item["every"] = entry["every"]
+        if isinstance(entry.get("cron"), str):
+            item["cron"] = entry["cron"]
+        if "event" in entry:
+            item["event"] = copy.deepcopy(entry["event"])
+        if kind == "source" or (isinstance(entry.get("rule"), str) and entry["rule"].strip()):
+            item["rule"] = trigger_rule_id(adw_name, entry)
+        for opt in ("ref", "name", "label", "x", "y"):
+            if opt in entry:
+                item[opt] = entry[opt]
+        out.append(item)
+    return out
+
+
+def known_sources(config_dir: Path | None = None) -> tuple[set[str], dict[str, str]]:
+    from . import loops as loops_mod
+    from . import sources as sources_mod
+
+    root = _active_config_dir(config_dir)
+    ids: set[str] = set()
+    types: dict[str, str] = {}
+    for sid, (_, _, defn) in sources_mod._file_sources(root).items():
+        ids.add(sid)
+        if isinstance(defn.get("type"), str):
+            types[sid] = defn["type"]
+    cfg_file = root / "config.toml"
+    cfg: config.Config | None = None
+    if cfg_file.is_file():
+        with suppress(Exception):
+            cfg = config.load(cfg_file, strict=False, base_dir=root)
+    if cfg is None:
+        with suppress(Exception):
+            cfg = config.load_or_problem()[0]
+    if cfg is not None:
+        loop_list = None
+        if root != paths.CONFIG_DIR.resolve():
+            loop_list = []
+            loops_dir = root / "loops"
+            if loops_dir.is_dir():
+                for lf in sorted(loops_dir.glob("*/loop.toml")):
+                    with suppress(Exception):
+                        loop_list.append(loops_mod.load(lf))
+        with suppress(Exception):
+            for src in sources_mod.load_all(cfg, loop_list, config_dir=root):
+                ids.add(src.id)
+                if isinstance(src.definition.get("type"), str):
+                    types[src.id] = src.definition["type"]
+    if root == paths.CONFIG_DIR.resolve() and paths.DB_FILE.exists():
+        with suppress(foundation.NoDatabase, foundation.IncompatibleSchema, OSError), foundation.reader() as conn:
+            has_cursors = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cursors'"
+            ).fetchone()
+            if has_cursors:
+                for row in conn.execute("SELECT source FROM cursors"):
+                    sid = str(row["source"])
+                    if not sid.startswith("oncall:"):
+                        ids.add(sid)
+    return ids, types
+
+
+def _iter_active_adw_tomls(config_dir: Path | None = None) -> list[tuple[str, dict]]:
+    root = _active_config_dir(config_dir)
+    found: dict[str, dict] = {}
+    for folder in (paths.ENGINE_ADWS_DIR, root / "adws"):
+        if not folder.is_dir():
+            continue
+        for file in sorted(folder.glob("*.toml")):
+            if not file.is_file() or file.stem == "library":
+                continue
+            with suppress(OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                parsed = tomllib.loads(file.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    found[file.stem] = parsed
+    return sorted(found.items())
+
+
+def _param_type_ok(expected: str, value: object) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "string[]":
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
+    if expected == "boolean":
+        return type(value) is bool
+    if expected == "integer":
+        return type(value) is int
+    if expected == "number":
+        return type(value) in (int, float)
+    return True
+
+
+def validate_triggers(
+    data: object,
+    *,
+    adw_name: str,
+    config_dir: Path | None = None,
+    where: str = "adw",
+    known_source_ids: set[str] | None = None,
+    source_types: dict[str, str] | None = None,
+    library: dict | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    problems: list[str] = []
+    warnings: list[dict[str, str]] = []
+    if not isinstance(data, dict):
+        return problems, warnings
+    raw_triggers = data.get("trigger")
+    if not raw_triggers:
+        return problems, warnings
+    if not isinstance(raw_triggers, list):
+        return [f"{where}.trigger must be a list of tables"], warnings
+
+    from . import adw_library, adwgraph
+
+    lib = adw_library.load() if library is None else library
+    lib_triggers = adwgraph._trigger_index(lib)
+    if known_source_ids is None or source_types is None:
+        loaded_ids, loaded_types = known_sources(config_dir=config_dir)
+        if known_source_ids is None:
+            known_source_ids = loaded_ids
+        if source_types is None:
+            source_types = loaded_types
+
+    node_ids = {
+        n["id"] for n in (data.get("node") or ())
+        if isinstance(n, dict) and isinstance(n.get("id"), str)
+    }
+    other_rules: dict[str, tuple[str, str]] = {}
+    for other_adw, other_parsed in _iter_active_adw_tomls(config_dir=config_dir):
+        if other_adw == adw_name:
+            continue
+        for other_trig in other_parsed.get("trigger") or ():
+            if not isinstance(other_trig, dict) or not isinstance(other_trig.get("id"), str):
+                continue
+            if other_trig.get("kind") == "source" or (isinstance(other_trig.get("rule"), str) and other_trig["rule"].strip()):
+                other_rid = trigger_rule_id(other_adw, other_trig)
+                other_rules.setdefault(other_rid, (other_adw, other_trig["id"]))
+
+    seen_ids: set[str] = set()
+    seen_rules: dict[str, str] = {}
+    for idx, trig in enumerate(raw_triggers):
+        loc = f"{where}.trigger[{idx}]"
+        if not isinstance(trig, dict):
+            problems.append(f"{loc} must be a table")
+            continue
+        tid = trig.get("id", "")
+        if not isinstance(tid, str) or not tid.strip():
+            problems.append(f"{loc}.id must be a non-empty string")
+            continue
+        if tid in seen_ids:
+            problems.append(f"{loc}.id: duplicate trigger id {tid!r}")
+        else:
+            seen_ids.add(tid)
+        if tid in node_ids:
+            problems.append(f"{loc}.id: trigger id {tid!r} conflicts with node id {tid!r}")
+
+        kind = trig.get("kind")
+        if kind not in TRIGGER_KINDS:
+            problems.append(f"{loc}.kind: unknown trigger kind {kind!r}")
+            continue
+
+        raw_rule = trig.get("rule")
+        if raw_rule is not None:
+            if not isinstance(raw_rule, str) or not raw_rule.strip():
+                problems.append(f"{loc}.rule must be a non-empty string")
+            elif raw_rule.strip().startswith("@"):
+                problems.append(f"{loc}.rule: {raw_rule!r} starts with reserved prefix '@'")
+
+        effective_rule = ""
+        if isinstance(raw_rule, str) and raw_rule.strip():
+            effective_rule = raw_rule.strip()
+        elif kind == "source":
+            effective_rule = f"{adw_name}-{tid}"
+        if effective_rule and not effective_rule.startswith("@"):
+            if effective_rule in seen_rules:
+                problems.append(
+                    f"{loc}.rule: duplicate rule id {effective_rule!r} already named by trigger {seen_rules[effective_rule]!r}"
+                )
+            elif effective_rule in other_rules:
+                other_adw, other_tid = other_rules[effective_rule]
+                problems.append(
+                    f"{loc}.rule: duplicate rule id {effective_rule!r} already named by trigger {other_tid!r} in ADW {other_adw!r}"
+                )
+            else:
+                seen_rules[effective_rule] = tid
+
+        if kind == "source":
+            sid = trig.get("source")
+            if not isinstance(sid, str) or not sid.strip():
+                problems.append(f"{loc}.source: source trigger {tid!r} requires a source id")
+            elif sid not in known_source_ids:
+                problems.append(f"{loc}.source: unknown source {sid!r}")
+        elif kind == "schedule":
+            has_every = "every" in trig
+            has_cron = "cron" in trig
+            if has_every == has_cron:
+                problems.append(f"{loc}: schedule trigger {tid!r} must set exactly one of 'every' or 'cron'")
+            elif has_every:
+                try:
+                    cron.seconds(trig["every"])
+                except cron.BadSchedule as error:
+                    problems.append(f"{loc}.every: {error}")
+            else:
+                try:
+                    cron.parse(trig["cron"])
+                except cron.BadSchedule as error:
+                    problems.append(f"{loc}.cron: {error}")
+            warnings.append({
+                "code": "inactive",
+                "path": f"{where}#trigger.{tid}",
+                "message": f"trigger {tid!r} (kind 'schedule') is inactive: takes effect only through a loop that names it",
+            })
+        elif kind == "event":
+            ev = trig.get("event")
+            if isinstance(ev, str):
+                if not ev.strip():
+                    problems.append(f"{loc}.event must not be empty")
+            elif isinstance(ev, list):
+                if not ev or any(not isinstance(v, str) or not v.strip() for v in ev):
+                    problems.append(f"{loc}.event must be a non-empty string or list of strings")
+            else:
+                problems.append(f"{loc}.event: event trigger {tid!r} requires an event")
+            warnings.append({
+                "code": "inactive",
+                "path": f"{where}#trigger.{tid}",
+                "message": f"trigger {tid!r} (kind 'event') is inactive: takes effect only through a loop that names it",
+            })
+
+        lib_entry = _library_trigger_entry(trig, lib_triggers, source_types)
+        if lib_entry is not None:
+            param_specs = {p["name"]: p["type"] for p in (lib_entry.get("params") or ())}
+            for pname, pval in _trigger_params(trig, lib_entry).items():
+                if pname in param_specs and not _param_type_ok(param_specs[pname], pval):
+                    problems.append(f"{loc}.params.{pname}: expected {param_specs[pname]}, got {type(pval).__name__}")
+    return problems, warnings
+
+
+def implicit_trigger_rules(*, config_dir: Path | None = None) -> tuple[RouteRule, ...]:
+    rules: list[RouteRule] = []
+    for adw_name, parsed in _iter_active_adw_tomls(config_dir=config_dir):
+        for trig in parsed.get("trigger") or ():
+            if not isinstance(trig, dict) or trig.get("kind") != "source":
+                continue
+            sid = trig.get("source")
+            tid = trig.get("id")
+            if not isinstance(sid, str) or not sid.strip() or not isinstance(tid, str) or not tid.strip():
+                continue
+            rid = trigger_rule_id(adw_name, trig)
+            if rid.startswith("@"):
+                continue
+            rules.append(RouteRule(id=rid, adw=adw_name, when={"source": sid.strip()}))
+    return tuple(rules)
+
+
+def _with_implicit_trigger_rules(routes: Routes, *, config_dir: Path | None = None) -> Routes:
+    implicit = implicit_trigger_rules(config_dir=config_dir)
+    if not implicit:
+        return routes
+    existing_ids = {r.id for r in routes.rules}
+    to_add = [r for r in implicit if r.id not in existing_ids]
+    if not to_add:
+        return routes
+    insert_at = next((i for i, r in enumerate(routes.rules) if not r.when), len(routes.rules))
+    merged = (*routes.rules[:insert_at], *to_add, *routes.rules[insert_at:])
+    return Routes(
+        rules=merged,
+        path=routes.path,
+        level=routes.level,
+        raw=routes.raw,
+        sha256=routes.sha256,
+        version=routes.version,
+    )
+
+
+def _validate_and_steps(data: object, *, where: str = "adw", config_dir: Path | None = None) -> tuple[list[dict] | None, list[str]]:
     errors: list[str] = []
     try:
         configschema.validate("adw", data, where=where)
@@ -283,8 +632,9 @@ def _validate_and_steps(data: object, *, where: str = "adw") -> tuple[list[dict]
     from . import adw_library, adwgraph
 
     if adwgraph.is_graph(data):
+        _, source_types = known_sources(config_dir=config_dir) if config_dir is not None else (None, None)
         try:
-            compiled = adwgraph.compile(data, adw_library.load())
+            compiled = adwgraph.compile(data, adw_library.load(), source_types=source_types)
         except adwgraph.GraphError as e:
             errors.append(f"{where}: {e}")
             return None, errors
@@ -371,7 +721,7 @@ def validate_routes(data: object, *, cfg: config.Config | None = None, config_di
                 elif key == "repaired_by":
                     if type(val) is not bool:
                         errors.append(f"{loc}.when.repaired_by must be a boolean")
-                elif key in ("repo", "kind"):
+                elif key in ("repo", "kind", "source"):
                     vals = [val] if isinstance(val, str) else list(val)
                     if not vals or any(not isinstance(v, str) or not v.strip() for v in vals):
                         errors.append(f"{loc}.when.{key} must be a non-empty string or list of strings")
@@ -393,7 +743,7 @@ def load(cfg: config.Config | None, name: str, *, config_dir: Path | None = None
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise AdwError(f"{path}: invalid TOML: {e}") from e
-    compiled, errors = _validate_and_steps(data, where=str(path))
+    compiled, errors = _validate_and_steps(data, where=str(path), config_dir=config_dir)
     if errors:
         raise AdwError("; ".join(errors))
     assert compiled is not None
@@ -408,6 +758,7 @@ def load(cfg: config.Config | None, name: str, *, config_dir: Path | None = None
         raw=raw,
         sha256=sha,
         version=f"adw/{name}@{sha[:12]}",
+        triggers=tuple(serialize_triggers(name, data)),
     )
 
 
@@ -435,14 +786,16 @@ def parse_routes_data(data: dict, *, path: Path, level: str, raw: bytes,
     )
 
 
-def load_routes(cfg: config.Config | None = None, *, config_dir: Path | None = None) -> Routes:
+def load_routes(cfg: config.Config | None = None, *, config_dir: Path | None = None,
+                include_triggers: bool = True) -> Routes:
     path, level = resolve_routes_path(config_dir=config_dir)
     raw = path.read_bytes()
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise AdwError(f"{path}: invalid TOML: {e}") from e
-    return parse_routes_data(data, path=path, level=level, raw=raw, config_dir=config_dir)
+    routes = parse_routes_data(data, path=path, level=level, raw=raw, config_dir=config_dir)
+    return _with_implicit_trigger_rules(routes, config_dir=config_dir) if include_triggers else routes
 
 
 def _adw_has_step(steps: list[dict] | tuple[dict, ...], step_name: str) -> bool:
@@ -995,7 +1348,15 @@ def _matches_value(expected: object, actual: str) -> bool:
     return False
 
 
-def _matches_rule(rule: RouteRule, *, events: set[str], has_repair: bool, repo_name: str, ticket_kind: str) -> bool:
+def _matches_rule(
+    rule: RouteRule,
+    *,
+    events: set[str],
+    has_repair: bool,
+    repo_name: str,
+    ticket_kind: str,
+    task_source: str = "",
+) -> bool:
     when = rule.when
     if not when:
         return True
@@ -1007,7 +1368,76 @@ def _matches_rule(rule: RouteRule, *, events: set[str], has_repair: bool, repo_n
         return False
     if "repo" in when and not _matches_value(when["repo"], repo_name):
         return False
+    if "source" in when and not _matches_value(when["source"], task_source):
+        return False
     return not ("kind" in when and not _matches_value(when["kind"], ticket_kind))
+
+
+def _origin_source(origin: object) -> str:
+    if not isinstance(origin, str):
+        return ""
+    raw = origin.strip()
+    if not raw or raw in ("hand", "owner", "person") or raw.startswith(("u:", "ref:")):
+        return ""
+    if raw.startswith("source:"):
+        return raw.removeprefix("source:").strip()
+    if raw.startswith("intake:"):
+        return raw.removeprefix("intake:").strip()
+    return raw
+
+
+def _resolve_task_source(cfg: config.Config | None, repo: config.Repo, tid: str, *, source: str = "") -> str:
+    if source:
+        return source
+    if not paths.DB_FILE.exists():
+        return ""
+    with suppress(foundation.NoDatabase, foundation.IncompatibleSchema, OSError), foundation.reader() as conn:
+        task_num = task_store.TaskStore.find_task_num(conn, repo, tid, cfg=cfg)
+        if task_num is None:
+            return ""
+        tables = {
+            str(r[0])
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "intake_candidates" in tables and "intake_items" in tables:
+            irow = conn.execute(
+                "SELECT i.source FROM intake_candidates ic JOIN intake_items i ON i.id = ic.item "
+                "WHERE ic.task_id = ? ORDER BY ic.rowid DESC LIMIT 1",
+                (task_num,),
+            ).fetchone()
+            if irow and irow["source"]:
+                return str(irow["source"])
+        if "task_refs" in tables and "refs" in tables:
+            ref_rows = conn.execute(
+                "SELECT r.system, r.connector, r.facts, tr.role "
+                "FROM task_refs tr JOIN refs r ON r.id = tr.ref_id "
+                "WHERE tr.task_id = ? "
+                "ORDER BY (tr.role = 'origin') DESC, (tr.role = 'primary') DESC, tr.id ASC",
+                (task_num,),
+            ).fetchall()
+            for ref in ref_rows:
+                raw_facts = ref["facts"]
+                if isinstance(raw_facts, str) and raw_facts.strip():
+                    with suppress(ValueError):
+                        facts = json.loads(raw_facts)
+                        if isinstance(facts, dict) and isinstance(facts.get("source"), str) and facts["source"].strip():
+                            return facts["source"].strip()
+                connector = str(ref["connector"] or "").strip()
+                if ref["system"] == "intake":
+                    return connector or "intake"
+                if connector:
+                    return connector
+        task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        if "origin" in task_cols:
+            if task_store.is_contracted(conn):
+                trow = conn.execute("SELECT origin FROM tasks WHERE id = ?", (task_num,)).fetchone()
+            elif "num" in task_cols:
+                trow = conn.execute("SELECT origin FROM tasks WHERE num = ?", (task_num,)).fetchone()
+            else:
+                trow = conn.execute("SELECT origin FROM tasks WHERE rowid = ?", (task_num,)).fetchone()
+            if trow:
+                return _origin_source(trow["origin"])
+    return ""
 
 
 def _resolve_ticket_kind(cfg: config.Config, repo: config.Repo, tid: str, *, kind: str = "",
@@ -1066,7 +1496,7 @@ def _build_decision(cfg: config.Config | None, name: str, rule_id: str, *, conti
 
 
 def _match_routes(cfg: config.Config, repo: config.Repo, tid: str, routes: Routes, *,
-                  continues: str = "", kind: str = "", config_dir: Path | None = None,
+                  continues: str = "", kind: str = "", source: str = "", config_dir: Path | None = None,
                   newest: dict | None = None, feedback: list[dict] | None = None,
                   has_repair: bool | None = None) -> RouteDecision:
     if newest is None:
@@ -1082,8 +1512,17 @@ def _match_routes(cfg: config.Config, repo: config.Repo, tid: str, routes: Route
         has_repair = bool(newest and pipeline.repaired_by(newest["id"]))
     needs_kind = any("kind" in r.when for r in routes.rules)
     ticket_kind = _resolve_ticket_kind(cfg, repo, str(tid), kind=kind, routes_need_kind=needs_kind)
+    needs_source = any("source" in r.when for r in routes.rules)
+    task_source = _resolve_task_source(cfg, repo, str(tid), source=source) if needs_source else source
     for rule in routes.rules:
-        if _matches_rule(rule, events=events_set, has_repair=has_repair, repo_name=repo.name, ticket_kind=ticket_kind):
+        if _matches_rule(
+            rule,
+            events=events_set,
+            has_repair=has_repair,
+            repo_name=repo.name,
+            ticket_kind=ticket_kind,
+            task_source=task_source,
+        ):
             parsed_set = parse_rule_set(rule.set) if rule.set else {}
             return _build_decision(
                 cfg, rule.adw, rule.id,
@@ -1098,22 +1537,18 @@ def _match_routes(cfg: config.Config, repo: config.Repo, tid: str, routes: Route
 
 def route(cfg: config.Config, repo: config.Repo, tid: str | int, *, requested: str = "",
           continues: str = "", repairs: str = "", dry_run: bool = False, force: bool = False,
-          kind: str = "", config_dir: Path | None = None, spec: bool = False,
+          kind: str = "", source: str = "", config_dir: Path | None = None, spec: bool = False,
           layer: config.RepoLayer | None = None, read_only: bool = False) -> RouteDecision:
     tid_s = str(tid)
-    # 1. Explicit --adw NAME -> @asked
     if requested:
         return _build_decision(cfg, requested, "@asked", continues=continues, config_dir=config_dir)
-    # 2. Explicit --repair RUN -> @repair
     if repairs:
         repaired_adw = _earlier_adw(repairs) if repairs != "repair" else ""
         target = "orchestrate" if repaired_adw == "orchestrate" else "repair"
         return _build_decision(cfg, target, "@repair", config_dir=config_dir)
-    # 3. Explicit --continue RUN -> @continue (or fall back to rules when earlier has NULL adw)
     if continues:
         if earlier := _earlier_adw(continues):
             return _build_decision(cfg, earlier, "@continue", continues=continues, config_dir=config_dir)
-    # 4. Answered run check -> @continue (when not dry_run and not already continuing)
     if not dry_run and not continues:
         if asked := pipeline.answered_run(repo.name, tid_s):
             if asked_adw := _earlier_adw(asked["id"]):
@@ -1121,7 +1556,6 @@ def route(cfg: config.Config, repo: config.Repo, tid: str | int, *, requested: s
                     cfg, asked_adw, "@continue",
                     continues=asked["id"], config_dir=config_dir, answered=True,
                 )
-    # 5. Preserve durable issue orchestrator for specs & enrolled orchestrated lineages (#946/#949)
     if not tracker.is_task_id(tid_s) and (spec or spec_store.find(repo.name, tid_s)):
         return _build_decision(cfg, "orchestrate", "default", continues=continues, config_dir=config_dir)
     newest = run_store.newest_whole_run(repo.name, tid_s)
@@ -1139,22 +1573,22 @@ def route(cfg: config.Config, repo: config.Repo, tid: str | int, *, requested: s
             return _build_decision(
                 cfg, "orchestrate", "@continue" if prev else "default", continues=prev, config_dir=config_dir,
             )
-        if feedback and (source := next(iter(task_store.open_pr_runs(repo.name, tid_s)), None)):
-            if _earlier_adw(source["id"]) == "orchestrate":
+        if feedback and (pr_source := next(iter(task_store.open_pr_runs(repo.name, tid_s)), None)):
+            if _earlier_adw(pr_source["id"]) == "orchestrate":
                 prev = ("" if (force or policy_restart)
-                        else (orch_store.find(source["id"]) or {}).get("current_run", source["id"]))
+                        else (orch_store.find(pr_source["id"]) or {}).get("current_run", pr_source["id"]))
                 return _build_decision(
                     cfg, "orchestrate", "feedback-revise", continues=prev, config_dir=config_dir,
                 )
         elif layer is not None and layer.factory_path == pipeline.ORCHESTRATED:
             if not (newest and newest["status"] == "interrupted" and _earlier_adw(newest["id"]) not in ("", "orchestrate")):
                 return _build_decision(cfg, "orchestrate", "default", config_dir=config_dir)
-    # 6. Evaluate routes/adw.toml
     routes = load_routes(cfg, config_dir=config_dir)
     return _match_routes(
         cfg, repo, tid_s, routes,
         continues=continues,
         kind=kind,
+        source=source,
         config_dir=config_dir,
         newest=newest,
         feedback=feedback,
@@ -1170,9 +1604,17 @@ def _offline_ticket_kind(repo_name: str, tid: str, run_id: str) -> str:
     return str(task_line.get("kind") or "")
 
 
+def _offline_task_source(cfg: config.Config, repo: config.Repo, tid: str, run_id: str) -> str:
+    if resolved := _resolve_task_source(cfg, repo, tid):
+        return resolved
+    task_line = factory.first(run_lines.read(run_id), "task")
+    return str(task_line.get("source") or _origin_source(task_line.get("origin")))
+
+
 def dry_run_routes(cfg: config.Config, draft_routes: Routes, *, config_dir: Path | None = None,
                    limit_per_repo: int = 50) -> list[dict]:
     live_routes = load_routes(cfg, config_dir=config_dir)
+    effective_draft = _with_implicit_trigger_rules(draft_routes, config_dir=config_dir)
     repo_names = list(dict.fromkeys([r.name for r in cfg.repos]))
     changes: list[dict] = []
     for repo_name in repo_names:
@@ -1188,12 +1630,13 @@ def dry_run_routes(cfg: config.Config, draft_routes: Routes, *, config_dir: Path
             feedback = pipeline.pending_feedback(repo_name, tid)
             has_repair = bool(newest and pipeline.repaired_by(newest["id"]))
             kind = _offline_ticket_kind(repo_name, tid, row["id"])
+            task_source = _offline_task_source(cfg, repo, tid, row["id"])
             live_decision = _match_routes(
-                cfg, repo, tid, live_routes, kind=kind, config_dir=config_dir,
+                cfg, repo, tid, live_routes, kind=kind, source=task_source, config_dir=config_dir,
                 newest=newest, feedback=feedback, has_repair=has_repair,
             )
             draft_decision = _match_routes(
-                cfg, repo, tid, draft_routes, kind=kind, config_dir=config_dir,
+                cfg, repo, tid, effective_draft, kind=kind, source=task_source, config_dir=config_dir,
                 newest=newest, feedback=feedback, has_repair=has_repair,
             )
             if (live_decision.adw, live_decision.rule) != (draft_decision.adw, draft_decision.rule):
@@ -1226,7 +1669,7 @@ def check_draft(kind: str, data: object, *, cfg: config.Config | None = None,
     requires_accept = not can_auto_activate(kind, actor) if actor else gate == "review"
     if kind == "adw":
         loc = where or "adw"
-        compiled, errors = _validate_and_steps(data, where=loc)
+        compiled, errors = _validate_and_steps(data, where=loc, config_dir=config_dir)
         if errors:
             return {
                 "status": "invalid",

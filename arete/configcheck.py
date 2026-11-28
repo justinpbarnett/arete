@@ -102,13 +102,23 @@ def _raise_gate(current: str, target: str) -> str:
     return target if GATE_ORDER[target] > GATE_ORDER[current] else current
 
 
-def _stage(name: str, ok: bool, problems: list[str] | None = None, notes: list[str] | None = None) -> dict:
-    return {
+def _stage(
+    name: str,
+    ok: bool,
+    problems: list[str] | None = None,
+    notes: list[str] | None = None,
+    *,
+    findings: list[dict[str, object]] | None = None,
+) -> dict:
+    stage: dict[str, object] = {
         "name": name,
         "ok": ok,
         "problems": list(problems or ()),
         "notes": list(notes or ()),
     }
+    if findings is not None:
+        stage["findings"] = list(findings)
+    return stage
 
 
 def _schema_name_for(kind: str, path: str, name: str) -> str:
@@ -364,7 +374,25 @@ def _validate_references(
         except ValueError as error:
             problems.append(str(error))
     elif kind == "adw" and isinstance(parsed, dict):
-        problems.extend(adw.validate_adw(parsed, where=where))
+        from . import adw_library, adwgraph
+
+        if adwgraph.is_graph(parsed):
+            library = adw_library.load()
+            if not adw._valid_name(str(parsed.get("name") or "")):
+                problems.append(f"{where}.name: invalid ADW name {parsed.get('name')!r}")
+            problems.extend(adwgraph.validate_node_references(parsed, library, where=where))
+            t_probs, t_warns = adw.validate_triggers(
+                parsed, adw_name=name, config_dir=config_dir, where=where, library=library
+            )
+            problems.extend(t_probs)
+            warnings.extend(t_warns)
+        else:
+            problems.extend(adw.validate_adw(parsed, where=where))
+            t_probs, t_warns = adw.validate_triggers(
+                parsed, adw_name=name, config_dir=config_dir, where=where
+            )
+            problems.extend(t_probs)
+            warnings.extend(t_warns)
         if parsed.get("name") != name:
             problems.append(f"{where}: name {parsed.get('name')!r} does not match {name!r}")
     elif kind == "routes" and isinstance(parsed, dict):
@@ -783,6 +811,10 @@ def find_delete_references(kind: str, name: str, config_dir: Path | None = None)
             triage_tbl = parsed.get("triage")
             if isinstance(triage_tbl, dict) and triage_tbl.get("source") == name:
                 refs.add(f"config:{rel}")
+        for adw_name, parsed in adw._iter_active_adw_tomls(config_dir=root):
+            for trig in parsed.get("trigger", ()) if isinstance(parsed.get("trigger"), list) else ():
+                if isinstance(trig, dict) and trig.get("kind") == "source" and trig.get("source") == name:
+                    refs.add(f"adw:{adw_name}")
     elif kind == "target" and not (paths.DEFAULTS_DIR / "targets" / f"{name}.toml").is_file():
         for rule_name, parsed in _iter_rule_tomls(root):
             if parsed.get("target") == name:
@@ -1037,13 +1069,33 @@ def _stage_dry_run(
             else:
                 dr = res.get("stages", {}).get("dry_run", {})
                 if kind == "adw":
-                    notes.append(f"outline: {len(dr.get('outline') or ())} node(s)")
-                else:
-                    notes.append(f"route changes: {len(dr.get('changes') or ())} ticket(s)")
+                    outline_nodes = dr.get("outline") or []
+                    notes.append(f"outline: {len(outline_nodes)} node(s)")
+                    return problems, notes, {"outline": outline_nodes}
+                notes.append(f"route changes: {len(dr.get('changes') or ())} ticket(s)")
         return problems, notes, None
 
     notes.append("skipped")
     return problems, notes, None
+
+
+def _stage_graph(parsed: object, config_dir: Path, where: str) -> dict:
+    from . import adw_library, adwgraph
+
+    if not isinstance(parsed, dict) or not adwgraph.is_graph(parsed):
+        return _stage("graph", True, [], ["skipped"], findings=[])
+    library = adw_library.load()
+    _, source_types = adw.known_sources(config_dir=config_dir)
+    findings = adwgraph.check(parsed, library, source_types=source_types)
+    problems = [str(f["message"]) for f in findings]
+    if not findings:
+        try:
+            compiled = adwgraph.compile(parsed, library, source_types=source_types)
+        except adwgraph.GraphError as error:
+            problems.append(f"{where}: {error}")
+        else:
+            adw._validate_step_list(compiled, f"{where}.steps", 0, problems, allow_empty=False)
+    return _stage("graph", not problems, problems, [], findings=findings)
 
 
 def check(
@@ -1138,6 +1190,12 @@ def check(
     stages.append(_stage("references", not ref_problems, ref_problems, ref_notes))
     if ref_problems or stop_after <= 3:
         return {"validator": VALIDATOR, "ok": not ref_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
+
+    if kind == "adw":
+        graph_stage = _stage_graph(parsed, root, path or f"{kind}/{name}")
+        stages.append(graph_stage)
+        if not graph_stage["ok"]:
+            return {"validator": VALIDATOR, "ok": False, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 4: floor (gate calculation)
     if old_bytes is None and path:

@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 35
+MINOR = 36
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -469,12 +469,27 @@ PUSH_SUBSCRIBE = obj({
     "label": STRING,
 }, ["endpoint", "keys"])
 
+GRAPH_FINDING = obj({
+    "code": {**STRING, "enum": [
+        "type_mismatch", "flow_to_data", "cycle", "retry_no_tries",
+        "missing_input", "dead_wire", "unreachable", "no_finish",
+    ]},
+    "node": STRING,
+    "pin": NULL_TEXT,
+    "message": STRING,
+    "from_node": STRING,
+    "from_pin": STRING,
+    "to_node": STRING,
+    "to_pin": STRING,
+    "wire": STRING,
+}, ["code", "node", "pin", "message"])
+
 for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
                 "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
-                "invalid_state": {"current": JSON},
+                "invalid_state": {"current": JSON, "findings": array(GRAPH_FINDING)},
                 "already_open": {"item": STRING}, "referenced": {"references": array(STRING)},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
@@ -497,6 +512,7 @@ for _error in ERRORS:
         _error["schema"]["required"].remove("path")
     elif _code == "invalid_state":
         _error["schema"]["required"].remove("current")
+        _error["schema"]["required"].remove("findings")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
                          "detail": _description, "error": _description}
 
@@ -656,6 +672,21 @@ CONFIG_PROMPT_APPEND = obj({
     "path": STRING,
     "version": STRING,
 }, ["layer", "name", "path", "version"])
+CONFIG_ADW_TRIGGER = obj({
+    "id": STRING,
+    "kind": {**STRING, "enum": ["manual", "source", "schedule", "event"]},
+    "source": NULL_TEXT,
+    "every": NULL_TEXT,
+    "cron": NULL_TEXT,
+    "event": {"type": ["string", "array", "null"], "items": STRING},
+    "rule": NULL_TEXT,
+    "ref": NULL_TEXT,
+    "name": NULL_TEXT,
+    "label": NULL_TEXT,
+    "x": NULL_INT,
+    "y": NULL_INT,
+    "params": mapping(JSON),
+}, ["id", "kind", "params"])
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
 CONFIG_ITEM_RICH = {
     **CONFIG_ITEM,
@@ -667,6 +698,7 @@ CONFIG_ITEM_RICH = {
     "base": NULL_TEXT,
     "drift": BOOLEAN,
     "appends": array(CONFIG_PROMPT_APPEND),
+    "triggers": array(CONFIG_ADW_TRIGGER),
     "runs7d": INTEGER,
     "passRate": NULL_INT,
     "costPerRunNusd": NULL_INT,
@@ -704,7 +736,8 @@ CHECK_STAGE = obj({
     "ok": BOOLEAN,
     "problems": array(STRING),
     "notes": array(STRING),
-})
+    "findings": array(GRAPH_FINDING),
+}, ["name", "ok", "problems", "notes"])
 CHECK_REPORT = obj({
     "validator": STRING,
     "ok": BOOLEAN,
