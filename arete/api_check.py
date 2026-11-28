@@ -668,7 +668,8 @@ class Check:
                     headers, raw = self.request(method, path, fixture_blob,
                                                 headers={**(key or {}), "Content-Type": "application/octet-stream"},
                                                 status=op["success_status"])
-                elif name in ("task.run", "session.start", "chat.session_start", "loop.start", "loop.try", "loop.draft"):
+                elif name in ("task.run", "session.start", "chat.session_start", "loop.start", "loop.try",
+                              "loop.draft", "config.ask"):
                     dummy_proc = type("_P", (), {
                         "pid": 0, "poll": lambda self: None, "terminate": lambda self: None,
                         "kill": lambda self: None, "wait": lambda self, timeout=None: 0,
