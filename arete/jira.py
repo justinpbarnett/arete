@@ -298,20 +298,91 @@ class Client:
         return self.browse_url(issues[0]["key"]) if issues else ""
 
     def create_task(self, project: str, account: str, title: str, body: str, labels: list[str], *,
-                    parent: str = "", subtask_type: str = "") -> str:
-        fields = {"project": {"key": project}, "issuetype": {"name": "Task"}, "assignee": {"accountId": account},
+                    parent: str = "", subtask_type: str = "", issue_type: str = "") -> str:
+        fields = {"project": {"key": project}, "issuetype": {"name": issue_type or "Task"}, "assignee": {"accountId": account},
                   "summary": outbound.screen(title), "description": adf.from_markdown(outbound.screen(body)),
                   "labels": labels}
         if parent:
             fields.update(parent={"key": parent}, issuetype={"id": subtask_type})
         try:
             result = self.request("POST", "/rest/api/3/issue", body={"fields": fields})
+        except JiraError as error:
+            if (not parent and issue_type and issue_type.casefold() != "task"
+                    and error.status == 400 and "issuetype" in str(error).casefold()):
+                fields["issuetype"] = {"name": "Task"}
+                result = self.request("POST", "/rest/api/3/issue", body={"fields": fields})
+            else:
+                raise
         except (ValueError, UnicodeError) as error:
             raise JiraUnsure("Jira returned an unreadable reply after creating the task") from error
         key = result.get("key") if isinstance(result, dict) else None
         if not isinstance(key, str) or not KEY_RE.fullmatch(key) or key.rsplit("-", 1)[0] != project.upper():
             raise JiraUnsure("Jira did not confirm the created task key")
         return self.browse_url(key)
+
+    def issue_links(self, key: str) -> list[dict]:
+        fields = (self.issue(key, ["issuelinks"]) or {}).get("fields") or {}
+        links = fields.get("issuelinks")
+        return links if isinstance(links, list) else []
+
+    def _is_blocks_link(self, kind: dict) -> bool:
+        return (str(kind.get("outward") or "").strip().casefold() == "blocks"
+                and str(kind.get("inward") or "").strip().casefold() == "is blocked by")
+
+    def _pick_link_type(self, *, blocks: bool = False, preferred: str = "Relates") -> dict:
+        found = (self.get("/rest/api/3/issueLinkType") or {}).get("issueLinkTypes") or []
+        if blocks:
+            for row in found:
+                if self._is_blocks_link(row):
+                    return {"id": row["id"]} if row.get("id") else {"name": row["name"]}
+            raise JiraError("Jira has no Blocks issue link type configured")
+        want = preferred.strip().casefold()
+        for row in found:
+            if not self._is_blocks_link(row) and (
+                str(row.get("name") or "").strip().casefold() == want
+                or want in str(row.get("inward") or "").casefold()
+                or want in str(row.get("outward") or "").casefold()
+            ):
+                return {"id": row["id"]} if row.get("id") else {"name": row["name"]}
+        for row in found:
+            if not self._is_blocks_link(row) and (row.get("id") or row.get("name")):
+                return {"id": row["id"]} if row.get("id") else {"name": row["name"]}
+        return {"name": preferred}
+
+    def link_issues(self, source_key: str, target_key: str, *, preferred_type: str = "Relates") -> bool:
+        """Create a non-blocking historical provenance link between source_key and target_key once."""
+        target = target_key.upper()
+        for link in self.issue_links(source_key):
+            if self._is_blocks_link(link.get("type") or {}):
+                continue
+            inward = str((link.get("inwardIssue") or {}).get("key") or "").upper()
+            outward = str((link.get("outwardIssue") or {}).get("key") or "").upper()
+            if target in (inward, outward):
+                return False
+        link_type = self._pick_link_type(blocks=False, preferred=preferred_type)
+        self.request(
+            "POST",
+            "/rest/api/3/issueLink",
+            body={"type": link_type, "inwardIssue": {"key": source_key.upper()}, "outwardIssue": {"key": target}},
+            single_attempt=True,
+        )
+        return True
+
+    def link_blocks(self, prerequisite_key: str, dependent_key: str) -> bool:
+        """Create a native Jira Blocks dependency link once."""
+        prereq, dep = prerequisite_key.upper(), dependent_key.upper()
+        for link in self.issue_links(dep):
+            if (self._is_blocks_link(link.get("type") or {})
+                    and str((link.get("inwardIssue") or {}).get("key") or "").upper() == prereq):
+                return False
+        link_type = self._pick_link_type(blocks=True)
+        self.request(
+            "POST",
+            "/rest/api/3/issueLink",
+            body={"type": link_type, "inwardIssue": {"key": prereq}, "outwardIssue": {"key": dep}},
+            single_attempt=True,
+        )
+        return True
 
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]
