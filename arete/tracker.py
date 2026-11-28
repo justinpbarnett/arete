@@ -747,37 +747,153 @@ class JiraTracker:
     def prepare(self) -> list[str]:
         return []
 
-    def label(self, tid: str, add=(), remove=(), *, run_id: str = "") -> str:
-        return error_of(lambda: self.client.edit_labels(tid, [self.label_name(s) for s in add],
-                                                        [self.label_name(s) for s in remove]))
+    def label(self, tid: str, add=(), remove=(), *, run_id: str = "", family: str = "state",
+              slot_name: str = "", approved_by: str | None = None, c=None) -> str:
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
 
-    def comment(self, tid: str, body: str, *, run_id: str = "") -> str:
-        return error_of(lambda: self.client.comment(tid, body))
+        obj = f"jira:{tid}"
+        payload = json.dumps({
+            "add": [self.label_name(s) for s in add],
+            "remove": [self.label_name(s) for s in remove],
+            "family": family,
+        })
 
-    def move(self, tid: str, state: str, *, keep_open: bool = False) -> str:
+        def _draft(conn) -> None:
+            if run_id:
+                name = slot_name or f"state:{outbox_store.run_kind_count(conn, run_id, 'label') + 1}"
+                slot = outbox.agent_slot(run_id, "", "label", obj, name)
+                drafted_by = f"run:{run_id}"
+            else:
+                slot = slot_name or f"label:jira:{tid}:{secrets.token_hex(6)}"
+                drafted_by = approved_by or "arete"
+            outbox.draft(
+                conn,
+                target="jira",
+                kind="label",
+                object=obj,
+                body=payload,
+                drafted_by=drafted_by,
+                approved_by=approved_by,
+                slot=slot,
+                run_id=run_id or None,
+                task_id=f"{self.repo.name} {tid}",
+                summary=f"label {tid}",
+            )
+
+        if c is not None:
+            _draft(c)
+        else:
+            with foundation.tx() as conn:
+                _draft(conn)
+        return ""
+
+    def comment(self, tid: str, body: str, *, run_id: str = "", slot_name: str = "",
+                slot: str = "", approved_by: str | None = None, c=None) -> str:
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
+
+        obj = f"jira:{tid}"
+
+        def _draft(conn) -> None:
+            if slot:
+                resolved_slot = slot
+                drafted_by = f"run:{run_id}" if run_id else (approved_by or "arete")
+            elif run_id:
+                name = slot_name or f"say:{outbox_store.run_kind_count(conn, run_id, 'comment') + 1}"
+                resolved_slot = outbox.agent_slot(run_id, "", "comment", obj, name)
+                drafted_by = f"run:{run_id}"
+            else:
+                resolved_slot = slot_name or f"comment:jira:{tid}:{secrets.token_hex(6)}"
+                drafted_by = approved_by or "arete"
+            outbox.draft(
+                conn,
+                target="jira",
+                kind="comment",
+                object=obj,
+                body=body,
+                drafted_by=drafted_by,
+                approved_by=approved_by,
+                slot=resolved_slot,
+                run_id=run_id or None,
+                task_id=f"{self.repo.name} {tid}",
+                summary=f"comment on {tid}",
+                on_conflict_ignore=bool(slot),
+            )
+
+        if c is not None:
+            _draft(c)
+        else:
+            with foundation.tx() as conn:
+                _draft(conn)
+        return ""
+
+    def move(self, tid: str, state: str, *, keep_open: bool = False, run_id: str = "", slot: str = "") -> str:
         try:
             target = self.cfg.transitions.get(state, "")
-            return self.shift(tid, target, keep_done=True, keep_open=True).error if keep_open else self.move_to(tid, target)
+            if not target:
+                return ""
+            if keep_open:
+                return self.shift(tid, target, keep_done=True, keep_open=True, run_id=run_id, slot=slot).error
+            return self.move_to(tid, target, run_id=run_id, slot=slot)
         except jira.JiraError as e:
             return str(e)
 
-    def move_to(self, tid: str, target: str) -> str:
-        return self.shift(tid, target).error
+    def move_to(self, tid: str, target: str, *, run_id: str = "", slot: str = "") -> str:
+        return self.shift(tid, target, run_id=run_id, slot=slot).error
 
-    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False, *, keep_open: bool = False) -> Moved:
+    def shift(self, tid: str, target: str, stamps: bool = False, keep_done: bool = False, *,
+              keep_open: bool = False, run_id: str = "", slot: str = "", slot_name: str = "", c=None) -> Moved:
         if not target:
             return Moved()
+        from . import outbox
+        from .store import db as foundation
+        from .store import outbox as outbox_store
+
         f = self.client.issue(tid, ["status", "updated"]).get("fields") or {}
         status = (f.get("status") or {}).get("name", "")
         done = ((f.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
+        before = f.get("updated") or ""
         if status.lower() == target.lower() or keep_done and done:
-            return Moved(before=f.get("updated") or "")
-        if not (self.client.move(tid, target, category="open") if keep_open else self.client.move(tid, target)):
-            return Moved(f"{tid} has no {'non-closing ' if keep_open else ''}transition to '{target}' from '{status}'")
-        after = ""
-        if stamps:
-            after = (self.client.issue(tid, ["updated"]).get("fields") or {}).get("updated") or ""
-        return Moved(before=f.get("updated") or "", after=after, moved=True)
+            return Moved(before=before)
+
+        obj = f"jira:{tid}"
+        payload = json.dumps({"target": target, "keep_open": keep_open, "keep_done": keep_done})
+
+        def _draft(conn) -> None:
+            if slot:
+                resolved_slot = slot
+                drafted_by = f"run:{run_id}" if run_id else "arete"
+            elif run_id:
+                name = slot_name or f"move:{outbox_store.run_kind_count(conn, run_id, 'transition') + 1}"
+                resolved_slot = outbox.agent_slot(run_id, "", "transition", obj, name)
+                drafted_by = f"run:{run_id}"
+            else:
+                resolved_slot = slot_name or f"transition:jira:{tid}:{target}:{secrets.token_hex(6)}"
+                drafted_by = "arete"
+            outbox.draft(
+                conn,
+                target="jira",
+                kind="transition",
+                object=obj,
+                body=payload,
+                drafted_by=drafted_by,
+                slot=resolved_slot,
+                run_id=run_id or None,
+                task_id=f"{self.repo.name} {tid}",
+                summary=f"move {tid} to {target}",
+                on_conflict_ignore=bool(slot),
+            )
+
+        if c is not None:
+            _draft(c)
+        else:
+            with foundation.tx() as conn:
+                _draft(conn)
+        after = before if stamps else ""
+        return Moved(before=before, after=after, moved=True)
 
     def pr_title(self, subject: str, t: Ticket) -> str:
         return with_ref(subject, t.ref)

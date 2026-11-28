@@ -292,11 +292,40 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         read_back(DirSource(wt), EVALS, name, draft)
         git(["add", "--", rel], wt)
         util.git_as_owner(["commit", "-q", "-m", f"chore(evals): add {name}\n\n{summary}\n\nArete-Run: {run.id}"], wt)
-        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
+        from . import outbox
+
+        head = git(["rev-parse", "HEAD"], wt).strip()
+        lease = workspace.remote_head(c.repo.path, branch)
+        outbox.publish_push(
+            repo_name=c.repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            use_lease=True,
+            mode="branch",
+            run_id=run.id,
+            drafted_by=f"run:{run.id}",
+            timeout=300,
+        )
         body = "\n\n".join([summary, f"## Task\n\n**{draft.title}**\n\n{draft.prompt}", f"## Steps\n\n{draft.verify}",
                             f"## On the merge commit\n\n{on_merge.markdown()}", f"## On the base\n\n{on_base.markdown()}",
                             f"Run `{run.id}`."])
-        url = gh.pr_create(c.repo.github, branch, base, f"chore(evals): add {name}", body, cwd=wt)
+        created = outbox.publish_pr(
+            action="create",
+            repo=c.repo.github,
+            name=c.repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            title=f"chore(evals): add {name}",
+            body=body,
+            run_id=run.id,
+            drafted_by=f"run:{run.id}",
+            retry_unknown=True,
+        )
+        url = str(created.get("sent_url") or "")
         run.log(f"opened {url}")
         return f"{rel} in {url}"
     finally:

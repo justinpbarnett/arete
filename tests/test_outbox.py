@@ -855,26 +855,11 @@ j_502 = run_jira_post_fault(lambda u: urllib.error.HTTPError(u, 502, "Bad Gatewa
 j_timeout = run_jira_post_fault(lambda u: TimeoutError("timed out"))
 j_reset = run_jira_post_fault(lambda u: ConnectionResetError("reset"))
 
-# 429 with Retry-After: 0 and URLError(ConnectionRefusedError) retry POST once.
-def run_jira_post_retry(exc_factory):
-    stored = []
-    calls = [0]
-    class Opener:
-        def open(self, req, timeout=None):
-            calls[0] += 1
-            if calls[0] == 1:
-                raise exc_factory(req.full_url)
-            stored.append(req.data)
-            return _Resp(b'{"id": "501"}')
-    client = jira.Client("http://127.0.0.1", "a@b.test", "tok")
-    with mock.patch.object(jira, "_opener", Opener()), mock.patch("time.sleep"):
-        url = client.comment("APP-1", "hello", return_url=True)
-    return calls[0], len(stored), bool(url)
-
+# Non-GET Jira requests never retry (even on 429 or ConnectionRefusedError); the outbox sender owns retries.
 hdrs_429 = Message()
 hdrs_429["Retry-After"] = "0"
-j_429 = run_jira_post_retry(lambda u: urllib.error.HTTPError(u, 429, "Too Many Requests", hdrs_429, io.BytesIO(b"")))
-j_refused = run_jira_post_retry(lambda u: urllib.error.URLError(ConnectionRefusedError("refused")))
+j_429 = run_jira_post_fault(lambda u: urllib.error.HTTPError(u, 429, "Too Many Requests", hdrs_429, io.BytesIO(b"")))
+j_refused = run_jira_post_fault(lambda u: urllib.error.URLError(ConnectionRefusedError("refused")))
 
 # GET 502 then 200 is still retried.
 get_calls = [0]
@@ -927,8 +912,8 @@ print("BEHAVIOR_RESULT=" + json.dumps({
         self.assertEqual(result["j_502"], ["JiraUnsure", 1])
         self.assertEqual(result["j_timeout"], ["JiraUnsure", 1])
         self.assertEqual(result["j_reset"], ["JiraUnsure", 1])
-        self.assertEqual(result["j_429"], [2, 1, True])
-        self.assertEqual(result["j_refused"], [2, 1, True])
+        self.assertEqual(result["j_429"], ["JiraError", 1])
+        self.assertEqual(result["j_refused"], ["JiraError", 1])
         self.assertEqual(result["get_retry"], [2, {"ok": True}])
         self.assertEqual(result["order"], ["sweep", "send_due"])
         self.assertTrue(result["since_matches"])
@@ -966,40 +951,25 @@ with db.tx() as c:
 db.migrate()
 migrated = [outbox.get(i["id"]) for i in outbox.list_items()]
 
-# Live trigger tests: add_approval, set_approval_note, claim_approval -> settle_approval(done) & (failed).
+# Approvals is now a VIEW over outbox with INSTEAD OF INSERT/UPDATE triggers.
+with db.reader() as c:
+    approvals_is_view = approvals_store.is_view(c)
+
 aid1 = approvals_store.add_approval("loop2", "r1", {"type": "push", "item": {}}, "Live push 1")
 approvals_store.set_approval_note(aid1, "plain_summary", "x")
 with db.reader() as c:
     ob1_id = outbox_store.get_by_legacy_approval(c, aid1)["id"]
 after_note = outbox.get(ob1_id)
 
-tok1 = approvals_store.claim_approval(aid1, util.iso(util.now() + timedelta(minutes=2)))
-after_claim = outbox.get(ob1_id)
-approvals_store.settle_approval(aid1, "done", "approved", "https://github.com/o/r/pull/9", judged=False, token=tok1)
-after_done = outbox.get(ob1_id)
+# Stale sending rows (including migrated legacy rows) are swept by outbox.sweep().
+with db.tx() as c:
+    swept = outbox.sweep(c, since=util.now() + timedelta(hours=1))
 
-aid2 = approvals_store.add_approval("loop2", "r1", {"type": "push", "item": {}}, "Live push 2")
-with db.reader() as c:
-    ob2_id = outbox_store.get_by_legacy_approval(c, aid2)["id"]
-tok2 = approvals_store.claim_approval(aid2, util.iso(util.now() + timedelta(minutes=2)))
-approvals_store.settle_approval(aid2, "failed", "failed", "err2", judged=False, token=tok2)
-after_failed = outbox.get(ob2_id)
-
-# send_due() and sweep(+1h) leave all legacy rows untouched and log no gh call.
-ledger = FakeGitHubLedger(paths.STATE_DIR / "legacy-gh.json")
-with mock.patch.object(util, "sh", side_effect=ledger.handle):
-    outbox.send_due()
-    with db.tx() as c:
-        swept = outbox.sweep(c, since=util.now() + timedelta(hours=1))
-gh_calls = len(ledger.load()["calls"])
-
-# outbox.approve on legacy draft calls delivery.decide(id, True), and outbox.edit returns 409 invalid_state.
+# outbox.approve transitions the legacy-backed row directly without calling delivery.decide, and edit on non-draft returns 409.
 aid3 = approvals_store.add_approval("loop2", "r1", {"type": "push", "item": {}}, "Live push 3")
 with db.reader() as c:
     ob3_id = outbox_store.get_by_legacy_approval(c, aid3)["id"]
-decided_calls = []
-with mock.patch.object(delivery, "decide", side_effect=lambda i, y: decided_calls.append((i, y)) or "ok"):
-    outbox.approve(ob3_id)
+approved_ob3 = outbox.approve(ob3_id)
 edit_err = None
 try:
     outbox.edit(ob3_id, body="nope", base_rev=1)
@@ -1007,31 +977,23 @@ except contract.Problem as e:
     edit_err = (e.status, e.code)
 
 print("BEHAVIOR_RESULT=" + json.dumps({
+    "approvals_is_view": approvals_is_view,
     "migrated_states": [m["item"]["state"] for m in migrated],
     "migrated_kinds": [m["item"]["kind"] for m in migrated],
-    "migrated_sending_open": (len(migrated[1]["attempts"]), migrated[1]["attempts"][0]["started"], migrated[1]["attempts"][0]["ended"]),
     "migrated_sent_ref": migrated[2]["item"]["sent_ref"],
     "after_note_plain": after_note["item"]["plain_summary"],
-    "after_claim": (after_claim["item"]["state"], len(after_claim["attempts"]), after_claim["attempts"][0]["ended"] is None),
-    "after_done": (after_done["item"]["state"], after_done["attempts"][0]["outcome"], after_done["item"]["sent_ref"]),
-    "after_failed": (after_failed["item"]["state"], after_failed["attempts"][0]["outcome"]),
-    "swept": swept,
-    "gh_calls": gh_calls,
-    "decided_calls": decided_calls,
+    "swept_count": len(swept),
+    "approved_state": approved_ob3["state"],
     "edit_err": edit_err,
 }))
 """)
+        self.assertTrue(result["approvals_is_view"])
         self.assertEqual(result["migrated_states"], ["draft", "sending", "sent", "rejected", "failed"])
         self.assertEqual(result["migrated_kinds"], ["issue", "pr", "push", "loop", "push"])
-        self.assertEqual(result["migrated_sending_open"], [1, "2026-11-01T12:00:00Z", None])
         self.assertEqual(result["migrated_sent_ref"], "https://github.com/o/r/pull/1")
         self.assertEqual(result["after_note_plain"], "x")
-        self.assertEqual(result["after_claim"], ["sending", 1, True])
-        self.assertEqual(result["after_done"], ["sent", "sent", "https://github.com/o/r/pull/9"])
-        self.assertEqual(result["after_failed"], ["failed", "unknown"])
-        self.assertEqual(result["swept"], [])
-        self.assertEqual(result["gh_calls"], 0)
-        self.assertEqual(result["decided_calls"][0][1], True)
+        self.assertEqual(result["swept_count"], 1)
+        self.assertEqual(result["approved_state"], "approved")
         self.assertEqual(result["edit_err"], [409, "invalid_state"])
 
     def test_inbox_adapter_stale_sending_and_cli_approve(self):

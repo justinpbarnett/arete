@@ -35,17 +35,25 @@ def add_verdict(run_id: str, kind: str, subject: str, about: str, answers: dict,
                    util.iso() if outcome else None))
 
 
-def settle_verdicts(run_id: str, outcome: str, approval: int | None = None, was: tuple[str, ...] = ("",)) -> None:
-    with db() as c:
-        c.execute(f"UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = COALESCE(?, approval) "  # noqa: S608
-                  f"WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome IN ({','.join('?' * len(was))})",
-                  (outcome, util.iso(), approval, run_id, *was))
+def settle_verdicts(run_id: str, outcome: str, approval: int | None = None, was: tuple[str, ...] = ("",),
+                    *, c=None) -> None:
+    sql = (f"UPDATE verdicts SET outcome = ?, outcome_at = ?, approval = COALESCE(?, approval) "  # noqa: S608
+           f"WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome IN ({','.join('?' * len(was))})")
+    args = (outcome, util.iso(), approval, run_id, *was)
+    if c is not None:
+        c.execute(sql, args)
+        return
+    with db() as conn:
+        conn.execute(sql, args)
 
 
-def set_verdict_sha(run_id: str, sha: str) -> None:
-    with db() as c:
-        c.execute("UPDATE verdicts SET sha = ? WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome != 'replaced'",
-                  (sha, run_id))
+def set_verdict_sha(run_id: str, sha: str, *, c=None) -> None:
+    sql = "UPDATE verdicts SET sha = ? WHERE run_id = ? AND kind IN ('push', 'proof') AND outcome != 'replaced'"
+    if c is not None:
+        c.execute(sql, (sha, run_id))
+        return
+    with db() as conn:
+        conn.execute(sql, (sha, run_id))
 
 
 def verdicts_since(since: str, connect=reader) -> list[dict]:

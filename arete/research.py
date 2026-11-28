@@ -144,11 +144,45 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
         if not util.git(["diff", "--cached", "--name-only"], wt).strip():
             return gh.open_pr_url(h.repo.github, branch) or f"https://github.com/{h.repo.github}/blob/{base}/{path}"
         util.git_as_owner(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
-        util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
+        from . import outbox
+
+        head = util.git(["rev-parse", "HEAD"], wt).strip()
+        outbox.publish_push(
+            repo_name=h.repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            use_lease=False,
+            force=True,
+            mode="branch",
+            drafted_by="research",
+        )
         if url := gh.open_pr_url(h.repo.github, branch):
-            gh.pr_edit_body(url, body, link=link)
+            outbox.publish_pr(
+                action="body",
+                repo=h.repo.github,
+                name=h.repo.name,
+                url=url,
+                body=body,
+                link=link,
+                drafted_by="research",
+            )
             return url
-        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
+        created = outbox.publish_pr(
+            action="create",
+            repo=h.repo.github,
+            name=h.repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            title=subject,
+            body=body,
+            link=link,
+            labels=tk.pr_labels,
+            drafted_by="research",
+            retry_unknown=True,
+        )
+        return str(created.get("sent_url") or "")
     finally:
         workspace.remove_worktree(h.repo, wt)
 

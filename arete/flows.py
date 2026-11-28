@@ -888,7 +888,15 @@ class Job:
                 head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
                 c.note_pushed_head(head)
             if self.with_prs:
-                pipeline.note_prs(self.run, self.branch, self.with_prs)
+                row = run_store.run_get(self.run.id)
+                urls = [c.pr for c in self.with_prs if c.pr]
+                if row is not None and urls:
+                    record.note(
+                        self.run.id,
+                        base_version=int(row["version"]),
+                        branch=self.branch,
+                        pr_url=" ".join(urls),
+                    )
 
     def hold(self, name: str) -> str:
         if name != "prepare" or not self.pending or not self.only and kept_pending(self, self.continues):
@@ -1859,7 +1867,18 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
     stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found}
     for c in staged.changed:
         if c in opened:
-            gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
+            from . import outbox
+
+            outbox.publish_pr(
+                action="body",
+                repo=c.github,
+                name=c.github or c.dir,
+                url=c.pr,
+                body=with_stop(report_body, stops.get(c.github, "")),
+                link=link,
+                run_id=run.id,
+                drafted_by=f"run:{run.id}",
+            )
         elif not c.pr:
             if before_push:
                 remote_head = workspace.remote_head(c.src, job.branch)
@@ -1870,11 +1889,28 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
                                        draft=bool(draft_why)) if recovery else nullcontext())
             body = (pipeline.with_siblings("Gate evidence is posted separately.",
                                            pipeline.sibling_section(t.ref, c, job.with_prs)) if recovery else report_body)
+            from . import outbox
+
+            head = util.git(["rev-parse", "HEAD"], c.wt).strip()
             with write:
-                c.pr = gh.pr_create(c.github, job.branch, c.base, title, body, labels=tk.pr_labels,
-                                    draft=bool(draft_why), cwd=c.wt, link=link, **({"single_attempt": True} if recovery else {}))
-            if not recovery:
-                pipeline.note_prs(run, job.branch, job.with_prs)
+                created = outbox.publish_pr(
+                    action="create",
+                    repo=c.github,
+                    name=c.github or c.dir,
+                    base=c.base,
+                    branch=job.branch,
+                    head=head,
+                    lease=c.lease,
+                    title=title,
+                    body=body,
+                    link=link,
+                    labels=tk.pr_labels,
+                    draft_pr=bool(draft_why),
+                    run_id=run.id,
+                    drafted_by=f"run:{run.id}",
+                    retry_unknown=not recovery,
+                )
+                c.pr = str(created.get("sent_url") or "")
             opened.append(c)
             if before_push and gh.pr_draft_and_head(c.pr)[1] != c.lease:
                 raise workspace.RunFailed("GitHub created a PR with a different head; inspect it before any merge")
@@ -1891,7 +1927,6 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
         drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why, recovery=recovery)
         recovery.recheck(during="after refreshing PR evidence")
     else:
-        pipeline.note_prs(run, job.branch, with_prs)
         ci_stopped = [c for c in found if stops[c.github]]
         ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
                                              job.left_for_a_person, link, stops, committed,

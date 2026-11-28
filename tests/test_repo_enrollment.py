@@ -46,6 +46,22 @@ class Trackers:
                               "labels": [{"name": args[i + 1]} for i, a in enumerate(args) if a == "--label"]}
             return issues[number]["html_url"]
         assert args[0] == "api", args
+        if "--method" in args and args[args.index("--method") + 1] == "POST":
+            endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
+            if create_match := re.fullmatch(r"repos/([^/]+/[^/]+)/issues", endpoint):
+                slug = create_match.group(1)
+                payload = json.loads(input) if isinstance(input, str) else {}
+                issues = self.github.setdefault(slug, {})
+                number = len(issues) + 1
+                issues[number] = {
+                    "number": number,
+                    "id": number + 1000,
+                    "html_url": gh.issue_url(slug, number),
+                    "body": payload.get("body", ""),
+                    "title": payload.get("title", ""),
+                    "labels": [{"name": lb} for lb in (payload.get("labels") or ())],
+                }
+                return json.dumps(issues[number])
         match = re.fullmatch(r"repos/([^/]+/[^/]+)/issues(?:/(\d+)(/sub_issues)?)?(?:\?.*)?", args[1])
         assert match, args
         slug, number, subissues = match.groups()
@@ -359,8 +375,11 @@ class EnrollAndPublish(unittest.TestCase):
                  "fingerprint": self.id() + "/app", "evidence": [team_spec]},
                 {"repo": "arete", "title": "Factory follow-up", "summary": "One review step repeated",
                  "fingerprint": self.id() + "/arete"}]
+        from arete import outbox
+
         run = SimpleNamespace(loop=loop, cfg=cfg, id="fixture-mine", trial=False, log=mock.Mock())
         loop_run.finish_watch(run, [{"trust": "internal"}], rows, loop_run.new_findings(run, rows), "Reviewed team spec")
+        outbox.send_due()
         app = self.trackers.jira["TEAM-3"]["fields"]
         self.assertEqual(app["labels"], ["repo-app"])
         self.assertIn(team_spec, adf.to_text(app["description"]))
@@ -439,9 +458,12 @@ class EnrollAndPublish(unittest.TestCase):
         self.assertTrue(old.allows_unattended_deploy("production"))
         self.assertTrue(new.allows_unattended_deploy("staging"))
         self.assertFalse(new.allows_unattended_deploy("production"))
-        item = {"repo": new.name, "workdir": str(new.path), "base": new.target_branch, "check": "true"}
+        from arete import send_push
+
+        head = "0" * 40
+        item = {"mode": "land", "repo": new.name, "base": new.target_branch, "head": head, "check": "true"}
         with mock.patch.object(push.util, "git") as git, self.assertRaisesRegex(RuntimeError, "requires a PR"):
-            push.Push().execute(item, [], "fixture", "fixture", cfg)
+            send_push._push_send({"id": 1, "object": f"git:{new.name}", "marker": "m"}, json.dumps(item))
         git.assert_not_called()
         self.assertEqual(push.policy_refusal(old, "old-base"), "")
         c = workspace.Checkout("", new.github, new.path, self.root / "worktree", "old-base")

@@ -151,7 +151,7 @@ class Client:
         headers = {"Authorization": self._auth, "Accept": accept}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        retries = 0 if single_attempt else RETRIES
+        retries = 0 if single_attempt or method != "GET" else RETRIES
         for attempt in range(retries + 1):
             from .store import factory
             factory.check_worker()
@@ -165,17 +165,17 @@ class Client:
                     return raw
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
-                if (single_attempt or method == "POST") and e.code >= 500:
+                if (single_attempt or method != "GET") and e.code >= 500:
                     raise JiraUnsure(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}", e.code) from None
                 if (e.code == 429 or e.code >= 500) and attempt < retries and wait <= MAX_RETRY_WAIT:
                     time.sleep(wait)
                     continue
-                later = f" (retry after {wait:.0f} s)" if wait > MAX_RETRY_WAIT else ""
+                later = f" (retry after {wait:.0f} s)" if (wait > MAX_RETRY_WAIT or (e.code == 429 and retries == 0)) else ""
                 raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip(), e.code) from None
             except (urllib.error.URLError, TimeoutError, OSError, RemoteDisconnected) as e:
                 never_sent = isinstance(e, urllib.error.URLError) and isinstance(
                     e.reason, (socket.gaierror, ConnectionRefusedError))
-                if (single_attempt or method == "POST") and not never_sent:
+                if (single_attempt or method != "GET") and not never_sent:
                     raise JiraUnsure(f"jira {method} {path}: {e}") from None
                 if attempt < retries:
                     if not util.online():
@@ -257,6 +257,35 @@ class Client:
 
     def comments(self, key: str) -> list[dict]:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/comment", key="comments", orderBy="created")
+
+    def comments_with_properties(self, key: str) -> list[dict]:
+        return self._paged(
+            f"/rest/api/3/issue/{_path_segment(key)}/comment",
+            key="comments",
+            expand="properties",
+            orderBy="-created",
+        )
+
+    def comment_outbox(self, key: str, markdown: str, marker: str) -> tuple[str, str]:
+        path = f"/rest/api/3/issue/{_path_segment(key)}/comment"
+        body = {
+            "body": adf.from_markdown(outbound.screen(markdown)),
+            "properties": [{"key": "arete.ob", "value": marker}],
+        }
+        posted = self.request("POST", path, body=body, single_attempt=True)
+        comment_id = posted.get("id") if isinstance(posted, dict) else None
+        if comment_id is None or not str(comment_id).strip():
+            raise JiraUnsure("Jira did not confirm the created comment id")
+        cid = str(comment_id)
+        return cid, self.comment_url(key, cid)
+
+    def transition(self, key: str, transition_id: str) -> None:
+        self.request(
+            "POST",
+            f"/rest/api/2/issue/{_path_segment(key)}/transitions",
+            body={"transition": {"id": transition_id}},
+            single_attempt=True,
+        )
 
     def find_comment_marker(self, key: str, marker: str, *, author: str = "") -> str:
         for row in self.comments(key):

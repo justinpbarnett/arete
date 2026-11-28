@@ -476,24 +476,38 @@ def due_candidates(now_iso: str, connect=reader) -> list[tuple[int, int]]:
             return []
         rows = c.execute(
             "SELECT id, version FROM outbox "
-            "WHERE state = 'approved' AND send_at <= ? AND legacy_approval IS NULL "
+            "WHERE state = 'approved' AND send_at <= ? "
             "ORDER BY send_at, id",
             (now_iso,),
         ).fetchall()
         return [(int(r["id"]), int(r["version"])) for r in rows]
 
 
-def claim_due(c, numeric_id: int, expected_version: int, now_iso: str) -> tuple[dict, int] | None:
+def claim_due(
+    c, numeric_id: int, expected_version: int, now_iso: str, *, allow_bypass_fifo: bool = False
+) -> tuple[dict, int] | None:
+    if allow_bypass_fifo:
+        fifo_clause = (
+            "AND (object = '' OR NOT EXISTS ("
+            "    SELECT 1 FROM outbox earlier "
+            "    WHERE earlier.object = outbox.object "
+            "      AND earlier.kind = outbox.kind "
+            "      AND earlier.id < outbox.id "
+            "      AND earlier.state = 'sending'"
+            "))"
+        )
+    else:
+        fifo_clause = (
+            "AND (object = '' OR NOT EXISTS ("
+            "    SELECT 1 FROM outbox earlier "
+            "    WHERE earlier.object = outbox.object "
+            "      AND earlier.id < outbox.id "
+            "      AND earlier.state IN ('approved', 'sending')"
+            "))"
+        )
     changed = c.execute(
-        "UPDATE outbox SET state = 'sending', version = version + 1, attempts = attempts + 1, updated = ? "
-        "WHERE id = ? AND state = 'approved' AND send_at <= ? AND version = ? AND legacy_approval IS NULL "
-        "AND (object = '' OR NOT EXISTS ("
-        "    SELECT 1 FROM outbox earlier "
-        "    WHERE earlier.object = outbox.object "
-        "      AND earlier.id < outbox.id "
-        "      AND earlier.state IN ('approved', 'sending') "
-        "      AND earlier.legacy_approval IS NULL"
-        "))",
+        f"UPDATE outbox SET state = 'sending', version = version + 1, attempts = attempts + 1, updated = ? "  # noqa: S608
+        f"WHERE id = ? AND state = 'approved' AND send_at <= ? AND version = ? {fifo_clause}",
         (now_iso, numeric_id, now_iso, expected_version),
     ).rowcount
     if changed != 1:
@@ -506,6 +520,14 @@ def claim_due(c, numeric_id: int, expected_version: int, now_iso: str) -> tuple[
     )
     emit_event(c, "outbox.changed", row, {"attempt": attempt_n})
     return row, attempt_n
+
+
+def record_attempt_external_id(item_id: int, attempt_n: int, external_id: str) -> None:
+    with foundation.tx() as c:
+        c.execute(
+            "UPDATE delivery_attempts SET external_id = ? WHERE item = ? AND n = ? AND ended IS NULL",
+            (external_id, item_id, attempt_n),
+        )
 
 
 def is_state_label_body(body: str) -> bool:
@@ -547,7 +569,7 @@ def discard_older_state_labels(c, obj: str, before_id: int, now_iso: str) -> lis
         return []
     rows = c.execute(
         "SELECT * FROM outbox WHERE object = ? AND kind = 'label' AND id < ? "
-        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') AND legacy_approval IS NULL "
+        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') "
         "ORDER BY id ASC",
         (obj, before_id),
     ).fetchall()
@@ -565,7 +587,7 @@ def has_newer_active_state_label(c, obj: str, after_id: int) -> bool:
         return False
     rows = c.execute(
         "SELECT * FROM outbox WHERE object = ? AND kind = 'label' AND id > ? "
-        "AND state NOT IN ('rejected', 'discarded') AND legacy_approval IS NULL "
+        "AND state NOT IN ('rejected', 'discarded') "
         "ORDER BY id ASC",
         (obj, after_id),
     ).fetchall()
@@ -577,7 +599,7 @@ def discard_older_board_items(c, obj: str, before_id: int, now_iso: str) -> list
         return []
     rows = c.execute(
         "SELECT id FROM outbox WHERE object = ? AND kind = 'issue' AND slot LIKE 'board:%' AND id < ? "
-        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') AND legacy_approval IS NULL "
+        "AND state IN ('draft', 'edited', 'approved', 'held', 'failed') "
         "ORDER BY id ASC",
         (obj, before_id),
     ).fetchall()
@@ -592,7 +614,7 @@ def run_kind_count(c, run_id: str, kind: str) -> int:
     if not available(c):
         return 0
     row = c.execute(
-        "SELECT COUNT(*) FROM outbox WHERE run_id = ? AND kind = ? AND legacy_approval IS NULL",
+        "SELECT COUNT(*) FROM outbox WHERE run_id = ? AND kind = ?",
         (run_id, kind),
     ).fetchone()
     return int(row[0]) if row else 0
@@ -606,7 +628,7 @@ def pending_label_item(obj: str, connect=reader) -> int | None:
             return None
         row = c.execute(
             "SELECT id FROM outbox WHERE kind = 'label' AND object = ? "
-            "AND state NOT IN ('sent', 'rejected', 'discarded') AND legacy_approval IS NULL "
+            "AND state NOT IN ('sent', 'rejected', 'discarded') "
             "ORDER BY id DESC LIMIT 1",
             (obj,),
         ).fetchone()
@@ -619,7 +641,7 @@ def newest_sent_board_issue(repo: str, connect=reader) -> int | None:
             return None
         row = c.execute(
             "SELECT sent_ref FROM outbox WHERE kind = 'issue' AND object = ? AND slot LIKE ? "
-            "AND state = 'sent' AND sent_ref IS NOT NULL AND legacy_approval IS NULL "
+            "AND state = 'sent' AND sent_ref IS NOT NULL "
             "ORDER BY id DESC LIMIT 1",
             (f"github:{repo}", f"board:{repo}:create:%"),
         ).fetchone()
@@ -667,7 +689,7 @@ def stale_sending(c, since_iso: str) -> list[dict]:
         "SELECT o.id, o.version, a.n "
         "FROM outbox o "
         "JOIN delivery_attempts a ON a.item = o.id AND a.ended IS NULL "
-        "WHERE o.state = 'sending' AND o.legacy_approval IS NULL AND a.started < ? "
+        "WHERE o.state = 'sending' AND a.started < ? "
         "ORDER BY o.id",
         (since_iso,),
     ).fetchall()
@@ -676,9 +698,9 @@ def stale_sending(c, since_iso: str) -> list[dict]:
 
 def sweep_one(c, numeric_id: int, expected_version: int, attempt_n: int, now_iso: str) -> dict | None:
     changed = c.execute(
-        "UPDATE outbox SET state = 'approved', version = version + 1, updated = ? "
-        "WHERE id = ? AND state = 'sending' AND version = ? AND legacy_approval IS NULL",
-        (now_iso, numeric_id, expected_version),
+        "UPDATE outbox SET state = 'approved', send_at = COALESCE(send_at, ?), version = version + 1, updated = ? "
+        "WHERE id = ? AND state = 'sending' AND version = ?",
+        (now_iso, now_iso, numeric_id, expected_version),
     ).rowcount
     if changed != 1:
         return None

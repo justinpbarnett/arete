@@ -470,7 +470,19 @@ def push_fetched(spec: Spec, repo: config.Repo) -> None:
             log_line(spec, "error", f"not pushing {spec.branch}: its commits touch denied paths {held}")
         spec.held = held
         return
-    util.git(["push", "-q", "--", "origin", f"{spec.fetched}:refs/heads/{spec.branch}"], repo.path, timeout=600)
+    from . import outbox
+
+    outbox.publish_push(
+        repo_name=repo.name,
+        base=spec.base,
+        branch=spec.branch,
+        head=spec.fetched,
+        use_lease=False,
+        mode="branch",
+        run_id=spec.id,
+        drafted_by=f"run:{spec.id}",
+        timeout=600,
+    )
     spec.pushed, spec.held = spec.fetched, ""
     log_line(spec, "device", f"pushed {spec.fetched[:10]} to {spec.branch}")
 
@@ -603,13 +615,31 @@ def open_draft_pr(spec: Spec, cfg: config.Config, report: dict) -> str:
         url = gh.open_pr_url(github, spec.branch)
         if url and repo.target_branch and gh.pr_view(url).get("baseRefName") != base:
             return f"the draft PR targets a different branch than {base}"
-        url = url or gh.pr_create(github, spec.branch, base, util.first_line(spec.prompt, 72), draft_body(spec, report),
-                                  draft=True, cwd=repo.path)
+        reused = bool(url)
+        if not url:
+            from . import outbox
+
+            created = outbox.publish_pr(
+                action="create",
+                repo=github,
+                name=repo.name,
+                base=base,
+                branch=spec.branch,
+                head=spec.pushed,
+                title=util.first_line(spec.prompt, 72),
+                body=draft_body(spec, report),
+                draft_pr=True,
+                run_id=spec.id,
+                drafted_by=f"run:{spec.id}",
+                retry_unknown=True,
+            )
+            url = str(created.get("sent_url") or "")
     except (gh.GhError, RuntimeError, OSError) as e:
         return f"the draft PR was not opened: {util.one_line(str(e), 300)}"
     spec.pr = url
     save_spec(spec)
-    record.note(spec.id, pr_url=url)
+    if reused:
+        record.note(spec.id, pr_url=url)
     log_line(spec, "pr", f"draft PR {url}")
     return ""
 

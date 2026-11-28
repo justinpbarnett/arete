@@ -785,8 +785,11 @@ class Handler(BaseHTTPRequestHandler):
         questions, answers = b.get("questions"), b.get("answers")
         if not all(isinstance(x, list) and all(isinstance(t, str) for t in x) for x in (questions, answers)):
             raise Refusal(400, "Questions and answers take lists of text.")
+        base_version = b.get("base_version")
+        if base_version is not None and (isinstance(base_version, bool) or not isinstance(base_version, int)):
+            raise Refusal(400, "base_version must be an integer.")
         said = triage.send(config.load_or_problem()[0], ref, questions, answers, str(b.get("repo") or ""),
-                           publication=publication)
+                           publication=publication, base_version=base_version)
         return {"ref": ref, "said": f"{said} {start_poll_without_failing_the_send()}"}
 
     def usage_row(self, b) -> dict:
@@ -1425,16 +1428,29 @@ def post_approval(handler, rest, query):
     yes = handler.body().get("approve") is True
 
     def _decide(publication=None):
+        from .store import outbox as outbox_store
+
         item = inbox_store.get_open_by_subject(f"approval:{number}")
+        if item is None:
+            with foundation.tx() as c:
+                ob = outbox_store.get_by_legacy_approval(c, number) if outbox_store.available(c) else None
+                if ob is not None:
+                    inbox.sync(c, "outbox")
+            if ob is not None:
+                item = inbox_store.get_open_by_subject(f"outbox:{ob['id']}")
         if item is not None:
-            return inbox.resolve(
+            resolved = inbox.resolve(
                 item["id"],
                 base_version=item["version"],
                 verb="approve" if yes else "reject",
                 credential=handler.credential,
                 publication=publication,
                 allow_legacy_auth=True,
-            )["result"]
+            )
+            res = resolved["result"]
+            if isinstance(res, dict) and "id" in res and "state" in res:
+                return {"id": number, "approved": yes, "result": res["id"]}
+            return res
         return control.decide(number, yes, publication=publication)
 
     return handler.publish("/api/approvals/{id}", {"id": str(number)}, _decide)

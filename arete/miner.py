@@ -949,7 +949,20 @@ def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
             raise RuntimeError(refusal)
         message = f"docs(harness): add an approved global rule\n\n{p['change']}\n\nArete-Run: {p['run_id']}"
         util.git_as_owner(["commit", "-q", "-m", message], wt)
-        git(["push", "-q", "origin", f"HEAD:{base}"], wt, timeout=300)
+        from . import outbox
+
+        head = git(["rev-parse", "HEAD"], wt).strip()
+        outbox.publish_push(
+            repo_name=repo.name,
+            base=base,
+            branch=base,
+            head=head,
+            use_lease=False,
+            mode="branch",
+            run_id=run_id,
+            drafted_by=f"run:{run_id}" if run_id else "miner",
+            timeout=300,
+        )
         return base
     finally:
         workspace.remove_worktree(repo, wt)
@@ -989,10 +1002,24 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         fixes = util.count(len(landed), "mined fix", "mined fixes")
         util.git_as_owner(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
         head = git(["rev-parse", "HEAD"], wt).strip()
-        if not workspace.remote_head(repo.path, branch):
+        lease = workspace.remote_head(repo.path, branch)
+        if not lease:
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
-        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
+        from . import outbox
+
+        outbox.publish_push(
+            repo_name=repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            use_lease=True,
+            mode="branch",
+            run_id=run_id,
+            drafted_by=f"run:{run_id}" if run_id else "miner",
+            timeout=300,
+        )
         body = ["Fixes mined from recent sessions and recorded runs where an agent needed correcting.", ""]
         keep_evidence = not (repo.public or repo.name == cfg.arete_repo)
         for i, p in enumerate(landed, 1):
@@ -1002,12 +1029,25 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
                  "The miner uses CI and evals to decide eligible Arete prompt changes and global skill changes. "
                  "Other changes go to human review.",
                  "Closed PRs teach the miner what to avoid proposing again."]
-        gh.ensure_label(repo.github, MINER_LABEL, "1d76db", "Harness fixes mined by arete")
         existing = gh.prs(repo.github, label=MINER_LABEL, state="open")
         if any(p.get("headRefName") == branch for p in existing):
             return next(p["url"] for p in existing if p.get("headRefName") == branch), landed, head
-        return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
-                            "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed, head
+        created = outbox.publish_pr(
+            action="create",
+            repo=repo.github,
+            name=repo.name,
+            base=base,
+            branch=branch,
+            head=head,
+            lease=lease,
+            title=f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
+            body="\n".join(body),
+            labels=[MINER_LABEL],
+            run_id=run_id,
+            drafted_by=f"run:{run_id}" if run_id else "miner",
+            retry_unknown=True,
+        )
+        return str(created.get("sent_url") or ""), landed, head
     finally:
         workspace.remove_worktree(repo, wt, owner=run_id)
 

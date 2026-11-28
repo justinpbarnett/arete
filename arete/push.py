@@ -4,10 +4,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import config, diffguard, environment, jev, outbound, paths, util, vault
+from . import config, diffguard, jev, outbound, paths, util, vault
 from .emits import Emit, config_repo
-from .loops import Loop, as_list, blank, check_env, worktree_kinds
-from .store import insights as insight_store
+from .loops import Loop, as_list, blank, worktree_kinds
 
 APPROVE_KEYS = ("lines", "deletes", "paths", "reviewer")
 PATCH_SHOWN = 12000
@@ -45,11 +44,13 @@ class Push(Emit):
     def render(self, loop: Loop, run_id: str, spec: dict, findings: list[dict], outcome: dict) -> dict:
         src = Path(outcome["workdir"])
         start, branch = outcome["start"], outcome["branch"]
+        head = outcome.get("head") or util.git(["rev-parse", branch], src).strip()
         diff = diffguard.between(src, start, branch, moves=True)
         deleted = util.git_records(["diff", "--name-only", "--no-renames", "--diff-filter=D", start, branch], src)
         public = outcome.get("public", True)
-        return {"repo": loop.repo, "workdir": str(src), "branch": branch, "base": outcome["base"],
-                "check": push_check(spec, loop), "env": check_env(loop, run_id),
+        return {"mode": "land", "repo": loop.repo, "loop": loop.name, "branch": branch, "base": outcome["base"],
+                "start": start, "head": head,
+                "check": push_check(spec, loop),
                 "timeout": loop.timeout_minutes * 60, "lines": diff.lines, "files": diff.files, "deleted": deleted,
                 "title": outbound.plain(f"{loop.name}: run {run_id}" if public else outcome.get("title", ""), 120),
                 "report": outbound.plain(outcome.get("facts", "") if public else outcome.get("report", ""), 6000),
@@ -63,9 +64,11 @@ class Push(Emit):
 
     def only_a_person(self, spec: dict, item: dict, cfg: config.Config) -> str:
         repo = push_repo(cfg, item)
+        if repo is None:
+            return f"repo {item.get('repo')!r} is not configured on this host"
         if reason := policy_refusal(repo, item["base"]):
             return reason
-        layer = config.load_layer(repo.layer_dir if repo else Path(item["workdir"]) / ".agents")
+        layer = config.load_layer(repo.layer_dir)
         if layer.trust_level != "automerge":
             return f"the trust level of {item['repo']} is pr, so a person lands each push"
         if denied := [f for f in item["files"] if util.matches_any(f, diffguard.denied_paths(layer))]:
@@ -86,18 +89,18 @@ class Push(Emit):
             return f"the diff runs past the {PATCH_SHOWN} characters JEV reads"
         return ""
 
-    def held(self, spec: dict, item: dict, cfg: config.Config) -> str:
-        return self.ruled(spec, item, cfg) or ". ".join(self.objections(item, cfg).values())
+    def held(self, spec: dict, item: dict, cfg: config.Config, *, run_id: str = "") -> str:
+        return self.ruled(spec, item, cfg) or ". ".join(self.objections(item, cfg, run_id=run_id).values())
 
     def reviewer(self, spec: dict, item: dict, cfg: config.Config) -> dict:
         if not (model := approve_rules(spec).get("reviewer")):
             return {}
         return {"model": model, "may_land": not self.only_a_person(spec, item, cfg)}
 
-    def objections(self, item: dict, cfg: config.Config) -> dict[str, str]:
+    def objections(self, item: dict, cfg: config.Config, *, run_id: str = "") -> dict[str, str]:
         if not jev.ready(cfg, [push_repo(cfg, item)]):
             return {}
-        run_id, about = item.get("env", {}).get("ARETE_RUN_ID", ""), item.get("about") or item["title"]
+        about = item.get("about") or item["title"]
         found = {}
         try:
             if held := jev.diff_screen(item.get("patch", ""), about, cfg, trace=(run_id, "push screen jev")):
@@ -109,19 +112,7 @@ class Push(Emit):
         return found
 
     def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
-        if blank(item.get("check")):
-            raise RuntimeError("it has no check to run after the rebase, so it cannot land: reject it. Its loop now "
-                               "loads only with a push check, so every later push from it has one")
-        src, base = Path(item["workdir"]), item["base"]
-        if reason := policy_refusal(push_repo(cfg, item), base):
-            raise RuntimeError(reason)
-        if "origin" not in util.git(["remote"], src, check=False).split():
-            raise RuntimeError(f"{paths.short_path(src)} has no origin to push to")
-        with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
-            sha = land(item, wt, src, base, cfg)
-        insight_store.set_verdict_sha(run_id, sha)
-        util.delete_branch(src, item["branch"])
-        return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
+        raise RuntimeError("push emits deliver through the outbox sender")
 
     def describe(self, item: dict) -> str:
         return (f"push {item['branch']} to {item['base']} of {item['repo']} after `{item['check']}` passes "
@@ -137,8 +128,10 @@ class Push(Emit):
         problem = (item.get("proof") or {}).get("problem")
         return "\n\n".join(filter(None, [f"The problem it fixes:\n{problem}" if problem else "", self.detail(item)]))
 
-    def rejected(self, item: dict) -> None:
-        util.delete_branch(Path(item["workdir"]), item["branch"])
+    def rejected(self, item: dict, cfg: config.Config | None = None) -> None:
+        repo = push_repo(cfg or config.load(), item)
+        if repo is not None and repo.path.is_dir() and item.get("branch"):
+            util.delete_branch(repo.path, item["branch"])
 
 
 def approve_rules(spec: dict) -> dict:
@@ -147,7 +140,7 @@ def approve_rules(spec: dict) -> dict:
 
 
 def push_repo(cfg: config.Config, item: dict) -> config.Repo | None:
-    return config_repo(cfg, item["repo"]) or cfg.repo_for_path(item["workdir"])
+    return config_repo(cfg, item.get("repo", ""))
 
 
 def policy_refusal(repo: config.Repo | None, base: str) -> str:
@@ -213,28 +206,6 @@ def rebase_onto(wt: Path, base: str) -> None:
         clashes = util.git_records(["diff", "--name-only", "--diff-filter=U"], wt, check=False)
         util.git(["rebase", "--abort"], wt, check=False)
         raise NoLongerRebases(base, clashes, e) from e
-
-
-def land(item: dict, wt: Path, src: Path, base: str, cfg: config.Config) -> str:
-    for attempt in (1, 2):
-        util.git(["fetch", "-q", "origin", base], src)
-        util.git(["reset", "-q", "--hard"], wt)
-        util.git(["clean", "-qfd"], wt)
-        rebase_onto(wt, base)
-        gate = environment.sh(item["check"], cfg, push_repo(cfg, item), sets=item["env"], cwd=wt,
-                              timeout=item["timeout"])
-        if gate.returncode != 0:
-            raise RuntimeError(f"`{item['check']}` exits {gate.returncode} after the rebase: "
-                               f"{util.last_line((gate.stdout or '') + (gate.stderr or ''), 300)}")
-        try:
-            util.git(["push", "-q", "origin", f"HEAD:refs/heads/{base}"], wt)
-        except RuntimeError:
-            if attempt == 2:
-                raise
-            continue
-        util.git(["fetch", "-q", "origin", base], src, check=False)
-        return util.git(["rev-parse", "HEAD"], wt).strip()
-    raise RuntimeError("unreachable")
 
 
 def fast_forward(src: Path, base: str, sha: str) -> str:

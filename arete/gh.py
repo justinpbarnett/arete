@@ -837,7 +837,7 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
-def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = False) -> None:
+def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = True) -> None:
     gh(["pr", "ready", _safe_target(url, "PR"), *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
 
 
