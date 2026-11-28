@@ -28,7 +28,7 @@ ACCOUNT_ID = re.compile(r"[a-z0-9][a-z0-9:_-]{0,63}")
 KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
-ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_-]*:(?:[A-Za-z0-9_.*-]+|\*)")
+ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_-]*:(?:[A-Za-z0-9_.-]+\*?|\*)")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
 VERIFICATION_KEY_NAME = "VERIFICATION_SIGNING_KEY"
@@ -158,6 +158,8 @@ def expose_rules(row: dict) -> list[dict]:
 
 
 def role_matches(role: str, pattern: str) -> bool:
+    if not isinstance(role, str) or not isinstance(pattern, str) or not role or not pattern:
+        return False
     return pattern == role or (pattern.endswith("*") and role.startswith(pattern[:-1]))
 
 
