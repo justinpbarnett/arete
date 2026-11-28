@@ -240,8 +240,8 @@ class PairedSpecPublicationTests(unittest.TestCase):
         self.assertEqual(pkg_res["issue"], "1")
         self.assertEqual(app_res["issue"], "1")
         # Both issues have independent spec + agent labels on their respective trackers.
-        self.assertEqual({l["name"] for l in self.trackers.github["org/pkg"][1]["labels"]}, {"spec", "agent"})
-        self.assertEqual({l["name"] for l in self.trackers.github["org/app"][1]["labels"]}, {"spec", "agent"})
+        self.assertEqual({label["name"] for label in self.trackers.github["org/pkg"][1]["labels"]}, {"spec", "agent"})
+        self.assertEqual({label["name"] for label in self.trackers.github["org/app"][1]["labels"]}, {"spec", "agent"})
         # Each links to its peer via tracker comments.
         pkg_comments = "\n".join(c["body"] for c in self.trackers.comments[("org/pkg", 1)])
         app_comments = "\n".join(c["body"] for c in self.trackers.comments[("org/app", 1)])

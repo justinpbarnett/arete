@@ -367,105 +367,105 @@ def plan_pair(cfg: config.Config, entries, key: str, *, ready_only: str = "") ->
     sha = idempotency.fingerprint("POST", PAIR_ROUTE, {}, canonical)
     lock_key = hashlib.sha256(key.encode()).hexdigest()
 
-    with idempotency.owning("repo.publish.pair", key, sha, PAIR_ROUTE) as context:
-        with util.lock(f"repo-publish-pair-{lock_key}", wait=True):
-            with foundation.tx():
-                row = idempotency.matching_claim(context)
-                if row and row["status"]:
-                    return json.loads(row["response"])
-                receipt = idempotency.Publication(context, row)
-                if receipt.pending is None:
-                    receipt.remember({"published": {}, "linked": {}, "native_linked": {}})
+    with (idempotency.owning("repo.publish.pair", key, sha, PAIR_ROUTE) as context,
+          util.lock(f"repo-publish-pair-{lock_key}", wait=True)):
+        with foundation.tx():
+            row = idempotency.matching_claim(context)
+            if row and row["status"]:
+                return json.loads(row["response"])
+            receipt = idempotency.Publication(context, row)
+            if receipt.pending is None:
+                receipt.remember({"published": {}, "linked": {}, "native_linked": {}})
 
-            published = dict(receipt.pending.get("published") or {})
-            linked = dict(receipt.pending.get("linked") or {})
-            native_linked = dict(receipt.pending.get("native_linked") or {})
+        published = dict(receipt.pending.get("published") or {})
+        linked = dict(receipt.pending.get("linked") or {})
+        native_linked = dict(receipt.pending.get("native_linked") or {})
 
-            # Publish prerequisites before dependents so retries reuse already-published work.
-            ordered = sorted(ready_entries, key=lambda e: (1 if e["requires_peer"] else 0, e["role"]))
-            for entry in ordered:
-                role = entry["role"]
-                if role in published:
-                    continue
-                member_key = "pair-" + hashlib.sha256(f"{key}:{role}".encode()).hexdigest()[:40]
-                url = plan(cfg, entry["repo"], "spec", entry["title"], entry["body"], member_key, draft=entry["draft"])
-                issue_id = _issue_id_from_url(entry["destination"], url)
-                published[role] = {
+        # Publish prerequisites before dependents so retries reuse already-published work.
+        ordered = sorted(ready_entries, key=lambda e: (1 if e["requires_peer"] else 0, e["role"]))
+        for entry in ordered:
+            role = entry["role"]
+            if role in published:
+                continue
+            member_key = "pair-" + hashlib.sha256(f"{key}:{role}".encode()).hexdigest()[:40]
+            url = plan(cfg, entry["repo"], "spec", entry["title"], entry["body"], member_key, draft=entry["draft"])
+            issue_id = _issue_id_from_url(entry["destination"], url)
+            published[role] = {
+                "repo": entry["repo"].name,
+                "issue": issue_id,
+                "url": url,
+                "tracker": entry["destination"]["tracker"],
+                "draft": entry["draft"],
+                "published": True,
+            }
+            receipt.remember({**receipt.pending, "published": published, "linked": linked,
+                              "native_linked": native_linked})
+
+        both_published = len(published) == 2
+        if both_published:
+            by_role = {e["role"]: e for e in normalized}
+            roles = [e["role"] for e in normalized]
+            for src_role, dst_role in ((roles[0], roles[1]), (roles[1], roles[0])):
+                src_entry, dst_entry = by_role[src_role], by_role[dst_role]
+                src_pub, dst_pub = published[src_role], published[dst_role]
+                edge = f"{src_role}->{dst_role}"
+                if edge not in linked:
+                    lines = [f"Linked spec: {dst_pub['repo']} {dst_pub['url']}"]
+                    if src_entry["requires_peer"]:
+                        lines.append(
+                            f"Requires spec: {dst_pub['repo']} {dst_pub['url']}"
+                            f"{_need_suffix(src_entry['need'], src_entry.get('artifact'))}"
+                        )
+                    marker = "aretepeer" + hashlib.sha256(f"{receipt.marker}:{edge}".encode()).hexdigest()[:32]
+                    _post_peer_comment(cfg, src_entry["destination"], src_pub["issue"], "\n".join(lines), marker)
+                    linked[edge] = True
+                    receipt.remember({**receipt.pending, "published": published, "linked": linked,
+                                      "native_linked": native_linked})
+                if src_entry["requires_peer"] and edge not in native_linked:
+                    _link_native_blocker(cfg, src_entry, src_pub, dst_entry, dst_pub)
+                    native_linked[edge] = True
+                    receipt.remember({**receipt.pending, "published": published, "linked": linked,
+                                      "native_linked": native_linked})
+                cross_repo.record_link(
+                    src_pub["repo"],
+                    src_pub["issue"],
+                    dst_pub["repo"],
+                    dst_pub["issue"],
+                    url=src_pub["url"],
+                    peer_url=dst_pub["url"],
+                    role=src_role,
+                    requires=src_entry["requires_peer"],
+                    need=src_entry["need"],
+                    artifact=src_entry.get("artifact"),
+                )
+
+        specs_out = {}
+        for entry in normalized:
+            role = entry["role"]
+            if role in published:
+                peers = [
+                    {
+                        "role": other["role"],
+                        "repo": published[other["role"]]["repo"],
+                        "issue": published[other["role"]]["issue"],
+                        "url": published[other["role"]]["url"],
+                        "requires": entry["requires_peer"],
+                        "need": entry["need"],
+                        **({"artifact": entry["artifact"]} if entry.get("artifact") else {}),
+                    }
+                    for other in normalized if other["role"] != role and other["role"] in published
+                ]
+                specs_out[role] = {**published[role], "peers": peers}
+            else:
+                specs_out[role] = {
                     "repo": entry["repo"].name,
-                    "issue": issue_id,
-                    "url": url,
+                    "issue": "",
+                    "url": "",
                     "tracker": entry["destination"]["tracker"],
                     "draft": entry["draft"],
-                    "published": True,
+                    "published": False,
+                    "peers": [],
                 }
-                receipt.remember({**receipt.pending, "published": published, "linked": linked,
-                                  "native_linked": native_linked})
-
-            both_published = len(published) == 2
-            if both_published:
-                by_role = {e["role"]: e for e in normalized}
-                roles = [e["role"] for e in normalized]
-                for src_role, dst_role in ((roles[0], roles[1]), (roles[1], roles[0])):
-                    src_entry, dst_entry = by_role[src_role], by_role[dst_role]
-                    src_pub, dst_pub = published[src_role], published[dst_role]
-                    edge = f"{src_role}->{dst_role}"
-                    if edge not in linked:
-                        lines = [f"Linked spec: {dst_pub['repo']} {dst_pub['url']}"]
-                        if src_entry["requires_peer"]:
-                            lines.append(
-                                f"Requires spec: {dst_pub['repo']} {dst_pub['url']}"
-                                f"{_need_suffix(src_entry['need'], src_entry.get('artifact'))}"
-                            )
-                        marker = "aretepeer" + hashlib.sha256(f"{receipt.marker}:{edge}".encode()).hexdigest()[:32]
-                        _post_peer_comment(cfg, src_entry["destination"], src_pub["issue"], "\n".join(lines), marker)
-                        linked[edge] = True
-                        receipt.remember({**receipt.pending, "published": published, "linked": linked,
-                                          "native_linked": native_linked})
-                    if src_entry["requires_peer"] and edge not in native_linked:
-                        _link_native_blocker(cfg, src_entry, src_pub, dst_entry, dst_pub)
-                        native_linked[edge] = True
-                        receipt.remember({**receipt.pending, "published": published, "linked": linked,
-                                          "native_linked": native_linked})
-                    cross_repo.record_link(
-                        src_pub["repo"],
-                        src_pub["issue"],
-                        dst_pub["repo"],
-                        dst_pub["issue"],
-                        url=src_pub["url"],
-                        peer_url=dst_pub["url"],
-                        role=src_role,
-                        requires=src_entry["requires_peer"],
-                        need=src_entry["need"],
-                        artifact=src_entry.get("artifact"),
-                    )
-
-            specs_out = {}
-            for entry in normalized:
-                role = entry["role"]
-                if role in published:
-                    peers = [
-                        {
-                            "role": other["role"],
-                            "repo": published[other["role"]]["repo"],
-                            "issue": published[other["role"]]["issue"],
-                            "url": published[other["role"]]["url"],
-                            "requires": entry["requires_peer"],
-                            "need": entry["need"],
-                            **({"artifact": entry["artifact"]} if entry.get("artifact") else {}),
-                        }
-                        for other in normalized if other["role"] != role and other["role"] in published
-                    ]
-                    specs_out[role] = {**published[role], "peers": peers}
-                else:
-                    specs_out[role] = {
-                        "repo": entry["repo"].name,
-                        "issue": "",
-                        "url": "",
-                        "tracker": entry["destination"]["tracker"],
-                        "draft": entry["draft"],
-                        "published": False,
-                        "peers": [],
-                    }
-            result = {"specs": specs_out, "linked": both_published}
-            receipt.complete(json.dumps(result).encode())
-            return result
+        result = {"specs": specs_out, "linked": both_published}
+        receipt.complete(json.dumps(result).encode())
+        return result

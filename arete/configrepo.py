@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -167,7 +167,7 @@ def live_sha(root: Path | None = None) -> str:
 
 def _git_blob_sha(data: bytes) -> str:
     header = f"blob {len(data)}\0".encode()
-    return hashlib.sha1(header + data).hexdigest()
+    return hashlib.sha1(header + data, usedforsecurity=False).hexdigest()
 
 
 def _normalize_rel(path: str | Path) -> str:
@@ -189,7 +189,7 @@ def _is_secret_rel(rel: str) -> bool:
         lower = part.lower()
         if lower in ("pi.env", ".env", "verification-authority") or lower.startswith(".env.") or lower.endswith(".env"):
             return True
-        if lower.endswith(".secret") or lower.endswith(".secrets"):
+        if lower.endswith((".secret", ".secrets")):
             return True
         if i == 0 and lower in ("hooks", "secrets") and len(parts) > 1:
             return True
@@ -351,10 +351,8 @@ def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> N
         os.replace(tmp, target)
         util.flush_folder(target.parent)
     except BaseException:
-        try:
+        with suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
 
 
@@ -396,13 +394,12 @@ def writer_lock(fence: Fence | None = None):
             finally:
                 _ACTIVE_REPO_LOCK.reset(tok)
     else:
-        with instance_fence() as owned:
-            with util.lock(REPO_LOCK, wait=True):
-                tok = _ACTIVE_REPO_LOCK.set(True)
-                try:
-                    yield owned
-                finally:
-                    _ACTIVE_REPO_LOCK.reset(tok)
+        with instance_fence() as owned, util.lock(REPO_LOCK, wait=True):
+            tok = _ACTIVE_REPO_LOCK.set(True)
+            try:
+                yield owned
+            finally:
+                _ACTIVE_REPO_LOCK.reset(tok)
 
 
 @contextmanager
@@ -412,10 +409,8 @@ def _active_hook_fence(root: Path, fence: Fence):
     try:
         yield fence.token
     finally:
-        try:
+        with suppress(FileNotFoundError):
             os.unlink(marker)
-        except FileNotFoundError:
-            pass
 
 
 def _install_hook(root: Path) -> None:
@@ -483,11 +478,11 @@ def _set_enabled_toml(text: str, enabled: bool) -> str:
     headers = [i for i, line in enumerate(lines) if re.match(r"\s*\[", line)]
     end = headers[0] if headers else len(lines)
     pat = re.compile(r"(\s*enabled\s*=\s*)[^#\r\n]*?(\s*(?:#[^\r\n]*)?)(\r?\n?)\Z")
-    for i in range(0, end):
+    for i in range(end):
         if m := pat.match(lines[i]):
             lines[i] = f"{m.group(1)}{val}{m.group(2)}{m.group(3) or chr(10)}"
             return "".join(lines)
-    insert_at = max((i for i in range(0, end) if lines[i].strip()), default=-1) + 1
+    insert_at = max((i for i in range(end) if lines[i].strip()), default=-1) + 1
     if insert_at > 0 and not lines[insert_at - 1].endswith("\n"):
         lines[insert_at - 1] += "\n"
     lines.insert(insert_at, f"enabled = {val}\n")
@@ -775,10 +770,8 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes], actor: str, sour
             if live_data is not None:
                 _write_atomic_bytes(target, live_data, (modes or {}).get(rel))
             else:
-                try:
+                with suppress(FileNotFoundError):
                     os.unlink(target)
-                except FileNotFoundError:
-                    pass
         _git(["reset", "-q", "HEAD", "--", *paths_sorted], root, check=False)
         raise
     sha = live_sha(root)
@@ -791,51 +784,50 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
     if not paths.DB_FILE.exists() or not config_store.available():
         return
     meta = _parse_commit_meta(root, sha)
-    with foundation.tx() as conn:
-        with principals.acting(meta["author"]):
-            for rel in paths_sorted:
-                if rel == ".gitignore":
-                    continue
-                raw = changes[rel]
-                kind, name = classify_path(rel)
-                origin = origin_of(rel)
-                digest = hashlib.sha256(raw).hexdigest()
-                content_version = f"{kind}/{name}@{digest[:12]}"
-                new_blob = _git_blob_sha(raw)
-                ver = config_store.upsert_live(
-                    conn,
-                    kind=kind,
-                    name=name,
-                    origin=origin,
-                    path=rel,
-                    sha256=digest,
-                    version=content_version,
-                    commit_sha=sha,
-                    author=meta["author"],
-                    source=meta["source"],
-                    note=meta["note"],
-                    at=meta["at"],
-                    fields="{}",
-                )
-                events.emit(
-                    f"config.{kind}.changed",
-                    f"config:{kind}/{name}",
-                    cls="durable",
-                    ver=ver,
-                    data={
-                        "path": rel,
-                        "commit": sha,
-                        "old_blob": old_blobs.get(rel, ABSENT),
-                        "new_blob": new_blob,
-                        "kind": kind,
-                        "name": name,
-                        "origin": origin,
-                        "version": ver,
-                        "content_version": content_version,
-                        "source": meta["source"],
-                    },
-                    connection=conn,
-                )
+    with foundation.tx() as conn, principals.acting(meta["author"]):
+        for rel in paths_sorted:
+            if rel == ".gitignore":
+                continue
+            raw = changes[rel]
+            kind, name = classify_path(rel)
+            origin = origin_of(rel)
+            digest = hashlib.sha256(raw).hexdigest()
+            content_version = f"{kind}/{name}@{digest[:12]}"
+            new_blob = _git_blob_sha(raw)
+            ver = config_store.upsert_live(
+                conn,
+                kind=kind,
+                name=name,
+                origin=origin,
+                path=rel,
+                sha256=digest,
+                version=content_version,
+                commit_sha=sha,
+                author=meta["author"],
+                source=meta["source"],
+                note=meta["note"],
+                at=meta["at"],
+                fields="{}",
+            )
+            events.emit(
+                f"config.{kind}.changed",
+                f"config:{kind}/{name}",
+                cls="durable",
+                ver=ver,
+                data={
+                    "path": rel,
+                    "commit": sha,
+                    "old_blob": old_blobs.get(rel, ABSENT),
+                    "new_blob": new_blob,
+                    "kind": kind,
+                    "name": name,
+                    "origin": origin,
+                    "version": ver,
+                    "content_version": content_version,
+                    "source": meta["source"],
+                },
+                connection=conn,
+            )
 
 
 def commit(changes: dict[str, str | bytes], base: dict[str, str], actor: str, source: str,
