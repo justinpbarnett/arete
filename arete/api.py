@@ -7,21 +7,25 @@ import json
 import platform
 import re
 import secrets
+import time
 import zlib
 from collections import Counter
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
 from . import (
     IMPORTED_NS, __version__, api_http, attention, bands, board, codebase, config, configcheck, configitems,
     configkinds, configrepo, contract, control, credential_http, devices, drafts, events, floor, inbox, leases,
-    outbox, paths, pi, record, refusals,
-    secretstore, settings, stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
+    loop_run, loops, outbox, paths, pi, record, refusals, secretstore, settings, sources, stats, tasks, ticket_media,
+    tool_events, triage, util, webhooks, webpush,
 )
+from . import principals as actor_principals
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import devices as device_store
 from .store import idempotency as claims_store
+from .store import sources as source_store
 from .store import tasks as task_store
 from .store import tokens, writes
 
@@ -464,6 +468,12 @@ def read(name, values, handler, *, conn=None):
         return {"devices": devices.device_views()}
     if name == "device.get":
         return {"device": needed(devices.device_get_view(values["device"]), values["device"])}
+    if name == "source.list":
+        connect = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return {"sources": sources.views(connect=connect, poll_limit=20)}
+    if name == "source.get":
+        connect = (lambda: nullcontext(conn)) if conn is not None else foundation.reader
+        return {"source": needed(sources.view_for(values["source"], connect=connect, poll_limit=50), values["source"])}
     if name == "lease.list":
         only_open: bool | None = None
         if "open" in values:
@@ -1092,8 +1102,9 @@ def dispatch(handler, op, path_values, query):
 
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
-    "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
-    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair", "run.step",
+    "device.probe", "source.poll", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
+    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair",
+    "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
     "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
@@ -1526,8 +1537,6 @@ def mutation(name, values, handler):
         _set_run_location(handler, run_id, created=True)
         result = {"run": run_object(runs.run_get(run_id))}
     elif name == "loop.start":
-        from . import loop_run
-
         ev_list = _resolve_events_input(values.get("events"))
         row = loop_run.launch(values["loop"], events=ev_list, wait=False)
         _set_run_location(handler, row["id"], created=True)
@@ -1715,6 +1724,110 @@ def mutation(name, values, handler):
         else:
             dev_view = needed(devices.device_get_view(device_name), device_name)
             result = {"device": dev_view, "probe": dev_view["last_probe"]}
+    elif name == "source.poll":
+        sid = values["source"]
+        dry_run = bool(values.get("dry_run", False))
+        cfg = config.load_or_problem()[0]
+        all_loops = loops.load_all(cfg)
+        src = next((s for s in sources.load_all(cfg, all_loops) if s.id == sid), None)
+        if src is None:
+            if not sid.startswith("oncall:") and source_store.cursor(sid) is not None:
+                raise contract.Problem("invalid_state", f"source '{sid}' is disabled")
+            raise contract.Problem("not_found", f"No source {sid}")
+        if not src.enabled:
+            raise contract.Problem("invalid_state", f"source '{sid}' is disabled")
+        if not dry_run and src.feeds == "pipeline":
+            raise contract.Problem("invalid_state", f"source '{sid}' feeds the pipeline; poll pipeline or use dry_run")
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        if src.definition.get("type") == "pipeline":
+            run = loop_run.launch("poll", trial=True) if dry_run else loop_run.launch("poll")
+            run_id = str(run["id"])
+            status = str(run.get("status") or "")
+            summary = str(run.get("summary") or "")
+            if status in ("queued", "running") and wait_seconds > 0:
+                deadline = time.monotonic() + wait_seconds
+                while time.monotonic() < deadline:
+                    row = runs.run_get(run_id)
+                    if row is not None and row["status"] not in ("queued", "running"):
+                        status = str(row["status"])
+                        summary = str(row.get("summary") or "")
+                        break
+                    time.sleep(0.05)
+            if status in ("queued", "running"):
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": run_id,
+                }
+            else:
+                if "picks" in run and isinstance(run["picks"], list):
+                    picks = [str(p) for p in run["picks"]]
+                else:
+                    feed_rows = runs.feed(run_id) if runs.run_get(run_id) is not None else []
+                    picks = [str(ln["text"]) for ln in feed_rows if ln.get("kind") == "out"]
+                ok_run = status in ("done", "skipped")
+                result = {
+                    "source": sid,
+                    "dry_run": dry_run,
+                    "ok": ok_run,
+                    "error": None if ok_run else (summary or status),
+                    "picks": picks,
+                    "op": run_id,
+                }
+        elif dry_run:
+            future = sources.submit_poll(sources.dry_run, src, cfg)
+            try:
+                result = future.result(timeout=wait_seconds)
+            except concurrent.futures.TimeoutError:
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": None,
+                }
+        else:
+            actor = actor_principals.current()
+
+            def _do_poll(target_src=src, target_cfg=cfg, target_actor=actor, target_sid=sid) -> dict:
+                with actor_principals.acting(target_actor):
+                    try:
+                        found, queued = sources.poll(target_src, target_cfg)
+                    except Exception as err:
+                        return {
+                            "source": target_sid,
+                            "dry_run": False,
+                            "ok": False,
+                            "error": f"{type(err).__name__}: {util.first_line(str(err), 300)}",
+                            "events": [],
+                            "queued": [],
+                        }
+                    return {
+                        "source": target_sid,
+                        "dry_run": False,
+                        "ok": True,
+                        "error": None,
+                        "events": found,
+                        "queued": queued,
+                    }
+
+            future = sources.submit_poll(_do_poll)
+            try:
+                result = future.result(timeout=wait_seconds)
+            except concurrent.futures.TimeoutError:
+                if handler is not None:
+                    handler.success_status = 202
+                result = {
+                    "accepted": True,
+                    "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                    "source": sid,
+                    "op": None,
+                }
     elif name == "push.subscribe":
         result = {"subscription": webpush.subscribe_v1(values, principals.contact(handler.person))}
     elif name == "push.remove":

@@ -25,9 +25,10 @@ KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
 
 
 class JiraError(RuntimeError):
-    def __init__(self, message: str, status: int = 0):
+    def __init__(self, message: str, status: int = 0, *, retry_after: int | float | None = None):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 class JiraUnsure(JiraError):
@@ -123,6 +124,7 @@ class Client:
         self._secret_row: dict | None = None
         self._me: dict | None = None
         self._statuses: dict[str, set[str]] = {}
+        self.rate: dict[str, int | None] = {"remaining": None, "retry_after": None}
 
     @classmethod
     def from_env(cls, cfg: config.JiraConfig) -> Client:
@@ -159,19 +161,26 @@ class Client:
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:
                     raw = r.read()
+                    self._record_rate(getattr(r, "headers", None), retry_after=None)
                     if self._secret_row and urllib.parse.urlsplit(r.geturl()).netloc == urllib.parse.urlsplit(url).netloc:
                         accounts.record_workspace(self._secret_row, "jira", "api_key")
                         self._secret_row = None
                     return raw
             except urllib.error.HTTPError as e:
                 wait = _retry_after(e, attempt)
+                header_retry = _header_retry_after(e)
+                self._record_rate(e.headers, retry_after=header_retry if e.code == 429 else None)
                 if (single_attempt or method != "GET") and e.code >= 500:
                     raise JiraUnsure(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}", e.code) from None
                 if (e.code == 429 or e.code >= 500) and attempt < retries and wait <= MAX_RETRY_WAIT:
                     time.sleep(wait)
                     continue
                 later = f" (retry after {wait:.0f} s)" if (wait > MAX_RETRY_WAIT or (e.code == 429 and retries == 0)) else ""
-                raise JiraError(f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip(), e.code) from None
+                raise JiraError(
+                    f"jira {method} {path}: HTTP {e.code} {_error_text(e)}{later}".rstrip(),
+                    e.code,
+                    retry_after=header_retry if e.code == 429 else None,
+                ) from None
             except (urllib.error.URLError, TimeoutError, OSError, RemoteDisconnected) as e:
                 never_sent = isinstance(e, urllib.error.URLError) and isinstance(
                     e.reason, (socket.gaierror, ConnectionRefusedError))
@@ -184,6 +193,14 @@ class Client:
                     continue
                 raise JiraError(f"jira {method} {path}: {e}") from None
         raise JiraError(f"jira {method} {path}: out of retries")
+
+    def _record_rate(self, headers, *, retry_after: int | None) -> None:
+        rem = _header_int(headers, "X-RateLimit-Remaining") if headers is not None else None
+        if rem is not None or retry_after is not None:
+            self.rate = {
+                "remaining": rem if rem is not None else self.rate.get("remaining"),
+                "retry_after": retry_after,
+            }
 
     def get(self, path: str, **params):
         return self.request("GET", path, params or None)
@@ -484,6 +501,21 @@ def _read_description(issue: dict) -> dict:
 
 def _path_segment(key: str) -> str:
     return urllib.parse.quote(key, safe="")
+
+
+def _header_int(headers, name: str) -> int | None:
+    raw = headers.get(name) if headers is not None else None
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return None
+    return max(0, math.ceil(value)) if math.isfinite(value) else None
+
+
+def _header_retry_after(e: urllib.error.HTTPError) -> int | None:
+    return _header_int(e.headers, "Retry-After")
 
 
 def _retry_after(e: urllib.error.HTTPError, attempt: int) -> float:

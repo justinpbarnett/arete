@@ -1078,6 +1078,71 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: st
     return sha
 
 
+def _inline_sources_by_id(loop_name: str, raw: bytes | None) -> dict[str, dict]:
+    if not raw:
+        return {}
+    from . import sources as sources_mod
+
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return {}
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("source"), list):
+        return {}
+    out: dict[str, dict] = {}
+    for entry in parsed["source"]:
+        if not isinstance(entry, dict) or sources_mod.is_file_ref(entry):
+            continue
+        sid = sources_mod.table_source_id(loop_name, entry)
+        if sources_mod.SOURCE_ID_RE.fullmatch(sid) and sid not in out:
+            out[sid] = dict(entry)
+    return out
+
+
+def _emit_inline_source_changes(
+    conn,
+    root: Path,
+    rel: str,
+    loop_name: str,
+    old_blob: str,
+    new_raw: bytes | None,
+    sha: str,
+    meta: dict,
+) -> None:
+    from . import sources as sources_mod
+
+    old_raw: bytes | None = None
+    if old_blob and old_blob != ABSENT:
+        done = _git(["cat-file", "blob", old_blob], root, check=False, text=False)
+        if done.returncode == 0:
+            old_raw = done.stdout
+    old_map = _inline_sources_by_id(loop_name, old_raw)
+    new_map = _inline_sources_by_id(loop_name, new_raw)
+    for sid in sorted(old_map.keys() | new_map.keys()):
+        if old_map.get(sid) == new_map.get(sid):
+            continue
+        new_cv = sources_mod.inline_version(sid, new_map[sid]) if sid in new_map else None
+        payload: dict[str, object] = {
+            "id": sid,
+            "name": sid,
+            "kind": "source",
+            "loop": loop_name,
+            "path": rel,
+            "commit": sha,
+            "origin": f"loop:{loop_name}",
+            "source": meta["source"],
+        }
+        if new_cv is not None:
+            payload["content_version"] = new_cv
+        events.emit(
+            "config.source.changed",
+            f"config:source/{sid}",
+            cls="durable",
+            data=payload,
+            connection=conn,
+        )
+
+
 def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[str, bytes | None],
                   old_blobs: dict[str, str]) -> None:
     if not paths.DB_FILE.exists() or not config_store.available():
@@ -1126,6 +1191,8 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                     },
                     connection=conn,
                 )
+                if kind == "loop":
+                    _emit_inline_source_changes(conn, root, rel, name, old_blobs.get(rel, ABSENT), None, sha, meta)
                 continue
             digest = hashlib.sha256(raw).hexdigest()
             content_version = f"{kind}/{name}@{digest[:12]}"
@@ -1164,6 +1231,8 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
                 },
                 connection=conn,
             )
+            if kind == "loop":
+                _emit_inline_source_changes(conn, root, rel, name, old_blobs.get(rel, ABSENT), raw, sha, meta)
         if meta.get("draft_id"):
             drafts.finalize_activated_draft(conn, meta["draft_id"], sha)
 
@@ -1523,6 +1592,8 @@ def _reconcile_locked(root: Path, fence: Fence) -> int:
                         },
                         connection=conn,
                     )
+                    if kind == "loop":
+                        _emit_inline_source_changes(conn, root, rel, name, old_blob, raw, sha, meta)
                 if meta.get("draft_id"):
                     from . import drafts
 

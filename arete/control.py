@@ -31,7 +31,6 @@ from .loops import Loop
 from .store import db as foundation
 from .store import loops as loop_store
 from .store import runs as run_store
-from .store import sources as source_store
 from .store import writes
 
 AB_DAYS = 30
@@ -256,7 +255,6 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
     cfg = config.load_or_problem()[0]
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
-    source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
     runs = run_store.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
     paid = run_store.paid_by_run([r["id"] for r in runs], connect)
     return {**view, "prompt": loops.prompt_text(loop), "state": loop_store.loop_state(loop.name, connect)["data"],
@@ -265,7 +263,7 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
             "waiting": [i for i in loop_store.pending(connect) if i["loop"] == loop.name],
             "dead": [{k: v for k, v in i.items() if k != "loop"}
                      for i in loop_store.dead_items(connect) if i["loop"] == loop.name],
-            "cursors": [c for c in source_store.cursors(connect) if c["source"] in source_ids],
+            "sources": sources.views_for_loop(cfg, loop, connect=connect),
             "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "secret_present": bool(loop.trigger.webhook and webhooks.present(loop.name)),
             "model": loop.model_for(cfg) if loop.agent and not loop.error else "",

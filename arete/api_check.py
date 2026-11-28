@@ -613,7 +613,8 @@ class Check:
                       "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
-                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
+                      "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"],
+                      "source": "pipeline"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
@@ -775,6 +776,11 @@ class Check:
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 elif name == "incident.scan":
                     with patch.object(oncall, "scan", return_value={"seen": 0}):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "source.poll":
+                    from . import loop_run as loop_run_mod
+
+                    with patch.object(loop_run_mod, "launch", return_value={"id": "poll-check", "status": "done", "picks": []}):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])

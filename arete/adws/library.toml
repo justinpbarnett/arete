@@ -302,6 +302,14 @@ params = [
 out = [{ pin = "event", type = "event" }, { pin = "task", type = "task" }]
 
 [[trigger]]
+id = "pipeline"
+kind = "source"
+params = [
+  { name = "loop", type = "string", hint = "Engine loop driving pipeline polling (default poll)" },
+]
+out = [{ pin = "task", type = "task" }]
+
+[[trigger]]
 id = "schedule"
 kind = "schedule"
 params = [

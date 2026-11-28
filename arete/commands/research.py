@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-from .. import config, paths
+from .. import paths
 from ..store import db as foundation
 
 
@@ -15,39 +15,82 @@ def piped_events() -> list[dict]:
 
 
 def cmd_jira_check(args) -> int:
-    from .. import jira, poll, tracker
+    from urllib.parse import quote
 
-    cfg = config.load()
-    try:
-        client = jira.Client.from_env(cfg.jira)
-        me = client.me()
-        print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
-        routes = poll.jira_routes_by_project(cfg)
-        targets = [(f"[jira.transitions] {k}", k, v) for k, v in cfg.jira.transitions.items()]
-        targets += [(f"[jira.research] {k}", f"research {k}", v) for k, v in cfg.jira.research.items()]
-        targets += [(f"[jira.landed] {k}", f"landed on {k}", v) for k, v in cfg.jira.landed.items()]
-        for project, labels in sorted(routes.items()):
-            jql = tracker.candidates_jql(project)
-            n = len(client.search(jql, ["labels"], limit=100))
-            print(f"  {project}: {n} labeled `{tracker.LABEL}` and waiting; routes {', '.join(sorted(labels))}")
-            known = {s.lower() for s in client.statuses(project)}
-            for key, _, name in targets:
-                if name.lower() not in known:
-                    print(f"  {project}: no status named '{name}' for {key}; it moves a ticket only where a "
-                          "transition has that name")
-            if targets:
-                print(f"  {project}: moves " + ", ".join(f"{when} to {name}" for _, when, name in targets))
-    except jira.JiraError as e:
-        print(f"jira failed: {e}")
+    from .. import client, tracker
+
+    listing = client.call("GET", "/api/v1/sources")
+    jira_sources = [
+        s for s in (listing.get("sources") or ())
+        if isinstance(s, dict) and s.get("feeds") == "pipeline" and s.get("kind") == "jira"
+    ]
+    if not jira_sources:
+        print("jira ok")
+        return 0
+    seen_header: set[tuple[str, str]] = set()
+    failed = False
+    for src in jira_sources:
+        sid = str(src["id"])
+        try:
+            reply = client.call(
+                "POST",
+                f"/api/v1/sources/{quote(sid, safe='')}/poll",
+                {"dry_run": True},
+                extra_headers={"Prefer": "wait=10"},
+            )
+        except client.Failed as e:
+            print(f"jira failed: {e}")
+            failed = True
+            continue
+        if not reply.get("ok", True):
+            print(f"jira failed: {reply.get('error') or 'unknown error'}")
+            failed = True
+            continue
+        info = reply.get("check") or {}
+        base, login = str(info.get("base") or ""), str(info.get("login") or "?")
+        if (base, login) not in seen_header:
+            seen_header.add((base, login))
+            print(f"jira {base} as {login}")
+        project = str(info.get("project") or sid.removeprefix("jira-").upper())
+        waiting = int(info.get("waiting") or 0)
+        routes = [str(r) for r in (info.get("routes") or ())]
+        print(f"  {project}: {waiting} labeled `{tracker.LABEL}` and waiting; routes {', '.join(routes)}")
+        for miss in info.get("missing_statuses") or ():
+            print(
+                f"  {project}: no status named '{miss['status']}' for {miss['key']}; it moves a ticket only where a "
+                "transition has that name"
+            )
+        if moves := info.get("moves") or []:
+            print(f"  {project}: moves " + ", ".join(f"{m['when']} to {m['status']}" for m in moves))
+    if failed:
         return 1
     print("jira ok")
     return 0
 
 
 def cmd_poll(args) -> int:
-    from .. import poll
+    if getattr(args, "local", False):
+        from .. import poll
 
-    return poll.poll(dry_run=args.dry_run)
+        return poll.poll(dry_run=args.dry_run)
+    from .. import client
+
+    reply = client.call(
+        "POST",
+        "/api/v1/sources/pipeline/poll",
+        {"dry_run": bool(args.dry_run)},
+        extra_headers={"Prefer": "wait=10"},
+    )
+    for line in reply.get("picks") or ():
+        print(line)
+    if reply.get("accepted") and reply.get("op"):
+        print(f"started {reply['op']}")
+        return 0
+    if not reply.get("ok", True):
+        if err := reply.get("error"):
+            print(err, file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_mine(args) -> int:
@@ -183,6 +226,7 @@ def register(sub) -> None:
 
     p = sub.add_parser("poll", help="loop 3: run the pipeline on the oldest ready ticket in each pipeline repo")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--local", action="store_true", help="run the poll in this process")
     p.set_defaults(fn=cmd_poll)
 
     p = sub.add_parser("mine", help="loop 1: mine corrections into harness PRs and repository enforcement proposals")
@@ -197,7 +241,7 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_audit)
 
     p = sub.add_parser("jira-check", help="read Jira with the configured token and count waiting tickets")
-    p.set_defaults(fn=cmd_jira_check, local_read=True)
+    p.set_defaults(fn=cmd_jira_check)
 
     p = sub.add_parser("eval", help="loop 4: run eval tasks (all repos with evals when REPO is left out); "
                                     "`eval mine [REPO]` writes tasks from merged arete PRs")

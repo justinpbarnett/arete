@@ -32,5 +32,11 @@ days = 56
 [events_file]
 days = 90
 
+[source_polls]
+days = 90
+
+[sources]
+unused_days = 90
+
 [db]
 max_mb = 500

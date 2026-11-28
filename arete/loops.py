@@ -312,17 +312,18 @@ def folders(cfg: config.Config) -> list[tuple[str, str, Path]]:
             if not (origin == "private" and is_switch_only(d / name))]
 
 
-def load_all(cfg: config.Config | None = None) -> list[Loop]:
+def load_all(cfg: config.Config | None = None, *, check: bool = True) -> list[Loop]:
     if cfg is None:
         from . import pins
 
         cfg = pins.active_config()
     loops: dict[str, Loop] = {}
+    seen_inline: dict[str, str] = {}
     switched = switch_overrides(cfg)
     for origin, repo, folder in folders(cfg):
         name = f"{repo}/{folder.name}" if repo else folder.name
         try:
-            loop = load(folder, origin, repo, cfg)
+            loop = load(folder, origin, repo, cfg, seen_inline=seen_inline, check=check)
         except (LoopError, cron.BadSchedule, tomllib.TOMLDecodeError, ValueError, TypeError, KeyError,
                 AttributeError, OSError) as e:
             loop = broken(name, folder, origin, str(e) if isinstance(e, LoopError | cron.BadSchedule)
@@ -333,6 +334,14 @@ def load_all(cfg: config.Config | None = None) -> list[Loop]:
             loop.enabled, loop.error = False, f"another loop is already named {name} in {loops[name].dir}"
             loops[f"{name}@{folder}"] = loop
             continue
+        if not loop.error:
+            from . import sources as sources_mod
+
+            for table in loop.sources:
+                if not sources_mod.is_file_ref(table):
+                    sid = sources_mod.table_source_id(loop.name, table)
+                    if sources_mod.SOURCE_ID_RE.fullmatch(sid) and sid not in seen_inline:
+                        seen_inline[sid] = loop.name
         loops[name] = loop
     return list(loops.values())
 
@@ -353,7 +362,8 @@ def find(name: str, cfg: config.Config | None = None) -> Loop:
     raise LoopError(f"no loop named {name}; see `arete loop list`")
 
 
-def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
+def load(folder: Path, origin: str, repo: str, cfg: config.Config, *,
+         seen_inline: dict[str, str] | None = None, check: bool = True) -> Loop:
     data = tomllib.loads((folder / "loop.toml").read_text())
     if not NAME.match(folder.name):
         raise LoopError(f"folder name '{folder.name}' must be lowercase letters, digits and dashes")
@@ -399,7 +409,8 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         group=str(trig.get("group", "")),
         trust=str(trig.get("trust", "untrusted")),
     )
-    validate(loop, cfg)
+    if check:
+        validate(loop, cfg, seen_inline=seen_inline)
     return loop
 
 
@@ -432,28 +443,114 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
 RESERVED_SOURCE_NAMES = ("webhook", "metric")
 
 
-def source_name_problems(loop: Loop) -> list[str]:
-    problems = []
-    names = [s.get("name") for s in loop.sources]
-    if len(loop.sources) > 1 and any(n is None for n in names):
-        problems.append("a loop with more than one [[source]] needs a name on each, such as name = \"issues\"")
-    for name in (n for n in names if n is not None):
+def _other_inline_sources(loop: Loop, cfg: config.Config) -> dict[str, str]:
+    from . import sources as sources_mod
+
+    found: dict[str, str] = {}
+    own_dir = loop.dir.resolve()
+    for _, repo, folder in folders(cfg):
+        if folder.resolve() == own_dir:
+            continue
+        other_name = f"{repo}/{folder.name}" if repo else folder.name
+        if other_name == loop.name:
+            continue
+        try:
+            data = tomllib.loads((folder / "loop.toml").read_text())
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            continue
+        raw_sources = data.get("source")
+        if not isinstance(raw_sources, list):
+            continue
+        for entry in raw_sources:
+            if not isinstance(entry, dict) or sources_mod.is_file_ref(entry):
+                continue
+            sid = sources_mod.table_source_id(other_name, entry)
+            if sources_mod.SOURCE_ID_RE.fullmatch(sid) and sid not in found:
+                found[sid] = other_name
+    return found
+
+
+def source_problems(loop: Loop, cfg: config.Config, *, seen_inline: dict[str, str] | None = None) -> list[str]:
+    from . import sources as sources_mod
+
+    problems: list[str] = []
+    unnamed = [s for s in loop.sources if s.get("id") is None and s.get("name") is None]
+    if len(unnamed) > 1:
+        problems.append("at most one [[source]] per loop may omit both id and name; set an explicit id or name")
+
+    other_inline = _other_inline_sources(loop, cfg) if seen_inline is None else seen_inline
+    local_inline: set[str] = set()
+    names = [s.get("name") for s in loop.sources if s.get("name") is not None]
+    for name in names:
         if not isinstance(name, str) or not NAME.fullmatch(name):
             problems.append(f"source name {name!r} must be lowercase letters, digits and dashes")
         elif name.isdigit():
             problems.append(f"source name '{name}' cannot be only digits, it would collide with a position")
         elif name in RESERVED_SOURCE_NAMES:
             problems.append(f"source name '{name}' is reserved")
-    named = [n for n in names if isinstance(n, str)]
-    problems += [f"source name '{n}' is used by more than one [[source]]" for n in sorted(set(named))
-                 if named.count(n) > 1]
+    valid_names = [n for n in names if isinstance(n, str)]
+    problems += [
+        f"source name '{n}' is used by more than one [[source]]"
+        for n in sorted(set(valid_names))
+        if valid_names.count(n) > 1
+    ]
+
+    for s in loop.sources:
+        raw_id = s.get("id")
+        if raw_id is not None:
+            if not isinstance(raw_id, str) or not sources_mod.SOURCE_ID_RE.fullmatch(raw_id):
+                problems.append(
+                    f"source id {raw_id!r} must match ^[a-z0-9][a-z0-9-]{{0,63}}$; set an explicit id"
+                )
+                continue
+            sid = raw_id
+        else:
+            sid = sources_mod.table_source_id(loop.name, s)
+            if len(sid) > 64 or not sources_mod.SOURCE_ID_RE.fullmatch(sid):
+                problems.append(
+                    f"derived source id '{sid}' is invalid or over 64 characters; set an explicit id"
+                )
+                continue
+
+        if sources_mod.is_file_ref(s):
+            file_path = sources_mod.source_file_path(sid)
+            if file_path is None:
+                problems.append(f"source '{sid}' names no file in sources/{sid}.toml or defaults")
+                continue
+            try:
+                parsed = tomllib.loads(file_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+                problems.append(f"source '{sid}' ({sources_mod.source_file_rel(file_path)}) does not load: {error}")
+                continue
+            if not isinstance(parsed, dict) or parsed.get("type") not in sources_mod.SOURCES:
+                problems.append(
+                    f"source '{sid}' type '{parsed.get('type') if isinstance(parsed, dict) else None}' "
+                    f"is not one of {', '.join(sources_mod.SOURCES)}"
+                )
+            else:
+                problems += sources_mod.SOURCES[parsed["type"]].problems(parsed, None, cfg)
+            continue
+
+        if sid in local_inline:
+            problems.append(f"source '{sid}' is already defined inline in loop '{loop.name}'")
+        elif (existing_file := sources_mod.source_file_path(sid)) is not None:
+            problems.append(
+                f"source '{sid}' is already defined by {sources_mod.source_file_rel(existing_file)}"
+            )
+        elif sid in other_inline and other_inline[sid] != loop.name:
+            problems.append(f"source '{sid}' is already defined inline by loop '{other_inline[sid]}'")
+        local_inline.add(sid)
+
+        if s.get("type") not in sources_mod.SOURCES:
+            problems.append(f"source type '{s.get('type')}' is not one of {', '.join(sources_mod.SOURCES)}")
+        else:
+            problems += sources_mod.SOURCES[s["type"]].problems(s, loop, cfg)
     return problems
 
 
-def validate(loop: Loop, cfg: config.Config) -> None:
+def validate(loop: Loop, cfg: config.Config, *, seen_inline: dict[str, str] | None = None) -> None:
     from . import routing
     from .delivery import EMITS
-    from .sources import SOURCES
 
     problems = []
     kind = KINDS.get(loop.kind)
@@ -490,12 +587,7 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"a loop that takes findings from other loops and has the acting tools {', '.join(acting)} "
                         f"needs [trigger] trust = \"internal\" or above, so a finding from untrusted text never "
                         f"reaches it")
-    problems += source_name_problems(loop)
-    for s in loop.sources:
-        if s.get("type") not in SOURCES:
-            problems.append(f"source type '{s.get('type')}' is not one of {', '.join(SOURCES)}")
-        else:
-            problems += SOURCES[s["type"]].problems(s, loop, cfg)
+    problems += source_problems(loop, cfg, seen_inline=seen_inline)
     for e in loop.emits:
         if e.get("type") not in EMITS:
             problems.append(f"emit type '{e.get('type')}' is not one of {', '.join(EMITS)}")

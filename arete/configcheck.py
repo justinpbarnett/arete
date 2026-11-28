@@ -309,6 +309,11 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
                 config.ask_table(ask_part)
         except (ValueError, TypeError) as error:
             problems.append(f"{where}: {error}")
+    elif kind == "source":
+        from . import sources as sources_mod
+
+        if not sources_mod.SOURCE_ID_RE.fullmatch(name):
+            problems.append(f"{where}: source id {name!r} must match ^[a-z0-9][a-z0-9-]{{0,63}}$")
     return problems
 
 
@@ -408,6 +413,47 @@ def _validate_references(
                         problems.append(
                             f"{where}: drops required field(s) {', '.join(dropped)} from engine schema {name}"
                         )
+    elif kind == "source" and isinstance(parsed, dict):
+        from . import sources as sources_mod
+        from .store import db as foundation
+        from .store import projects as projects_store
+
+        cfg = config.load_or_problem()[0]
+        stype = parsed.get("type")
+        if stype not in sources_mod.SOURCES:
+            problems.append(f"{where}: source type {stype!r} is not one of {', '.join(sources_mod.SOURCES)}")
+        else:
+            problems.extend(f"{where}: {p}" for p in sources_mod.SOURCES[stype].problems(parsed, None, cfg))
+        raw_line = parsed.get("line")
+        if isinstance(raw_line, str) and raw_line.strip() and paths.DB_FILE.exists():
+            lid = raw_line.strip()
+            with foundation.reader() as conn:
+                if projects_store.available(conn):
+                    row = projects_store.get_line(conn, lid)
+                    if row is None:
+                        problems.append(f"{where}: unknown line '{lid}'")
+                    elif row["archived"]:
+                        problems.append(f"{where}: line '{lid}' is archived")
+    elif kind == "loop" and isinstance(parsed, dict):
+        from .store import db as foundation
+        from .store import projects as projects_store
+
+        raw_sources = parsed.get("source")
+        if isinstance(raw_sources, list) and paths.DB_FILE.exists():
+            line_ids = [
+                entry["line"].strip()
+                for entry in raw_sources
+                if isinstance(entry, dict) and isinstance(entry.get("line"), str) and entry["line"].strip()
+            ]
+            if line_ids:
+                with foundation.reader() as conn:
+                    if projects_store.available(conn):
+                        for lid in line_ids:
+                            row = projects_store.get_line(conn, lid)
+                            if row is None:
+                                problems.append(f"{where}: unknown line '{lid}'")
+                            elif row["archived"]:
+                                problems.append(f"{where}: line '{lid}' is archived")
     elif kind == "prompt" and isinstance(parsed, str):
         if not name.endswith(".append") and not path.startswith("layers/"):
             cfg_file = config_dir / "config.toml"
@@ -433,6 +479,55 @@ def _validate_references(
             except ValueError as error:
                 problems.append(f"{where}: {error}")
     return problems, warnings
+
+
+def _source_list_gate(loop_name: str, old_val: object, new_val: object) -> tuple[str, bool, list[str]]:
+    """Compute (gate, all_a, exposes) for inline [[source]] table edits inside a loop."""
+    from . import sources as sources_mod
+
+    old_list = old_val if isinstance(old_val, list) else []
+    new_list = new_val if isinstance(new_val, list) else []
+    old_by_id = {
+        sources_mod.table_source_id(loop_name, entry): entry
+        for entry in old_list
+        if isinstance(entry, dict)
+    }
+    new_by_id = {
+        sources_mod.table_source_id(loop_name, entry): entry
+        for entry in new_list
+        if isinstance(entry, dict)
+    }
+    gate = "A"
+    all_a = True
+    exposes: list[str] = []
+    for sid in sorted(old_by_id.keys() | new_by_id.keys()):
+        old_tbl = old_by_id.get(sid)
+        new_tbl = new_by_id.get(sid)
+        if old_tbl is None:
+            all_a = False
+            gate = _raise_gate(gate, "B")
+            for sub_dotted, ov, nv in _diff_paths({}, new_tbl):
+                if _is_reach_change("source", sub_dotted, ov, nv):
+                    exposes.append(f"source.{sid}.{sub_dotted}")
+                    gate = "C"
+            continue
+        if new_tbl is None:
+            all_a = False
+            gate = _raise_gate(gate, "B")
+            for sub_dotted, ov, nv in _diff_paths(old_tbl, {}):
+                if _is_reach_change("source", sub_dotted, ov, nv):
+                    exposes.append(f"source.{sid}.{sub_dotted}")
+                    gate = "C"
+            continue
+        for sub_dotted, ov, nv in _diff_paths(old_tbl, new_tbl):
+            if _is_reach_change("source", sub_dotted, ov, nv):
+                exposes.append(f"source.{sid}.{sub_dotted}")
+                gate = "C"
+                all_a = False
+            elif not _is_a_only_change("source", sub_dotted):
+                all_a = False
+                gate = _raise_gate(gate, "B")
+    return gate, all_a, exposes
 
 
 def _compute_floor(
@@ -491,8 +586,17 @@ def _compute_floor(
         else:
             all_a = True
             gate = default_gate
+            if kind == "source" and old_bytes is None:
+                all_a = False
+                gate = _raise_gate(gate, "B")
             for dotted, old_v, new_v in changes:
-                if _is_reach_change(kind, dotted, old_v, new_v):
+                if kind == "loop" and dotted == "source":
+                    s_gate, s_all_a, s_exposes = _source_list_gate(name, old_v, new_v)
+                    exposes.extend(s_exposes)
+                    gate = _raise_gate(gate, s_gate)
+                    if not s_all_a:
+                        all_a = False
+                elif _is_reach_change(kind, dotted, old_v, new_v):
                     exposes.append(dotted)
                     gate = "C"
                     all_a = False
@@ -825,9 +929,29 @@ def _stage_dry_run(
     raw_bytes: bytes,
     config_dir: Path,
     author: str,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], dict | None]:
     problems: list[str] = []
     notes: list[str] = []
+
+    if kind == "source" and isinstance(parsed, dict):
+        from . import sources as sources_mod
+
+        cfg = config.load_or_problem()[0]
+        if parsed.get("type") == "pipeline":
+            dr = {"source": name, "dry_run": True, "ok": True, "error": None, "items": [], "would_rescope": False, "check": None}
+            notes.append("pipeline source: no fetch")
+            return problems, notes, dr
+        try:
+            src = sources_mod.build_file_src(name, parsed, raw_bytes, cfg, config_dir=config_dir)
+            dr = sources_mod.dry_run(src, cfg)
+        except Exception as error:
+            problems.append(f"dry_run source failed: {error}")
+            return problems, notes, None
+        if not dr.get("ok"):
+            problems.append(f"dry_run source failed: {dr.get('error') or 'unknown error'}")
+        else:
+            notes.append(f"items: {len(dr.get('items') or ())}, would_rescope: {bool(dr.get('would_rescope'))}")
+        return problems, notes, dr
 
     if kind == "prompt":
         try:
@@ -840,16 +964,16 @@ def _stage_dry_run(
             notes.append(f"rendered sample task for {len(lines)} line(s) ({len(rendered)} chars)")
         except Exception as error:
             problems.append(f"dry_run prompt render failed: {error}")
-        return problems, notes
+        return problems, notes, None
 
     if kind == "schema":
         if not isinstance(parsed, dict):
             problems.append("dry_run schema must be a JSON object")
-            return problems, notes
+            return problems, notes, None
         cfg = config.load_or_problem()[0]
         lines = [r.name for r in cfg.repos] or ["default"]
         notes.append(f"validated sample schema binding for {len(lines)} line(s)")
-        return problems, notes
+        return problems, notes, None
 
     if kind in ("step_settings", "models"):
         with tempfile.TemporaryDirectory(prefix="arete-check-dryrun-") as tmp:
@@ -896,7 +1020,7 @@ def _stage_dry_run(
                     problems.append(f"dry_run diff failed: {error}")
             else:
                 notes.append("dry_run skipped (no live config.toml)")
-        return problems, notes
+        return problems, notes, None
 
     if kind in ("adw", "routes"):
         with tempfile.TemporaryDirectory(prefix="arete-check-adw-") as tmp:
@@ -907,7 +1031,7 @@ def _stage_dry_run(
                 res = adw.check_draft(kind, parsed, cfg=cfg, config_dir=overlay, where=path, actor=author)
             except Exception as error:
                 problems.append(f"dry_run {kind} failed: {error}")
-                return problems, notes
+                return problems, notes, None
             if res.get("status") != "valid":
                 problems.extend(res.get("errors") or [f"{kind} dry run failed"])
             else:
@@ -916,10 +1040,10 @@ def _stage_dry_run(
                     notes.append(f"outline: {len(dr.get('outline') or ())} node(s)")
                 else:
                     notes.append(f"route changes: {len(dr.get('changes') or ())} ticket(s)")
-        return problems, notes
+        return problems, notes, None
 
     notes.append("skipped")
-    return problems, notes
+    return problems, notes, None
 
 
 def check(
@@ -1033,10 +1157,10 @@ def check(
         return {"validator": VALIDATOR, "ok": not res_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 6: dry_run
-    dry_problems, dry_notes = _stage_dry_run(kind, name, path, parsed, raw_bytes, root, author)
+    dry_problems, dry_notes, dry_report = _stage_dry_run(kind, name, path, parsed, raw_bytes, root, author)
     stages.append(_stage("dry_run", not dry_problems, dry_problems, dry_notes))
     ok = not dry_problems
-    return {
+    report: dict[str, object] = {
         "validator": f"{VALIDATOR}@{codebase.STAMP}",
         "ok": ok,
         "stages": stages,
@@ -1044,6 +1168,9 @@ def check(
         "exposes": exposes,
         "warnings": warnings,
     }
+    if dry_report is not None:
+        report["dry_run"] = dry_report
+    return report
 
 
 def check_staged_files(staged_blobs: dict[str, bytes], root: Path) -> tuple[bool, str, list[str]]:

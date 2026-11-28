@@ -7652,9 +7652,12 @@ class _CliThroughServeCase(unittest.TestCase):
         "oncall cancel 1": "POST /api/incidents/{id}/cancel",
         "oncall dismiss 1": "POST /api/incidents/{id}/dismiss",
         "oncall retry 1": "POST /api/incidents/{id}/retry",
+        "poll": "POST /api/v1/sources/{source}/poll",
+        "jira-check": "GET /api/v1/sources",
         "derived recompute band:demo --base-version 1": "POST /api/v1/derived/band/{line}/recompute",
     }
     ONLINE_VARIANTS = {
+        "poll --dry-run": "POST /api/v1/sources/{source}/poll",
         "status --json r1": "GET /api/runs/{run}/events",
         "status --json": "GET /api/live",
         "record pin r1": None,
@@ -7671,7 +7674,7 @@ class _CliThroughServeCase(unittest.TestCase):
     CREDENTIAL_COMMANDS = ("login --token-stdin", "logout", "pair")
     READS = (
         "ab", "backup --check", "benchmark report missing", "costs", "devices", "doctor", "events",
-        "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
+        "experiment summary missing", "jev report", "loop feed r1", "loop list", "loop status poll",
         "merged", "oncall list", "oncall show 1", "prices diff", "prices recompute r1 build", "prompts",
         "hold", "record r1", "research", "secrets replay-sample", "session list", "session report r1",
         "steps --repo replay-sample", "triage", "verifiers report missing",
@@ -7692,7 +7695,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
         "mcp": "mcp_stdio", "mcp-ask": "owner_asks", "mcp-config": "commands.api",
         "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
-        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
+        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "prices import": "prices",
         "release enroll": "release_proof", "release observe": "release_proof", "release status": "release_proof",
         "release-journeys": "releasejourneys", "replay sample": "replay",
         "repo enroll": "commands.setup", "repo publish": "commands.setup", "repo publish-pair": "commands.setup",
@@ -7711,6 +7714,7 @@ class _CliThroughServeCase(unittest.TestCase):
     LOCAL_VARIANTS = {
         "run replay-sample 7 --dry-run": "pipeline.run_issue / record.start",
         "run replay-sample 7 --local": "pipeline.run_issue", "file-rule 1 --local": "miner.file_rule",
+        "poll --local": "poll.poll",
         "loop new --run-id r1 work": "scaffold.draft", "loop start example --events sample.json": "loop_run.launch",
         "session start --task work": "sessions.launch", "session start --task --draft-pr work": "sessions.launch",
         "research --next": "research.next_due", "research replay-sample#7 --run": "research.run_now",
@@ -9729,8 +9733,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 173)
-        self.assertEqual(len({op["name"] for op in operations}), 173)
+        self.assertEqual(len(operations), 176)
+        self.assertEqual(len({op["name"] for op in operations}), 176)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -23960,6 +23964,881 @@ class SettingsShellTests(unittest.TestCase):
             assert.equal(SECTIONS.length, 13);
         """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class SourceConfigTests(unittest.TestCase):
+    class_timeout = 30
+
+    def _run_source_child(self, script: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-sources-") as tmp:
+            root = Path(tmp).resolve()
+            env = api_check.isolated_env(root)
+            env["ARETE_TEST_FAST_SYNC"] = "1"
+            env["ARETE_DRIVE_FLUSH"] = "0"
+            preamble = (
+                "import hashlib, http.client, json, os, shutil, socket, sqlite3, subprocess, sys, threading, time\n"
+                "from contextlib import contextmanager, redirect_stdout\n"
+                "from datetime import UTC, datetime, timedelta\n"
+                "from http.server import ThreadingHTTPServer\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "import urllib.request\n"
+                "from arete import (\n"
+                "    accounts, api, api_check, cli, client, config, configcheck, configrepo, control,\n"
+                "    credential_files, dashboard, gh, inbox, jira, lines as lines_mod, loop_run, loops,\n"
+                "    paths, poll as poll_mod, principals, record, retention, serve, sources, tailnet, util,\n"
+                ")\n"
+                "from arete.store import (\n"
+                "    db, inbox as inbox_store, loops as loop_store, retention as retention_store,\n"
+                "    runs as run_store, sources as source_store, tokens as token_store,\n"
+                ")\n"
+                "def _forbid(*a, **kw):\n"
+                "    raise RuntimeError('external transport forbidden in SourceConfigTests')\n"
+                "mock.patch.object(urllib.request, 'urlopen', _forbid).start()\n"
+                "mock.patch.object(accounts, 'read', _forbid).start()\n"
+                "mock.patch.object(gh, 'gh', _forbid).start()\n"
+                "ROOT = Path.cwd()\n"
+                "def emit(val):\n"
+                "    print('BEHAVIOR_RESULT=' + json.dumps(val), flush=True)\n"
+                "@contextmanager\n"
+                "def live_dashboard(login='owner@example.test'):\n"
+                "    logins = tailnet.Logins(mock.Mock())\n"
+                "    logins.of = lambda _: login\n"
+                "    with mock.patch('socket.getfqdn', return_value='127.0.0.1'):\n"
+                "        srv = ThreadingHTTPServer(('127.0.0.1', 0), dashboard.Handler)\n"
+                "    srv.node = SimpleNamespace(names={'127.0.0.1'})\n"
+                "    srv.logins = logins\n"
+                "    srv.tls = object()\n"
+                "    srv.pending_secrets = {}\n"
+                "    t = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)\n"
+                "    t.start()\n"
+                "    try:\n"
+                "        yield srv, srv.server_address[1]\n"
+                "    finally:\n"
+                "        srv.shutdown()\n"
+                "        srv.server_close()\n"
+                "        t.join(timeout=2)\n"
+                "def http_req(port, method, path, *, token, body=None, key=None, extra_headers=None):\n"
+                "    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)\n"
+                "    headers = {'Authorization': 'Bearer ' + token}\n"
+                "    if extra_headers:\n"
+                "        headers.update(extra_headers)\n"
+                "    payload = None\n"
+                "    if body is not None:\n"
+                "        headers['Content-Type'] = 'application/json'\n"
+                "        payload = json.dumps(body).encode()\n"
+                "    if key:\n"
+                "        headers['Idempotency-Key'] = key if len(key) >= 8 else f'idem-key-{key}'\n"
+                "    try:\n"
+                "        conn.request(method, path, body=payload, headers=headers)\n"
+                "        resp = conn.getresponse()\n"
+                "        raw = resp.read().decode()\n"
+                "        return resp.status, dict(resp.getheaders()), (json.loads(raw) if raw.strip() else None)\n"
+                "    finally:\n"
+                "        conn.close()\n"
+                "def write_loop(name, text):\n"
+                "    folder = paths.CONFIG_DIR / 'loops' / name\n"
+                "    folder.mkdir(parents=True, exist_ok=True)\n"
+                "    (folder / 'loop.toml').write_text(text, encoding='utf-8')\n"
+                "    return folder\n"
+                "def append_jsonl(path, rows):\n"
+                "    with open(path, 'a', encoding='utf-8') as f:\n"
+                "        for r in rows:\n"
+                "            f.write(json.dumps(r) + '\\n')\n"
+                "def say_poll(srv_obj, src):\n"
+                "    buf = StringIO()\n"
+                "    with redirect_stdout(buf):\n"
+                "        srv_obj.poll_source(src)\n"
+                "    return buf.getvalue()\n"
+            )
+            cmd = api_check.child_command(Path(__file__).resolve().parents[1], preamble + "\n" + script)
+            done = subprocess.run(
+                cmd, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT, check=False,
+            )
+            if done.returncode != 0:
+                self.fail(f"source child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+            for line in reversed(done.stdout.splitlines()):
+                if line.startswith("BEHAVIOR_RESULT="):
+                    return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+            self.fail(f"missing BEHAVIOR_RESULT= line:\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+
+    def test_health_reorder_insert_edit_unused_and_new_ids(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n[jira]\nbase_url = "https://jira.example.test"\nemail = "bot@example.test"\n')
+db.migrate()
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == db.LATEST
+    names = {r["name"] for r in c.execute("SELECT name FROM schema_migrations")}
+    assert "m0070_sources_durable_expand.py" in names
+    assert "m0071_sources_durable_backfill.py" in names
+configrepo.init()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+
+a_file = ROOT / "a.jsonl"
+b_file = ROOT / "b.jsonl"
+c_file = ROOT / "c.jsonl"
+append_jsonl(a_file, [{"key": "a1", "title": "A1"}])
+append_jsonl(b_file, [{"key": "b1", "title": "B1"}])
+append_jsonl(c_file, [{"key": "c1", "title": "C1"}, {"key": "c2", "title": "C2"}])
+
+class FakeJira:
+    def __init__(self, issues, refused_jql="", rate=None, retry_after=None):
+        self.base = "https://jira.example.test"
+        self._issues = issues
+        self._refused_jql = refused_jql
+        self.rate = dict(rate or {"remaining": None, "retry_after": None})
+        self._retry_after = retry_after
+
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+
+    def search(self, jql, fields, limit=50):
+        if self._refused_jql and jql == self._refused_jql:
+            raise jira.JiraError("bad jql", 429, retry_after=self._retry_after)
+        return self._issues[:limit]
+
+now_iso = util.iso()
+fake_jira = FakeJira([{"key": "ABC-1", "fields": {"summary": "First", "updated": now_iso}}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+why = "watch local events"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status = Ready"
+every = "10s"
+''')
+
+srv = serve.Server()
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    out_a = say_poll(srv, by_id["a"])
+    out_j1 = say_poll(srv, by_id["j"])
+    assert "a1" in out_a and "baseline" in out_a
+    assert "ABC-1" in out_j1 and "baseline" in out_j1
+    first_ok = source_store.cursor("j")["last_ok"]
+
+    fake_jira._refused_jql = "status = Ready"
+    fake_jira.rate = {"remaining": 40, "retry_after": 30}
+    fake_jira._retry_after = 30
+    say_poll(srv, by_id["j"])
+    say_poll(srv, by_id["j"])
+
+with live_dashboard() as (_, port):
+    st_loop, _, loop_body = http_req(port, "GET", "/api/loops/demo", token=token)
+    assert st_loop == 200
+    loop_sources = {s["id"]: s for s in loop_body["sources"]}
+    assert set(loop_sources) == {"a", "j"}
+    j_row = loop_sources["j"]
+    a_row = loop_sources["a"]
+    assert j_row["subject"] == "source:j" and j_row["version"] >= 3 and j_row["source_version"].startswith("source/j@")
+    assert j_row["last_ok"] == first_ok
+    assert j_row["error_streak"] == 2
+    assert j_row["rate_limit"]["remaining"] == 40 and j_row["rate_limit"]["retry_after"] == 30
+    assert len(j_row["polls"]) == 3
+    backoff_delta = (util.parse_iso(j_row["backoff_until"]) - util.now()).total_seconds()
+    assert backoff_delta >= 25, backoff_delta
+    assert j_row["note"] != "ok" and "bad jql" in j_row["note"]
+    assert j_row["every"] == "10s" and j_row["why"] is None
+    assert j_row["counts"] == {"polls": 3, "read": 1, "new": 1}, j_row["counts"]
+    assert a_row["note"] == "ok" and a_row["every"] == "5m" and a_row["why"] == "watch local events"
+    assert a_row["counts"] == {"polls": 1, "read": 1, "new": 1}
+
+    st_list, hdrs_list, list_body = http_req(port, "GET", "/api/v1/sources", token=token)
+    assert st_list == 200 and hdrs_list.get("ETag") and list_body.get("seq")
+    st_304, _, _ = http_req(port, "GET", "/api/v1/sources", token=token, extra_headers={"If-None-Match": hdrs_list["ETag"]})
+    assert st_304 == 304
+    v1_by_id = {s["id"]: s for s in list_body["sources"]}
+    assert "a" in v1_by_id and "j" in v1_by_id
+    assert v1_by_id["j"]["error_streak"] == 2 and v1_by_id["j"]["rate_limit"]["remaining"] == 40
+    st_get, hdrs_get, get_body = http_req(port, "GET", "/api/v1/sources/j", token=token)
+    assert st_get == 200 and hdrs_get.get("ETag") and get_body["source"]["id"] == "j"
+    st_404, _, _ = http_req(port, "GET", "/api/v1/sources/nope", token=token)
+    assert st_404 == 404
+
+with db.reader() as c:
+    ev_kinds = [r["kind"] for r in c.execute("SELECT kind FROM events_log WHERE subject = 'source:j' ORDER BY seq")]
+    assert ev_kinds == ["source.polled", "source.failed", "source.failed"], ev_kinds
+
+# Reorder, insert, edit non-scope keys
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+say_poll(srv, by_id["b"])
+append_jsonl(a_file, [{"key": "a5", "title": "A5"}])
+append_jsonl(b_file, [{"key": "b2", "title": "B2"}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "c"
+type = "command"
+command = "cat {c_file}"
+every = "5m"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "2m"
+timeout = 60
+trust = "owner"
+limit = 10
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+said_c = say_poll(srv, by_id["c"])
+assert "baseline" in said_c and "c1" in said_c and "c2" in said_c
+a_events, _ = sources.poll(by_id["a"], srv.cfg)
+b_events, _ = sources.poll(by_id["b"], srv.cfg)
+assert [e["key"] for e in a_events] == ["a5"]
+assert [e["key"] for e in b_events] == ["b2"]
+assert source_store.source_seen("a") == {"a1", "a5"}
+assert source_store.source_seen("b") == {"b1", "b2"}
+
+# Unused id stays, restoring it catches up without baseline; new id baselines
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "b"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+''')
+srv.load()
+unused_a = sources.view_for("a", srv.cfg, srv.live)
+assert unused_a is not None and unused_a["enabled"] is False and unused_a["source_version"].startswith("source/a@")
+append_jsonl(a_file, [{"key": "a7", "title": "A7"}])
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+[[source]]
+id = "brand-new"
+type = "command"
+command = "cat {c_file}"
+every = "5m"
+''')
+srv.load()
+by_id = {s.id: s for s in sources.load_all(srv.cfg, srv.live)}
+a_resumed, _ = sources.poll(by_id["a"], srv.cfg)
+assert [e["key"] for e in a_resumed] == ["a7"]
+said_new = say_poll(srv, by_id["brand-new"])
+assert "baseline" in said_new and "c1" in said_new
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_outage_fix_rescope_inbox_and_log_rescope(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n[jira]\nbase_url = "https://jira.example.test"\nemail = "bot@example.test"\n')
+db.migrate()
+configrepo.init()
+principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+
+now = util.now()
+recent_ts = util.iso(now)
+month_ago = util.iso(now - timedelta(days=30))
+
+class FakeJira:
+    def __init__(self, issues):
+        self.base = "https://jira.example.test"
+        self.issues = issues
+        self.rate = {"remaining": 90, "retry_after": None}
+
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+
+    def search(self, jql, fields, limit=50):
+        return self.issues[:limit]
+
+fake_jira = FakeJira([{"key": "ABC-1", "fields": {"summary": "Base", "updated": recent_ts}}])
+
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status = Ready"
+every = "5m"
+''')
+
+srv = serve.Server()
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+
+# Fix JQL (scope change): 5 recent tickets + 1 older ticket updated a month ago
+fake_jira.issues = [
+    {"key": "ABC-1", "fields": {"summary": "Base", "updated": recent_ts}},
+    *[{"key": f"ABC-{i}", "fields": {"summary": f"Recent {i}", "updated": util.iso(util.now())}} for i in range(2, 7)],
+    {"key": "ABC-OLD", "fields": {"summary": "Month old", "updated": month_ago}},
+]
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    said = say_poll(srv, src_j)
+assert "TR-" in said and "ABC-OLD" in said and "skipped" in said, said
+
+pending = loop_store.pending()
+assert len(pending) == 1
+assert [e["key"] for e in json.loads(pending[0]["payload"])] == [f"ABC-{i}" for i in range(2, 7)]
+
+item1 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+assert item1 is not None and item1["priority"] == 2 and item1["verbs"] == ["fire", "dismiss"]
+assert [e["key"] for e in item1["detail"]["held"]] == ["ABC-OLD"]
+ver1 = item1["version"]
+
+# Second scope change while rescope item is open merges keys and bumps version
+fake_jira.issues.append({"key": "ABC-OLDER", "fields": {"summary": "Older still", "updated": month_ago}})
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged, Backlog)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+
+item2 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+assert item2["id"] == item1["id"] and item2["version"] == ver1 + 1
+assert [e["key"] for e in item2["detail"]["held"]] == ["ABC-OLD", "ABC-OLDER"]
+
+# Resolve with verb="fire" queues 1 item holding both and resolves as fired; next poll queues nothing
+with live_dashboard() as (_, port):
+    st_res, _, body_res = http_req(
+        port, "POST", f"/api/v1/inbox/{item2['id']}/resolve",
+        token=token, key="fire-rescope-1",
+        body={"base_version": item2["version"], "verb": "fire"},
+    )
+    assert st_res == 200, (st_res, body_res)
+    assert body_res["item"]["state"] == "resolved" and body_res["item"]["resolution"] == "fired"
+
+pending_after = loop_store.pending()
+assert len(pending_after) == 2
+assert [e["key"] for e in json.loads(pending_after[-1]["payload"])] == ["ABC-OLD", "ABC-OLDER"]
+
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    more, more_items = sources.poll(src_j, srv.cfg)
+assert more == [] and more_items == []
+
+# Also verify dismiss verb
+fake_jira.issues.append({"key": "ABC-DISMISS", "fields": {"summary": "Dismiss me", "updated": month_ago}})
+write_loop("demo", '''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "j"
+type = "jira"
+jql = "status in (Ready, Triaged, Backlog, Hold)"
+every = "5m"
+''')
+srv.load()
+with mock.patch.object(jira.Client, "from_env", return_value=fake_jira):
+    src_j = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "j")
+    say_poll(srv, src_j)
+item3 = inbox_store.get_open_by_kind_and_subject("rescope", "source:j")
+with live_dashboard() as (_, port):
+    st_dis, _, body_dis = http_req(
+        port, "POST", f"/api/v1/inbox/{item3['id']}/resolve",
+        token=token, key="dismiss-rescope-1",
+        body={"base_version": item3["version"], "verb": "dismiss"},
+    )
+    assert st_dis == 200 and body_dis["item"]["resolution"] == "dismissed"
+assert len(loop_store.pending()) == 2
+
+# Log source rescope: wider path glob + pattern edit keeps file1 offset and starts file2 at end
+log_dir = ROOT / "logs_src"
+log_dir.mkdir()
+f1 = log_dir / "app1.log"
+f2 = log_dir / "app2.log"
+f1.write_text("INFO startup\n", encoding="utf-8")
+write_loop("logdemo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "app-log"
+type = "log"
+path = "{log_dir}/app1.log"
+pattern = "ERROR"
+every = "5m"
+''')
+srv.load()
+src_log = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "app-log")
+sources.poll(src_log, srv.cfg)
+
+with open(f1, "a", encoding="utf-8") as fh:
+    fh.write("ERROR disk full on node\n")
+f2.write_text("ERROR ancient crash in file2\n", encoding="utf-8")
+write_loop("logdemo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "app-log"
+type = "log"
+path = "{log_dir}/*.log"
+pattern = "ERROR|WARN"
+every = "5m"
+''')
+srv.load()
+src_log = next(s for s in sources.load_all(srv.cfg, srv.live) if s.id == "app-log")
+ev_log1, _ = sources.poll(src_log, srv.cfg)
+assert len(ev_log1) == 1 and "disk full" in ev_log1[0]["title"], ev_log1
+
+with open(f2, "a", encoding="utf-8") as fh:
+    fh.write("WARN new warning in file2\n")
+ev_log2, _ = sources.poll(src_log, srv.cfg)
+assert len(ev_log2) == 1 and "new warning" in ev_log2[0]["title"], ev_log2
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_backfill_checks_retention_and_shared_file_source(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n')
+db.migrate()
+configrepo.init()
+principals.seed_owner("owner@example.test")
+
+a_file = ROOT / "a.jsonl"
+b_file = ROOT / "b.jsonl"
+append_jsonl(a_file, [{"key": "k1", "title": "K1"}, {"key": "k2", "title": "K2"}])
+append_jsonl(b_file, [{"key": "x1", "title": "X1"}])
+
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "other"
+type = "command"
+command = "cat {b_file}"
+every = "5m"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+''')
+
+old_settings = {"type": "command", "command": f"cat {a_file}"}
+old_hash = hashlib.sha256(json.dumps(old_settings, sort_keys=True, default=str).encode()).hexdigest()
+old_polled = "2026-11-20T12:00:00Z"
+with db.tx() as c:
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#0', NULL, ?, 1, 'old', NULL)", (old_polled,))
+    c.execute("INSERT INTO seen (source, key, ts) VALUES ('demo#0', 'k1', ?), ('demo#0', 'k2', ?)", (old_polled, old_polled))
+    c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#0', ?)", (old_hash,))
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('demo#1', NULL, ?, 1, 'stale', ?)", (old_polled, old_polled))
+    c.execute("INSERT INTO source_owners (source, fingerprint) VALUES ('demo#1', 'unmatched-owner')")
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok) VALUES ('oncall:scan', '{}', ?, 1, 'ok', ?)", (old_polled, old_polled))
+
+moved1 = sources.backfill()
+assert moved1 == 1, moved1
+with db.reader() as c:
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'demo#0'").fetchone() is None
+    cur_a = dict(c.execute("SELECT * FROM cursors WHERE source = 'a'").fetchone())
+    assert cur_a["scope_sha"] and cur_a["source_version"].startswith("source/a@") and cur_a["last_ok"] == old_polled
+    assert {r[0] for r in c.execute("SELECT key FROM seen WHERE source = 'a'")} == {"k1", "k2"}
+    assert c.execute("SELECT fingerprint FROM source_owners WHERE source = 'a'").fetchone()[0] == old_hash
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
+
+cfg = config.load()
+demo1_view = sources.view_for("demo#1", cfg)
+assert demo1_view is not None and demo1_view["enabled"] is False
+
+assert sources.backfill() == 0
+
+append_jsonl(a_file, [{"key": "k3", "title": "K3"}])
+src_a = next(s for s in sources.load_all(cfg) if s.id == "a")
+said_lines = []
+ev_a, _ = sources.poll(src_a, cfg, say=said_lines.append)
+assert [e["key"] for e in ev_a] == ["k3"] and not any("baseline" in ln for ln in said_lines)
+
+before_a = source_store.cursor("a")
+source_store.set_cursor("oncall:scan", '{"n": 1}', True, "scanned")
+source_store.set_cursor("a", '{"v": 1}', True, "manual")
+after_a = source_store.cursor("a")
+assert after_a["scope_sha"] == before_a["scope_sha"]
+assert after_a["last_ok"] == before_a["last_ok"]
+assert after_a["version"] == before_a["version"] + 1
+
+shared_file = ROOT / "shared.jsonl"
+append_jsonl(shared_file, [{"key": "s1", "title": "S1"}])
+(paths.CONFIG_DIR / "sources").mkdir(parents=True, exist_ok=True)
+(paths.CONFIG_DIR / "sources" / "shared-src.toml").write_text(f'type = "command"\ncommand = "cat {shared_file}"\nevery = "5m"\n')
+write_loop("l1", 'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "shared-src"\n')
+write_loop("l2", 'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "shared-src"\n')
+src_shared = next(s for s in sources.load_all(cfg) if s.id == "shared-src")
+assert set(src_shared.loops) == {"l1", "l2"}
+sources.poll(src_shared, cfg)
+append_jsonl(shared_file, [{"key": "s2", "title": "S2"}])
+ev_sh, items_sh = sources.poll(src_shared, cfg)
+assert [e["key"] for e in ev_sh] == ["s2"] and len(items_sh) == 2
+
+def expect_invalid(loop_obj, needle):
+    try:
+        loops.validate(loop_obj, cfg)
+    except loops.LoopError as e:
+        assert needle in str(e), (needle, str(e))
+    else:
+        raise AssertionError(f"expected LoopError containing {needle!r}")
+
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "A_b", "type": "command", "command": "true"}]), "A_b")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"type": "command", "command": "true"}, {"type": "command", "command": "true"}]), "omit both id and name")
+expect_invalid(loops.Loop("other-loop", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "a", "type": "command", "command": "true"}]), "demo")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "shared-src", "type": "command", "command": "true"}]), "shared-src.toml")
+expect_invalid(loops.Loop("chk", ROOT, "private", kind="command", spec={"command": "true"},
+                          sources=[{"id": "no-such-file"}]), "names no file")
+
+old_91 = util.iso(util.now() - timedelta(days=91))
+keep_89 = util.iso(util.now() - timedelta(days=89))
+with db.tx() as c:
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (old_91, old_91))
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('a', ?, ?, 1, 1, 0)", (keep_89, keep_89))
+    c.execute("INSERT INTO cursors (source, value, polled, ok, detail, last_ok, version) VALUES ('stale-unused', NULL, ?, 1, 'old', ?, 1)", (old_91, old_91))
+    c.execute("INSERT INTO seen (source, key, ts) VALUES ('stale-unused', 'u1', ?)", (old_91,))
+    c.execute("INSERT INTO source_polls (source, started, ended, ok, read, new) VALUES ('stale-unused', ?, ?, 1, 0, 0)", (old_91, old_91))
+policy = retention.parse_bytes(b"[source_polls]\ndays = 90\n[sources]\nunused_days = 90\n")
+retention_store.prune_rows(policy, retention_store.measure())
+with db.reader() as c:
+    starts_a = {r[0] for r in c.execute("SELECT started FROM source_polls WHERE source = 'a'")}
+    assert old_91 not in starts_a and keep_89 in starts_a
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM seen WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM source_polls WHERE source = 'stale-unused'").fetchone() is None
+    assert c.execute("SELECT 1 FROM cursors WHERE source = 'oncall:scan'").fetchone() is not None
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_poll_route_cli_gates_config_events_and_active_line_hooks(self):
+        res = self._run_source_child(r"""
+paths.ensure_dirs()
+repo_dir = ROOT / "sample-repo"
+repo_dir.mkdir()
+subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo_dir, env=os.environ, check=True)
+(repo_dir / "README.md").write_text("demo\n", encoding="utf-8")
+subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@e", "add", "."], cwd=repo_dir, env=os.environ, check=True)
+subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-qm", "init"], cwd=repo_dir, env=os.environ, check=True)
+paths.CONFIG_FILE.write_text(f'''
+max_parallel = 2
+[jira]
+base_url = "https://jira.example.test"
+email = "bot@example.test"
+[jira.transitions]
+running = "Done"
+pr = "NoSuchStatus"
+[[repo]]
+name = "app"
+path = "{repo_dir}"
+github = "org/app"
+tracker = "jira"
+jira_project = "APP"
+pipeline = true
+''')
+db.migrate()
+configrepo.init()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+token = credential_files.read_client(db.schema_metadata()["instance_tag"])
+_, read_only_token = token_store.issue(owner, "read-only", ["read"])
+
+a_file = ROOT / "a.jsonl"
+append_jsonl(a_file, [{"key": "a1", "title": "A1"}])
+write_loop("demo", f'''
+kind = "command"
+[run]
+command = "true"
+[[source]]
+id = "a"
+type = "command"
+command = "cat {a_file}"
+every = "5m"
+''')
+(paths.CONFIG_DIR / "sources").mkdir(parents=True, exist_ok=True)
+(paths.CONFIG_DIR / "sources" / "off-src.toml").write_text(f'type = "command"\ncommand = "cat {a_file}"\nenabled = false\n')
+
+cfg = config.load()
+src_a = next(s for s in sources.load_all(cfg) if s.id == "a")
+sources.poll(src_a, cfg)
+append_jsonl(a_file, [{"key": "a2", "title": "A2"}])
+
+class FakeJiraCheck:
+    def __init__(self):
+        self.base = "https://jira.example.test"
+        self.rate = {"remaining": 50, "retry_after": None}
+
+    def me(self):
+        return {"displayName": "Bot User"}
+
+    def search(self, jql, fields, limit=100):
+        return [{"key": "APP-1"}, {"key": "APP-2"}]
+
+    def statuses(self, project):
+        return {"Done", "To Do"}
+
+launch_calls = []
+def fake_launch(name, **kw):
+    launch_calls.append((name, kw))
+    return {"id": f"poll-run-{len(launch_calls)}", "status": "done", "picks": ["picked APP-1"]}
+
+with live_dashboard() as (_, port):
+    before_seen = source_store.source_seen("a")
+    before_cur = source_store.cursor("a")
+    with db.reader() as c:
+        before_polls = c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0]
+    st_dr, _, body_dr = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=token, key="poll-dry-1", body={"dry_run": True}, extra_headers={"Prefer": "wait=5"},
+    )
+    assert st_dr == 200 and body_dr["ok"] is True and body_dr["dry_run"] is True
+    flags = {it["key"]: it["seen"] for it in body_dr["items"]}
+    assert flags == {"a1": True, "a2": False}, flags
+    assert source_store.source_seen("a") == before_seen
+    assert source_store.cursor("a") == before_cur
+    with db.reader() as c:
+        assert c.execute("SELECT COUNT(*) FROM source_polls WHERE source = 'a'").fetchone()[0] == before_polls
+
+    st_real, _, body_real = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=token, key="poll-real-1", body={"dry_run": False}, extra_headers={"Prefer": "wait=5"},
+    )
+    assert st_real == 200 and [e["key"] for e in body_real["events"]] == ["a2"] and len(body_real["queued"]) == 1
+
+    st_403, _, body_403 = http_req(
+        port, "POST", "/api/v1/sources/a/poll",
+        token=read_only_token, key="poll-403-1", body={"dry_run": False},
+    )
+    assert st_403 == 403 and body_403["code"] == "scope_missing", (st_403, body_403)
+
+    st_off, _, body_off = http_req(
+        port, "POST", "/api/v1/sources/off-src/poll", token=token, key="poll-off-1", body={"dry_run": False},
+    )
+    assert st_off == 409 and body_off["code"] == "invalid_state"
+    st_feed, _, body_feed = http_req(
+        port, "POST", "/api/v1/sources/jira-app/poll", token=token, key="poll-feed-1", body={"dry_run": False},
+    )
+    assert st_feed == 409 and body_feed["code"] == "invalid_state"
+
+    with mock.patch.object(loop_run, "launch", side_effect=fake_launch):
+        st_p1, _, body_p1 = http_req(
+            port, "POST", "/api/v1/sources/pipeline/poll",
+            token=token, key="pipe-real-1", body={"dry_run": False}, extra_headers={"Prefer": "wait=5"},
+        )
+        st_p2, _, body_p2 = http_req(
+            port, "POST", "/api/v1/sources/pipeline/poll",
+            token=token, key="pipe-dry-1", body={"dry_run": True}, extra_headers={"Prefer": "wait=5"},
+        )
+    assert st_p1 == 200 and body_p1["op"] == "poll-run-1"
+    assert st_p2 == 200 and body_p2["picks"] == ["picked APP-1"]
+    assert launch_calls == [("poll", {}), ("poll", {"trial": True})], launch_calls
+
+    server_info = {
+        "scheme": "http", "host": "127.0.0.1", "port": port,
+        "addresses": ["127.0.0.1"], "pid": os.getpid(), **paths.state_and_config(),
+    }
+    util.write_json(paths.SERVER_FILE, server_info)
+    with mock.patch.object(loop_run, "launch", side_effect=fake_launch):
+        buf_poll = StringIO()
+        with redirect_stdout(buf_poll):
+            rc_poll = cli.main(["poll", "--dry-run"])
+        assert rc_poll == 0 and "picked APP-1" in buf_poll.getvalue()
+        assert launch_calls[-1] == ("poll", {"trial": True})
+
+    local_calls = []
+    with mock.patch.object(poll_mod, "poll", side_effect=lambda dry_run=False: (local_calls.append(dry_run), 0)[1]):
+        assert cli.main(["poll", "--local"]) == 0
+    assert local_calls == [False]
+
+    cli_jira_calls = []
+    def server_only_jira(jcfg):
+        cli_jira_calls.append(threading.current_thread().name)
+        return FakeJiraCheck()
+    with mock.patch.object(jira.Client, "from_env", side_effect=server_only_jira):
+        buf_jc = StringIO()
+        with redirect_stdout(buf_jc):
+            rc_jc = cli.main(["jira-check"])
+    assert rc_jc == 0
+    jc_out = buf_jc.getvalue()
+    assert "APP: 2 labeled" in jc_out and "NoSuchStatus" in jc_out and "jira ok" in jc_out, jc_out
+    assert cli_jira_calls and all(t != threading.current_thread().name for t in cli_jira_calls), cli_jira_calls
+paths.SERVER_FILE.unlink(missing_ok=True)
+
+poll_loop = loops.find("poll", cfg)
+rid = record.start("loop", loop="poll", loop_kind="command", trigger="every")
+loop_run.settle(loop_run.LoopRun(poll_loop, rid, cfg), "done", "exit 0")
+pipe_view = sources.view_for("pipeline", cfg)
+assert pipe_view["last_ok"] is not None and len(pipe_view["polls"]) == 1 and pipe_view["polls"][0]["ok"] is True
+
+old_src_bytes = f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'.encode()
+r_new = configcheck.check("source", "s1", "sources/s1.toml", old_src_bytes, old_bytes=None)
+assert r_new["ok"] and r_new["gate"] == "B" and r_new["dry_run"]["ok"] and len(r_new["dry_run"]["items"]) == 2
+r_a = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file}"\nevery = "10m"\nenabled = true\n',
+                        old_bytes=old_src_bytes)
+assert r_a["ok"] and r_a["gate"] == "A"
+r_b = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file} # changed"\nevery = "5m"\n',
+                        old_bytes=old_src_bytes)
+assert r_b["gate"] == "B"
+r_c = configcheck.check("source", "s1", "sources/s1.toml",
+                        f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\ntrust = "owner"\n',
+                        old_bytes=old_src_bytes)
+assert r_c["gate"] == "C"
+
+old_loop = f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'.encode()
+lr_a = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "1m"\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_a["gate"] == "A", lr_a
+lr_b = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nlimit = 5\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_b["gate"] == "B", lr_b
+lr_c = configcheck.check("loop", "demo", "loops/demo/loop.toml",
+                         f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nquarantine = true\n',
+                         old_bytes=old_loop, stop_after=4)
+assert lr_c["gate"] == "C", lr_c
+
+with principals.acting(owner):
+    _, b_s1 = configrepo.read("sources/s1.toml")
+    configrepo.commit({"sources/s1.toml": f'type = "command"\ncommand = "cat {a_file}"\nevery = "5m"\n'},
+                      {"sources/s1.toml": b_s1}, owner, "dashboard")
+    _, b_lp = configrepo.read("loops/demo/loop.toml")
+    configrepo.commit({"loops/demo/loop.toml": f'kind = "command"\n[run]\ncommand = "true"\n[[source]]\nid = "a"\ntype = "command"\ncommand = "cat {a_file}"\nevery = "2m"\n'},
+                      {"loops/demo/loop.toml": b_lp}, owner, "dashboard")
+with db.reader() as c:
+    src_changed = {r["subject"] for r in c.execute("SELECT subject FROM events_log WHERE kind = 'config.source.changed'")}
+    assert "config:source/s1" in src_changed and "config:source/a" in src_changed, src_changed
+
+with principals.acting(owner):
+    lines_mod.ensure(cfg)
+    extra = lines_mod.create_line({"id": "app-extra", "project": "app", "name": "Extra", "kind": "loops", "repo": "app"})["data"]
+    _, b_ls = configrepo.read("sources/line-src.toml")
+    configrepo.commit({"sources/line-src.toml": f'type = "command"\ncommand = "cat {a_file}"\nline = "app-extra"\n'},
+                      {"sources/line-src.toml": b_ls}, owner, "dashboard")
+    try:
+        lines_mod.delete_line("app-extra", extra["version"])
+        raise AssertionError("expected LineInUse for active source reference")
+    except lines_mod.LineInUse as exc:
+        assert any(b.get("kind") == "source" and "line-src" in b.get("detail", "") for b in exc.blockers), exc.blockers
+
+    bad_ref = configcheck.check("source", "bad-line", "sources/bad-line.toml",
+                                f'type = "command"\ncommand = "cat {a_file}"\nline = "no-such-line"\n', stop_after=3)
+    assert not bad_ref["ok"] and any("no-such-line" in p for p in bad_ref["stages"][-1]["problems"])
+    try:
+        _, b_bl = configrepo.read("sources/bad-line.toml")
+        configrepo.commit({"sources/bad-line.toml": f'type = "command"\ncommand = "cat {a_file}"\nline = "no-such-line"\n'},
+                          {"sources/bad-line.toml": b_bl}, owner, "dashboard")
+        raise AssertionError("expected ConfigRepoError for unknown line")
+    except configrepo.ConfigRepoError:
+        pass
+
+    _, b_ls2 = configrepo.read("sources/line-src.toml")
+    configrepo.commit({"sources/line-src.toml": None}, {"sources/line-src.toml": b_ls2}, owner, "dashboard")
+    bad_src_file = paths.CONFIG_DIR / "sources" / "broken-src.toml"
+    bad_src_file.write_text("type = [unclosed\n", encoding="utf-8")
+    try:
+        lines_mod.delete_line("app-extra", extra["version"])
+        raise AssertionError("expected LineInUse fail-closed for unreadable source file")
+    except lines_mod.LineInUse as exc:
+        assert any(b.get("kind") == "unreadable_config" and "broken-src.toml" in b.get("detail", "") for b in exc.blockers), exc.blockers
+    finally:
+        bad_src_file.unlink(missing_ok=True)
+    lines_mod.delete_line("app-extra", extra["version"])
+    arch_ref = configcheck.check("source", "arch-line", "sources/arch-line.toml",
+                                 f'type = "command"\ncommand = "cat {a_file}"\nline = "app-extra"\n', stop_after=3)
+    assert not arch_ref["ok"] and any("archived" in p for p in arch_ref["stages"][-1]["problems"])
+
+openapi = json.loads((paths.PACKAGE_DIR.parent / "docs" / "openapi.json").read_text(encoding="utf-8"))
+list_ref = openapi["paths"]["/api/v1/sources"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+src_schema = openapi["components"]["schemas"][list_ref.rsplit("/", 1)[-1]]["properties"]["sources"]["items"]
+for nullable_field in ("source_version", "kind", "line", "feeds", "last_ok", "polled", "advanced", "backoff_until", "every", "why"):
+    field_type = src_schema["properties"][nullable_field]["type"]
+    assert isinstance(field_type, list) and "null" in field_type, (nullable_field, field_type)
+assert {"type": "null"} in src_schema["properties"]["rate_limit"]["anyOf"]
+assert src_schema["properties"]["note"]["type"] == "string"
+assert set(src_schema["properties"]["counts"]["properties"]) == {"polls", "read", "new"}
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
 
 
 class SyncTests(unittest.TestCase):
