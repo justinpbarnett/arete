@@ -35,7 +35,9 @@ def require(condition, message):
 def isolated_env(root):
     names = {"ARETE_CONFIG_DIR": "config", "ARETE_STATE_DIR": "state", "ARETE_LOG_DIR": "logs",
              "ARETE_WORKTREES_DIR": "worktrees", "TMPDIR": "tmp", "HOME": "home", "XDG_STATE_HOME": "xdg"}
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", _test_stacks.PREFIX_ENV) if k in os.environ}
+    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", _test_stacks.PREFIX_ENV,
+                                      "ARETE_DRIVE_FLUSH", "ARETE_TEST_FAST_SYNC",
+                                      "ARETE_TEST_DB_TEMPLATE") if k in os.environ}
     for variable, name in names.items():
         folder = root / name
         folder.mkdir(exist_ok=True)
