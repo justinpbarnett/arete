@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
 
 from . import backup, derived, install, paths, util
+from . import bands as _bands  # noqa: F401
 from .store import approvals as approvals_store
 from .store import chats as chats_store
 from .store import db as foundation

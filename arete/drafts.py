@@ -689,7 +689,7 @@ def default_path(kind: str, name: str) -> str:
             return "layers/defaults/config.toml"
         return f"layers/{name}/config.toml"
     if kind == "attention":
-        return "config.toml"
+        return "attention.toml"
     if kind == "retention":
         return "retention.toml"
     if kind == "prompt":
@@ -727,7 +727,7 @@ def _unified_diff(path: str, old_bytes: bytes | None, new_text: str | None) -> s
 
 
 def _current_ver_row(kind: str, name: str, path: str, conn=None) -> dict | None:
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and path == "config.toml" else kind
     return (
         config_store.live_item(lookup_kind, name, conn)
         or config_store.live_by_path(path, conn)
@@ -1506,7 +1506,7 @@ def _runs_pinning_version(
 def _previous_and_new_version_info(draft: dict) -> tuple[dict | None, dict | None]:
     kind, name = draft["kind"], draft["name"]
     rel = draft["path"] or default_path(kind, name)
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     history = configrepo.version_history(lookup_kind, name, rel)
     activated_sha = draft["activated_commit"]
     new_entry = None
@@ -1722,7 +1722,7 @@ def start_config_ask(
 
 
 def _live_state_for_base_check(kind: str, name: str, rel: str) -> tuple[int, dict | None]:
-    lookup_kind = "step_settings" if kind == "attention" else kind
+    lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     live_row = config_store.live_item(lookup_kind, name) or config_store.live_by_path(rel)
     live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
     return live_ver, live_row

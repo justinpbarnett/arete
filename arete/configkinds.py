@@ -69,7 +69,7 @@ REGISTRY = {
     "device": kind("device", "review", Home("devices/{name}.toml")),
     "loop": kind("loop", "review", Home("loops/{name}/loop.toml"),
                  Home("layers/{repo}/loops/{name}/loop.toml", "{repo}.{name}", escape_repo=True)),
-    "attention": kind("attention", "check", Home("config.toml", "defaults")),
+    "attention": kind("attention", "check", Home("attention.toml", "defaults"), Home("config.toml", "defaults")),
     "sound": kind("sound", "check", Home("sounds/{name}.toml")),
     "experiment": kind("experiment", "review", Home("experiments/{name}.toml")),
     "retention": kind("retention", "check", Home("retention.toml", "defaults")),
