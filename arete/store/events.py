@@ -86,7 +86,7 @@ def reuse_receipt(subject, ver):
     return True
 
 
-def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None, connection=None):
+def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None, idem=None, connection=None):
     c = foundation.write_connection() if connection is None else connection
     if not c.in_transaction:
         raise RuntimeError("event emission needs an open write transaction")
@@ -97,9 +97,9 @@ def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=N
         raise ValueError("invalid event class")
     if cause_seq is None:
         cause_seq = CAUSE_SEQ.get()
-    seq = c.execute("INSERT INTO events_log (at, kind, subject, ver, task, class, shape, actor, cause_seq, data, via) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
-                    (util.iso(), kind, subject, ver, task, cls, actor, cause_seq, json.dumps(data),
+    seq = c.execute("INSERT INTO events_log (at, kind, subject, ver, task, class, shape, actor, cause_seq, idem, data, via) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                    (util.iso(), kind, subject, ver, task, cls, actor, cause_seq, idem, json.dumps(data),
                      provenance() if via is None else via)).lastrowid
     if RECEIPTS.get() is not None and ver is not None:
         RECEIPTS.get().append((seq, subject, ver))

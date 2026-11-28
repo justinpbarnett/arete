@@ -23,7 +23,7 @@ PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set", "webhook.rotate"}
 PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate", "push.subscribe"}
 WRITES = ("POST", "PATCH", "PUT", "DELETE")
-SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:activate")
+SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:activate|run:start")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
 LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "stage": "capture"}
 
@@ -226,18 +226,19 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
                 parts = auth[0].split()
                 if len(auth) != 1 or len(parts) != 2 or parts[0].lower() != "bearer":
                     raise tokens.InvalidCredential()
-                text, kind = parts[1], "token"
+                text, allowed_kinds = parts[1], ("token", "lease")
             else:
                 if not secure or len(cookies) != 1:
                     raise tokens.InvalidCredential()
-                text, kind = cookies[0], "session"
-            credential = tokens.resolve(text, kinds=(kind,))
+                text, allowed_kinds = cookies[0], ("session",)
+            credential = tokens.resolve(text, kinds=allowed_kinds, lease_header=handler.headers.get("X-Arete-Lease"))
         except tokens.InvalidCredential as error:
-            traffic.fail(peer)
+            if error.code not in ("lease_fenced", "lease_expired"):
+                traffic.fail(peer)
             if cookies and secure:
                 handler.set_cookie = session_cookie("", 0)
             if not (cookies and browser_asset and method == "GET"):
-                raise problem(error.code) from None
+                raise problem(error.code, **error.details) from None
     handler.credential = credential
     handler.person = credential.principal if credential else principals.for_login(logins.of(peer))
     if name == "meta.get" and (not handler.person and not (auth or cookies) or
@@ -256,7 +257,7 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
             raise problem("csrf")
     if not (claim or mcp):
         authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential)
-    if credential:
+    if credential and credential.kind != "lease":
         logins.of(peer)
         try:
             tokens.note_use(credential, logins.node_key(peer))
@@ -278,6 +279,18 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
     if requires_credential and credential is None:
         raise unauthenticated(handler, write, secure)
+    if credential is not None and credential.kind == "lease":
+        if name == "lease.get":
+            target_lease = unquote(handler.operation[1].get("lease", ""))
+            if target_lease not in (f"L-{credential.lease_id}", str(credential.lease_id)):
+                raise problem("forbidden")
+            return
+        if name == "run.get":
+            target_run = unquote(handler.operation[1].get("id", ""))
+            if not credential.run_id or target_run != credential.run_id:
+                raise problem("forbidden")
+            return
+        raise problem("forbidden")
     if name.startswith("secret.") or name == "webhook.rotate":
         secret_access(unquote(handler.operation[1].get("scope", "")))
     if name == "pairing.start" and (credential is None or credential.kind != "session"):

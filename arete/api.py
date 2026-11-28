@@ -2,17 +2,37 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
-from urllib.parse import unquote
+import concurrent.futures
+import re
+import secrets
+from urllib.parse import quote, unquote
 
 from . import (
-    api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, events,
-    inbox, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage, util,
+    api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, devices,
+    events, inbox, leases, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage,
+    util,
     webhooks, webpush,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
+from .store import devices as device_store
 from .store import tasks as task_store
 from .store import tokens, writes
+
+_PREFER_WAIT = re.compile(r"(?:^|[,\s;])wait=(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+
+
+def prefer_wait(handler, *, default: float = 2.0, maximum: float = 10.0) -> float:
+    if handler is None:
+        return default
+    for line in handler.headers.get_all("Prefer", []):
+        if m := _PREFER_WAIT.search(line):
+            try:
+                value = float(m.group(1))
+            except ValueError:
+                continue
+            return min(maximum, max(0.0, value))
+    return default
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
@@ -294,6 +314,47 @@ def read(name, values, handler):
         return inbox.triage_screen()
     if name == "push.list":
         return {"subscriptions": webpush.list_v1()}
+    if name == "device.list":
+        return {"devices": devices.device_views()}
+    if name == "device.get":
+        return {"device": needed(devices.device_get_view(values["device"]), values["device"])}
+    if name == "lease.list":
+        only_open: bool | None = None
+        if "open" in values:
+            raw_open = values["open"].strip().lower()
+            if raw_open in ("1", "true", "yes"):
+                only_open = True
+            elif raw_open in ("0", "false", "no"):
+                only_open = False
+            else:
+                raise contract.Problem("invalid_input", "open must be true or false")
+        rows = device_store.leases_list(
+            run_id=values.get("run"),
+            device=values.get("device"),
+            only_open=only_open,
+        )
+        return {"leases": [leases.view(row) for row in rows]}
+    if name == "lease.get":
+        lease_num = leases.parse_id(values["lease"])
+        row = device_store.lease_get(lease_num) if lease_num is not None else None
+        return {"lease": leases.view(needed(row, values["lease"]))}
+    if name == "run.sandbox":
+        run_id = values["run"]
+        run_row = needed(runs.run_get(run_id), run_id)
+        lease_row = None
+        if run_row.get("lease_id"):
+            lease_row = device_store.lease_get(int(run_row["lease_id"]))
+        if lease_row is None:
+            lease_row = device_store.latest_lease_for_run(run_id)
+        device_name = lease_row["device"] if lease_row else (run_row.get("device") or "local")
+        probe_row = device_store.latest_device_probe(device_name)
+        facts = probe_row["facts"] if probe_row else None
+        return {
+            "device": device_name,
+            "lease": f"L-{lease_row['id']}" if lease_row else None,
+            "address": lease_row["address"] if lease_row else "",
+            "facts": facts,
+        }
     if name == "outbox.list":
         return {"items": outbox.list_items(state=values.get("state"), task=values.get("task"), run=values.get("run"))}
     if name == "outbox.get":
@@ -484,7 +545,8 @@ def command(handler, op, values, path_values, *, claim=None):
     return handler.keyed_action(op["method"], op["path"], path_values, action,
                                 atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
                                                                       "settings.update", "loop.enable", "loop.disable",
-                                                                      "outbox.approve", "outbox.retry", "outbox.reject"),
+                                                                      "device.probe", "outbox.approve",
+                                                                      "outbox.retry", "outbox.reject"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
@@ -562,6 +624,28 @@ def mutation(name, values, handler):
             credential=handler.credential,
             pending_secrets=inbox.server_secrets(handler.server),
         )
+    elif name == "device.probe":
+        device_name = values["device"]
+        try:
+            devices.get(device_name)
+        except devices.DeviceError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        future = devices.probe_async(device_name, idem=key)
+        try:
+            future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+            result = {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "device": device_name,
+            }
+        else:
+            dev_view = needed(devices.device_get_view(device_name), device_name)
+            result = {"device": dev_view, "probe": dev_view["last_probe"]}
     elif name == "push.subscribe":
         result = {"subscription": webpush.subscribe_v1(values, principals.contact(handler.person))}
     elif name == "push.remove":

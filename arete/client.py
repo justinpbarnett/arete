@@ -473,7 +473,8 @@ def acquired_connection(where, deadline):
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS, key: str | None = None,
             *, where: Server | None = None, buffered: bool = False,
-            deadline: float | None = None, token: str | None = None) -> http.client.HTTPResponse:
+            deadline: float | None = None, token: str | None = None,
+            extra_headers: dict[str, str] | None = None) -> http.client.HTTPResponse:
     where = where or server(deadline)
     if method != "GET" and token is None:
         token = stored_token(where) or ""
@@ -489,7 +490,7 @@ def request(method: str, path: str, body: dict | None = None,
             if method == "GET" and path == META and not where.instance and token is None:
                 return instance_response(where, deadline)
             return request_once(method, path, body, read_seconds, within, key=key, deadline=deadline, where=where,
-                                buffered=buffered, token=token)
+                                buffered=buffered, token=token, extra_headers=extra_headers)
         except Restarting as e:
             if restart is None:
                 limit = time.monotonic() + RESTART_WAIT_SECONDS
@@ -667,7 +668,7 @@ def read_response(resp, deadline):
 
 
 def call(method: str, path: str, body: dict | None = None, key: str | None = None,
-         *, deadline: float | None = None) -> dict:
+         *, deadline: float | None = None, extra_headers: dict[str, str] | None = None) -> dict:
     if method != "GET":
         upload_hooks_before_write()
         if key is None:
@@ -676,7 +677,8 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
         return keyed_call(body, key, deadline=deadline)
     where = server(deadline)
     try:
-        response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline)
+        response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline,
+                           extra_headers=extra_headers)
     except Failed as e:
         if not path.startswith("/api/v1/") or not unknown_route(e, method, path):
             raise

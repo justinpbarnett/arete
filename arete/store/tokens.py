@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -15,6 +16,8 @@ from . import db, events, principals
 TABLES = {"tokens": "kept"}
 SESSION_DAYS = 400
 TOKEN_ID = credential_files.TAG
+LEASE_TOKEN_ID = re.compile(r"L([1-9][0-9]{0,17})")
+LEASE_HEADER = re.compile(r"L-([1-9][0-9]{0,17})\.([1-9][0-9]{0,17})")
 SESSION_SECONDS = SESSION_DAYS * 86400
 TOKEN_ROW = ("SELECT t.*, p.role, p.status AS person_status, p.kind AS person_kind, client.status AS client_status "
              "FROM tokens t JOIN principals p ON p.id = t.principal "
@@ -24,9 +27,10 @@ PENDING_USES = {}
 
 
 class InvalidCredential(Exception):
-    def __init__(self, code="unauthenticated"):
+    def __init__(self, code="unauthenticated", **details):
         super().__init__(code)
         self.code = code
+        self.details = details
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,8 @@ class Credential:
     deadline: str | None
     profile: str | None = None
     commands: frozenset[str] | None = None
+    lease_id: int | None = None
+    run_id: str | None = None
 
     def allows(self, scope):
         return ("*" in self.scopes or scope in self.scopes) and (self.role == "owner" or scope == "read")
@@ -153,13 +159,67 @@ def active(row, kind):
             and (kind != "token" or row["client_status"] == "active"))
 
 
-def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None):
+def _resolve_lease_token(text: str, tag: str, lease_num: int, *, lease_header: str | None) -> Credential:
+    with db.reader() as c:
+        meta = db.metadata(c)
+        if tag != meta.get("instance_tag") or not meta.get("token_key_ref"):
+            raise InvalidCredential()
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'").fetchone():
+            raise InvalidCredential()
+        lease_row = c.execute("SELECT * FROM leases WHERE id = ?", (lease_num,)).fetchone()
+        if lease_row is None:
+            raise InvalidCredential()
+        dead_rows = c.execute(
+            "SELECT token_hash, dead_at FROM lease_tokens WHERE lease_id = ?",
+            (lease_num,),
+        ).fetchall()
+    expected = digest(credential_files.read_key(meta["token_key_ref"]), text)
+    active_hash = lease_row["token_hash"] or ""
+    matches_active = bool(active_hash) and hmac.compare_digest(expected, active_hash)
+    if not matches_active:
+        if any(r["dead_at"] is not None and hmac.compare_digest(expected, r["token_hash"]) for r in dead_rows):
+            raise InvalidCredential("lease_fenced", epoch=int(lease_row["epoch"]))
+        raise InvalidCredential()
+    if lease_row["released"] is not None:
+        raise InvalidCredential("lease_fenced", epoch=int(lease_row["epoch"]))
+    if not isinstance(lease_header, str) or not (hdr := LEASE_HEADER.fullmatch(lease_header.strip())):
+        raise InvalidCredential()
+    hdr_lease, hdr_epoch = int(hdr.group(1)), int(hdr.group(2))
+    if hdr_lease != lease_num:
+        raise InvalidCredential()
+    if hdr_epoch != int(lease_row["epoch"]):
+        raise InvalidCredential("lease_fenced", epoch=int(lease_row["epoch"]))
+    if lease_row["expires"] < util.iso():
+        raise InvalidCredential("lease_expired", epoch=int(lease_row["epoch"]))
+    return Credential(
+        id=f"L-{lease_num}",
+        principal=f"lease:{lease_num}",
+        role="lease",
+        actor=f"lease:{lease_num}",
+        kind="lease",
+        scopes=frozenset({"read"}),
+        key_ref=meta["token_key_ref"],
+        epoch=meta["restore_epoch"],
+        generation=meta["token_generation"],
+        deadline=lease_row["expires"],
+        lease_id=lease_num,
+        run_id=lease_row["run_id"],
+    )
+
+
+def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None, lease_header=None):
     if not isinstance(text, str) or len(text) > 512:
         raise InvalidCredential()
     parts = text.split("_", 3)
-    if len(parts) != 4 or parts[0] != "ar" or not TOKEN_ID.fullmatch(parts[2]):
+    if len(parts) != 4 or parts[0] != "ar":
         raise InvalidCredential()
     _, tag, identity, _ = parts
+    if lease_match := LEASE_TOKEN_ID.fullmatch(identity):
+        if "lease" not in kinds:
+            raise InvalidCredential()
+        return _resolve_lease_token(text, tag, int(lease_match.group(1)), lease_header=lease_header)
+    if not TOKEN_ID.fullmatch(identity):
+        raise InvalidCredential()
     with db.reader() as c:
         meta = db.metadata(c)
         if tag != meta["instance_tag"]:
