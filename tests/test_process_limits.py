@@ -103,7 +103,7 @@ class Isolated(unittest.TestCase):
                                 "RUNS_DIR": root / "runs", "WORKTREES_DIR": root / "worktrees",
                                 "LOCKS_DIR": root / "state/locks", "LOG_DIR": root / "logs"}.items():
                 patches.enter_context(patch.object(paths, name, value))
-            foundation.migrate()
+            support.seed_db(root / "state", db_file=cls.template)
 
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory(prefix="arete-limits-")
@@ -4600,7 +4600,7 @@ class RepairWorkflowFixture(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
         cls.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
         with support.workspace_state(root):
-            foundation.migrate()
+            support.seed_db(root / "state")
             cls.workspace_db_seed = paths.DB_FILE.read_bytes()
         cls.base = root / "repo"
         cls.base.mkdir()

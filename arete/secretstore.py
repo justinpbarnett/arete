@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config, launch_lease, owner_asks, paths, util
-from .store import credentials, db, writes
+from .store import credentials, db, principals, writes
 
 NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 REPO_NAME = re.compile(owner_asks.NAME_PATTERN)
@@ -27,8 +27,13 @@ SCOPE = re.compile(r"global|(?:repo|line|device|connector):[A-Za-z0-9][A-Za-z0-9
 ACCOUNT_ID = re.compile(r"[a-z0-9][a-z0-9:_-]{0,63}")
 KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 TAG = re.compile(r"[0-9a-f]{8}")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_-]*:(?:[A-Za-z0-9_.*-]+|\*)")
 SINGLE_LINE = {"api_key", "minted_token", "webhook_secret"}
 KEY_ITEM = "global/FINGERPRINT_KEY"
+VERIFICATION_KEY_NAME = "VERIFICATION_SIGNING_KEY"
+VERIFICATION_KEY_ITEM = f"global/{VERIFICATION_KEY_NAME}"
+VERIFICATION_KEY_PATH = "verification-authority/signing.secret"
 ACL_TYPE_EXTENDED = 0x100
 KEY_REF = "fingerprint_key_ref"
 KEY_PROOF = "fingerprint_key_proof"
@@ -104,16 +109,56 @@ def validate_provider(provider: str | None) -> None:
 
 
 def validate_value(value: str, kind: str) -> None:
+    from . import vault
+
     if not isinstance(kind, str) or not KIND.fullmatch(kind):
         raise ValueError("invalid secret kind")
-    if not isinstance(value, str) or len(value) < 8:
-        raise ValueError("secret value must be at least 8 characters")
+    if not isinstance(value, str) or len(value) < vault.SHORTEST:
+        raise ValueError(f"secret value must be at least {vault.SHORTEST} characters")
     if kind in SINGLE_LINE and (value.splitlines() != [value] or "\0" in value):
         raise ValueError("this secret kind requires a single line")
     try:
         value.encode()
     except UnicodeEncodeError:
         raise ValueError("secret value must be valid UTF-8") from None
+
+
+def validate_expose(expose) -> list[dict]:
+    if isinstance(expose, str):
+        try:
+            expose = json.loads(expose)
+        except ValueError:
+            raise ValueError("expose must be a JSON list of {env, roles} entries") from None
+    if not isinstance(expose, (list, tuple)):
+        raise ValueError("expose must be a list of {env, roles} entries")
+    normalized = []
+    for entry in expose:
+        if not isinstance(entry, dict) or set(entry) != {"env", "roles"}:
+            raise ValueError("each expose entry must have env and roles")
+        env_name, roles = entry["env"], entry["roles"]
+        if not isinstance(env_name, str) or not ENV_NAME.fullmatch(env_name):
+            raise ValueError("invalid expose env name")
+        if (not isinstance(roles, (list, tuple)) or not roles
+                or not all(isinstance(r, str) and ROLE_PATTERN.fullmatch(r) for r in roles)):
+            raise ValueError("expose roles must be a non-empty list of role patterns")
+        normalized.append({"env": env_name, "roles": list(roles)})
+    return normalized
+
+
+def expose_rules(row: dict) -> list[dict]:
+    raw = row.get("expose_rules")
+    if raw is None:
+        if row["scope"].startswith("repo:"):
+            return [{"env": row["name"], "roles": ["step:*", "runner:*"]}]
+        return []
+    try:
+        return validate_expose(raw)
+    except ValueError:
+        return []
+
+
+def role_matches(role: str, pattern: str) -> bool:
+    return pattern == role or (pattern.endswith("*") and role.startswith(pattern[:-1]))
 
 
 @dataclass(frozen=True)
@@ -313,8 +358,9 @@ def security(*args, input=None):
     program = config.keychain_program()
     if not program:
         raise StoreError("the Keychain is unavailable for this installation")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")}
     try:
-        return subprocess.run([program, *args], input=input, capture_output=True, timeout=10, check=False)
+        return subprocess.run([program, *args], input=input, capture_output=True, timeout=10, check=False, env=env)
     except (OSError, subprocess.SubprocessError):
         raise StoreError("Keychain command failed") from None
 
@@ -372,14 +418,14 @@ def write_item(ref: Reference, settings: config.SecretsConfig, value: bytes, *, 
 
 def external_item(scope, name, *, changing_value=False):
     item = item_path(scope, name)
-    if item == KEY_ITEM:
+    if item in (KEY_ITEM, VERIFICATION_KEY_ITEM):
         owner = "its owning service" if changing_value else "Arete"
         raise InternalSecret(f"This secret is managed by {owner}.")
     return item
 
 
 def require_removable(item, store=None):
-    if item == KEY_ITEM or store == "owner_file":
+    if item in (KEY_ITEM, VERIFICATION_KEY_ITEM) or store == "owner_file":
         raise InternalSecret("This secret is managed by its owning service.")
 
 
@@ -876,9 +922,78 @@ def set_names(names) -> set[str]:
 
 
 def values():
+    for _, value in entries():
+        yield value
+
+
+def entries():
     for row in rows():
-        if row["status"] == "set" and (value := read(row["scope"], row["name"])) is not None:
-            yield value.decode(errors="replace")
+        if row["status"] != "set":
+            continue
+        with suppress(InternalSecret, StoreError, StoreMissing, OSError, ValueError):
+            if (value := read(row["scope"], row["name"])) is not None:
+                yield row, value.decode(errors="replace")
+
+
+def read_for_expose(row: dict) -> tuple[str | None, str]:
+    from . import vault
+
+    scope, name = row["scope"], row["name"]
+    item = item_path(scope, name)
+    if item in (KEY_ITEM, VERIFICATION_KEY_ITEM):
+        return None, "internal"
+    settings = config.secret_settings()
+    try:
+        require_store(settings)
+        with registry() as c:
+            meta = db.metadata(c)
+            key = None
+            if row.get("fingerprint") is not None:
+                _, key = lookup_key(c, settings, local_key_path(), meta)
+            ref = registry_reference(c, row, item)
+        if ref.store not in (settings.store, "owner_file"):
+            return None, "store_mismatch"
+        raw = read_item(ref, settings)
+    except (StoreError, StoreMissing, FingerprintKeyMissing, OSError, ValueError, sqlite3.Error,
+            db.NoDatabase, db.IncompatibleSchema):
+        return None, "missing"
+    if raw is None:
+        return None, "missing"
+    text = raw.decode(errors="replace")
+    if len(text) < vault.SHORTEST:
+        return None, "below_floor"
+    if key is None or item_digest(key, raw) != row["fingerprint"]:
+        return None, "fingerprint_mismatch"
+    return text, ""
+
+
+def record_refused(row: dict, role: str, env_name: str, reason: str = "below_floor") -> None:
+    actor = principals.current()
+    detail = json.dumps({"role": role, "env": env_name, "reason": reason})
+
+    def write():
+        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError):
+            with db.tx() as c:
+                credentials.secret_event(c, row, "refused", actor, util.iso(), ok=False, detail=detail)
+
+    if db.transaction_mode() is not None:
+        db.after_transaction(write)
+    elif not db.isolated_busy():
+        write()
+
+
+def set_expose(scope: str, name: str, expose, actor: str) -> dict | None:
+    from . import scrub
+
+    external_item(scope, name, changing_value=True)
+    validate_actor(actor)
+    rules = validate_expose(expose)
+    with registry(write=True) as c:
+        row = credentials.set_expose(c, scope, name, rules)
+        if row is not None:
+            credentials.secret_changed(c, row, actor)
+            db.after_commit(scrub.invalidate)
+        return row
 
 
 def move_files():
@@ -975,6 +1090,8 @@ def history_detail(kind, provider, operation_id=None):
 
 
 def save_change(c, scope, name, previous, ref, change):
+    from . import scrub
+
     actor, at = change["actor"], change["at"]
     if change.get("removed"):
         row = (credentials.mark_removed(c, previous, at) if previous else
@@ -983,14 +1100,64 @@ def save_change(c, scope, name, previous, ref, change):
     else:
         rotated = change.get("rotated", bool(previous and previous["status"] == "set"))
         row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
-                                      actor, at, change["provider"], rotated=rotated, managed_by=change.get("managed_by"))
+                                      actor, at, change["provider"], rotated=rotated,
+                                      managed_by=change.get("managed_by"), expose=change.get("expose"))
         event = "moved" if change.get("moved") else "rotated" if rotated else "set"
     kind, provider = row["kind"], row["provider"]
     if event == "removed" and "provider" in change:
         kind, provider = change["kind"], change["provider"]
     credentials.secret_event(c, row, event, actor, at, detail=history_detail(kind, provider, change["id"]))
     credentials.secret_changed(c, row, actor)
+    db.after_commit(scrub.invalidate)
     return row
+
+
+def verification_key_row(c):
+    ref = Reference("owner_file", db.metadata(c)["instance_tag"], VERIFICATION_KEY_PATH)
+    row = credentials.secret(c, "global", VERIFICATION_KEY_NAME)
+    if row and (row["kind"], row["store"], row["reference"]) != ("signing_key", ref.store, str(ref)):
+        raise StoreError(f"{VERIFICATION_KEY_ITEM} conflicts with the verification authority's registry entry")
+    return row, ref
+
+
+def save_verification_key(c, row, ref, value: bytes, actor: str):
+    sha = item_digest(fingerprint_key(), value)
+    if row and row["fingerprint"] == sha:
+        return row
+    return save_change(c, "global", VERIFICATION_KEY_NAME, row, ref,
+                       dict(id=secrets.token_hex(16), kind="signing_key", actor=actor,
+                            at=util.iso(), fingerprint=sha, provider=None, rotated=row is not None))
+
+
+def register_verification_key(value: bytes, *, rotated: bool = False):
+    if not rotated:
+        with registry() as c:
+            if verification_key_row(c)[0] is not None:
+                return
+    with registry(write=True) as c:
+        row, ref = verification_key_row(c)
+        if row is None or rotated:
+            actor = principals.current()
+            validate_actor(actor)
+            save_verification_key(c, row, ref, value, actor)
+
+
+def check_verification_key(actor: str):
+    from . import scratch
+
+    validate_actor(actor)
+    with registry(write=True) as c:
+        previous, ref = verification_key_row(c)
+        value = None
+        with suppress(FileNotFoundError), scratch.authority_fd() as fd:
+            value = scratch.read_secret(fd)
+        row = previous if value is None else save_verification_key(c, previous, ref, value, actor)
+        if row is not None:
+            at = util.iso()
+            ok = value is not None
+            row = credentials.mark_checked(c, row, ok, at, recovered=row is not previous)
+            credentials.secret_event(c, row, "checked", actor, at, ok=ok, detail=history_detail(row["kind"], None))
+        return row
 
 
 def recover_changes(c, scope, name, row, ref, receipt, fingerprint, *, absent):
@@ -1025,9 +1192,10 @@ def validate_set(scope, name, value, kind):
             raise ValueError(why)
 
 
-def adopt(scope, name, value, kind, *, provider=None, managed_by=None, owner_file=None, settings=None):
+def adopt(scope, name, value, kind, *, provider=None, managed_by=None, owner_file=None, settings=None, expose=None):
     validate_set(scope, name, value, kind)
     validate_provider(provider)
+    rules = validate_expose(expose) if expose is not None else None
     item = item_path(scope, name)
     active = config.secret_settings()
     if settings is not None and settings != active:
@@ -1065,7 +1233,8 @@ def adopt(scope, name, value, kind, *, provider=None, managed_by=None, owner_fil
             retire_pending(item, raw, row)
             return row
         change = {"id": secrets.token_hex(16), "reference": str(ref), "kind": kind, "actor": "hand", "at": util.iso(),
-                      "fingerprint": fingerprint, "provider": provider, "moved": True, "rotated": False, "managed_by": managed_by}
+                  "fingerprint": fingerprint, "provider": provider, "moved": True, "rotated": False, "managed_by": managed_by,
+                  **({"expose": rules} if rules is not None else {})}
         if pending:
             change = pending[0]
             if (change["fingerprint"], change["kind"], change["provider"], change.get("managed_by")) != (
@@ -1084,11 +1253,12 @@ def adopt(scope, name, value, kind, *, provider=None, managed_by=None, owner_fil
 
 
 def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: str | None = None,
-        managed_by: str | None = None) -> dict:
+        managed_by: str | None = None, expose=None) -> dict:
     item = external_item(scope, name, changing_value=True)
     validate_actor(actor)
     validate_set(scope, name, value, kind)
     validate_provider(provider)
+    rules = validate_expose(expose) if expose is not None else None
     settings = config.secret_settings()
     local = local_key_path()
     with registry(write=True) as c:
@@ -1109,8 +1279,8 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
         if removal:
             raise StoreError("secret removal is pending; retry the removal before setting a new value")
         change = {"id": secrets.token_hex(16), "reference": str(ref), "kind": kind, "actor": actor, "at": util.iso(),
-                      "fingerprint": digest(key, value), "provider": provider, "rotated": stored is not None,
-                      "managed_by": managed_by}
+                  "fingerprint": digest(key, value), "provider": provider, "rotated": stored is not None,
+                  "managed_by": managed_by, **({"expose": rules} if rules is not None else {})}
         # Keep earlier operations recoverable until the outer SQLite transaction commits.
         raw = save_pending(item, dict(pending_binding(ref, settings, key), confirmed=confirmed, sets=[change]))
         data = value.encode()
@@ -1129,6 +1299,8 @@ def remove(scope, name, actor):
 
 
 def check(scope, name, actor="hand"):
+    if item_path(scope, name) == VERIFICATION_KEY_ITEM:
+        return check_verification_key(actor)
     return reconcile(scope, name, actor)
 
 

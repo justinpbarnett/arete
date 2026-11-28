@@ -12,18 +12,19 @@ import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
 import time
 import unicodedata
 from collections.abc import Collection
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import launchd, paths, sandbox, scratch_process, util
+from . import launchd, paths, sandbox, scratch_process, secretstore, util
 from .store import runs as run_store
 
 PREFIX = paths.SCRATCH_PREFIX
@@ -53,6 +54,8 @@ RUN_BASELINES: dict[str, dict[int, int] | None] = {}
 RUN_LABELS: dict[str, dict | None] = {}
 MAX_RECORD_BYTES = 1024 * 1024
 REPLACED_RECORD_READS = 5
+PIN = "browser-server.pin"
+MAX_PIN_BYTES = 64 * 1024 * 1024
 SECRET = "signing.secret"
 NEXT_SECRET = "signing.secret.next"
 ROTATION_MARKER = "rotation.marker"
@@ -126,9 +129,56 @@ def read_secret(fd: int, name: str = SECRET) -> bytes:
     return secret
 
 
+def legacy_authority() -> Path | None:
+    config = sandbox.ACCOUNT_CONFIG_DIR
+    if (config != paths.NOWHERE and sandbox.AUTHORITY != paths.NOWHERE
+            and paths.STATE_DIR.absolute() == config.parent.parent / ".local/share/arete"):
+        return sandbox.LEGACY_AUTHORITY
+    return None
+
+
+def entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def migration_receipt() -> Path:
+    return sandbox.AUTHORITY.with_name(sandbox.AUTHORITY_MIGRATION_RECEIPT)
+
+
+def pending_migration() -> Path | None:
+    source = legacy_authority()
+    if (source is not None and not entry_exists(sandbox.AUTHORITY) and not entry_exists(migration_receipt())
+            and entry_exists(source)):
+        return source
+    return None
+
+
+def ignored_legacy_authority() -> str:
+    source = legacy_authority()
+    if source is None or source == sandbox.AUTHORITY:
+        return ""
+    try:
+        if entry_exists(source):
+            if entry_exists(migration_receipt()):
+                return f"legacy verification authority {source} reappeared after migration; ignored"
+            if entry_exists(sandbox.AUTHORITY):
+                return f"legacy verification authority {source} left in place: {sandbox.AUTHORITY} already exists"
+    except OSError as error:
+        return f"cannot check for legacy verification authority {source}: {error}"
+    return ""
+
+
 @contextmanager
 def authority_fd(create: bool = False):
+    if sandbox.AUTHORITY == paths.NOWHERE:
+        raise FileNotFoundError(sandbox.AUTHORITY)
     if create:
+        if source := pending_migration():
+            raise PermissionError(f"verification authority {source} awaits migration by arete serve")
         with paths.directory_fd(sandbox.AUTHORITY.parent) as parent, suppress(FileExistsError):
             os.mkdir(sandbox.AUTHORITY.name, 0o700, dir_fd=parent)
     with paths.directory_fd(sandbox.AUTHORITY) as fd:
@@ -155,58 +205,140 @@ def stored_in(fd: int, folder: str) -> list[str]:
         return []
 
 
+def lock_migration_leases(stack: ExitStack, fd: int, source: Path) -> None:
+    for name in sorted(n for n in os.listdir(fd) if n.endswith(".lease")):
+        path = source / name
+        try:
+            lease = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            stack.callback(os.close, lease)
+            info = os.fstat(lease)
+            checked(info, identity(info))
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            checked(os.stat(name, dir_fd=fd, follow_symlinks=False), identity(info))
+        except BlockingIOError:
+            raise OSError(errno.EBUSY, "attempt lease is held", str(path)) from None
+        except OSError as error:
+            raise OSError(error.errno, f"cannot lock attempt lease: {error.strerror}", str(path)) from error
+
+
+def migrate_authority() -> str:
+    source = legacy_authority()
+    if source is None or source == sandbox.AUTHORITY:
+        return ""
+    try:
+        if problem := ignored_legacy_authority():
+            return problem
+        if not entry_exists(source):
+            return ""
+        with (paths.directory_fd(source.parent) as old_parent,
+              paths.directory_fd(sandbox.AUTHORITY.parent, create=True) as new_parent,
+              private_directory(old_parent, source.name) as authority, ExitStack() as leases):
+            try:
+                fcntl.flock(authority, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise OSError(errno.EBUSY, "authority folder lock is held", str(source)) from None
+            lock_migration_leases(leases, authority, source)
+            try:
+                settled = leases.enter_context(private_directory(authority, SETTLED))
+            except FileNotFoundError:
+                pass
+            else:
+                lock_migration_leases(leases, settled, source / SETTLED)
+            checked(os.stat(source.name, dir_fd=old_parent, follow_symlinks=False), identity(os.fstat(authority)), True)
+            restore_entry(source.name, old_parent, sandbox.AUTHORITY.name, new_parent)
+            os.fsync(old_parent)
+            os.fsync(new_parent)
+            os.close(os.open(sandbox.AUTHORITY_MIGRATION_RECEIPT,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=new_parent))
+            os.fsync(new_parent)
+    except OSError as error:
+        return f"verification authority migration from {source} to {sandbox.AUTHORITY}: {error}"
+    return ""
+
+
+def start_authority() -> str:
+    problem = migrate_authority()
+    try:
+        with authority_fd() as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            secretstore.register_verification_key(read_secret(fd))
+    except FileNotFoundError:
+        pass
+    except (OSError, RuntimeError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
+        problem = "; ".join(filter(None, (problem, f"cannot register {sandbox.AUTHORITY / SECRET}: {error}")))
+    return problem
+
+
 def stored_files(fd: int) -> list[str]:
-    names = [n for n in os.listdir(fd) if n.endswith(".json") or n == "browser-server.pin"]
+    names = [n for n in os.listdir(fd) if n.endswith(".json") or n in (PIN, NEXT_SECRET, ROTATION_MARKER)]
     return sorted(names + stored_in(fd, SETTLED) + stored_in(fd, RECEIPTS))
 
 
-def mint_secret(fd: int) -> None:
-    fcntl.flock(fd, fcntl.LOCK_EX)
+def mint_secret(fd: int) -> bool:
     try:
-        try:
-            os.stat(SECRET, dir_fd=fd, follow_symlinks=False)
-            return
-        except FileNotFoundError:
-            pass
-        if held := stored_files(fd):
-            listed = ", ".join(str(sandbox.AUTHORITY / n) for n in held[:5])
-            raise PermissionError(
-                f"scratch authority {sandbox.AUTHORITY} has no signing.secret but holds {len(held)} records "
-                f"({listed}); restore signing.secret, or move the listed records into "
-                f"{sandbox.AUTHORITY / 'orphaned'} once their "
-                "roots are gone")
-        create_secret(fd, SECRET)
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.stat(SECRET, dir_fd=fd, follow_symlinks=False)
+        return False
+    except FileNotFoundError:
+        pass
+    if held := stored_files(fd):
+        listed = ", ".join(str(sandbox.AUTHORITY / n) for n in held[:5])
+        raise PermissionError(
+            f"scratch authority {sandbox.AUTHORITY} has no signing.secret but holds {len(held)} records "
+            f"({listed}); restore signing.secret, or move the listed records into "
+            f"{sandbox.AUTHORITY / 'orphaned'} once their "
+            "roots are gone")
+    create_secret(fd, SECRET)
+    os.fsync(fd)
+    return True
 
 
 @contextmanager
 def registry(create: bool = False):
     if not sandbox.can_confine(False) or os.getuid() == 0 or sandbox.AUTHORITY == paths.NOWHERE:
         raise sandbox.ConfinementUnavailable("local producers cannot protect the scratch authority store")
+    if create and not entry_exists(sandbox.AUTHORITY) and pending_migration() is None:
+        secretstore.migrate_registry()
     with authority_fd(create) as fd:
         if create:
-            mint_secret(fd)
-        yield fd, read_secret(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                minted = mint_secret(fd)
+                key = read_secret(fd)
+                secretstore.register_verification_key(key, rotated=minted)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            key = read_secret(fd)
+        yield fd, key
 
 
-def load(fd: int, key: bytes, selector: str) -> dict:
-    if len(selector) != 64 or any(c not in "0123456789abcdef" for c in selector):
-        raise ValueError("invalid attempt selector")
+class BadSignature(ValueError):
+    pass
+
+
+def load_signed(fd: int, key: bytes, name: str, limit: int) -> dict:
     for _ in range(REPLACED_RECORD_READS):
-        source = os.open(selector + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         with os.fdopen(source, "rb") as inp:
             st = os.fstat(source)
             if stat.S_ISREG(st.st_mode) and st.st_nlink == 0:
                 continue
             checked(st, identity(st))
-            envelope = json.loads(inp.read(MAX_RECORD_BYTES + 1))
+            envelope = json.loads(inp.read(limit))
             break
     else:
         raise OSError(errno.ESTALE, "resource replaced or linked")
     data = envelope["data"]
     if not hmac.compare_digest(envelope["signature"], hmac.digest(key, encoded(data), "sha256").hex()):
-        raise ValueError("unauthenticated scratch record")
+        raise BadSignature("unauthenticated scratch record")
+    return data
+
+
+def load(fd: int, key: bytes, selector: str) -> dict:
+    if len(selector) != 64 or any(c not in "0123456789abcdef" for c in selector):
+        raise ValueError("invalid attempt selector")
+    data = load_signed(fd, key, selector + ".json", MAX_RECORD_BYTES + 1)
     if (data["version"] != 2 or data["attempt"]["selector"] != selector
             or data.get("source_mutations") is not False):
         raise ValueError("inconsistent scratch record")
@@ -223,12 +355,16 @@ def write_atomic(fd: int, name: str, payload: bytes) -> None:
     os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
 
 
-def store(fd: int, key: bytes, data: dict) -> None:
+def store_signed(fd: int, key: bytes, name: str, data: dict, *, limit: int | None = None) -> None:
     signature = hmac.digest(key, encoded(data), "sha256").hex()
     payload = encoded({"data": data, "signature": signature})
-    if len(payload) > MAX_RECORD_BYTES:
-        raise ValueError(f"scratch record is {len(payload)} bytes, over the {MAX_RECORD_BYTES} byte limit")
-    write_atomic(fd, data["attempt"]["selector"] + ".json", payload)
+    if limit is not None and len(payload) > limit:
+        raise ValueError(f"scratch record is {len(payload)} bytes, over the {limit} byte limit")
+    write_atomic(fd, name, payload)
+
+
+def store(fd: int, key: bytes, data: dict) -> None:
+    store_signed(fd, key, data["attempt"]["selector"] + ".json", data, limit=MAX_RECORD_BYTES)
 
 
 class RotationRefused(RuntimeError):
@@ -284,11 +420,9 @@ def rotation_secret(fd: int, started: bool) -> bytes:
 
 
 def verifies(fd: int, key: bytes, name: str) -> bool:
-    from . import browser
-
     try:
-        if name == browser.PIN:
-            browser.load_pin(fd, key)
+        if name == PIN:
+            load_signed(fd, key, name, MAX_PIN_BYTES)
         elif "/" in name:
             folder, leaf = name.split("/", 1)
             with private_directory(fd, folder) as directory:
@@ -301,10 +435,8 @@ def verifies(fd: int, key: bytes, name: str) -> bool:
 
 
 def resign(fd: int, old: bytes, new: bytes, name: str) -> None:
-    from . import browser
-
-    if name == browser.PIN:
-        browser.store_pin(fd, new, browser.load_pin(fd, old))
+    if name == PIN:
+        store_signed(fd, new, name, load_signed(fd, old, name, MAX_PIN_BYTES))
     elif "/" in name:
         folder, leaf = name.split("/", 1)
         with private_directory(fd, folder) as directory:
@@ -327,15 +459,11 @@ def unverified(names: list[str]) -> RotationRefused:
 
 
 def rotation_counts(names, files: list[str]) -> tuple[int, int]:
-    from . import browser
-
     present = [n for n in names if n in files]
-    return sum(n != browser.PIN for n in present), int(browser.PIN in present)
+    return sum(n != PIN for n in present), int(PIN in present)
 
 
 def rotate() -> tuple[int, int]:
-    from . import browser
-
     with registry() as (fd, _):
         fcntl.flock(fd, fcntl.LOCK_EX)
         old = read_secret(fd)
@@ -343,7 +471,7 @@ def rotate() -> tuple[int, int]:
         if blockers:
             raise RotationRefused("\n".join(blockers))
         listing = os.listdir(fd)
-        files = sorted(n for n in listing if n.endswith(".json")) + [n for n in listing if n == browser.PIN]
+        files = sorted(n for n in listing if n.endswith(".json")) + [n for n in listing if n == PIN]
         marker = resigned_names(fd)
         has_next = NEXT_SECRET in listing
         files += [name for name in stored_in(fd, RECEIPTS) if SELECTOR_FILE.fullmatch(Path(name).name)]
@@ -356,12 +484,14 @@ def rotate() -> tuple[int, int]:
             if marker is not None:
                 os.fsync(fd)
                 os.unlink(ROTATION_MARKER, dir_fd=fd)
+                secretstore.register_verification_key(old, rotated=True)
                 return rotation_counts(marker, files)
         new = rotation_secret(fd, marker is not None)
         files += [name for name in settled if name not in files and verifies(fd, new, name)]
         bad = [n for n in files if not verifies(fd, new, n) and not verifies(fd, old, n)]
         if bad:
             raise unverified(bad)
+        secretstore.register_verification_key(old)
         done = {n for n in files if verifies(fd, new, n)}
         note_resigned(fd, done)
         for name in files:
@@ -373,6 +503,7 @@ def rotate() -> tuple[int, int]:
         if bad:
             raise RotationRefused("not signed by the new secret: " + ", ".join(bad))
         swap_secret(fd)
+        secretstore.register_verification_key(new, rotated=True)
         return rotation_counts(done, files)
 
 
@@ -487,8 +618,11 @@ def survey(*, check=lambda: None) -> View:
             return View(good, unreadable, False)
     except FileNotFoundError:
         check()
-        if os.path.lexists(sandbox.AUTHORITY):
+        if sandbox.AUTHORITY != paths.NOWHERE and entry_exists(sandbox.AUTHORITY):
             raise
+        if source := pending_migration():
+            return View([], [Unreadable(str(source), "awaits migration by arete serve", None, "", "", "", False)],
+                        False)
         return View([], [], True)
 
 
@@ -701,9 +835,10 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
         if unresolved:
             held = named_holders([h for d in unresolved if isinstance(d, dict) and isinstance(d.get("diagnostic"), dict)
                                   for h in d["diagnostic"].get("holders", [])])
-            files = ", ".join(u.path for u in unresolved if isinstance(u, Unreadable))
+            files = ", ".join(f"unreadable record {h.path}" if isinstance(h, Unreadable) else path_of(h)
+                              for h in unresolved)
             raise OSError(errno.EBUSY, "workspace has an unresolved verification attempt"
-                          + (f" held by {held}" if held else "") + (f" (unreadable record {files})" if files else ""))
+                          + (f" held by {held}" if held else "") + f" ({files})")
         selector, token = secrets.token_hex(32), secrets.token_hex(8)
         root = ws / f"{PREFIX}{token}{paths.SCRATCH_SUFFIX}"
         directories, files = {}, {}
@@ -985,7 +1120,8 @@ def home_dir() -> Path:
 def hidden_folders(with_state: bool = True) -> tuple[Path, ...]:
     home = home_dir()
     state = home / ".local/share/arete"
-    return tuple(p for p in (sandbox.AUTHORITY.parent, state, home / "Library/Application Support/arete",
+    return tuple(p for p in (home / ".config/arete", sandbox.AUTHORITY, state,
+                             home / "Library/Application Support/arete",
                              *sandbox.secret_store_roots(),
                              *(home / n for n in (*sandbox.SECRET_DIRS, ".claude", ".codex", ".pi")))
                  if with_state or p != state)
@@ -1079,6 +1215,8 @@ def exposure(path: Path, grants) -> Path | None:
 
 
 def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
+    if kwargs.get("env") is None:
+        raise ValueError("scratch.spawn requires an explicit env")
     a = PRODUCING.get()
     if a is None and actor_confined:
         return subprocess.Popen(*args, **kwargs)
@@ -1825,7 +1963,10 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 return "", [], kept
             if data.get("capture"):
                 kept = cleanup(a, data, fd, key)
-                return data.get("snapshot", ""), [], kept
+                snapshot = Path(data.get("snapshot") or "").name
+                if snapshot and snapshot in data.get("archives", ()):
+                    archived = str(sandbox.AUTHORITY / a.selector / snapshot)
+                return archived, [], kept
             if not os.path.lexists(a.root):
                 if a.directories or a.files:
                     data["diagnostic"] = "registered scratch root missing; original workspace retained"

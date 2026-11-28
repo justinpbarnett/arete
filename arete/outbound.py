@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import re
 import socket
 import tomllib
 from urllib.parse import urlsplit
 
-from . import paths, util
-import contextlib
+from . import paths, scrub, util, vault
 
 SECRETISH = re.compile(r"((?:(?<![A-Za-z])|(?=sk-[a-z-]*[A-Z0-9_]))sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
                        r"|[A-Za-z0-9+/]{40,}|/Users/[^/\s]+)")
@@ -15,8 +15,8 @@ TAGS = re.compile(r"<[A-Za-z/!?][^>]{0,200}>")
 LINKS = re.compile(r"!?\[([^\]]{0,200})\]\([^)]{0,500}\)")
 
 
-def redact(text: str) -> str:
-    return SECRETISH.sub("[redacted]", text)
+def redact(text: str, *, subject: str = "outbound") -> str:
+    return SECRETISH.sub(vault.REDACTED, scrub.text(text, "outbound", subject))
 
 
 def sanitize(text: str, n: int = 200) -> str:
@@ -136,7 +136,8 @@ def registered(text: str) -> str:
     return re.sub(re.escape(PRIVATE_ADDRESS) + "|" + pattern, PRIVATE_ADDRESS, text, flags=re.IGNORECASE)
 
 
-def screen(text: str) -> str:
+def screen(text: str, *, subject: str = "outbound") -> str:
+    text = scrub.text(text, "outbound", subject)
     keep_configured_private()
     text = ORIGIN.sub(screen_origin, text)
     text = BARE_PRIVATE.sub(screen_bare, text)

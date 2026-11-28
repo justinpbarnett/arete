@@ -61,7 +61,7 @@ def watch_exit(queue, pid, status=False):
 def wait_for_command(group, command):
     with closing(select.kqueue()) as queue:
         watch_exit(queue, group, status=True)
-        with subprocess.Popen(command, process_group=group, close_fds=False) as proc:
+        with subprocess.Popen(command, env=os.environ, process_group=group, close_fds=False) as proc:
             try:
                 watch_exit(queue, proc.pid)
             except ProcessLookupError:

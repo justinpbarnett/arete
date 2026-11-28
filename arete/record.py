@@ -236,8 +236,9 @@ def append(fd: int, text: str) -> None:
 
 
 class Recorder:
-    def __init__(self, run_id: str, step: str, header: dict, hidden: Sequence[str]):
+    def __init__(self, run_id: str, step: str, header: dict, hidden: Sequence[str] | scrub.Redactions = ()):
         self.run_id, self.step, self.hidden = run_id, step, hidden
+        self.subject = f"{run_id}/{step}" if run_id else step
         self.runner, self.model = header.get("runner", ""), header.get("model", "")
         self.lock = threading.RLock()
         self.at, self.started = util.iso(), time.monotonic()
@@ -289,7 +290,7 @@ class Recorder:
             if time.monotonic() - self.clocked >= CLOCK_SECONDS:
                 self.clocked = time.monotonic()
                 clock.append(json.dumps({"arete": "clock", "seconds": self.elapsed()}))
-            text = "\n".join([*clock, scrub.scrub(raw, self.hidden)])
+            text = "\n".join([*clock, scrub.text(raw, "record", self.subject, extra=self.hidden)])
             if self.held is None:
                 self.put(text)
                 return
@@ -340,11 +341,13 @@ class Recorder:
              **({"atom": self.header["atom"]} if self.header.get("atom") else {}),
              **{k: result[k] for k in ("auth_modes", "paid_usd", "credential", "effort") if k in result},
              seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
-             **({"error": util.first_line(scrub.scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
+             **({"error": util.first_line(scrub.text(result["error"], "record", self.subject, extra=self.hidden), 300)}
+                if result["error"] else {}))
 
     def write(self, entry: dict) -> None:
         with self.lock:
-            self.put(scrub.scrub(json.dumps(entry, ensure_ascii=False, default=str), self.hidden))
+            self.put(scrub.text(json.dumps(entry, ensure_ascii=False, default=str), "record", self.subject,
+                                extra=self.hidden))
 
     def put(self, text: str) -> None:
         if self.fd is None:
@@ -370,8 +373,8 @@ class Recorder:
 def mark(run_id: str, kind: str, **fields) -> None:
     if not run_id:
         return
-    text = scrub.scrub(json.dumps({"kind": kind, "at": util.iso(), **fields}, ensure_ascii=False, default=str),
-                       scrub.secrets())
+    text = scrub.text(json.dumps({"kind": kind, "at": util.iso(), **fields}, ensure_ascii=False, default=str),
+                      "record", f"{run_id}/{kind}")
     folder = paths.record_dir(run_id)
     try:
         folder.mkdir(parents=True, exist_ok=True)

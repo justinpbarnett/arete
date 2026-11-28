@@ -124,18 +124,39 @@ def explicit(source, key, token, names):
     return choices[0] if choices and all(c == choices[0] for c in choices) else None
 
 
+def diff_checks(name: str, previous: list[str], latest: list[str]) -> list[dict]:
+    changed = []
+    if len(previous) == len(latest):
+        for before, after in zip(previous, latest):
+            if before != after:
+                changed.append({"node": name, "before": before, "after": after})
+        return changed
+    old_set, new_set = set(previous), set(latest)
+    removed = [c for c in previous if c not in new_set]
+    added = [c for c in latest if c not in old_set]
+    for before, after in zip(removed, added):
+        changed.append({"node": name, "before": before, "after": after})
+    for before in removed[len(added):]:
+        changed.append({"node": name, "before": before, "after": ""})
+    for after in added[len(removed):]:
+        changed.append({"node": name, "before": "", "after": after})
+    return changed
+
+
 def plan_amendment(source, remote, key, saved, updates, version):
     data = saved["data"]
     children = specgraphs.children(key)
     plan = copy.deepcopy(data["plan"])
     by_key = {n["key"]: n for n in plan["children"]}
-    open_nodes, corrections, edges = [], {}, []
+    replaced = data.get("replaced_nodes", {})
+    open_nodes, corrections, edges, changed_checks = [], {}, [], []
     for name, checks in sorted(updates.items()):
         node = by_key[name]
         ref, native = children[name]
         item = remote.read(ref)
         if item.native_id != native or not spec_graph.same_parent(remote, ref, remote.read(key.parent)):
             raise spec_tracker.Held(f"the native parent or identity of {ref} changed")
+        changed_checks.extend(diff_checks(name, list(node["checks"]), list(checks)))
         if item.open and not spec_graph_delivery.child_landing(source.repo.name, ref, data["targets"]):
             node["checks"] = checks
             open_nodes.append(name)
@@ -158,7 +179,52 @@ def plan_amendment(source, remote, key, saved, updates, version):
                 node["artifacts"][correction] = artifact.copy()
             edges.append([correction, node["key"]])
     spec_graph.ordered({n["key"]: set(n["requires"]) for n in plan["children"]})
-    return {"version": version, "plan": plan, "open": open_nodes, "corrections": corrections, "edges": edges}
+    active_keys = {n["key"] for n in data["plan"]["children"] if n["key"] not in replaced}
+    relinked = {dep for _, dep in edges}
+    unaffected_nodes = sorted(active_keys - set(updates) - relinked)
+    return {
+        "version": version,
+        "plan": plan,
+        "open": open_nodes,
+        "corrections": corrections,
+        "edges": edges,
+        "changed_checks": changed_checks,
+        "unaffected": unaffected_nodes,
+    }
+
+
+def parent_summary(key, version, update, mapped) -> str:
+    lines = [f"Reconciled parent spec amendment `{version[:12]}` for {key.parent}."]
+    if changed := update.get("changed_checks"):
+        lines.extend(["", "### Changed acceptance checks", ""])
+        for item in changed:
+            if item["before"] and item["after"]:
+                lines.append(f"- `{item['node']}`: `{item['before']}` -> `{item['after']}`")
+            elif item["after"]:
+                lines.append(f"- `{item['node']}` (added): `{item['after']}`")
+            else:
+                lines.append(f"- `{item['node']}` (removed): `{item['before']}`")
+    if update["open"]:
+        affected = ", ".join(f"{mapped[n][0]} (`{n}`)" if n in mapped else f"`{n}`" for n in update["open"])
+        lines.append(f"\nAffected open children redirected: {affected}.")
+    if update["corrections"]:
+        fixes = ", ".join(
+            f"{mapped[orig][0]} (`{orig}`) -> {mapped[fix][0]} (`{fix}`)"
+            if orig in mapped and fix in mapped else f"`{orig}` -> `{fix}`"
+            for orig, fix in sorted(update["corrections"].items())
+        )
+        lines.append(f"\nCorrection children created (completed tickets stayed closed): {fixes}.")
+    if update["edges"]:
+        relinked = ", ".join(
+            f"{mapped[dep][0]} (`{dep}`) now waits on {mapped[fix][0]} (`{fix}`)"
+            if dep in mapped and fix in mapped else f"`{dep}` -> `{fix}`"
+            for fix, dep in update["edges"]
+        )
+        lines.append(f"\nPrerequisites added to open dependents: {relinked}.")
+    if untouched := update.get("unaffected"):
+        kept = ", ".join(f"{mapped[n][0]} (`{n}`)" if n in mapped else f"`{n}`" for n in untouched)
+        lines.append(f"\nUnaffected children continuing unchanged: {kept}.")
+    return "\n".join(lines)
 
 
 def note(publication, operation, ref, body):
@@ -233,13 +299,21 @@ def reconcile(source, claim, ticket):
         contracts[name] = contract
     for name in update["corrections"].values():
         publication.enable(name, remote.read(mapped[name][0]))
+    if update["open"] or update["corrections"] or update.get("changed_checks"):
+        note(publication, f"parent-amend:{version}", key.parent,
+             f"[arete] {parent_summary(key, version, update, mapped)}")
     if not current():
         raise spec_tracker.Held("parent authority changed during native amendment publication")
     updated = {**data, "plan": update["plan"], "accepted_parent": snapshot(ticket), "ticket_version": version,
                "parent": spec_graph.body_identity(parent), "amended_contracts": contracts,
                "replaced_nodes": {**data.get("replaced_nodes", {}), **update["corrections"]},
-               "amendments": [*data.get("amendments", []), {"version": version, "open": update["open"],
-                                                            "corrections": update["corrections"]}]}
+               "amendments": [*data.get("amendments", []), {
+                   "version": version,
+                   "open": update["open"],
+                   "corrections": update["corrections"],
+                   "changed_checks": update.get("changed_checks", []),
+                   "unaffected": update.get("unaffected", []),
+               }]}
     updated.pop("pending_amendment")
     specgraphs.amend(key, data, updated, claim=claim)
     return False  # The next settlement reads the updated parent and child receipts together.

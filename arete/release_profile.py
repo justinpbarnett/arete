@@ -9,7 +9,7 @@ from pathlib import Path
 from . import paths, release_proof as proof, serve_guard, util, zte
 
 FIELDS = {"destination", "staging", "production", "production_branch", "identity_path", "immutable_host_suffix",
-          "checks", "qa", "qa_require_revision"}
+          "checks", "qa", "qa_require_revision", "promotion_mode"}
 TARGET_FIELDS = ("github", "tracker", "jira_site", "jira_project", "jira_label", "target_branch", "landing", "unattended_environment")
 
 

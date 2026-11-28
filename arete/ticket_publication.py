@@ -10,15 +10,17 @@ from .store import db as foundation
 
 LOOP_ROUTE = "/loops/configured-ticket"
 PLAN_ROUTE = "/repo/publish"
+FOLLOWUP_ROUTE = "/ticket-feedback/follow-up"
 
 
-def target_for(cfg: config.Config, repo: config.Repo) -> dict:
+def target_for(cfg: config.Config, repo: config.Repo, *, jira_client: jira.Client | None = None) -> dict:
     if repo.tracker == "github" and repo.github:
         return {"tracker": "github", "github": repo.github}
     if repo.tracker == "jira":
         if project := tracker.jira_project(repo, cfg.jira):
+            site = repo.jira_site or (jira_client.base if jira_client is not None else jira.site_url(cfg.jira))
             return {"tracker": "jira", "project": project, "route": tracker.route_label(repo),
-                    "site": repo.jira_site or jira.site_url(cfg.jira)}
+                    "site": site}
         raise ValueError(f"{repo.name} has no Jira project configured")
     raise ValueError(f"{repo.name} needs a configured GitHub or Jira destination")
 
@@ -66,6 +68,37 @@ def plan(cfg: config.Config, repo: config.Repo, kind: str, title: str, body: str
         return publish(item, cfg, context)
 
 
+def follow_up(cfg: config.Config, repo: config.Repo, title: str, body: str, key: str, *,
+              labels: list[str] | tuple[str, ...] = (), issue_type: str = "",
+              jira_client: jira.Client | None = None) -> str:
+    clean_title = title.strip()
+    if not clean_title or "\n" in clean_title or "\r" in clean_title or not body.strip():
+        raise ValueError("Follow-up publication needs a single-line title and a nonempty body.")
+    target = target_for(cfg, repo, jira_client=jira_client)
+    label_list = list(dict.fromkeys(lb for lb in labels if lb))
+    payload = {
+        "repo": repo.name,
+        "kind": "follow-up",
+        "title": clean_title,
+        "body": body,
+        "labels": label_list,
+        "issue_type": issue_type,
+    }
+    sha = idempotency.fingerprint("POST", FOLLOWUP_ROUTE, {}, payload)
+    item = {
+        "destination": target,
+        "title": clean_title,
+        "parent": "",
+        "labels": label_list,
+        "issue_type": issue_type,
+        "body": gh.marked(body),
+    }
+    lock_key = hashlib.sha256(key.encode()).hexdigest()
+    with idempotency.owning("ticket.followup", key, sha, FOLLOWUP_ROUTE) as context:
+        with util.lock(f"followup-publish-{lock_key}", wait=True):
+            return publish(item, cfg, context, jira_client=jira_client)
+
+
 def finding(item: dict, cfg: config.Config, approval) -> str:
     key = item["publication_key"]
     try:
@@ -75,7 +108,8 @@ def finding(item: dict, cfg: config.Config, approval) -> str:
         raise RuntimeError(str(error)) from error
 
 
-def publish(item: dict, cfg: config.Config, context, approval=None) -> str:
+def publish(item: dict, cfg: config.Config, context, approval=None, *,
+            jira_client: jira.Client | None = None) -> str:
     with foundation.tx():
         row = idempotency.matching_claim(context)
         if row and row["status"]:
@@ -83,7 +117,7 @@ def publish(item: dict, cfg: config.Config, context, approval=None) -> str:
         receipt = idempotency.Publication(context, row)
         if receipt.pending is None:
             receipt.remember({"destination": item["destination"]})
-    return send(item, cfg, receipt, approval)
+    return send(item, cfg, receipt, approval, jira_client=jira_client)
 
 
 def jira_parent(client: jira.Client, target: dict, parent: str) -> str:
@@ -106,7 +140,8 @@ def github_child(repo: str, parent: str, url: str, receipt: idempotency.Publicat
     gh.ensure_sub_issue(repo, int(parent), int(number))
 
 
-def send(item: dict, cfg: config.Config, receipt: idempotency.Publication, approval) -> str:
+def send(item: dict, cfg: config.Config, receipt: idempotency.Publication, approval, *,
+         jira_client: jira.Client | None = None) -> str:
     target = receipt.pending["destination"]
     if target != item["destination"]:
         raise ValueError("The queued ticket's destination differs from its earlier publication receipt")
@@ -117,7 +152,7 @@ def send(item: dict, cfg: config.Config, receipt: idempotency.Publication, appro
     parent = item.get("parent", "")
 
     if target["tracker"] == "jira":
-        client = jira.Client.from_env(cfg.jira)
+        client = jira_client or jira.Client.from_env(cfg.jira)
         if client.base != target["site"]:
             raise jira.JiraError("the queued ticket belongs to a different Jira site")
         account = client.me().get("accountId")
@@ -125,7 +160,9 @@ def send(item: dict, cfg: config.Config, receipt: idempotency.Publication, appro
             raise jira.JiraError("cannot confirm the Jira account for this ticket")
         found = receipt.pending.get("issue_url") or client.find_task_marker(target["project"], account, marker)
         labels = list(dict.fromkeys([*item["labels"], target["route"]]))
-        options = {"parent": parent, "subtask_type": jira_parent(client, target, parent)} if parent and not found else {}
+        options: dict = {"parent": parent, "subtask_type": jira_parent(client, target, parent)} if parent and not found else {}
+        if not parent and item.get("issue_type"):
+            options["issue_type"] = item["issue_type"]
 
         def create():
             return client.create_task(target["project"], account, item["title"], body, labels, **options)

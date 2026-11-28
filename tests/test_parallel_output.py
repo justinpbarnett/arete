@@ -60,7 +60,7 @@ class Noisy(unittest.TestCase):
 
 
 class Sleeper(unittest.TestCase):
-    class_timeout = 0.5
+    class_timeout = 0.4
 
     def test_hangs(self):
         time.sleep(60)
@@ -98,15 +98,33 @@ class AssertionWithReplacePatched(BusySolo):
 
 
 class BusyTimeout(BusySolo):
-    class_timeout = 1
+    class_timeout = 0.5
 
     def test_hangs(self):
         if self.attempt <= 2:
             time.sleep(60)
 
 
+class StateWriterOne(unittest.TestCase):
+    def test_clean_state(self):
+        state = os.environ["ARETE_STATE_DIR"]
+        marker = os.path.join(state, "dirty.txt")
+        self.assertFalse(os.path.exists(marker))
+        with open(marker, "w") as handle:
+            handle.write("from-one")
+
+
+class StateWriterTwo(unittest.TestCase):
+    def test_clean_state(self):
+        state = os.environ["ARETE_STATE_DIR"]
+        marker = os.path.join(state, "dirty.txt")
+        self.assertFalse(os.path.exists(marker))
+        with open(marker, "w") as handle:
+            handle.write("from-two")
+
+
 class BusyTimeoutThenFailure(BusySolo):
-    class_timeout = 1
+    class_timeout = 0.5
 
     def test_hangs_on_first_solo_attempt(self):
         if self.attempt == 1:
@@ -176,7 +194,7 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertRegex(output, r"(?m)^class exceeded (?:1\.5s|[\d.]+s \(deadline 1\.5s x load [\d.]+\))$")
+        self.assertRegex(output, r"(?m)^class exceeded (?:1\.2s|[\d.]+s \(deadline 1\.2s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)
@@ -227,12 +245,23 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertIn(f"{identifier}: starting alone at host load 21", output)
         self.assertIn(f"{identifier}: failures", output)
         before_failure = output.partition(f"{identifier}: failures")[0]
-        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 3s x load [\d.]+\)\nPython class stack")
+        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 1\.5s x load [\d.]+\)\nPython class stack")
         self.assertIn("in test_hangs_on_first_solo_attempt\n", before_failure)
         self.assertIn("AssertionError: assertion on the extra solo attempt", output)
         self.assertIn(f"Failed classes: {identifier}", output)
         marker = Path(self.env["PARALLEL_MARKERS"]) / name
         self.assertEqual(marker.read_text().splitlines(), ["1", "2", "3"], output)
+
+    def test_fork_pool_isolates_state_across_reused_slots_and_captures_timeout_stacks(self):
+        code, output = self.run_suite("-j", "1", "test_sample.StateWriterOne", "test_sample.StateWriterTwo")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Ran 2 tests", output)
+        code, output = self.run_suite("-j", "1", "test_sample.Sleeper", "test_sample.StateWriterOne")
+        self.assertEqual(code, 1, output)
+        self.assertIn("Python class stack", output)
+        self.assertIn("in test_hangs", output)
+        self.assertIn("Failed classes: test_sample.Sleeper", output)
+        self.assertIn("Ran 1 tests", output)
 
 
 def report(**details):

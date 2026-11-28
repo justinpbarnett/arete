@@ -26,10 +26,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
-from . import paths, sandbox, scratch, util
+from . import environment, paths, sandbox, scratch, util
 
 REGISTRY = "https://registry.npmjs.org/"
-PIN = "browser-server.pin"
+PIN = scratch.PIN
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 MAX_DOWNLOAD = 64 * 1024 * 1024
 MAX_FILE = 128 * 1024 * 1024
@@ -143,22 +143,15 @@ def extract(data: bytes, target: Path) -> None:
             handle.write(content)
 
 
-def pin_signature(key: bytes, packages: dict) -> str:
-    return hmac.digest(key, scratch.encoded(packages), "sha256").hex()
-
-
 def store_pin(fd: int, key: bytes, packages: dict) -> None:
-    scratch.write_atomic(fd, PIN, scratch.encoded({"data": packages, "signature": pin_signature(key, packages)}))
+    scratch.store_signed(fd, key, PIN, packages)
 
 
 def load_pin(fd: int, key: bytes) -> dict:
-    source = os.open(PIN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-    with os.fdopen(source, "rb") as handle:
-        scratch.checked(os.fstat(source), scratch.identity(os.fstat(source)))
-        envelope = json.loads(handle.read(MAX_DOWNLOAD))
-    if not hmac.compare_digest(envelope["signature"], pin_signature(key, envelope["data"])):
-        raise refuse("the pin is not signed by this engine")
-    return envelope["data"]
+    try:
+        return scratch.load_signed(fd, key, PIN, scratch.MAX_PIN_BYTES)
+    except scratch.BadSignature as error:
+        raise refuse("the pin is not signed by this engine") from error
 
 
 def write_pin(packages: dict) -> None:
@@ -356,7 +349,7 @@ def listen_port(a: scratch.Attempt, app: int, avoid: frozenset[int] = frozenset(
 
 def listens(argv: list[str], port: int, folder: Path) -> bool:
     proc = subprocess.Popen(argv, cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.DEVNULL, start_new_session=True, env=environment.build(()))
     try:
         deadline = time.monotonic() + LISTEN_PROBE_SECONDS
         while proc.poll() is None and time.monotonic() < deadline:
@@ -524,7 +517,7 @@ def stop_browser(data: dict) -> None:
     def writers() -> list[int]:
         try:
             rows = subprocess.run(["/bin/ps", "-U", str(os.getuid()), "-o", "pid=,pgid="], check=False,
-                                  capture_output=True, text=True, timeout=30).stdout.split("\n")
+                                  capture_output=True, text=True, timeout=30, env=environment.build(())).stdout.split("\n")
         except (OSError, subprocess.SubprocessError):
             return []
         found = []

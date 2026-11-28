@@ -56,10 +56,12 @@ def runtime():
                 for name in BUNDLE:
                     shutil.copyfile(SOURCE / name, stage / name)
                 try:
+                    from . import environment
+
                     subprocess.run([executable("npm"), "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=stage,
                                    check=True, timeout=240, stdout=subprocess.DEVNULL,
-                                   env={**os.environ, "PATH": str(Path(executable("node")).parent) + os.pathsep
-                                        + os.environ.get("PATH", "")})
+                                   env=environment.build((), {"PATH": str(Path(executable("node")).parent) + os.pathsep
+                                                              + os.environ.get("PATH", "")}))
                 except subprocess.SubprocessError as error:
                     raise ValueError("Could not install the locked Pi Durable runtime") from error
                 stage.rename(installed)

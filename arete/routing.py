@@ -3,7 +3,6 @@ from __future__ import annotations
 import http.client
 import json
 import math
-import os
 import re
 import urllib.request
 from dataclasses import dataclass, replace
@@ -606,7 +605,7 @@ class Discovery:
         if claude_openrouter(way.runner, vendor):
             return self.remembered(f"openrouter_key:{way.model}:{materialize}", lambda: pi_route(
                 f"{vendor}/{way.model}", self.cfg, self.repo, self.device, self.connect, mode="api_key",
-                source={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}, materialize=materialize))
+                source=environment.without("CLAUDE_CODE_OAUTH_TOKEN"), materialize=materialize))
         return (self.materialize(f"{vendor}/{ident}", "api_key") if materialize else
                 self.probe(f"{vendor}/{ident}", "api_key"))
 

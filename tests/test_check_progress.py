@@ -97,7 +97,16 @@ class CheckProgressTests(ProgressFixture):
         with (paths.directory_fd(paths.CHECK_LOCKS_DIR, create=True) as directory, util.lock_file("checks") as worker,
               slots.check_lock_file(directory, slots.CHECK_SLOTS_LOCK) as lock):
             self.assertTrue(util.flock_now(lock) and util.flock_now(worker))
-            with (patch.object(pipeline.time, "sleep", side_effect=(f.close() for f in (lock, worker))),
+            real_sleep = pipeline.time.sleep
+            pending_locks = iter((lock, worker))
+
+            def release_lock(seconds):
+                if seconds < 0.1:
+                    real_sleep(seconds)
+                elif (held := next(pending_locks, None)) is not None:
+                    held.close()
+
+            with (patch.object(pipeline.time, "sleep", side_effect=release_lock),
                   patch.object(b.run, "time_for", return_value=11),
                   patch.object(pipeline.environment, "sh", side_effect=launch)):
                 self.assertEqual(b.check_with_repairs(), (False, 2))

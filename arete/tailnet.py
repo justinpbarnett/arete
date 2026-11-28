@@ -41,12 +41,14 @@ def tailscale_exe() -> str:
 
 
 def tailscale_run(*args: str, timeout: float) -> subprocess.CompletedProcess | None:
+    from . import environment
+
     exe = tailscale_exe()
     if not exe:
         return None
     try:
         return subprocess.run([exe, *args], capture_output=True, text=True, errors="replace", timeout=timeout,
-                              check=False, env={**os.environ, **TAILSCALE_AS_CLI})
+                              check=False, env=environment.build((), TAILSCALE_AS_CLI))
     except subprocess.TimeoutExpired:
         return None
 

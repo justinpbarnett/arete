@@ -46,8 +46,11 @@ def base64url(data: bytes) -> str:
 
 
 def openssl(args: list[str], stdin: bytes | None = None) -> bytes:
+    from . import environment
+
     try:
-        res = subprocess.run(["openssl", *args], input=stdin, capture_output=True, timeout=30, check=False)
+        res = subprocess.run(["openssl", *args], input=stdin, capture_output=True, timeout=30, check=False,
+                             env=environment.build(()))
     except (OSError, subprocess.SubprocessError):
         raise KeyFault("openssl could not make the push key") from None
     if res.returncode != 0:

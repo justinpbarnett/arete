@@ -86,17 +86,19 @@ def sh(
     check: bool = False,
     env: dict | None = None,
     input: str | None = None,
-    inherit: bool = True,
+    role: str | None = None,
     keeps: tuple[str, ...] = (),
     hold_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess:
-    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps, hold_fds=hold_fds)
+    return _sh(cmd, cwd, timeout, check, env, input, role, keeps, hold_fds=hold_fds)
 
 
-def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
+def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, role=None, keeps=(), *,
         deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
         index_lock: _DeployIndexLock | None = None, hold_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
-    full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
+    from . import environment
+
+    full_env = environment.build((), env, role=role)
     words = ["/bin/sh", "-c", cmd] if isinstance(cmd, str) else cmd
     supervised = check_process.launch(words, timeout, hold_fds) if hold_fds else nullcontext((cmd, (), None))
     try:
@@ -121,16 +123,19 @@ def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=T
     return res
 
 
-def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
+def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *, env: dict | None = None,
                    graceful_timeout: bool = False, index_lock: _DeployIndexLock | None = None,
                    hold_fds: tuple[int, ...] = (), cancel=None, **kw) -> subprocess.CompletedProcess:
+    from . import environment
+
     stdin = subprocess.PIPE if input is not None else None
+    env = environment.build(()) if env is None else env
     if hold_fds:
         kw["pass_fds"] = hold_fds
     if graceful_timeout:
         kw.update(own_group_args())
     with ExitStack() as cleanup:
-        proc = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+        proc = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, **kw)
         if graceful_timeout:
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is not None:
@@ -678,7 +683,7 @@ def end_session(pid) -> None:
 def process_rows(columns: str) -> list[list[int]]:
     try:
         listed = subprocess.run(["/bin/ps", "-A", "-o", columns], capture_output=True, text=True, timeout=10,
-                                check=False).stdout
+                                check=False, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     return [list(map(int, line.split())) for line in listed.splitlines()]
@@ -773,6 +778,8 @@ def read_json_snapshot(p: Path, default):
 
 
 def flush_fd(fd: int) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     if os.environ.get("ARETE_DRIVE_FLUSH") != "0" and hasattr(fcntl, "F_FULLFSYNC"):
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
@@ -783,6 +790,8 @@ def flush_fd(fd: int) -> None:
 
 
 def flush_file(p: Path) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     fd = os.open(p, os.O_RDONLY)
     try:
         flush_fd(fd)
@@ -791,6 +800,8 @@ def flush_file(p: Path) -> None:
 
 
 def flush_folder(folder: Path) -> None:
+    if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+        return
     fd = os.open(folder, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -878,7 +889,13 @@ def nonnegative_number(value) -> float | None:
 def github_token() -> str:
     if paths.ISOLATED:
         return ""
-    res = sh(["gh", "auth", "token"], timeout=10)
+    from . import environment
+
+    try:
+        res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, errors="replace", timeout=10,
+                             check=False, env=environment.build(()))
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return res.stdout.strip() if res.returncode == 0 else ""
 
 

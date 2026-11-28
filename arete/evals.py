@@ -255,7 +255,7 @@ class Source:
         if self.ref:
             res = subprocess.run(sandbox.protected_command(["git", "show", f"{self.ref}:{rel}"], self.repo.path),
                                  cwd=self.repo.path, capture_output=True,
-                                 timeout=60, check=False)
+                                 timeout=60, check=False, env=environment.build(()))
             if res.returncode != 0:
                 raise FileNotFoundError(rel)
             return res.stdout

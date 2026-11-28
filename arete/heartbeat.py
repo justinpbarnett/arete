@@ -337,11 +337,13 @@ def check_serve() -> list[Check]:
         return [Check("serve:beat", True, "not installed yet; the launchd jobs run the loops until serve is installed")]
     if not beat:
         return [Check("serve:beat", False, "arete serve is installed but has never run; see its log")]
+    authority = [Check("scratch:authority", False, problem)] if (problem := beat.get("authority_problem")) else []
     if not beat["alive"]:
         why = "its process is gone" if beat["process_gone"] else f"last beat {beat['age_seconds']}s ago"
-        return [Check("serve:beat", False, f"arete serve is down: {why}")]
+        return [Check("serve:beat", False, f"arete serve is down: {why}"), *authority]
     waiting = "unknown" if beat["pending"] is None else beat["pending"]
-    out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {waiting} waiting")]
+    out = [Check("serve:beat", True, f"pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {waiting} waiting"),
+           *authority]
     if failing := beat.get("failing"):
         detail = "; ".join(f"{key}: {f['error']} (since {f['since']}, {util.count(f['ticks'], 'pass', 'passes')})"
                            for key, f in sorted(failing.items()))

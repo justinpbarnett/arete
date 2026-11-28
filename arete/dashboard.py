@@ -43,6 +43,7 @@ from . import (
     oncall,
     paths,
     pipeline,
+    scrub,
     principals,
     record,
     refusals,
@@ -882,7 +883,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.stream_problem() or (dropped and dropped()) or ended()
 
                 for line in run_lines.follow(run_id, start, until):
-                    self.stream_write(event_line(line))
+                    cleaned = scrub.text(event_line(line).decode("utf-8", "replace"), "api", f"/api/runs/{run_id}/events")
+                    self.stream_write(cleaned.encode("utf-8"))
         except OSError:
             pass
 
@@ -930,7 +932,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
 
+    def _scrub_payload(self, status: int, payload: bytes, kind: str) -> bytes:
+        if not payload:
+            return payload
+        media = kind.split(";", 1)[0].strip().lower()
+        if media not in ("application/json", "application/problem+json", "application/x-ndjson",
+                         "text/event-stream", "text/plain"):
+            return payload
+        subject = getattr(self, "api_path", "") or request_path(getattr(self, "path", ""))
+        op = getattr(self, "operation", None)
+        op_name = op[0]["name"] if op else ""
+        if 200 <= status < 300 and op_name in ("token.issue", "token.rotate", "webhook.rotate") and media == "application/json":
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+                if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+                    secret_text = parsed.pop("text")
+                    cleaned = scrub.value(parsed, "api", subject)
+                    cleaned["text"] = secret_text
+                    return api_http.json_bytes(cleaned)
+            except (UnicodeDecodeError, ValueError):
+                pass
+        return scrub.text(payload.decode("utf-8", "replace"), "api", subject).encode("utf-8")
+
     def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0, *, conditional=False, tag=None) -> None:
+        payload = self._scrub_payload(status, payload, kind)
         if conditional and tag is None:
             tag = api_http.etag(payload, kind, self.read_seq)
         if tag and api_http.matches_etag(self.headers, tag):

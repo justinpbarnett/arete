@@ -28,9 +28,11 @@ class Job:
 
 
 def printed(target: str, *, strict: bool = False) -> str | None:
+    from . import environment
+
     try:
         done = subprocess.run([LAUNCHCTL, "print", target], check=False, capture_output=True, text=True, errors="replace",
-                              timeout=10)
+                              timeout=10, env=environment.build(()))
     except (OSError, subprocess.SubprocessError):
         if strict:
             raise

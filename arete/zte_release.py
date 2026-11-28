@@ -157,14 +157,19 @@ def activation_timeout(until: datetime | None, cap: float) -> float:
 
 
 def restart(install: Installation, *, until: datetime | None = None) -> None:
+    from . import environment
+
     command = ["/bin/launchctl", "kickstart", "-k", install.service]
-    boot = subprocess.run(command, timeout=activation_timeout(until, 20), capture_output=True, check=False)
+    boot = subprocess.run(command, timeout=activation_timeout(until, 20), capture_output=True, check=False,
+                          env=environment.build(()))
     pilot.require(boot.returncode == 0, "launchd could not restart the managed service")
 
 
 def launch_job(service: str, *, until: datetime | None = None) -> str:
+    from . import environment
+
     job = subprocess.run(["/bin/launchctl", "print", service], timeout=activation_timeout(until, 4),
-                         capture_output=True, text=True, check=False)
+                         capture_output=True, text=True, check=False, env=environment.build(()))
     pilot.require(job.returncode == 0, "the managed launchd job is not loaded")
     return job.stdout
 
@@ -199,14 +204,18 @@ def database(install: Installation, *, until: datetime | None = None) -> None:
 
 
 def stop_unhealthy_service(install: Installation) -> None:
+    from . import environment
+
     service = subprocess.run(["/bin/launchctl", "bootout", install.service], timeout=20,
-                             capture_output=True, check=False)
+                             capture_output=True, check=False, env=environment.build(()))
     pilot.require(service.returncode == 0, "database unhealthy and launchd did not confirm service shutdown")
 
 
 def executable_matches(root: Path, pid: int, *, until: datetime | None = None) -> bool:
+    from . import environment
+
     process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], timeout=activation_timeout(until, 4),
-                             capture_output=True, text=True, check=False)
+                             capture_output=True, text=True, check=False, env=environment.build(()))
     return process.returncode == 0 and process.stdout.strip() == f"{root / '.venv/bin/python'} -m arete.cli serve"
 
 
@@ -245,13 +254,15 @@ def require_fresh_runtime(install: Installation, sha: str, observation: dict, un
 
 def probe_https(install: Installation, sha: str, *, until: datetime | None = None) -> None:
     reason = "authenticated HTTPS did not confirm the selected engine and schema"
+    from . import environment
+
     with tempfile.TemporaryFile() as headers:
         timeout = activation_timeout(until, 8)
         result = subprocess.run([
             "/usr/bin/curl", "--disable", "--noproxy", "*", "--proto", "=https", "--silent",
             "--max-time", str(timeout), "--max-filesize", str(2**18), "--header", "Accept: application/json",
             "--dump-header", f"/dev/fd/{headers.fileno()}", "--write-out", "\n%{http_code}", f"{install.endpoint}/api/meta",
-        ], pass_fds=(headers.fileno(),), capture_output=True, timeout=timeout, check=False)
+        ], pass_fds=(headers.fileno(),), capture_output=True, timeout=timeout, check=False, env=environment.build(()))
         if until is not None:
             activation_time_left(until)
         pilot.require(result.returncode == 0, reason)

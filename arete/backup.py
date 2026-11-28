@@ -184,13 +184,16 @@ def add_tree(tar: tarfile.TarFile, root: Path, arcname: str) -> None:
 
 
 def layers_bundle() -> bytes | None:
+    from . import environment
+
     layers = paths.CONFIG_DIR / "layers"
     if not (layers / ".git").exists() and not layers.is_symlink():
         return None
     if layers.is_symlink() or (layers / ".git").is_symlink() or not (layers / ".git").is_dir():
         raise RuntimeError("layers is linked or has no plain .git folder, so it is not bundled")
+    env = environment.build(())
     listed = subprocess.run(["git", "log", "--all", "--root", "-m", "--no-renames", "--raw", "--format=", "-z"],
-                            check=False, cwd=layers, capture_output=True, timeout=300)
+                            check=False, cwd=layers, capture_output=True, timeout=300, env=env)
     if listed.returncode != 0:
         raise RuntimeError(f"listing layers history failed ({listed.returncode})")
     records = iter(listed.stdout.decode(errors="replace").split("\0"))
@@ -208,7 +211,8 @@ def layers_bundle() -> bytes | None:
             raise RuntimeError("layers history holds a symlink; the bundle was not made")
         if any(forbidden_name(part) for part in path.split("/")):
             raise RuntimeError(f"layers history holds {path}, which never leaves the machine; the bundle was not made")
-    res =subprocess.run(["git", "bundle", "create", "-", "--all"], check=False, cwd=layers, capture_output=True, timeout=300)
+    res = subprocess.run(["git", "bundle", "create", "-", "--all"], check=False, cwd=layers, capture_output=True,
+                         timeout=300, env=env)
     if res.returncode != 0 or not res.stdout:
         raise RuntimeError(f"git bundle of layers failed ({res.returncode}): "
                            f"{util.first_line(res.stderr.decode(errors='replace'), 200)}")

@@ -155,6 +155,8 @@ def policy_refusal(repo: config.Repo | None, base: str) -> str:
         return ""
     if repo.landing == "pr":
         return f"{repo.name} requires a PR; direct push is disabled"
+    if repo.unattended_environment == "none":
+        return f"{repo.name} does not allow unattended deployment; direct push is disabled"
     if repo.target_branch and base != repo.target_branch:
         return f"{repo.name} now targets {repo.target_branch}, not {base}"
     return ""
