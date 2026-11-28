@@ -11,6 +11,7 @@ import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
 import { browserPaired, clientNotice, staleWrite } from "./ui-notice.js";
+import { ConsoleDock, consoleOpen } from "./ui-console.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -117,7 +118,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
   const parent = selectedInbox(route) && ["triage", "outbox"].includes(route.screen)
     ? [`#${route.screen}`, `Back to ${route.screen === "triage" ? "inbox" : "Outbox"}`]
     : route.screen === "task" && route.path[0] ? ["#board", "Back to Board"] : null;
-  return html`<div class="ui-app" data-screen=${route.screen} data-detail=${parent ? "" : undefined}>
+  return html`<div class="ui-app" data-screen=${route.screen} data-detail=${parent ? "" : undefined} data-console=${consoleOpen.value ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
       <div class="top-bar ops-links" aria-label="Dashboard shortcuts">
@@ -143,6 +144,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
       ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}
       <${ReasonBox} />
     </main>
+    ${consoleOpen.value ? html`<${ConsoleDock} />` : null}
     <${KeySheet} />
     <${Palette} />
   </div>`;

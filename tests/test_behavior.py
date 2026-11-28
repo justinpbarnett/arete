@@ -23861,3 +23861,200 @@ with api_check.offline():
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class UiConsoleDockTests(unittest.TestCase):
+    def test_ui_console_served_and_clean(self):
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-console.js", served)
+        self.assertIn("/ui-console.css", served)
+        self.assertIn("/ui.html", served)
+        root = Path(__file__).resolve().parents[1]
+        js_text = (root / "arete" / "web" / "ui-console.js").read_text(encoding="utf-8")
+        self.assertEqual(served["/ui-console.js"][0].decode("utf-8"), js_text)
+        self.assertIn("/api/chats", js_text)
+        self.assertIn("/api/v1/chats", js_text)
+        self.assertIn("Chat with Arete", js_text)
+        self.assertRegex(js_text, r"\b3000\b")
+        self.assertRegex(js_text, r"\b30000\b")
+        self.assertNotIn("style=", js_text)
+        self.assertNotIn("innerHTML", js_text)
+        ui_html = served["/ui.html"][0].decode("utf-8")
+        self.assertIn("/ui-console.css", ui_html)
+        self.assertIn("/ui-console.js", ui_html)
+        keymap = (root / "docs" / "ui" / "keymap.md").read_text(encoding="utf-8")
+        self.assertIn("| gc |", keymap)
+        keys_js = (root / "arete" / "web" / "ui-keys.js").read_text(encoding="utf-8")
+        self.assertIn('"gc"', keys_js)
+
+    def test_ui_console_dock_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import {
+              attachFiles, closeConsole, consoleCommand, consoleOpen, consoleState,
+              createChat, dropChatDraft, fileChatDraft, openConsole, pollChat,
+              sendChatMessage, setUnsentText, startChatSession, startConsole,
+              stopChatSession, toggleConsole,
+            } from "./arete/web/ui-console.js";
+
+            const store = new Map();
+            let throwStore = false;
+            globalThis.localStorage = {
+              getItem: (k) => { if (throwStore) throw new Error("blocked"); return store.has(k) ? store.get(k) : null; },
+              setItem: (k, v) => { if (throwStore) throw new Error("blocked"); store.set(k, String(v)); },
+              removeItem: (k) => { if (throwStore) throw new Error("blocked"); store.delete(k); },
+            };
+            globalThis.location = { protocol: "http:", host: "127.0.0.1:8787" };
+
+            const timers = [];
+            let nextTimer = 1;
+            const cleared = new Set();
+            globalThis.setTimeout = (fn, ms) => {
+              const id = nextTimer++;
+              timers.push({ id, fn, ms });
+              return id;
+            };
+            globalThis.clearTimeout = (id) => { if (id) cleared.add(id); };
+
+            const calls = [];
+            let busyFlag = true;
+            const fp = "a".repeat(64);
+            let draftObj = { chat: 1, title: "Fix lint", body: "Run lint in CI", fingerprint: fp };
+            let messages = [{ id: 1, sender: "you", text: "Hi", ts: "2026-11-28T10:00:00Z", paid_usd: 0, cost: 0 }];
+            const listedChats = () => [
+              { id: 1, project: "demo", title: "Hi", created: "2026-11-28T10:00:00Z", busy: busyFlag, drafted: Boolean(draftObj), running_sessions: 0 },
+              ...extraChats,
+            ];
+            const extraChats = [];
+            const chatView = (id = 1) => ({
+              id, project: "demo", folder: "~/demo", title: id === 1 ? "Hi" : "", created: "2026-11-28T10:00:00Z",
+              busy: id === 1 ? busyFlag : false, spent: 0.02, unclassified_messages: 0,
+              draft: id === 1 ? draftObj : null,
+              messages: id === 1 ? messages : [],
+              sessions: { running: 1, max_sessions: 3, left: 4.5, budget_usd: 5, sessions: [{ id: "s1", status: "running", prompt: "inspect", paid: 0.1 }] },
+            });
+
+            globalThis.fetch = async (url, init = {}) => {
+              const method = (init.method || "GET").toUpperCase();
+              const headers = new Headers(init.headers);
+              const body = init.body ? JSON.parse(init.body) : null;
+              calls.push({ method, url, headers, body });
+              if (method === "GET" && url === "/api/chats") {
+                return Response.json({ chats: listedChats(), projects: ["demo", "arete"] });
+              }
+              if (method === "GET" && /^\\/api\\/chats\\/\\d+$/.test(url)) {
+                return Response.json(chatView(Number(url.split("/").pop())));
+              }
+              if (method === "POST" && url === "/api/v1/chats") {
+                const added = { id: 2, title: "", project: body.project, created: "2026-11-28T10:05:00Z", busy: false, drafted: false, running_sessions: 0 };
+                extraChats.push(added);
+                return Response.json({ seq: "1.1", chat: added, run: null }, { status: 201 });
+              }
+              if (method === "POST" && url === "/api/v1/chats/1/messages") {
+                busyFlag = true;
+                messages = [...messages, { id: 2, sender: "you", text: body.text, ts: "2026-11-28T10:01:00Z", paid_usd: 0, cost: 0 }];
+                return Response.json({ seq: "1.2", chat: chatView(1), run: null }, { status: 201 });
+              }
+              if (method === "POST" && url === "/api/chats/1/file") {
+                draftObj = null;
+                messages = [...messages, { id: 3, sender: "arete", text: "Drafted OB-9; it waits in the outbox for approval.", ts: "2026-11-28T10:02:00Z", paid_usd: 0, cost: 0 }];
+                return Response.json(chatView(1));
+              }
+              if (method === "DELETE" && url === "/api/v1/chats/1") {
+                draftObj = null;
+                return Response.json({ seq: "1.3", chat: chatView(1) });
+              }
+              if (method === "POST" && url === "/api/v1/chats/1/sessions") {
+                return Response.json({ seq: "1.4", run: { id: "s2" }, session: { id: "s2" } }, { status: 201 });
+              }
+              if (method === "POST" && url === "/api/chats/1/sessions/s1/stop") {
+                return Response.json({ stopped: true });
+              }
+              return Response.json({ error: "unexpected" }, { status: 404 });
+            };
+
+            startConsole();
+            assert.equal(consoleOpen.peek(), false);
+            assert.equal(calls.length, 0);
+            assert.equal(timers.length, 0);
+
+            assert.equal(consoleCommand.title, "Chat with Arete");
+            consoleCommand.run();
+            await pollChat();
+            assert.equal(consoleOpen.peek(), true);
+            assert.equal(timers.at(-1).ms, 3000);
+
+            busyFlag = false;
+            await pollChat();
+            assert.equal(timers.at(-1).ms, 30000);
+
+            setUnsentText("Please inspect");
+            await attachFiles([{ name: "notes.txt", size: 11, type: "text/plain", text: async () => "hello world" }]);
+            assert.equal(await sendChatMessage(), true);
+            const sendReq = calls.find((c) => c.method === "POST" && c.url === "/api/v1/chats/1/messages");
+            assert.ok(sendReq);
+            assert.equal(sendReq.headers.get("X-Arete"), "1");
+            assert.ok(sendReq.headers.get("Idempotency-Key"));
+            assert.match(sendReq.body.text, /Please inspect/);
+            assert.match(sendReq.body.text, /notes\\.txt/);
+            assert.match(sendReq.body.text, /hello world/);
+            assert.equal(consoleState.peek().chat.busy, true);
+
+            assert.equal(await fileChatDraft(), true);
+            const fileReqs = calls.filter((c) => c.method === "POST" && c.url === "/api/chats/1/file");
+            assert.equal(fileReqs.length, 1);
+            assert.equal(fileReqs[0].headers.get("X-Arete"), "1");
+            assert.ok(fileReqs[0].headers.get("Idempotency-Key"));
+            assert.equal(fileReqs[0].body.draft, fp);
+            assert.match(consoleState.peek().draftResult.text, /OB-9/);
+
+            draftObj = { chat: 1, title: "Drop me", body: "Body", fingerprint: fp };
+            await pollChat();
+            assert.equal(await dropChatDraft(), true);
+            const dropReqs = calls.filter((c) => c.method === "DELETE" && c.url === "/api/v1/chats/1");
+            assert.equal(dropReqs.length, 1);
+            assert.equal(dropReqs[0].headers.get("X-Arete"), "1");
+            assert.ok(dropReqs[0].headers.get("Idempotency-Key"));
+            assert.match(consoleState.peek().draftResult.text, /Dropped/);
+
+            assert.equal(await startChatSession("check tests"), true);
+            const startSess = calls.find((c) => c.method === "POST" && c.url === "/api/v1/chats/1/sessions");
+            assert.ok(startSess);
+            assert.equal(startSess.body.prompt, "check tests");
+            assert.equal(startSess.headers.get("X-Arete"), "1");
+            assert.ok(startSess.headers.get("Idempotency-Key"));
+
+            assert.equal(await stopChatSession(1, "s1"), true);
+            const stopSess = calls.find((c) => c.method === "POST" && c.url === "/api/chats/1/sessions/s1/stop");
+            assert.ok(stopSess);
+            assert.equal(stopSess.headers.get("X-Arete"), "1");
+            assert.ok(stopSess.headers.get("Idempotency-Key"));
+
+            const createdId = await createChat("demo");
+            assert.equal(createdId, 2);
+            const createReq = calls.find((c) => c.method === "POST" && c.url === "/api/v1/chats");
+            assert.ok(createReq);
+            assert.equal(createReq.body.project, "demo");
+            assert.equal(createReq.headers.get("X-Arete"), "1");
+            assert.ok(createReq.headers.get("Idempotency-Key"));
+
+            setUnsentText("keep across reload");
+            startConsole();
+            assert.equal(consoleOpen.peek(), true);
+            assert.equal(consoleState.peek().unsent["2"], "keep across reload");
+
+            const beforeCloseCount = calls.length;
+            const lastTimerId = timers.at(-1).id;
+            toggleConsole();
+            assert.equal(consoleOpen.peek(), false);
+            assert.ok(cleared.has(lastTimerId));
+            await pollChat();
+            assert.equal(calls.length, beforeCloseCount);
+
+            throwStore = true;
+            openConsole({ focus: false });
+            setUnsentText("storage unavailable");
+            closeConsole();
+            assert.equal(consoleOpen.peek(), false);
+        """], capture_output=True, text=True, timeout=10, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

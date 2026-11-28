@@ -1,0 +1,56 @@
+.ui-app[data-console] { --console-width: clamp(320px, 26vw, 420px); grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--console-width); }
+.ui-app[data-console] .reason-box { right: var(--console-width); }
+.console-dock { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--panel); border-left: 1px solid var(--rule); overflow: hidden; }
+.console-dock[data-drop="true"] { outline: 1px solid var(--accent); outline-offset: -1px; }
+.console-head { height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--rule); }
+.console-head .pane-label { padding: 0; }
+.console-close { padding: 0; border: 0; background: none; cursor: pointer; }
+.console-pick { flex: none; display: grid; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+.console-label, .console-sub, .console-draft-fields dt { margin: 0; font: 500 var(--text-micro)/1.4 var(--font-data); color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+.console-select, .console-input, .console-textarea { width: 100%; min-width: 0; background: var(--canvas); border: 1px solid var(--rule-strong); color: var(--ink); font: var(--text-s)/1.4 var(--font-ui); padding: 4px 8px; }
+.console-select { min-height: var(--row); }
+.console-textarea { resize: vertical; min-height: 60px; }
+.console-about { color: var(--muted); font: var(--text-micro)/1.5 var(--font-data); overflow-wrap: anywhere; }
+.console-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; display: grid; gap: 10px; align-content: start; }
+.console-sessions { display: grid; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
+.console-session-list, .console-attachments { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.console-session-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; font-size: var(--text-s); }
+.console-session-meta { flex: 1; min-width: 0; color: var(--muted); font: var(--text-micro)/1.4 var(--font-data); overflow-wrap: anywhere; }
+.console-link { color: var(--ink-2); font: var(--text-micro)/1.4 var(--font-data); text-decoration: underline; text-underline-offset: 3px; }
+.console-link:hover { color: var(--ink); }
+.console-summary { cursor: pointer; color: var(--ink-2); font: var(--text-s)/1.4 var(--font-ui); }
+.console-session-form, .console-new-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.console-session-form { margin-top: 6px; }
+.console-messages { display: grid; gap: 8px; }
+.console-msg { padding: 8px 10px; border: 1px solid var(--rule); background: var(--canvas); display: grid; gap: 4px; }
+.console-msg.from-you { border-left: 2px solid var(--rule-strong); background: var(--raised); }
+.console-msg.from-arete { border-left: 2px solid var(--ink-2); }
+.console-msg.from-session { border-left: 2px solid var(--faint); }
+.console-who, .console-hint { color: var(--muted); font: var(--text-micro)/1.4 var(--font-data); }
+.console-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-s); }
+.console-text a, .console-report a, .console-result a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.console-report { display: grid; gap: 4px; font-size: var(--text-s); overflow-wrap: anywhere; }
+.console-report ul { margin: 0; padding-left: 18px; }
+.console-working { padding: 6px 8px; border: 1px solid var(--rule); border-left: 2px solid var(--ink-2); background: var(--raised); color: var(--ink-2); font: var(--text-micro)/1.5 var(--font-data); }
+.console-draft { padding: 10px; border: 1px solid var(--rule); border-left: 2px solid var(--accent); background: var(--canvas); display: grid; gap: 6px; }
+.console-draft-fields { margin: 0; display: grid; gap: 4px; }
+.console-draft-fields dd { margin: 0 0 4px; overflow-wrap: anywhere; font-size: var(--text-s); }
+.console-draft-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--text-s)/1.4 var(--font-data); color: var(--ink-2); }
+.console-foot { flex: none; display: grid; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--rule); background: var(--canvas); }
+.console-send, .console-new { display: grid; gap: 6px; }
+.console-new { padding-top: 8px; border-top: 1px solid var(--rule); }
+.console-attachments { gap: 4px; }
+.console-attachment { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px; border: 1px solid var(--rule); background: var(--raised); }
+.console-attachment-name { min-width: 0; overflow-wrap: anywhere; font: var(--text-micro)/1.4 var(--font-data); color: var(--ink-2); }
+.console-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.console-btn { min-height: var(--row); padding: 0 10px; background: var(--panel); border: 1px solid var(--rule-strong); color: var(--ink); font-size: var(--text-s); cursor: pointer; }
+.console-btn:hover:not(:disabled) { background: var(--selected); }
+.console-btn:disabled { color: var(--muted); border-color: var(--rule); cursor: default; }
+.console-result { font-size: var(--text-s); color: var(--ink-2); overflow-wrap: anywhere; }
+.console-result.caution { color: var(--accent); }
+.console-result.fault { color: var(--fault); }
+@media (width < 900px) {
+  .ui-app[data-console] { grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
+  .ui-app[data-console] .main { display: none; }
+  .console-dock { border-left: 0; }
+}

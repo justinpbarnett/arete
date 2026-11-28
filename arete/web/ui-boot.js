@@ -11,6 +11,7 @@ import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
 import { startHooks } from "./ui-hooks.js";
 import { feedbackCommand, startFeedback } from "./ui-feedback.js";
+import { consoleCommand, consoleOpen, startConsole } from "./ui-console.js";
 import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
 import { browserPaired } from "./ui-notice.js";
@@ -45,6 +46,7 @@ effect(() => {
   const selected = route.value;
   const latest = snapshot.value;
   const runs = runView.value;
+  consoleOpen.value;
   const runFault = selected.screen === "run" && (runs.queueError || runs.detailError);
   connection.value = connectivity(latest, now.value);
   readRetry.value = readFault(selected.screen, latest) || runFault ? retry : null;
@@ -98,8 +100,9 @@ configurePalette(screenKeys.map(([key, id, title, href], index) => ({ key, id, t
   pending.value = "";
   sheet.value = false;
   dismissMenu();
-}, () => { mode.value = "NORMAL"; }, [feedbackCommand]);
+}, () => { mode.value = "NORMAL"; }, [feedbackCommand, consoleCommand]);
 startFeedback();
+startConsole();
 startKeys();
 globalCommands([{ id: "run-checks", title: "Run checks now", run: () => dispatch(actions.checks) }]);
 startHooks();
