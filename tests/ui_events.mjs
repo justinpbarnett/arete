@@ -5,6 +5,7 @@ import { prepareWrite, sendWrite } from "../arete/web/ui-write.js";
 import { clientNotice, staleWrite } from "../arete/web/ui-notice.js";
 import { parse } from "../arete/web/ui-router.js";
 import { TaskQueue } from "../arete/web/ui-work.js";
+import { safeLink } from "../arete/web/ui-operations.js";
 import { effect } from "../arete/web/vendor-signals.js";
 
 const locks = {
@@ -763,3 +764,9 @@ await transport(false);
 await transport(true);
 await snapshots();
 await boardSnapshots();
+
+assert.equal(safeLink("https://github.com/org/repo/pull/1"), "https://github.com/org/repo/pull/1");
+assert.equal(safeLink("http://example.test/a"), "http://example.test/a");
+for (const bad of ["javascript:alert(1)", "data:text/html,hi", "https://evil.test/\nfoo", "https://evil.test/ a", "https://", "", null, 42]) {
+  assert.equal(safeLink(bad), undefined, `safeLink must reject ${String(bad)}`);
+}

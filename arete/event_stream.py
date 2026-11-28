@@ -9,6 +9,10 @@ from .credential_http import problem
 from .store import db as foundation
 
 
+def _sse_line(value: object) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
 def serve(handler, query, code):
     try:
         return stream(handler, query, code)
@@ -40,6 +44,7 @@ def stream(handler, query, code):
         for key, value in (("Cache-Control", "no-store"), ("X-Accel-Buffering", "no"),
                            ("Connection", "close"), ("Arete-Instance", instance)):
             handler.send_header(key, value)
+        handler.send_security_headers()
         handler.stream_headers()
         handler.connection.settimeout(30)
 
@@ -76,13 +81,13 @@ def stream(handler, query, code):
         start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
 
         def message(kind, data, ident=None):
-            payload = scrub.text(json.dumps(data), "api", "/api/v1/events")
+            payload = _sse_line(scrub.text(json.dumps(data), "api", "/api/v1/events"))
             if fmt == "ndjson":
                 handler.stream_write((payload + "\n").encode())
             else:
-                frame = (f"id: {ident}\n" if ident is not None else "")
+                frame = (f"id: {_sse_line(ident)}\n" if ident is not None else "")
                 if kind in ("reset", "serve.beat") or query.get("named"):
-                    frame += f"event: {kind}\n"
+                    frame += f"event: {_sse_line(kind)}\n"
                 handler.stream_write((frame + "data: " + payload + "\n\n").encode())
 
         beat = started + 15

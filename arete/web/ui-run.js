@@ -12,6 +12,7 @@ import { parse } from "./ui-router.js";
 import { runHash as hashOf, taskHash } from "./ui-data.js";
 import { runView, snapshot } from "./ui-live.js";
 import { TicketProgress } from "./ui-work.js";
+import { safeLink } from "./ui-operations.js";
 
 const html = htm.bind(h);
 export const GROUPS = ["Running", "Recovering", "Waiting on you", "Fault", "Done"];
@@ -19,7 +20,7 @@ const GLYPHS = { Running: "▷", Recovering: "▷", "Waiting on you": "◆", Fau
 const FAULTS = ["failed", "interrupted", "stopped"];
 const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
 const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
-const pullUrls = (urls) => String(urls ?? "").split(/\s+/).filter((url) => /^https?:\/\//i.test(url));
+const pullUrls = (urls) => String(urls ?? "").split(/\s+/).map(safeLink).filter(Boolean);
 
 export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
   : FAULTS.includes(status) ? "Fault" : "Done";

@@ -86,6 +86,15 @@ def rotate(name, actor):
     return value
 
 
+def _single_header(headers, name: str) -> str:
+    if hasattr(headers, "get_all"):
+        values = headers.get_all(name) or []
+        if len(values) > 1:
+            raise Stated(400, f"Send at most one {name} header.")
+        return (values[0] if values else "").strip()
+    return str(headers.get(name) or "").strip()
+
+
 def bearer_token(authorization: str) -> str:
     scheme, _, credentials = authorization.strip().partition(" ")
     return credentials.strip() if scheme.lower() == "bearer" else authorization.strip()
@@ -95,8 +104,10 @@ def check(name: str, headers, body: bytes) -> None:
     key = secret(name)
     if not key:
         raise Stated(404, f"No webhook for {name}.")
-    signature = headers.get("X-Hub-Signature-256", "")
-    token = headers.get("X-Arete-Token", "") or bearer_token(headers.get("Authorization", ""))
+    signature = _single_header(headers, "X-Hub-Signature-256")
+    header_token = _single_header(headers, "X-Arete-Token")
+    auth_header = _single_header(headers, "Authorization")
+    token = header_token or bearer_token(auth_header)
     if signature:
         expected = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature.encode(), expected.encode()):
@@ -116,26 +127,29 @@ def body_text(headers, body: bytes) -> str:
 
 
 def delivery_id(headers) -> str:
-    return headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or ""
+    raw = headers.get("X-GitHub-Delivery") or headers.get("X-Request-Id") or ""
+    return str(raw).strip()[:200]
 
 
 def event_of(name: str, headers, body: bytes) -> dict:
     text = body_text(headers, body)
     try:
         data = json.loads(text) if text.strip() else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
         data = {"text": text[:20000]}
     if not isinstance(data, dict):
         data = {"value": data}
-    github_event = headers.get("X-GitHub-Event", "")
-    action = data.get("action", "") if isinstance(data.get("action"), str) else ""
+    github_event = str(headers.get("X-GitHub-Event") or "").strip()[:100]
+    action = data.get("action", "").strip()[:100] if isinstance(data.get("action"), str) else ""
     title = (f"GitHub {github_event}{' ' + action if action else ''}" if github_event
              else str(data.get("title") or data.get("summary") or data.get("text") or f"webhook for {name}"))
     key = delivery_id(headers) or f"sha256:{hashlib.sha256(body).hexdigest()}"
-    repo = ((data.get("repository") or {}).get("full_name", "") if isinstance(data.get("repository"), dict) else
-            str(data.get("repo", "")))
+    raw_repo = (data.get("repository") or {}).get("full_name") if isinstance(data.get("repository"), dict) else data.get("repo")
+    repo = raw_repo.strip()[:200] if isinstance(raw_repo, str) else ""
+    raw_url = data.get("url")
+    url = raw_url.strip()[:500] if isinstance(raw_url, str) else ""
     return sources.event("webhook" if not github_event else f"github.{github_event}", f"{name}#webhook", key, title,
-                         repo=repo, url=str(data.get("url", ""))[:500], trust="untrusted",
+                         repo=repo, url=url, trust="untrusted",
                          data=data if len(text) <= MAX_EVENT_BODY else {"truncated": text[:MAX_EVENT_BODY]})
 
 
@@ -192,7 +206,7 @@ def reconcile_spec_event(event: dict, *, cfg=None) -> list[tuple[str, str]]:
             if not got:
                 continue
             claim = specs.find(repo_name, tid)
-            if claim.get("state") != "published" or not claim.get("data", {}).get("graph"):
+            if not claim or claim.get("state") != "published" or not claim.get("data", {}).get("graph"):
                 continue
             try:
                 source = tracker.for_ticket(cfg, repo, tid)

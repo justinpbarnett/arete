@@ -93,8 +93,19 @@ function money(n) {
   return value > 0 && value < 0.005 ? "<$0.01" : `$${value.toFixed(2)}`;
 }
 
+function safeHttpsUrl(href) {
+  if (typeof href !== "string" || !href || /[\u0000-\u0020\u007f]/.test(href)) return null;
+  try {
+    const parsed = new URL(href);
+    return parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function link(href, text) {
-  return /^https:\/\//.test(href || "") ? el("a", { href, rel: "noreferrer", target: "_blank", text }) : document.createTextNode(text);
+  const safe = safeHttpsUrl(href);
+  return safe ? el("a", { href: safe, rel: "noopener noreferrer", target: "_blank", text }) : document.createTextNode(text);
 }
 
 function chip(state) {

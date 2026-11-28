@@ -15,7 +15,7 @@ TABLES = {
 KINDS = frozenset(("approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace"))
 STATES = frozenset(("open", "snoozed", "shelved", "paused", "resolved"))
 PRIORITIES = (1, 2, 3)
-ID_RE = re.compile(r"^(?:[Tt][Rr]-)?([1-9][0-9]*)$")
+ID_RE = re.compile(r"^(?:[Tt][Rr]-)?([1-9][0-9]{0,17})$")
 
 
 def format_id(numeric_id: int) -> str:
@@ -24,7 +24,7 @@ def format_id(numeric_id: int) -> str:
 
 def parse_id(value: str | int) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool):
-        return value if value > 0 else None
+        return value if 0 < value < 2**63 else None
     if not isinstance(value, str):
         return None
     m = ID_RE.fullmatch(value.strip())
