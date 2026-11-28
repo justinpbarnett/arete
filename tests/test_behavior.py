@@ -23117,3 +23117,196 @@ with db.reader() as c:
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class PromptsUiTests(unittest.TestCase):
+    def test_prompts_web_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        js_path = root / "arete" / "web" / "ui-prompts.js"
+        css_path = root / "arete" / "web" / "ui-prompts.css"
+        js_text = js_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-prompts.js", served)
+        self.assertIn("/ui-prompts.css", served)
+        self.assertEqual(served["/ui-prompts.js"][0], js_text.encode("utf-8"))
+        self.assertEqual(served["/ui-prompts.css"][0], css_text.encode("utf-8"))
+        self.assertIn("/api/v1/config/prompt", js_text)
+        self.assertIn("/api/v1/drafts", js_text)
+        for label, content in (("ui-prompts.js", js_text), ("ui-prompts.css", css_text)):
+            for forbidden in ("style=", "innerHTML", "insertAdjacentHTML"):
+                self.assertNotIn(forbidden, content, f"{label} must not contain {forbidden}")
+
+    def test_prompts_ui_behavior_offline(self):
+        root = Path(__file__).resolve().parents[1]
+        script = """
+import assert from "node:assert/strict";
+import { parse } from "./arete/web/ui-router.js";
+import { prompts as promptsMeta } from "./arete/web/ui-data.js";
+import { notice } from "./arete/web/ui-notice.js";
+import { Shell } from "./arete/web/ui-shell.js";
+import {
+  NEW_PROMPT_NOTICE,
+  PromptCrumbs,
+  PromptFocus,
+  PromptSubtitle,
+  extractUsedBy,
+  matchPromptItem,
+  notifyNewPrompt,
+  parseLoopTarget,
+  promptCounts,
+  promptList,
+  promptPath,
+  promptsView,
+  stopPrompts,
+  syncPrompts,
+} from "./arete/web/ui-prompts.js";
+
+globalThis.location = { hash: "#prompts/arete/prompts/build.md", host: "localhost", protocol: "http:", replace() {} };
+const route = parse("#prompts/arete/prompts/build.md");
+assert.equal(route.screen, "prompts");
+assert.equal(promptPath(route), "arete/prompts/build.md");
+
+const meta = promptsMeta();
+assert.equal(meta.list, "/api/v1/config/prompt");
+assert.equal(meta.drafts, "/api/v1/drafts");
+assert.equal(meta.item("build", "config"), "/api/v1/config/prompt/build?level=config");
+assert.equal(meta.loopFile("mine", "loop.toml"), "/api/v1/config/loop/mine?file=loop.toml");
+assert.equal(meta.hash("arete/prompts/build.md"), "#prompts/arete/prompts/build.md");
+
+const items = [
+  { kind: "prompt", name: "build", path: "prompts/build.md", level: "config", version: 5, overrides: "arete/prompts/build.md", drift: true },
+  { kind: "prompt", name: "plan", path: "arete/prompts/plan.md", level: "engine", version: 8, overrides: null, drift: false },
+  { kind: "prompt", name: "review", path: "arete/prompts/review.md", level: "engine", version: 4, overrides: null, drift: false },
+];
+const drafts = [
+  { id: "d1", kind: "prompt", name: "build", state: "valid" },
+  { id: "d2", kind: "prompt", name: "plan", state: "discarded" },
+];
+assert.equal(matchPromptItem(items, "arete/prompts/build.md").name, "build");
+assert.deepEqual(promptCounts(items, drafts), { total: 3, overrides: 1, pending: 1 });
+
+const usedBy = extractUsedBy([
+  { name: "feature", content: 'schema = 1\\n[[node]]\\nid = "imp"\\nstep = "implement"\\n[[node]]\\nid = "pl"\\nstep = "plan"\\n' },
+  { name: "repair", content: '[[steps]]\\ndo = "implement"\\n' },
+  { name: "custom", nodes: [{ id: "check", prompt: "arete/prompts/review.md" }] },
+], [{ id: "implement", prompt: "build.md" }, { id: "plan", prompt: "plan.md" }]);
+assert.deepEqual(usedBy.build, ["feature · implement", "repair · implement"]);
+assert.deepEqual(usedBy.plan, ["feature · plan"]);
+assert.deepEqual(usedBy.review, ["custom · check"]);
+
+const calls = [];
+globalThis.fetch = async (url, options = {}) => {
+  calls.push({ url: String(url), method: options.method || "GET" });
+  const target = String(url);
+  if (target === "/api/v1/config/prompt") return Response.json({ items });
+  if (target === "/api/v1/drafts") return Response.json({ drafts });
+  if (target === "/api/v1/config/loop") return Response.json({ items: [{ kind: "loop", name: "mine", path: "loops/mine/loop.toml", level: "config", version: 1 }] });
+  if (target === "/api/v1/config/adw") return Response.json({ items: [{ name: "feature", content: '[[steps]]\\ndo = "implement"\\n[[steps]]\\ndo = "plan"\\n' }] });
+  if (target === "/api/v1/config/library/adw") return Response.json({ item: { content: { step: [{ id: "implement", prompt: "build.md" }, { id: "plan", prompt: "plan.md" }] } } });
+  if (target.startsWith("/api/v1/config/prompt/build")) {
+    return Response.json({
+      item: { ...items[0], content: "Line one\\nA very long second line that wraps cleanly.", runs7d: 41, passRate: 88, costPerRun: 1.9 },
+    });
+  }
+  if (target.startsWith("/api/v1/config/loop/mine")) {
+    return Response.json({
+      item: { kind: "loop", name: "mine", path: "loops/mine/loop.toml", version: 1, content: 'description = "Mine lessons"\\nkind = "watch"\\n' },
+    });
+  }
+  return Response.json({ error: "not found" }, { status: 404 });
+};
+
+syncPrompts(route);
+await new Promise((resolve) => setTimeout(resolve, 60));
+assert.ok(calls.every((entry) => entry.method === "GET"));
+
+const view = promptsView.value;
+assert.equal(view.settled, true);
+assert.equal(view.detail.name, "build");
+assert.equal(PromptSubtitle({ view }), "3 prompts · 1 local override · 1 pending");
+
+promptList.setSort("name");
+assert.deepEqual(promptList.rows().map((r) => r.name), ["build", "plan", "review"]);
+promptList.setSort("version");
+assert.deepEqual(promptList.rows().map((r) => r.name), ["plan", "build", "review"]);
+promptList.setSort("name");
+
+promptList.pick("overrideFlag", "Local overrides");
+assert.equal(promptList.facetCount("overrideFlag", "Local overrides"), 1);
+assert.deepEqual(promptList.rows().map((r) => r.name), ["build"]);
+promptList.pick("overrideFlag", "Local overrides");
+
+promptList.setQuery("plan");
+assert.deepEqual(promptList.rows().map((r) => r.name), ["build", "plan"]);
+promptList.setQuery("");
+
+const expand = (node) => {
+  if (node == null || typeof node === "boolean") return null;
+  if (Array.isArray(node)) return node.map(expand);
+  if (typeof node !== "object") return node;
+  if (typeof node.type === "function") {
+    return node.type.prototype?.render ? { component: node.type.name, props: node.props } : expand(node.type(node.props));
+  }
+  return { type: node.type, props: { ...node.props, children: expand(node.props?.children) } };
+};
+const textOf = (node) => {
+  if (node == null || typeof node === "boolean") return "";
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (typeof node !== "object") return String(node);
+  return textOf(node.props?.children);
+};
+
+const focusTree = expand(PromptFocus({ route, view }));
+const focusJson = JSON.stringify(focusTree);
+const focusText = textOf(focusTree);
+assert.match(focusText, /■ local override/);
+assert.match(focusText, /prompts\\/build\\.md/);
+assert.match(focusText, /live v5/);
+assert.match(focusText, /ahead of main/);
+assert.match(focusText, /used by feature · implement/);
+assert.match(focusText, /41 runs in 7d/);
+assert.match(focusText, /pass 88%/);
+assert.doesNotMatch(focusText, /per run/);
+assert.match(focusJson, /"class":"pr-ln"/);
+assert.match(focusJson, /"class":"pr-code"/);
+assert.match(focusText, /A very long second line that wraps cleanly\\./);
+assert.doesNotMatch(focusJson, /"type":"textarea"/);
+
+const crumbsText = textOf(expand(PromptCrumbs({ route, view })));
+assert.match(crumbsText, /Arete.*Prompts.*build\\.md/);
+
+const shellJson = JSON.stringify(expand(Shell({ route, snapshot: {}, resources: {}, prompts: view })));
+assert.match(shellJson, /"class":"pr-crumbs"/);
+
+const loopRoute = parse("#prompts/loops/mine/loop.toml");
+assert.equal(parseLoopTarget(promptPath(loopRoute), view.loops).name, "mine");
+syncPrompts(loopRoute);
+await new Promise((resolve) => setTimeout(resolve, 60));
+const loopTree = expand(PromptFocus({ route: loopRoute, view: promptsView.value }));
+const loopFocusJson = JSON.stringify(loopTree);
+const loopFocusText = textOf(loopTree);
+assert.match(loopFocusJson, /"data-readonly":"true"/);
+assert.match(loopFocusText, /Mine lessons/);
+assert.match(loopFocusText, /Description/);
+assert.match(loopFocusText, /Used by/);
+assert.match(loopFocusText, /Lines/);
+assert.match(loopFocusText, /Updated/);
+assert.doesNotMatch(loopFocusJson, /"type":"textarea"|contenteditable/i);
+
+const beforeCalls = calls.length;
+notifyNewPrompt();
+assert.equal(notice.value, NEW_PROMPT_NOTICE);
+assert.equal(calls.length, beforeCalls);
+
+stopPrompts();
+"""
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            cwd=root,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -10,6 +10,7 @@ import { FloorFocus, FloorQueue, HealthFocus, TaskFocus, TaskQueue } from "./ui-
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
+import { PromptCrumbs, PromptFocus, PromptQueue, PromptSubtitle } from "./ui-prompts.js";
 import { browserPaired, clientNotice, staleWrite } from "./ui-notice.js";
 
 const html = htm.bind(h);
@@ -31,8 +32,7 @@ const classic = {
 function NotPorted({ screen }) {
   const link = classic[screen];
   return html`<div class="ops-detail"><h3>Not yet in the new dashboard</h3>
-    ${link ? html`<a href=${link[0]}>${link[1]}</a>` : html`<p>${screen === "prompts"
-    ? "Prompt files and overrides are still managed outside the dashboard." : "Edit ADWs in your checkout. Loop operations are available in classic."}</p>`}
+    ${link ? html`<a href=${link[0]}>${link[1]}</a>` : html`<p>Edit ADWs in your checkout. Loop operations are available in classic.</p>`}
     ${screen === "adws" ? html`<a href="/#loops">Open loops in classic</a>` : null}
     ${screen === "insights" ? html`<a href="/#usage">Open usage in classic</a>` : null}</div>`;
 }
@@ -89,8 +89,9 @@ function runQueueBody({ view, route, retry }) {
 }
 
 const runPage = () => ({ title: "Runs", subtitle: html`<${RunSubtitle} />`, queue: "Runs", focus: "Run" });
+const promptsPage = (view) => ({ ...data.prompts(), subtitle: html`<${PromptSubtitle} view=${view} />` });
 
-function panels({ route, snapshot, resources, now, retry, runs }) {
+function panels({ route, snapshot, resources, now, retry, runs, prompts }) {
   switch (route.screen) {
     case "floor": return [html`${snapshot.slots == null ? null : html`<p class="slots mono">Slots ${snapshot.slots} / ${snapshot.capacity}</p>`}
       <${FloorQueue} snapshot=${snapshot} retry=${retry} />`, html`<${FloorFocus} snapshot=${snapshot} retry=${retry} />`];
@@ -103,17 +104,19 @@ function panels({ route, snapshot, resources, now, retry, runs }) {
     case "run": return [runQueueBody({ view: runs, route, retry }), html`
       ${runs.detail?.run?.status === "needs-info" ? html`<${RunQuestions} resource=${snapshot.questions} run=${runs.id} retry=${retry} />` : null}
       <${RunFocus} key=${runs.id} view=${runs} now=${now} retry=${retry} />`];
+    case "prompts": return [html`<${PromptQueue} route=${route} view=${prompts} retry=${retry} />`,
+      html`<${PromptFocus} route=${route} view=${prompts} retry=${retry} />`];
     case "settings": return [html`<${SettingsQueue} />`, html`<${HealthFocus} resource=${resources.health} retry=${retry} />`];
     default: return [html`<${NotPorted} screen=${route.screen} />`, null];
   }
 }
 
-export function Shell({ route, snapshot, resources, now, retry, runs }) {
+export function Shell({ route, snapshot, resources, now, retry, runs, prompts }) {
   fixtureRevision.value;
   const actionList = fixture.value;
   const counts = actionList?.counts();
-  const page = route.screen === "run" ? runPage() : data[route.screen](route);
-  const [queue, focus] = panels({ route, snapshot, resources, now, retry, runs });
+  const page = route.screen === "run" ? runPage() : route.screen === "prompts" ? promptsPage(prompts) : data[route.screen](route);
+  const [queue, focus] = panels({ route, snapshot, resources, now, retry, runs, prompts });
   const parent = selectedInbox(route) && ["triage", "outbox"].includes(route.screen)
     ? [`#${route.screen}`, `Back to ${route.screen === "triage" ? "inbox" : "Outbox"}`]
     : route.screen === "task" && route.path[0] ? ["#board", "Back to Board"] : null;
@@ -121,6 +124,7 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
       <div class="top-bar ops-links" aria-label="Dashboard shortcuts">
+        ${route.screen === "prompts" ? html`<${PromptCrumbs} route=${route} view=${prompts} />` : null}
         ${browserPaired.value ? html`<a href="/pair">Pair a device and manage tokens</a>` : null}
         ${route.screen === "run" ? html`<a href="/#sessions">Sessions in classic</a>` : null}
         <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>

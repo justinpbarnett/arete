@@ -80,7 +80,30 @@ export function board(route) { return { title: route.active === "my-work" ? "Ope
 export function task() { return { title: "Task", subtitle: "Work, activity and runs", queue: "Tasks", focus: "Overview" }; }
 export function intake() { return { title: "Intake", subtitle: "Incoming work", queue: "Intake", focus: "Focus" }; }
 export function outbox() { return { title: "Outbox", subtitle: "Drafts and deliveries waiting for review", queue: "Delivery queue", focus: "Review" }; }
-export function prompts() { return { title: "Prompts", subtitle: "Prompt library", queue: "Prompts", focus: "Editor", extra: "Details" }; }
+export function prompts() {
+  return {
+    title: "Prompts",
+    subtitle: "Prompt library",
+    queue: "Prompts",
+    focus: "Prompt",
+    extra: "Details",
+    list: "/api/v1/config/prompt",
+    item: (name, level = "") => `/api/v1/config/prompt/${encodeURIComponent(name)}${level ? `?${new URLSearchParams({ level })}` : ""}`,
+    loops: "/api/v1/config/loop",
+    loopFile: (name, file = "", level = "") => {
+      const params = new URLSearchParams();
+      if (file) params.set("file", file);
+      if (level) params.set("level", level);
+      const qs = params.toString();
+      return `/api/v1/config/loop/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
+    },
+    adws: "/api/v1/config/adw",
+    adw: (name) => `/api/v1/config/adw/${encodeURIComponent(name)}`,
+    library: "/api/v1/config/library/adw",
+    drafts: "/api/v1/drafts",
+    hash: (path = "") => `#prompts${path ? `/${String(path).split("/").filter(Boolean).map(encodeURIComponent).join("/")}` : ""}`,
+  };
+}
 export function adws() { return { title: "ADWs", subtitle: "Agent development workflows", queue: "ADWs", focus: "Canvas", extra: "Properties" }; }
 export function insights() { return { title: "Insights", subtitle: "Work over time", queue: "Charts", focus: "Chart" }; }
 export function settings() { return { title: "Settings", subtitle: "Health and configuration", queue: "Sections", focus: "Health" }; }

@@ -5,6 +5,7 @@ import { current, listen } from "./ui-router.js";
 import { visit } from "./ui-data.js";
 import { live, connectivity, readFault, runView, screenReads } from "./ui-live.js";
 import { applyQueue } from "./ui-run.js";
+import { promptsView, retryPrompts, syncPrompts } from "./ui-prompts.js";
 import { startKeys, marks, screenKeys, pending, sheet, mode, connection, readRetry, activatePane } from "./ui-keys.js";
 import { configurePalette, globalCommands } from "./ui-palette.js";
 import { actions, dispatch } from "./ui-actions.js";
@@ -37,18 +38,24 @@ function finish() {
     ms: Math.max(0, Math.min(86400000, Math.round(performance.now() - outgoing.at))) });
 }
 
-const retry = () => feed.retry();
+const retry = () => {
+  feed.retry();
+  if (route.value.screen === "prompts") retryPrompts();
+};
 
 effect(() => applyQueue(runView.value));
+effect(() => syncPrompts(route.value));
 
 effect(() => {
   const selected = route.value;
   const latest = snapshot.value;
   const runs = runView.value;
+  const prompts = promptsView.value;
   const runFault = selected.screen === "run" && (runs.queueError || runs.detailError);
+  const promptFault = selected.screen === "prompts" && Boolean(prompts.listError || prompts.detailError);
   connection.value = connectivity(latest, now.value);
-  readRetry.value = readFault(selected.screen, latest) || runFault ? retry : null;
-  render(h(Shell, { route: selected, snapshot: latest, resources: screenReads.value, now: now.value, retry, runs }), document.getElementById("app"));
+  readRetry.value = readFault(selected.screen, latest) || runFault || promptFault ? retry : null;
+  render(h(Shell, { route: selected, snapshot: latest, resources: screenReads.value, now: now.value, retry, runs, prompts }), document.getElementById("app"));
   marks();
   normalizePrimary();
   document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "Open work" : selected.screen}`;
