@@ -16,9 +16,12 @@ from statistics import NormalDist
 from typing import TextIO
 
 from .. import (
+    codebase,
     config,
+    configrepo,
     evals,
     paths,
+    pins,
     pipeline,
     prices,
     prompts,
@@ -27,6 +30,7 @@ from .. import (
     routing,
     run_lines,
     runner,
+    settings,
     slots,
     steps,
     util,
@@ -34,16 +38,18 @@ from .. import (
 )
 from ..agent import traits_of
 from ..diffguard import denied_paths
+from ..store import blobs as blob_store
 from ..store import runs as run_store
 from ..store import sources as source_store
 from ..util import engine_commit
 
-ATOMS = ("plan", "build", "check_repair")
 FIXED_GRADERS = ("verify", "eval_grade")
+TRIAL_ROLES = ("plan", "build", "check_repair")
 SPLITS = ("train", "validation", "holdout")
-TOP_KEYS = ("name", "repo", "atom", "repeats", "cache_policy", "arms", "tasks", "accept", "limits")
-EXTRA_KEYS = ("prompts", "context")
-ARM_KEYS = ("tier", "runner", "provider", "model", "effort", "tools", "mcp", "instructions", *EXTRA_KEYS)
+TOP_KEYS = ("name", "repo", "atom", "repeats", "cache_policy", "vary", "arms", "tasks", "accept", "limits")
+EXTRA_KEYS = ("prompts", "context", "settings", "schemas", "adws", "routes", "files")
+ARM_KEYS = ("tier", "runner", "provider", "model", "effort", "tools", "mcp", "instructions",
+            "timeout_minutes", "tries", "prompt", "schema", *EXTRA_KEYS)
 ROUTE_KEYS = ("tier", "runner", "provider", "model")
 ALIVE_SECONDS = 10
 TASK_KEYS = ("base", "split")
@@ -54,6 +60,7 @@ HEADROOM_KEYS = ("tokens", "spend_usd")
 LIMIT_LABELS = {"spend_usd": "spend", "minutes": "time", "calls": "calls", "tokens": "tokens"}
 MIN_PAIRS = 6
 DEFAULT_CACHE_POLICY = "provider-default"
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 HEX = re.compile(r"[0-9a-fA-F]{7,40}")
 LIMIT_EXIT = 3
@@ -109,6 +116,13 @@ class Experiment:
     recovered: Callable | None = None
     codex: list[str] = field(default_factory=list)
     executors: dict[str, str] = field(default_factory=dict)
+    vary: tuple[str, ...] | None = None
+    engine_sha: str = ""
+    arm_refs: dict[str, str] = field(default_factory=dict)
+    arm_commits: dict[str, str] = field(default_factory=dict)
+    arm_bases: dict[str, str] = field(default_factory=dict)
+    arm_resolutions: dict[str, pins.Resolution] = field(default_factory=dict)
+    grader_pins: dict[str, object] = field(default_factory=dict)
 
 
 def unknown(table: dict, allowed: tuple[str, ...], where: str) -> None:
@@ -179,14 +193,55 @@ def base_commit(repo: config.Repo, name: str, base: str, key: str = "base") -> s
 
 
 def read_extras(repo: config.Repo, name: str, entry: dict) -> dict:
-    found = {}
+    found: dict[str, object] = {}
     if "prompts" in entry:
-        folder = paths.expand(text(entry, "prompts", f"arms.{name}."))
-        if missing := evals.Prompts(folder).missing():
-            raise Refused(f"arms.{name}: prompts {paths.short_path(folder)} has no {', '.join(missing)}")
-        found["prompts"] = str(folder)
+        raw_prompts = entry["prompts"]
+        if isinstance(raw_prompts, str):
+            folder = paths.expand(text(entry, "prompts", f"arms.{name}."))
+            if missing := evals.Prompts(folder).missing():
+                raise Refused(f"arms.{name}: prompts {paths.short_path(folder)} has no {', '.join(missing)}")
+            found["prompts"] = str(folder)
+        elif isinstance(raw_prompts, dict) and raw_prompts:
+            prompt_map: dict[str, str] = {}
+            for pname, pval in raw_prompts.items():
+                stem = Path(str(pname)).stem
+                if not prompts.NAME_RE.fullmatch(stem):
+                    raise Refused(f"arms.{name}.prompts.{pname}: invalid prompt name")
+                if not isinstance(pval, str) or not pval.strip():
+                    raise Refused(f"arms.{name}.prompts.{pname}: must be a non-empty string or file path")
+                candidate = paths.expand(pval) if ("\n" not in pval and len(pval) < 512) else None
+                if candidate is not None and candidate.is_file():
+                    prompt_map[stem] = candidate.read_text(encoding="utf-8")
+                else:
+                    prompt_map[stem] = pval
+            found["prompts"] = prompt_map
+        else:
+            raise Refused(f"arms.{name}.prompts must be a folder path or table of prompt files")
     if "context" in entry:
         found["context"] = commit_of(repo, f"arms.{name}: context", text(entry, "context", f"arms.{name}."))
+    if "settings" in entry:
+        raw_settings = entry["settings"]
+        if not isinstance(raw_settings, dict):
+            raise Refused(f"arms.{name}.settings must be a table of step settings")
+        step_map: dict[str, dict] = {}
+        for role_name, table in raw_settings.items():
+            canonical = config.STEP_ALIASES.get(role_name, role_name)
+            if canonical not in config.STEP_ROLES:
+                raise Refused(f"arms.{name}.settings.{role_name}: unknown step role")
+            if canonical in FIXED_GRADERS:
+                raise Refused(f"arms.{name}.settings.{role_name}: the grader stays fixed")
+            try:
+                step_map[canonical] = config.step_table(table, f"arms.{name}.settings.{role_name}")
+            except ValueError as e:
+                raise Refused(f"arm {name}: {e}") from e
+        if step_map:
+            found["settings"] = step_map
+    for map_key in ("schemas", "adws", "routes", "files"):
+        if map_key in entry:
+            raw_map = entry[map_key]
+            if not isinstance(raw_map, dict):
+                raise Refused(f"arms.{name}.{map_key} must be a table")
+            found[map_key] = dict(raw_map)
     return found
 
 
@@ -201,12 +256,15 @@ def read_arms(cfg: config.Config, layer: config.RepoLayer, atom: str, table: dic
         if not isinstance(entry, dict):
             raise Refused(f"arms.{name} must be a table")
         unknown(entry, ARM_KEYS, f"arms.{name}")
+        extra = read_extras(repo, name, entry)
         try:
-            given[name] = config.step_table({k: v for k, v in entry.items() if k not in EXTRA_KEYS}, f"arms.{name}")
+            flat = config.step_table({k: v for k, v in entry.items() if k not in EXTRA_KEYS}, f"arms.{name}")
+            extra_atom = (extra.get("settings") or {}).get(atom, {})
+            given[name] = {**flat, **extra_atom}
             resolved[name] = steps.resolve(cfg, layer, atom, "", given[name])
         except ValueError as e:
             raise Refused(f"arm {name}: {e}") from e
-        if extra := read_extras(repo, name, entry):
+        if extra:
             extras[name] = extra
     return given, resolved, extras
 
@@ -343,13 +401,13 @@ def codex_lines(limits: dict, routes: list[str]) -> list[str]:
 
 
 def followers(atom: str, follow: bool) -> list[str]:
-    return [r for r, b in config.INHERITS.items() if b == atom and r in ATOMS] if follow else []
+    return [r for r, b in config.INHERITS.items() if b == atom] if follow else []
 
 
 def freeze(cfg: config.Config, layer: config.RepoLayer, atom: str, baseline: dict,
            follow: bool = False) -> dict[str, dict]:
     route = {k: v for k, v in baseline.items() if k in ROUTE_KEYS}
-    return {role: route for role in ATOMS
+    return {role: route for role in TRIAL_ROLES
             if role != atom and role not in followers(atom, follow) and route
             and not steps.resolve(cfg, layer, role, "").model}
 
@@ -359,8 +417,383 @@ def evidence(task: evals.Task) -> str:
     return sha(task.title, task.prompt, task.check, task.verify, *hidden)
 
 
+def read_vary(data: dict) -> tuple[str, ...] | None:
+    if "vary" not in data:
+        return None
+    raw = data["vary"]
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x.strip() for x in raw):
+        raise Refused("vary must be a list of non-empty resolved.json key paths")
+    return tuple(x.strip() for x in raw)
+
+
+def config_manifest_path(name: str, *, config_commit: str = "") -> Path:
+    slug = name.removeprefix("experiment:")
+    if not SLUG.fullmatch(slug):
+        raise Refused(f"experiment name {name!r} must match {SLUG.pattern}")
+    if configrepo.is_repo():
+        commit = config_commit or configrepo.live_sha()
+        if commit:
+            return pins.config_checkout(commit) / "experiments" / f"{slug}.toml"
+    return paths.CONFIG_DIR / "experiments" / f"{slug}.toml"
+
+
+def commit_manifest(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8")
+    data = tomllib.loads(raw)
+    name = text(data, "name")
+    if not SLUG.fullmatch(name):
+        raise Refused(f"name {name!r} must match {SLUG.pattern}")
+    rel = f"experiments/{name}.toml"
+    if not configrepo.is_repo():
+        try:
+            configrepo.init()
+        except configrepo.ConfigRepoError:
+            return name
+    _, base = configrepo.read(rel)
+    configrepo.commit({rel: raw}, {rel: base}, actor="hand", source="hand", note=f"hand edit: {rel}")
+    return name
+
+
+def load_from_config(name: str, carried: Totals | None = None, follow: bool = False) -> Experiment:
+    manifest_file = config_manifest_path(name)
+    if not manifest_file.is_file():
+        raise Refused(f"no experiment manifest at {paths.short_path(manifest_file)}")
+    return designed(tomllib.loads(manifest_file.read_text(encoding="utf-8")), carried, follow)
+
+
 def load(path: Path) -> Experiment:
-    return designed(tomllib.loads(path.read_text()))
+    return designed(tomllib.loads(path.read_text(encoding="utf-8")))
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        items = ", ".join(
+            f"{k if re.fullmatch(r'[A-Za-z0-9_-]+', str(k)) else json.dumps(str(k))} = {_toml_value(v)}"
+            for k, v in value.items()
+        )
+        return "{ " + items + " }"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _collapse_toml_key(lines: list[str], table: str, key: str) -> None:
+    start, end = settings.table_span(lines, table)
+    if start is None:
+        return
+    for i in range(start, end):
+        if not (m := settings.key_line(key).match(lines[i])):
+            continue
+        for j in range(i, end):
+            try:
+                tomllib.loads("".join(lines[i:j + 1]))
+            except tomllib.TOMLDecodeError:
+                continue
+            lines[i:j + 1] = [f"{m.group(1)}[]{m.group(3) or chr(10)}"]
+            return
+        return
+
+
+def _step_table_name(raw: dict, role: str) -> str:
+    held = raw.get("steps", {})
+    alias = next((a for a, target in config.STEP_ALIASES.items() if target == role and a in held), "")
+    return f"steps.{alias or role}"
+
+
+def edit_step_toml(text_in: str, role_updates: dict[str, dict]) -> str:
+    raw = tomllib.loads(text_in) if text_in.strip() else {}
+    lines = text_in.splitlines(keepends=True)
+    for role, keys in role_updates.items():
+        if not keys:
+            continue
+        table = _step_table_name(raw, role)
+        for key, value in keys.items():
+            _collapse_toml_key(lines, table, key)
+            if value is None:
+                settings.drop_key(lines, table, key)
+            else:
+                settings.set_key(lines, table, key, _toml_value(value))
+    return "".join(lines)
+
+
+def arm_ref_name(exp_name: str, arm: str) -> str:
+    return f"refs/arete/arms/{exp_name}/{arm}"
+
+
+def _arm_prompt_bytes(stem: str, raw_text: str) -> bytes:
+    prepared = prompts.ensure_override_front_matter(stem, raw_text)
+    return prepared.encode("utf-8")
+
+
+def arm_file_changes(exp: Experiment, arm: str, live_cfg_text: str) -> dict[str, bytes]:
+    changes: dict[str, bytes] = {}
+    extra = exp.extras.get(arm, {})
+    step_updates: dict[str, dict] = {}
+    if exp.arms.get(arm):
+        step_updates[exp.atom] = dict(exp.arms[arm])
+    if isinstance(extra.get("settings"), dict):
+        for role, tbl in extra["settings"].items():
+            step_updates[role] = {**step_updates.get(role, {}), **tbl}
+    if step_updates:
+        updated_cfg = edit_step_toml(live_cfg_text, step_updates)
+        if updated_cfg != live_cfg_text:
+            changes["config.toml"] = updated_cfg.encode("utf-8")
+    raw_prompts = extra.get("prompts")
+    if isinstance(raw_prompts, str):
+        folder = Path(raw_prompts)
+        for file in sorted(folder.glob("*.md")):
+            stem = file.stem
+            if stem not in prompts.engine_prompt_names():
+                continue
+            raw_bytes = file.read_bytes()
+            live_bytes = configrepo.live_bytes(f"prompts/{file.name}")
+            engine_file = paths.PROMPTS_DIR / file.name
+            engine_bytes = engine_file.read_bytes() if engine_file.is_file() else b""
+            if raw_bytes == engine_bytes and live_bytes is None:
+                continue
+            if live_bytes is not None and raw_bytes == live_bytes:
+                continue
+            changes[f"prompts/{file.name}"] = _arm_prompt_bytes(stem, raw_bytes.decode("utf-8"))
+    elif isinstance(raw_prompts, dict):
+        for stem, text_val in sorted(raw_prompts.items()):
+            changes[f"prompts/{stem}.md"] = _arm_prompt_bytes(stem, str(text_val))
+    if isinstance(extra.get("schemas"), dict):
+        for sname, sval in sorted(extra["schemas"].items()):
+            stem = Path(str(sname)).stem
+            raw_s = sval if isinstance(sval, str) else json.dumps(sval, indent=2) + "\n"
+            changes[f"schemas/{stem}.json"] = raw_s.encode("utf-8")
+    if isinstance(extra.get("adws"), dict):
+        for aname, aval in sorted(extra["adws"].items()):
+            stem = Path(str(aname)).stem
+            changes[f"adws/{stem}.toml"] = str(aval).encode("utf-8")
+    if isinstance(extra.get("routes"), dict):
+        for rname, rval in sorted(extra["routes"].items()):
+            stem = Path(str(rname)).stem
+            changes[f"routes/{stem}.toml"] = str(rval).encode("utf-8")
+    if isinstance(extra.get("files"), dict):
+        for rel, fval in sorted(extra["files"].items()):
+            changes[str(rel)] = fval if isinstance(fval, bytes) else str(fval).encode("utf-8")
+    return changes
+
+
+def _matches_declared(key: str, declared: set[str]) -> bool:
+    return key in declared or any(key.startswith(prefix + ".") for prefix in declared)
+
+
+def inferred_vary(exp: Experiment) -> set[str]:
+    keys: set[str] = set()
+    for arm, vals in exp.arms.items():
+        for k in vals:
+            keys.add(f"settings.{exp.atom}.{k}")
+        if exp.atom and vals:
+            for rk in ("model", "runner", "provider", "tier"):
+                if any(k in ROUTE_KEYS for k in vals):
+                    keys.add(f"settings.{exp.atom}.{rk}")
+        extra = exp.extras.get(arm, {})
+        if isinstance(extra.get("settings"), dict):
+            for role, tbl in extra["settings"].items():
+                for k in tbl:
+                    keys.add(f"settings.{role}.{k}")
+                if any(k in ROUTE_KEYS for k in tbl):
+                    for rk in ROUTE_KEYS:
+                        keys.add(f"settings.{role}.{rk}")
+        if "prompts" in extra:
+            raw_p = extra["prompts"]
+            if isinstance(raw_p, dict):
+                for stem in raw_p:
+                    keys.add(f"prompts.{stem}")
+            else:
+                keys.add("prompts")
+        if "context" in extra:
+            keys.add("harness")
+        if isinstance(extra.get("schemas"), dict):
+            for sname in extra["schemas"]:
+                keys.add(f"schemas.{Path(str(sname)).stem}")
+        if isinstance(extra.get("adws"), dict):
+            for aname in extra["adws"]:
+                keys.add(f"adws.{Path(str(aname)).stem}")
+        if isinstance(extra.get("routes"), dict):
+            for rname in extra["routes"]:
+                keys.add(f"routes.{Path(str(rname)).stem}")
+        if isinstance(extra.get("files"), dict):
+            keys.update(("settings", "prompts", "schemas", "adws", "routes"))
+    return keys
+
+
+def diff_resolved_docs(
+    expected_doc: dict,
+    actual_doc: dict,
+    *,
+    ignore_declared: set[str] | None = None,
+    map_grader: bool = False,
+) -> list[str]:
+    declared = ignore_declared or set()
+    changed: list[str] = []
+
+    def add(key: str) -> None:
+        if key not in changed:
+            changed.append(key)
+
+    if expected_doc.get("engine_sha") != actual_doc.get("engine_sha") and not _matches_declared("engine_sha", declared):
+        add("engine_sha")
+
+    exp_settings = expected_doc.get("settings") or {}
+    act_settings = actual_doc.get("settings") or {}
+    for role in sorted(set(exp_settings) | set(act_settings)):
+        e_role = exp_settings.get(role) or {}
+        a_role = act_settings.get(role) or {}
+        for field_name in sorted(set(e_role) | set(a_role)):
+            e_entry = e_role.get(field_name) if isinstance(e_role, dict) else None
+            a_entry = a_role.get(field_name) if isinstance(a_role, dict) else None
+            e_val = e_entry.get("value") if isinstance(e_entry, dict) else e_entry
+            a_val = a_entry.get("value") if isinstance(a_entry, dict) else a_entry
+            if e_val != a_val:
+                dotted = f"settings.{role}.{field_name}"
+                if _matches_declared(dotted, declared):
+                    continue
+                base_role = config.INHERITS.get(role, "")
+                a_level = a_entry.get("level") if isinstance(a_entry, dict) else ""
+                e_level = e_entry.get("level") if isinstance(e_entry, dict) else ""
+                if base_role and "inherit" in (a_level, e_level) and _matches_declared(f"settings.{base_role}.{field_name}", declared):
+                    continue
+                add(dotted)
+                if map_grader and role == "eval_grade":
+                    add("grader")
+
+    for section_name in ("prompts", "schemas", "adws", "routes"):
+        e_sec = expected_doc.get(section_name) or {}
+        a_sec = actual_doc.get(section_name) or {}
+        for item_name in sorted(set(e_sec) | set(a_sec)):
+            e_meta = e_sec.get(item_name) or {}
+            a_meta = a_sec.get(item_name) or {}
+            e_sha = e_meta.get("sha256") if isinstance(e_meta, dict) else e_meta
+            a_sha = a_meta.get("sha256") if isinstance(a_meta, dict) else a_meta
+            if e_sha != a_sha:
+                dotted = f"{section_name}.{item_name}"
+                if _matches_declared(dotted, declared):
+                    continue
+                add(dotted)
+                if map_grader and section_name == "prompts" and item_name == "grade":
+                    add("grader")
+
+    for scalar in ("adw", "adw_version", "adw_rule"):
+        if expected_doc.get(scalar) != actual_doc.get(scalar) and not _matches_declared(scalar, declared):
+            add(scalar)
+
+    def _harness_content(doc: dict) -> dict | None:
+        h = doc.get("harness")
+        if not isinstance(h, dict):
+            return None
+        return {k: v for k, v in h.items() if k != "label"}
+
+    if _harness_content(expected_doc) != _harness_content(actual_doc) and not _matches_declared("harness", declared):
+        add("harness")
+    else:
+        e_exp = (expected_doc.get("expertise") or {}).get("sha256") if isinstance(expected_doc.get("expertise"), dict) else None
+        a_exp = (actual_doc.get("expertise") or {}).get("sha256") if isinstance(actual_doc.get("expertise"), dict) else None
+        if e_exp != a_exp and not _matches_declared("harness", declared):
+            add("harness")
+
+    e_prices = expected_doc.get("prices")
+    a_prices = actual_doc.get("prices")
+    if e_prices != a_prices and not _matches_declared("prices", declared):
+        add("prices")
+
+    return changed
+
+
+def _resolve_arm(
+    exp: Experiment,
+    arm: str,
+    arm_ref_or_commit: str,
+    *,
+    engine_sha: str,
+) -> pins.Resolution:
+    extra = exp.extras.get(arm, {})
+    src = evals.Source(exp.repo, str(extra.get("context") or ""))
+    return pins.resolve(
+        "experiment",
+        repo=exp.repo,
+        layer=exp.layer,
+        overrides=exp.frozen or None,
+        arm=arm_ref_or_commit,
+        harness_source=src,
+        engine_sha=engine_sha,
+    )
+
+
+def prepare_arms(
+    exp: Experiment,
+    *,
+    reuse_commits: dict[str, str] | None = None,
+    engine_sha: str = "",
+) -> dict[str, pins.Resolution]:
+    configrepo.ensure_repo()
+    cur_engine = engine_sha or codebase.current_stamp()
+    live_base = configrepo.live_sha()
+    live_cfg_text = (configrepo.live_bytes("config.toml") or b"").decode("utf-8")
+    baseline = exp.accept["baseline"]
+    refs: dict[str, str] = {}
+    commits: dict[str, str] = {}
+    bases: dict[str, str] = {}
+    resolutions: dict[str, pins.Resolution] = {}
+
+    for arm in exp.arms:
+        ref = arm_ref_name(exp.name, arm)
+        refs[arm] = ref
+        if reuse_commits and arm in reuse_commits and configrepo.resolve_ref(reuse_commits[arm]):
+            commit_sha = reuse_commits[arm]
+            base_sha = configrepo.parent_sha(commit_sha) or live_base
+        else:
+            changes = {} if (arm == baseline and not exp.arms[arm] and not exp.extras.get(arm)) else arm_file_changes(
+                exp, arm, live_cfg_text
+            )
+            try:
+                commit_sha = configrepo.commit(
+                    changes,
+                    {},
+                    actor="engine",
+                    source="engine",
+                    note=f"experiment {exp.name} arm {arm}",
+                    ref=ref,
+                    allow_empty=True,
+                )
+            except configrepo.ConfigRepoError as e:
+                raise Refused(f"arm {arm}: {e}") from e
+            base_sha = live_base
+        commits[arm] = commit_sha
+        bases[arm] = base_sha
+        target_ref = commit_sha if (reuse_commits and arm in reuse_commits) else ref
+        resolutions[arm] = _resolve_arm(exp, arm, target_ref, engine_sha=cur_engine)
+
+    base_doc = json.loads(resolutions[baseline].resolved_bytes)
+    declared = set(exp.vary) if exp.vary is not None else inferred_vary(exp)
+    for arm, res in resolutions.items():
+        if arm == baseline:
+            continue
+        arm_doc = json.loads(res.resolved_bytes)
+        extra_diffs = diff_resolved_docs(base_doc, arm_doc, ignore_declared=declared)
+        if extra_diffs:
+            raise Refused(f"arm {arm} changes undeclared key(s): {', '.join(extra_diffs)}")
+
+    exp.engine_sha = cur_engine
+    exp.arm_refs = refs
+    exp.arm_commits = commits
+    exp.arm_bases = bases
+    exp.arm_resolutions = resolutions
+    grade_meta = resolutions[baseline].prompts.get("grade") or {}
+    exp.grader_pins = {
+        "prompt": dict(grade_meta),
+        "settings_sha": resolutions[baseline].settings_sha_for("eval_grade"),
+        "verify": exp.design["grader"]["verify"],
+    }
+    return resolutions
 
 
 def designed(data: dict, carried: Totals | None = None, follow: bool = False) -> Experiment:
@@ -370,13 +803,15 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
         return workflows.designed(data, carried, follow)
     unknown(data, TOP_KEYS, "the manifest")
     name = text(data, "name")
-    if not NAME.fullmatch(name):
-        raise Refused("name takes only letters, digits, _ and -")
-    atom = text(data, "atom")
+    if not SLUG.fullmatch(name):
+        raise Refused("name must match ^[a-z0-9][a-z0-9-]{0,63}$")
+    raw_atom = text(data, "atom", "", "build")
+    atom = config.STEP_ALIASES.get(raw_atom, raw_atom)
     if atom in FIXED_GRADERS:
-        raise Refused(f"atom {atom!r}: the grader stays fixed")
-    if atom not in ATOMS:
-        raise Refused(f"atom must be one of {', '.join(ATOMS)}, not {atom!r}")
+        raise Refused(f"atom {raw_atom!r}: the grader stays fixed")
+    if atom not in config.STEP_ROLES:
+        raise Refused(f"atom must be a known step role, not {raw_atom!r}")
+    vary = read_vary(data)
     repeats = number(data, "repeats", whole=True)
     if repeats < 1:
         raise Refused(f"repeats must be 1 or more, not {repeats}")
@@ -390,81 +825,91 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
         grader = steps.resolve(cfg, layer, "eval_grade", "")
     except (ValueError, OSError) as e:
         raise Refused(f"repo {repo.name}: {e}") from e
-    given, settings, extras = read_arms(cfg, layer, atom, section(data, "arms"), repo)
+    given, resolved_settings, extras = read_arms(cfg, layer, atom, section(data, "arms"), repo)
     tasks, splits = read_tasks(repo, section(data, "tasks"))
     accept = read_accept(section(data, "accept"), given, splits)
     limits = read_limits(section(data, "limits"))
-    shared = fingerprints(repo, layer)
     frozen = freeze(cfg, layer, atom, given[accept["baseline"]], follow)
     following = followers(atom, follow)
-    held = {role: steps.resolve(cfg, layer, role, "", frozen.get(role)) for role in ATOMS
+    held = {role: steps.resolve(cfg, layer, role, "", frozen.get(role)) for role in TRIAL_ROLES
             if role != atom and role not in following}
     inherited = {n: {role: steps.resolve(cfg, layer, role, "", None, given[n]) for role in following}
-                 for n in settings}
+                 for n in resolved_settings}
     routes = unstoppable(
-        cfg, atom, settings,
+        cfg, atom, resolved_settings,
         {**held, **{f"{role} of arm {n}": s for n, roles in inherited.items() for role, s in roles.items()}},
         grader, limits)
-    own = {n: fingerprints(repo, layer, Path(x.get("prompts", paths.PROMPTS_DIR)), x.get("context", ""))
-           for n, x in extras.items()}
     design = {
         "name": name, "repo": repo.name, "atom": atom, "repeats": repeats, "cache_policy": cache_policy,
+        **({"vary": list(vary)} if vary is not None else {}),
         "accept": accept,
         "arms": {n: {**given[n], "runner": s.runner, "model": s.model, "provider": s.provider, "tier": s.tier,
                      "effort": s.effort, "settings": effective(cfg, s),
-                     "fingerprints": arm_fingerprints(own.get(n, shared), cfg, s),
-                     **{k: paths.short_path(v) if k == "prompts" else v for k, v in extras.get(n, {}).items()},
+                     **{k: (paths.short_path(v) if k == "prompts" and isinstance(v, str) else v)
+                        for k, v in extras.get(n, {}).items()},
                      **({"inheritors": {r: effective(cfg, s2) for r, s2 in inherited[n].items()}} if follow else {})}
-                 for n, s in settings.items()},
+                 for n, s in resolved_settings.items()},
         "frozen": {role: {"overrides": frozen.get(role, {}), "settings": effective(cfg, s)}
                    for role, s in held.items()},
         "tasks": {n: {"split": splits[n], "base": t.base, "evidence": evidence(t)} for n, t in tasks.items()},
         "grader": {"runner": grader.runner, "model": grader.model, "effort": grader.effort,
                    "settings": effective(cfg, grader), "verify": sha_json(layer.verify.policy()) if layer.verify else "",
                    "prompt": sha(prompts.body(paths.PROMPTS_DIR / "grade.md"))},
-        "fingerprints": shared,
         "engine": engine_code(),
         "money": {"prices": (prices.load() or {}).get("version", ""),
                   "local_providers": sorted(cfg.local_providers)},
         **({HEADROOM: limits[HEADROOM]} if HEADROOM in limits else {}),
     }
     digest = sha_json(design)[:12]
-    return Experiment(name, cfg, repo, layer, atom, repeats, cache_policy, given, settings, tasks, splits, accept,
-                      limits, frozen, design, digest, extras, carried or Totals(), follow, codex=routes)
+    return Experiment(name, cfg, repo, layer, atom, repeats, cache_policy, given, resolved_settings, tasks, splits,
+                      accept, limits, frozen, design, digest, extras, carried or Totals(), follow, codex=routes,
+                      vary=vary)
 
 
-def observed(exp: Experiment, arm: str) -> dict:
-    invalid = False
-    try:
-        layer = config.load_layer(exp.repo.layer_dir)
-    except (ValueError, TypeError, OSError):
-        layer, invalid = exp.layer, True
-    extra = exp.extras.get(arm, {})
-    base = fingerprints(exp.repo, layer, Path(extra.get("prompts", paths.PROMPTS_DIR)), extra.get("context", ""))
-    found = arm_fingerprints(base, exp.cfg, exp.settings[arm])
-    if invalid:
-        found["context"] = "unreadable layer"
-    workflow = {}
+def drift_before(exp: Experiment, arm: str) -> tuple[list[str], pins.Resolution]:
+    if arm not in exp.arm_resolutions:
+        prepare_arms(exp)
+    cur_engine = codebase.current_stamp()
+    arm_target = exp.arm_commits.get(arm) or exp.arm_refs[arm]
+    pin_res = _resolve_arm(exp, arm, arm_target, engine_sha=cur_engine)
+    start_res = exp.arm_resolutions[arm]
+    start_doc = json.loads(start_res.resolved_bytes)
+    cur_doc = json.loads(pin_res.resolved_bytes)
+    changed = diff_resolved_docs(start_doc, cur_doc, ignore_declared=None, map_grader=True)
     if exp.executors:
         from . import workflows
 
-        workflow = {"workflow": workflows.fingerprint(config.load(), layer)}
-    return {"fingerprints": found, "grader": sha(prompts.body(paths.PROMPTS_DIR / "grade.md")),
-            "engine": engine_code(), "prices": (prices.load() or {}).get("version", ""), **workflow}
+        layer = pin_res.layer or exp.layer
+        if workflows.fingerprint(pin_res.cfg, layer) != exp.design.get("workflow_sha"):
+            if "workflow" not in changed:
+                changed.append("workflow")
+    return changed, pin_res
 
 
-def drift(exp: Experiment, arm: str, seen: dict) -> list[str]:
-    changed = [k for k in ("prompt", "context", "tools")
-               if seen["fingerprints"][k] != exp.design["arms"][arm]["fingerprints"][k]]
-    if exp.executors and seen.get("workflow") != exp.design["workflow_sha"]:
-        changed.append("workflow")
-    return changed + [k for k, expected in (("grader", exp.design["grader"]["prompt"]),
-                                           ("engine", exp.design["engine"]),
-                                           ("prices", exp.design["money"]["prices"])) if seen[k] != expected]
+def drift_after(run_id: str, pin_res: pins.Resolution) -> list[str]:
+    changed: list[str] = []
+    after_engine = codebase.current_stamp()
+    if after_engine != pin_res.engine_sha:
+        changed.append("engine_sha")
+    resolved_doc = json.loads(pin_res.resolved_bytes)
+    expected_prompts = resolved_doc.get("prompts") or {}
+    for rows in run_store.step_inputs_by_run(run_id).values():
+        for inp in rows:
+            if inp.get("role") != "prompt":
+                continue
+            pname = str(inp.get("name") or "")
+            expected_id = str((expected_prompts.get(pname) or {}).get("id") or "")
+            if expected_id and inp.get("version") != expected_id:
+                key = f"prompts.{pname}"
+                if key not in changed:
+                    changed.append(key)
+                if pname == "grade" and "grader" not in changed:
+                    changed.append("grader")
+    return changed
 
 
 def drift_reason(changed: list[str]) -> str:
-    return (f"the {', '.join(changed)} changed since the design; "
+    return (f"the {', '.join(changed)} changed since the experiment started; "
             "restore them to continue or pass --out for a new file")
 
 
@@ -635,18 +1080,22 @@ def usage(exp: Experiment, arm: str, run_id: str) -> dict:
 
 def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: float, accepted: bool = False,
                failures: list[str] | None = None, repairs: int = 0, outcomes: dict | None = None,
-               seen: dict | None = None) -> dict:
+               *, resolved_sha: str = "", engine_sha: str = "", config_commit: str = "") -> dict:
     task, arm = begun["task"], begun["arm"]
-    seen = seen if seen is not None else begun["seen"]
     used = usage(exp, arm, begun["run"])
     if (outcomes or {}).get("usage_unknown"):
         used.update(charged_usd=None, reference_usd=None,
                     reference_unknown_calls=max(1, used["reference_unknown_calls"]))
     used["wait_seconds"] = round(used["wait_seconds"] + slot_seconds(events(path), begun), 2)
+    run_row = run_store.run_get(begun["run"]) or {}
+    r_sha = resolved_sha or begun.get("resolved_sha") or str(run_row.get("resolved_sha") or "")
+    e_sha = engine_sha or begun.get("engine_sha") or str(run_row.get("engine_sha") or "")
+    c_sha = config_commit or begun.get("config_commit") or str(run_row.get("config_commit") or "")
     return {"event": "trial", "at": util.iso(), "task": task, "split": exp.splits[task],
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
             "run": begun["run"], "status": status, "accepted": accepted, "failures": failures or [],
-            "repairs": repairs, "fingerprints": seen["fingerprints"], "engine": seen["engine"],
+            "repairs": repairs, "resolved_sha": r_sha, "engine_sha": e_sha,
+            **({"config_commit": c_sha} if c_sha else {}),
             **(outcomes or {}), **used, "wall_seconds": round(wall, 2)}
 
 
@@ -781,7 +1230,7 @@ def slot_reason(exp: Experiment, free: int, passed: list[dict]) -> str:
 
 
 def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals, *,
-              resolution=None) -> tuple[str, TextIO, str, float]:
+              resolution=None, arm: str = "") -> tuple[str, TextIO, str, float]:
     tag = f"{exp.name}-{waiting['task']}-{waiting['arm']}-{waiting['repeat']}"
     began, noted, since, told = time.monotonic(), time.monotonic(), "", ""
     while True:
@@ -789,8 +1238,9 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals, *,
             free = slots.slots_free_to_start(slots.live_max_parallel(exp.cfg.max_parallel))
             passed = source_store.tickets_passed_over()
             if free > 0 and not passed:
+                extra_fields = {"arm": arm} if arm else {}
                 run_id = record.start("experiment", tag=tag, lock=run_store.run_lock("experiment", exp.repo.name),
-                                      repo=exp.repo.name, resolution=resolution)
+                                      repo=exp.repo.name, resolution=resolution, **extra_fields)
                 held = slots.hold(exp.repo.name, None)
                 if since:
                     append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
@@ -830,59 +1280,57 @@ def overrun(limits: dict, used: Totals) -> dict:
     return {"overrun": {"tokens": max(0, tokens), "spend_usd": round(max(0.0, spend), 6)}}
 
 
-def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals, seen: dict) -> str:
-    from .. import configrepo, pins
+def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, used: Totals,
+              seen: dict | None = None) -> str:
+    if arm not in exp.arm_resolutions:
+        prepare_arms(exp)
+    changed, pin_res = drift_before(exp, arm)
+    if changed:
+        return drift_reason(changed)
 
     found = events(path)
     attempt = 1 + max((e["attempt"] for e in found if e.get("event") == "start" and key_of(e) == (task, arm, repeat)),
                       default=0)
     waiting = {"event": "wait", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt}
     extra = exp.extras.get(arm, {})
-    prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
-        if "prompts" in extra else evals.Prompts()
-    src = evals.Source(exp.repo, extra.get("context", ""))
-    pin_res = pins.resolve(
-        "experiment",
-        repo=exp.repo,
-        layer=exp.layer,
-        arm={"name": arm, "atom": exp.atom, "settings": exp.arms[arm], "frozen": exp.frozen},
-        prompts_dir=prompts.dir,
-        prompts_level="arm" if "prompts" in extra else "engine",
-        prompts_from=f"arm:{arm}" if "prompts" in extra else "",
-        harness_source=src,
-        cfg=exp.cfg if not configrepo.is_repo() else None,
+    raw_prompts = extra.get("prompts")
+    trial_prompts = (
+        evals.Prompts(Path(raw_prompts), paths.short_path(raw_prompts))
+        if isinstance(raw_prompts, str)
+        else evals.Prompts()
     )
-    run_id, held, since, waited = take_slot(exp, path, waiting, used, resolution=pin_res)
+    src = evals.Source(exp.repo, str(extra.get("context") or ""))
+    run_id, held, since, waited = take_slot(
+        exp, path, waiting, used, resolution=pin_res, arm=f"{exp.name}:{arm}",
+    )
     try:
         with record.failed_on_crash(run_id), pins.use(pin_res):
             if since:
                 run_lines.waited(run_id, "slot", since, util.iso())
-            seen = observed(exp, arm)
-            if changed := drift(exp, arm, seen):
-                record.settle(run_id, "stopped", summary=drift_reason(changed))
-                return drift_reason(changed)
             begun = {"event": "start", "task": task, "arm": arm, "repeat": repeat, "attempt": attempt,
-                     "run": run_id, "at": util.iso(), "seen": seen}
+                     "run": run_id, "at": util.iso(), "resolved_sha": pin_res.resolved_sha,
+                     "engine_sha": pin_res.engine_sha, "config_commit": pin_res.config_commit}
             append(path, begun)
             started = time.monotonic()
+            overrides = exp.frozen if pin_res.config_commit else trial_overrides(exp, arm)
             given = {"id": run_id, "repo": pin_res.repo or exp.repo, "dir": paths.RUNS_DIR / run_id,
                      "cfg": pin_res.cfg, "task": task,
-                     "trial": f"{arm}-{repeat}", "step_overrides": trial_overrides(exp, arm), "limits": exp.limits,
+                     "trial": f"{arm}-{repeat}", "step_overrides": overrides, "limits": exp.limits,
                      "pinned": pin_res.layer or exp.layer, "follow": exp.follow, "reviews": exp.reviews,
                      "checks_required": exp.checks_required, "before": replace(used, seconds=used.seconds + waited)}
             trial = exp.make_run(exp, arm, given) if exp.make_run else TrialRun(**given)
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
                 with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
-                    result = evals.run_task(pin_res.cfg, src, exp.tasks[task], prompts, run=trial)
-                seen = observed(exp, arm)
+                    result = evals.run_task(pin_res.cfg, src, exp.tasks[task], trial_prompts, run=trial)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
                 append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started,
-                                        outcomes=trial.outcomes()))
+                                        outcomes=trial.outcomes(), resolved_sha=pin_res.resolved_sha,
+                                        engine_sha=pin_res.engine_sha, config_commit=pin_res.config_commit))
                 raise
             failures = result.failures or ([result.why] if result.why else [])
-            changed = drift(exp, arm, seen)
+            changed = drift_after(run_id, pin_res)
             stopped_by = drift_reason(changed) if changed else trial.stopped_by or reached(
                 exp.limits, trial.used(), launching=False)
             record.settle(run_id, "stopped" if stopped_by else "done",
@@ -895,7 +1343,9 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                                      "hidden_check": result.hidden, "blocking_findings": result.blocking,
                                      **trial.outcomes(),
                                      **({"drift": changed} if changed else {}),
-                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}, seen=seen))
+                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})},
+                                    resolved_sha=pin_res.resolved_sha, engine_sha=pin_res.engine_sha,
+                                    config_commit=pin_res.config_commit))
             return stopped_by
     finally:
         held.close()
@@ -910,10 +1360,7 @@ def work(exp: Experiment, path: Path) -> int:
         try:
             if why := reached(exp.limits, used):
                 raise Capped(why)
-            seen = observed(exp, arm)
-            if changed := drift(exp, arm, seen):
-                raise Capped(drift_reason(changed))
-            why = run_trial(exp, path, task, arm, repeat, used, seen)
+            why = run_trial(exp, path, task, arm, repeat, used)
         except Capped as e:
             why = str(e)
         if why:
@@ -927,19 +1374,119 @@ def terminate(*_) -> None:
     raise pipeline.Stopped(record.STOPPED)
 
 
-def check_design(exp: Experiment, path: Path, found: list[dict]) -> None:
+def check_resume(exp: Experiment, path: Path, found: list[dict], *, prepare: bool = True) -> None:
     started = next((e for e in found if e.get("event") == "manifest"), None)
-    if started and started.get("digest") != exp.digest:
+    if started is None:
+        if prepare and not exp.arm_resolutions:
+            prepare_arms(exp)
+        return
+    rec_arms = started.get("arms") if isinstance(started.get("arms"), dict) else {}
+    rec_engine = str(started.get("engine_sha") or "")
+    rec_grader = started.get("grader") if isinstance(started.get("grader"), dict) else {}
+    if prepare:
+        reuse = {
+            arm: str(info["commit"])
+            for arm, info in rec_arms.items()
+            if isinstance(info, dict) and info.get("commit")
+        }
+        prepare_arms(exp, reuse_commits=reuse or None)
+    problems: list[str] = []
+
+    def add(item: str) -> None:
+        if item not in problems:
+            problems.append(item)
+
+    if rec_engine and exp.engine_sha and exp.engine_sha != rec_engine:
+        add("engine_sha")
+    if rec_grader and exp.grader_pins:
+        rec_gp = (rec_grader.get("prompt") or {}).get("sha256") if isinstance(rec_grader.get("prompt"), dict) else ""
+        cur_gp = (exp.grader_pins.get("prompt") or {}).get("sha256") if isinstance(exp.grader_pins.get("prompt"), dict) else ""
+        if (rec_gp and cur_gp and rec_gp != cur_gp) or (
+            rec_grader.get("settings_sha") and exp.grader_pins.get("settings_sha") != rec_grader.get("settings_sha")
+        ) or (
+            rec_grader.get("verify") is not None and exp.grader_pins.get("verify") != rec_grader.get("verify")
+        ):
+            add("grader")
+    for arm, info in rec_arms.items():
+        if not isinstance(info, dict):
+            continue
+        rec_sha = str(info.get("resolved_sha") or "")
+        cur_res = exp.arm_resolutions.get(arm)
+        if cur_res is None:
+            add(f"arms.{arm}")
+            continue
+        if rec_sha and cur_res.resolved_sha != rec_sha:
+            raw_old = blob_store.read(rec_sha)
+            if raw_old is not None:
+                try:
+                    old_doc = json.loads(raw_old)
+                except ValueError:
+                    old_doc = None
+            else:
+                old_doc = None
+            if isinstance(old_doc, dict):
+                for key in diff_resolved_docs(old_doc, json.loads(cur_res.resolved_bytes), map_grader=True):
+                    add(key)
+            else:
+                add(f"arms.{arm}")
+    if problems:
+        raise Refused(
+            f"cannot resume {paths.short_path(path)}: {', '.join(problems)} changed since the experiment started; "
+            "restore them or pass --out for a new file"
+        )
+    if started.get("digest") != exp.digest:
         raise Refused(f"the design changed since {paths.short_path(path)} was started; pass --out for a new file")
+
+
+def check_design(exp: Experiment, path: Path, found: list[dict]) -> None:
+    check_resume(exp, path, found, prepare=False)
+
+
+def _manifest_event(exp: Experiment) -> dict:
+    return {
+        "event": "manifest",
+        "digest": exp.digest,
+        "design": exp.design,
+        "engine": engine_commit(),
+        "engine_sha": exp.engine_sha,
+        "arms": {
+            arm: {
+                "ref": exp.arm_refs[arm],
+                "commit": exp.arm_commits[arm],
+                "base": exp.arm_bases.get(arm, ""),
+                "resolved_sha": exp.arm_resolutions[arm].resolved_sha,
+            }
+            for arm in exp.arms
+            if arm in exp.arm_resolutions
+        },
+        "grader": exp.grader_pins,
+    }
+
+
+def _persist_arm_blobs(exp: Experiment) -> None:
+    if not exp.arm_resolutions or not paths.DB_FILE.exists():
+        return
+    with blob_store.lock():
+        rows: list[tuple[str, str, int]] = []
+        for res in exp.arm_resolutions.values():
+            rows.extend(res.write_blobs())
+        if rows:
+            from ..store import db as foundation
+
+            with foundation.tx() as c:
+                if run_store.has_pins(c):
+                    for digest_sha, blob_kind, size in rows:
+                        blob_store.record_row(c, digest_sha, blob_kind, size)
 
 
 def drive(exp: Experiment, path: Path) -> int:
     found = events(path)
-    check_design(exp, path, found)
+    check_resume(exp, path, found, prepare=True)
+    _persist_arm_blobs(exp)
     if not any(e.get("event") == "manifest" for e in found):
-        append(path, {"event": "manifest", "digest": exp.digest, "design": exp.design, "engine": engine_commit()})
+        append(path, _manifest_event(exp))
     append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid(),
-                  "engine": engine_commit()})
+                  "engine": engine_commit(), "engine_sha": exp.engine_sha})
     settle_interrupted(exp, path)
     if exp.executors and any(e.get("usage_unknown") for e in events(path) if e.get("event") == "trial"):
         raise Refused("workflow usage is unresolved; reconcile retained receipts before authorizing a new output file")
@@ -956,14 +1503,21 @@ def drive(exp: Experiment, path: Path) -> int:
 
 def plan_lines(exp: Experiment, path: Path, label: str = "experiment") -> list[str]:
     found = events(path)
-    check_design(exp, path, found)
+    check_resume(exp, path, found, prepare=False)
     grader, accept = exp.design["grader"], exp.accept
     mode = "whole workflow" if exp.executors else f"atom {exp.atom}"
     out = [f"{label} {exp.name} (design {exp.digest}): {mode} on {exp.repo.name}",
            f"results file: {paths.short_path(path)}"]
     for name, s in exp.settings.items():
-        extra = "".join(f", {k} {paths.short_path(v) if k == 'prompts' else v[:12]}"
-                        for k, v in exp.extras.get(name, {}).items())
+        extra_parts = []
+        for k, v in exp.extras.get(name, {}).items():
+            if k == "prompts" and isinstance(v, str):
+                extra_parts.append(f", {k} {paths.short_path(v)}")
+            elif isinstance(v, str):
+                extra_parts.append(f", {k} {v[:12]}")
+            elif isinstance(v, dict):
+                extra_parts.append(f", {k} {','.join(sorted(v))}")
+        extra = "".join(extra_parts)
         out.append(f"arm {name}: runner {s.runner}, model {s.model}, effort {s.effort or 'default'}, "
                    f"tier {s.tier or 'none'}, timeout {s.timeout_minutes} minutes{extra}")
     out.append(f"grader (fixed): runner {grader['runner']}, model {grader['model']}, "
@@ -992,15 +1546,21 @@ def exclusive(repo_name: str, job) -> int:
         if not got:
             print(f"an experiment is already running for {repo_name}")
             return 0
-        earlier = signal.signal(signal.SIGTERM, terminate)
+        is_main = threading.current_thread() is threading.main_thread()
+        earlier = signal.signal(signal.SIGTERM, terminate) if is_main else None
         try:
             return job()
         finally:
-            signal.signal(signal.SIGTERM, earlier)
+            if is_main and earlier is not None:
+                signal.signal(signal.SIGTERM, earlier)
 
 
 def run(manifest: Path, out: str = "", dry: bool = False) -> int:
-    exp = load(manifest)
+    if not dry and manifest.is_file():
+        slug = commit_manifest(manifest)
+        exp = load_from_config(slug) if config_manifest_path(slug).is_file() else load(manifest)
+    else:
+        exp = load(manifest)
     path = paths.expand(out) if out else default_path(exp.name)
     if dry:
         return dry_run(exp, path)
@@ -1033,7 +1593,7 @@ def per_accepted(total: float | None, k: int) -> float | None:
 
 
 def arm_summary(arm: str, trials: list[dict], confidence: float) -> dict:
-    mine = [t for t in trials if t.get("arm") == arm]
+    mine = [t for t in trials if t.get("arm") == arm and t.get("status") != "drifted"]
     finished = {key_of(t): t for t in mine if t.get("status") == "done"}
     n, k = len(finished), sum(bool(t.get("accepted")) for t in finished.values())
     sums = {key: sum(t.get(key) or 0 for t in mine) for key in ("repairs", "calls", "tokens_in", "tokens_out",
@@ -1187,3 +1747,209 @@ def show(path: Path, as_json: bool) -> int:
     found = summary(path)
     print(json.dumps(found) if as_json else render(found))
     return 0
+
+
+def experiment_slug(raw: str) -> str:
+    slug = raw.strip().removeprefix("experiment:")
+    if not SLUG.fullmatch(slug):
+        raise Refused(f"invalid experiment id {raw!r}; expected slug matching {SLUG.pattern}")
+    return slug
+
+
+def _manifest_bytes_for(slug: str) -> bytes | None:
+    rel = f"experiments/{slug}.toml"
+    if configrepo.is_repo():
+        if raw := configrepo.live_bytes(rel):
+            return raw
+    candidate = paths.CONFIG_DIR / rel
+    return candidate.read_bytes() if candidate.is_file() else None
+
+
+def _optimize_trail_results(slug: str) -> dict | None:
+    trail = paths.STATE_DIR / "experiments" / slug / "trail.jsonl"
+    found = events(trail)
+    search_ev = next((e for e in reversed(found) if e.get("event") == "search"), None)
+    if search_ev is None:
+        return None
+    rounds_ev = [e for e in found if e.get("event") == "round"]
+    holdout_ev = next((e for e in reversed(found) if e.get("event") == "holdout"), None)
+    end_ev = next((e for e in reversed(found) if e.get("event") == "end"), None)
+    stop_ev = next((e for e in reversed(found) if e.get("event") == "stop"), None)
+    return {
+        "name": slug,
+        "mode": "optimize",
+        "digest": search_ev.get("digest", ""),
+        "rounds": rounds_ev,
+        "holdout": holdout_ev,
+        "end": end_ev,
+        "stopped": stop_ev,
+    }
+
+
+def experiment_view(raw_id: str) -> dict | None:
+    from ..store import config as config_store
+
+    try:
+        slug = experiment_slug(raw_id)
+    except Refused:
+        return None
+    raw = _manifest_bytes_for(slug)
+    if raw is None:
+        return None
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+
+    rel = f"experiments/{slug}.toml"
+    live_row = None
+    if paths.DB_FILE.exists() and config_store.available():
+        live_row = config_store.live_item("experiment", slug) or config_store.live_by_path(rel)
+    version = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 1
+
+    res_path = default_path(slug)
+    res_events = events(res_path)
+    manifest_ev = next((e for e in res_events if e.get("event") == "manifest"), None)
+    manifest_arms = manifest_ev.get("arms", {}) if isinstance(manifest_ev, dict) else {}
+
+    arms_list: list[dict] = []
+    if isinstance(parsed.get("arms"), dict):
+        for arm_name, arm_cfg in parsed["arms"].items():
+            ref = arm_ref_name(slug, arm_name)
+            m_info = manifest_arms.get(arm_name) if isinstance(manifest_arms, dict) else None
+            commit = configrepo.resolve_ref(ref) or (m_info.get("commit") if isinstance(m_info, dict) else "") or None
+            resolved_sha = (m_info.get("resolved_sha") if isinstance(m_info, dict) else None) or None
+            arms_list.append({
+                "name": str(arm_name),
+                "ref": ref,
+                "commit": commit,
+                "resolved_sha": resolved_sha,
+                "settings": dict(arm_cfg) if isinstance(arm_cfg, dict) else {},
+            })
+    elif isinstance(parsed.get("rounds"), list):
+        seen_names: set[str] = set()
+        arms_list.append({
+            "name": "baseline",
+            "ref": arm_ref_name(slug, "baseline"),
+            "commit": configrepo.resolve_ref(arm_ref_name(slug, "baseline")) or None,
+            "resolved_sha": None,
+            "settings": {},
+        })
+        seen_names.add("baseline")
+        for rnd in parsed["rounds"]:
+            cands = rnd.get("candidates") if isinstance(rnd, dict) else None
+            if not isinstance(cands, dict):
+                continue
+            for cname, cval in cands.items():
+                if cname in seen_names:
+                    continue
+                seen_names.add(cname)
+                ref = arm_ref_name(slug, str(cname))
+                arms_list.append({
+                    "name": str(cname),
+                    "ref": ref,
+                    "commit": configrepo.resolve_ref(ref) or None,
+                    "resolved_sha": None,
+                    "settings": dict(cval) if isinstance(cval, dict) else {},
+                })
+
+    results: dict | None = None
+    if manifest_ev is not None:
+        results = summary(res_path)
+    else:
+        results = _optimize_trail_results(slug)
+
+    return {
+        "id": f"experiment:{slug}",
+        "subject": f"experiment:{slug}",
+        "version": version,
+        "arms": arms_list,
+        "results": results,
+    }
+
+
+def experiment_views() -> list[dict]:
+    from .. import configitems
+
+    slugs: set[str] = set()
+    for item in configitems.listing("experiment"):
+        if name := str(item.get("name") or "").strip():
+            slugs.add(name)
+    exp_dir = paths.CONFIG_DIR / "experiments"
+    if exp_dir.is_dir():
+        for file in sorted(exp_dir.glob("*.toml")):
+            if file.is_file():
+                slugs.add(file.stem)
+    views: list[dict] = []
+    for slug in sorted(slugs):
+        if view := experiment_view(slug):
+            views.append(view)
+    return views
+
+
+def launch_async(
+    raw_id: str,
+    *,
+    mode: str = "",
+    run_args: dict | None = None,
+    actor: str = "",
+) -> tuple[str, object]:
+    import concurrent.futures
+
+    from . import optimize
+
+    slug = experiment_slug(raw_id)
+    raw = _manifest_bytes_for(slug)
+    if raw is None:
+        raise FileNotFoundError(f"No experiment {slug}")
+    parsed = tomllib.loads(raw.decode("utf-8"))
+    resolved_mode = mode or ("optimize" if "rounds" in parsed else "run")
+    args = dict(run_args or {})
+    out_arg = str(args.get("out") or "")
+
+    if resolved_mode == "optimize":
+        search = optimize.load_from_config(slug)
+        out_folder = optimize.folder_of(search, out_arg)
+        optimize.check_digest(search, out_folder / "trail.jsonl", events(out_folder / "trail.jsonl"))
+        repo_name = search.repo
+
+        def runner_job() -> int:
+            return exclusive(repo_name, lambda: optimize.climb(search, out_folder))
+    else:
+        exp = load_from_config(slug)
+        out_path = paths.expand(out_arg) if out_arg else default_path(slug)
+        check_resume(exp, out_path, events(out_path), prepare=True)
+        _persist_arm_blobs(exp)
+        repo_name = exp.repo.name
+
+        def runner_job() -> int:
+            return exclusive(repo_name, lambda: drive(exp, out_path))
+
+    run_id = record.start(
+        "experiment_run",
+        tag=slug,
+        repo=repo_name,
+        started_by=actor or None,
+        summary=f"experiment {resolved_mode} {slug}",
+    )
+    future: concurrent.futures.Future[int] = concurrent.futures.Future()
+
+    def _worker() -> None:
+        try:
+            code = runner_job()
+        except BaseException as exc:
+            record.settle(run_id, "failed", summary=util.first_line(str(exc), 200))
+            if not future.done():
+                future.set_exception(exc)
+            return
+        record.settle(
+            run_id,
+            "done" if code == 0 else "stopped",
+            summary=f"experiment {resolved_mode} {slug} exited {code}",
+        )
+        if not future.done():
+            future.set_result(code)
+
+    thread = threading.Thread(target=_worker, name=f"experiment-{slug}", daemon=True)
+    thread.start()
+    return run_id, future

@@ -548,6 +548,14 @@ def read(name, values, handler, *, conn=None):
         return {"drafts": [drafts.public(r) for r in rows]}
     if name == "draft.get":
         return {"draft": drafts.public(needed(drafts.get(values["draft"]), values["draft"]))}
+    if name == "experiment.list":
+        from .lab import experiment
+
+        return {"experiments": experiment.experiment_views()}
+    if name == "experiment.get":
+        from .lab import experiment
+
+        return {"experiment": needed(experiment.experiment_view(values["experiment"]), values["experiment"])}
     if name == "health.get":
         return {"health": board.health_board(include_held=False)}
     if name == "hook_event.list":
@@ -997,7 +1005,7 @@ _NON_ATOMIC_COMMANDS = frozenset((
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
     "config.draft", "config.check", "config.activate", "config.rollback", "config.try",
-    "config.ask", "config.promote", "draft.discard",
+    "config.ask", "config.promote", "draft.discard", "experiment.run",
     "project.create", "project.update", "project.restore",
     "line.create", "line.update", "line.restore", "line.delete",
     "view.create", "view.update", "view.restore",
@@ -1106,6 +1114,8 @@ def mutation(name, values, handler):
             why=values.get("why", ""),
             instruction=values.get("instruction", ""),
             model=values.get("model", ""),
+            evidence=values.get("evidence"),
+            diff=values.get("diff"),
             level=values.get("level"),
             run_check=values.get("check", True),
         )
@@ -1181,6 +1191,41 @@ def mutation(name, values, handler):
         result = {"item": item}
     elif name == "draft.discard":
         result = {"draft": drafts.public(drafts.discard(values["draft"], reason=values.get("reason")))}
+    elif name == "experiment.run":
+        from .lab import experiment
+
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        try:
+            slug = experiment.experiment_slug(values["experiment"])
+            run_id, future = experiment.launch_async(
+                slug,
+                mode=values.get("mode", ""),
+                run_args=values.get("args"),
+                actor=_config_actor(handler),
+            )
+        except FileNotFoundError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except experiment.Refused as error:
+            raise contract.Problem("validation", str(error)) from None
+        try:
+            code = future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+                handler.location = f"/api/v1/runs/{quote(run_id, safe='')}"
+            result = {
+                "accepted": True,
+                "run": run_object(runs.run_get(run_id)),
+                "experiment": f"experiment:{slug}",
+            }
+        except experiment.Refused as error:
+            raise contract.Problem("validation", str(error)) from None
+        else:
+            result = {
+                "experiment": needed(experiment.experiment_view(slug), slug),
+                "run": run_object(runs.run_get(run_id)),
+                "code": int(code),
+            }
     elif name in ("loop.enable", "loop.disable"):
         key = handler.headers.get("Idempotency-Key", "") if handler else ""
         control.switch(values["loop"], name == "loop.enable", idem=key)

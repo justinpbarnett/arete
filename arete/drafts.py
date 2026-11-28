@@ -441,7 +441,7 @@ def _match_evidence(raw: str, candidate_ids: set[str], out: set[str]) -> None:
             for rid in candidate_ids:
                 if rid in cites_text:
                     out.add(rid)
-        for key in ("trial_runs", "runs"):
+        for key in ("trial_runs", "runs", "trials"):
             vals = parsed.get(key)
             if isinstance(vals, list):
                 for item in vals:
@@ -784,6 +784,7 @@ def create_and_check(
     instruction: str = "",
     model: str = "",
     evidence: object = None,
+    diff: str | None = None,
     level: str | None = None,
     run_check: bool = True,
 ) -> tuple[dict, dict | None]:
@@ -800,7 +801,7 @@ def create_and_check(
     old_bytes = configrepo.live_bytes(rel, root) if configrepo.is_repo(root) else (
         (root / rel).read_bytes() if (root / rel).is_file() else None
     )
-    diff_text = _unified_diff(rel, old_bytes, body)
+    diff_text = diff if diff is not None else _unified_diff(rel, old_bytes, body)
     live_ver = _live_ver_for(kind, name, rel)
     base_str = str(live_ver if base_version is None else base_version)
     ev = evidence if evidence is not None else []
@@ -946,6 +947,25 @@ def _matches_base_version(base_version: str | int, live_ver: int, live_row: dict
     return live_row is not None and text in (live_row.get("version"), live_row.get("commit_sha"))
 
 
+def _arm_activation_spec(draft: dict, root: Path) -> tuple[str, str, list[str]] | None:
+    ev = draft.get("evidence")
+    if not isinstance(ev, dict) or not ev.get("arm_commit"):
+        return None
+    arm_commit = configrepo.resolve_ref(str(ev["arm_commit"]), root)
+    if not arm_commit:
+        raise contract.Problem("validation", f"Arm commit {ev['arm_commit']!r} is missing from the config repo.")
+    arm_base = str(ev.get("arm_base") or configrepo.parent_sha(arm_commit, root))
+    raw_files = ev.get("arm_files")
+    arm_files = (
+        [str(p) for p in raw_files if isinstance(p, str) and p]
+        if isinstance(raw_files, list) and raw_files
+        else configrepo.commit_changed_paths(arm_commit, root, base=arm_base)
+    )
+    if not arm_files:
+        raise contract.Problem("validation", f"Arm commit {arm_commit[:12]} changes no files.")
+    return arm_commit, arm_base, arm_files
+
+
 def _validate_base_and_check_for_activation(
     draft: dict,
     actor: str,
@@ -977,6 +997,59 @@ def _validate_base_and_check_for_activation(
             f"Config item {draft['kind']}/{draft['name']} is at version {live_ver}, not {base_version}.",
             current={"kind": draft["kind"], "name": draft["name"], "version": live_ver},
         )
+
+    arm_spec = _arm_activation_spec(draft, root)
+    if arm_spec is not None:
+        arm_commit, arm_base, arm_files = arm_spec
+        for arm_rel in arm_files:
+            live_blob = configrepo._live_blob(root, arm_rel)
+            base_blob = configrepo.blob_at(arm_base, arm_rel, root)
+            if live_blob != base_blob:
+                raise contract.Problem(
+                    "version_conflict",
+                    f"Config item {arm_rel} moved since arm {arm_commit[:12]} was cut.",
+                    current={"path": arm_rel, "live_blob": live_blob, "arm_base": arm_base},
+                )
+        if len(arm_files) > 1 or draft["kind"] == "experiment":
+            worst_gate = "B"
+            all_stages: list[dict] = []
+            for arm_rel in arm_files:
+                file_bytes = configrepo.commit_bytes(arm_commit, arm_rel, root)
+                if file_bytes is None:
+                    continue
+                f_kind, f_name = configrepo.classify_path(arm_rel)
+                if f_kind not in configkinds.REGISTRY:
+                    continue
+                old_f = configrepo.live_bytes(arm_rel, root) if configrepo.is_repo(root) else None
+                sub = configcheck.check(
+                    f_kind,
+                    f_name,
+                    arm_rel,
+                    file_bytes.decode("utf-8"),
+                    author=draft["author"],
+                    config_dir=root,
+                    old_bytes=old_f,
+                )
+                all_stages.extend(sub.get("stages", ()))
+                if not sub["ok"]:
+                    with foundation.tx() as c:
+                        _update_check_row(c, draft["numeric_id"], sub)
+                        if draft["state"] in ("draft", "valid"):
+                            move(c, draft["numeric_id"], draft["state"], "invalid", sync_inbox=False)
+                        _sync_inbox(c)
+                    problems = [p for st in sub["stages"] for p in st.get("problems", ())]
+                    raise contract.Problem("validation", "; ".join(problems) or f"Draft {draft['id']} failed configcheck.")
+                if configcheck.GATE_ORDER[sub["gate"]] > configcheck.GATE_ORDER[worst_gate]:
+                    worst_gate = sub["gate"]
+            report = {
+                "ok": True,
+                "gate": worst_gate,
+                "validator": configcheck.VALIDATOR,
+                "stages": all_stages,
+                "exposes": [],
+                "warnings": [],
+            }
+            return report, live_ver
 
     old_bytes = configrepo.live_bytes(rel, root) if configrepo.is_repo(root) else None
     report = configcheck.check(
@@ -1043,26 +1116,74 @@ def activate(
             raise PresenceRequired(refreshed, report)
 
         rel = draft["path"] or default_path(draft["kind"], draft["name"])
-        live_blob = configrepo._live_blob(root, rel)
-        body_bytes = draft["body"].encode("utf-8")
-        commit_sha = configrepo.commit(
-            {rel: body_bytes},
-            {rel: live_blob},
-            actor=actor,
-            source=source,
-            idem=idem,
-            note=draft["why"] or f"activate {draft['id']}",
-            draft_id=draft["id"],
-            activate_c=(gate == "C" and presence_passed),
-            fence=owned,
-            write_files=write_files,
-        )
+        arm_spec = _arm_activation_spec(draft, root)
+        if arm_spec is not None:
+            arm_commit, _, arm_files = arm_spec
+            changes = {arm_rel: configrepo.commit_bytes(arm_commit, arm_rel, root) for arm_rel in arm_files}
+            bases = {arm_rel: configrepo._live_blob(root, arm_rel) for arm_rel in arm_files}
+            commit_sha = configrepo.commit(
+                changes,
+                bases,
+                actor=actor,
+                source=source,
+                idem=idem,
+                note=draft["why"] or f"activate {draft['id']}",
+                draft_id=draft["id"],
+                activate_c=(gate == "C" and presence_passed),
+                fence=owned,
+                write_files=write_files,
+                merge_parent=arm_commit,
+            )
+        else:
+            live_blob = configrepo._live_blob(root, rel)
+            body_bytes = draft["body"].encode("utf-8")
+            commit_sha = configrepo.commit(
+                {rel: body_bytes},
+                {rel: live_blob},
+                actor=actor,
+                source=source,
+                idem=idem,
+                note=draft["why"] or f"activate {draft['id']}",
+                draft_id=draft["id"],
+                activate_c=(gate == "C" and presence_passed),
+                fence=owned,
+                write_files=write_files,
+            )
         # Ensure draft publication is finalized even on no-op or idempotent replay.
         with foundation.tx() as c, principals.acting(actor):
             finalize_activated_draft(c, draft["id"], commit_sha)
         new_ver = _live_ver_for(draft["kind"], draft["name"], rel)
         updated = get(draft["numeric_id"])
     return {"draft": public(updated), "commit": commit_sha, "version": new_ver}
+
+
+def _find_merge_draft_for_rollback(kind: str, name: str, to: str | int, root: Path) -> tuple[dict, str] | None:
+    candidates = list_drafts(state="active", kind=kind, name=name, limit=5)
+    to_text = str(to).strip()
+    for draft in candidates:
+        act_sha = str(draft.get("activated_commit") or "")
+        if not act_sha:
+            continue
+        parents = configrepo.parents_of(act_sha, root)
+        if len(parents) < 2:
+            continue
+        first_parent = parents[0]
+        if to_text in (first_parent, "0", "absent", str(draft.get("base_version") or "").strip()):
+            return draft, first_parent
+        rel = draft["path"] or default_path(kind, name)
+        lookup_kind = "step_settings" if kind == "attention" else kind
+        row = config_store.by_selector(lookup_kind, name, to_text)
+        if row is not None and row.get("commit_sha") == first_parent:
+            return draft, first_parent
+        hist = configrepo.version_history(lookup_kind, name, rel)
+        for entry in hist:
+            if entry["commit_sha"] == first_parent and to_text in (
+                str(entry.get("version")),
+                str(entry.get("content_version") or ""),
+                first_parent,
+            ):
+                return draft, first_parent
+    return None
 
 
 def rollback(
@@ -1078,7 +1199,109 @@ def rollback(
 ) -> dict:
     if actor.startswith("run:"):
         raise contract.Problem("gate_refused", f"Actor {actor!r} cannot roll back config.")
+    root = paths.CONFIG_DIR.resolve()
+    merge_target = _find_merge_draft_for_rollback(kind, name, to, root) if configrepo.is_repo(root) else None
+    if merge_target is not None:
+        active_draft, first_parent = merge_target
+        rel = active_draft["path"] or default_path(kind, name)
+        lookup_kind = "step_settings" if kind == "attention" else kind
+        with configrepo.writer_lock(fence) as owned:
+            configrepo.ensure_repo(fence=owned)
+            configrepo.reconcile(fence=owned)
+            live_row = config_store.live_item(lookup_kind, name) or config_store.live_by_path(rel)
+            live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+            if not _matches_base_version(base_version, live_ver, live_row):
+                raise contract.Problem(
+                    "version_conflict",
+                    f"Config item {kind}/{name} is at version {live_ver}, not {base_version}.",
+                    current={"kind": kind, "name": name, "version": live_ver},
+                )
+            act_sha = active_draft["activated_commit"]
+            touched = configrepo.commit_changed_paths(act_sha, root, base=first_parent)
+            if not touched:
+                raise contract.Problem("validation", f"Merge commit {act_sha[:12]} changed no files to revert.")
+            changes = {t_rel: configrepo.commit_bytes(first_parent, t_rel, root) for t_rel in touched}
+            bases = {t_rel: configrepo._live_blob(root, t_rel) for t_rel in touched}
+            revert_diff = configrepo.commit_diff(act_sha, first_parent, root)
+            first_body = changes.get(rel)
+            draft_num = add(
+                kind=kind,
+                name=name,
+                origin=configrepo.origin_of(rel),
+                path=rel,
+                base_version=str(base_version),
+                body=first_body.decode("utf-8") if isinstance(first_body, bytes) else "",
+                diff=revert_diff,
+                author=actor,
+                why=f"rollback to {to}",
+                gate="B",
+                state="valid",
+            )
+            revert_id = format_id(draft_num)
+            commit_sha = configrepo.commit(
+                changes,
+                bases,
+                actor=actor,
+                source="revert",
+                idem=idem,
+                note=f"rollback {kind}/{name} to {to}",
+                draft_id=revert_id,
+                activate_c=presence_passed,
+                fence=owned,
+            )
+            with foundation.tx() as c, principals.acting(actor):
+                finalize_activated_draft(c, revert_id, commit_sha)
+            new_ver = _live_ver_for(kind, name, rel)
+            updated = get(draft_num)
+        return {"draft": public(updated), "commit": commit_sha, "version": new_ver}
+
     found = configitems.item(kind, name)
+    if str(to).strip() in ("0", "absent"):
+        rel = found["path"]
+        with configrepo.writer_lock(fence) as owned:
+            configrepo.ensure_repo(fence=owned)
+            configrepo.reconcile(fence=owned)
+            lookup_kind = "step_settings" if kind == "attention" else kind
+            live_row = config_store.live_item(lookup_kind, name) or config_store.live_by_path(rel)
+            live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+            if not _matches_base_version(base_version, live_ver, live_row):
+                raise contract.Problem(
+                    "version_conflict",
+                    f"Config item {kind}/{name} is at version {live_ver}, not {base_version}.",
+                    current={"kind": kind, "name": name, "version": live_ver},
+                )
+            live_blob = configrepo._live_blob(root, rel)
+            draft_num = add(
+                kind=kind,
+                name=name,
+                origin=configrepo.origin_of(rel),
+                path=rel,
+                base_version=str(base_version),
+                body="",
+                diff="",
+                author=actor,
+                why=f"rollback to {to}",
+                gate="B",
+                state="valid",
+            )
+            revert_id = format_id(draft_num)
+            commit_sha = configrepo.commit(
+                {rel: None},
+                {rel: live_blob},
+                actor=actor,
+                source="revert",
+                idem=idem,
+                note=f"rollback {kind}/{name} to {to}",
+                draft_id=revert_id,
+                activate_c=presence_passed,
+                fence=owned,
+            )
+            with foundation.tx() as c, principals.acting(actor):
+                finalize_activated_draft(c, revert_id, commit_sha)
+            new_ver = _live_ver_for(kind, name, rel)
+            updated = get(draft_num)
+        return {"draft": public(updated), "commit": commit_sha, "version": new_ver}
+
     target = configitems.read(found, version=str(to))
     content = target["content"]
     if not isinstance(content, str):

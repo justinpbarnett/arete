@@ -163,6 +163,9 @@ def _is_reach_change(kind: str, dotted: str, old_val: object, new_val: object) -
         return False
     if _contains_secret_ref(new_val) or _contains_secret_ref(old_val):
         return True
+    # Experiment manifests run isolated non-delivering trials; promotion checks the target config files.
+    if kind == "experiment":
+        return False
     # `[models]` maps step/role names (including `review`) to model aliases — not reach keys.
     if kind == "step_settings" and parts[0] == "models":
         return False

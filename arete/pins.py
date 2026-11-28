@@ -233,6 +233,7 @@ def identify_schema(schema_obj: dict, fallback_name: str = "output") -> tuple[st
 def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str, prompts_from: str,
                   *, repo_root: Path | None = None, config_dir: Path | None = None,
                   config_commit: str = "", arm: dict | None = None,
+                  arm_changed: set[str] | None = None,
                   draft_id: str = "") -> tuple[dict[str, str], dict[str, dict]]:
     texts: dict[str, str] = {}
     meta: dict[str, dict] = {}
@@ -264,10 +265,11 @@ def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str,
             except (OSError, UnicodeDecodeError):
                 continue
             sha = hashlib.sha256(raw).hexdigest()
+            is_arm = bool(arm_changed and f"prompts/{file.name}" in arm_changed)
             texts[file.stem] = text
             meta[file.stem] = {
                 "id": f"prompt/{file.stem}@{sha[:12]}",
-                "level": "config",
+                "level": "arm" if is_arm else "config",
                 "from": f"prompts/{file.name}@{config_commit}" if config_commit else f"prompts/{file.name}",
                 "sha256": sha,
             }
@@ -338,7 +340,8 @@ def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str,
 
 
 def _load_schemas(engine_sha: str, *, config_dir: Path | None = None, config_commit: str = "",
-                  arm: dict | None = None, draft_id: str = "") -> tuple[dict[str, dict], dict[str, dict]]:
+                  arm: dict | None = None, arm_changed: set[str] | None = None,
+                  draft_id: str = "") -> tuple[dict[str, dict], dict[str, dict]]:
     objects: dict[str, dict] = {}
     meta: dict[str, dict] = {}
     engine_file_names: set[str] = set()
@@ -368,10 +371,11 @@ def _load_schemas(engine_sha: str, *, config_dir: Path | None = None, config_com
             if not isinstance(parsed, dict):
                 continue
             ssha = hashlib.sha256(raw).hexdigest()
+            is_arm = bool(arm_changed and f"schemas/{file.name}" in arm_changed)
             objects[file.stem] = parsed
             meta[file.stem] = {
                 "id": schema_id(file.stem, ssha),
-                "level": "config",
+                "level": "arm" if is_arm else "config",
                 "from": f"schemas/{file.name}@{config_commit}" if config_commit else f"schemas/{file.name}",
                 "sha256": ssha,
             }
@@ -516,8 +520,33 @@ def pin_config(*, cfg: config.Config | None = None, config_commit: str | None = 
     return "", pinned_dir, pinned_cfg
 
 
+def _collect_config_toml_dir(config_dir: Path, subdir: str, *, config_commit: str = "",
+                             arm_changed: set[str] | None = None) -> dict[str, dict]:
+    folder = config_dir / subdir
+    if not folder.is_dir():
+        return {}
+    out: dict[str, dict] = {}
+    for file in sorted(folder.glob("*.toml")):
+        if not file.is_file():
+            continue
+        try:
+            raw = file.read_bytes()
+        except OSError:
+            continue
+        sha = hashlib.sha256(raw).hexdigest()
+        rel = f"{subdir}/{file.name}"
+        is_arm = bool(arm_changed and rel in arm_changed)
+        out[file.stem] = {
+            "id": f"{subdir[:-1]}/{file.stem}@{sha[:12]}",
+            "level": "arm" if is_arm else "config",
+            "from": f"{rel}@{config_commit}" if config_commit else rel,
+            "sha256": sha,
+        }
+    return out
+
+
 def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.RepoLayer | Path | None = None,
-            overrides: dict[str, dict] | None = None, arm: dict | None = None,
+            overrides: dict[str, dict] | None = None, arm: str | dict | None = None,
             task_kind: str = "", prompts_dir: Path | None = None, prompts_level: str = "",
             prompts_from: str = "", ab_ticket: tuple[str, str] | None = None,
             ab_held: dict[str, tuple[str, str, dict]] | None = None,
@@ -529,6 +558,28 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
     engine_sha = codebase.STAMP if engine_sha is None else engine_sha
     schema_version = foundation.LATEST
     live_root = paths.CONFIG_DIR.resolve()
+    arm_ref = ""
+    arm_commit = ""
+    arm_changed: set[str] = set()
+    arm_dict: dict | None = None
+    if isinstance(arm, str) and arm.strip():
+        arm_ref = arm.strip()
+        arm_commit = configrepo.resolve_ref(arm_ref)
+        if not arm_commit:
+            raise ValueError(f"arm ref {arm_ref!r} does not resolve in config repo")
+        if config_commit is None:
+            config_commit = arm_commit
+        arm_changed = set(configrepo.commit_changed_paths(arm_commit))
+    elif isinstance(arm, dict) and arm:
+        arm_dict = arm
+        if raw_ref := str(arm.get("ref") or arm.get("commit") or "").strip():
+            arm_ref = raw_ref
+            arm_commit = configrepo.resolve_ref(arm_ref)
+            if arm_commit:
+                if config_commit is None:
+                    config_commit = arm_commit
+                arm_changed = set(configrepo.commit_changed_paths(arm_commit))
+
     config_commit, config_dir, pinned_cfg = pin_config(cfg=cfg, config_commit=config_commit, config_dir=config_dir)
 
     resolved_repo: config.Repo | None = None
@@ -566,15 +617,17 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
     arm_name = ""
     arm_atom = ""
     arm_step_settings: dict[str, dict] = {}
-    if isinstance(arm, dict) and arm:
-        arm_name = str(arm.get("name") or "arm")
-        arm_atom = str(arm.get("atom") or "")
-        if isinstance(arm.get("frozen"), dict):
-            for k, v in arm["frozen"].items():
+    if arm_ref and not arm_dict:
+        arm_name = arm_ref.rsplit("/", 1)[-1]
+    elif arm_dict:
+        arm_name = str(arm_dict.get("name") or (arm_ref.rsplit("/", 1)[-1] if arm_ref else "arm"))
+        arm_atom = str(arm_dict.get("atom") or "")
+        if isinstance(arm_dict.get("frozen"), dict):
+            for k, v in arm_dict["frozen"].items():
                 if isinstance(v, dict):
                     arm_step_settings[config.STEP_ALIASES.get(k, k)] = dict(v)
-        if arm_atom and isinstance(arm.get("settings"), dict):
-            arm_step_settings[config.STEP_ALIASES.get(arm_atom, arm_atom)] = dict(arm["settings"])
+        if arm_atom and isinstance(arm_dict.get("settings"), dict):
+            arm_step_settings[config.STEP_ALIASES.get(arm_atom, arm_atom)] = dict(arm_dict["settings"])
 
     step_overrides = {config.STEP_ALIASES.get(k, k): dict(v) for k, v in (overrides or {}).items() if isinstance(v, dict)}
     held_map: dict[str, tuple[str, str, dict]] = dict(ab_held or {})
@@ -614,7 +667,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
     prompt_texts, prompts_meta = _load_prompts(
         engine_sha, prompts_dir, prompts_level, prompts_from,
         repo_root=repo_root, config_dir=config_dir, config_commit=config_commit,
-        arm=arm, draft_id=draft_id,
+        arm=arm_dict, arm_changed=arm_changed, draft_id=draft_id,
     )
 
     prompt_appends: dict[str, tuple[prompts.LayerAppend, ...]] = {}
@@ -629,7 +682,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
 
     schema_objects, schemas_meta = _load_schemas(
         engine_sha, config_dir=config_dir, config_commit=config_commit,
-        arm=arm, draft_id=draft_id,
+        arm=arm_dict, arm_changed=arm_changed, draft_id=draft_id,
     )
 
     blobs_out: dict[str, tuple[str, bytes]] = {}
@@ -654,15 +707,19 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
     resolved_adw, resolved_adw_version, resolved_adw_rule = _adw_fields(
         adw_name or adw_path, adw_version, adw_rule, engine_sha, config_dir,
     )
+    adws_meta = _collect_config_toml_dir(config_dir, "adws", config_commit=config_commit, arm_changed=arm_changed)
+    routes_meta = _collect_config_toml_dir(config_dir, "routes", config_commit=config_commit, arm_changed=arm_changed)
     loop_files = _collect_loop_files(pinned_cfg, loop_name, config_dir, repo_root)
     harness_meta = _collect_harness(resolved_repo, resolved_layer, harness_source, blobs_out)
 
     arm_summary = None
-    if arm:
+    if arm_ref or arm_dict:
         arm_summary = {
             "name": arm_name,
+            **({"ref": arm_ref} if arm_ref else {}),
+            **({"commit": arm_commit} if arm_commit else {}),
             **({"atom": arm_atom} if arm_atom else {}),
-            **({"settings": arm.get("settings")} if isinstance(arm.get("settings"), dict) else {}),
+            **({"settings": arm_dict.get("settings")} if arm_dict and isinstance(arm_dict.get("settings"), dict) else {}),
         }
 
     pinned_line = (
@@ -680,6 +737,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         "adw": resolved_adw,
         "adw_rule": resolved_adw_rule,
         "adw_version": resolved_adw_version,
+        **({"adws": adws_meta} if adws_meta else {}),
         "arm": arm_summary,
         "config_commit": config_commit,
         "engine_sha": engine_sha,
@@ -697,6 +755,7 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         "prompt_appends": {
             k: [a.as_row() for a in v] for k, v in sorted(prompt_appends.items())
         },
+        **({"routes": routes_meta} if routes_meta else {}),
         "schema_version": schema_version,
         "schemas": schemas_meta,
         "settings": settings_prov,

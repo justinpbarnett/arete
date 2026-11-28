@@ -623,12 +623,12 @@ def render_engine(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) ->
     if not NAME_RE.fullmatch(name):
         raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
     is_engine_dir = prompts_dir.resolve() == paths.PROMPTS_DIR.resolve()
-    if not is_engine_dir and (pin := pins.current()) is not None and name in pin.prompt_texts:
+    if (pin := pins.current()) is not None and name in pin.prompt_texts:
         raw_text = pin.prompt_texts[name]
         meta = pin.prompts.get(name, {})
         sha = str(meta.get("sha256") or hashlib.sha256(raw_text.encode("utf-8")).hexdigest())
         version = str(meta.get("id") or f"prompt/{name}@{sha[:12]}")
-        level = str(meta.get("level") or "run")
+        level = str(meta.get("level") or ("engine" if is_engine_dir else "run"))
     else:
         cached = prompt_loader.TEMPLATES.get(prompts_dir.absolute(), {}).get(name)
         if cached is not None:
@@ -693,6 +693,24 @@ def fill_override_front_matter(name: str, body_text: str) -> str:
         "---\n"
     )
     return fm + body_text
+
+
+def ensure_override_front_matter(name: str, body_text: str) -> str:
+    """Return body_text with config-override front matter, upgrading engine front matter when needed."""
+    if not has_front_matter(body_text):
+        return fill_override_front_matter(name, body_text)
+    if not NAME_RE.fullmatch(name):
+        return body_text
+    engine_file = paths.PROMPTS_DIR / f"{name}.md"
+    if not engine_file.is_file():
+        return body_text
+    try:
+        meta, parsed_body = parse(body_text)
+    except ValueError:
+        return body_text
+    if meta.get("overrides") == f"arete/prompts/{name}.md" and normalize_base_sha(meta.get("base")) is not None:
+        return body_text
+    return fill_override_front_matter(name, parsed_body)
 
 
 def rebase_override_base(raw_text: str, new_engine_sha: str) -> str:

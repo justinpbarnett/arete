@@ -51,16 +51,70 @@ def retrieval_errors() -> tuple[type[BaseException], ...]:
 
 @refusing(experiment_errors)
 def experiment_run(args) -> int:
+    from urllib.parse import quote
+
+    from .. import client
     from ..lab import experiment
 
-    return experiment.run(paths.expand(args.manifest), args.out, args.dry_run)
+    target = paths.expand(args.manifest)
+    if args.dry_run:
+        if target.is_file():
+            return experiment.run(target, args.out, True)
+        exp = experiment.load_from_config(experiment.experiment_slug(args.manifest))
+        path = paths.expand(args.out) if args.out else experiment.default_path(exp.name)
+        return experiment.dry_run(exp, path)
+    if target.is_file():
+        slug = experiment.commit_manifest(target)
+    else:
+        slug = experiment.experiment_slug(args.manifest)
+    body: dict[str, object] = {"mode": "run"}
+    if args.out:
+        body["args"] = {"out": args.out}
+    try:
+        answer = client.call("POST", f"/api/v1/experiments/{quote(slug, safe='')}/run", body)
+    except client.Down:
+        if target.is_file():
+            return experiment.run(target, args.out, False)
+        exp = experiment.load_from_config(slug)
+        path = paths.expand(args.out) if args.out else experiment.default_path(exp.name)
+        return experiment.exclusive(exp.repo.name, lambda: experiment.drive(exp, path))
+    client.emit({k: v for k, v in answer.items() if k != "seq"})
+    return int(answer.get("code") or 0)
 
 
 @refusing(experiment_errors)
 def experiment_optimize(args) -> int:
-    from ..lab import optimize
+    from urllib.parse import quote
 
-    return optimize.run(paths.expand(args.plan), args.out, args.dry_run)
+    from .. import client
+    from ..lab import experiment, optimize
+
+    target = paths.expand(args.plan)
+    if args.dry_run:
+        if target.is_file():
+            return optimize.run(target, args.out, True)
+        search = optimize.load_from_config(experiment.experiment_slug(args.plan))
+        folder = optimize.folder_of(search, args.out)
+        optimize.check_digest(search, folder / "trail.jsonl", experiment.events(folder / "trail.jsonl"))
+        return optimize.dry_run(search, folder)
+    if target.is_file():
+        slug = experiment.commit_manifest(target)
+    else:
+        slug = experiment.experiment_slug(args.plan)
+    body: dict[str, object] = {"mode": "optimize"}
+    if args.out:
+        body["args"] = {"out": args.out}
+    try:
+        answer = client.call("POST", f"/api/v1/experiments/{quote(slug, safe='')}/run", body)
+    except client.Down:
+        if target.is_file():
+            return optimize.run(target, args.out, False)
+        search = optimize.load_from_config(slug)
+        folder = optimize.folder_of(search, args.out)
+        optimize.check_digest(search, folder / "trail.jsonl", experiment.events(folder / "trail.jsonl"))
+        return experiment.exclusive(search.repo, lambda: optimize.climb(search, folder))
+    client.emit({k: v for k, v in answer.items() if k != "seq"})
+    return int(answer.get("code") or 0)
 
 
 @refusing(experiment_errors)

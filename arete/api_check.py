@@ -442,10 +442,11 @@ class Check:
 
     def shapes(self):
         from . import (
-            agent, cohorts, config, contract, control, dashboard, devices, heartbeat, leases, oncall, outbox, paths,
-            pipeline, principals, private_evidence, record, replay, research, secretstore, triage,
+            agent, cohorts, config, configrepo, contract, control, dashboard, devices, heartbeat, leases, oncall,
+            outbox, paths, pipeline, principals, private_evidence, record, replay, research, secretstore, triage,
         )
         from . import tasks as tasks_mod
+        from .lab import experiment as experiment_mod
         from .sighting import Sighting
         from .store import blobs, chats, db, incidents, insights, push, runs, tokens
         from .store import evidence as evidence_store
@@ -519,6 +520,37 @@ class Check:
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
         sample_cfg = config.load()
         sample_repo = sample_cfg.repo(replay.SAMPLE_REPO)
+        _, exp_base = configrepo.read("experiments/sample.toml")
+        configrepo.commit(
+            {
+                "experiments/sample.toml": (
+                    'name = "sample"\n'
+                    f'repo = "{sample_repo.name}"\n'
+                    'atom = "build"\n'
+                    'repeats = 1\n'
+                    'vary = ["settings.build.effort"]\n\n'
+                    '[arms.baseline]\n\n'
+                    '[arms.cheap]\n'
+                    'effort = "low"\n\n'
+                    '[tasks.word-train]\n'
+                    'base = "HEAD"\n'
+                    'split = "train"\n\n'
+                    '[accept]\n'
+                    'baseline = "baseline"\n'
+                    'split = "train"\n'
+                    'min_pairs = 6\n\n'
+                    '[limits]\n'
+                    'spend_usd = 5\n'
+                    'minutes = 10\n'
+                    'calls = 50\n'
+                    'tokens = 500000\n'
+                )
+            },
+            {"experiments/sample.toml": exp_base},
+            actor="hand",
+            source="hand",
+            note="fixture sample experiment",
+        )
         send_src = triage.GitHubSource(sample_repo.github or f"owner/{sample_repo.name}", [sample_repo])
         send_ticket = triage.Candidate(f"{sample_repo.name}#9", "9", "Fixture send ticket", "https://example.invalid/9", "old")
         triage_store.triage_put({
@@ -750,6 +782,16 @@ class Check:
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 elif name == "incident.scan":
                     with patch.object(oncall, "scan", return_value={"seen": 0}):
+                        headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                elif name == "experiment.run":
+                    import concurrent.futures
+
+                    def _stub_launch(raw_id, **_kw):
+                        fut: concurrent.futures.Future[int] = concurrent.futures.Future()
+                        fut.set_result(0)
+                        return self.run, fut
+
+                    with patch.object(experiment_mod, "launch_async", side_effect=_stub_launch):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
                 else:
                     headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])

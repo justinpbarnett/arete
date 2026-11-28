@@ -114,6 +114,14 @@ def reload(count: int) -> None:
     os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
 
+def current_stamp() -> str:
+    head, dirty = head_and_dirt()
+    digest, _ = inventory()
+    if head:
+        return head + (f"+dirty.{digest[:8]}" if dirty else "")
+    return f"code.{digest[:12]}"
+
+
 def load(*, templates: bool = False) -> str:
     global RELEASE, STAMP
     if STAMP:

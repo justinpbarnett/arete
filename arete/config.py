@@ -745,10 +745,10 @@ def step_tables(data, where: str, ignored: list[str] | None = None, *,
 def ab_tables(data, where: str = "ab", *, problems: list[Problem] | None = None, path: str = "",
               scope: str = "") -> dict[str, dict]:
     found = {}
-    shape = configschema.schema("experiment")
-    step_names = configschema.enum("experiment", "properties", "step")
-    kinds = configschema.enum("experiment", "properties", "kind")[1:]
-    arm_shape = configschema.schema("experiment", "properties", "arm")
+    shape = configschema.schema("experiment", "$defs", "ab")
+    step_names = configschema.enum("experiment", "$defs", "ab", "properties", "step")
+    kinds = configschema.enum("experiment", "$defs", "ab", "properties", "kind")[1:]
+    arm_shape = configschema.schema("experiment", "$defs", "ab", "properties", "arm")
     for name, raw in table_of(data, where).items():
         label = f"[{where}.{name}]"
         raw = table_of(raw, f"{where}.{name}")
