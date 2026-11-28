@@ -420,7 +420,7 @@ def compare(old, new):
     old_kinds, new_kinds = _config_kinds_enum(old["operations"]), _config_kinds_enum(new["operations"])
     additive_config_kinds = bool(old_kinds and new_kinds and set(old_kinds) <= set(new_kinds))
     retires_repo_limit = (
-        old.get("minor", 0) < 29 <= new.get("minor", 0)
+        old.get("minor", 0) < 30 <= new.get("minor", 0)
         and "line.create" in new["operations"]
     )
     old_roles, new_roles = _roles_enum(old["operations"]), _roles_enum(new["operations"])

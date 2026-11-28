@@ -13,7 +13,7 @@ from urllib.parse import quote, unquote
 from . import (
     api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo, contract, control,
     credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals, secretstore, settings,
-    tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
+    stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
 )
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -353,6 +353,7 @@ def event_timestamp(value, field):
 
 
 def execute(name, values, handler=None):
+    api_http.set_etag_context(None)
     prepare(name, values)
     if name == "batch.run" and handler is not None:
         for request in values["requests"]:
@@ -369,12 +370,23 @@ def execute(name, values, handler=None):
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
         if name == "batch.run":
-            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler)} for r in reads]
+            results = [{"seq": seq, **read(r["operation"], r.get("input", {}), handler, conn=conn)} for r in reads]
             return {"seq": seq, "results": results}
-        return {"seq": seq, **read(name, values, handler)}
+        payload, validator = read_with_validator(name, values, handler, conn=conn)
+        if validator is not None and handler is not None:
+            api_http.set_etag_context((seq, validator))
+        return {"seq": seq, **payload}
 
 
-def read(name, values, handler):
+def read_with_validator(name, values, handler, *, conn=None):
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)
+    if name.startswith("config."):
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)
+    return read(name, values, handler, conn=conn), None
+
+
+def read(name, values, handler, *, conn=None):
     if name == "factory.get":
         from .store import factory
         return {"factory": factory.view()}
@@ -522,8 +534,10 @@ def read(name, values, handler):
             "data": encoded,
             "encoding": encoding,
         }}
+    if name == "adw.stats":
+        return read_adw_stats(values["name"], conn=conn)[0]
     if name.startswith("config."):
-        return read_config(name.removeprefix("config."), values)
+        return read_config_with_validator(name.removeprefix("config."), values, conn=conn)[0]
     if name == "draft.list":
         rows = drafts.list_drafts(
             state=values.get("state"),
@@ -720,23 +734,69 @@ def read(name, values, handler):
     return {resource: serialize(row, contract.RESOURCE[resource])}
 
 
-def read_config(verb, values):
+def _config_validator_parts(item: dict[str, object]) -> dict[str, object]:
+    content = item.get("content")
+    raw = content.encode("utf-8") if isinstance(content, str) else api_http.json_bytes(content)
+    return {
+        "kind": item.get("kind"),
+        "name": item.get("name"),
+        "path": item.get("path"),
+        "version": item.get("version"),
+        "content_version": item.get("content_version"),
+        "level": item.get("level"),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def read_adw_stats(name: str, *, conn=None) -> tuple[dict[str, object], str]:
+    if conn is None:
+        with foundation.one_read() as read_conn:
+            return read_adw_stats(name, conn=read_conn)
+    found = configitems.item("adw", name, conn=conn)
+    item = configitems.read(found, conn=conn)
+    usage, rev = stats.adw_stats_snapshot(conn, name)
+    return usage, stats.validator_token(_config_validator_parts(item), rev)
+
+
+def read_config_with_validator(verb, values, *, conn=None):
     if verb == "kinds":
-        return {"kinds": configitems.kinds()}
+        return {"kinds": configitems.kinds()}, None
     kind = values["kind"]
     if verb == "list":
-        return {"items": configitems.listing(kind)}
-    found = configitems.item(kind, values["name"], level=values.get("level"))
+        return {"items": configitems.listing(kind, conn=conn)}, None
+    if conn is None and verb == "read" and kind in ("prompt", "adw"):
+        with foundation.one_read() as read_conn:
+            return read_config_with_validator(verb, values, conn=read_conn)
+    found = configitems.item(kind, values["name"], level=values.get("level"), conn=conn)
     if verb == "read":
-        return {"item": configitems.read(found, version=values.get("version"), level=values.get("level"),
-                                         from_ref=values.get("from"), file=values.get("file"))}
+        item = configitems.read(found, version=values.get("version"), level=values.get("level"),
+                                from_ref=values.get("from"), file=values.get("file"), conn=conn)
+        if kind == "prompt":
+            usage, rev = stats.prompt_stats_snapshot(conn, values["name"])
+            enriched = {**item, **usage}
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        if kind == "adw":
+            adw_usage, rev = stats.adw_stats_snapshot(conn, values["name"])
+            enriched = {
+                **item,
+                "runs7d": adw_usage["runs"],
+                "passRate": adw_usage["passRate"],
+                "costPerRunNusd": adw_usage["costPerRunNusd"],
+                "costPerRun": adw_usage["costPerRun"],
+            }
+            return {"item": enriched}, stats.validator_token(_config_validator_parts(enriched), rev)
+        return {"item": item}, None
     if verb == "versions":
-        shas, entries = configitems.versions(found)
-        return {"versions": shas, "entries": entries}
-    diff = configitems.diff(found, values.get("from"), values.get("to"))
+        shas, entries = configitems.versions(found, conn=conn)
+        return {"versions": shas, "entries": entries}, None
+    diff = configitems.diff(found, values.get("from"), values.get("to"), conn=conn)
     if diff is None:
         raise contract.Problem("unavailable", "No config Git diff is available")
-    return {"diff": diff}
+    return {"diff": diff}, None
+
+
+def read_config(verb, values):
+    return read_config_with_validator(verb, values)[0]
 
 
 def _resolve_activate_draft_id(values: dict) -> str:
@@ -833,6 +893,7 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
 
 
 def dispatch(handler, op, path_values, query):
+    api_http.set_etag_context(None)
     name, method = op["name"], op["method"]
     identity = {k: unquote(v) for k, v in path_values.items()}
     coerced_query = dict(query)

@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 29
+MINOR = 30
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -635,10 +635,27 @@ CONFIG_ITEM_RICH = {
     "base": NULL_TEXT,
     "drift": BOOLEAN,
     "appends": array(CONFIG_PROMPT_APPEND),
+    "runs7d": INTEGER,
+    "passRate": NULL_INT,
+    "costPerRunNusd": NULL_INT,
+    "costPerRun": NULL_NUM,
 }
 CONFIG_ITEM_SCHEMA = obj(CONFIG_ITEM_RICH, ["kind", "name", "path"])
 CONFIG_READ_ITEM_SCHEMA = obj({**CONFIG_ITEM_RICH, "content": {"type": ["string", "object"]}},
                               ["kind", "name", "path", "content"])
+NODE_STATS = obj({
+    "runs": INTEGER,
+    "passRate": NULL_INT,
+    "medianSeconds": NULL_NUM,
+})
+ADW_STATS_FIELDS = {
+    "runs": INTEGER,
+    "passRate": NULL_INT,
+    "medianSeconds": NULL_NUM,
+    "costPerRunNusd": NULL_INT,
+    "costPerRun": NULL_NUM,
+    "nodes": mapping(NODE_STATS),
+}
 CONFIG_KIND_INFO = obj({"kind": CONFIG_KIND, "home": array(STRING), "schema": STRING, "gate": STRING,
                         "verbs": array(STRING)})
 CONFIG_VERSION = obj({"version": INTEGER, "content_version": STRING, "commit_sha": STRING, "sha256": STRING,
@@ -726,6 +743,9 @@ OPERATIONS += [
               envelope({"item": CONFIG_READ_ITEM_SCHEMA}),
               obj({**CONFIG_ID, "version": STRING, "level": STRING, "from": STRING, "file": STRING}, list(CONFIG_ID)),
               CONFIG_EXAMPLE),
+    operation("adw.stats", "config/adw/{name}/stats",
+              envelope(ADW_STATS_FIELDS),
+              obj({"name": CONFIG_NAME}), {"name": "feature"}),
     operation("config.versions", "config/{kind}/{name}/versions",
               envelope({"versions": array(STRING), "entries": array(CONFIG_VERSION)}, required=["seq", "versions"]),
               obj(CONFIG_ID), CONFIG_EXAMPLE),
