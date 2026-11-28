@@ -13,18 +13,20 @@ import { runHash as hashOf, taskHash } from "./ui-data.js";
 import { runView, snapshot } from "./ui-live.js";
 import { TicketProgress } from "./ui-work.js";
 import { safeLink } from "./ui-operations.js";
+import { RunWaterfall } from "./ui-run-waterfall.js";
 
 const html = htm.bind(h);
 export const GROUPS = ["Running", "Recovering", "Waiting on you", "Fault", "Done"];
 const GLYPHS = { Running: "▷", Recovering: "▷", "Waiting on you": "◆", Fault: "×", Done: "✓" };
 const FAULTS = ["failed", "interrupted", "stopped"];
-const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
 const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
 const pullUrls = (urls) => String(urls ?? "").split(/\s+/).map(safeLink).filter(Boolean);
 
-export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
+export const groupOf = (status) => status === "running" ? "Running"
+  : status === "needs-info" || status === "waiting" ? "Waiting on you"
   : FAULTS.includes(status) ? "Fault" : "Done";
-export const wordOf = (status) => status === "stopped" ? "■ STOPPED" : `${GLYPHS[groupOf(status)]} ${status === "needs-info" ? "WAITING" : String(status).toUpperCase()}`;
+export const wordOf = (status) => status === "stopped" ? "■ STOPPED"
+  : `${GLYPHS[groupOf(status)]} ${status === "needs-info" || status === "waiting" ? "WAITING" : String(status).toUpperCase()}`;
 const runGroup = (run) => run.ask_route === "unblock" ? "Recovering"
   : run.ask_route === "closed" ? "Done" : groupOf(run.status);
 const runWord = (run) => run.ask_route === "unblock" ? "▷ RECOVERY"
@@ -163,32 +165,31 @@ function failure(view) {
   return found?.message ?? found?.error ?? view.detail?.run?.summary ?? "";
 }
 
-function Steps({ view }) {
-  const steps = reduceSteps(view.events);
-  if (!steps.length) return h(Empty, { what: view.detail.run.status === "running" ? "Waiting for the first step" : "No steps recorded for this run" });
-  return html`<div class="run-steps-scroll" tabindex="0" role="region" aria-label="Run steps"><table class="run-steps"><thead><tr><th>Step</th><th>State</th><th>Took</th><th>Cost</th><th>Model</th><th>Turns</th></tr></thead>
-    <tbody>${steps.map((row) => row.kind !== "step" ? html`<tr key=${row.key} class=${`note ${row.kind}`} data-kind=${row.kind}>
-      <td colspan="6">${row.kind === "error" ? "× error" : "report"}${row.step ? ` · ${row.step}` : ""} · ${row.text}</td></tr>`
-    : html`<tr key=${row.key} data-kind="step" data-state=${row.state}>
-      <td class="step-name">${row.step}${row.attempt > 1 ? html` <span class="muted">try ${row.attempt}</span>` : null}</td>
-      <td class=${row.state === "fail" ? "fault" : ""}>${STEP_STATES[row.state] ?? row.state}${row.error ? html`<span class="muted step-error"> ${row.error}</span>` : null}</td>
-      <td>${duration(row.seconds)}</td><td>${row.cost == null ? "" : money(row.cost)}</td>
-      <td>${row.label}${row.tokensIn == null && row.tokensOut == null ? "" : html` <span class="muted">${count(row.tokensIn)} in · ${count(row.tokensOut)} out</span>`}</td>
-      <td>${row.turns ?? ""}</td></tr>`)}</tbody></table></div>`;
-}
-
 export const stepsOf = (view) => reduceSteps(view.events).filter((row) => row.kind === "step").length;
 const recordedTurns = (view) => view.events.reduce((sum, event) => sum + (event.event === "step_end" && Number.isFinite(event.turns) ? event.turns : 0), 0);
 const liveProgress = (rows, run) => rows?.find((row) => row.repo === run.repo && String(run.issue) === row.issue);
 
-function Head({ view, now }) {
+function beatAge(now) {
+  const snap = snapshot.value;
+  const age = snap.serve?.age_seconds;
+  if (!Number.isFinite(age)) return "";
+  return duration(age + (snap.received && Number.isFinite(now) ? Math.max(0, now - snap.received) / 1000 : 0));
+}
+
+function Head({ view, now, summary }) {
   const run = view.detail.run;
   const group = runGroup(run);
-  const steps = stepsOf(view);
+  const fallbackSteps = stepsOf(view);
+  const stepCount = summary?.stepCount || fallbackSteps;
+  const stepIndex = summary?.stepIndex || fallbackSteps;
+  const stepName = summary?.stepName || "";
+  const bandLabel = summary?.bandWord || "";
   const models = view.detail.models ?? [];
   const tokensIn = models.reduce((sum, model) => sum + (model.tokens_in || 0), 0);
   const tokensOut = models.reduce((sum, model) => sum + (model.tokens_out || 0), 0);
+  const turnsTotal = Math.max(view.turns?.length || 0, recordedTurns(view), summary?.turns || 0);
   const prs = pullUrls(run.pr_url);
+  const beat = beatAge(now);
   let progress = view.detail.ticket_progress;
   const current = progress && liveProgress(snapshot.value.live?.ticket_progress?.rows, run);
   if (current && !(Date.parse(progress.timing?.as_of) > Date.parse(current.timing?.as_of))) {
@@ -198,12 +199,14 @@ function Head({ view, now }) {
     <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${runWord(run)}</span>
       <span class="run-id mono">${run.id}</span>
       ${taskOf(run) ? html`<a class="run-task" href=${taskOf(run)}>${run.ticket || run.issue}</a>` : null}
-      ${run.status === "running" ? html`<span class="run-live" aria-label="Live">● LIVE</span>` : null}</div>
+      ${run.status === "running" ? html`<span class="run-live" aria-label="Live">● LIVE${beat ? ` · beat ${beat}` : ""}</span>` : null}</div>
     <h2 class="run-summary">${run.summary || run.id}</h2>
     ${view.detail.recovery ? html`<p class="run-meta">Automatic recovery: ${view.detail.recovery.phase.replaceAll("_", " ")}
       ${view.detail.recovery.detail ? ` · ${view.detail.recovery.detail}` : ""}</p>` : null}
-    <p class="run-meta mono"><span>step ${steps} of ${steps}</span><span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
-      <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${recordedTurns(view)} turns</span>
+    <p class="run-meta mono"><span>step ${stepName ? `${stepName} ` : ""}${stepIndex} of ${stepCount}</span>
+      ${bandLabel ? html`<span class=${`wf-band-word ${bandLabel.toLowerCase()}`} data-band-word=${bandLabel}>${bandLabel === "SLOW" ? "◌" : "✓"} ${bandLabel}</span>` : null}
+      <span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
+      <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${turnsTotal} turns</span>
       ${prs.map((url, i) => html`<a key=${url} href=${url} target="_blank" rel="noopener noreferrer">${prs.length === 1 ? "PR" : `PR ${i + 1}`}</a>`)}</p>
     ${progress ? html`<section class="ops-section"><h3>Ticket progress</h3><${TicketProgress} progress=${progress} /></section>` : null}
   </header>`;
@@ -256,7 +259,8 @@ function Orchestration({ view, retry }) {
 function turnTime(turn) { return turn.at ? String(turn.at).slice(11, 19) : ""; }
 
 export class RunFocus extends Component {
-  state = { tab: "steps", open: new Set() };
+  state = { tab: "steps", open: new Set(), summary: null };
+  setSummary = (summary) => { this.setState({ summary }); };
   go = (id) => { location.hash = hashOf(id); };
   link = () => {
     const run = this.props.view.detail?.run;
@@ -321,17 +325,18 @@ export class RunFocus extends Component {
     }
     const run = view.detail.run;
     const group = runGroup(run);
-    const { tab, open } = this.state;
+    const { tab, open, summary } = this.state;
     const context = this.actionOf();
     const turns = view.turns;
-    const recorded = Math.max(turns.length, recordedTurns(view));
-    const tabs = [["steps", "Steps"], ...(view.detail.orchestration ? [["actions", `Actions (${view.detail.orchestration.actions.length})`]] : []),
+    const recorded = Math.max(turns.length, recordedTurns(view), summary?.turns || 0);
+    const stepCount = summary?.stepCount || stepsOf(view);
+    const tabs = [["steps", stepCount ? `Steps ${stepCount}` : "Steps"], ...(view.detail.orchestration ? [["actions", `Actions (${view.detail.orchestration.actions.length})`]] : []),
       ["turns", `Turns (${turns.length} of ${recorded})`], ["sandbox", "Sandbox (0)"]];
     const fault = failure(view);
     const key = (turn) => `${run.id}|${turn.id}`;
     return html`<div class="run-page" data-run=${run.id}>
       ${view.detailError ? html`<${Fault} what="Run" fault=${view.detailError} retry=${retry} />` : null}
-      <${Head} view=${view} now=${now} />
+      <${Head} view=${view} now=${now} summary=${summary} />
       <div class="run-tabs" role="tablist" aria-label="Run">${tabs.map(([name, label]) => html`<button key=${name} type="button" role="tab" id=${`run-tab-${name}`}
         aria-selected=${tab === name} aria-controls="run-panel" tabindex=${tab === name ? 0 : -1} onClick=${() => this.setState({ tab: name })}>${label}</button>`)}</div>
       <div class=${`run-strip ${group === "Fault" ? "fault" : ""}`} data-group=${group}>
@@ -345,7 +350,7 @@ export class RunFocus extends Component {
       </div>
       <div class="run-panel" id="run-panel" role="tabpanel" aria-labelledby=${`run-tab-${tab}`}
         data-list=${tab === "turns" && turns.length ? undefined : "run-panel"} ref=${(el) => { if (el) el.uiContext = this.actionOf; }}>
-        ${tab === "steps" ? html`${view.eventsError ? html`<${Fault} what="Steps" fault=${view.eventsError} retry=${retry} />` : null}<${Steps} view=${view} />`
+        ${tab === "steps" ? html`${view.eventsError ? html`<${Fault} what="Steps" fault=${view.eventsError} retry=${retry} />` : null}<${RunWaterfall} view=${view} now=${now} reduceSteps=${reduceSteps} onSummary=${this.setSummary} />`
     : tab === "actions" ? html`<${Orchestration} view=${view} retry=${retry} />`
     : tab === "sandbox" ? html`<${Empty} what="No sandbox recorded" />`
     : html`${view.turnsError ? html`<${Fault} what="Turns" fault=${view.turnsError} retry=${retry} />` : null}
