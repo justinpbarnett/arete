@@ -489,7 +489,8 @@ def _multi_repo_delivery(claim: dict, tk: tracker.Tracker, landed: list[dict],
     }
 
 
-def at_delivery(claim: dict, tk: tracker.Tracker, *, cfg: config.Config | None = None) -> dict:
+def at_delivery(claim: dict, tk: tracker.Tracker, ticket: tracker.Ticket | None = None, *,
+                cfg: config.Config | None = None) -> dict:
     data = claim["data"]
     if data.get("graph"):
         from . import spec_graph_delivery
@@ -511,9 +512,16 @@ def at_delivery(claim: dict, tk: tracker.Tracker, *, cfg: config.Config | None =
         if promise and (proof.get("status") != "verified" or not proof.get("receipt_id") or any(
                 proof.get(k) != promise[k] for k in ("repo", "ticket", "destination", "path", "policy"))):
             return {}
+        from . import spec_graph_delivery
+        policy = release_proof.goal(tk.repo.name, claim["issue"]) or {}
+        item = ticket if ticket is not None else tk.get(claim["issue"])
+        activations = release_proof.required_activations(policy, item)
+        if activations and spec_graph_delivery.activations_verified(activations, receipt=proof):
+            return {}
         return {"method": "protected release observation", "landed": landed, "how": f"Observed {proof['path']} "
                 f"on {proof['destination']} at {proof['revision']}", "saw": f"All protected assertions matched. "
-                f"Receipt {proof['receipt_id']}."}
+                f"Receipt {proof['receipt_id']}.",
+                **({"activations": activations} if activations else {})}
     if not done.get("environment") and all(t["exact_tree"] for t in landed):
         return {"method": "verified candidate tree matches the landed tree", "landed": landed, **data["behavior"]}
     if not (request := data.get("observation_request")):
@@ -526,13 +534,19 @@ def at_delivery(claim: dict, tk: tracker.Tracker, *, cfg: config.Config | None =
               f"Please observe the outcome there for these landed revisions:\n\n{location(request['landed'])}\n\n"
               f"Reply with `Spec evidence {request['token']}` on its own first line, followed by `How:` and `Saw:` "
               "lines describing how you checked it and what matched the expected outcome. Do not include secrets.")
+    from . import spec_graph_delivery
+    item = ticket if ticket is not None else tk.get(claim["issue"])
+    activations = spec_graph_delivery.activation_requirements(item)
     for body, url, created in comments(tk, claim["issue"]):
         observed = tracker.spec_observation(body)
         if (observed and observed[0] == request["token"] and url and created
                 and jira.parse_time(created) > util.parse_iso(request["since"])
                 and confirmed_observation(tk, claim["issue"], body, url)):
+            if activations and spec_graph_delivery.activations_verified(activations, text=f"{observed[1]}\n{observed[2]}"):
+                continue
             return {"method": "publisher's delivery-point observation", "landed": request["landed"],
-                    "how": observed[1][:2000], "saw": observed[2][:2000], "source": url}
+                    "how": observed[1][:2000], "saw": observed[2][:2000], "source": url,
+                    **({"activations": activations} if activations else {})}
     return {}
 
 
@@ -566,17 +580,17 @@ def settle(cfg, repo, claim: dict) -> None:
     if obligations := data.get("delivery_obligations"):
         if any(ob != obligation(rname, t, data["definition"]) for rname, ob in obligations.items()):
             return
-        if not (protected := at_delivery(claim, tk, cfg=cfg)):
+        if not (protected := at_delivery(claim, tk, ticket=t, cfg=cfg)):
             return
         if claim["state"] == "evidenced" and data.get("delivery") != protected:
             return
     elif promise := data.get("delivery_obligation"):
-        if promise != obligation(repo.name, t, data["definition"]) or not (protected := at_delivery(claim, tk, cfg=cfg)):
+        if promise != obligation(repo.name, t, data["definition"]) or not (protected := at_delivery(claim, tk, ticket=t, cfg=cfg)):
             return
         if claim["state"] == "evidenced" and data.get("delivery") != protected:
             return
     if claim["state"] == "published":
-        observed = protected or data.get("delivery") or at_delivery(claim, tk, cfg=cfg)
+        observed = protected or data.get("delivery") or at_delivery(claim, tk, ticket=t, cfg=cfg)
         if not observed:
             return
         data["delivery"] = observed
