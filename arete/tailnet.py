@@ -225,10 +225,8 @@ def tls_context() -> ssl.SSLContext:
 
 
 def host_name(host: str) -> str:
-    host = host.strip().lower()
-    if host.startswith("["):
-        return host[1:host.find("]")]
-    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    parsed = credential_http.origin_of("http", host.strip()) if isinstance(host, str) else None
+    return parsed[1] if parsed is not None else ""
 
 
 @dataclass(frozen=True)

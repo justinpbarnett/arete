@@ -154,6 +154,8 @@ def active(row, kind):
 
 
 def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None):
+    if not isinstance(text, str) or len(text) > 512:
+        raise InvalidCredential()
     parts = text.split("_", 3)
     if len(parts) != 4 or parts[0] != "ar" or not TOKEN_ID.fullmatch(parts[2]):
         raise InvalidCredential()
@@ -327,14 +329,17 @@ def stream_status(credential, marker):
 def note_use(credential, peer):
     at = util.now()
     expires = session_lifetime(at) if credential.kind == "session" else None
-    if expires is not None and expires > credential.deadline:
-        with db.tx() as c:
-            renewed = c.execute("UPDATE tokens SET expires = max(expires, ?) "
-                                "WHERE id = ? AND revoked_at IS NULL AND expires > ? "
-                                "AND (SELECT value FROM schema_meta WHERE key = 'token_key_ref') = ?",
-                                (expires, credential.id, util.iso(at), credential.key_ref))
-            if not renewed.rowcount:
-                raise InvalidCredential()
+    if expires is not None:
+        if credential.deadline is None:
+            raise InvalidCredential()
+        if expires > credential.deadline:
+            with db.tx() as c:
+                renewed = c.execute("UPDATE tokens SET expires = max(expires, ?) "
+                                    "WHERE id = ? AND revoked_at IS NULL AND expires > ? "
+                                    "AND (SELECT value FROM schema_meta WHERE key = 'token_key_ref') = ?",
+                                    (expires, credential.id, util.iso(at), credential.key_ref))
+                if not renewed.rowcount:
+                    raise InvalidCredential()
     with USE_LOCK:
         PENDING_USES[credential.key_ref, credential.id] = util.iso(), peer
 

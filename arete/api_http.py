@@ -140,7 +140,7 @@ def json_bytes(value):
 def problem(status, answer):
     code = answer.get("code")
     if not any(error["code"] == code and error["status"] == status for error in contract.ERRORS):
-        code = STATUS_CODES[status]
+        code = STATUS_CODES.get(status, "internal_error" if status >= 500 else "invalid_input")
     return {**answer, "code": code, "type": f"urn:arete:problem:{code}", "title": HTTPStatus(status).phrase,
             "status": status, "detail": answer["error"]}
 

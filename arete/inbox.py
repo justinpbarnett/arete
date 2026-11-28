@@ -43,6 +43,18 @@ _SECRETS_LOCK = threading.Lock()
 _FALLBACK_SECRETS: dict[tuple[str, str], str] = {}
 
 PRESENCE_TTL_MINUTES = 10
+RESERVED_MANUAL_PREFIXES = (
+    "presence:",
+    "approval:",
+    "ask:",
+    "run:",
+    "proposal:",
+    "skipped:",
+    "ticket:",
+    "chat:",
+    "incident:",
+    "workspace:",
+)
 
 
 def server_secrets(server=None) -> dict[tuple[str, str], str]:
@@ -637,10 +649,18 @@ def raise_manual(body: dict, *, credential=None) -> dict:
     subject = str(body.get("subject") or "").strip()
     if not subject:
         raise contract.Problem("validation", "subject is required when ask is not provided")
+    if subject.lower().startswith(RESERVED_MANUAL_PREFIXES):
+        raise contract.Problem("validation", f"Subject prefix {subject.partition(':')[0]!r} is reserved for system items.")
     kind = str(body.get("kind") or "freeform").strip()
     if kind not in inbox_store.KINDS:
         raise contract.Problem("validation", f"Unsupported inbox kind {kind!r}")
-    priority = int(body.get("priority", 2))
+    raw_priority = body.get("priority", 2)
+    if isinstance(raw_priority, bool):
+        raise contract.Problem("validation", "priority must be 1, 2, or 3")
+    try:
+        priority = int(raw_priority)
+    except (TypeError, ValueError):
+        raise contract.Problem("validation", "priority must be 1, 2, or 3") from None
     if priority not in inbox_store.PRIORITIES:
         raise contract.Problem("validation", "priority must be 1, 2, or 3")
     title = str(body.get("title") or subject)
@@ -1058,7 +1078,7 @@ def resolve(
             pending_secrets=pending_secrets,
         )
 
-    if item["kind"] == "approval" and not allow_legacy_auth:
+    if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:
         if credential is None or credential.kind != "session":
             raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required")
 

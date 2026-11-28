@@ -190,6 +190,7 @@ export function paletteFixture(mode) {
 }
 
 export async function startHooks() {
+  if (document.querySelector('meta[name="arete-scratch"]')?.content !== "1") return;
   const query = readQuery();
   if (query.get("actions") === "fixture") actionFixture();
   paletteFixture(query.get("palette"));

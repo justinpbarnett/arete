@@ -30,7 +30,7 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 GONE = (404, 410)
 KEY_FIELD = re.compile(r"[A-Za-z0-9_-]{1,200}={0,2}")
 EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-SUBSCRIPTION_ID = re.compile(r"^PS-([1-9][0-9]*)$")
+SUBSCRIPTION_ID = re.compile(r"^PS-([1-9][0-9]{0,17})$")
 SPKI_POINT_BYTES = 65
 
 known_key: tuple[tuple[int, int], str] | None = None
@@ -281,7 +281,8 @@ def subscription_state() -> dict:
 
 
 def checked_endpoint(endpoint) -> str:
-    if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 2048:
+    if (not isinstance(endpoint, str) or not endpoint or len(endpoint) > 2048
+            or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in endpoint)):
         raise Refused("The subscription needs an endpoint address of at most 2048 characters.")
     try:
         parts = urlsplit(endpoint)

@@ -129,8 +129,19 @@ function quiet(...parts) {
   return el("p", { class: "muted" }, ...parts);
 }
 
+function safeHttpsUrl(href) {
+  if (typeof href !== "string" || !href || /[\u0000-\u0020\u007f]/.test(href)) return null;
+  try {
+    const parsed = new URL(href);
+    return parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function link(href, text) {
-  return /^https:\/\//.test(href || "") ? el("a", { href, rel: "noreferrer", target: "_blank", "data-focus": `link:${href}`, text }) : document.createTextNode(text);
+  const safe = safeHttpsUrl(href);
+  return safe ? el("a", { href: safe, rel: "noopener noreferrer", target: "_blank", "data-focus": `link:${safe}`, text }) : document.createTextNode(text);
 }
 
 function withLinks(text) {
