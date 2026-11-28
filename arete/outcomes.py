@@ -23,9 +23,11 @@ from . import (
     util,
     workspace,
 )
+from .store import asks as ask_store
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import specs as spec_store
+from .store import tasks as task_store
 from .util import git
 
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
@@ -33,6 +35,7 @@ HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
 PR_SEEN_SETTLE = timedelta(minutes=1)
 REJECTED_PR_LISTEN = timedelta(days=7)
+PR_SETTLE_EXPECT = ("pr", "failed", "stopped", "interrupted", "needs-info", "rejected")
 
 
 def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
@@ -97,26 +100,74 @@ def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict
                                            if skip else ""))
 
 
-def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
+def _pr_ext_state(pr: dict) -> str:
+    if pr.get("mergedAt") or str(pr.get("state") or "").upper() == "MERGED":
+        return "merged"
+    if str(pr.get("state") or "").upper() == "CLOSED":
+        return "closed"
+    return "open"
+
+
+def _pr_ref_facts(pr: dict) -> dict[str, object]:
+    facts: dict[str, object] = {}
+    if state := pr.get("state"):
+        facts["state"] = str(state)
+    if pr.get("number") is not None:
+        facts["number"] = pr["number"]
+    if pr.get("mergedAt"):
+        facts["merged_at"] = str(pr["mergedAt"])
+    if pr.get("closedAt"):
+        facts["closed_at"] = str(pr["closedAt"])
+    if pr.get("updatedAt"):
+        facts["updated_at"] = str(pr["updatedAt"])
+    if pr.get("headRefName"):
+        facts["head_ref"] = str(pr["headRefName"])
+    if pr.get("headRefOid"):
+        facts["head_sha"] = str(pr["headRefOid"])
+    if pr.get("baseRefName"):
+        facts["base_ref"] = str(pr["baseRefName"])
+    merge_commit = pr.get("mergeCommit")
+    if isinstance(merge_commit, dict) and merge_commit.get("oid"):
+        facts["merge_commit"] = str(merge_commit["oid"])
+    return facts
+
+
+def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict, *,
+                    task: int | None = None, tasks: list[int | None] | None = None) -> None:
     from . import unblock
 
-    for url, pr in zip(urls, prs, strict=True):
+    for idx, (url, pr) in enumerate(zip(urls, prs, strict=True)):
         updated = pr.get("updatedAt", "")
         fresh[url] = seen.get(url, "")
         if updated and seen.get(url) == updated:
             continue
+        tnum = tasks[idx] if tasks is not None else (task if task is not None else r.get("task_id"))
+        repo_name = str(r.get("repo") or "")
+        issue_ref = str(r.get("issue") or "")
+        if (not repo_name or not issue_ref) and tnum is not None:
+            trow = task_store.task_get_num(int(tnum), include_relations=False)
+            if trow is not None:
+                repo_name = repo_name or str(trow.get("repo") or "")
+                issue_ref = issue_ref or str(trow.get("id") or f"T-{tnum}")
         try:
             state = pr.get("state", "")
-            rows = owner_feedback(url, state, r["repo"], str(r["issue"]))
+            rows = owner_feedback(url, state, repo_name, issue_ref)
+            if tnum is not None:
+                for row in rows:
+                    row["task_id"] = int(tnum)
             if rows and state == "OPEN":
-                newest = run_store.newest_live_whole_run(r["repo"], r["issue"]) or {}
+                newest = (
+                    run_store.newest_live_whole_run(int(tnum))
+                    if tnum is not None
+                    else run_store.newest_live_whole_run(repo_name, issue_ref)
+                ) or {}
                 eligible = rows
                 if held := pr_recovery.blocked(newest):
-                    repo = next((repo for repo in cfg.repos if repo.name == r["repo"]), None)
+                    repo = next((repo for repo in cfg.repos if repo.name == repo_name), None)
                     attached = unblock.recovery_checkouts(repo, newest)[1] if repo else {}
                     eligible = unblock.replies_after_hold(newest, held, rows, attached)
                 if eligible:
-                    judge_feedback(cfg, r["repo"], url, eligible)
+                    judge_feedback(cfg, repo_name, url, eligible)
             added = insights_store.add_feedback(rows)
         except gh.GhError as e:
             print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
@@ -130,28 +181,67 @@ def sync_outcomes(cfg: config.Config) -> None:
     from . import zte
 
     seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
-    for r in run_store.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
-        if zte.reserved(str(r["issue"])):
+    grouped: dict[str, list[dict]] = {}
+    for ref in task_store.pr_refs_to_sync(util.iso(util.now() - REJECTED_PR_LISTEN)):
+        rid = ref.get("run_id")
+        if rid:
+            grouped.setdefault(str(rid), []).append(ref)
+
+    for run_id, ref_group in grouped.items():
+        r = run_store.run_get(run_id)
+        if r is None or zte.reserved(str(r.get("issue") or "")):
             continue
-        urls = r["pr_url"].split()
-        try:
-            prs = [gh.pr_view(url) for url in urls]
-        except gh.GhError:
+        fetched: list[tuple[dict, dict]] = []
+        all_fetched = True
+        for ref in ref_group:
+            try:
+                pr = gh.pr_view(ref["url"])
+            except gh.GhError:
+                all_fetched = False
+                continue
+            ext_state = _pr_ext_state(pr)
+            fetched_at = util.iso()
+            task_store.update_pr_ref_state(
+                int(ref["num"]),
+                ext_state=ext_state,
+                facts=_pr_ref_facts(pr),
+                fetched_at=fetched_at,
+                remote_updated=str(pr.get("updatedAt") or "") or None,
+            )
+            fetched.append((ref, pr))
+        if not fetched:
             continue
-        record_feedback(cfg, r, urls, prs, seen, fresh)
-        closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
-        merged = all(pr.get("mergedAt") for pr in prs)
+        urls = [ref["url"] for ref, _ in fetched]
+        prs = [pr for _, pr in fetched]
+        tasks_list = [ref["task_id"] if ref.get("task_id") is not None else r.get("task_id") for ref, _ in fetched]
+        record_feedback(cfg, r, urls, prs, seen, fresh, tasks=tasks_list)
+        for ref, pr in fetched:
+            ext_state = _pr_ext_state(pr)
+            if ext_state in ("merged", "closed"):
+                insights_store.close_feedback(ref["url"], pr.get("state") or ext_state.upper())
+        all_run_refs = task_store.run_pr_refs(run_id)
+        closed = bool(all_run_refs) and all(ref["ext_state"] in ("merged", "closed") for ref in all_run_refs)
+        merged = bool(all_run_refs) and all(ref["ext_state"] == "merged" for ref in all_run_refs)
         if r["status"] == "rejected" and not merged:
             if not closed:
                 record.move(r["id"], "pr", expect=("rejected",))
             continue
-        if not closed:
+        if not closed or not all_fetched:
             continue
-        for url, pr in zip(urls, prs, strict=True):
-            insights_store.close_feedback(url, pr["state"])
-        closed_at = max((util.iso(util.parse_iso(pr["closedAt"]).astimezone(UTC))
-                         for pr in prs if pr.get("closedAt")), default=util.iso())
-        record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
+        closed_timestamps: list[str] = []
+        for _, pr in fetched:
+            ts = pr.get("closedAt") or pr.get("mergedAt")
+            if ts:
+                closed_timestamps.append(util.iso(util.parse_iso(str(ts)).astimezone(UTC)))
+        for ref in all_run_refs:
+            ref_facts = ref.get("facts") or {}
+            ts = ref_facts.get("closed_at") or ref_facts.get("merged_at")
+            if ts:
+                closed_timestamps.append(util.iso(util.parse_iso(str(ts)).astimezone(UTC)))
+        closed_at = max(closed_timestamps, default=util.iso())
+        target_status = "merged" if merged else "rejected"
+        if record.move(r["id"], target_status, expect=PR_SETTLE_EXPECT, finished=closed_at):
+            ask_store.asks_retire(r["id"], target_status)
     util.write_json(PR_SEEN_FILE, fresh)
     from . import ticket_feedback, ticket_followups
 

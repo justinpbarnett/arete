@@ -3451,7 +3451,8 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
         row, = insights_store.open_feedback([url])
         self.assertEqual((row["status"], row["run_id"]), ("new", None))
         self.assertEqual(insights_store.feedback_due(self.repo.name, "2025-12-31T23:59:59Z"), [])
-        self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [self.ticket])
+        # The newest whole run is interrupted, so feedback_due leaves out this task while poll still waits for quiet.
+        self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [])
         insights_store.add_feedback([{**self.feedback_row, "gh_id": 2,
                                       "created": "2026-01-01T00:09:00Z"}])
         reached = []
@@ -3541,7 +3542,7 @@ class FeedbackRevisionBudgetTests(FeedbackRevisionBudgetFixture):
             feedback = {row["pr_url"]: (row["status"], row["run_id"])
                         for row in insights_store.feedback_between("2025-01-01", "9999-01-01")}
             self.assertEqual(feedback, {url: ("recorded", noop["id"]), sibling: ("new", None)})
-            self.assertEqual(run_store.open_runs(self.repo.name, self.ticket)[0]["id"], parent.id)
+            self.assertEqual(tasks_store.open_pr_runs(self.repo.name, self.ticket)[0]["id"], parent.id)
             self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [self.ticket])
             model.assert_not_called()
 

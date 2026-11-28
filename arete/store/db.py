@@ -205,7 +205,8 @@ TASK_IDENTITY_EXPAND_SCHEMA = 57
 TASK_IDENTITY_BACKFILL_SCHEMA = 58
 TASK_IDENTITY_CONTRACT_SCHEMA = 59
 BLOBS_RETENTION_SCHEMA = 60
-CONFIG_DRAFT_NULL_BODY_SCHEMA = 61
+PR_REFS_RECONCILE_SCHEMA = 61
+CONFIG_DRAFT_NULL_BODY_SCHEMA = 62
 TASK_ADMISSION_CAPABILITY = "task_admission_v1"
 PROCESS_CAPABILITIES = (TASK_ADMISSION_CAPABILITY,)
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -378,7 +379,7 @@ def contract_blockers(conn, n):
         blockers.extend(workspace_admission_blockers())
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
-    elif n in (DEVICES_CONTRACT_SCHEMA, OUTBOX_CONTRACT_SCHEMA):
+    elif n in (DEVICES_CONTRACT_SCHEMA, OUTBOX_CONTRACT_SCHEMA, PR_REFS_RECONCILE_SCHEMA):
         beat = control.database_beat()
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)

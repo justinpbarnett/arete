@@ -703,17 +703,34 @@ def _apply_sent_effects(c, row: dict, body: str) -> list[int]:
 
     if kind == "pr" and payload is not None and (payload.get("action") or "create") == "create" and sent_url:
         run_id = row.get("run_id")
+        task_id = row.get("task_id")
+        run_row = None
         if run_id:
-            run_row = c.execute("SELECT version, pr_url, branch FROM runs WHERE id = ?", (run_id,)).fetchone()
-            if run_row is not None:
-                urls = str(run_row["pr_url"] or "").split()
+            raw_run = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if raw_run is not None:
+                run_row = dict(raw_run)
+                urls = str(run_row.get("pr_url") or "").split()
                 if sent_url not in urls:
                     urls.append(sent_url)
-                branch = str(payload.get("branch") or run_row["branch"] or "")
+                branch = str(payload.get("branch") or run_row.get("branch") or "")
                 fields: dict[str, object] = {"pr_url": " ".join(urls)}
                 if branch:
                     fields["branch"] = branch
                 writes.update("runs", run_id, fields, base_version=int(run_row["version"]))
+        if (run_row is not None and (run_row.get("kind") == "pipeline" or run_row.get("task_id") is not None)) or task_id:
+            from .store import tasks as task_store
+
+            task_store.TaskStore.upsert_pr_ref(
+                c,
+                sent_url,
+                run_id=str(run_id) if run_id else None,
+                task_id=run_row.get("task_id") if (run_row is not None and run_row.get("task_id") is not None) else task_id,
+                repo=str(run_row.get("repo") or "") if run_row is not None else "",
+                issue=str(run_row.get("issue") or "") if run_row is not None else "",
+                force_open=True,
+                actor=principals.current() or "hand",
+                emit_event=True,
+            )
 
     if kind == "push" and row.get("run_id"):
         run_id = str(row["run_id"])

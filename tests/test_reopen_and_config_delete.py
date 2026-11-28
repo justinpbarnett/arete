@@ -699,14 +699,14 @@ class ConfigDeleteGuardsAndPresenceTests(_ReopenAndDeleteCase):
 
 class ConfigDraftNullBodyMigrationTests(_ReopenAndDeleteCase):
     @_case
-    def test_m0061_migration_allows_null_body_and_preserves_existing_drafts(self, _):
+    def test_m0062_migration_allows_null_body_and_preserves_existing_drafts(self, _):
         for suffix in ("", "-wal", "-shm", "-journal"):
             paths.DB_FILE.with_name(paths.DB_FILE.name + suffix).unlink(missing_ok=True)
         foundation._CHECKED.clear()
         empty_snaps = Path.cwd() / "empty-snaps"
         empty_snaps.mkdir(exist_ok=True)
         chain = foundation.migrations.load()
-        with mock.patch.object(foundation.migrations, "load", return_value=chain[:60]):
+        with mock.patch.object(foundation.migrations, "load", return_value=chain[:61]):
             foundation.migrate(workspace_snapshots=empty_snaps)
         did = drafts.add(kind="device", name="keep", body='kind = "local"\n', author="hand", gate="B")
         with foundation.tx() as c, self.assertRaises(sqlite3.IntegrityError):

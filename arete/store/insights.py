@@ -6,7 +6,6 @@ from datetime import timedelta
 from .. import run_lines, util
 from ._rows import insert_sql, json_dict, validate_columns
 from .db import db, reader, tx
-from .runs import OPEN_PR_RUN
 
 TABLES = {
     "usage": "configured keep_days",
@@ -150,14 +149,99 @@ def add_feedback(rows: list[dict]) -> int:
         return c.total_changes - before
 
 
-def feedback_due(repo: str, quiet_since: str) -> list[str]:
+def feedback_turn_due(rows: list[dict], quiet_since: str) -> bool:
+    fresh = [r for r in rows if r.get("status") == "new"]
+    if not fresh:
+        return False
+    return any(r.get("at_once") for r in fresh) or max(str(r.get("created") or "") for r in fresh) <= quiet_since
+
+
+def _feedback_due_rows(repo: str, quiet_since: str, *, only_open_asks: bool = False) -> list[str]:
+    from . import runs as run_store
+    from . import tasks as task_store
+
     with reader() as c:
-        rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "  # noqa: S608
-                         "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
-                         f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
-                         "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
-                         "GROUP BY issue ORDER BY last", (repo,))
-        return [str(r["issue"]) for r in rows if r["at_once"] or r["last"] <= quiet_since]
+        if not task_store.has_identity_expand(c):
+            return []
+        k = run_store.seq_col(c, "nr")
+        rows = c.execute(
+            """
+            SELECT
+                COALESCE(
+                    f.task_id,
+                    (SELECT tr.task_id FROM task_refs tr
+                     JOIN refs rr ON rr.id = tr.ref_id
+                     WHERE rr.kind = 'pr' AND rr.url = f.pr_url
+                     ORDER BY tr.id ASC LIMIT 1)
+                ) AS task_id,
+                f.issue AS issue,
+                MAX(f.at_once) AS at_once,
+                MAX(f.created) AS last
+            FROM feedback f
+            WHERE f.repo = ?
+              AND f.status = 'new'
+              AND EXISTS (
+                  SELECT 1 FROM refs r
+                  WHERE r.kind = 'pr' AND r.url = f.pr_url AND r.ext_state IN ('open', '')
+              )
+            GROUP BY COALESCE(
+                CAST(COALESCE(
+                    f.task_id,
+                    (SELECT tr.task_id FROM task_refs tr
+                     JOIN refs rr ON rr.id = tr.ref_id
+                     WHERE rr.kind = 'pr' AND rr.url = f.pr_url
+                     ORDER BY tr.id ASC LIMIT 1)
+                ) AS TEXT),
+                f.issue
+            )
+            ORDER BY last
+            """,
+            (repo,),
+        ).fetchall()
+        due: list[str] = []
+        for r in rows:
+            if not (r["at_once"] or (r["last"] or "") <= quiet_since):
+                continue
+            task_id = r["task_id"]
+            if task_id is not None:
+                newest = c.execute(
+                    f"SELECT id, status FROM runs nr WHERE nr.kind = 'pipeline' AND nr.task_id = ? "  # noqa: S608
+                    f"AND {run_store.WHOLE_RUN} AND nr.status != 'queued' "
+                    "AND NOT (nr.pid IS NULL AND nr.status = 'stopped' AND nr.stop_asked IS NULL) "
+                    f"ORDER BY nr.started DESC, {k} DESC LIMIT 1",
+                    (int(task_id),),
+                ).fetchone()
+            else:
+                newest = c.execute(
+                    f"SELECT id, status FROM runs nr WHERE nr.kind = 'pipeline' AND nr.repo = ? AND nr.issue = ? "  # noqa: S608
+                    f"AND {run_store.WHOLE_RUN} AND nr.status != 'queued' "
+                    "AND NOT (nr.pid IS NULL AND nr.status = 'stopped' AND nr.stop_asked IS NULL) "
+                    f"ORDER BY nr.started DESC, {k} DESC LIMIT 1",
+                    (repo, str(r["issue"])),
+                ).fetchone()
+            if only_open_asks:
+                if newest is None or newest["status"] != "needs-info":
+                    continue
+                has_ask = c.execute(
+                    "SELECT 1 FROM asks WHERE run = ? AND status = 'open' LIMIT 1",
+                    (newest["id"],),
+                ).fetchone()
+                if has_ask is None:
+                    continue
+            elif newest is not None and newest["status"] in ("needs-info", "interrupted"):
+                continue
+            label = str(r["issue"]) if r["issue"] not in (None, "") else (f"T-{task_id}" if task_id is not None else "")
+            if label:
+                due.append(label)
+        return due
+
+
+def feedback_due(repo: str, quiet_since: str) -> list[str]:
+    return _feedback_due_rows(repo, quiet_since, only_open_asks=False)
+
+
+def feedback_due_for_open_asks(repo: str, quiet_since: str) -> list[str]:
+    return _feedback_due_rows(repo, quiet_since, only_open_asks=True)
 
 
 def close_feedback(pr_url: str, pr_state: str) -> None:

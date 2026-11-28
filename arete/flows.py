@@ -2188,8 +2188,8 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
         run.facts["requirements"] = job.verified.requirements()
         run.facts["held"] = summary
         run.enter("pr")
-        record.note(run.id, branch=job.branch, pr_url=pr_url)
         pipeline.supersede_older_runs(run, pr_url.split())
+        record.note(run.id, branch=job.branch, pr_url=pr_url)
         status = "pr"
     elif ending == "done":
         run.say(done_comment(job, summary))
