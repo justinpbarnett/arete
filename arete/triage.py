@@ -22,6 +22,7 @@ from . import (
     paths,
     principals,
     prompt_loader,
+    prompts,
     refusals,
     runner,
     screening,
@@ -405,7 +406,7 @@ def classified_by_jev(cfg: config.Config, src: TriageSource, c: Candidate,
 
 
 def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> tuple[dict | None, float, str]:
-    text = prompt_loader.prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=ticket,
+    text = prompts.render_engine("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=ticket,
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [messages, summary]
+---
 You keep the memory of a chat between an owner and the orchestrator of arete, an unattended pipeline. Fold the new
 messages into the summary so far, and write one summary of the whole.
 

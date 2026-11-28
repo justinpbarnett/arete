@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [observation, verification_policy]
+---
 # Issue orchestrator monitor turn
 
 Continue managing the approved issue in this conversation until its tracker closes or its pull request merges.

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .. import eval_mine, evals, paths, pipeline, record, replay, routing, steps, util, workspace
+from .. import eval_mine, evals, paths, pipeline, prompts, record, replay, routing, steps, util, workspace
 from ..agent import REPLAY, traits_of
 from . import experiment
 
@@ -67,7 +67,7 @@ def reviewer(exp: experiment.Experiment) -> tuple[dict, list[str]]:
     if why := traits_of(which).cannot_gate:
         raise experiment.Refused(f"the reviewer: {why}")
     return {"runner": s.runner, "model": s.model, "effort": s.effort, "settings": experiment.effective(exp.cfg, s),
-            "prompt": experiment.sha((paths.PROMPTS_DIR / "review.md").read_bytes())}, routes
+            "prompt": experiment.sha(prompts.body(paths.PROMPTS_DIR / "review.md"))}, routes
 
 
 def resolved_references(exp: experiment.Experiment, references: dict[str, str]) -> dict[str, str]:

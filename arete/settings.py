@@ -137,8 +137,18 @@ def resolved(repo: str = "", task_kind: str = "", node: str = "") -> dict:
                 cfg_no_replay, layer, role, task_kind,
                 provenance=True, config_commit=commit, layer_from=layer_from,
             )
-            values_out[role] = {k: v["value"] for k, v in prov.items()}
-            levels_out[role] = {k: {"level": v["level"], "from": v["from"]} for k, v in prov.items()}
+            vals: dict[str, object] = {}
+            lvls: dict[str, dict] = {}
+            for k, v in prov.items():
+                if k in config.STEP_MAPS:
+                    vals[k] = {ck: cv["value"] for ck, cv in v.items()}
+                    for ck, cv in v.items():
+                        lvls[f"{k}.{ck}"] = {"level": cv["level"], "from": cv["from"]}
+                else:
+                    vals[k] = v["value"]
+                    lvls[k] = {"level": v["level"], "from": v["from"]}
+            values_out[role] = vals
+            levels_out[role] = lvls
             roles_out.append({
                 "role": role,
                 "runner": res.runner or None,

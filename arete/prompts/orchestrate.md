@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [api, observation]
+---
 # Arete orchestrator
 
 You are the one coordinator of this run.

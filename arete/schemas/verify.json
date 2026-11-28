@@ -1,0 +1,84 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "what": {
+            "type": "string"
+          },
+          "how": {
+            "type": "string"
+          },
+          "saw": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "cause": {
+            "type": "string",
+            "enum": [
+              "change",
+              "environment"
+            ]
+          },
+          "screenshot": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "what",
+          "how",
+          "saw",
+          "passed"
+        ]
+      }
+    },
+    "unmeasured_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocked_by": {
+      "type": "string"
+    },
+    "missing_capability": {
+      "type": "string"
+    },
+    "missing_tools": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "advisory_gaps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "pending_delivery": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "summary",
+    "checks"
+  ]
+}

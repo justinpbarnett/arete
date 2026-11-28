@@ -5,7 +5,7 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, delivery, outbound, prompt_loader, push, runner, util
+from . import config, delivery, outbound, prompt_loader, prompts, push, runner, util
 from .agent import READ_TOOLS
 from .store import approvals as approvals_store
 
@@ -108,7 +108,7 @@ def read_change(approval: dict, wt: Path, base: str, diff: str, model: str, cfg:
     log = util.git(["log", f"-n{COMMITS_SHOWN}", "--date=short", "--format=%h %ad %s", f"origin/{base}", "--", *files],
                    wt) if files else ""
     briefing_without_patch = emit.briefing({**item, "patch": ""})
-    text = prompt_loader.prompt("hold_review", loop=approval["loop"], repo=delivery.repo_of(approval) or "none", base=base,
+    text = prompts.render_engine("hold_review", loop=approval["loop"], repo=delivery.repo_of(approval) or "none", base=base,
                            held=approval["emit"]["held"], mark=secrets.token_hex(8),
                            briefing=briefing_without_patch[:BRIEFING_SHOWN],
                            diff=push.shown_patch(diff, f"git diff origin/{base} HEAD", DIFF_SHOWN),

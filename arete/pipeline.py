@@ -56,6 +56,7 @@ from . import (
     pr_recovery,
     principals,
     prompt_loader,
+    prompts,
     record,
     routing,
     run_lines,
@@ -74,11 +75,10 @@ from . import (
 )
 from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
 from .review import (
-    CATCH_UP_REVIEW_SCHEMA,
     REPAIR_SELECTOR_SCHEMA,
-    REVIEW_SCHEMA,
     Review,
     catch_up_problems,
+    catch_up_schema,
     numbered,
     permitted_review_patches,
 )
@@ -148,67 +148,9 @@ NO_CHECKS = "(none configured)"
 SUMMARY_CHARS = 3000
 PLAN_CHARS = 6000
 CUT_MARK = " …"
-
-PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "plan": {"type": "string"},
-        "ambiguous": {"type": "boolean"},
-        "question": {"type": "string"},
-        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
-        "estimated_lines": {"type": "integer", "minimum": 0},
-        "verify": {"type": "string"},
-        "left_for_a_person": {"type": "string"},
-        "assumptions": {"type": "array", "items": {"type": "string"}},
-        "split": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
-                "required": ["title", "body"],
-            },
-        },
-    },
-    "required": ["plan", "ambiguous", "risk", "estimated_lines", "verify"],
-}
-LEARN_SCHEMA = learning.SCHEMA
 EXPERTISE_MAX_LINES = learning.MAX_LINES
-REVISE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "replies": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"comment_id": {"type": "integer"}, "reply": {"type": "string"}},
-            "required": ["comment_id", "reply"],
-        }},
-    },
-    "required": ["summary", "replies"],
-}
 RESOLVER_SETS = {"RUFF_NO_CACHE": "true"}
-
-RESOLVE_SCHEMA = {
-    "type": "object",
-    "properties": {"resolved": {"type": "boolean"}, "summary": {"type": "string"}},
-    "required": ["resolved", "summary"],
-}
 CONFLICT_MARKER = re.compile(r"^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)", re.MULTILINE)
-CI_FIX_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "checks": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "caused_by_pr": {"type": "boolean"},
-                "reason": {"type": "string"},
-            },
-            "required": ["name", "caused_by_pr", "reason"],
-        }},
-        "summary": {"type": "string"},
-    },
-    "required": ["checks", "summary"],
-}
 MAX_CI_REASON_CHARS = 700
 AUTOMERGE_CATCH_UPS = 2
 FEEDBACK_QUIET_MINUTES = 10
@@ -356,6 +298,12 @@ class AgentRun:
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}), ticket=self.ab_ticket,
                              held=self.ab_held.get(role))
+
+    def prompt(self, call: str, role: str, **values) -> prompt_loader.Rendered:
+        return prompts.render(prompts.resolve(self, call, role), **values)
+
+    def schema(self, call: str, role: str) -> prompts.LoadedSchema:
+        return prompts.resolve_schema(self, call, role)
 
     def time_for(self, seconds: float) -> float:
         return seconds
@@ -1610,9 +1558,23 @@ def check_failure_story(heading: str, failures: list[dict], report: str = "") ->
     return "\n\n".join(filter(None, parts))
 
 
-def check_fix_prompt(attempt: int, tries: int, report: str, checks: str, deny: list[str]) -> str:
-    text = prompt_loader.prompt(
-        "fix", attempt=attempt, max_attempts=tries, failures=report, checks=checks, denied=prompt_loader.code_list(deny))
+def run_prompt(run: object, call: str, role: str, **values) -> prompt_loader.Rendered:
+    if isinstance(run, AgentRun):
+        return run.prompt(call, role, **values)
+    return prompts.render(prompts.resolve(run, call, role), **values)
+
+
+def run_schema(run: object, call: str, role: str) -> prompts.LoadedSchema:
+    if isinstance(run, AgentRun):
+        return run.schema(call, role)
+    return prompts.resolve_schema(run, call, role)
+
+
+def check_fix_prompt(attempt: int, tries: int, report: str, checks: str, deny: list[str], *,
+                     run: AgentRun | None = None) -> str:
+    values = {"attempt": attempt, "max_attempts": tries, "failures": report, "checks": checks,
+              "denied": prompt_loader.code_list(deny)}
+    text = run_prompt(run, "fix", "check_repair", **values) if run is not None else prompts.render_engine("fix", **values)
     return check_repair.builder_prompt(text)
 
 
@@ -2007,8 +1969,8 @@ class Build(TicketWork):
 
     def repair_focused(self) -> tuple[str, Result]:
         step = self.next_step("review_regression_fix")
-        prompt = prompt_loader.prompt("review_fix", problems=self.repair_feedback(), notes="None.",
-                                      denied=prompt_loader.code_list(self.deny))
+        prompt = run_prompt(self.run, "review_fix", "review_repair", problems=self.repair_feedback(), notes="None.",
+                            denied=prompt_loader.code_list(self.deny))
         return step, self.resume(step, prompt, role="review_repair")
 
     def focused_repair_limit(self) -> str:
@@ -2289,7 +2251,8 @@ class Build(TicketWork):
             failures = [item for item in self.check_results if not item["passed"]]
             self.run.story.append(check_failure_story(f"Checks failed on attempt {attempts}:", failures, self.report))
             attempts += 1
-            self.resume(step_name(attempts), check_fix_prompt(attempts, tries, self.report, self.check_commands, self.deny),
+            self.resume(step_name(attempts),
+                        check_fix_prompt(attempts, tries, self.report, self.check_commands, self.deny, run=self.run),
                         role="check_repair")
 
     def recheck(self, after: str, *, focused: str = "", return_focused_hold: bool = False) -> None:
@@ -3596,16 +3559,23 @@ def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
     pin = pins.current()
     if repo.layer:
         if pin is not None and pin.layer is not None:
+            prompts.validate_layer_appends(pin.layer.dir)
             try:
                 steps.check(cfg, pin.layer)
             except (ValueError, TypeError) as e:
                 raise workspace.RunFailed(f"{paths.short_path(pin.layer.config_file)}: {e}") from e
             return pin.layer
-        return checked_layer(cfg, repo.layer)
-    if (ws / ".agents" / "config.toml").exists():
-        return checked_layer(cfg, ws / ".agents")
+        layer = checked_layer(cfg, repo.layer)
+        prompts.validate_layer_appends(layer.dir)
+        return layer
+    if (ws / ".agents" / "config.toml").exists() or (ws / ".agents" / "prompts").is_dir():
+        layer = checked_layer(cfg, ws / ".agents")
+        prompts.validate_layer_appends(layer.dir)
+        return layer
     run.log(f"layer: {paths.short_path(repo.path / '.agents')} is not committed; lessons stay in the main checkout")
-    return checked_layer(cfg, repo.path / ".agents")
+    layer = checked_layer(cfg, repo.path / ".agents")
+    prompts.validate_layer_appends(layer.dir)
+    return layer
 
 
 def triage_checks(approval: dict | None) -> str:
@@ -3755,9 +3725,10 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                 + feedback)
         estimate = 0
         run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
-        res = run.agent("revise", brief.prompt("revise", feedback=feedback, checks=runs_checks),
+        res = run.agent("revise", prompt_loader.task_prompt(
+            run.prompt("revise", "build", **brief.values(feedback=feedback, checks=runs_checks))),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES,
-                        json_schema=REVISE_SCHEMA)
+                        json_schema=run.schema("revise", "build"))
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text, recovery=runner.start_failure(res, "build"))
         run.facts["left_for_a_person"] = left_for_a_person
@@ -3766,10 +3737,11 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         if stage(checkouts, deny).empty:
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
-        res = run.agent("plan", brief.prompt(
-            "plan", triage=triage_notes(approval), checks=checks,
-            journeys=journeys.guidance(layer.verify.feature_map, planning=True) if layer.verify else ""),
-                        ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
+        res = run.agent("plan", prompt_loader.task_prompt(run.prompt(
+            "plan", "plan", **brief.values(
+                triage=triage_notes(approval), checks=checks,
+                journeys=journeys.guidance(layer.verify.feature_map, planning=True) if layer.verify else ""))),
+                        ws, role="plan", allowed_tools=read_rules, json_schema=run.schema("plan", "plan"))
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "planning step failed", recovery=runner.start_failure(res, "plan"))
         plan = res.structured
@@ -3792,8 +3764,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                         f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
         run.facts.update(assumptions=assumptions_of(plan), left_for_a_person=left_for_a_person)
 
-        res = run.agent("build", brief.prompt(
-            "build", plan=plan_text, checks=runs_checks, estimate=estimate, verify=goal),
+        res = run.agent("build", prompt_loader.task_prompt(run.prompt(
+            "build", "build", **brief.values(plan=plan_text, checks=runs_checks, estimate=estimate, verify=goal))),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES)
         if not res.ok:
             return _fail(run, "build step failed", res.text, recovery=runner.start_failure(res, "build"))
@@ -3831,8 +3803,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             run.story.append(f"Review requested changes:\n{problems}")
             step = round_name("review_fix", n)
             b.capture_repair_baselines(f"{step}:before")
-            reply = b.resume(step, prompt_loader.prompt("review_fix", problems=b.repair_feedback() or problems,
-                                                       notes=review.fix_notes(), denied=brief.denied),
+            reply = b.resume(step, run.prompt("review_fix", "review_repair", problems=b.repair_feedback() or problems,
+                                              notes=review.fix_notes(), denied=brief.denied),
                              role="review_repair").text
             passed, reply = b.retry_focused_repairs(step, reply)
             if not passed:
@@ -5609,7 +5581,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         watched_before = (ignored_before | (untracked_before & parent_tracked)) - scratch_before
         fingerprints = {n: workspace.fingerprint(c.wt / n, "") for n in watched_before}
         previous = run.sessions.get("build")
-        text = prompt_loader.prompt("resolve", repo=run.repo.name, github=c.github, base=named,
+        text = run.prompt("resolve", "build", repo=run.repo.name, github=c.github, base=named,
                       base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
                       ref=ticket.ref, title=ticket.title, body=ticket.body,
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
@@ -5621,7 +5593,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         try:
             res = run.agent(round_name("resolve", n), prompt_loader.task_prompt(text), c.wt, role="build",
                             allowed_tools=prompt_loader.bash_rules(bash_rules), disallowed_tools=routing.NO_GIT_WRITES,
-                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
+                            json_schema=run.schema("resolve", "build"), resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
                 run.sessions.pop("build", None)
@@ -5738,11 +5710,13 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     name = b.next_step("ci_fix")
-    text = prompt_loader.prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
-                  merged_base=merged_base, left_for_a_person=left, denied=prompt_loader.code_list(b.deny))
+    text = run.prompt("ci_fix", "ci_repair", round=n, max_rounds=max_rounds, failures=failures, diff=diff,
+                      checks=b.check_commands, merged_base=merged_base, left_for_a_person=left,
+                      denied=prompt_loader.code_list(b.deny))
     if carried := b.repair_feedback():
         text += f"\n\nAddress these review findings and keep earlier repairs working:\n\n{carried}"
-    res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair", json_schema=CI_FIX_SCHEMA)
+    res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair",
+                                                         json_schema=run.schema("ci_fix", "ci_repair"))
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
             r.reason = "The CI fix step failed before it judged this check."
@@ -5763,7 +5737,7 @@ def judge_publication_ci(b: Build, pushed: list[workspace.Checkout], reds: list[
                 "Use the exact check headings below and give the reason for each verdict. Make no edits.\n\n"
                 f"{failures}\n\n## Published diff\n\n```diff\n{diff}\n```")
         res = run.agent(b.next_step("ci_judge"), prompt_loader.task_prompt(text), b.ws, role="ci_repair",
-                        read_only=True, persist=False, json_schema=CI_FIX_SCHEMA)
+                        read_only=True, persist=False, json_schema=run.schema("ci_fix", "ci_repair"))
     except (RuntimeError, OSError, ValueError) as e:
         run.log(f"ci: could not judge the published checks: {util.first_line(str(e), 300)}")
         return
@@ -6171,18 +6145,19 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
         earlier = list(before.blocking())
         listed = {p.get("finding") for p in earlier}
         earlier.extend(p for key, p in reconsider.items() if key not in listed)
-        schema = REVIEW_SCHEMA
-        text = b.brief.prompt(
-            "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
-            diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-            earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+        schema = run_schema(b.run, "review", "review")
+        review_kw = {
+            "plan": plan, "checks": b.report, "evidence": verified.markdown(),
+            "compare": compare_with_fork(b.checkouts),
+            "diff": util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+            "earlier": earlier_review(earlier, reply, fixed_since(b, before.trees or {})),
+        }
+        text = (prompt_loader.task_prompt(run_prompt(b.run, "review", "review", **b.brief.values(**review_kw)))
+                if isinstance(b.brief, prompt_loader.Brief) else b.brief.prompt("review", **review_kw))
         context = nullcontext((text, {}))
     else:
         earlier = list(reconsider.values())
-        schema = CATCH_UP_REVIEW_SCHEMA
-        if earlier:
-            schema = {**schema, "properties": {**schema["properties"], "earlier": REVIEW_SCHEMA["properties"]["earlier"]},
-                      "required": [*schema["required"], "earlier"]}
+        schema = catch_up_schema(run_schema(b.run, "review", "review"), earlier=bool(earlier))
         context = catch_up_review_prompt(b, catch_up, plan, verified, before)
     allowed_tools = prompt_loader.bash_rules(b.read_bash)
     names = prompt_loader.code_list(sorted(b.repair_commands())) or "None configured."
@@ -6252,8 +6227,9 @@ def catch_up_review_prompt(b: Build, c: workspace.Checkout, plan: str, verified:
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
     if not earlier:
         return ""
-    return prompt_loader.prompt("review_earlier", blockers=numbered(earlier), reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
-                  fixed=fixed or NO_FIX_DIFF)
+    return prompts.render_engine("review_earlier", blockers=numbered(earlier),
+                                 reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
+                                 fixed=fixed or NO_FIX_DIFF)
 
 
 def index_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
@@ -6299,9 +6275,9 @@ def verify_in_use(b: Build, goal: str, summary: str, *, return_focused_hold: boo
 
 @runlimits.verification
 def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified) -> None:
-    b.resume(b.next_step("verify_fix"), prompt_loader.prompt("verify_fix", attempt=attempt, max_attempts=tries,
-                                               failures=verified.markdown(), checks=b.check_commands,
-                                               denied=prompt_loader.code_list(b.deny)),
+    b.resume(b.next_step("verify_fix"), run_prompt(b.run, "verify_fix", "check_repair", attempt=attempt,
+                                                   max_attempts=tries, failures=verified.markdown(),
+                                                   checks=b.check_commands, denied=prompt_loader.code_list(b.deny)),
              role="check_repair")
 
 
@@ -6475,16 +6451,24 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             if not replay_only and probes_passed:
                 agent_started = True
                 fault_controls = verify.fault_note(v) if url and delivery_verification else ""
-                res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
-                    scratch=scratch.note(attempt),
-                    commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
-                    env_example=verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",
-                    compare=compare_with_fork(b.checkouts), owner=run.owner_note,
-                    journeys=journeys.guidance(selected if requested or covered_commands else feature_map), **values),
+                verify_kw = {
+                    "surface": surface_note(v, url, evidence) + fault_controls, "notes": v.notes,
+                    "scratch": scratch.note(attempt),
+                    "commands": prompt_loader.code_list(bash), "checks": check_list(b.layer),
+                    "env_example": verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",
+                    "compare": compare_with_fork(b.checkouts), "owner": run.owner_note,
+                    "journeys": journeys.guidance(selected if requested or covered_commands else feature_map),
+                    **values,
+                }
+                verify_text = (
+                    prompt_loader.task_prompt(run_prompt(run, prompt_name, role, **b.brief.values(**verify_kw)))
+                    if isinstance(b.brief, prompt_loader.Brief) else b.brief.prompt(prompt_name, **verify_kw)
+                )
+                res = run.agent(step, verify_text,
                                 b.ws, role=role,
                                 allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
-                                disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.candidate_schema(delivery_token),
+                                disallowed_tools=routing.NO_GIT_WRITES,
+                                json_schema=verify.candidate_schema(delivery_token, base=run_schema(run, prompt_name, role)),
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
@@ -6742,10 +6726,10 @@ def expertise_now(expertise_file: Path) -> str:
 
 
 def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw) -> Learned | None:
-    res = run.agent(call, prompt_loader.prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
-                                  story="\n\n".join(run.story), expertise=expertise or "(none yet)",
-                                  max_lines=EXPERTISE_MAX_LINES),
-                    wt, role="learn", json_schema=LEARN_SCHEMA, persist=False, **kw)
+    res = run.agent(call, run_prompt(run, "learn", "learn", repo=run.repo.name, ref=run.ref, title=title,
+                                     story="\n\n".join(run.story), expertise=expertise or "(none yet)",
+                                     max_lines=EXPERTISE_MAX_LINES),
+                    wt, role="learn", json_schema=run_schema(run, "learn", "learn"), persist=False, **kw)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     try:
         return learning.parse(found, expertise)

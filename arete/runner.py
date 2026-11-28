@@ -928,16 +928,19 @@ def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> N
 
 
 def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Session, atom: str,
-                     try_no: int) -> tuple[list[dict], tuple[tuple[str, str, int], ...], str]:
-    from . import factory, pins, prompt_loader
+                     try_no: int) -> tuple[list[dict], tuple[tuple[str, str, int], ...], str, str, str, str]:
+    from . import factory, pins, prompt_loader, prompts
     from .store import blobs as blob_store
 
     if not trace[0]:
-        return [], (), ""
+        return [], (), "", "", "", ""
     pin = pins.current()
     items: list[dict] = []
     blobs_to_write: dict[str, tuple[str, bytes]] = {}
     call_no = max(0, int(try_no or 0))
+    step_prompt_version = ""
+    step_prompt_level = ""
+    step_schema_version = ""
 
     rendered_bytes = str(prompt).encode("utf-8")
     rendered_sha = blob_store.digest(rendered_bytes)
@@ -945,14 +948,26 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
     items.append({"role": "rendered", "name": trace[1], "sha256": rendered_sha, "call": call_no})
 
     if isinstance(prompt, prompt_loader.Rendered) and prompt.prompt_name:
+        level = prompt.prompt_level if prompt.prompt_level in ("engine", "config", "arm", "run") else "engine"
+        step_prompt_version = prompt.prompt_version
+        step_prompt_level = level
         items.append({
             "role": "prompt",
             "name": prompt.prompt_name,
             "version": prompt.prompt_version,
-            "level": prompt.prompt_level,
+            "level": level,
             "sha256": prompt.prompt_sha256,
             "call": call_no,
         })
+        for app in prompt.prompt_appends:
+            items.append({
+                "role": "prompt_append",
+                "name": str(app.get("name") or ""),
+                "version": str(app.get("version") or ""),
+                "level": str(app.get("level") or ""),
+                "sha256": str(app.get("sha256") or ""),
+                "call": call_no,
+            })
         input_bytes = json.dumps(prompt.prompt_values, sort_keys=True, separators=(",", ":"),
                                  ensure_ascii=False, default=str).encode("utf-8")
         input_sha = blob_store.digest(input_bytes)
@@ -960,8 +975,16 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
         items.append({"role": "inputs", "name": prompt.prompt_name, "sha256": input_sha, "call": call_no})
 
     if (schema_obj := kw.get("json_schema")) is not None and isinstance(schema_obj, dict):
-        sname, sver, ssha = pins.identify_schema(schema_obj, trace[1])
-        items.append({"role": "schema", "name": sname, "version": sver, "level": "engine",
+        if isinstance(schema_obj, prompts.LoadedSchema) and schema_obj.schema_name:
+            sname = schema_obj.schema_name
+            sver = schema_obj.schema_version
+            slevel = schema_obj.schema_level if schema_obj.schema_level in ("engine", "config", "arm", "run") else "engine"
+            ssha = schema_obj.schema_sha256
+        else:
+            sname, sver, ssha = pins.identify_schema(schema_obj, trace[1])
+            slevel = "engine"
+        step_schema_version = sver
+        items.append({"role": "schema", "name": sname, "version": sver, "level": slevel,
                       "sha256": ssha, "call": call_no})
         if (seam := factory.inside(trace[0])) is not None:
             seam.schema = sver
@@ -987,7 +1010,7 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
         blob_rows.append((sha, blob_kind, len(data)))
 
     settings_sha = pin.settings_sha_for(atom or trace[1]) if pin is not None else ""
-    return items, tuple(blob_rows), settings_sha
+    return items, tuple(blob_rows), settings_sha, step_prompt_version, step_prompt_level, step_schema_version
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
@@ -1048,7 +1071,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             return token_cost(openrouter_quote.rates, res.tokens_in, res.tokens_out, res.cache_read, res.cache_write)
         return 0.0 if on_local else priced(res, cfg)
 
-    step_inputs, step_blob_rows, step_settings_sha = _step_inputs_for(prompt, trace, kw, resume, atom, try_no)
+    (step_inputs, step_blob_rows, step_settings_sha, step_prompt_version,
+     step_prompt_level, step_schema_version) = _step_inputs_for(prompt, trace, kw, resume, atom, try_no)
 
     def persist(res: Result) -> None:
         try:
@@ -1057,7 +1081,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                              [(call, call.call_seconds if res.calls else time.monotonic() - started)
                               for call in res.calls or [res]], effort=kw.get("effort", ""),
                              tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "",
-                             inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows)
+                             inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows,
+                             prompt_version=step_prompt_version, prompt_level=step_prompt_level,
+                             schema_version=step_schema_version)
         except BaseException as error:
             rec.finish(replace(res, ok=False, error=scrub.text(
                 f"cost is not in steps: {record.failure(error)}; {res.error}", "record", subject, extra=hidden)),

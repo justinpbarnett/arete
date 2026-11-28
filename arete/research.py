@@ -17,6 +17,7 @@ from . import (
     jev_verdicts,
     paths,
     prompt_loader,
+    prompts,
     research_budget,
     research_plan,
     research_search,
@@ -444,7 +445,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
     budget = budget_for(cfg)
     if started is not None:
         budget.started = started
-    planned = research_plan.plan(cfg, budget, prompt_loader.prompt("research_plan", **values), cwd, add_dirs, ref, family)
+    planned = research_plan.plan(cfg, budget, prompts.render_engine("research_plan", **values), cwd, add_dirs, ref, family)
     if not planned.plan:
         return Result(ok=False, error=planned.error), budget.spent_usd
     plan = planned.plan
@@ -471,7 +472,7 @@ def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
         brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
-    res = budget.call(prompt_loader.prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
+    res = budget.call(prompts.render_engine("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
                       model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
                       add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)
     return res, budget.spent_usd
@@ -558,7 +559,7 @@ def ask(cfg, ref, values, h, filed_path, dirs, done, started, judged):
             res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
                               [o["ref"] for _, o, _ in done], started, judged)
         else:
-            res = runner.run(prompt_loader.prompt("research", **values, **filing(h, filed_path)),
+            res = runner.run(prompts.render_engine("research", **values, **filing(h, filed_path)),
                              cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
                              json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                              timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),

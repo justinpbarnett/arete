@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [approved, approved_head, attachments, base, base_head, body, checkout, checks, comments, earlier, evidence, fork, merged_head, plan, ref, repo, resolution, sources, title]
+---
 Review the effect of catching an already approved PR up to a moved base.
 
 Repository $repo. The checkout under review is `$checkout`.

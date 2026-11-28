@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 18
+MINOR = 19
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -85,7 +85,10 @@ RESOURCE = {
                  "cost_usd": NUMBER, "seconds": NUMBER,
                  "settings_sha": NULL_TEXT,
                  "settings": {"type": ["object", "null"], "additionalProperties": JSON},
-                 "inputs": {"type": ["array", "null"], "items": mapping(JSON)}},
+                 "inputs": {"type": ["array", "null"], "items": mapping(JSON)},
+                 "prompt_version": NULL_TEXT,
+                 "prompt_level": NULL_TEXT,
+                 "schema_version": NULL_TEXT},
                 ["id", "run_id", "name", "model", "runner", "cost_usd", "seconds"]),
     "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
     "incident": obj({"id": STRING, "detail": INCIDENT}),

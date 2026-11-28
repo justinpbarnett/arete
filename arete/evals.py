@@ -32,12 +32,12 @@ from . import (
     verify,
     workspace,
 )
+from . import prompts as prompt_resolver
 from .agent import BUILD_TOOLS, READ_TOOLS
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
     MAX_DIFF_IN_PROMPT,
-    PLAN_SCHEMA,
     AgentRun,
     TicketWork,
     check_calls,
@@ -47,7 +47,7 @@ from .pipeline import (
     run_checks,
     use_product,
 )
-from .review import REVIEW_SCHEMA, review_problems
+from .review import review_problems
 from .store import insights as insights_store
 from .store import runs as run_store
 from .util import git
@@ -759,7 +759,7 @@ def review(run: EvalRun, wt: Path, brief: prompt_loader.Brief, plan: str, report
         "review", plan=plan, checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
         compare="`git diff HEAD`", earlier=""),
                     wt, role="review", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH),
-                    json_schema=REVIEW_SCHEMA, timeout=timeout)
+                    json_schema=prompt_resolver.engine_schema("review"), timeout=timeout)
     if not res.ok or not isinstance(res.structured, dict):
         raise workspace.RunFailed("review step failed")
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
@@ -874,7 +874,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         res = run.agent("plan", brief.prompt(
             "plan", prompts.dir, triage="", checks=checks),
                         wt, **run.call_kw(cfg, "plan", READ_TOOLS, prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH)),
-                        json_schema=PLAN_SCHEMA, timeout=timeout)
+                        json_schema=prompt_resolver.engine_schema("plan"), timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
             result.why = "plan step failed"
             return result
@@ -897,8 +897,8 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         try:
             while not ok and run.may_repair(attempts, max_attempts):
                 attempts += 1
-                fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
-                                           checks=runs_checks, denied=brief.denied)
+                fix = prompt_resolver.render_engine("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts,
+                                                    failures=report, checks=runs_checks, denied=brief.denied)
                 res = run.agent(f"fix{attempts}", prompt_loader.task_prompt(fix), wt,
                                 **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,

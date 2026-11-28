@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import (alerts, config, delegation, environment, factory, flows, gh, jira, launch_lease, outbound,
-               owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, queueing, record,
+               owner_asks, paths, pilot, pipeline, pr_recovery, principals, prompt_loader, prompts, queueing, record,
                run_lines, runlimits, steps, tracker, util, vault, workspace, zte)
 from .agent import json_from_text
 from .store import asks as asks_store
@@ -382,7 +382,7 @@ def _diagnose_pinned(cfg, repo, layer, setting, report: str, row, attempt: str, 
     place = run.dir / "controller"
     place.mkdir(mode=0o700)
     observation = {"exhausted_limit": limit, "allowed_evidence_keys": list(evidence), "evidence": evidence}
-    prompt = prompt_loader.prompt("unblock", observation=json.dumps(observation),
+    prompt = prompts.render_engine("unblock", observation=json.dumps(observation),
                                   verification_policy=prompt_loader.VERIFICATION_POLICY)
     request = delegation.request(SimpleNamespace(run=run, cfg=cfg, layer=layer, ws=place), "unblock", prompt,
                                  setting, (), [])

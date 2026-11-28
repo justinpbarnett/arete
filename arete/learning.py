@@ -5,19 +5,6 @@ from typing import NamedTuple
 
 MAX_LINES = 80
 MAX_ADDED = 3
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "expertise": {"type": "string"},
-        "added": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ADDED},
-        "removed": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"lesson": {"type": "string"}, "why": {"type": "string"}},
-            "required": ["lesson", "why"],
-        }},
-    },
-    "required": ["expertise", "added", "removed"],
-}
 
 
 class Rewrite(NamedTuple):

@@ -24,50 +24,6 @@ REPAIR_SELECTOR_SCHEMA = {
     "required": ["selectors"],
 }
 
-REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "changes": {"type": "string"},
-        "problems": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "file": {"type": "string"},
-                    "problem": {"type": "string"},
-                    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
-                    "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
-                    "acceptance": {"type": "string"},
-                    "verification": {
-                        "type": "string",
-                        "enum": list(REPAIR_METHODS),
-                        "description": "Defaults to check for blockers. Use review for inspection or in_use for a "
-                                       "live observation.",
-                    },
-                    "check": {"type": "string"},
-                    "test_class": {"type": "string"},
-                    "verification_reason": {"type": "string"},
-                },
-                "required": ["problem", "severity"],
-            },
-        },
-        "earlier": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "status": {"type": "string", "enum": list(EARLIER_STATUSES)},
-                    "why": {"type": "string"},
-                },
-                "required": ["id", "status", "why"],
-            },
-        },
-    },
-    "required": ["summary", "problems"],
-}
-
 _LOCATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -77,19 +33,23 @@ _LOCATION_SCHEMA = {
     },
     "required": ["file"],
 }
-_PROBLEMS_SCHEMA = REVIEW_SCHEMA["properties"]["problems"]
-_PROBLEM_SCHEMA = _PROBLEMS_SCHEMA["items"]
-CATCH_UP_REVIEW_SCHEMA = {
-    **REVIEW_SCHEMA,
-    "properties": {
-        "summary": REVIEW_SCHEMA["properties"]["summary"],
-        "changes": REVIEW_SCHEMA["properties"]["changes"],
+
+
+def catch_up_schema(base: dict | None = None, *, earlier: bool = False) -> dict:
+    from . import prompts
+
+    src = base if base is not None else prompts.engine_schema("review")
+    problems_schema = src["properties"]["problems"]
+    problem_schema = problems_schema["items"]
+    props = {
+        "summary": src["properties"]["summary"],
+        "changes": src["properties"]["changes"],
         "problems": {
-            **_PROBLEMS_SCHEMA,
+            **problems_schema,
             "items": {
-                **_PROBLEM_SCHEMA,
+                **problem_schema,
                 "properties": {
-                    **_PROBLEM_SCHEMA["properties"],
+                    **problem_schema["properties"],
                     "attribution": {
                         **_LOCATION_SCHEMA,
                         "description": "Cite a changed line, or a changed file in the base or resolution part with no text hunk.",
@@ -104,8 +64,19 @@ CATCH_UP_REVIEW_SCHEMA = {
                 },
             },
         },
-    },
-}
+    }
+    required = list(src["required"])
+    if earlier and "earlier" in src["properties"]:
+        props["earlier"] = src["properties"]["earlier"]
+        if "earlier" not in required:
+            required.append("earlier")
+    built = {**src, "properties": props, "required": required}
+    if isinstance(src, prompts.LoadedSchema) and src.schema_name:
+        return prompts.LoadedSchema(
+            built, name=src.schema_name, version=src.schema_version,
+            level=src.schema_level, sha256=src.schema_sha256,
+        )
+    return built
 _HUNK_START = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", re.MULTILINE)
 _PATCH_SECTION = re.compile(r"^diff --git ", re.MULTILINE)
 _SAME_PATH = re.compile(r'("?)a/(.+)\1 \1b/\2\1')

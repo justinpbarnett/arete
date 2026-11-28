@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import codebase, config, configrepo, paths, prices, principals, steps, util
+from . import codebase, config, configrepo, paths, prices, principals, prompts, steps, util
 from .store import blobs as blob_store
 from .store import db as foundation
 from .store import runs as run_store
@@ -45,6 +45,9 @@ class Resolution:
     blob_payloads: dict[str, tuple[str, bytes]] = field(default_factory=dict)
     payer: str | None = None
     ab_held: dict[str, tuple[str, str, dict]] = field(default_factory=dict)
+    prompt_appends: dict[str, tuple[prompts.LayerAppend, ...]] = field(default_factory=dict)
+    schema_objects: dict[str, dict] = field(default_factory=dict)
+    draft_id: str = ""
 
     @property
     def config(self) -> config.Config:
@@ -188,18 +191,18 @@ def schema_id(name: str, sha: str) -> str:
 
 
 def known_step_schemas() -> dict[str, dict]:
-    from . import chat, patching, pipeline, review
+    from . import chat, patching
 
-    return {
-        "plan": pipeline.PLAN_SCHEMA,
-        "patch": patching.SCHEMA,
-        "revise": pipeline.REVISE_SCHEMA,
-        "review": review.REVIEW_SCHEMA,
-        "learn": pipeline.LEARN_SCHEMA,
-        "ci_fix": pipeline.CI_FIX_SCHEMA,
-        "resolve": pipeline.RESOLVE_SCHEMA,
-        "chat": chat.REPLY_SCHEMA,
-    }
+    found: dict[str, dict] = {}
+    if paths.SCHEMAS_DIR.is_dir():
+        for file in sorted(paths.SCHEMAS_DIR.glob("*.json")):
+            try:
+                found[file.stem] = prompts.engine_schema(file.stem)
+            except (OSError, ValueError):
+                continue
+    found["patch"] = patching.SCHEMA
+    found["chat"] = chat.REPLY_SCHEMA
+    return found
 
 
 def step_schema_version(step_name: str) -> str:
@@ -207,24 +210,52 @@ def step_schema_version(step_name: str) -> str:
     obj = schemas.get(step_name)
     if obj is None:
         return ""
+    if isinstance(obj, prompts.LoadedSchema) and obj.schema_version:
+        return obj.schema_version
     return schema_id(step_name, schema_digest(obj))
 
 
 def identify_schema(schema_obj: dict, fallback_name: str = "output") -> tuple[str, str, str]:
+    if isinstance(schema_obj, prompts.LoadedSchema) and schema_obj.schema_name:
+        return schema_obj.schema_name, schema_obj.schema_version, schema_obj.schema_sha256
     target_sha = schema_digest(schema_obj)
     for name, known in known_step_schemas().items():
         if schema_digest(known) == target_sha:
+            if isinstance(known, prompts.LoadedSchema) and known.schema_version:
+                return name, known.schema_version, known.schema_sha256
             return name, schema_id(name, target_sha), target_sha
     clean = fallback_name or "output"
     return clean, schema_id(clean, target_sha), target_sha
 
 
 def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str, prompts_from: str,
-                  *, repo_root: Path | None = None, config_dir: Path | None = None) -> tuple[dict[str, str], dict[str, dict]]:
+                  *, repo_root: Path | None = None, config_dir: Path | None = None,
+                  config_commit: str = "", arm: dict | None = None,
+                  draft_id: str = "") -> tuple[dict[str, str], dict[str, dict]]:
     texts: dict[str, str] = {}
     meta: dict[str, dict] = {}
+    engine_names: set[str] = set()
     if paths.PROMPTS_DIR.is_dir():
         for file in sorted(paths.PROMPTS_DIR.glob("*.md")):
+            try:
+                raw = file.read_bytes()
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            sha = hashlib.sha256(raw).hexdigest()
+            engine_names.add(file.stem)
+            texts[file.stem] = text
+            meta[file.stem] = {
+                "id": f"prompt/{file.stem}@{sha[:12]}",
+                "level": "engine",
+                "from": f"arete/prompts/{file.name}@{engine_sha}",
+                "sha256": sha,
+            }
+
+    if config_dir is not None and (cfg_prompts := config_dir / "prompts").is_dir():
+        for file in sorted(cfg_prompts.glob("*.md")):
+            if file.stem not in engine_names or not file.is_file():
+                continue
             try:
                 raw = file.read_bytes()
                 text = raw.decode("utf-8")
@@ -234,10 +265,42 @@ def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str,
             texts[file.stem] = text
             meta[file.stem] = {
                 "id": f"prompt/{file.stem}@{sha[:12]}",
-                "level": "engine",
-                "from": f"arete/prompts/{file.name}@{engine_sha}",
+                "level": "config",
+                "from": f"prompts/{file.name}@{config_commit}" if config_commit else f"prompts/{file.name}",
                 "sha256": sha,
             }
+
+    if isinstance(arm, dict) and arm:
+        arm_name = str(arm.get("name") or "arm")
+        arm_dir = arm.get("prompts_dir") or arm.get("prompts")
+        if isinstance(arm_dir, (str, Path)) and Path(arm_dir).is_dir():
+            for file in sorted(Path(arm_dir).glob("*.md")):
+                try:
+                    raw = file.read_bytes()
+                    text = raw.decode("utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                sha = hashlib.sha256(raw).hexdigest()
+                texts[file.stem] = text
+                meta[file.stem] = {
+                    "id": f"prompt/{file.stem}@{sha[:12]}",
+                    "level": "arm",
+                    "from": f"arm:{arm_name}/{file.name}",
+                    "sha256": sha,
+                }
+        elif isinstance(arm_dir, dict):
+            for fname, content in sorted(arm_dir.items()):
+                stem = Path(fname).stem
+                raw = content if isinstance(content, bytes) else str(content).encode("utf-8")
+                sha = hashlib.sha256(raw).hexdigest()
+                texts[stem] = raw.decode("utf-8")
+                meta[stem] = {
+                    "id": f"prompt/{stem}@{sha[:12]}",
+                    "level": "arm",
+                    "from": f"arm:{arm_name}/{fname}",
+                    "sha256": sha,
+                }
+
     if prompts_dir is not None and prompts_dir.resolve() != paths.PROMPTS_DIR.resolve() and prompts_dir.is_dir():
         level = prompts_level or "run"
         base_from = prompts_from or relative_path(prompts_dir, repo_root=repo_root, config_dir=config_dir)
@@ -255,7 +318,103 @@ def _load_prompts(engine_sha: str, prompts_dir: Path | None, prompts_level: str,
                 "from": f"{base_from}/{file.name}" if base_from and not base_from.endswith(file.name) else base_from,
                 "sha256": sha,
             }
+
+    if draft_id:
+        for stem in sorted(engine_names):
+            raw = prompts._draft_file_bytes(draft_id, f"prompts/{stem}.md")
+            if raw is None:
+                continue
+            sha = hashlib.sha256(raw).hexdigest()
+            texts[stem] = raw.decode("utf-8")
+            meta[stem] = {
+                "id": f"prompt/{stem}@{sha[:12]}",
+                "level": "run",
+                "from": f"draft:{draft_id}/prompts/{stem}.md",
+                "sha256": sha,
+            }
     return texts, meta
+
+
+def _load_schemas(engine_sha: str, *, config_dir: Path | None = None, config_commit: str = "",
+                  arm: dict | None = None, draft_id: str = "") -> tuple[dict[str, dict], dict[str, dict]]:
+    objects: dict[str, dict] = {}
+    meta: dict[str, dict] = {}
+    engine_file_names: set[str] = set()
+    for sname, sobj in known_step_schemas().items():
+        if isinstance(sobj, prompts.LoadedSchema) and sobj.schema_sha256:
+            engine_file_names.add(sname)
+            ssha = sobj.schema_sha256
+            sid = sobj.schema_version
+            sfrom = f"arete/schemas/{sname}.json@{engine_sha}"
+            objects[sname] = dict(sobj)
+        else:
+            ssha = schema_digest(sobj)
+            sid = schema_id(sname, ssha)
+            sfrom = f"arete@{engine_sha}"
+            objects[sname] = sobj
+        meta[sname] = {"id": sid, "level": "engine", "from": sfrom, "sha256": ssha}
+
+    if config_dir is not None and (cfg_schemas := config_dir / "schemas").is_dir():
+        for file in sorted(cfg_schemas.glob("*.json")):
+            if file.stem not in engine_file_names or not file.is_file():
+                continue
+            try:
+                raw = file.read_bytes()
+                parsed = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            ssha = hashlib.sha256(raw).hexdigest()
+            objects[file.stem] = parsed
+            meta[file.stem] = {
+                "id": schema_id(file.stem, ssha),
+                "level": "config",
+                "from": f"schemas/{file.name}@{config_commit}" if config_commit else f"schemas/{file.name}",
+                "sha256": ssha,
+            }
+
+    if isinstance(arm, dict) and arm:
+        arm_name = str(arm.get("name") or "arm")
+        arm_dir = arm.get("schemas_dir") or arm.get("schemas")
+        if isinstance(arm_dir, (str, Path)) and Path(arm_dir).is_dir():
+            for file in sorted(Path(arm_dir).glob("*.json")):
+                try:
+                    raw = file.read_bytes()
+                    parsed = json.loads(raw.decode("utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                ssha = hashlib.sha256(raw).hexdigest()
+                objects[file.stem] = parsed
+                meta[file.stem] = {
+                    "id": schema_id(file.stem, ssha),
+                    "level": "arm",
+                    "from": f"arm:{arm_name}/{file.name}",
+                    "sha256": ssha,
+                }
+
+    if draft_id:
+        for sname in sorted(engine_file_names):
+            raw = prompts._draft_file_bytes(draft_id, f"schemas/{sname}.json")
+            if raw is None:
+                continue
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            ssha = hashlib.sha256(raw).hexdigest()
+            objects[sname] = parsed
+            meta[sname] = {
+                "id": schema_id(sname, ssha),
+                "level": "run",
+                "from": f"draft:{draft_id}/schemas/{sname}.json",
+                "sha256": ssha,
+            }
+    return objects, meta
 
 
 def _adw_info(cfg: config.Config, adw_path: str, engine_sha: str, config_dir: Path,
@@ -350,7 +509,8 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
             prompts_from: str = "", ab_ticket: tuple[str, str] | None = None,
             ab_held: dict[str, tuple[str, str, dict]] | None = None,
             harness_source=None, adw_path: str = "", loop_name: str = "",
-            cfg: config.Config | None = None, engine_sha: str | None = None) -> Resolution:
+            cfg: config.Config | None = None, engine_sha: str | None = None,
+            draft_id: str = "") -> Resolution:
     engine_sha = codebase.STAMP if engine_sha is None else engine_sha
     schema_version = foundation.LATEST
     config_commit = configrepo.live_sha() if configrepo.is_repo() else ""
@@ -444,18 +604,24 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
 
     prompt_texts, prompts_meta = _load_prompts(
         engine_sha, prompts_dir, prompts_level, prompts_from,
-        repo_root=repo_root, config_dir=config_dir,
+        repo_root=repo_root, config_dir=config_dir, config_commit=config_commit,
+        arm=arm, draft_id=draft_id,
     )
 
-    schemas_meta: dict[str, dict] = {}
-    for sname, sobj in known_step_schemas().items():
-        ssha = schema_digest(sobj)
-        schemas_meta[sname] = {
-            "id": schema_id(sname, ssha),
-            "level": "engine",
-            "from": f"arete@{engine_sha}",
-            "sha256": ssha,
-        }
+    prompt_appends: dict[str, tuple[prompts.LayerAppend, ...]] = {}
+    if resolved_layer is not None and resolved_layer.dir != Path():
+        repo_name = (
+            resolved_repo.name if resolved_repo is not None else
+            (resolved_layer.dir.parent.name if resolved_layer.dir.name == ".agents" else resolved_layer.dir.name)
+        )
+        rel_prompts = relative_path(resolved_layer.dir / "prompts", repo_root=repo_root, config_dir=config_dir)
+        appends_source = f"{rel_prompts}@{config_commit}" if config_commit else rel_prompts
+        prompt_appends = prompts.load_layer_appends(resolved_layer.dir, repo_name, source_base=appends_source)
+
+    schema_objects, schemas_meta = _load_schemas(
+        engine_sha, config_dir=config_dir, config_commit=config_commit,
+        arm=arm, draft_id=draft_id,
+    )
 
     blobs_out: dict[str, tuple[str, bytes]] = {}
     expertise_meta: dict | None = None
@@ -503,6 +669,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         },
         "prices": prices_meta,
         "prompts": prompts_meta,
+        "prompt_appends": {
+            k: [a.as_row() for a in v] for k, v in sorted(prompt_appends.items())
+        },
         "schema_version": schema_version,
         "schemas": schemas_meta,
         "settings": settings_prov,
@@ -539,6 +708,9 @@ def resolve(kind: str, *, repo: config.Repo | str | None = None, layer: config.R
         resolved_bytes=resolved_bytes,
         blob_payloads=blobs_out,
         ab_held=held_map,
+        prompt_appends=prompt_appends,
+        schema_objects=schema_objects,
+        draft_id=draft_id,
     )
 
 

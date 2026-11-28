@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "properties": {
+    "plan": {
+      "type": "string"
+    },
+    "ambiguous": {
+      "type": "boolean"
+    },
+    "question": {
+      "type": "string"
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "estimated_lines": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "verify": {
+      "type": "string"
+    },
+    "left_for_a_person": {
+      "type": "string"
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "split": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ]
+      }
+    }
+  },
+  "required": [
+    "plan",
+    "ambiguous",
+    "risk",
+    "estimated_lines",
+    "verify"
+  ]
+}

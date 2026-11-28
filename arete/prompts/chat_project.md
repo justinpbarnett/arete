@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [checks, expertise, layer, path, repo]
+---
 ## This chat's project: $repo
 
 The owner tied this chat to $repo, a repo in the config. Its code is your working directory, $path. Answer about its

@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [arete_prompts, arete_repo, audit, check_adoption, digest, done, earlier_feedback, events, feedback, global_repo, hours, max, pending, records, rejected, repos, since]
+---
 You improve the harness that coding agents work in and propose repository enforcement for recurring corrections.
 Below is a digest of the last $hours hours of a person working with Claude Code, plus tool failure stats.
 The digest also covers arete's own recorded runs.

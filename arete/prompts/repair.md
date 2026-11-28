@@ -1,7 +1,11 @@
+---
+schema: 1
+inputs: [attachments, body, checks, commands, comments, denied, expertise, findings, max_lines, owner, plan, ref, repo, source, test_classes, title, worktree]
+---
 You are the builder in an unattended build pipeline. Arete's own final review of the open PR for this issue still
 requested changes. $owner
 
-Repository: $repo. $workspace
+Repository: $repo. $worktree
 
 ## Issue $ref: $title
 

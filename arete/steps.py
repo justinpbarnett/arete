@@ -50,6 +50,8 @@ class Settings:
     ab_name: str = ""
     ab_side: str = ""
     ab_arm: str = ""
+    prompts: dict[str, str] = field(default_factory=dict)
+    schemas: dict[str, str] = field(default_factory=dict)
 
     def effort_on(self, which: str) -> str:
         return routing.nearest_effort(which, self.effort)
@@ -160,6 +162,15 @@ def _json_value(value):
     return value
 
 
+def _merge_map(settings: dict, prov: dict[str, dict], key: str, values: dict[str, str],
+               level_name: str, source_name: str) -> None:
+    settings[key] = {**settings.get(key, {}), **values}
+    merged_prov = dict(prov.get(key, {}))
+    for call_name, file_name in values.items():
+        merged_prov[call_name] = {"value": file_name, "level": level_name, "from": source_name}
+    prov[key] = merged_prov
+
+
 def merged_provenance(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, overrides: dict,
                       inherited: dict | None = None, arm: dict | None = None, *,
                       config_commit: str = "", layer_from: str = "", arm_from: str = "",
@@ -178,11 +189,21 @@ def merged_provenance(cfg: config.Config, layer: config.RepoLayer, role: str, ki
             engine_sha=engine_sha,
         )
         settings, own_route = dict(base_settings), False
+        for k in config.STEP_MAPS:
+            if k in settings:
+                settings[k] = dict(settings[k])
         for k, entry in base_prov.items():
-            prov[k] = {"value": entry["value"], "level": "inherit", "from": entry["from"]}
+            if k in config.STEP_MAPS:
+                prov[k] = {ck: {"value": cv["value"], "level": "inherit", "from": cv["from"]}
+                           for ck, cv in entry.items()}
+            else:
+                prov[k] = {"value": entry["value"], "level": "inherit", "from": entry["from"]}
         for k, v in built_in.get(role, {}).items():
-            settings[k] = v
-            prov[k] = {"value": _json_value(v), "level": "engine", "from": engine_source}
+            if k in config.STEP_MAPS:
+                _merge_map(settings, prov, k, v, "engine", engine_source)
+            else:
+                settings[k] = v
+                prov[k] = {"value": _json_value(v), "level": "engine", "from": engine_source}
     else:
         limits_set = getattr(layer, "_limits_set", frozenset())
         settings, own_route = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts}, True
@@ -198,8 +219,11 @@ def merged_provenance(cfg: config.Config, layer: config.RepoLayer, role: str, ki
         }
         for table in (defaults, built_in.get(role, {})):
             for k, v in table.items():
-                settings[k] = v
-                prov[k] = {"value": _json_value(v), "level": "engine", "from": engine_source}
+                if k in config.STEP_MAPS:
+                    _merge_map(settings, prov, k, v, "engine", engine_source)
+                else:
+                    settings[k] = v
+                    prov[k] = {"value": _json_value(v), "level": "engine", "from": engine_source}
     explicit_runner = False
     layers = (
         (cfg.steps.get(role), "config", cfg_source),
@@ -223,8 +247,13 @@ def merged_provenance(cfg: config.Config, layer: config.RepoLayer, role: str, ki
             own_route = True
         if table:
             for k, v in table.items():
-                settings[k] = v
-                prov[k] = {"value": _json_value(v), "level": level_name, "from": source_name}
+                if k in config.STEP_MAPS:
+                    if level_name in ("layer", "layer kind"):
+                        continue
+                    _merge_map(settings, prov, k, v, level_name, source_name)
+                else:
+                    settings[k] = v
+                    prov[k] = {"value": _json_value(v), "level": level_name, "from": source_name}
     if base:
         settings["explicit_route"] = own_route or explicit_runner
     return settings, prov
@@ -415,15 +444,19 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
                         instructions_explicit=explicit is not None, requires=requires,
                         inherits=config.INHERITS.get(role, ""), budget_usd=found.get("budget_usd"),
                         explicit_route=found.get("explicit_route", False), ab_name=ab_name, ab_side=ab_side,
-                        ab_arm=json.dumps(arm) if arm else "")
+                        ab_arm=json.dumps(arm) if arm else "",
+                        prompts=dict(found.get("prompt", {})), schemas=dict(found.get("schema", {})))
     if not provenance:
         return resolved
     runner_src = prov.get("runner", route_prov)
     provider_src = prov.get("provider", route_prov)
-    out_prov: dict[str, dict] = {
-        k: {"value": _json_value(v["value"]), "level": v["level"], "from": v["from"]}
-        for k, v in prov.items()
-    }
+    out_prov: dict[str, dict] = {}
+    for k, v in prov.items():
+        if k in config.STEP_MAPS:
+            out_prov[k] = {ck: {"value": cv["value"], "level": cv["level"], "from": cv["from"]}
+                           for ck, cv in v.items()}
+        else:
+            out_prov[k] = {"value": _json_value(v["value"]), "level": v["level"], "from": v["from"]}
     if name:
         out_prov["model"] = {"value": name, "level": route_prov["level"], "from": route_prov["from"]}
     if which:

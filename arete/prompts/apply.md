@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [denied, proposals]
+---
 Apply these harness changes to the repository in your working directory. Each one was mined from real
 sessions where an agent needed correcting. Make each change exactly where it says, in the file's existing
 voice and format, as briefly as it can be said.

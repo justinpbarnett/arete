@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "caused_by_pr": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "caused_by_pr",
+          "reason"
+        ]
+      }
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "checks",
+    "summary"
+  ]
+}

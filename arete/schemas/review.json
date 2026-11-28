@@ -1,0 +1,98 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "changes": {
+      "type": "string"
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "problem": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "blocker",
+              "major",
+              "minor"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "issue",
+              "regression",
+              "security",
+              "data_loss"
+            ]
+          },
+          "acceptance": {
+            "type": "string"
+          },
+          "verification": {
+            "type": "string",
+            "enum": [
+              "check",
+              "review",
+              "in_use"
+            ],
+            "description": "Defaults to check for blockers. Use review for inspection or in_use for a live observation."
+          },
+          "check": {
+            "type": "string"
+          },
+          "test_class": {
+            "type": "string"
+          },
+          "verification_reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "problem",
+          "severity"
+        ]
+      }
+    },
+    "earlier": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "open",
+              "waived"
+            ]
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "why"
+        ]
+      }
+    }
+  },
+  "required": [
+    "summary",
+    "problems"
+  ]
+}

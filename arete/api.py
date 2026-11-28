@@ -127,6 +127,9 @@ def resources(name, values):
                 "settings_sha": snap_sha,
                 "settings": snapshots.get(snap_sha) if snap_sha else None,
                 "inputs": step_inputs if step_inputs is not None else [],
+                "prompt_version": r.get("prompt_version") or None,
+                "prompt_level": r.get("prompt_level") or None,
+                "schema_version": r.get("schema_version") or None,
             })
         return out
     if name == "loop":

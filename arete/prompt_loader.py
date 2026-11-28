@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -15,15 +14,20 @@ class Rendered(str):
     prompt_level: str
     prompt_values: dict
     prompt_sha256: str
+    prompt_appends: tuple[dict, ...]
+    prompt_append_tail: str
 
     def __new__(cls, text: str, *, name: str = "", version: str = "", level: str = "",
-                values: dict | None = None, sha256: str = "") -> Rendered:
+                values: dict | None = None, sha256: str = "", appends: tuple[dict, ...] = (),
+                append_tail: str = "") -> Rendered:
         obj = super().__new__(cls, text)
         obj.prompt_name = name
         obj.prompt_version = version
         obj.prompt_level = level
         obj.prompt_values = dict(values or {})
         obj.prompt_sha256 = sha256
+        obj.prompt_appends = tuple(appends)
+        obj.prompt_append_tail = append_tail
         return obj
 
     @classmethod
@@ -36,6 +40,8 @@ class Rendered(str):
                 level=source.prompt_level,
                 values=source.prompt_values,
                 sha256=source.prompt_sha256,
+                appends=source.prompt_appends,
+                append_tail=source.prompt_append_tail,
             )
         return text
 
@@ -47,6 +53,8 @@ class Rendered(str):
             level=self.prompt_level,
             values=self.prompt_values,
             sha256=self.prompt_sha256,
+            appends=self.prompt_appends,
+            append_tail=self.prompt_append_tail,
         )
 
     def __radd__(self, other: str) -> Rendered:
@@ -57,6 +65,8 @@ class Rendered(str):
             level=self.prompt_level,
             values=self.prompt_values,
             sha256=self.prompt_sha256,
+            appends=self.prompt_appends,
+            append_tail=self.prompt_append_tail,
         )
 
 TEMPLATES: dict[Path, dict[str, str]] = {}
@@ -109,16 +119,19 @@ def load_templates(folder: Path) -> None:
 
 
 def template(name: str, prompts_dir: Path = paths.PROMPTS_DIR) -> Template:
+    from . import prompts
+
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
     text = TEMPLATES.get(prompts_dir.absolute(), {}).get(name)
     if text is None:
         text = (prompts_dir / f"{name}.md").read_text()
-    return parse_template(name, text)
+    _, body_text = prompts.parse(text)
+    return parse_template(name, body_text)
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> Rendered:
-    from . import pins
+    from . import pins, prompts
 
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
@@ -131,29 +144,11 @@ def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> Render
         version = str(meta.get("id") or "")
         level = str(meta.get("level") or "engine")
         sha = str(meta.get("sha256") or "")
-        source = parse_template(name, raw_text)
-    else:
-        source = template(name, prompts_dir)
-        sha = hashlib.sha256(source.template.encode("utf-8")).hexdigest()
-        version = f"prompt/{name}@{sha[:12]}"
-        level = "engine" if prompts_dir.resolve() == paths.PROMPTS_DIR.resolve() else "run"
-    values.setdefault("owner", owner_asks.NOBODY)
-    class_check = values.get("class_check")
-    values.setdefault("test_classes", class_check or "uv run python -m tests.parallel test_x.SomeTests")
-    values.setdefault("class_check_guidance", (
-        f"Run the test classes for the files you changed by name, for example `{class_check}`.\n" if class_check else ""
-    ))
-    if missing := sorted(set(source.get_identifiers()) - values.keys()):
-        raise MissingInputs(f"prompt {name}: missing inputs: {', '.join(missing)}")
-    rendered_values = {k: ("" if v is None else str(v)) for k, v in values.items()}
-    return Rendered(
-        source.substitute(rendered_values),
-        name=name,
-        version=version,
-        level=level,
-        values=rendered_values,
-        sha256=sha,
-    )
+        resolved = prompts.ResolvedPrompt(
+            call=name, role="", name=name, version=version, level=level, sha256=sha, text=raw_text,
+        )
+        return prompts.render(resolved, **values)
+    return prompts.render_engine(name, prompts_dir, **values)
 
 
 def task_prompt(text: str) -> str:
@@ -203,7 +198,7 @@ def fill_template(template: str, default: str, **values) -> str:
 @dataclass(frozen=True)
 class Brief:
     repo: str
-    workspace: str
+    worktree: str
     ref: str
     title: str
     body: str
@@ -218,6 +213,10 @@ class Brief:
     denied: str = ""
     class_check: str = ""
 
+    def values(self, **step) -> dict:
+        return {f.name: getattr(self, f.name) for f in fields(self)} | step
+
     def prompt(self, name: str, prompts_dir: Path = paths.PROMPTS_DIR, **step) -> str:
-        values = {f.name: getattr(self, f.name) for f in fields(self)}
-        return task_prompt(prompt(name, prompts_dir, **(values | step)))
+        from . import prompts
+
+        return task_prompt(prompts.render_engine(name, prompts_dir, **self.values(**step)))

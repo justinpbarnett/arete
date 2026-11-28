@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [covered, questions]
+---
 ## The research plan
 
 A planner found that the family reports for $covered already answer the ticket. You have no web tools. Write the

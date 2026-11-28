@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import child, config, paths, prompt_loader, research_budget, research_plan, routing, runner, steps, tracker, util
+from . import child, config, paths, prompts, research_budget, research_plan, routing, runner, steps, tracker, util
 from .agent import WEB_TOOLS
 from .screening import Posture, Screen, screen_many
 from .screening import held as screen_held
@@ -173,7 +173,7 @@ def account_call(worker, res, paid, allowance, deadline):
 def work(cfg: config.Config, s: steps.Settings, task: dict, criteria: list[str], ref: str, n: int, cwd: Path,
          allowance: float, seconds: float, round_no: int = 0) -> Outcome:
     which = routing.chosen(s.model, s.runner, cfg)[0]
-    text = prompt_loader.prompt("research_search", goal=task["goal"], queries=research_plan.bullets(task["queries"]),
+    text = prompts.render_engine("research_search", goal=task["goal"], queries=research_plan.bullets(task["queries"]),
                   max_sources=task["max_sources"], criteria=research_plan.bullets(criteria))
     started = time.monotonic()
     deadline = started + seconds
@@ -491,7 +491,7 @@ def gap_lines(evidence: dict) -> list[str]:
 
 
 def brief(plan: dict, evidence: dict) -> str:
-    return prompt_loader.prompt("research_evidence", questions=research_plan.bullets(plan["questions"]),
+    return prompts.render_engine("research_evidence", questions=research_plan.bullets(plan["questions"]),
                   criteria=research_plan.bullets(plan["source_criteria"]), claims=research_plan.bullets(plan["claims"]),
                   tasks=task_lines(evidence), sources=json.dumps(supplied(evidence), indent=2),
                   gaps="\n".join(gap_lines(evidence)) or "none")

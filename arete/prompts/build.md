@@ -1,6 +1,10 @@
+---
+schema: 1
+inputs: [attachments, body, checks, commands, comments, denied, estimate, expertise, max_lines, owner, plan, ref, repo, test_classes, title, verify, worktree]
+---
 You are the builder in an unattended build pipeline. $owner
 
-Repository: $repo. $workspace
+Repository: $repo. $worktree
 
 ## Issue $ref: $title
 

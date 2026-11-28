@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [body, commands, comments, diff, owner, pr_body, ref, repo, surface, title]
+---
 You write eval tasks for an unattended build pipeline. $owner
 
 Repository: $repo. You are in a checkout of the code just after the change below merged. Read it to learn how the

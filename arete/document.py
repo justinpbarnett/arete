@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from . import config, outbound, paths, prompt_loader, runner, steps, util
+from . import config, outbound, prompts, runner, steps, util
 from .review import Review
 
 SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}, "text": {"type": "string"}},
@@ -287,7 +287,7 @@ def fill(brief: Brief, doc: config.Document, samples: list[str], target: tuple[i
     voice = "\n".join(f"- {clipped(line)}" for line in samples)
     words = f"about {target[0]} to {target[1]} words" if target else "as short as completeness allows"
     pinned = protected(brief)
-    return prompt_loader.prompt("document", paths.PROMPTS_DIR,
+    return prompts.render_engine("document",
         kind=brief.kind, audience=brief.audience or "the reader", channel=brief.channel or "plain text",
         action=brief.action, facts=bullets(brief.facts), acceptance=bullets(brief.acceptance),
         supplied="\n".join(f"- {s}" for s in supplied) or "- none", draft=brief.draft.strip() or "none",

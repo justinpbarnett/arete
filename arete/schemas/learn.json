@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "expertise": {
+      "type": "string"
+    },
+    "added": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 3
+    },
+    "removed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "lesson": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "lesson",
+          "why"
+        ]
+      }
+    }
+  },
+  "required": [
+    "expertise",
+    "added",
+    "removed"
+  ]
+}

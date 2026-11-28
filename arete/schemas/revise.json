@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "replies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "comment_id": {
+            "type": "integer"
+          },
+          "reply": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "comment_id",
+          "reply"
+        ]
+      }
+    }
+  },
+  "required": [
+    "summary",
+    "replies"
+  ]
+}

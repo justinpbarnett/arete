@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [attempt, count, denied, earlier, evidence, first_seen, incident, kind, last_seen, max_attempts, source]
+---
 This is an on-call repair. Arete's watcher saw a failure and opened incident $incident ($kind, from $source).
 It was seen $count times, from $first_seen to $last_seen. This is attempt $attempt of $max_attempts.
 $earlier
