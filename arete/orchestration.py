@@ -619,6 +619,18 @@ class Controller(worker_turns.WorkerTurns):
             job.pop(key, None)
         prepared["ticket"] = {key: getattr(ticket, key) for key in flows.TICKET_FIELDS}
         prepared["ticket"]["comments"] = ticket.owner_comments or ""
+        run_dir = getattr(self.run, "dir", None)
+        if run_dir is not None and hasattr(self.run.tracker, "save_images"):
+            attachments, attachment_dirs, manifest = pipeline.collect_ticket_attachments(
+                self.run.tracker, ticket, Path(run_dir), log=getattr(self.run, "log", None),
+            )
+            if attachments or manifest["media"] or manifest["external"]:
+                prepared["attachments"] = attachments
+                existing_dirs = list(prepared.get("add_dirs") or [])
+                for d in map(str, attachment_dirs):
+                    if d not in existing_dirs:
+                        existing_dirs.append(d)
+                prepared["add_dirs"] = existing_dirs
         prepared["approval"] = triage_store.triage_approval(self.run.triage_key)
         self.data["goal_base"] = f"Check the current authorized ticket in use:\n{ticket.title}\n{ticket.body}"
         if feedback := self.data.get("feedback"):
