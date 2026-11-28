@@ -916,13 +916,22 @@ def cooling(cfg: config.Config, row: dict) -> str:
     return until if until > util.iso() else ""
 
 
+def _repair_runs(repair: dict, limit: int = 50) -> list[dict]:
+    if not repair.get("task"):
+        return []
+    tnum = tasks_store.parse_task_num(repair["task"])
+    if tnum is not None:
+        return run_store.ticket_runs(tnum, limit=limit)
+    return run_store.ticket_runs(repair["repo"], repair["task"], limit=limit)
+
+
 def spent(cfg: config.Config, repairs: list[dict]) -> float:
-    ids = [r["id"] for x in repairs if x["task"] for r in run_store.ticket_runs(x["repo"], x["task"], limit=50)]
+    ids = [r["id"] for x in repairs if x["task"] for r in _repair_runs(x, limit=50)]
     return sum(run_store.paid_by_run(ids, local_providers=cfg.local_providers).values())
 
 
 def last_run_id(repair: dict) -> str:
-    return next((r["id"] for r in run_store.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
+    return next((r["id"] for r in _repair_runs(repair, limit=1)), "-")
 
 
 def repair_line(row: dict) -> str:
@@ -994,7 +1003,8 @@ def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
 def interrupted_run(repair: dict) -> dict | None:
     if not repair["task"]:
         return None
-    run = run_store.newest_whole_run(repair["repo"], repair["task"])
+    tnum = tasks_store.parse_task_num(repair["task"])
+    run = run_store.newest_whole_run(tnum) if tnum is not None else run_store.newest_whole_run(repair["repo"], repair["task"])
     return run if run and run["status"] == "interrupted" else None
 
 
@@ -1138,7 +1148,8 @@ def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
 
 
 def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
-    run = run_store.newest_whole_run(repair["repo"], repair["task"])
+    tnum = tasks_store.parse_task_num(repair["task"]) if repair.get("task") else None
+    run = run_store.newest_whole_run(tnum) if tnum is not None else run_store.newest_whole_run(repair["repo"], repair["task"])
     if run is None:
         return resume(cfg, row, repair, "the repair task has no run yet")
     status = run["status"]
@@ -1197,11 +1208,12 @@ def cancel(incident_id: int) -> dict:
         repair = live_repair(steered(incident_id))
         if repair is None:
             raise control.Refused(f"incident {incident_id} has no repair running")
-        run = run_store.running_run(repair["repo"], repair["task"]) if repair["task"] else None
+        tnum = tasks_store.parse_task_num(repair["task"]) if repair["task"] else None
+        run = (run_store.running_run(tnum) if tnum is not None else run_store.running_run(repair["repo"], repair["task"])) if repair["task"] else None
         if run:
             stop_run(run["id"])
         if repair["task"]:
-            tasks_store.task_set_state(repair["task"], "closed", ("todo",))
+            tasks_store.task_set_state(tnum if tnum is not None else repair["task"], "closed", 0, from_states=("todo", "ready"))
         incident_store.set_repair(repair["id"], ended=util.iso(), outcome="cancelled")
         until = cooling(config.load(), incident_store.incident(incident_id))
         stopped = f"stopped run {run['id']}" if run else "no run was live"

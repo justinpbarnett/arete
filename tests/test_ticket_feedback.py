@@ -2,6 +2,7 @@ import contextlib
 import subprocess
 import tempfile
 import unittest
+from tests import support
 from pathlib import Path
 from unittest import mock
 
@@ -16,7 +17,6 @@ from arete import (
     paths,
     pipeline,
     poll,
-    record,
     release_promotion,
     release_proof,
     ticket_feedback as tf,
@@ -274,7 +274,7 @@ class ClarificationAndResumptionTests(_FeedbackDbCase):
         tk = tracker.JiraTracker(repo, cfg.jira)
 
         # Non-secret needs-info ask -> resolved by authorized Jira team comment.
-        rid1 = record.start("pipeline", repo="team", issue="TEAM-10", status="needs-info")
+        rid1 = support.start_pipeline(repo="team", issue="TEAM-10", status="needs-info")
         ask_store.ask_add("ask-1", rid1, "team", "TEAM-10", "build", "build", "need choice", "",
                           [{"header": "Format", "kind": "text", "question": "Which date format?"}], {})
         c1 = tf.ThreadComment("901", "qa-1", "QA", "Use YYYY-MM-DD.",
@@ -285,7 +285,7 @@ class ClarificationAndResumptionTests(_FeedbackDbCase):
         self.assertEqual(ask_store.ask_get("ask-1")["status"], "answered")
 
         # Secret ask -> NEVER answered by tracker comment.
-        rid2 = record.start("pipeline", repo="team", issue="TEAM-11", status="needs-info")
+        rid2 = support.start_pipeline(repo="team", issue="TEAM-11", status="needs-info")
         ask_store.ask_add("ask-2", rid2, "team", "TEAM-11", "build", "build", "need token", "",
                           [{"header": "Token", "kind": "secret", "name": "API_TOKEN", "question": "Supply token"}], {})
         c2 = tf.ThreadComment("902", "qa-1", "QA", "Here is the token",
@@ -337,7 +337,7 @@ class StagedChildAndWorkerSteeringTests(_FeedbackDbCase):
         self.assertEqual((pick.tid, pick.from_ticket_feedback), ("21", True))
 
         # 4. Single-ticket worker claims feedback, injects into brief, and settles it applied on completion.
-        rid = record.start("pipeline", repo="product", issue="21", status="running")
+        rid = support.start_pipeline(repo="product", issue="21", status="running")
         run = pipeline.Run(rid, repo, self.root / "runs" / rid, tracker=tk, tid="21", writes_lines=False)
         run.claim_feedback()
         self.assertEqual(len(run.ticket_feedback), 1)
@@ -364,7 +364,7 @@ class StagedChildAndWorkerSteeringTests(_FeedbackDbCase):
         repo = config.Repo("product", self.root, github="owner/product", pipeline=True, tracker="github")
         cfg = config.Config(repos=[repo])
         tk = tracker.GitHubTracker(repo)
-        rid = record.start("pipeline", repo="product", issue="30", status="running")
+        rid = support.start_pipeline(repo="product", issue="30", status="running")
         ticket = tracker.Ticket("30", "#30", "Active feature", body="Build it", open=True, labels=["agent"])
         steer = tf.ThreadComment("701", "owner", "owner", "Please also validate empty email addresses.",
                                  "https://github.com/owner/product/issues/30#issuecomment-701", "2026-11-27T14:00:00Z")
@@ -387,7 +387,7 @@ class ClosedTicketFollowUpAndReplayTests(_FeedbackDbCase):
         tk = tracker.GitHubTracker(repo)
 
         # Simulate ticket picked up at 10:00 and completed/closed.
-        rid = record.start("pipeline", repo="product", issue="40", status="merged")
+        rid = support.start_pipeline(repo="product", issue="40", status="merged")
         with foundation.tx() as c:
             c.execute("UPDATE runs SET started = ? WHERE id = ?", ("2026-11-27T10:00:00Z", rid))
         spec_store.bind("github:owner/product#40", "product", "40", "", lambda: rid)

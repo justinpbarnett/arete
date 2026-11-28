@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from arete import config, dbstats, environment_gaps, flows, gh, oncall, pilot, pipeline
+from tests import support
 from arete import paths, poll, routing, run_lines, slots, tasks, tracker, util, vault, zte
 from arete.store import db
 from arete.store import orchestration as ledger
@@ -139,7 +140,11 @@ class ProgressFixture(unittest.TestCase):
         seed_db(self.root / "state")
 
     def run_row(self, run_id, status="running", **fields):
-        runs.insert_run(run_id, {"kind": "pipeline", "repo": REPO, "issue": self.issue, "status": status, "started": self.started} | fields)
+        issue_val = fields.get("issue", self.issue)
+        task_id, issue_key = support.ensure_task_id(REPO, issue_val)
+        runs.insert_run(run_id, {"kind": "pipeline", "repo": REPO, "issue": self.issue,
+                                 "task_id": task_id, "issue_key": issue_key,
+                                 "status": status, "started": self.started} | fields)
 
     def fields(self, row, **expected):
         self.assertEqual({key: row[key] for key in expected}, expected)

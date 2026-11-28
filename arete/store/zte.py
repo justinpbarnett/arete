@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import secrets
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -102,7 +101,7 @@ def pre_pr_hold(delivery: Delivery | None) -> dict | None:
             or data.get("stopped_at") != "pushed" or data.get("reason") != "the issue is not in the dedicated delivery queue"
             or data.get("production_issue_base") != delivery.base or data.get("close_after_health") is not True
             or unexpected & data.keys() or type(delivery.task) is not str
-            or not re.fullmatch(r"t-[0-9a-f]{40}", delivery.task)
+            or not re.fullmatch(r"(?:T-[0-9]+|t-[0-9a-f]{40})", delivery.task)
             or type(delivery.version) is not int or delivery.version < 1
             or type(delivery.base) is not str or not re.fullmatch(r"[0-9a-f]{40}", delivery.base)
             or type(branch) is not str or not re.fullmatch(rf"arete/{delivery.task}-[a-z0-9-]+", branch)
@@ -179,8 +178,7 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
                              (data["github"]["number"], issue["node"])).fetchone()
             if used:
                 return None
-        tid = "t-" + secrets.token_hex(20)
-        tasks.task_add(repo, body, title=title, kind=kind, reserved_id=tid)
+        tid = tasks.task_add(repo, body, title=title, kind=kind)
         c.execute("INSERT INTO zte_deliveries (task, policy, repo, base, created, deadline, phase, data) "
                   "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
                   (tid, policy, repo, base, util.iso(now), deadline, json.dumps(data, sort_keys=True)))
@@ -218,6 +216,6 @@ def complete(delivery: Delivery, task_version: int, **data) -> Delivery:
             delivery.data.get("issue_close_sent_after") and data.get("issue_closure")):
         raise Conflict("the reserved issue has no observed completion")
     with db.tx():
-        if not tasks.task_set_state(delivery.task, "done", from_states=("pr",), base_version=task_version):
+        if not tasks.task_set_state(delivery.task, "done", 0, from_states=("pr", "review"), base_version=task_version):
             raise Conflict("ZTE task changed before its healthy release was recorded")
         return transition(delivery, "healthy", **data)

@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arete import config, gh, issue_goal, jev, merge_review, paths, pipeline, record, tracker, unblock, unblock_watch, util
+from arete import config, gh, issue_goal, jev, merge_review, paths, pipeline, tracker, unblock, unblock_watch, util
 from arete import verify, workspace
 from arete.store import runs, tasks, unblock as ledger
 from tests import support
@@ -47,7 +47,7 @@ class IssueMergeTests(unittest.TestCase):
         tid = tasks.task_add(repo.name, "Change doc to after.", "Update doc")
         ticket = tracker.for_ticket(cfg, repo, tid).get(tid)
         url = "https://github.com/example/sample/pull/1"
-        run_id = record.start("pipeline", repo=repo.name, issue=tid, status="pr", pr_url=url, branch="topic")
+        run_id = support.start_pipeline(repo=repo.name, issue=tid, status="pr", pr_url=url, branch="topic")
         run = SimpleNamespace(id=run_id, repo=repo, budget=SimpleNamespace(issue_goal=True))
         checkout = workspace.Checkout("", repo.github, src, src, "main", url, head)
         layer = config.load_layer(layer_dir)

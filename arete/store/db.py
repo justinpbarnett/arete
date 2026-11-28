@@ -201,7 +201,12 @@ STEPS_LIFECYCLE_SCHEMA = 53
 RECORD_TURNS_SCHEMA = 54
 DERIVED_SCHEMA = 55
 CONFIG_DRAFTS_SCHEMA = 56
-BLOBS_RETENTION_SCHEMA = 57
+TASK_IDENTITY_EXPAND_SCHEMA = 57
+TASK_IDENTITY_BACKFILL_SCHEMA = 58
+TASK_IDENTITY_CONTRACT_SCHEMA = 59
+BLOBS_RETENTION_SCHEMA = 60
+TASK_ADMISSION_CAPABILITY = "task_admission_v1"
+PROCESS_CAPABILITIES = (TASK_ADMISSION_CAPABILITY,)
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -220,6 +225,7 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
                              RUN_RETENTION_SCHEMA, RUNS_PROMPT_BINDING_SCHEMA, RUNS_ADW_SCHEMA,
                              TRIAGE_VERSION_SCHEMA, OUTBOX_BACKFILL_SCHEMA,
                              STEPS_LIFECYCLE_SCHEMA, RECORD_TURNS_SCHEMA, DERIVED_SCHEMA, CONFIG_DRAFTS_SCHEMA,
+                             TASK_IDENTITY_EXPAND_SCHEMA, TASK_IDENTITY_BACKFILL_SCHEMA,
                              BLOBS_RETENTION_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
@@ -283,11 +289,75 @@ def missing_database():
     return NoDatabase(f"{paths.DB_FILE} is missing; run arete serve or arete migrate")
 
 
+def _has_capability(raw, capability: str) -> bool:
+    if isinstance(raw, (list, tuple, set)):
+        return capability in raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = [part.strip() for part in raw.split(",") if part.strip()]
+        return isinstance(parsed, list) and capability in parsed
+    return False
+
+
+def _task_identity_process_blockers(beat: dict, n: int) -> list[str]:
+    from .. import control
+
+    blockers: list[str] = []
+    if problem := workspace_serve_blocker(beat, n):
+        blockers.append(problem)
+    elif util.lock_is_held("serve"):
+        status = control.database_beat()
+        if not isinstance(status, dict) or not _has_capability(status.get("capabilities"), TASK_ADMISSION_CAPABILITY):
+            pid = status.get("pid") if isinstance(status, dict) else None
+            blockers.append(f"serve {pid or 'lock'} lacks {TASK_ADMISSION_CAPABILITY}")
+    elif paths.DB_FILE.parent.resolve() != paths.STATE_DIR.resolve() and util.pid_alive(beat.get("pid")):
+        if not _has_capability(beat.get("capabilities"), TASK_ADMISSION_CAPABILITY):
+            blockers.append(f"serve {beat.get('pid')} lacks {TASK_ADMISSION_CAPABILITY}")
+    server = util.read_json(paths.DB_FILE.with_name(paths.SERVER_FILE.name), {})
+    if isinstance(server, dict) and util.pid_alive(server.get("pid")):
+        if not _has_capability(server.get("capabilities"), TASK_ADMISSION_CAPABILITY):
+            blockers.append(f"dashboard {server.get('pid')} lacks {TASK_ADMISSION_CAPABILITY}")
+    return blockers
+
+
 def contract_blockers(conn, n):
     from .. import control, launch_lease, record
 
     workspace_contract = n == WORKSPACE_CONTRACT_SCHEMA
+    task_identity_contract = n == TASK_IDENTITY_CONTRACT_SCHEMA
     blockers = [f"launch lease {name}" for name in launch_lease.held_launches()] if workspace_contract else []
+    if task_identity_contract:
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        has_caps = "capabilities" in run_cols
+        has_task = "task_id" in run_cols
+        cap_expr = "capabilities" if has_caps else "NULL AS capabilities"
+        task_expr = "task_id" if has_task else "NULL AS task_id"
+        for row in conn.execute(
+            f"SELECT id, pid, lock, started, finished, status, kind, schema_version, {cap_expr}, {task_expr} "  # noqa: S608
+            "FROM runs WHERE status IN ('running', 'queued')"
+        ):
+            row = dict(row)
+            incompatible = (
+                row["schema_version"] is None
+                or int(row["schema_version"]) < n
+                or not _has_capability(row.get("capabilities"), TASK_ADMISSION_CAPABILITY)
+                or (row["kind"] == "pipeline" and row.get("task_id") is None)
+            )
+            if not incompatible:
+                continue
+            if row["status"] == "running":
+                with record.dead(row) as gone:
+                    if not gone:
+                        blockers.append(row["id"])
+            else:
+                blockers.append(row["id"])
+        beat = control.database_beat()
+        if not isinstance(beat, dict):
+            beat = {}
+        blockers.extend(_task_identity_process_blockers(beat, n))
+        return blockers
     statuses = "(status = 'running' OR pid IS NOT NULL)" if workspace_contract else "status = 'running'"
     for row in conn.execute(f"SELECT id, pid, lock, started, finished, status FROM runs WHERE {statuses} "  # noqa: S608
                             "AND (schema_version IS NULL OR schema_version < ?)", (n,)):

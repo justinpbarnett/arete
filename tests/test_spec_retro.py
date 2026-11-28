@@ -126,7 +126,9 @@ class SpecRetroTests(unittest.TestCase):
 
     def test_watch_uses_actual_run_and_feedback_and_emits_once_across_retries(self):
         # Tracker reads and model responses are fixtures; discovery, SQL lookups and loop dedup use real code.
+        task_id, issue_key = support.ensure_task_id(self.repo, 12)
         run_store.insert_run("sample-delivery", {"kind": "pipeline", "repo": self.repo.name, "issue": 12,
+                                                 "task_id": task_id, "issue_key": issue_key,
                                                  "status": "merged", "summary": "Repeated rendering in both views",
                                                  "started": "2026-11-23T14:00:00Z", "finished": "2026-11-23T14:30:00Z"})
         insights.add_feedback([{"repo": self.repo.name, "issue": "12", "pr_url": "https://github.com/org/product/pull/18",

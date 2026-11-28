@@ -604,7 +604,7 @@ class PipelineNoSlotTests(unittest.TestCase):
 
     def record_feedback(self, path="orchestrate", tid="765"):
         url = f"https://github.com/{self.repo.github}/pull/{tid}"
-        run = record.start("pipeline", repo=self.repo.name, issue=tid, adw=None if path == "classic" else path)
+        run = support.start_pipeline(repo=self.repo.name, issue=tid, adw=None if path == "classic" else path)
         self.assertTrue(record.move(run, "pr", ("running",), pr_url=url))
         with redirect_stdout(StringIO()):
             pipeline.run_lines.write(run, "execution", path=path)
@@ -743,14 +743,16 @@ class PolicyRetryCapTests(unittest.TestCase):
         remote = "fixture/repo"
         self.repo = config.Repo("fixture", self.state, github=remote, parts=[config.Part("", remote)])
         self.local = tracker.LocalTracker(self.repo)
-        self.tid = task_store.task_add(self.repo.name, "Retry policy fixture", reserved_id="t-0845")
+        self.tid = task_store.task_add(self.repo.name, "Retry policy fixture")
         task_store.task_set_state(self.tid, "failed")
 
     def add_run(self, hours, *, tid=None, repo=None, status="failed", reason="policy-changed", duration=1):
         tid = self.tid if tid is None else tid
         repo = self.repo.name if repo is None else repo
+        task_id, issue_key = support.ensure_task_id(repo, tid)
         run_store.insert_run(f"{repo}-{tid}-{hours}-{status}-{reason}", {
-            "kind": "pipeline", "repo": repo, "issue": tid, "status": status,
+            "kind": "pipeline", "repo": repo, "issue": tid, "task_id": task_id, "issue_key": issue_key,
+            "status": status,
             "started": util.iso(self.now - timedelta(hours=hours + duration)),
             "finished": util.iso(self.now - timedelta(hours=hours)),
             "summary": pipeline.worker_policy_changed(),
@@ -768,8 +770,11 @@ class PolicyRetryCapTests(unittest.TestCase):
             self.add_run(hours)
         self.add_run(4, status="stopped")
         self.add_run(5, reason="engine-crash")
-        self.add_run(6, tid="t-0001")
-        self.add_run(7, repo="other")
+        other_tid = task_store.task_add(self.repo.name, "Other task")
+        task_store.task_set_state(other_tid, "done")
+        other_repo_tid = task_store.task_add("other", "Other repo task")
+        self.add_run(6, tid=other_tid)
+        self.add_run(7, repo="other", tid=other_repo_tid)
 
         ticket, output = self.pick(self.local)
 
@@ -853,7 +858,7 @@ class PrepareResumeTests(unittest.TestCase):
         self.enterContext(mock.patch.object(pipeline.alerts, "ask_notice"))
 
     def controller(self, run_id, previous=""):
-        record.start("pipeline", run_id=run_id, repo=self.repo.name, issue="7")
+        support.start_pipeline(run_id=run_id, repo=self.repo.name, issue="7")
         folder = self.root / run_id
         folder.mkdir()
         run = pipeline.Run(run_id, self.repo, folder, tracker=self.tracker, tid="7", path="orchestrate", cfg=self.cfg)
@@ -1958,9 +1963,9 @@ class RestoredPRRevisionTests(unittest.TestCase):
                                               issues=lambda r, label, **kw: [issue(r, 7)] if label in labels else []))
         self.enterContext(mock.patch.object(codebase, "STAMP", "same-engine"))
         self.enterContext(mock.patch.object(pipeline, "write_report"))
-        record.start("pipeline", run_id="prior-run", repo=repo.name, issue=self.run.tid)
+        support.start_pipeline(run_id="prior-run", repo=repo.name, issue=self.run.tid)
         self.run.repairs = "repair-source"
-        record.start("pipeline", run_id=self.run.repairs, repo=repo.name, issue=self.run.tid)
+        support.start_pipeline(run_id=self.run.repairs, repo=repo.name, issue=self.run.tid)
         record.settle(self.run.repairs, "pr", pr_url=c.pr, branch="revision")
         record.settle("prior-run", "needs-info", summary="Keep the edit?", branch="revision")
         self.run.answering = pipeline.run_store.run_get("prior-run")
@@ -1970,7 +1975,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         source = orchestration.repairs.Source(self.run.repairs, "revision", [c.pr], Review.stored({}), "", "", "", "")
         self.enterContext(mock.patch.object(orchestration.repairs, "source", return_value=source))
         self.enterContext(mock.patch.object(orchestration.repairs, "matched_head", return_value=self.head))
-        record.start("pipeline", run_id=self.run.id, repo=repo.name, issue=self.run.tid)
+        support.start_pipeline(run_id=self.run.id, repo=repo.name, issue=self.run.tid)
 
         def finish(flow, ending, **fields):
             said = flows.respond(flow, ending, **fields).data
@@ -1995,7 +2000,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertEqual([row["pr_url"] for row in pipeline.run_store.open_runs(repo.name, self.run.tid)], [c.pr])
         self.assertEqual(pipeline.pending_feedback(repo.name, self.run.tid), [])
         self.assertIn(self.run.tracker.label_name("failed"), labels)
-        preview = record.start("pipeline", run_id="newer-preview", repo=repo.name, issue=self.run.tid, dry_run=True)
+        preview = support.start_pipeline(run_id="newer-preview", repo=repo.name, issue=self.run.tid, dry_run=True)
         record.settle(preview, "dry-run")
         self.assertEqual(pipeline.run_store.newest_whole_run(repo.name, self.run.tid)["id"], preview)
         self.assertEqual(pipeline.run_store.newest_live_whole_run(repo.name, self.run.tid)["id"], failed["id"])
@@ -2026,7 +2031,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
             fresh = pipeline.Run(id="fresh-run", repo=repo, tracker=self.run.tracker, tid=tid, path="orchestrate",
                                  dir=self.run.dir / "fresh")
             fresh.dir.mkdir()
-            record.start("pipeline", run_id=fresh.id, repo=repo_name, issue=tid)
+            support.start_pipeline(run_id=fresh.id, repo=repo_name, issue=tid)
             flow = flows.start(cfg, fresh, failed)
             self.assertEqual(flow.ctx.ws, self.ws)
             self.actions.return_value = []
@@ -2384,9 +2389,11 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
 
         script = None
         if case in {"reconcile", "verify-retry"}:
+            from tests import support
+
             head = util.git(["rev-parse", "HEAD"], wt).strip()
             pr = "https://github.com/fixture/repo/pull/1"
-            previous = record.start("pipeline", repo=repo.name, issue=tid, branch="ticket", pr_url=pr)
+            previous = support.start_pipeline(repo=repo.name, issue=tid, branch="ticket", pr_url=pr)
             if case == "reconcile":
                 pending = {"action": "d0001-1", "pr": pr, "previous": "previous-head",
                            "head": head, "base": "base", "verified": {}, "review": {}}
@@ -5878,7 +5885,7 @@ class CatchUpRepairFixture(PublicationFixture):
         state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.enterContext(support.workspace_state(state))
         support.seed_db(paths.STATE_DIR)
-        rid = pipeline.record.start("pipeline", repo=repo.name, issue="7")
+        rid = support.start_pipeline(repo=repo.name, issue="7")
         folder = paths.RUNS_DIR / rid
         folder.mkdir(parents=True)
         run = pipeline.Run(rid, repo, folder, tracker=tracker.GitHubTracker(repo), tid="7",
@@ -7898,7 +7905,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.enterContext(mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")))
 
     def new_run(self):
-        rid = pipeline.record.start("pipeline", repo=self.repo.name, issue="7")
+        rid = support.start_pipeline(repo=self.repo.name, issue="7")
         folder = paths.RUNS_DIR / rid
         folder.mkdir(parents=True)
         run = pipeline.Run(rid, self.repo, folder, tracker=tracker.GitHubTracker(self.repo), tid="7")
@@ -11941,7 +11948,9 @@ class MissingPromptInputsTests(unittest.TestCase):
         reserved = zte_store.reserve("fixture-policy", repo.name, "a" * 40, deadline,
                                      "Fixture ZTE task", "fix", "Fixture ZTE specification", {"task_version": 1})
         grant = zte_store.transition(reserved, "dispatching")
-        slot_lock = pipeline.run_store.run_lock("slot", repo.name, grant.task)
+        from arete.store import tasks as task_store
+
+        slot_lock = pipeline.run_store.run_lock("slot", task=task_store.parse_task_num(grant.task))
 
         def drive(flow):
             self.assertTrue(util.lock_is_held(slot_lock))
@@ -12342,9 +12351,13 @@ class MinerLifecycleTests(unittest.TestCase):
         self.enterContext(support.workspace_state(self.root))
         db.migrate()
 
+        from arete.store import tasks as task_store
+
+        miner_tid = task_store.task_add(self.repo.name, "Miner admission fixture")
+
         def start_pipeline():
             with self.assertRaises(ReachedPipelineStart):
-                pipeline.run_issue(self.repo.name, "t-0657")
+                pipeline.run_issue(self.repo.name, miner_tid)
 
         with (
             mock.patch.multiple(pipeline.scratch, process_ids=set, service_labels=set),
@@ -12362,7 +12375,7 @@ class MinerLifecycleTests(unittest.TestCase):
             self.assertEqual(self.run_miner(proposals=[proposal]), 0)
             hold_slot.assert_called_once()
             self.assertEqual(start.call_args.args, ("pipeline",))
-            self.assertEqual(start.call_args.kwargs["issue"], "t-0657")
+            self.assertEqual(start.call_args.kwargs["issue"], miner_tid)
             receipt.assert_not_called()
         self.eval.assert_called_once_with(self.cfg, self.repo, self.BASE, self.HEAD)
         self.assertEqual(self.ci_reads, [self.HEAD])
