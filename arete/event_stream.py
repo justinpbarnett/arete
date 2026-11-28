@@ -49,6 +49,11 @@ def stream(handler, query, code):
         handler.connection.settimeout(30)
 
     started = time.monotonic()
+    if seq is None and query.get("idem"):
+        with foundation.one_read() as c:
+            meta = events.metadata(c)
+            epoch, _ = events.cursor(meta["head"])
+            seq = max(events.cursor(meta["trim"][cls])[1] for cls in selected[2])
     if fmt == "json":
         while True:
             if issue := handler.stream_problem():

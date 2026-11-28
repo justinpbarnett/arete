@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import (
     api,
@@ -681,12 +681,13 @@ class Handler(BaseHTTPRequestHandler):
     def complete_action(self, context, action, atomic, status, redact):
         if not atomic:
             claims.claim(context, None)
+        self.success_status = status
         with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
             try:
                 result = action()
             except Exception as e:
-                status = refusal_status(e)
-                if not atomic and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
+                err_status = refusal_status(e)
+                if not atomic and (isinstance(e, NoRoute) or err_status is not None and 400 <= err_status < 500):
                     claims.abandon(context)
                 raise
             receipt = self.write_receipt or event_store.committed_receipt()
@@ -696,7 +697,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = {**result, "text": "[shown once]"} if redact else result
             if context[2] == credential_http.PAIRING_CLAIM_ROUTE:
                 context = (*context[:3], credential_http.pairing_claim_fingerprint(context[3]))
-            return claims.complete(context, status, api_http.json_bytes(payload), seq), result
+            final_status = self.success_status
+            return claims.complete(context, final_status, api_http.json_bytes(payload), seq), result
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
@@ -1451,9 +1453,22 @@ def post_session(handler, rest, query):
 
 
 def post_device(handler, rest, query):
+    import concurrent.futures
+
     name, _, action = unquote(rest).rpartition("/")
     if action == "probe":
-        return devices.probe(name)
+        key = handler.headers.get("Idempotency-Key") or secrets.token_hex(12)
+        wait_seconds = api.prefer_wait(handler, default=2.0, maximum=10.0)
+        future = devices.probe_async(name, idem=key)
+        try:
+            return future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            handler.success_status = 202
+            return {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "device": name,
+            }
     raise NoRoute
 
 

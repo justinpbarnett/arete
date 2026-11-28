@@ -79,10 +79,10 @@ def machine_hosts() -> list[str]:
         except OSError:
             pass
         try:
-            data = tomllib.loads((paths.CONFIG_DIR / "devices.toml").read_text())
-            found += [str(d.get("host", "")).rpartition("@")[2] for d in (data.get("device") or {}).values()
-                      if isinstance(d, dict)]
-        except (OSError, ValueError, AttributeError):
+            from . import devices
+
+            found += [d.host.rpartition("@")[2] for d in devices.load() if d.host]
+        except (OSError, ValueError, AttributeError, RuntimeError):
             pass
         own_hosts = [normalized_host(h) for h in dict.fromkeys(found) if len(h) >= 4 and not h.isalpha()]
     return own_hosts

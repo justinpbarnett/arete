@@ -195,23 +195,51 @@ def probe_words(probe: dict | None) -> tuple[str, str]:
 
 
 def devices_list(args) -> int:
-    from .. import control
+    from .. import api
 
-    fleet = control.fleet()
-    print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
+    if getattr(args, "probe", ""):
+        args.name = args.probe
+        return devices_probe(args)
+    if client.configured_server():
+        reply = client.call("GET", "/api/v1/devices")
+    else:
+        try:
+            reply = client.call("GET", "/api/v1/devices")
+        except client.Down:
+            reply = api.execute("device.list", {})
+    fleet = reply.get("devices") or []
+    print_table([(d["id"], d["kind"], d.get("host") or "", *probe_words(d.get("last_probe"))) for d in fleet], 220,
                 indent="")
-    for d in fleet:
-        if d.get("error"):
-            print(f"  {d['error']}")
     return 0
 
 
-def devices_probe(args) -> int:
-    from .. import devices
+def _follow_device_probe(watch: str, name: str) -> dict:
+    sep = "&" if "?" in watch else "?"
+    for _ in range(12):
+        resp = client.request("GET", f"{watch}{sep}timeout=10", buffered=True,
+                              extra_headers={"Accept": "application/json"})
+        payload = client.decoded(resp, "GET", watch)
+        for ev in payload.get("events") or []:
+            if ev.get("kind") == "device.changed":
+                data = ev.get("data") or {}
+                if isinstance(data.get("probe"), dict):
+                    return data["probe"]
+                got = client.call("GET", f"/api/v1/devices/{quote(name, safe='')}")
+                return got.get("device", {}).get("last_probe") or {"ok": bool(data.get("ok"))}
+    got = client.call("GET", f"/api/v1/devices/{quote(name, safe='')}")
+    return got.get("device", {}).get("last_probe") or {"ok": False, "detail": "probe timed out"}
 
-    info = devices.probe(args.name)
+
+def devices_probe(args) -> int:
+    name = args.name
+    path = f"/api/v1/devices/{quote(name, safe='')}/probe"
+    reply = client.call("POST", path, {}, extra_headers={"Prefer": "wait=10"})
+    if reply.get("accepted") and reply.get("watch"):
+        info = _follow_device_probe(reply["watch"], name)
+    else:
+        info = reply.get("probe") or {}
     print(json.dumps(info, indent=2))
-    return 0 if info["ok"] else 1
+    return 0 if info.get("ok") else 1
 
 
 def cmd_webhook(args) -> int:
@@ -286,8 +314,9 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("devices", help="the devices loops and sessions run on, with their last probe")
+    p.add_argument("--probe", metavar="NAME", default="", help="probe one device through serve and print what it found")
     dsub = p.add_subparsers(dest="action", required=False, parser_class=Parser)
-    p.set_defaults(fn=devices_list, local_read=True)
+    p.set_defaults(fn=devices_list, local_read=lambda args: not args.probe and not client.configured_server())
     a = dsub.add_parser("probe", help="probe one device and print what it found")
     a.add_argument("name", metavar="NAME", help="a device name")
     a.set_defaults(fn=devices_probe, local_read=False)

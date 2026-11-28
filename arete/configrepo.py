@@ -313,10 +313,11 @@ def validate_actor(actor: str) -> str:
 
 
 def _validate_content(rel: str, raw: bytes, root: Path) -> None:
+    parsed = None
     if rel.endswith(".toml"):
         try:
             text = raw.decode("utf-8")
-            tomllib.loads(text)
+            parsed = tomllib.loads(text)
         except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
             raise ConfigRepoError(f"{rel} is not valid TOML: {e}") from e
     if rel == "config.toml":
@@ -327,6 +328,15 @@ def _validate_content(rel: str, raw: bytes, root: Path) -> None:
                 config.load(draft, strict=True, base_dir=root)
             except Exception as e:
                 raise ConfigRepoError(f"config.toml failed validation: {e}") from e
+    classified = configkinds.classify(rel)
+    if classified is not None and classified[0] == "device" and isinstance(parsed, dict):
+        from . import configschema, devices
+
+        try:
+            configschema.validate("device", parsed, where=rel)
+            devices.parse_device(classified[1], parsed)
+        except (ValueError, devices.DeviceError) as e:
+            raise ConfigRepoError(f"{rel} failed validation: {e}") from e
 
 
 def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> None:
@@ -755,7 +765,7 @@ def _status_paths(root: Path) -> list[str]:
     return sorted(dict.fromkeys(out))
 
 
-def _commit_files_locked(root: Path, changes: dict[str, bytes], actor: str, source: str, *,
+def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: str, source: str, *,
                          run_id: str = "", idem: str = "", note: str = "", fence: Fence,
                          modes: dict[str, int] | None = None, write_files: bool = True) -> str:
     paths_sorted = sorted(changes)
@@ -765,8 +775,18 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes], actor: str, sour
         for rel in paths_sorted:
             target = root / rel
             previous_working[rel] = target.read_bytes() if target.is_file() else None
-            _write_atomic_bytes(target, changes[rel], (modes or {}).get(rel))
-    _git(["add", "--", *paths_sorted], root)
+            data = changes[rel]
+            if data is None:
+                with suppress(FileNotFoundError):
+                    os.unlink(target)
+            else:
+                _write_atomic_bytes(target, data, (modes or {}).get(rel))
+    to_add = [rel for rel in paths_sorted if changes[rel] is not None]
+    to_del = [rel for rel in paths_sorted if changes[rel] is None]
+    if to_add:
+        _git(["add", "--", *to_add], root)
+    if to_del:
+        _git(["rm", "-q", "-f", "--ignore-unmatch", "--", *to_del], root)
     if _git(["diff", "--cached", "--quiet", "--", *paths_sorted], root, check=False).returncode == 0:
         return live_sha(root)
     msg = _format_commit_message(note or f"config: update {', '.join(paths_sorted)}", actor, source, run_id, idem)
@@ -789,7 +809,7 @@ def _commit_files_locked(root: Path, changes: dict[str, bytes], actor: str, sour
     return sha
 
 
-def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[str, bytes],
+def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[str, bytes | None],
                   old_blobs: dict[str, str]) -> None:
     if not paths.DB_FILE.exists() or not config_store.available():
         return
@@ -801,6 +821,25 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
             raw = changes[rel]
             kind, name = classify_path(rel)
             origin = origin_of(rel)
+            if raw is None:
+                config_store.mark_deleted(conn, origin, rel)
+                events.emit(
+                    f"config.{kind}.changed",
+                    f"config:{kind}/{name}",
+                    cls="durable",
+                    data={
+                        "path": rel,
+                        "commit": sha,
+                        "old_blob": old_blobs.get(rel, ABSENT),
+                        "new_blob": ABSENT,
+                        "kind": kind,
+                        "name": name,
+                        "origin": origin,
+                        "source": meta["source"],
+                    },
+                    connection=conn,
+                )
+                continue
             digest = hashlib.sha256(raw).hexdigest()
             content_version = f"{kind}/{name}@{digest[:12]}"
             new_blob = _git_blob_sha(raw)
@@ -840,7 +879,7 @@ def _index_commit(root: Path, sha: str, paths_sorted: list[str], changes: dict[s
             )
 
 
-def commit(changes: dict[str, str | bytes], base: dict[str, str], actor: str, source: str,
+def commit(changes: dict[str, str | bytes | None], base: dict[str, str], actor: str, source: str,
            run_id: str = "", idem: str = "", *, note: str = "", fence: Fence | None = None,
            modes: dict[str, int] | None = None) -> str:
     actor = validate_actor(actor)
@@ -848,12 +887,12 @@ def commit(changes: dict[str, str | bytes], base: dict[str, str], actor: str, so
         raise ConfigRepoError(f"invalid config commit source {source!r}")
     if not changes:
         raise ConfigRepoError("configrepo.commit requires at least one file")
-    normalized: dict[str, bytes] = {}
+    normalized: dict[str, bytes | None] = {}
     norm_base: dict[str, str] = {}
     norm_modes: dict[str, int] = {}
     for raw_path, content in changes.items():
         rel = _normalize_rel(raw_path)
-        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        data = None if content is None else (content.encode("utf-8") if isinstance(content, str) else bytes(content))
         normalized[rel] = data
         if raw_path in base:
             norm_base[rel] = base[raw_path]
@@ -900,7 +939,8 @@ def commit(changes: dict[str, str | bytes], base: dict[str, str], actor: str, so
                 raise StaleBase(rel, norm_base[rel], live_blob)
         # Validate every new file BEFORE touching the working tree.
         for rel in sorted(normalized):
-            _validate_content(rel, normalized[rel], root)
+            if normalized[rel] is not None:
+                _validate_content(rel, normalized[rel], root)
         return _commit_files_locked(
             root,
             normalized,
