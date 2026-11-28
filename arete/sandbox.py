@@ -200,10 +200,20 @@ def can_confine(remote: bool) -> bool:
     return not remote and sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK)
 
 
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        lib = ctypes.CDLL(None)
+        lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+        _LIBC = lib
+    return _LIBC
+
+
 def sandboxed() -> bool:
-    lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
-    return lib.sandbox_check(os.getpid(), None, 0) != 0
+    return _libc().sandbox_check(os.getpid(), None, 0) != 0
 
 
 def secret_store_roots() -> tuple[Path, ...]:
@@ -225,8 +235,7 @@ def authority_roots() -> tuple[Path, ...]:
 
 
 def already_protects_authority() -> bool:
-    lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    lib = _libc()
 
     def denied(path: Path, *operations: bytes) -> bool:
         return all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(path))) == 1
@@ -518,8 +527,9 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
             profile += f'(allow file-read* (literal (param "RA{i}")))'
     if auth_path is not None:
         params += ["-D", f"AUTH={real_path(auth_path)}", "-D", f"LOCK={real_path(auth_path)}.lock"]
-    for i, path in enumerate(hidden):
-        params += ["-D", f"H{i}={real_path(path)}"]
+    real_hidden = [real_path(path) for path in hidden]
+    for i, path in enumerate(real_hidden):
+        params += ["-D", f"H{i}={path}"]
         profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
     if peers:
         params += ["-D", f"PEERS={real_path(peers)}", "-D", f"WORK={real_path(cwd)}"]
@@ -551,12 +561,13 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                 exceptions += f'(require-not (literal (param "RESTORE{i}")))'
             engine_filter = f"(require-all {engine_filter} {exceptions})"
         profile += f"(deny file-write* {engine_filter})"
-    params += ["-D", f"RUNTIME={real_path(sys.prefix)}"]
+    real_prefix = real_path(sys.prefix)
+    params += ["-D", f"RUNTIME={real_prefix}"]
     profile += '(deny file-write* (subpath (param "RUNTIME")))'
     for i, root in enumerate((paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)):
         params += ["-D", f"INSTALL{i}={real_path(root)}"]
         profile += f'(deny file-write* file-link (subpath (param "INSTALL{i}")))'
-    ancestors = {*engine.parents, *(p for root in (*hidden, Path(sys.prefix)) for p in real_path(root).parents)}
+    ancestors = {*engine.parents, *(p for root in (*real_hidden, real_prefix) for p in root.parents)}
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'

@@ -180,7 +180,7 @@ secretstore.subprocess.run = run_fixture_only
 """
         if schema is None:
             if not self.adapter_only:
-                init += "db.migrate()\n"
+                init += "from tests import support\nsupport.seed_db(paths.STATE_DIR)\n"
         else:
             init += f"""
 chain = [migration for migration in db.migrations.load() if migration.n <= {schema!r}]
@@ -3640,24 +3640,9 @@ assert str(store) in protection['files'] and str(nested) not in protection['open
 """)
 
 
-WORKSPACE_GIT_IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                          "-c", "commit.gpgsign=false"]
-
-
-def init_workspace_repo(src):
-    src.mkdir(parents=True)
-    util.git(["init", "-q", "-b", "main"], src)
-    (src / ".gitignore").write_text(".venv/\n")
-    (src / "notes.txt").write_text("original\n")
-    util.git(["add", "."], src)
-    util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qm", "sample"], src)
-
-
-def write_workspace_output(ws, content):
-    output = ws / ".venv/output"
-    output.parent.mkdir()
-    output.write_text(content)
-    return output
+WORKSPACE_GIT_IDENTITY = support.WORKSPACE_GIT_IDENTITY
+init_workspace_repo = support.init_workspace_repo
+write_workspace_output = support.write_workspace_output
 
 
 WORKSPACE_CHILD = """
@@ -3674,7 +3659,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from arete import config, paths, pipeline, record, sandbox, util, workspace
 from arete.store import db, runs, workspaces
-from tests.test_behavior import WORKSPACE_GIT_IDENTITY, init_workspace_repo, write_workspace_output
+from tests.support import WORKSPACE_GIT_IDENTITY, init_workspace_repo, seed_db, write_workspace_output
 
 sandbox.AUTHORITY = paths.CONFIG_DIR / 'fixture-authority'
 case = unittest.TestCase()
@@ -3847,7 +3832,7 @@ def registered(ws):
     return f"worktree {ws}" in util.git(["worktree", "list", "--porcelain"], src).splitlines()
 """
 
-WORKSPACE_REPO = WORKSPACE_REPO_SETUP + "\ndb.migrate()\n"
+WORKSPACE_REPO = WORKSPACE_REPO_SETUP + "\nseed_db(paths.STATE_DIR)\n"
 
 
 WORKSPACE_FLOW = r"""

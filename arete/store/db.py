@@ -56,7 +56,11 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         mode = "ro" if readonly else "rwc" if create else "rw"
         conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30 if timeout is None else timeout)
         try:
-            conn.execute("PRAGMA synchronous=NORMAL")
+            if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA temp_store=MEMORY")
+            else:
+                conn.execute("PRAGMA synchronous=NORMAL")
             return conn
         except BaseException:
             conn.close()
@@ -101,7 +105,11 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         conn.handles = retained if streaming else handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        else:
+            conn.execute("PRAGMA synchronous=NORMAL")
         if streaming:
             handles.close()
         return conn

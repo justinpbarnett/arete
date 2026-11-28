@@ -7,6 +7,9 @@ from pathlib import Path
 
 FOLDER = Path(__file__).resolve().parent
 STORE_FOLDER = FOLDER.parent
+_DEFAULT_FOLDER = FOLDER
+_DEFAULT_STORE_FOLDER = STORE_FOLDER
+_DEFAULT_CHAIN = None
 PHASES = {"expand", "backfill", "contract"}
 NAME = re.compile(r"m([0-9]{4})_([a-z]+)_([a-z][a-z0-9_]*).py")
 
@@ -49,6 +52,10 @@ def area_owner(area, name, registered):
 
 
 def load(folder=None):
+    global _DEFAULT_CHAIN
+    use_cache = folder is None and FOLDER == _DEFAULT_FOLDER and STORE_FOLDER == _DEFAULT_STORE_FOLDER
+    if use_cache and _DEFAULT_CHAIN is not None:
+        return list(_DEFAULT_CHAIN)
     folder = FOLDER if folder is None else Path(folder)
     registered = owners()
     found = {}
@@ -80,7 +87,10 @@ def load(folder=None):
         raise Refused(f"latest.txt: {e}; expected {highest}") from e
     if latest != [highest]:
         raise Refused(f"latest.txt names {latest!r}; expected {highest}")
-    return list(found.values())
+    chain = list(found.values())
+    if use_cache:
+        _DEFAULT_CHAIN = tuple(chain)
+    return chain
 
 
 def validate(conn, chain, version):

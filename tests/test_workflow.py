@@ -361,7 +361,7 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
             "import time\n"
             "import unittest\n\n"
             "class Sleeper(unittest.TestCase):\n"
-            "    class_timeout = 1\n\n"
+            "    class_timeout = 0.4\n\n"
             "    def test_sleep(self):\n"
             f"        time.sleep({seconds})\n"
         )
@@ -372,9 +372,9 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
         return runner, "deadline_extension_worker.Sleeper"
 
     def test_pool_timeout_passes_alone_with_triple_deadline(self):
-        # At load factor 1, the 2.5s sleep exceeds both the pool's 1s deadline
-        # and the old 2s rerun deadline. Allow 0.5s for worker overhead on the rerun.
-        runner, identifier = self.sleeper(2.5)
+        # At load factor 1, the 1.0s sleep exceeds both the pool's 0.4s deadline
+        # and the old 2x rerun deadline. Allow headroom for worker overhead on the rerun.
+        runner, identifier = self.sleeper(1.0)
         self.addCleanup(sys.modules.pop, "deadline_extension_worker", None)
 
         def remove_reports(path):
@@ -388,24 +388,24 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
             code = runner.run([], [identifier])
         self.addCleanup(shutil.rmtree, runner.folder, ignore_errors=True)
         self.assertEqual(code, 0, output.getvalue())
-        self.assertIn("class exceeded 1s", runner.first_failures[identifier]["timeout"].splitlines())
+        self.assertIn("class exceeded 0.4s", runner.first_failures[identifier]["timeout"].splitlines())
         self.assertEqual(runner.crowded, [identifier])
         self.assertIn(f"{identifier}: ran past its deadline on its first run, "
                       "then passed alone within three times its deadline", output.getvalue())
         self.assertEqual(runner.results[identifier]["ran"], 1)
 
     def first_attempt(self, deadline_load_ratio):
-        runner, identifier = self.sleeper(2)
+        runner, identifier = self.sleeper(0.8)
         runner.folder = runner.args.start
         runner.lifeline, held = os.pipe()
         self.addCleanup(os.close, runner.lifeline)
         self.addCleanup(os.close, held)
         cpus = os.cpu_count()
-        # Sample factor 1 at startup and the chosen factor at the 1s deadline.
-        # The 2s sleep has room to finish within 3s only when the deadline extends.
+        # Sample factor 1 at startup and the chosen factor at the 0.4s deadline.
+        # The 0.8s sleep has room to finish within 1.2s only when the deadline extends.
         samples = chain([(cpus, 0, 0)], repeat((deadline_load_ratio * cpus, 0, 0)))
         with mock.patch.object(os, "getloadavg", side_effect=samples) as getloadavg:
-            runner.child((0, parallel.Batch(identifier, 1, timeout=1)))
+            runner.child((0, parallel.Batch(identifier, 1, timeout=0.4)))
         return runner.results[identifier], getloadavg.call_args_list
 
     def test_rising_load_extends_first_attempt(self):
@@ -416,7 +416,7 @@ class ParallelDeadlineExtensionTests(unittest.TestCase):
 
     def test_steady_load_times_out_on_first_attempt(self):
         report, samples = self.first_attempt(1)
-        self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
+        self.assertIn("class exceeded 0.4s", report["timeout"].splitlines(), report)
         self.assertEqual(samples, [mock.call(), mock.call()])
 
 
@@ -560,7 +560,7 @@ class PipelineNoSlotTests(unittest.TestCase):
         with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
                                   LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
                                   LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
-            db.migrate()
+            support.seed_db(cls.state, db_file=cls.template)
 
     def setUp(self):
         root = self.state / self._testMethodName
@@ -830,7 +830,7 @@ class PrepareResumeTests(unittest.TestCase):
         with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
                                   LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
                                   LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
-            db.migrate()
+            support.seed_db(cls.state, db_file=cls.template)
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(dir=self.state))
@@ -2071,10 +2071,16 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
 
 class PublicationFixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._seed_repo = Path(tempfile.mkdtemp(prefix="arete-pub-seed-"))
+        cls.addClassCleanup(shutil.rmtree, cls._seed_repo, ignore_errors=True)
+        cls.create_repository(cls._seed_repo)
+
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.file = self.root / "file.txt"
-        self.create_repository(self.root)
+        shutil.copytree(self._seed_repo, self.root, dirs_exist_ok=True)
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
         self.controller = orchestration.Controller.__new__(orchestration.Controller)
         run = mock.Mock(id="fixture-run", environment_release="", dry_run=False)
@@ -2194,7 +2200,7 @@ from arete.store import orchestration as ledger, runs as run_store, tasks as tas
                                   LOCKS_DIR=state / "locks", WORKTREES_DIR=seed / "worktrees", LOG_DIR=seed / "logs"),
               mock.patch.object(migrations, "owners", cache(migrations.owners)),
               redirect_stdout(StringIO())):
-            db.migrate()
+            support.seed_db(state, db_file=cls.seed_db)
 
     @staticmethod
     def fixture_env(root):
@@ -4505,7 +4511,7 @@ class SingleWorkerPublicationTests(PublicationFixture):
         catalog.validate.side_effect = lambda *args: orchestration.Catalog.validate(catalog, *args)
 
         self.enterContext(support.workspace_state(Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))))
-        db.migrate()
+        support.seed_db(paths.STATE_DIR)
         self.transition.return_value = mock.DEFAULT
         del controller.persist
 
@@ -5783,7 +5789,7 @@ class CatchUpRepairFixture(PublicationFixture):
         job = self.publication_job(repo, branch, verified=verify.Verified("pass"), stamp=False)
         state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.enterContext(support.workspace_state(state))
-        db.migrate()
+        support.seed_db(paths.STATE_DIR)
         rid = pipeline.record.start("pipeline", repo=repo.name, issue="7")
         folder = paths.RUNS_DIR / rid
         folder.mkdir(parents=True)
@@ -8777,26 +8783,49 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
 class ServeDeploymentFixture(unittest.TestCase):
     class_timeout = 30
 
-    def setUp(self):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        origin = root / "origin.git"
-        self.writer = root / "writer"
-        self.checkout = root / "checkout"
-        self.state = root / "state"
-        self.git(root, "init", "-q", "--bare", "-b", "main", str(origin))
-        self.git(root, "init", "-q", "-b", "main", str(self.writer))
-        self.git(self.writer, "remote", "add", "origin", str(origin))
-        package = self.writer / "arete"
+    @classmethod
+    def setUpClass(cls):
+        cls._seed = Path(tempfile.mkdtemp(prefix="arete-deploy-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls._seed, ignore_errors=True)
+        origin = cls._seed / "origin.git"
+        writer = cls._seed / "writer"
+        checkout = cls._seed / "checkout"
+        cls._run_git(cls._seed, "init", "-q", "--bare", "-b", "main", str(origin))
+        cls._run_git(cls._seed, "init", "-q", "-b", "main", str(writer))
+        cls._run_git(writer, "remote", "add", "origin", str(origin))
+        package = writer / "arete"
         package.mkdir()
         (package / "fixture.py").write_text("version = 1\n")
         (package / "other.py").write_text("other = 1\n")
         (package / "shared.py").write_text("shared = 1\n")
-        self.start = self.commit(self.writer, "initial code")
-        self.git(self.writer, "push", "-q", "origin", "main")
-        self.git(root, "clone", "-q", str(origin), str(self.checkout))
-        layer = root / "layer"
+        cls._run_git(writer, "add", ".")
+        cls._run_git(writer, "commit", "-qm", "initial code", "--allow-empty")
+        cls._seed_start = cls._run_git(writer, "rev-parse", "HEAD")
+        cls._run_git(writer, "push", "-q", "origin", "main")
+        cls._run_git(cls._seed, "clone", "-q", str(origin), str(checkout))
+        layer = cls._seed / "layer"
         layer.mkdir()
         (layer / "config.toml").write_text('[git.required_check]\ncontext = "deployment-check"\napp_id = 17\n')
+
+    @staticmethod
+    def _run_git(cwd, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                       "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True,
+                                       timeout=CHILD_HANG_TIMEOUT).strip()
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        shutil.copytree(self._seed, root, dirs_exist_ok=True)
+        old_origin = str(self._seed / "origin.git")
+        new_origin = str(root / "origin.git")
+        for repo_dir in (root / "writer", root / "checkout"):
+            cfg_path = repo_dir / ".git" / "config"
+            cfg_path.write_text(cfg_path.read_text().replace(old_origin, new_origin))
+        self.writer = root / "writer"
+        self.checkout = root / "checkout"
+        self.state = root / "state"
+        self.start = self._seed_start
+        layer = root / "layer"
         self.repo = config.Repo("arete", self.checkout, github="fixture/arete", layer=layer)
         self.cfg = config.Config(repos=[self.repo])
         self.enterContext(mock.patch.multiple(paths, PACKAGE_DIR=self.checkout / "arete", STATE_DIR=self.state,
@@ -8812,9 +8841,7 @@ class ServeDeploymentFixture(unittest.TestCase):
         self.gate = self.enterContext(mock.patch.object(gh, "merge_ci_passed", wraps=gh.merge_ci_passed))
 
     def git(self, cwd, *args):
-        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                       "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True,
-                                       timeout=CHILD_HANG_TIMEOUT).strip()
+        return self._run_git(cwd, *args)
 
     def commit(self, cwd, subject):
         self.git(cwd, "add", ".")
@@ -9833,7 +9860,8 @@ signal.pause()
             timeout = CHILD_HANG_TIMEOUT if timeout is None else timeout
             return communicate(proc, input=input, timeout=max(CHILD_HANG_TIMEOUT, timeout))
 
-        with (mock.patch.object(sandbox, "protected_command", substitute_merge),
+        with (mock.patch.object(util, "DEPLOY_TERMINATION_GRACE", 0.1),
+              mock.patch.object(sandbox, "protected_command", substitute_merge),
               mock.patch.object(subprocess.Popen, "communicate", expire_after_writes)):
             self.assertEqual(self.deploy(), self.start)
 
