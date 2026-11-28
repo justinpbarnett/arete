@@ -97,7 +97,11 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True,
                                timeout=30 if timeout is None else timeout, factory=ScrubbingConnection)
         try:
-            conn.execute("PRAGMA synchronous=NORMAL")
+            if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA temp_store=MEMORY")
+            else:
+                conn.execute("PRAGMA synchronous=NORMAL")
             return conn
         except BaseException:
             conn.close()
@@ -142,7 +146,11 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         conn.handles = retained if streaming else handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        else:
+            conn.execute("PRAGMA synchronous=NORMAL")
         if streaming:
             handles.close()
         return conn
@@ -169,7 +177,8 @@ SPEC_DELIVERY_SCHEMA = 29
 SPEC_GRAPH_SCHEMA = 30
 FACTORY_SCHEMA = 31
 TICKET_FEEDBACK_SCHEMA = 32
-SECRET_EXPOSE_SCHEMA = 33
+TICKET_FOLLOWUPS_SCHEMA = 33
+SECRET_EXPOSE_SCHEMA = 34
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -181,7 +190,8 @@ WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] wo
 # Unrelated writers can use older databases. Spec graph migrations are serve-owned.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
-                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, SECRET_EXPOSE_SCHEMA))
+                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, TICKET_FOLLOWUPS_SCHEMA,
+                             SECRET_EXPOSE_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()

@@ -931,7 +931,7 @@ def secrets_table(data, config_file: Path, *, repo_paths=()) -> SecretsConfig:
 
 def secret_settings() -> SecretsConfig:
     try:
-        data = read_data()
+        data = paths.parse_toml_bytes(paths.read_confined(paths.CONFIG_FILE))
     except FileNotFoundError:
         data = {}
     return secrets_table(data.get("secrets", {}), paths.CONFIG_FILE,
