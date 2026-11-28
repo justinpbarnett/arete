@@ -493,6 +493,7 @@ def carry(run: LoopRun) -> str:
             return settle(run, "skipped", summary)
     run.scratch.mkdir(parents=True, exist_ok=True)
     how = "drop"
+    device_error: devices.DeviceError | None = None
     try:
         with (record.stoppable(),
               devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device):
@@ -501,17 +502,27 @@ def carry(run: LoopRun) -> str:
         status, summary = "skipped", f"budget: {e}"
         how = "dead"
     except Exception as e:
+        if isinstance(e, devices.DeviceError):
+            device_error = e
         if not isinstance(e, record.Stopped | devices.DeviceError):
             run.log("error", traceback.format_exc().strip())
         status, summary = devices.outcome_of(e, run.id)
         if status == "stopped":
             how = "dead" if summary == record.STOPPED else "release"
     summary = devices.with_left_up(summary, run.id)
+    from .store import devices as device_store
     from .store import factory
     if factory.interrupted(run.id):
         if status != "done":
             return settle(run, "interrupted", "Paused by the factory switch")
     with foundation.tx() as c:
+        if device_error is not None and run.loop.device:
+            device_store.open_wait(
+                c,
+                f"config:loop/{run.loop.name}",
+                f"device:{run.loop.device}",
+                util.one_line(str(device_error), 500),
+            )
         loop_store.end_claim(
             c, run.id, "dead" if status == "failed" else how, summary, max_attempts=run.loop.max_attempts
         )

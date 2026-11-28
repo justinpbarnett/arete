@@ -35,6 +35,7 @@ from . import (
     gh,
     hold_review,
     install,
+    leases,
     loop_run,
     loops,
     oncall,
@@ -554,6 +555,7 @@ class Server:
             self.schedule_resumed = state["version"]
         self.guard("stage:secret-move", self.move_secrets_when_due)
         self.guard("stage:secret-check", self.check_secrets_when_due)
+        self.guard("stage:leases", self.lapse_leases)
         self.guard("stage:reap", self.reap)
         self.guard("stage:claims", self.release_claims)
         states = self.guard("stage:states", loop_store.loop_states)
@@ -578,7 +580,7 @@ class Server:
         for name, action, args in stages:
             factory_state.admit()
             self.guard(f"stage:{name}", action, *args)
-        tick_stages = {"stage:reap", "stage:claims", "stage:secret-move", "stage:secret-check",
+        tick_stages = {"stage:leases", "stage:reap", "stage:claims", "stage:secret-move", "stage:secret-check",
                        *(f"stage:{name}" for name, _, _ in stages)}
         return states is not None and not any(key in tick_stages or key.startswith(("loop:", "secret-check:"))
                                               for key in self.failing)
@@ -632,6 +634,11 @@ class Server:
         for row in rows:
             self.guard(f"secret-check:{row['id']}", secretstore.check, row["scope"], row["name"])
         self.secrets_checked_at = now
+
+    def lapse_leases(self) -> None:
+        lapsed = leases.lapse()
+        if lapsed:
+            self.say(f"lapsed {util.count(len(lapsed), 'expired lease')}")
 
     def reap(self) -> None:
         for row in record.reap(tickets=False, release_claims=False):
@@ -1123,6 +1130,7 @@ class Server:
     def sweep_vms(self) -> None:
         try:
             devices.sweep(self.sweep_log)
+            devices.probe_waiting_devices(self.say)
         except Exception as e:
             self.say(f"sweeping left-over VMs failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
@@ -1204,6 +1212,11 @@ class Server:
             self.say(f"{loop.name}: queue item {item['id']} waits, {why}")
 
     def dispatch_item(self, item: dict, loop: Loop, slots: QueueSlots) -> str | None:
+        from .store import devices as device_store
+
+        if open_waits := device_store.open_waits_for_subject(f"config:loop/{loop.name}"):
+            blockers = ", ".join(w["blocker"].removeprefix("device:") for w in open_waits)
+            return f"waiting on {blockers}"
         if why := slots.why_full(item, loop, self.cfg):
             return why
         if spent := loop_run.spent_limit(loop, self.cfg):

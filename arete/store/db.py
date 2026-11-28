@@ -184,6 +184,8 @@ CONFIG_VER_SCHEMA = 36
 INBOX_SCHEMA = 37
 LOOP_QUEUE_SCHEMA = 38
 PRIVATE_EVIDENCE_SCHEMA = 39
+DEVICES_LEASES_SCHEMA = 40
+DEVICES_CONTRACT_SCHEMA = 41
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -197,10 +199,40 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
                              SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, TICKET_FOLLOWUPS_SCHEMA,
                              SECRET_EXPOSE_SCHEMA, CONFIG_INDEX_SCHEMA, CONFIG_VER_SCHEMA, INBOX_SCHEMA,
-                             LOOP_QUEUE_SCHEMA, PRIVATE_EVIDENCE_SCHEMA))
+                             LOOP_QUEUE_SCHEMA, PRIVATE_EVIDENCE_SCHEMA, DEVICES_LEASES_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
+_LEASE_FENCE_LOCK = threading.Lock()
+_LEASE_FENCE: tuple[int, int, str] | None = None
+
+
+class LeaseFenced(BaseException):
+    def __init__(self, code: str = "lease_fenced", *, lease_id: int | None = None,
+                 epoch: int | None = None, run_id: str = ""):
+        super().__init__(code)
+        self.code = code
+        self.lease_id = lease_id
+        self.epoch = epoch
+        self.run_id = run_id
+
+
+def register_lease_fence(lease_id: int, epoch: int, run_id: str = "") -> None:
+    global _LEASE_FENCE
+    with _LEASE_FENCE_LOCK:
+        _LEASE_FENCE = (lease_id, epoch, run_id)
+
+
+def clear_lease_fence(lease_id: int | None = None) -> None:
+    global _LEASE_FENCE
+    with _LEASE_FENCE_LOCK:
+        if lease_id is None or (_LEASE_FENCE is not None and _LEASE_FENCE[0] == lease_id):
+            _LEASE_FENCE = None
+
+
+def current_lease_fence() -> tuple[int, int, str] | None:
+    with _LEASE_FENCE_LOCK:
+        return _LEASE_FENCE
 
 
 class NoDatabase(RuntimeError):
@@ -252,6 +284,10 @@ def contract_blockers(conn, n):
         children = live_serve_children(heartbeat_serve_children(beat, seen) | inherited_serve_children())
         blockers.extend(f"inherited child {pid}" for pid in sorted({pid for pid, _ in children}))
         blockers.extend(workspace_admission_blockers())
+        if problem := workspace_serve_blocker(beat, n):
+            blockers.append(problem)
+    elif n == DEVICES_CONTRACT_SCHEMA:
+        beat = control.database_beat()
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
     else:
@@ -515,6 +551,21 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through:
                     if blockers:
                         print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
                         return True
+                    if migration.n == DEVICES_CONTRACT_SCHEMA:
+                        from .. import devices as devices_mod
+                        from .migrations import m0041_devices_contract as devices_contract
+
+                        try:
+                            projected = devices_mod.projected_after_split()
+                            check_conn = connect_db(paths.DB_FILE, readonly=True)
+                            check_conn.row_factory = sqlite3.Row
+                            try:
+                                devices_contract.validate_vms_rows(check_conn, projected)
+                            finally:
+                                check_conn.close()
+                            devices_mod.split_devices_toml()
+                        except BaseException as e:
+                            raise migrations.Refused(f"{migration.name}: {e}") from e
                 if not started_chain:
                     if paths.DB_FILE.stat().st_size:
                         snapshot = backup.snapshot(f"m{migration.n}")
@@ -559,6 +610,9 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through:
                     return True
                 except BaseException as e:
                     raise migrations.Refused(f"{migration.name}: {e}") from e
+                if migration.n == DEVICES_CONTRACT_SCHEMA:
+                    with suppress(OSError):
+                        (paths.STATE_DIR / "devices.json").unlink()
                 version = migration.n
                 print(f"applied {migration.name}", flush=True)
             backup.finish_restore()
@@ -682,7 +736,7 @@ def read_connection(*, timeout: float | None = None):
 
 
 @contextmanager
-def owned(mode, timeout, before_commit=None):
+def owned(mode, timeout, before_commit=None, *, fenced=True):
     bounded = _TRANSACTION_DEADLINE.get()
     if bounded:
         until, check = bounded
@@ -708,6 +762,14 @@ def owned(mode, timeout, before_commit=None):
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
+            if mode == "write" and fenced and (fence := current_lease_fence()) is not None:
+                lease_id, expected_epoch, run_id = fence
+                row = conn.execute("SELECT epoch, released, expires FROM leases WHERE id = ?", (lease_id,)).fetchone()
+                if row is None or row["epoch"] != expected_epoch or row["released"] is not None:
+                    actual_epoch = int(row["epoch"]) if row is not None else expected_epoch
+                    raise LeaseFenced("lease_fenced", lease_id=lease_id, epoch=actual_epoch, run_id=run_id)
+                if row["expires"] < util.iso():
+                    raise LeaseFenced("lease_expired", lease_id=lease_id, epoch=int(row["epoch"]), run_id=run_id)
             _OWNER.active = (os.getpid(), mode, conn)
             _OWNER.after_commit = callbacks
             if mode == "write" and isinstance(conn, ScrubbingConnection):
@@ -738,8 +800,8 @@ def owned(mode, timeout, before_commit=None):
 
 
 @contextmanager
-def tx(*, timeout: float | None = None, before_commit=None):
-    with owned("write", timeout, before_commit) as conn:
+def tx(*, timeout: float | None = None, before_commit=None, fenced: bool = True):
+    with owned("write", timeout, before_commit, fenced=fenced) as conn:
         yield conn
 
 

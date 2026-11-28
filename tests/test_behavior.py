@@ -7558,9 +7558,12 @@ class ConfigKindRegistryTests(unittest.TestCase):
         for name in ("capture", "ask", "dashboard"):
             assert not config.root_schema(name).get("x-arete-reach")
         test = unittest.TestCase()
-        for name in ("connector", "target", "device"):
+        for name in ("connector", "target"):
             with test.assertRaisesRegex(ValueError, "unavailable for writes"):
                 configschema.validate(name, {})
+        configschema.validate("device", {"kind": "ssh", "host": "box.test", "note": "build box"})
+        with test.assertRaisesRegex(ValueError, "unknown key extra"):
+            configschema.validate("device", {"kind": "ssh", "host": "box.test", "extra": True})
         with test.assertRaisesRegex(ValueError, "directory_cleanup must be boolean"):
             configschema.validate("step_settings", {"schema": 1, "defaults": {"tools": [], "mcp": [],
                                   "session": "fresh"}, "steps": {"verify": {"directory_cleanup": 1}}})
@@ -9841,8 +9844,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 86)
-        self.assertEqual(len({op["name"] for op in operations}), 86)
+        self.assertEqual(len(operations), 92)
+        self.assertEqual(len({op["name"] for op in operations}), 92)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -13884,4 +13887,957 @@ with scratch_records():
     server.cfg = cfg
     server.sweep_workspaces()
     assert ws.exists() and workspaces.get(wid)["state"] == "kept"
+""")
+
+
+DEVICE_LEASE_HELPER = r"""
+import concurrent.futures
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import timedelta
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from arete import (
+    accounts,
+    api,
+    cli,
+    config,
+    configrepo,
+    control,
+    dashboard,
+    devices,
+    exedev,
+    gh,
+    inbox,
+    leases,
+    loop_run,
+    loops,
+    outbound,
+    paths,
+    principals,
+    proxmox,
+    record,
+    replay,
+    secretstore,
+    serve,
+    ssh,
+    store,
+    tailnet,
+    util,
+)
+from arete.store import config as config_store
+from arete.store import db as foundation
+from arete.store import devices as device_store
+from arete.store import loops as loop_store
+from arete.store import migrations
+from arete.store import runs as run_store
+from arete.store import tokens as token_store
+
+
+def _forbid(*args, **kwargs):
+    raise AssertionError("forbidden external call")
+
+
+def install_offline_guards():
+    urllib.request.urlopen = _forbid
+    accounts.read = _forbid
+    gh.gh = _forbid
+
+
+def setup_scratch(migrate_through=None, *, include_devices=True):
+    install_offline_guards()
+    paths.ensure_dirs()
+    sample_dir = Path(os.environ["TMPDIR"]) / "replay-sample"
+    if not sample_dir.exists():
+        sample_lines = replay.sample(sample_dir)
+    else:
+        sample_lines = []
+    cfg_file = paths.CONFIG_DIR / "config.toml"
+    if not cfg_file.exists():
+        import shutil as _shutil
+
+        local_layer = paths.CONFIG_DIR / "layers" / "replay-sample"
+        if (sample_dir / "layer").is_dir() and not local_layer.exists():
+            local_layer.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copytree(sample_dir / "layer", local_layer)
+        rewritten = [
+            f'layer = {json.dumps(str(local_layer))}' if line.strip().startswith("layer =") else line
+            for line in sample_lines
+        ]
+        store_dir = Path(os.environ["TMPDIR"]) / "secret-store"
+        store_dir.mkdir(mode=0o700, exist_ok=True)
+        cfg_file.write_text(
+            "\n".join(rewritten)
+            + f'\n[secrets]\nstore = "pve_store"\nstore_dir = {json.dumps(str(store_dir))}\n',
+            encoding="utf-8",
+        )
+    if include_devices:
+        dev_dir = paths.CONFIG_DIR / "devices"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        (dev_dir / "prox.toml").write_text(
+            'kind = "proxmox"\nhost = "root@prox.test"\ntemplate = "9000"\nnote = "proxmox host"\n',
+            encoding="utf-8",
+        )
+        (dev_dir / "box.toml").write_text(
+            'kind = "ssh"\nhost = "box@box.test"\nnote = "build box"\n',
+            encoding="utf-8",
+        )
+        (dev_dir / "sand.toml").write_text(
+            'kind = "exe"\nnote = "exe sandbox"\n',
+            encoding="utf-8",
+        )
+    if migrate_through is None:
+        foundation.migrate()
+    else:
+        foundation.migrate(through=migrate_through)
+    principals.seed_owner("owner@example.test")
+    with foundation.tx(fenced=False) as c:
+        token_store.ensure_key(c)
+    configrepo.init()
+    configrepo.reconcile()
+
+
+class FakeProxmoxHost:
+    def __init__(self, root: Path, *, always_collide=False, storage_exists=False,
+                 fail_destroy=False, nextid_timeout=False, nextid_barrier_dir: Path | None = None):
+        self.root = root
+        self.vms_dir = root / "pve-vms"
+        self.vms_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = root / "pve-calls.log"
+        self.always_collide = always_collide
+        self.storage_exists = storage_exists
+        self.fail_destroy = fail_destroy
+        self.nextid_timeout = nextid_timeout
+        self.nextid_barrier_dir = nextid_barrier_dir
+        self.exe_vms: set[str] = set()
+        self.ssh_calls: list[list[str]] = []
+
+    def _log(self, line: str):
+        with self.log_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def calls(self) -> list[str]:
+        if not self.log_file.exists():
+            return []
+        return self.log_file.read_text(encoding="utf-8").splitlines()
+
+    def sh(self, argv, *, timeout=None, **kwargs):
+        cmd = argv if isinstance(argv, list) else [str(argv)]
+        self.ssh_calls.append(cmd)
+        if not cmd or cmd[0] != "ssh":
+            return subprocess.CompletedProcess(cmd, 0, "Linux x86_64\n/home/local\nhas:claude\n", "")
+        dest = cmd[-2]
+        remote = cmd[-1]
+        self._log(f"{dest}: {remote}")
+
+        if "root@prox.test" in dest:
+            if remote.startswith("pvesh get /cluster/nextid"):
+                if self.nextid_timeout:
+                    return subprocess.CompletedProcess(cmd, util.TIMED_OUT, "", "timed out")
+                vmid = 100
+                while (self.vms_dir / f"{vmid}.conf").exists():
+                    vmid += 1
+                if self.nextid_barrier_dir is not None and not (self.nextid_barrier_dir / "released").exists():
+                    self.nextid_barrier_dir.mkdir(parents=True, exist_ok=True)
+                    mine = self.nextid_barrier_dir / f"pid-{os.getpid()}"
+                    mine.write_text("ready", encoding="utf-8")
+                    deadline = time.monotonic() + 5
+                    while len(list(self.nextid_barrier_dir.glob("pid-*"))) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    (self.nextid_barrier_dir / "released").write_text("go", encoding="utf-8")
+                else:
+                    time.sleep(0.01)
+                return subprocess.CompletedProcess(cmd, 0, f"{vmid}\n", "")
+            if m := re.match(r"qm clone (\d+) (\d+) --name (\S+) --full 0", remote):
+                _, vmid_s, name = m.groups()
+                if self.storage_exists:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"lvcreate failed: storage volume vm-{vmid_s}-disk-0 already exists"
+                    )
+                if self.always_collide:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"unable to create VM {vmid_s}: config file already exists"
+                    )
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                try:
+                    fd = os.open(conf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, "", f"unable to create VM {vmid_s}: config file already exists"
+                    )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"name: {name}\n")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if m := re.match(r"qm config (\d+)\b", remote):
+                vmid_s = m.group(1)
+                if "grep" in remote:
+                    return subprocess.CompletedProcess(cmd, 0, "name: tpl\ntemplate: 1\nmemory: 4096\ncores: 2\n", "")
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                if not conf.exists():
+                    return subprocess.CompletedProcess(cmd, 2, "", f"Configuration file 'nodes/pve/qemu-server/{vmid_s}.conf' does not exist")
+                return subprocess.CompletedProcess(cmd, 0, conf.read_text(encoding="utf-8"), "")
+            if m := re.match(r"qm start (\d+)", remote):
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if m := re.match(r"qm stop (\d+).*qm destroy (\d+)", remote):
+                vmid_s = m.group(2)
+                if self.fail_destroy:
+                    return subprocess.CompletedProcess(cmd, 1, "", "host unreachable")
+                conf = self.vms_dir / f"{vmid_s}.conf"
+                if conf.exists():
+                    conf.unlink()
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        if "box@box.test" in dest:
+            if "uname -sm" in remote:
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    "Linux x86_64\n/home/box\nhas:claude\nhas:pi\ngpu:RTX 4090, 24564 MiB\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        if ssh.EXE_LOBBY in dest:
+            if remote.startswith("new "):
+                m = re.search(r"--name=(\S+)", remote)
+                name = m.group(1) if m else "arete-sand"
+                self.exe_vms.add(name)
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"ssh_dest": f"{name}{ssh.EXE_VM_DOMAIN}"}), "")
+            if remote.startswith("integrations ls"):
+                return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            if remote.startswith("rm "):
+                parts = remote.split()
+                name = parts[1]
+                if self.fail_destroy:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"errors": {name: "rm failed"}}), "")
+                if name in self.exe_vms:
+                    self.exe_vms.discard(name)
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"deleted": [name]}), "")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"not_found": [name]}), "")
+            return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+        if ssh.is_exe_vm(dest):
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    @contextmanager
+    def patched(self):
+        def fake_address(boot):
+            return f"10.0.0.{boot.vmid}"
+
+        def fake_trusted(boot, address, known_hosts):
+            known_hosts.write_text(f"{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTestOnly\n", encoding="utf-8")
+            return replace(boot.proxmox, name=f"{boot.proxmox.name} clone", kind="ssh",
+                           host=f"{boot.proxmox.user}@{address}", port=None, jump="",
+                           via=boot.proxmox, known_hosts=str(known_hosts))
+
+        with (
+            mock.patch.object(util, "sh", side_effect=self.sh),
+            mock.patch.object(devices, "clone_address", side_effect=fake_address),
+            mock.patch.object(devices, "trusted_clone", side_effect=fake_trusted),
+        ):
+            yield
+"""
+
+
+class DeviceLeaseTests(unittest.TestCase):
+    class_timeout = 30
+
+    def _run_child(self, code: str, *, env_extra: dict[str, str] | None = None, timeout: float = 25) -> subprocess.CompletedProcess:
+        root = Path(tempfile.mkdtemp(prefix="arete-devlease-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        env = {
+            k: os.environ[k]
+            for k in ("PATH", "LANG", "LC_ALL", "ARETE_TEST_FAST_SYNC", "ARETE_DRIVE_FLUSH")
+            if k in os.environ
+        }
+        for var, name in (
+            ("HOME", "home"),
+            ("ARETE_CONFIG_DIR", "config"),
+            ("ARETE_STATE_DIR", "state"),
+            ("ARETE_LOG_DIR", "logs"),
+            ("ARETE_WORKTREES_DIR", "worktrees"),
+            ("TMPDIR", "tmp"),
+            ("XDG_STATE_HOME", "xdg"),
+        ):
+            folder = root / name
+            folder.mkdir(exist_ok=True)
+            env[var] = str(folder)
+        env.update(env_extra or {})
+        repo_root = Path(__file__).resolve().parent.parent
+        helper_file = root / "tmp" / "device_lease_helper.py"
+        helper_file.write_text(DEVICE_LEASE_HELPER, encoding="utf-8")
+        script = (
+            f"import sys; sys.path.insert(0, {str(repo_root)!r}); sys.path.insert(0, {str(helper_file.parent)!r})\n"
+            "from device_lease_helper import *\n"
+            + code
+        )
+        proc = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script],
+            cwd=str(repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode != 0:
+            self.fail(f"child exited {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        return proc
+
+    def test_lapse_fence_renew_sleep_exe_and_prune(self):
+        self._run_child(r"""
+setup_scratch()
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+
+# 1. Lapse and fence in a real child process + cli.main exit 3 + run.log append.
+run_id = record.start("loop", loop="demo", device="box")
+child_ready = Path(os.environ["TMPDIR"]) / "child-ready"
+child_go = Path(os.environ["TMPDIR"]) / "child-go"
+child_code = (
+    f"import sys, time\nsys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r})\n"
+    "from pathlib import Path\n"
+    "from arete import cli, devices, leases, loop_run, record\n"
+    f"def _carry(rid):\n"
+    f"    with devices.lease('box', rid):\n"
+    f"        leases.current().pause_renewer()\n"
+    f"        Path({str(child_ready)!r}).write_text(str(leases.current().id))\n"
+    f"        while not Path({str(child_go)!r}).exists():\n"
+    f"            time.sleep(0.02)\n"
+    f"        record.note(rid, summary='should be fenced')\n"
+    f"    return 'done'\n"
+    "loop_run.carry_opened = _carry\n"
+    f"raise SystemExit(cli.main(['loop', 'exec', '--run-id', {run_id!r}]))\n"
+)
+child_env = {**{k: os.environ[k] for k in os.environ}, control.WORKER_ENV: "loop exec"}
+child = subprocess.Popen(
+    [sys.executable, "-I", "-B", "-c", child_code],
+    env=child_env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+try:
+    deadline = time.monotonic() + 10
+    while not child_ready.exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert child_ready.exists(), f"child never became ready: rc={child.poll()} stderr={child.stderr.read()}"
+    lease_id = int(child_ready.read_text().strip())
+
+    # Set expires 1s in the past and run leases.lapse().
+    past = util.iso(util.now() - timedelta(seconds=1))
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (past, lease_id))
+    lapsed = leases.lapse()
+    assert lapsed == [lease_id], lapsed
+
+    row = device_store.lease_get(lease_id)
+    assert row["epoch"] == 2 and row["released"] is not None and row["outcome"] == "expired", row
+    run_before = run_store.run_get(run_id)
+    assert run_before["status"] == "interrupted", run_before
+    with foundation.reader() as c:
+        evs = [dict(r) for r in c.execute(
+            "SELECT * FROM events_log WHERE kind = 'lease.changed' AND subject = ? ORDER BY seq",
+            (f"lease:{lease_id}",),
+        )]
+        assert evs and evs[-1]["ver"] == row["version"], (evs, row["version"])
+        toks = [dict(r) for r in c.execute("SELECT * FROM lease_tokens WHERE lease_id = ?", (lease_id,))]
+        assert toks and all(t["dead_at"] is not None for t in toks), toks
+
+    # Unblock child -> its record.note raises LeaseFenced("lease_fenced") -> cli.main exits 3, writes run.log, run unchanged.
+    child_go.write_text("go")
+    out, err = child.communicate(timeout=10)
+    assert child.returncode == 3, (child.returncode, out, err)
+    run_after = run_store.run_get(run_id)
+    assert run_after == run_before, (run_before, run_after)
+    log_text = (paths.RUNS_DIR / run_id / "run.log").read_text(encoding="utf-8")
+    assert f"L-{lease_id}" in log_text and "epoch 2" in log_text and "lease_fenced" in log_text, log_text
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+
+# 2. Expired lease with no epoch bump gives LeaseFenced("lease_expired").
+run_exp = record.start("loop", loop="exp", device="box")
+active = leases.claim("box", devices.version_of("box"), run_id=run_exp, start_renewer=False)
+try:
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=2)), active.id))
+    try:
+        record.note(run_exp, summary="should expire")
+        raise AssertionError("expected LeaseFenced(lease_expired)")
+    except leases.LeaseFenced as e:
+        assert e.code == "lease_expired", e.code
+finally:
+    active.close("", fenced=False)
+
+# 3. Barrier between lapse read and its tx(): renewal landing first wins and nothing lapses.
+run_race = record.start("loop", loop="race", device="box")
+active_race = leases.claim("box", devices.version_of("box"), run_id=run_race, start_renewer=False)
+try:
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=1)), active_race.id))
+    barrier_hit = []
+    def renew_in_between(cand):
+        barrier_hit.append(cand["id"])
+        future = util.iso(util.now() + timedelta(seconds=120))
+        with foundation.tx(fenced=False) as c:
+            c.execute("UPDATE leases SET renewed = ?, expires = ? WHERE id = ?", (util.iso(), future, cand["id"]))
+    assert leases.lapse(before_lapse=renew_in_between) == []
+    assert barrier_hit == [active_race.id]
+    assert device_store.lease_get(active_race.id)["released"] is None
+    assert run_store.run_get(run_race)["status"] == "running"
+finally:
+    active_race.close("", fenced=False)
+
+# 4. RENEW_SECONDS patched to 0.1 -> renewed moves and events_log count does not.
+run_ren = record.start("loop", loop="renew", device="box")
+with mock.patch.object(leases, "RENEW_SECONDS", 0.1):
+    active_ren = leases.claim("box", devices.version_of("box"), run_id=run_ren, start_renewer=True)
+    try:
+        with foundation.reader() as c:
+            before_count = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if device_store.lease_get(active_ren.id)["renewed"]:
+                break
+            time.sleep(0.05)
+        after_row = device_store.lease_get(active_ren.id)
+        with foundation.reader() as c:
+            after_count = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+        assert after_row["renewed"], after_row
+        assert after_count == before_count, (before_count, after_count)
+    finally:
+        active_ren.close("", fenced=False)
+
+# 5. Serve previous tick 300s back -> expired lease gets new expires, nothing interrupted, no event.
+run_sleep = record.start("loop", loop="sleep", device="box")
+active_sleep = leases.claim("box", devices.version_of("box"), run_id=run_sleep, start_renewer=False)
+try:
+    old_exp = util.iso(util.now() - timedelta(seconds=5))
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (old_exp, active_sleep.id))
+    with foundation.reader() as c:
+        ev_before = c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0]
+    assert leases.lapse(prev_tick=util.now() - timedelta(seconds=300)) == []
+    row_sleep = device_store.lease_get(active_sleep.id)
+    assert row_sleep["released"] is None and row_sleep["expires"] > old_exp, row_sleep
+    assert run_store.run_get(run_sleep)["status"] == "running"
+    with foundation.reader() as c:
+        assert c.execute("SELECT COUNT(*) FROM events_log").fetchone()[0] == ev_before
+finally:
+    active_sleep.close("", fenced=False)
+
+# 6. exe kind takes the same lease, renew, and sweep path with faked sandbox calls.
+with host.patched():
+    run_exe = record.start("loop", loop="exe-test", device="sand")
+    with devices.lease("sand", run_exe) as vm:
+        assert vm.host.endswith(ssh.EXE_VM_DOMAIN), vm
+        exe_lease = device_store.latest_lease_for_run(run_exe)
+        assert exe_lease["device"] == "sand" and exe_lease["vm_name"] in host.exe_vms and exe_lease["ready"]
+    done_exe = device_store.lease_get(exe_lease["id"])
+    assert done_exe["outcome"] == "deleted" and exe_lease["vm_name"] not in host.exe_vms
+
+# 7. Retention prune: device_probes 90d, lease_tokens 7d after lease released, cleared waits 90d, leases stay.
+old_91 = util.iso(util.now() - timedelta(days=91))
+old_8 = util.iso(util.now() - timedelta(days=8))
+with foundation.tx(fenced=False) as c:
+    device_store.insert_device_probe(c, device="box", device_version="device/box@000000000000",
+                                     at=old_91, ok=True, seconds=0.1, home="/home/old")
+    lid = device_store.insert_lease(c, run_id=None, device="box", device_version="", created=old_8, expires=old_8)
+    device_store.set_lease_token(c, lid, "oldhash", old_8)
+    c.execute("UPDATE leases SET released = ?, outcome = 'deleted' WHERE id = ?", (old_8, lid))
+    c.execute("INSERT INTO waits (subject, blocker, reason, opened, cleared) VALUES ('config:loop/x', 'device:box', 'old', ?, ?)",
+              (old_91, old_91))
+store.prune()
+with foundation.reader() as c:
+    assert c.execute("SELECT COUNT(*) FROM device_probes WHERE at = ?", (old_91,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM lease_tokens WHERE lease_id = ?", (lid,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM waits WHERE cleared = ?", (old_91,)).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM leases WHERE id = ?", (lid,)).fetchone()[0] == 1
+""")
+
+    def test_probes_as_rows_split_and_contract(self):
+        self._run_child(r"""
+# Part A: Probes as rows + devices.home cached by device_version + split devices.toml.
+setup_scratch()
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+with host.patched():
+    p_box = devices.probe("box")
+    p_prox = devices.probe("prox")
+    assert p_box["ok"] and p_prox["ok"]
+    assert not (paths.STATE_DIR / "devices.json").exists()
+
+    for name in ("box", "prox"):
+        row = device_store.latest_device_probe(name)
+        idx = config_store.live_item("device", name)
+        assert row is not None and idx is not None
+        assert row["device_version"] == idx["version"], (row["device_version"], idx["version"])
+
+    calls_before = len(host.ssh_calls)
+    assert devices.home("box") == "/home/box"
+    assert len(host.ssh_calls) == calls_before, "devices.home made an unexpected ssh call"
+    assert "box.test" in outbound.machine_hosts()
+
+# Split devices.toml with two devices in ONE configrepo commit, devices.load() equals old parse().
+legacy_toml = (
+    '[device.alpha]\nkind = "ssh"\nhost = "u@alpha.test"\nnote = "a"\n\n'
+    '[device.beta]\nkind = "proxmox"\nhost = "root@beta.test"\ntemplate = "9001"\n'
+)
+old_parsed = devices.parse(__import__("tomllib").loads(legacy_toml))
+for existing in (paths.CONFIG_DIR / "devices").glob("*.toml"):
+    existing.unlink()
+(paths.CONFIG_DIR / "devices.toml").write_text(legacy_toml, encoding="utf-8")
+configrepo.commit_hand_edits()
+before_commits = subprocess.run(
+    ["git", "rev-list", "--count", "HEAD"],
+    cwd=paths.CONFIG_DIR, capture_output=True, text=True, check=True, env={"PATH": os.environ["PATH"]},
+).stdout.strip()
+sha = devices.split_devices_toml()
+assert sha
+after_commits = subprocess.run(
+    ["git", "rev-list", "--count", "HEAD"],
+    cwd=paths.CONFIG_DIR, capture_output=True, text=True, check=True, env={"PATH": os.environ["PATH"]},
+).stdout.strip()
+assert int(after_commits) == int(before_commits) + 1
+assert not (paths.CONFIG_DIR / "devices.toml").exists()
+assert (paths.CONFIG_DIR / "devices" / "alpha.toml").is_file()
+assert (paths.CONFIG_DIR / "devices" / "beta.toml").is_file()
+loaded_remote = [d for d in devices.load() if d.name != "local"]
+assert loaded_remote == old_parsed, (loaded_remote, old_parsed)
+""")
+
+        # Part B: Contract migration gate, copy of two vms rows, view, lapse + sweep, and refusal on unmatched device.
+        self._run_child(r"""
+setup_scratch(migrate_through=39)
+host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
+prox_dev = devices.get("prox")
+created_ts = util.iso(util.now() - timedelta(minutes=5))
+# Create fake VM conf files on Proxmox host + insert two legacy vms rows + older running run holding gate.
+for vmid, vname in ((101, "arete-legacy-1"), (102, "arete-legacy-2")):
+    (host.vms_dir / f"{vmid}.conf").write_text(f"name: {vname}\n", encoding="utf-8")
+with foundation.tx(fenced=False) as c:
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-legacy-1", None, json.dumps(__import__("dataclasses").asdict(prox_dev)), 101, created_ts),
+    )
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-legacy-2", None, json.dumps(__import__("dataclasses").asdict(prox_dev)), 102, created_ts),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, status, started, pid, schema_version) VALUES (?, 'loop', 'running', ?, ?, 39)",
+        ("old-blocker", created_ts, os.getpid()),
+    )
+
+# Contract waits while old running run holds the gate (expand m0040 applies, contract m0041 waits).
+waiting = foundation.migrate()
+assert waiting is True
+with foundation.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 40
+
+# Release gate -> contract runs and copies both vms rows into open leases + creates vms view.
+with foundation.tx(fenced=False) as c:
+    c.execute("UPDATE runs SET status = 'done' WHERE id = 'old-blocker'")
+waiting = foundation.migrate()
+assert waiting is False
+with foundation.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 41
+    view_rows = [(r["name"], r["vmid"]) for r in c.execute("SELECT name, vmid FROM vms ORDER BY vmid")]
+    assert view_rows == [("arete-legacy-1", 101), ("arete-legacy-2", 102)], view_rows
+
+# Next lapse pass + sweep past LAPSE_GRACE_MINUTES delete both VMs and view reads empty.
+lapsed = leases.lapse()
+assert len(lapsed) == 2
+future_now = util.now() + timedelta(minutes=11)
+with host.patched(), mock.patch.object(util, "now", return_value=future_now):
+    devices.sweep(lambda rid: lambda text: None)
+with foundation.reader() as c:
+    assert c.execute("SELECT name, vmid FROM vms").fetchall() == []
+assert not (host.vms_dir / "101.conf").exists() and not (host.vms_dir / "102.conf").exists()
+""")
+
+        # Part C: Unmatched vms row refuses the contract naming row + delete_command().
+        self._run_child(r"""
+setup_scratch(migrate_through=40)
+ghost = devices.Device("ghost", "proxmox", host="root@ghost.test", template="9000")
+with foundation.tx(fenced=False) as c:
+    c.execute(
+        "INSERT INTO vms (name, run_id, device, vmid, created, answered, failing_since) VALUES (?,?,?,?,?,1,NULL)",
+        ("arete-orphan-vm", None, json.dumps(__import__("dataclasses").asdict(ghost)), 777, util.iso()),
+    )
+try:
+    foundation.migrate()
+    raise AssertionError("expected contract refusal")
+except migrations.Refused as e:
+    msg = str(e)
+    assert "arete-orphan-vm" in msg and "qm destroy 777" in msg and "root@ghost.test" in msg, msg
+""")
+
+    def test_vmid_retry_sweep_by_lease_and_outside_release(self):
+        self._run_child(r"""
+setup_scratch()
+tmp = Path(os.environ["TMPDIR"])
+
+# 1. Two processes lease prox and both read one nextid: both get a VM, vmids differ, one lease collided, every destroy names own vmid.
+barrier_dir = tmp / "nextid-barrier"
+host = FakeProxmoxHost(tmp, nextid_barrier_dir=barrier_dir)
+r1 = record.start("loop", loop="p1", device="prox")
+r2 = record.start("loop", loop="p2", device="prox")
+leased_dir = tmp / "leased-barrier"
+worker_script = (
+    f"import json, os, sys, time; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+    f"sys.path.insert(0, {str(tmp)!r}); "
+    "from device_lease_helper import *\n"
+    "run_id = sys.argv[1]\n"
+    f"host = FakeProxmoxHost(Path({str(tmp)!r}), nextid_barrier_dir=Path({str(barrier_dir)!r}))\n"
+    f"ldir = Path({str(leased_dir)!r}); ldir.mkdir(parents=True, exist_ok=True)\n"
+    "with host.patched():\n"
+    "    with devices.lease('prox', run_id) as vm:\n"
+    "        row = device_store.latest_lease_for_run(run_id)\n"
+    "        (ldir / f'up-{os.getpid()}').write_text(str(row['vmid']), encoding='utf-8')\n"
+    "        deadline = time.monotonic() + 8\n"
+    "        while len(list(ldir.glob('up-*'))) < 2 and time.monotonic() < deadline:\n"
+    "            time.sleep(0.02)\n"
+    "        print(json.dumps({'run': run_id, 'vmid': row['vmid'], 'host': vm.host}))\n"
+)
+env = {k: os.environ[k] for k in os.environ}
+p1 = subprocess.Popen([sys.executable, "-I", "-B", "-c", worker_script, r1], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p2 = subprocess.Popen([sys.executable, "-I", "-B", "-c", worker_script, r2], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+o1, e1 = p1.communicate(timeout=15)
+o2, e2 = p2.communicate(timeout=15)
+assert p1.returncode == 0 and p2.returncode == 0, (p1.returncode, e1, p2.returncode, e2)
+res1, res2 = json.loads(o1.strip().splitlines()[-1]), json.loads(o2.strip().splitlines()[-1])
+assert res1["vmid"] != res2["vmid"], (res1, res2)
+all_leases = device_store.leases_list(device="prox")
+assert any(r["outcome"] == "collided" for r in all_leases), all_leases
+destroy_lines = [line for line in host.calls() if "qm destroy" in line]
+assert len(destroy_lines) == 2, destroy_lines
+destroyed_ids = {int(re.search(r"qm destroy (\d+)", line).group(1)) for line in destroy_lines}
+assert destroyed_ids == {res1["vmid"], res2["vmid"]}, (destroyed_ids, res1, res2)
+
+# 2. Always colliding host fails after exactly 5 qm clone calls with exact error.
+host_collide = FakeProxmoxHost(tmp / "c5", always_collide=True)
+r5 = record.start("loop", loop="c5", device="prox")
+with host_collide.patched(), mock.patch.object(time, "sleep"):
+    try:
+        with devices.lease("prox", r5):
+            raise AssertionError("expected collision failure")
+    except devices.DeviceError as e:
+        assert "vmid collision on prox after 5 tries" in str(e), str(e)
+clone_calls = [line for line in host_collide.calls() if "qm clone " in line]
+assert len(clone_calls) == 5, clone_calls
+
+# 3. Storage volume already exists fails after 1 qm clone call.
+host_storage = FakeProxmoxHost(tmp / "storage", storage_exists=True)
+rs = record.start("loop", loop="st", device="prox")
+with host_storage.patched():
+    try:
+        with devices.lease("prox", rs):
+            raise AssertionError("expected storage failure")
+    except devices.DeviceError as e:
+        assert "already exists" in str(e)
+assert len([line for line in host_storage.calls() if "qm clone " in line]) == 1
+
+# 4. Sweep by lease:
+#    - Renewed lease whose run is set to interrupted survives sweep (no qm destroy).
+#    - Lapsed lease whose run is set back to running is destroyed once after 11 minutes and reads deleted.
+#    - Delete that keeps failing counts sweep_attempts; at +8 days raises ONE inbox item with VM + delete_command, no second one.
+host_sweep = FakeProxmoxHost(tmp / "sweep")
+r_keep_alive = record.start("loop", loop="alive", device="prox")
+with host_sweep.patched():
+    a_live = leases.claim("prox", devices.version_of("prox"), run_id=r_keep_alive, start_renewer=False)
+    (host_sweep.vms_dir / "201.conf").write_text("name: arete-live\n", encoding="utf-8")
+    a_live.update(vm_name="arete-live", vmid=201)
+    # Mark run interrupted, keep lease open & renewed -> sweep must NOT destroy it.
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE runs SET status = 'interrupted' WHERE id = ?", (r_keep_alive,))
+    devices.sweep(lambda rid: lambda text: None)
+    assert not any("qm destroy 201" in line for line in host_sweep.calls())
+    assert (host_sweep.vms_dir / "201.conf").exists()
+    a_live.abort_fenced()
+
+    # Lapsed lease whose run is set back to running -> destroyed once at +11 min -> outcome deleted.
+    r_lapsed = record.start("loop", loop="lapsed", device="prox")
+    a_lapsed = leases.claim("prox", devices.version_of("prox"), run_id=r_lapsed, start_renewer=False)
+    (host_sweep.vms_dir / "202.conf").write_text("name: arete-lapsed\n", encoding="utf-8")
+    a_lapsed.update(vm_name="arete-lapsed", vmid=202)
+    a_lapsed.abort_fenced()
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=5)), a_lapsed.id))
+    assert a_lapsed.id in leases.lapse()
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE runs SET status = 'running' WHERE id = ?", (r_lapsed,))
+    t11 = util.now() + timedelta(minutes=11)
+    with mock.patch.object(util, "now", return_value=t11):
+        devices.sweep(lambda rid: lambda text: None)
+    assert device_store.lease_get(a_lapsed.id)["outcome"] == "deleted"
+    assert sum("qm destroy 202" in line for line in host_sweep.calls()) == 1
+
+# Failing delete counts sweep_attempts, raises ONE inbox item at +8 days, no second on later sweep.
+host_fail = FakeProxmoxHost(tmp / "faildel", fail_destroy=True)
+r_fail = record.start("loop", loop="faildel", device="prox")
+with host_fail.patched():
+    a_fail = leases.claim("prox", devices.version_of("prox"), run_id=r_fail, start_renewer=False)
+    (host_fail.vms_dir / "203.conf").write_text("name: arete-stuck\n", encoding="utf-8")
+    a_fail.update(vm_name="arete-stuck", vmid=203)
+    a_fail.close("delete_failed", sweep_attempts=1, failing_since=util.iso(), last_sweep=util.iso(),
+                 last_sweep_error="boom", fenced=False)
+    assert devices.left_up(r_fail) and "203" in devices.with_left_up("failed", r_fail)
+    devices.sweep(lambda rid: lambda text: None)
+    assert device_store.lease_get(a_fail.id)["sweep_attempts"] == 2
+    t8d = util.now() + timedelta(days=8)
+    with mock.patch.object(util, "now", return_value=t8d):
+        devices.sweep(lambda rid: lambda text: None)
+        items = [it for it in inbox.list(state="open") if it["subject"] == f"lease:{a_fail.id}"]
+        assert len(items) == 1, items
+        detail_str = json.dumps(items[0])
+        assert "arete-stuck" in detail_str and "qm destroy 203" in detail_str, detail_str
+        attempts_at_giveup = device_store.lease_get(a_fail.id)["sweep_attempts"]
+        devices.sweep(lambda rid: lambda text: None)
+        assert device_store.lease_get(a_fail.id)["sweep_attempts"] == attempts_at_giveup
+        items2 = [it for it in inbox.list(state="open") if it["subject"] == f"lease:{a_fail.id}"]
+        assert len(items2) == 1
+
+# Release from outside bumps epoch + sets released in one tx and deletes VM.
+host_rel = FakeProxmoxHost(tmp / "rel")
+r_rel = record.start("loop", loop="rel", device="prox")
+with host_rel.patched():
+    a_rel = leases.claim("prox", devices.version_of("prox"), run_id=r_rel, start_renewer=False)
+    (host_rel.vms_dir / "204.conf").write_text("name: arete-rel\n", encoding="utf-8")
+    a_rel.update(vm_name="arete-rel", vmid=204)
+    a_rel.abort_fenced()
+    devices.release(r_rel)
+    rel_row = device_store.lease_get(a_rel.id)
+    assert rel_row["epoch"] == 2 and rel_row["released"] is not None and rel_row["outcome"] == "deleted", rel_row
+    assert not (host_rel.vms_dir / "204.conf").exists()
+""")
+
+    def test_api_token_resolver_device_projection_and_waits(self):
+        self._run_child(r"""
+setup_scratch()
+tmp = Path(os.environ["TMPDIR"])
+host = FakeProxmoxHost(tmp)
+owner = principals.owner()
+_, owner_token = token_store.issue(owner, "Device API test", ["*"])
+
+@contextmanager
+def live_server():
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "127.0.0.1")
+    logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "owner@example.test"))
+    with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    httpd.node = node
+    httpd.logins = logins
+    httpd.inside_serve = True
+    httpd.front = tailnet.Front("http", [])
+    httpd.pending_secrets = {}
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+def req(port, method, path, body=None, *, token=owner_token, headers=None):
+    conn = HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        hdrs = {"Authorization": f"Bearer {token}", **(headers or {})}
+        raw = None
+        if body is not None:
+            raw = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/json")
+            hdrs["Content-Length"] = str(len(raw))
+        conn.request(method, path, body=raw, headers=hdrs)
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        return resp.status, data
+    finally:
+        conn.close()
+
+with host.patched(), live_server() as port:
+    # 1. device.list & device.get before probe -> unprobed, spec=None, tools=None, host & note present.
+    st, listed = req(port, "GET", "/api/v1/devices")
+    assert st == 200
+    by_id = {d["id"]: d for d in listed["devices"]}
+    assert by_id["box"]["status"] == "unprobed" and by_id["box"]["spec"] is None and by_id["box"]["tools"] is None
+    assert by_id["box"]["host"] == "box@box.test" and by_id["box"]["note"] == "build box"
+
+    st, got = req(port, "GET", "/api/v1/devices/box")
+    assert st == 200 and got["device"]["status"] == "unprobed" and got["device"]["spec"] is None
+
+    # 2. device.probe with Prefer: wait=10 -> 200; device.get now ok with non-null spec & tools!
+    st, probed = req(port, "POST", "/api/v1/devices/box/probe", {},
+                     headers={"Idempotency-Key": "probe-fast-1", "Prefer": "wait=10"})
+    assert st == 200 and probed["probe"]["ok"] is True, (st, probed)
+    st, got_after = req(port, "GET", "/api/v1/devices/box")
+    assert st == 200 and got_after["device"]["status"] == "ok"
+    assert "Linux x86_64" in got_after["device"]["spec"] and "RTX 4090" in got_after["device"]["spec"]
+    assert got_after["device"]["tools"] == ["claude", "pi"]
+    assert got_after["device"]["runners"] == ["claude", "pi"]
+
+    # 3. Legacy alias POST /api/devices/box/probe still answers.
+    st, legacy = req(port, "POST", "/api/devices/box/probe", {})
+    assert st == 200 and legacy["ok"] is True, (st, legacy)
+
+    # 4. Slow probe (sleeps 3s) under Prefer: wait=1 -> 202 accepted with watch in <2s, event arrives under idem!
+    orig_probe = devices.probe
+    def slow_probe(device, timeout=20, *, idem=None):
+        time.sleep(3.0)
+        return orig_probe(device, timeout=timeout, idem=idem)
+
+    with mock.patch.object(devices, "probe", side_effect=slow_probe):
+        t0 = time.monotonic()
+        st, acc = req(port, "POST", "/api/v1/devices/box/probe", {},
+                      headers={"Idempotency-Key": "probe-slow-1", "Prefer": "wait=1"})
+        elapsed = time.monotonic() - t0
+        assert st == 202 and elapsed < 2.0, (st, elapsed, acc)
+        assert acc["accepted"] is True and acc["watch"] == "/api/v1/events?idem=probe-slow-1", acc
+        st_ev, ev_data = req(port, "GET", acc["watch"] + "&timeout=10",
+                             headers={"Accept": "application/json"})
+        assert st_ev == 200
+        assert any(e["kind"] == "device.changed" and e["idem"] == "probe-slow-1" for e in ev_data["events"]), ev_data
+
+    # 5. run.sandbox + lease.list version == last lease.changed ver + lease token auth (200, 410, 401, 403).
+    devices.probe("prox")
+    r_prox = record.start("loop", loop="sbx", device="prox")
+    r_other = record.start("loop", loop="other", device="box")
+    active = leases.claim("prox", devices.version_of("prox"), run_id=r_prox, start_renewer=False)
+    active.update(vm_name="arete-sbx", vmid=301, ready=util.iso(), address="10.0.0.301")
+    lease_tok = active.token
+    active.abort_fenced()
+
+    st, sbx = req(port, "GET", f"/api/v1/runs/{r_prox}/sandbox")
+    assert st == 200 and sbx["device"] == "prox" and sbx["lease"] == active.label and sbx["address"] == "10.0.0.301", sbx
+    assert isinstance(sbx["facts"], dict) and sbx["facts"]["ok"] is True
+
+    st, llist = req(port, "GET", f"/api/v1/leases?run={r_prox}&open=true")
+    assert st == 200 and len(llist["leases"]) == 1
+    with foundation.reader() as c:
+        last_ver = c.execute(
+            "SELECT ver FROM events_log WHERE kind = 'lease.changed' AND subject = ? ORDER BY seq DESC LIMIT 1",
+            (f"lease:{active.id}",),
+        ).fetchone()[0]
+    assert llist["leases"][0]["version"] == last_ver and llist["leases"][0]["streams"] == []
+
+    # Lease token with X-Arete-Lease: L-<id>.1 -> 200 on own lease.get & own run.get, 403 on other run.get.
+    st, lget = req(port, "GET", f"/api/v1/leases/{active.label}", token=lease_tok,
+                   headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 200 and lget["lease"]["epoch"] == 1, (st, lget)
+
+    st, rget_own = req(port, "GET", f"/api/v1/runs/{r_prox}", token=lease_tok,
+                       headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 200 and rget_own["run"]["id"] == r_prox, (st, rget_own)
+
+    st, rget_other = req(port, "GET", f"/api/v1/runs/{r_other}", token=lease_tok,
+                         headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 403 and rget_other["code"] == "forbidden", (st, rget_other)
+
+    # Forged token with same ar_<tag>_L<id>_ prefix -> 401.
+    prefix = "_".join(lease_tok.split("_", 3)[:3])
+    forged = f"{prefix}_forged_secret_value"
+    st, bad = req(port, "GET", f"/api/v1/leases/{active.label}", token=forged,
+                  headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 401, (st, bad)
+
+    # Lapse the lease -> same lease token answers 410 lease_fenced with epoch 2 (NOT 401).
+    with foundation.tx(fenced=False) as c:
+        c.execute("UPDATE leases SET expires = ? WHERE id = ?", (util.iso(util.now() - timedelta(seconds=2)), active.id))
+    assert active.id in leases.lapse()
+    st, fenced = req(port, "GET", f"/api/v1/leases/{active.label}", token=lease_tok,
+                     headers={"X-Arete-Lease": f"{active.label}.1"})
+    assert st == 410 and fenced["code"] == "lease_fenced" and fenced["epoch"] == 2, (st, fenced)
+
+    # CLI `arete devices` and `arete devices --probe box` go through serve.
+    from arete import credential_files
+    credential_files.write_client(foundation.schema_metadata()["instance_tag"], owner_token)
+    cli_env = {**{k: os.environ[k] for k in os.environ}, "ARETE_SERVER": f"http://127.0.0.1:{port}"}
+    cli_list = subprocess.run(
+        [sys.executable, "-I", "-B", "-c",
+         f"import sys; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+         "from arete.cli import main; raise SystemExit(main(['devices']))"],
+        env=cli_env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert cli_list.returncode == 0 and "box" in cli_list.stdout and "prox" in cli_list.stdout, (cli_list.returncode, cli_list.stdout, cli_list.stderr)
+    cli_probe = subprocess.run(
+        [sys.executable, "-I", "-B", "-c",
+         f"import sys; sys.path.insert(0, {str(Path(leases.__file__).resolve().parent.parent)!r}); "
+         "from arete.cli import main; raise SystemExit(main(['devices', '--probe', 'box']))"],
+        env=cli_env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert cli_probe.returncode == 0 and json.loads(cli_probe.stdout)["ok"] is True, (cli_probe.returncode, cli_probe.stdout, cli_probe.stderr)
+
+# 6. Waits: loop on prox whose nextid times out settles failed + opens one wait (config:loop/<name>, device:prox);
+#    dispatch starts no run and why names prox; ok probe clears wait in its tx; next dispatch starts it.
+loop_dir = paths.CONFIG_DIR / "loops" / "prox-job"
+loop_dir.mkdir(parents=True, exist_ok=True)
+(loop_dir / "loop.toml").write_text(
+    'kind = "command"\ndescription = "prox wait test"\nenabled = true\n'
+    '[run]\ncommand = "true"\ndevice = "prox"\n',
+    encoding="utf-8",
+)
+cfg_path = paths.CONFIG_DIR / "config.toml"
+cfg_path.write_text(cfg_path.read_text(encoding="utf-8") + f'\n[serve]\nloop_dirs = [{json.dumps(str(paths.CONFIG_DIR / "loops"))}]\n', encoding="utf-8")
+cfg = config.load()
+loop_obj = loops.find("prox-job", cfg)
+q1 = loop_store.enqueue("prox-job", "", "", "manual", [])
+run_w = record.start("loop", loop="prox-job", loop_kind="command", trigger="manual", device="prox")
+with foundation.tx(fenced=False) as c:
+    c.execute("UPDATE queue SET run_id = ? WHERE id = ?", (run_w, q1))
+
+host_timeout = FakeProxmoxHost(tmp / "to", nextid_timeout=True)
+with host_timeout.patched():
+    status = loop_run.carry(loop_run.LoopRun(loop_obj, run_w, cfg, trigger="manual"))
+assert status == "failed"
+assert run_store.run_get(run_w)["status"] == "failed"
+waits = device_store.open_waits_for_subject("config:loop/prox-job")
+assert len(waits) == 1 and waits[0]["blocker"] == "device:prox", waits
+
+q2 = loop_store.enqueue("prox-job", "", "", "manual-2", [])
+srv = serve.Server()
+srv.cfg = cfg
+with mock.patch.object(loop_run, "launch") as mock_launch:
+    srv.dispatch({"prox-job": loop_obj})
+    mock_launch.assert_not_called()
+    assert "prox" in srv.waiting.get(q2, ""), srv.waiting
+
+# Ok probe of prox clears the wait in its own tx, next dispatch starts it.
+with host.patched():
+    assert devices.probe("prox")["ok"] is True
+assert device_store.open_waits_for_subject("config:loop/prox-job") == []
+with mock.patch.object(loop_run, "launch", return_value={"id": "started-1"}) as mock_launch:
+    srv.dispatch({"prox-job": loop_obj})
+    mock_launch.assert_called_once()
+
+# 7. secret.set clears open wait with blocker secret:global/<name> in its tx; failed set leaves it open.
+with foundation.tx(fenced=False) as c:
+    device_store.open_wait(c, "config:loop/prox-job", "secret:global/WAIT_KEY", "missing secret")
+assert len(device_store.open_waits_for_subject("config:loop/prox-job")) == 1
+try:
+    secretstore.put("global", "WAIT_KEY", "x", "api_key", owner)  # too short -> fails validation
+    raise AssertionError("expected validation error")
+except ValueError:
+    pass
+assert len(device_store.open_waits_for_subject("config:loop/prox-job")) == 1
+
+secretstore.put("global", "WAIT_KEY", "valid-secret-value-123456", "api_key", owner)
+assert device_store.open_waits_for_subject("config:loop/prox-job") == []
 """)

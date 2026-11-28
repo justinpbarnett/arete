@@ -1,1 +1,41 @@
-{"type": "object", "x-arete-read-only": true}
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["local", "ssh", "exe", "proxmox"]
+    },
+    "host": {
+      "type": "string"
+    },
+    "dir": {
+      "type": "string"
+    },
+    "port": {
+      "type": "integer"
+    },
+    "identity": {
+      "type": "string"
+    },
+    "jump": {
+      "type": "string"
+    },
+    "template": {
+      "type": ["string", "integer"]
+    },
+    "user": {
+      "type": "string"
+    },
+    "egress": {
+      "type": "string",
+      "enum": ["", "integrations", "all"]
+    },
+    "keep": {
+      "type": "boolean"
+    },
+    "note": {
+      "type": "string"
+    }
+  }
+}
