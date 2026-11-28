@@ -36,6 +36,7 @@ from .store import evidence as evidence_store
 from .store import idempotency as claims_store
 from .store import inbox as inbox_store
 from .store import incidents as incident_store
+from .store import loops as loop_store
 from .store import runs as run_store
 from .store import workspaces as workspaces_store
 
@@ -56,6 +57,7 @@ RESERVED_MANUAL_PREFIXES = (
     "incident:",
     "workspace:",
     "evidence:",
+    "queue:",
 )
 
 
@@ -485,6 +487,56 @@ def _evidence_items(c) -> list[dict]:
     return items
 
 
+def queue_dead_spec(row: dict, events_count: int) -> dict:
+    summary = (row.get("dead_reason") or "").strip()
+    title = f"{row['loop']}: {util.first_line(summary, 120)}" if summary else f"{row['loop']}: dead queue item"
+    return {
+        "kind": "queue.dead",
+        "subject": f"queue:{row['id']}",
+        "task_id": "",
+        "run_id": str(row.get("run_id") or ""),
+        "line": str(row.get("loop") or ""),
+        "priority": 2,
+        "title": title,
+        "detail": {
+            "loop": row["loop"],
+            "run_id": str(row.get("run_id") or ""),
+            "summary": row.get("dead_reason") or "",
+            "events": int(events_count),
+            "attempts": int(row.get("attempts") or 0),
+        },
+        "verbs": ["requeue", "dismiss"],
+        "options": [],
+    }
+
+
+def raise_queue_dead(c, row: dict, events_count: int) -> tuple[dict, int | None, bool] | None:
+    if not inbox_store.available(c):
+        return None
+    spec = queue_dead_spec(row, events_count)
+    return inbox_store.raise_item(
+        c,
+        kind=spec["kind"],
+        subject=spec["subject"],
+        priority=spec["priority"],
+        title=spec["title"],
+        detail=spec["detail"],
+        verbs=spec["verbs"],
+        options=spec["options"],
+        task_id=spec["task_id"],
+        run_id=spec["run_id"],
+        line=spec["line"],
+    )
+
+
+def _queue_dead_items(c) -> list[dict]:
+    rows = c.execute(
+        "SELECT id, loop, run_id, dead_reason, attempts, COALESCE(json_array_length(payload), 0) AS events_count "
+        "FROM queue WHERE dead_at IS NOT NULL ORDER BY id"
+    ).fetchall()
+    return [queue_dead_spec(dict(r), r["events_count"]) for r in rows]
+
+
 ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
@@ -497,6 +549,7 @@ ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "alerts": ("alert:%", _alerts_items),
     "incidents": ("incident:%", _incidents_items),
     "workspaces": ("workspace:%", _workspaces_items),
+    "queue": ("queue:%", _queue_dead_items),
 }
 
 
@@ -655,6 +708,8 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
 
             row = evidence_store.get(ident, connect=lambda: nullcontext(c))
             return private_evidence.safe_view(row) if row else None
+        if kind == "queue" and ident.isdecimal():
+            return loop_store.queue_item(int(ident), c)
         if kind == "presence":
             actor, _, key = ident.partition("/")
             pending = inbox_store.get_pending(c, actor, key)
@@ -1103,6 +1158,53 @@ def _resolve_presence(
         return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
 
 
+def _resolve_queue_dead(
+    item: dict,
+    *,
+    numeric_id: int,
+    base_version: int,
+    verb: str,
+) -> dict:
+    ident = item["subject"].removeprefix("queue:")
+    if not ident.isdecimal():
+        raise contract.Problem("validation", f"Invalid queue subject {item['subject']!r}.")
+    queue_id = int(ident)
+    actor = principals.current()
+    now = util.iso()
+    missing = False
+    with foundation.tx() as c:
+        current = inbox_store.get(numeric_id, connect=lambda: nullcontext(c))
+        if current is None:
+            raise contract.Problem("not_found", f"No inbox item {item['id']}")
+        if current["state"] == "resolved":
+            raise contract.Problem("already_resolved", f"Inbox item {current['id']} is already resolved.", current=current)
+        if current["version"] != base_version:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=current)
+        try:
+            if verb == "requeue":
+                resolved = loop_store.requeue_item(
+                    c, queue_id, answered_by=actor, answered_at=now, base_version=base_version
+                )
+                handler_result = {"queue_id": queue_id, "requeued": True}
+            else:
+                resolved = loop_store.dismiss_item(
+                    c, queue_id, answered_by=actor, answered_at=now, base_version=base_version
+                )
+                handler_result = {"queue_id": queue_id, "dismissed": True}
+        except control.NotFound:
+            missing = True
+        else:
+            if resolved is None:
+                refreshed = inbox_store.get(numeric_id, connect=lambda: nullcontext(c)) or current
+                raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=refreshed)
+            return {"item": resolved, "result": handler_result}
+    if missing:
+        sync_source("queue")
+        refreshed = inbox_store.get(numeric_id) or item
+        raise contract.Problem("already_resolved", f"Dead queue item {queue_id} is no longer dead.", current=refreshed)
+    raise AssertionError("unreachable")
+
+
 def resolve(
     item_id: str | int,
     *,
@@ -1141,6 +1243,13 @@ def resolve(
             verb=verb,
             credential=credential,
             pending_secrets=pending_secrets,
+        )
+    if subject.startswith("queue:"):
+        return _resolve_queue_dead(
+            item,
+            numeric_id=numeric,
+            base_version=base_version,
+            verb=verb,
         )
 
     if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:

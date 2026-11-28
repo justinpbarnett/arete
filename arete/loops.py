@@ -15,6 +15,7 @@ from .store import runs as run_store
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 TRIES = 5
+DEFAULT_MAX_ATTEMPTS = 2
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TRUST_ORDER = ("untrusted", "internal", "owner")
 FINDING_EVENT = "finding"
@@ -84,6 +85,7 @@ class Loop:
     tools: list[str] = field(default_factory=lambda: list(READ_TOOLS))
     device: str = "local"
     timeout_minutes: float = 30
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     budget_usd: float | None = None
     daily_budget_usd: float | None = None
     queue: str = ""
@@ -354,6 +356,9 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
     run, trig = data.get("run", {}), data.get("trigger", {})
     kind = str(data.get("kind", "watch"))
     known = KINDS.get(kind)
+    max_attempts = run.get("max_attempts", DEFAULT_MAX_ATTEMPTS)
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise LoopError(f"[run] max_attempts '{max_attempts}' must be a whole number above 0")
     loop = Loop(
         name=f"{repo}/{folder.name}" if repo else folder.name,
         dir=folder,
@@ -371,6 +376,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         tools=list(run.get("tools", EDIT_TOOLS if known and known.worktree else READ_TOOLS)),
         device=str(run.get("device", "local")),
         timeout_minutes=float(run.get("timeout_minutes", 30)),
+        max_attempts=max_attempts,
         budget_usd=float(run["budget_usd"]) if run.get("budget_usd") else None,
         daily_budget_usd=float(run["daily_budget_usd"]) if run.get("daily_budget_usd") else None,
         queue=str(run.get("queue", "")),
@@ -456,6 +462,8 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append("[trigger] takes cron or every, not both")
     if loop.trigger.trust not in TRUST_ORDER:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
+    if type(loop.max_attempts) is not int or loop.max_attempts < 1:
+        problems.append(f"[run] max_attempts '{loop.max_attempts}' must be a whole number above 0")
     if kind:
         problems += kind.problems(loop, device.remote)
     problems += runner.agent_problems(loop.runner, loop.tools)
