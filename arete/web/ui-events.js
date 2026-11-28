@@ -7,7 +7,8 @@ const retryDelay = 2000;
 const recoveryDelay = 60000;
 const leaseDuration = 40000;
 const kinds = new Set(["run.started", "run.changed", "run.ended", "step.started", "step.ended",
-  "turn.appended", "principal.changed", "task.created", "task.changed"]);
+  "turn.appended", "principal.changed", "task.created", "task.changed",
+  "inbox.raised", "inbox.changed", "inbox.resolved", "line.changed"]);
 
 export function boardTask(event) {
   const row = event.data;
