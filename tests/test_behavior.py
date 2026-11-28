@@ -23962,6 +23962,295 @@ class SettingsShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class TriageAndIncidentsUITests(unittest.TestCase):
+    def test_triage_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-triage.js"
+        css_path = web / "ui-triage.css"
+        js_text = js_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-triage.js", served)
+        self.assertIn("/ui-triage.css", served)
+        self.assertEqual(served["/ui-triage.js"][0], js_path.read_bytes())
+        self.assertEqual(served["/ui-triage.css"][0], css_path.read_bytes())
+        self.assertIn("javascript", served["/ui-triage.js"][1])
+        self.assertIn("text/css", served["/ui-triage.css"][1])
+        self.assertIn("/api/v1/inbox", js_text)
+        self.assertIn("/api/v1/screens/triage", js_text)
+        self.assertNotIn("/api/triage", js_text)
+        self.assertNotIn("/api/live", js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+            self.assertNotIn(forbidden, css_text)
+        shell_text = (web / "ui-shell.js").read_text(encoding="utf-8")
+        self.assertIn("./ui-triage.js", shell_text)
+        self.assertIn("./ui-inbox.js", shell_text)
+
+    def test_triage_kinds_verbs_and_guards(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-triage-kinds.js"
+        js_text = js_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-triage-kinds.js", served)
+        self.assertEqual(served["/ui-triage-kinds.js"][0], js_path.read_bytes())
+        for needle in (
+            "choose",
+            "answer",
+            "approve",
+            "reject",
+            "accept",
+            "decline",
+            "/secrets/",
+            "/check",
+            "continue",
+            "redirect",
+            "retry",
+            "stop",
+            "/outbox/",
+            "keep_local",
+            "take_remote",
+            "canApproveRemember",
+            "hasVerb",
+        ):
+            self.assertIn(needle, js_text)
+        self.assertNotIn("approve_edited", js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+        check_pos = js_text.index("/check")
+        continue_resolve_pos = js_text.index('helpers.resolve("continue"', check_pos)
+        self.assertLess(check_pos, continue_resolve_pos)
+
+    def test_incidents_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        js_path = web / "ui-incidents.js"
+        js_text = js_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-incidents.js", served)
+        self.assertEqual(served["/ui-incidents.js"][0], js_path.read_bytes())
+        for needle in ("/api/incidents/", "retry", "dismiss", "cancel", "registerHealthBlock", "registerSubjectRenderer"):
+            self.assertIn(needle, js_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, js_text)
+
+    def test_triage_queue_blitz_undo_and_kinds_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import {
+              computeAndon,
+              formatHeadLine,
+              groupItems,
+              filterItems,
+              sortItems,
+              defaultSelectedId,
+              resolveHashItem,
+              nextAfterAction,
+              triageState,
+              triageAndonCount,
+              snoozeItem,
+              wakeItem,
+              shelveItem,
+              rendererFor,
+            } from "./arete/web/ui-triage.js";
+            import {
+              canApproveRemember,
+              choicePayload,
+              stopActionSpec,
+              isFailingLine,
+              computeWordDiff,
+              parseUnifiedDiff,
+              runSecretContinue,
+              approveOutboxDrafts,
+              conflictResolution,
+              formatSentNotice,
+            } from "./arete/web/ui-triage-kinds.js";
+            import {
+              retryIncident,
+              dismissIncident,
+              cancelIncident,
+              switchIncidentWatcher,
+            } from "./arete/web/ui-incidents.js";
+            import { undo } from "./arete/web/ui-undo.js";
+
+            const makeItem = (id, priority, kind, raised, extra = {}) => ({
+              id, priority, kind, raised, state: "open", version: 1,
+              title: `Title ${id}`, line: "core", subject: `${kind}:${id}`,
+              verbs: ["continue"], detail: {}, options: [], ...extra,
+            });
+            const open = [
+              makeItem("TR-201", 1, "continue", "2026-11-28T01:00:00Z"),
+              makeItem("TR-202", 1, "choice", "2026-11-28T02:00:00Z"),
+              makeItem("TR-203", 1, "stop", "2026-11-28T03:00:00Z"),
+              makeItem("TR-204", 2, "outbox", "2026-11-28T04:00:00Z"),
+              makeItem("TR-205", 2, "approval", "2026-11-28T05:00:00Z"),
+              makeItem("TR-206", 2, "freeform", "2026-11-28T06:00:00Z"),
+              makeItem("TR-207", 2, "fault", "2026-11-28T07:00:00Z"),
+              makeItem("TR-208", 2, "conflict", "2026-11-28T08:00:00Z"),
+              makeItem("TR-209", 2, "proposal", "2026-11-28T09:00:00Z"),
+              makeItem("TR-210", 2, "alert", "2026-11-28T10:00:00Z", { subject: "incident:7", verbs: ["retry", "dismiss"] }),
+              makeItem("TR-211", 3, "proposal", "2026-11-28T11:00:00Z"),
+              makeItem("TR-212", 3, "proposal", "2026-11-28T12:00:00Z"),
+              makeItem("TR-213", 3, "proposal", "2026-11-28T13:00:00Z"),
+            ];
+            const andon = computeAndon(open, { count: 10, high: 3, med: 7, low: 3, standing: 13, limit: 10, aim: 5, zone: "REACTIVE" });
+            assert.equal(
+              formatHeadLine(andon),
+              "10 need you · 3 high · 7 med · 3 low apart · 13 standing, limit 10 · zone REACTIVE",
+            );
+            assert.equal(defaultSelectedId(open, []), "TR-201");
+            assert.equal(resolveHashItem({ path: ["TR-202"] }, open, [])?.id, "TR-202");
+            assert.equal(groupItems(open, { groupBy: "priority" }).map(([l, r]) => [l, r.length]).join("|"), "◆ HIGH,3|◇ MED,7|○ LOW,3");
+            assert.equal(sortItems(open.slice(0, 3), "newest")[0].id, "TR-203");
+            assert.equal(filterItems(open, { query: "fault" }).length, 1);
+            assert.equal(nextAfterAction(open, "TR-201"), "TR-202");
+            assert.equal(nextAfterAction(open, "TR-213"), "TR-201");
+
+            const calls = [];
+            globalThis.fetch = async (url, opts = {}) => {
+              const body = opts.body ? JSON.parse(opts.body) : null;
+              const headers = Object.fromEntries(new Headers(opts.headers || {}).entries());
+              calls.push({ url: String(url), method: opts.method || "GET", headers, body });
+              if (String(url).endsWith("/snooze")) {
+                return Response.json({ item: { ...open[0], state: "snoozed", snooze_until: body.until, version: 2 } });
+              }
+              if (String(url).endsWith("/reopen")) {
+                return Response.json({ item: { ...open[0], state: "open", snooze_until: "", version: 3 } });
+              }
+              if (String(url).endsWith("/shelve")) {
+                return Response.json({ item: { ...open[1], state: "shelved", shelve_reason: body.reason, shelve_until: body.until, version: 2 } });
+              }
+              if (String(url).includes("/secrets/") && String(url).endsWith("/check")) {
+                const ok = String(url).includes("GOOD_KEY");
+                return Response.json({ secret: { name: ok ? "GOOD_KEY" : "BAD_KEY", present: ok, status: ok ? "set" : "missing", check_ok: ok } });
+              }
+              if (String(url).endsWith("/api/v1/outbox/OB-301") && opts.method === "PATCH") {
+                return Response.json({ item: { id: "OB-301", target: "slack", audience: "team", opened_at: null, rev: 2, version: 2, state: "edited" } });
+              }
+              if (String(url).endsWith("/api/v1/outbox/OB-301/open")) {
+                return Response.json({ item: { id: "OB-301", target: "slack", audience: "team", opened_at: "2026-11-28T10:00:00Z", rev: 2, version: 3, state: "edited" } });
+              }
+              if (String(url).endsWith("/api/v1/outbox/OB-301/approve")) {
+                return Response.json({ item: { id: "OB-301", target: "slack", state: "approved", rev: 2, version: 4 } });
+              }
+              if (String(url).endsWith("/api/v1/outbox/OB-302/approve")) {
+                return Response.json({ item: { id: "OB-302", target: "slack", state: "approved", rev: 1, version: 2 } });
+              }
+              return Response.json({ ok: true });
+            };
+
+            triageState.value = { ...triageState.peek(), open, parked: [], andon, loaded: true, selectedId: "TR-201" };
+            assert.equal(await snoozeItem(open[0], "2026-11-29T09:00:00.000Z"), true);
+            assert.equal(triageState.peek().selectedId, "TR-202");
+            assert.equal(triageAndonCount.value, 9);
+            assert.equal(calls.at(-1).headers["x-arete"], "1");
+            await undo();
+            assert.equal(calls.at(-1).url, "/api/v1/inbox/TR-201/reopen");
+            assert.equal(triageState.peek().selectedId, "TR-201");
+            assert.equal(triageAndonCount.value, 10);
+
+            assert.equal(await shelveItem(open[1], "", "2026-12-01T09:00:00Z"), false);
+            assert.equal(await shelveItem(open[1], "Waiting on review", "2026-12-01T09:00:00Z"), true);
+            const parkedOne = triageState.peek().parked.find((x) => x.id === "TR-202");
+            assert.ok(parkedOne);
+            assert.equal(await wakeItem(parkedOne, "2026-11-28T12:00:00.000Z"), true);
+            assert.equal(calls.at(-1).url, "/api/v1/inbox/TR-202/snooze");
+            assert.equal(calls.at(-1).body.until, "2026-11-28T12:00:00.000Z");
+
+            const choiceItem = makeItem("TR-301", 1, "choice", "2026-11-28T01:00:00Z", {
+              verbs: ["choose", "answer"],
+              options: [[{ label: "One", description: "First" }, { label: "Two", description: "Second" }]],
+            });
+            assert.equal(choicePayload(choiceItem, null, ""), null);
+            assert.deepEqual(choicePayload(choiceItem, 2, ""), { verb: "choose", body: { option: 2 }, label: "Answered TR-301 with option 2" });
+            assert.deepEqual(choicePayload(choiceItem, 3, "custom"), { verb: "choose", body: { answer: "custom" }, label: "Answered TR-301 with custom answer" });
+
+            assert.equal(canApproveRemember({ verbs: ["approve", "reject"], detail: { remember_allowed: true } }), false);
+            assert.equal(canApproveRemember({ verbs: ["approve", "reject", "approve_remember"], detail: { remember_allowed: false } }), false);
+            assert.equal(canApproveRemember({ verbs: ["approve", "reject", "approve_remember"], detail: { remember_allowed: true } }), true);
+
+            const resolvedCalls = [];
+            const fakeHelpers = {
+              resolve: async (verb, payload) => { resolvedCalls.push({ verb, payload }); return { item: { id: "TR-401", state: "resolved" } }; },
+              setNotice: () => {},
+              setInlineStatus: () => {},
+              advance: () => {},
+              refresh: () => {},
+            };
+            const badSecretItem = makeItem("TR-401", 1, "continue", "2026-11-28T01:00:00Z", {
+              subject: "secret:global/BAD_KEY", detail: { scope: "global", name: "BAD_KEY" }, verbs: ["continue"],
+            });
+            const badRes = await runSecretContinue(badSecretItem, fakeHelpers);
+            assert.equal(badRes.ok, false);
+            assert.equal(resolvedCalls.length, 0);
+
+            const goodSecretItem = makeItem("TR-402", 1, "continue", "2026-11-28T01:00:00Z", {
+              subject: "secret:global/GOOD_KEY", detail: { scope: "global", name: "GOOD_KEY" }, verbs: ["continue"],
+            });
+            const goodRes = await runSecretContinue(goodSecretItem, fakeHelpers);
+            assert.equal(goodRes.ok, true);
+            assert.equal(resolvedCalls.length, 1);
+            assert.equal(resolvedCalls[0].verb, "continue");
+
+            assert.equal(stopActionSpec({ id: "TR-501", verbs: ["retry"] }, "redirect", { fix: "x" }), null);
+            assert.equal(stopActionSpec({ id: "TR-501", verbs: ["retry"] }, "stop"), null);
+            assert.equal(stopActionSpec({ id: "TR-501", verbs: ["redirect", "retry", "stop"] }, "redirect", { fix: "fix it", prevent: "guard" }).verb, "redirect");
+            assert.equal(isFailingLine("AssertionError: failed check"), true);
+            assert.equal(isFailingLine("all green"), false);
+
+            const wdiff = computeWordDiff("hello old world", "hello new world");
+            assert.ok(wdiff.removed.some(([op, t]) => op === "-" && t === "old"));
+            assert.ok(wdiff.added.some(([op, t]) => op === "+" && t === "new"));
+            const udiff = parseUnifiedDiff("@@ -1 +1 @@\\n-old\\n+new");
+            assert.equal(udiff[1].cls, "tr-diff-del");
+            assert.equal(udiff[2].cls, "tr-diff-add");
+
+            calls.length = 0;
+            const obDrafts = [
+              { item: { id: "OB-301", target: "slack", audience: "team", opened_at: null, rev: 1, version: 1, state: "draft" }, latestBody: "old text" },
+              { item: { id: "OB-302", target: "slack", audience: "self", opened_at: null, rev: 1, version: 1, state: "draft" }, latestBody: "same text" },
+            ];
+            await approveOutboxDrafts(makeItem("TR-601", 2, "outbox", "2026-11-28T01:00:00Z", { verbs: ["approve", "reject"] }),
+              obDrafts, { "OB-301": "new text", "OB-302": "same text" }, fakeHelpers);
+            assert.deepEqual(calls.map((c) => `${c.method} ${c.url}`), [
+              "PATCH /api/v1/outbox/OB-301",
+              "POST /api/v1/outbox/OB-301/open",
+              "POST /api/v1/outbox/OB-301/approve",
+              "POST /api/v1/outbox/OB-302/approve",
+            ]);
+            assert.equal(calls[0].body.base_rev, 1);
+            assert.equal(calls[2].body.rev, 2);
+            assert.equal(formatSentNotice([{ id: "OB-301" }, { id: "OB-302" }]), "Sent OB-301 and OB-302");
+
+            const confItem = makeItem("TR-701", 2, "conflict", "2026-11-28T01:00:00Z", {
+              task_id: "T-42", verbs: ["keep_local", "take_remote"],
+            });
+            assert.equal(conflictResolution(confItem, 1).verb, "keep_local");
+            assert.equal(conflictResolution(confItem, 2).verb, "take_remote");
+            assert.deepEqual(conflictResolution(confItem, 3), { kind: "navigate", hash: "#task/T-42" });
+
+            assert.ok(rendererFor({ kind: "alert", subject: "incident:7" }));
+            calls.length = 0;
+            await retryIncident("7", { id: "TR-210", version: 4 });
+            await dismissIncident("7", { id: "TR-210", version: 4 });
+            await cancelIncident("7");
+            await switchIncidentWatcher(false);
+            assert.deepEqual(calls.map((c) => `${c.method} ${c.url}`), [
+              "POST /api/v1/inbox/TR-210/resolve",
+              "POST /api/v1/inbox/TR-210/resolve",
+              "POST /api/incidents/7/cancel",
+              "POST /api/incidents/switch",
+            ]);
+            assert.equal(calls[0].body.verb, "retry");
+            assert.equal(calls[1].body.verb, "dismiss");
+            assert.equal(calls[2].headers["x-arete"], "1");
+            assert.equal(calls[3].body.on, false);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class SyncTests(unittest.TestCase):
     """End-to-end acceptance tests for #305, #889, #890, and #891."""
 

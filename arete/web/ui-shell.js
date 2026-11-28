@@ -6,6 +6,7 @@ import { KeyBar, KeySheet } from "./ui-keybar.js";
 import { List } from "./ui-list.js";
 import { Fault, Gate } from "./ui-states.js";
 import { InboxFocus, InboxQueue, RunQuestions, selectedInbox } from "./ui-inbox.js";
+import { TriageAndon, TriageFocus, TriageQueue, TriageSubtitle, triageAndonCount } from "./ui-triage.js";
 import { FloorFocus, FloorQueue, TaskFocus, TaskQueue } from "./ui-work.js";
 import { SettingsFocus, SettingsQueue } from "./ui-settings.js";
 import { Palette, openPalette } from "./ui-palette.js";
@@ -45,7 +46,8 @@ export function Sidebar({ route, snapshot, now }) {
   const age = Number.isFinite(serve?.age_seconds)
     ? duration(serve.age_seconds + Math.max(0, now - snapshot.received) / 1000) : "";
   const questions = snapshot.questions;
-  const needs = snapshot.needsYou != null && questions?.data && !questions.error ? snapshot.needsYou + questions.data.asks.length : null;
+  const fallbackNeeds = snapshot.needsYou != null && questions?.data && !questions.error ? snapshot.needsYou + questions.data.asks.length : null;
+  const needs = triageAndonCount.value ?? fallbackNeeds;
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
     <button type="button" class="search" data-act="palette" aria-label="Search (Cmd K)" title="Search (Cmd K)" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
@@ -81,12 +83,14 @@ function runQueueBody({ view, route, retry }) {
 }
 
 const runPage = () => ({ title: "Runs", subtitle: html`<${RunSubtitle} />`, queue: "Runs", focus: "Run" });
+const triagePage = () => ({ title: "Triage", subtitle: html`<${TriageSubtitle} />`, queue: "Queue", focus: "Focus" });
 
 function panels({ route, snapshot, resources, now, retry, runs }) {
   switch (route.screen) {
     case "floor": return [html`${snapshot.slots == null ? null : html`<p class="slots mono">Slots ${snapshot.slots} / ${snapshot.capacity}</p>`}
       <${FloorQueue} snapshot=${snapshot} retry=${retry} />`, html`<${FloorFocus} snapshot=${snapshot} retry=${retry} />`];
-    case "triage":
+    case "triage": return [html`<${TriageQueue} route=${route} now=${now} retry=${retry} />`,
+      html`<${TriageFocus} route=${route} now=${now} retry=${retry} />`];
     case "outbox": return [html`<${InboxQueue} snapshot=${snapshot} route=${route} retry=${retry} />`,
       html`<${InboxFocus} snapshot=${snapshot} route=${route} retry=${retry} />`];
     case "task":
@@ -104,11 +108,13 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
   fixtureRevision.value;
   const actionList = fixture.value;
   const counts = actionList?.counts();
-  const page = route.screen === "run" ? runPage() : data[route.screen](route);
+  const page = route.screen === "run" ? runPage() : route.screen === "triage" ? triagePage() : data[route.screen](route);
   const [queue, focus] = panels({ route, snapshot, resources, now, retry, runs });
-  const parent = selectedInbox(route) && ["triage", "outbox"].includes(route.screen)
-    ? [`#${route.screen}`, `Back to ${route.screen === "triage" ? "inbox" : "Outbox"}`]
-    : route.screen === "task" && route.path[0] ? ["#board", "Back to Board"] : null;
+  const parent = route.screen === "triage" && route.path[0]
+    ? ["#triage", "Back to triage"]
+    : selectedInbox(route) && route.screen === "outbox"
+      ? ["#outbox", "Back to Outbox"]
+      : route.screen === "task" && route.path[0] ? ["#board", "Back to Board"] : null;
   return html`<div class="ui-app" data-screen=${route.screen} data-detail=${parent ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
@@ -118,7 +124,9 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
         <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
       </div>
       <header class="page-head">
-        <div class="head-row"><h1>${page.title}</h1><div class="head-tools"><factory-switch></factory-switch>
+        <div class="head-row"><h1>${page.title}</h1><div class="head-tools">
+          ${route.screen === "triage" ? html`<${TriageAndon} />` : null}
+          <factory-switch></factory-switch>
           ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
           ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
         </div></div>

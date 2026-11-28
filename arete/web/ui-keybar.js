@@ -1,7 +1,7 @@
 import { h, Component } from "./vendor-preact.js";
 import { effect } from "./vendor-signals.js";
 import htm from "./vendor-htm.js";
-import { mode, pane, pending, sheet, notice, connection, readRetry, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
+import { mode, pane, pending, sheet, notice, connection, readRetry, keybarRevision, hints, sheetGroups, toggleSheet } from "./ui-keys.js";
 import { Connectivity } from "./ui-states.js";
 
 import { openFeedback } from "./ui-feedback.js";
@@ -19,7 +19,7 @@ export class KeyBar extends Component {
   state = { revision: 0 };
   componentDidMount() {
     this.unsubscribe = effect(() => {
-      mode.value; pane.value; pending.value; sheet.value; notice.value; connection.value; readRetry.value;
+      mode.value; pane.value; pending.value; sheet.value; notice.value; connection.value; readRetry.value; keybarRevision.value;
       this.setState({ revision: this.state.revision + 1 });
     });
   }

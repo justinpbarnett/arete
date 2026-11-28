@@ -57,6 +57,8 @@ export const pending = signal("");
 export const sheet = signal(false);
 export const connection = signal("");
 export const readRetry = signal(null);
+export const keybarRevision = signal(0);
+export function refreshKeybar() { keybarRevision.value += 1; }
 
 const cursors = new Map();
 export const selectedItem = (id) => cursors.get(id);
@@ -112,12 +114,24 @@ export function selectItem(id, item, name = "queue") {
 
 export function actionContext() {
   const list = focusedList();
-  const row = list && cursorRow(list);
-  return list?.uiContext?.(row && itemId(row));
+  if (list?.uiContext) {
+    const row = cursorRow(list);
+    return list.uiContext(row && itemId(row));
+  }
+  const queueList = lists("queue").find((el) => el.uiContext);
+  if (queueList) {
+    const row = cursorRow(queueList);
+    return queueList.uiContext(row && itemId(row));
+  }
+  return null;
 }
 
 function destructive() {
   const context = actionContext();
+  if (context?.triage) {
+    context.destructive?.();
+    return;
+  }
   if (context?.item) perform(actions[context.item.verb ?? "remove"], context);
 }
 
@@ -137,6 +151,8 @@ function place(list, row) {
   cursors.set(listId, itemId(row));
   marks();
   row.scrollIntoView({ block: "nearest" });
+  list.uiSelect?.(itemId(row));
+  keybarRevision.value += 1;
 }
 
 function move(index, relative) {
@@ -240,7 +256,8 @@ function insert() {
   const list = focusedList();
   const scope = list && cursorRow(list);
   const fields = [...(scope?.querySelectorAll("textarea, input, [contenteditable]") ?? []),
-    ...paneElements(pane.value).flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")])];
+    ...paneElements(pane.value).flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input, .tr-detail textarea, .tr-detail input")]),
+    ...paneElements("focus").flatMap((el) => [...el.querySelectorAll(".tr-detail textarea, .tr-detail input, .ops-form textarea, .ops-form input")])];
   const box = fields.find((el) => writable(el) && usable(el));
   box?.focus();
 }
@@ -283,7 +300,7 @@ function chord(key) {
   if (prefix === "g" && key === "g") { move(0, false); return true; }
   if (prefix === "g" && key === "t") { tab(1); return true; }
   if (prefix === "g" && key === "T") { tab(-1); return true; }
-  if (prefix === "g" && key === "x") { actionContext()?.run?.open?.(); return true; }
+  if (prefix === "g" && key === "x") { (actionContext()?.openLink ?? actionContext()?.run?.open)?.(); return true; }
   if (prefix === "d" && key === "d") { destructive(); return true; }
   return prefix === "z" && key === "z";
 }
@@ -298,9 +315,34 @@ function normal(event) {
   if (pending.value && chord(key)) return true;
   if (key === "?") { toggleSheet(); return true; }
   if (key === "u") { undo(); return true; }
-  if (key === ".") { repeat(actionContext()); return true; }
+  if (key === ".") {
+    const context = actionContext();
+    if (context?.repeat) { context.repeat(); return true; }
+    repeat(context);
+    return true;
+  }
+  if (/^[1-4]$/.test(key)) {
+    const context = actionContext();
+    if (context?.pick) { context.pick(Number(key)); return true; }
+  }
+  if (key === "m") {
+    const context = actionContext();
+    if (context?.remember) { context.remember(); return true; }
+    if (context?.triage) return true;
+  }
+  if (key === "y") {
+    const context = actionContext();
+    if (context?.copy) { context.copy(); return true; }
+  }
   if (["s", "S", "R"].includes(key)) {
     const context = actionContext();
+    if (context?.triage) {
+      if (key === "s" && context.snooze) { context.snooze(); return true; }
+      if (key === "S" && context.shelve) { context.shelve(); return true; }
+      if (key === "R" && context.retry) { context.retry(); return true; }
+      if (key === "R" && readRetry.peek()) { readRetry.peek()(); return true; }
+      return key === "R";
+    }
     const action = context?.run ? (key === "R" ? context.run.retry : null)
       : context?.item && (context.setAside ?? actions[key === "s" ? "snooze" : key === "S" ? "shelve" : "repair"]);
     if (action) { perform(action, context); return true; }
@@ -356,7 +398,8 @@ function onKey(event) {
     if (submit && !submit.disabled) form.requestSubmit(submit);
     else if (!form) {
       const context = actionContext();
-      if (context?.primary) perform(context.primary, context);
+      if (context?.submit) context.submit();
+      else if (context?.primary) perform(context.primary, context);
     }
     event.preventDefault(); return;
   }
@@ -407,13 +450,15 @@ export function startKeys() {
 
 export function hints() {
   if (mode.value === "INSERT") return [[["Esc"], "leave"], [["Cmd Enter"], "submit"], [["Tab"], "next box"]];
+  const ctx = actionContext();
+  if (Array.isArray(ctx?.hints)) return ctx.hints;
   const list = focusedList();
   const row = list && cursorRow(list);
   const found = [[["j", "k"], "move"], [["gg", "G"], "first, last"], [["h", "l"], "pane"], [["Enter"], "open"]];
   if (row && [...row.querySelectorAll("textarea, input, [contenteditable]")].some(writable)) found.push([["i"], "type"]);
   if (document.querySelector("[data-search]")) found.push([["/"], "search"]);
   if (document.querySelector(tabSelector)) found.push([["gt", "gT"], "tab"]);
-  const run = list?.uiContext ? actionContext()?.run : null;
+  const run = list?.uiContext ? ctx?.run : null;
   if (run) found.push([["[", "]"], "run"], [["dd"], "stop"], [["gx"], "open"]);
   else if (list?.uiContext) found.push([["dd"], "act"], [["u"], "undo"], [["."], "repeat"]);
   if (run?.retry || readRetry.value) found.push([["⇧r"], "retry"]);

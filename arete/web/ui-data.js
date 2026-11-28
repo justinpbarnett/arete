@@ -72,7 +72,22 @@ export function run(id) {
 export const runHash = (id) => `#run/${encodeURIComponent(id)}`;
 export const taskHash = (id, repo = "") => `#task/${encodeURIComponent(id)}${repo ? `/${encodeURIComponent(repo)}` : ""}`;
 export const askHash = (id) => `#triage/ask/${encodeURIComponent(id)}`;
+export const triageHash = (id = "") => id ? `#triage/${encodeURIComponent(id)}` : "#triage";
+export const outboxHash = (id) => `#outbox/${encodeURIComponent(id)}`;
 export const taskDetail = (id, repo) => `/api/tasks/${encodeURIComponent(id)}${repo ? `?${new URLSearchParams({ repo })}` : ""}`;
+export const triageScreen = () => "/api/v1/screens/triage";
+export const inboxList = (state = "open") => `/api/v1/inbox?${new URLSearchParams({ state })}`;
+export const inboxOpen = () => "/api/v1/inbox?state=open";
+export const inboxParked = () => "/api/v1/inbox?state=snoozed,shelved";
+export const inboxItem = (id) => `/api/v1/inbox/${encodeURIComponent(id)}`;
+export const inboxResolve = (id) => `/api/v1/inbox/${encodeURIComponent(id)}/resolve`;
+export const inboxSnooze = (id) => `/api/v1/inbox/${encodeURIComponent(id)}/snooze`;
+export const inboxShelve = (id) => `/api/v1/inbox/${encodeURIComponent(id)}/shelve`;
+export const inboxReopen = (id) => `/api/v1/inbox/${encodeURIComponent(id)}/reopen`;
+export const inboxRetry = (id) => `/api/v1/inbox/${encodeURIComponent(id)}/retry`;
+export const outboxDetail = (id) => `/api/v1/outbox/${encodeURIComponent(id)}`;
+export const secretCheck = (scope, name) => `/api/v1/secrets/${encodeURIComponent(scope)}/${encodeURIComponent(name)}/check`;
+export const batchRoute = () => "/api/v1/batch";
 
 export function floor() { return { title: "Floor", subtitle: "The work in flight", queue: "Running work", focus: "Overview" }; }
 export function triage() { return { title: "Triage", subtitle: "Work that needs you", queue: "Queue", focus: "Focus" }; }
