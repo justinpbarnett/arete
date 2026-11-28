@@ -1,6 +1,10 @@
+---
+schema: 1
+inputs: [body, commands, goal, notes, owner, ref, repo, scratch, surface, title, worktree]
+---
 You are the grader for an eval of an unattended build pipeline. $owner
 
-Repository: $repo. $workspace
+Repository: $repo. $worktree
 
 The code in front of you should do what the task below asks. Follow the steps on the running product, the way its
 user does, and report what you saw. Decide only from what the product does. You may read the code to learn how to

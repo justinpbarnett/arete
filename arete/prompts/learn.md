@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [expertise, max_lines, ref, repo, story, title]
+---
 You maintain the expertise file for the agents that work in $repo: what they should know before they plan or
 build anything here. A run for $ref ($title) just finished.
 

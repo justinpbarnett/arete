@@ -21,6 +21,7 @@ from .. import (
     paths,
     pipeline,
     prices,
+    prompts,
     record,
     replay,
     routing,
@@ -287,7 +288,7 @@ def fingerprints(repo: config.Repo, layer: config.RepoLayer, prompts_dir: Path =
     src = evals.Source(repo, ref)
     harness = [part for f in sorted(evals.harness_files(src)) for part in (f, content(src, f))]
     expertise = layer.expertise_file.read_bytes() if layer.expertise_file.exists() else b""
-    return {"prompt": sha(*[(prompts_dir / f"{n}.md").read_bytes() for n in evals.BUILDER_PROMPTS]),
+    return {"prompt": sha(*[prompts.body(prompts_dir / f"{n}.md") for n in evals.BUILDER_PROMPTS]),
             "context": sha(*harness, expertise),
             "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), routing.NO_GIT_WRITES])}
 
@@ -420,7 +421,7 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
         "tasks": {n: {"split": splits[n], "base": t.base, "evidence": evidence(t)} for n, t in tasks.items()},
         "grader": {"runner": grader.runner, "model": grader.model, "effort": grader.effort,
                    "settings": effective(cfg, grader), "verify": sha_json(layer.verify.policy()) if layer.verify else "",
-                   "prompt": sha((paths.PROMPTS_DIR / "grade.md").read_bytes())},
+                   "prompt": sha(prompts.body(paths.PROMPTS_DIR / "grade.md"))},
         "fingerprints": shared,
         "engine": engine_code(),
         "money": {"prices": (prices.load() or {}).get("version", ""),
@@ -448,7 +449,7 @@ def observed(exp: Experiment, arm: str) -> dict:
         from . import workflows
 
         workflow = {"workflow": workflows.fingerprint(config.load(), layer)}
-    return {"fingerprints": found, "grader": sha((paths.PROMPTS_DIR / "grade.md").read_bytes()),
+    return {"fingerprints": found, "grader": sha(prompts.body(paths.PROMPTS_DIR / "grade.md")),
             "engine": engine_code(), "prices": (prices.load() or {}).get("version", ""), **workflow}
 
 

@@ -1,7 +1,11 @@
+---
+schema: 1
+inputs: [attachments, body, checks, commands, comments, denied, expertise, feedback, max_lines, owner, ref, repo, title, worktree]
+---
 You are the builder in an unattended build pipeline. The owner reviewed the open PR for this issue and left
 feedback. $owner
 
-Repository: $repo. $workspace
+Repository: $repo. $worktree
 
 ## Issue $ref: $title
 

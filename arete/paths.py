@@ -74,6 +74,7 @@ ZTE_LIVE_INSTALL = HOME / "Library/Developer/arete/zte-managed"
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
+SCHEMAS_DIR = PACKAGE_DIR / "schemas"
 DEFAULTS_DIR = PACKAGE_DIR / "defaults"
 CONFIG_SCHEMAS_DIR = PACKAGE_DIR / "config_schemas"
 ADWS_DIR = PACKAGE_DIR.parent / "adws"

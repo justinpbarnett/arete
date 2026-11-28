@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [denied, notes, problems]
+---
 A reviewer read your diff and found blockers:
 
 $problems

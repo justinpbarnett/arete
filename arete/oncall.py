@@ -21,6 +21,7 @@ from . import (
     outbound,
     paths,
     prompt_loader,
+    prompts,
     record,
     run_lines,
     screening,
@@ -966,7 +967,7 @@ def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
 def repair_prompt(row: dict, repairs: list[dict], limit: int, layer: config.RepoLayer) -> str:
     earlier = "".join(f"- attempt {n}: task {r['task']}, run {last_run_id(r)}, ended {r['outcome'] or 'unfinished'}\n"
                       for n, r in enumerate(repairs, 1))
-    return prompt_loader.prompt("oncall_repair", paths.PROMPTS_DIR,
+    return prompts.render_engine("oncall_repair",
         incident=row["id"], kind=row["class"], source=outbound.plain(row["source"], 200), count=row["count"],
         first_seen=row["first_seen"], last_seen=row["last_seen"], attempt=len(repairs) + 1,
         max_attempts=limit, earlier=f"Earlier attempts:\n{earlier}" if earlier else "", evidence=subject(row),

@@ -70,7 +70,7 @@ def run_axes(build, excerpt, trees, spec):
                           f"{brief.attachments or ''}\n{spec}" if axis == "Spec" else "")
                 text = prompt_loader.task_prompt(
                     f"Review the staged diff for {brief.repo} along the {axis} axis. {GUIDANCE[axis]}\n"
-                    f"{source}\n{brief.workspace}\nThe pinned comparison is {comparison}. The changes are staged; "
+                    f"{source}\n{brief.worktree}\nThe pinned comparison is {comparison}. The changes are staged; "
                     f"use the staged diff against the named commit. Report findings only, under 400 words.\n{excerpt}")
                 futures[axis] = pool.submit(copy_context().run, run.agent, f"review-{axis.lower()}", text, build.ws,
                     role="review", read_only=True, persist=False, allowed_tools=prompt_loader.bash_rules(build.read_bash),

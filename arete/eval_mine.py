@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, configrepo, gh, paths, prompt_loader, record, tracker, util, verify, workspace
+from . import config, configrepo, gh, paths, prompt_loader, prompts, record, tracker, util, verify, workspace
 from .agent import READ_TOOLS
 from .evals import (
     EVALS,
@@ -164,7 +164,7 @@ def surface(v: config.Verify) -> str:
 def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket, wt: Path, base: str,
           merge: str) -> Draft | Outcome:
     v = c.layer.verify
-    res = run.agent("write", prompt_loader.prompt("eval_mine", repo=c.repo.name, ref=ticket.ref, title=ticket.title,
+    res = run.agent("write", prompts.render_engine("eval_mine", repo=c.repo.name, ref=ticket.ref, title=ticket.title,
                                      body=ticket.body, comments=ticket.comments, pr_body=gh.pr_body(c.pr_url),
                                      diff=util.tail(git(["diff", base, merge], c.repo.path), MAX_DIFF_IN_PROMPT),
                                      surface=surface(v), commands=prompt_loader.code_list(config.DEFAULT_ALLOW_BASH + v.bash)),

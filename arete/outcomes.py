@@ -16,7 +16,6 @@ from . import (
     paths,
     pipeline,
     pr_recovery,
-    prompt_loader,
     record,
     tracker,
     util,
@@ -28,14 +27,6 @@ from .store import specs as spec_store
 from .util import git
 
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
-UAT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "before": {"type": "string"},
-        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
-    },
-    "required": ["before", "steps"],
-}
 HUNK_LINES = 6
 PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
 PR_SEEN_SETTLE = timedelta(minutes=1)
@@ -283,9 +274,9 @@ def uat_steps(cfg: config.Config, run: pipeline.Run, row: dict, branch: str) -> 
     share = pipeline.MAX_DIFF_IN_PROMPT // len(urls)
     prs = "\n\n".join(f"### {url}\n\n{gh.pr_body(url).strip()}\n\n```diff\n{cut(gh.pr_diff(url), share)}\n```"
                        for url in urls)
-    res = run.agent("uat", prompt_loader.prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
-                                  prs=prs, branch=branch),
-                    run.repo.path, role="uat", json_schema=UAT_SCHEMA, persist=False)
+    res = run.agent("uat", run.prompt("uat", "uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
+                                      prs=prs, branch=branch),
+                    run.repo.path, role="uat", json_schema=run.schema("uat", "uat"), persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
     listed = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
     failure = util.first_line(res.error or "none came back")

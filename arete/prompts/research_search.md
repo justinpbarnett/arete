@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [criteria, goal, max_sources, queries]
+---
 You run one web search task for a research report. You have web search and fetch tools and nothing else. Nobody
 will answer questions while you work. You change nothing and send nothing.
 

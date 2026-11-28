@@ -11,7 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import codebase, config, environment, evals, paths, prompt_loader, record, replay, routing, runner, util
+from .. import codebase, config, environment, evals, paths, prompts, record, replay, routing, runner, util
 from ..agent import REPLAY
 
 SPLITS = ("train", "validation", "holdout")
@@ -591,7 +591,7 @@ class Experiment:
         if self.charged >= self.suite.spend:
             row["accepted_why"] = row["failure"] = f"not run: the spend limit of ${self.suite.spend:g} was reached"
             return
-        question = prompt_loader.prompt("retrieval_answer", question=query.text,
+        question = prompts.render_engine("retrieval_answer", question=query.text,
                                    context="\n\n".join(p.block for p in supplied))
         extra = {"effort": gen.effort} if gen.effort else {}
         started = time.perf_counter()
@@ -639,7 +639,7 @@ class Experiment:
                        "fingerprint": self.corpus.fingerprint, "files": self.corpus.files,
                        "passages": len(self.corpus.passages), "passage_lines": self.suite.corpus.passage_lines},
             "generate": {"model": gen.model, "runner": gen.runner, "effort": gen.effort,
-                         "prompt_fingerprint": digest(prompt_file.read_bytes())} if gen else None,
+                         "prompt_fingerprint": digest(prompts.body(prompt_file))} if gen else None,
             "arms": arms, "results": results, "summary": summarize(arms, results)}
 
 

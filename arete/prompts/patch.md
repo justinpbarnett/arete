@@ -1,8 +1,12 @@
+---
+schema: 1
+inputs: [attachments, body, commands, comments, denied, expertise, owner, patch_files, patch_lines, ref, repo, title, triage, worktree]
+---
 You are implementing a small patch in an unattended pipeline.
 $owner
 
 Repository: $repo.
-$workspace
+$worktree
 
 ## Issue $ref: $title
 

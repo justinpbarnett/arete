@@ -31,6 +31,7 @@ from . import (
     pr_recovery,
     principals,
     prompt_loader,
+    prompts,
     repairs,
     requirement_revision,
     run_lines,
@@ -1631,7 +1632,7 @@ class Controller(worker_turns.WorkerTurns):
             return ledger.accept(self.lease, turn, observation["state_version"], response, self.action_limit)
         place = self.run.dir / "controller"
         place.mkdir(exist_ok=True)
-        prompt = prompt_loader.prompt(self.controller_prompt, api=help_text(self.protocol, spec=self.is_spec),
+        prompt = prompts.render_engine(self.controller_prompt, api=help_text(self.protocol, spec=self.is_spec),
                                       observation=json.dumps(observation))
         result = {}
         for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
@@ -1754,7 +1755,7 @@ class Controller(worker_turns.WorkerTurns):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         if assignment:
             private = builder_workspaces.folder(assignment["candidate"]["token"])
-            inputs.update(workspace=str(private), class_check="")
+            inputs.update(worktree=str(private), class_check="")
         if not writing:
             inputs["class_check"] = ""
         if self.is_spec and (done := self.data.get("definition")):

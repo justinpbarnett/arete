@@ -45,45 +45,26 @@ ENV_ASSIGNMENT = re.compile(
     rf"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>(?:[^{SHELL_WORD_BREAKS}]|{SHELL_QUOTING})*)(?P<space>[ \t]+|$)")
 EXAMPLE_SERVER_PORT = "51390"
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "fail", "blocked"]},
-        "summary": {"type": "string"},
-        "checks": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "what": {"type": "string"},
-                "how": {"type": "string"},
-                "saw": {"type": "string"},
-                "passed": {"type": "boolean"},
-                "cause": {"type": "string", "enum": ["change", "environment"]},
-                "screenshot": {"type": "string"},
-            },
-            "required": ["what", "how", "saw", "passed"],
-        }},
-        "unmeasured_requirements": {"type": "array", "items": {"type": "string"}},
-        "blocked_by": {"type": "string"},
-        "missing_capability": {"type": "string"},
-        "missing_tools": {"type": "array", "items": {"type": "string"}},
-        "advisory_gaps": {"type": "array", "items": {"type": "string"}},
-        "pending_delivery": {"type": "string"},
-    },
-    "required": ["verdict", "summary", "checks"],
-}
+def candidate_schema(token, base: dict | None = None):
+    from . import prompts
 
-
-def candidate_schema(token):
+    src = base if base is not None else prompts.engine_schema("verify")
     if not token:
-        return SCHEMA
+        return src
     candidate = {"type": "object", "additionalProperties": False,
                  "properties": {"candidate_requirement": {"type": "string"}, "reason": {"type": "string"}},
                  "required": ["candidate_requirement", "reason"]}
     receipt = {"type": "object", "additionalProperties": False,
                "properties": {"pending_delivery": {"type": "string", "enum": [token]}}, "required": ["pending_delivery"]}
-    return {**SCHEMA, "required": [*SCHEMA["required"], "pending_delivery", "unmeasured_requirements"],
-            "properties": {**SCHEMA["properties"], "pending_delivery": {"type": "string", "enum": [token]},
-                           "unmeasured_requirements": {"type": "array", "items": {"anyOf": [candidate, receipt]}}}}
+    built = {**src, "required": [*src["required"], "pending_delivery", "unmeasured_requirements"],
+             "properties": {**src["properties"], "pending_delivery": {"type": "string", "enum": [token]},
+                            "unmeasured_requirements": {"type": "array", "items": {"anyOf": [candidate, receipt]}}}}
+    if isinstance(src, prompts.LoadedSchema) and src.schema_name:
+        return prompts.LoadedSchema(
+            built, name=src.schema_name, version=src.schema_version,
+            level=src.schema_level, sha256=src.schema_sha256,
+        )
+    return built
 
 
 def candidate_gaps(rows, token):

@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [checks, denied, diff, failures, left_for_a_person, max_rounds, merged_base, round]
+---
 Arete committed your change, pushed it and opened the PR. CI then ran on the PR, and these checks failed.
 This is round $round of $max_rounds. $merged_base
 

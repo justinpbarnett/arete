@@ -5,6 +5,33 @@ tools = ["Read", "Glob", "Grep"]
 mcp = []
 session = "fresh"
 
+[defaults.prompt]
+plan = "plan"
+revise = "revise"
+repair = "repair"
+build = "build"
+fix = "fix"
+review_fix = "review_fix"
+resolve = "resolve"
+ci_fix = "ci_fix"
+review = "review"
+verify_fix = "verify_fix"
+verify = "verify"
+grade = "grade"
+learn = "learn"
+uat = "uat"
+
+[defaults.schema]
+plan = "plan"
+revise = "revise"
+resolve = "resolve"
+ci_fix = "ci_fix"
+review = "review"
+verify = "verify"
+grade = "verify"
+learn = "learn"
+uat = "uat"
+
 [steps.verify]
 directory_cleanup = true
 

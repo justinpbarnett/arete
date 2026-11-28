@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [attachments, body, class_check_guidance, commands, comments, context, denied, expertise, goal, max_lines, owner, ref, repo, title, worktree]
+---
 # Delegated goal
 
 $goal
@@ -5,7 +9,7 @@ $goal
 # Task
 
 Repository: $repo
-Workspace: $workspace
+Workspace: $worktree
 Issue $ref: $title
 
 $body

@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [claims, criteria, gaps, questions, sources, tasks]
+---
 ## The research plan
 
 A planner set this plan for the ticket and bounded search workers have run its search tasks. This call has no web

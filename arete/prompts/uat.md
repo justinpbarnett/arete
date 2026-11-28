@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [branch, prs, ref, ticket, title]
+---
 Work for ticket $ref was merged and deployed to `$branch`. A person will now check it there by hand, using the
 product the way its users do. Write the steps they follow.
 

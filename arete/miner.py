@@ -20,6 +20,7 @@ from . import (
     jev,
     paths,
     prompt_loader,
+    prompts,
     record,
     runlimits,
     runner,
@@ -859,7 +860,7 @@ def settle_open_prs(cfg: config.Config, run_id: str, repos: list[config.Repo], f
 
 
 def placeholders(text: str) -> set[str]:
-    return set(Template(text).get_identifiers())
+    return set(Template(prompts.parse(text)[1]).get_identifiers())
 
 
 def harness_diff_refusal(cfg: config.Config, repo: config.Repo, diff: diffguard.Diff) -> str:
@@ -888,7 +889,7 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path, base: str, h
         before = placeholders(git(["show", f"{base}:{f}"], wt))
         try:
             text = git(["show", f"{head}:{f}"], wt)
-            after = set(prompt_loader.parse_template(f, text).get_identifiers())
+            after = set(prompt_loader.parse_template(f, prompts.parse(text)[1]).get_identifiers())
         except ValueError as error:
             return str(error)
         if before != after:
@@ -906,7 +907,7 @@ def proposals_text(props: list[dict]) -> str:
 
 def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
     denied = list(dict.fromkeys(diffguard.ALWAYS_DENY + NEVER))
-    text = prompt_loader.prompt("apply", proposals=proposals_text(props), denied=prompt_loader.code_list(denied))
+    text = prompts.render_engine("apply", proposals=proposals_text(props), denied=prompt_loader.code_list(denied))
     return runner.run(text, wt, model=cfg.model("apply"),
                       allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
@@ -1154,7 +1155,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         prior_rows.sort(key=lambda r: r["recorded"] or r["created"] or "", reverse=True)
         earlier_text, earlier = render_feedback(prior_rows)
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
-    text = prompt_loader.prompt(
+    text = prompts.render_engine(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS, check_adoption=check_proposals.ADOPTION_CHANGE,
         pending=_fmt(approvals_store.proposals(status=["applied", "pending", "hand", "approve", "filing"])),

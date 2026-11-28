@@ -12,6 +12,7 @@ from ._rows import json_dict, validate_columns
 from .db import (
     RUNS_LINEAGE_SCHEMA,
     RUNS_PINS_SCHEMA,
+    RUNS_PROMPT_BINDING_SCHEMA,
     db,
     migration_applied,
     reader,
@@ -25,6 +26,10 @@ LINEAGE_RUN_FIELDS = frozenset(("continues", "chain", "restart", "started_by", "
 
 def has_pins(c) -> bool:
     return migration_applied(RUNS_PINS_SCHEMA, c)
+
+
+def has_prompt_binding(c) -> bool:
+    return migration_applied(RUNS_PROMPT_BINDING_SCHEMA, c)
 
 
 def has_lineage(c) -> bool:
@@ -772,18 +777,33 @@ def highest_contract_migration(connect=reader) -> int:
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
                  try_no: int = 0, auth_mode: str = "", *, inputs: tuple[dict, ...] | list[dict] = (),
                  settings_sha: str = "", settings_snapshots: dict[str, str] | None = None,
-                 blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+                 blob_rows: tuple[tuple[str, str, int], ...] = (),
+                 prompt_version: str = "", prompt_level: str = "", schema_version: str = "") -> None:
     from . import blobs as blob_store
 
     with writes.atomic() as c:
         pinned = has_pins(c)
+        bound = has_prompt_binding(c)
         if pinned:
             for sha, blob_kind, size in blob_rows:
                 blob_store.record_row(c, sha, blob_kind, size)
             if settings_snapshots:
                 save_settings_snapshots(c, settings_snapshots)
         for res, seconds in calls:
-            if pinned:
+            if bound:
+                cur = c.execute(
+                    "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
+                    " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
+                    " api_seconds, auth_mode, settings_sha, prompt_version, prompt_level, schema_version) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
+                    "?,?,?,?,?,?,?,?,?)",
+                    (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
+                     res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
+                     res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
+                     res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode, settings_sha or None,
+                     prompt_version or None, prompt_level or None, schema_version or None))
+            elif pinned:
                 cur = c.execute(
                     "INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
                     " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"

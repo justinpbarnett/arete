@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [attempt, checks, denied, failures, max_attempts]
+---
 The checks failed after your change. Attempt $attempt of $max_attempts.
 
 $failures

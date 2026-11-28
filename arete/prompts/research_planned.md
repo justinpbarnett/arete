@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [claims, criteria, questions, tasks]
+---
 ## The research plan
 
 A planner set this plan for the ticket. Run each search task within its limits, answer each question, hold sources

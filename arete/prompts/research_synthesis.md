@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [audit, claims, criteria, file_name, filing, gaps, more, owner, questions, ref, related, repos, shape, sources, tasks, ticket, title]
+---
 You write the research report for one ticket from evidence that search workers already gathered. $owner You have no web
 access and no way to search: write only from the evidence below and the files you may read. You change nothing and
 send nothing.

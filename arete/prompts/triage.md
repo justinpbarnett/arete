@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [owner, ref, repo_rule, repos, ticket, title]
+---
 You triage one ticket for an unattended pipeline. $owner Read the code as much
 as you need, and change nothing.
 

@@ -1237,12 +1237,13 @@ def plan(flow: factory.Flow) -> Outcome:
     run, layer = job.run, job.layer
     limit, info = layer.max_diff_lines, run.tracker.label_name("needs-info")
     reads = pipeline.git_reads(job.checkouts)
-    res = run.agent("plan", job.brief.prompt(
-        "plan", triage=job.triage,
-        checks=pipeline.check_list(layer), journeys=journeys.guidance(layer.verify.feature_map, planning=True)
-        if layer.verify else ""),
+    res = run.agent("plan", prompt_loader.task_prompt(run.prompt(
+        "plan", "plan", **job.brief.values(
+            triage=job.triage,
+            checks=pipeline.check_list(layer),
+            journeys=journeys.guidance(layer.verify.feature_map, planning=True) if layer.verify else ""))),
                     job.ws, role="plan", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
-                    json_schema=pipeline.PLAN_SCHEMA)
+                    json_schema=run.schema("plan", "plan"))
     if not res.ok or not isinstance(res.structured, dict):
         return end_as("fail", "failed", why="planning step failed", recovery=runner.start_failure(res, "plan"))
     found = res.structured
@@ -1307,9 +1308,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     feedback = pipeline.feedback_markdown(run.feedback)
     left = pipeline.left_on_prs(run.feedback_prs)
     run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
-    res = run.agent("revise", job.brief.prompt("revise", feedback=feedback, checks=job.checks),
+    res = run.agent("revise", prompt_loader.task_prompt(
+        run.prompt("revise", BUILD, **job.brief.values(feedback=feedback, checks=job.checks))),
                     job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
-                    disallowed_tools=routing.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
+                    disallowed_tools=routing.NO_GIT_WRITES, json_schema=run.schema("revise", BUILD))
     if not res.ok or not isinstance(res.structured, dict):
         return end_as("fail", "failed", why="revise step failed", said=res.text,
                       recovery=runner.start_failure(res, BUILD))
@@ -1350,8 +1352,10 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
     b.restore_repair_state(found.repair_state)
     b.carry_review(found.review, restored=True)
     b.capture_repair_baselines("repair:before")
-    prompt = job.brief.prompt("repair", plan=found.plan, source=found.run_id,
-                              findings=b.repair_feedback() or findings, checks=job.checks)
+    prompt = prompt_loader.task_prompt(run.prompt(
+        "repair", REVIEW_REPAIR, **job.brief.values(
+            plan=found.plan, source=found.run_id,
+            findings=b.repair_feedback() or findings, checks=job.checks)))
     res = run.agent("repair", check_repair.builder_prompt(prompt),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
@@ -1380,7 +1384,7 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
     run = job.run
     atom = atom_of("implement", {"round": round, "asks": asks})
     if asks:
-        res = job.b.resume(round, asks, role=atom, json_schema=pipeline.CI_FIX_SCHEMA)
+        res = job.b.resume(round, asks, role=atom, json_schema=pipeline.run_schema(run, "ci_fix", atom))
         return Outcome("pass" if res.ok and isinstance(res.structured, dict) else "fail",
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
@@ -1391,9 +1395,9 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
     if round.startswith(REVIEW_FIX):
         b.capture_repair_baselines(f"{round}:before")
         problems = "\n\n".join(filter(None, (feedback, b.repair_feedback())))
-        prompt = prompt_loader.prompt(REVIEW_FIX, problems=problems, notes=job.review.fix_notes(), denied=denied)
+        prompt = pipeline.run_prompt(run, REVIEW_FIX, atom, problems=problems, notes=job.review.fix_notes(), denied=denied)
     else:
-        prompt = pipeline.check_fix_prompt(attempt, tries, feedback, b.check_commands, b.deny)
+        prompt = pipeline.check_fix_prompt(attempt, tries, feedback, b.check_commands, b.deny, run=run)
     res = b.resume(round, prompt, role=atom)
     reply = res.text
     if res.ok and round.startswith(REVIEW_FIX):
@@ -1408,7 +1412,8 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
 
 def build(job: Job) -> Outcome:
     run, layer = job.run, job.layer
-    prompt = job.brief.prompt(BUILD, plan=job.plan_text, checks=job.checks, estimate=job.estimate, verify=job.goal)
+    prompt = prompt_loader.task_prompt(run.prompt(
+        BUILD, BUILD, **job.brief.values(plan=job.plan_text, checks=job.checks, estimate=job.estimate, verify=job.goal)))
     res = run.agent(BUILD, check_repair.builder_prompt(prompt),
                     job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)

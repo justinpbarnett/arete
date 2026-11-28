@@ -50,7 +50,17 @@
         },
         "floor": {"type": "string", "x-arete-reach": true},
         "budget_usd": {"type": "number", "x-arete-reach": true},
-        "directory_cleanup": {"type": "boolean"}
+        "directory_cleanup": {"type": "boolean"},
+        "prompt": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "x-arete-reach": true
+        }
       },
       "additionalProperties": false,
       "x-arete-reach": true
@@ -146,7 +156,17 @@
         },
         "floor": {"type": "string", "x-arete-reach": true},
         "budget_usd": {"type": "number", "x-arete-reach": true},
-        "directory_cleanup": {"type": "boolean"}
+        "directory_cleanup": {"type": "boolean"},
+        "prompt": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "x-arete-reach": true
+        }
       },
       "additionalProperties": false,
       "x-arete-reach": true,

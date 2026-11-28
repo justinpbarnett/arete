@@ -14455,7 +14455,7 @@ def flow_fn(flow):
     run = flow.ctx.run
     brief = prompt_loader.Brief('sample', 'ws', tid, 'Pinned run ticket', 'Do the work')
     plan_text = brief.prompt('plan', paths.PROMPTS_DIR, triage='', checks='unit')
-    p_res = run.agent('plan', plan_text, flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    p_res = run.agent('plan', plan_text, flow.ctx.ws, role='plan', json_schema=run.schema('plan', 'plan'))
     assert p_res.ok
     build_text = brief.prompt('build', paths.PROMPTS_DIR, plan='do it', checks='unit', estimate=5, verify='ok')
     b_res = run.agent('build', build_text, flow.ctx.ws, role='build')
@@ -14746,7 +14746,7 @@ def fake_replay(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prom
                          structured={'plan': 'p', 'verify': 'v'}, turns=1)
 
 def do_plan(flow):
-    res = flow.ctx.run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan', json_schema=pipeline.PLAN_SCHEMA)
+    res = flow.ctx.run.agent('plan', 'plan prompt', flow.ctx.ws, role='plan', json_schema=flow.ctx.run.schema('plan', 'plan'))
     return factory.Outcome(data={'plan': res.structured['plan']}, result='pass')
 
 def parked_flow(flow):
@@ -14763,19 +14763,27 @@ assert rc1 == 0
 r1 = run_store.newest_whole_run('sample', tid)
 assert r1['status'] == 'needs-info' and calls == ['plan']
 
-# Run 2: PLAN_SCHEMA gains one property -> plan runs again under continuation!
-extended_schema = {
-    **pipeline.PLAN_SCHEMA,
-    'properties': {**pipeline.PLAN_SCHEMA['properties'], 'extra_field': {'type': 'string'}},
-}
+# Run 2: plan schema gains one property -> plan runs again under continuation!
+from arete import prompts as prompt_resolver
+base_plan_schema = prompt_resolver.engine_schema('plan')
+extended_raw = json.dumps({
+    **base_plan_schema,
+    'properties': {**base_plan_schema['properties'], 'extra_field': {'type': 'string'}},
+}, indent=2) + '\n'
+with configrepo.writer_lock() as fence:
+    configrepo.commit({'schemas/plan.json': extended_raw}, {'schemas/plan.json': configrepo.ABSENT},
+                      actor='hand', source='hand', note='extend plan schema', fence=fence)
 with (mock.patch.dict(factory.STEPS, {'plan': do_plan}),
-      mock.patch.object(pipeline, 'PLAN_SCHEMA', extended_schema),
       mock.patch.object(replay, 'run', side_effect=fake_replay)):
     rc2 = pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', parked_flow, continues=r1['id'], restart='resume'))
 assert rc2 == 0
 r2 = run_store.newest_whole_run('sample', tid)
 assert calls == ['plan', 'plan'], calls
 assert any(s['step'] == 'plan' for s in run_store.steps(r2['id']))
+_, cur_sha = configrepo.read('schemas/plan.json')
+with configrepo.writer_lock() as fence:
+    configrepo.commit({'schemas/plan.json': None}, {'schemas/plan.json': cur_sha},
+                      actor='hand', source='hand', note='remove plan schema override', fence=fence)
 
 # Run 3: contract migration added above r1.schema_version -> takes no stored step even with same schema!
 calls.clear()
@@ -17266,3 +17274,339 @@ emit_result({
         self.assertEqual(result["gh_rule_audience"], "self")
         self.assertEqual(result["default_state"], "approved")
         self.assertEqual(result["team_state"], "draft")
+
+
+class _PromptReplayCase(unittest.TestCase):
+    def run_prompt_child(self, body: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-prompt-behavior-") as tmp:
+            root = Path(tmp).resolve()
+            env = {
+                "ARETE_CONFIG_DIR": str(root / "config"),
+                "ARETE_STATE_DIR": str(root / "state"),
+                "ARETE_LOG_DIR": str(root / "logs"),
+                "ARETE_WORKTREES_DIR": str(root / "worktrees"),
+                "TMPDIR": str(root / "tmp"),
+                "HOME": str(root / "home"),
+            }
+            for folder in env.values():
+                Path(folder).mkdir(parents=True, exist_ok=True)
+            base_env = {k: v for k, v in os.environ.items()
+                        if k in ("PATH", "LANG", "LC_ALL", "TZ", "ARETE_TEST_FAST_SYNC")}
+            base_env.update(env)
+            preamble = (
+                "import hashlib, json, re, shutil, sys\n"
+                "from io import StringIO\n"
+                "from contextlib import redirect_stdout\n"
+                "from pathlib import Path\n"
+                "from string import Template\n"
+                "from unittest import mock\n"
+                "from arete import api, config, configrepo, document, evals, oncall, paths, pipeline, prompts, replay, steps\n"
+                "from arete.lab import experiment\n"
+                "from arete.store import blobs as blob_store, config as config_store, db, runs as run_store, tasks as task_store\n"
+                "import importlib.util\n"
+                "_spec = importlib.util.spec_from_file_location('adw_feature', paths.ADWS_DIR / 'feature.py')\n"
+                "_feat_mod = importlib.util.module_from_spec(_spec)\n"
+                "_spec.loader.exec_module(_feat_mod)\n"
+                "def run_adw(tid):\n"
+                "    return pipeline.run_issue(replay.SAMPLE_REPO, tid, force=True, dry_run=True, script=pipeline.Script('feature', _feat_mod.feature))\n"
+                f"root = Path({str(root)!r})\n"
+                "with redirect_stdout(StringIO()):\n"
+                "    db.migrate()\n"
+                "def setup_sample(adw=True):\n"
+                "    sample_dir = root / 'sample'\n"
+                "    lines = replay.sample(sample_dir, adw=adw)\n"
+                "    layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO\n"
+                "    layer_dest.parent.mkdir(parents=True, exist_ok=True)\n"
+                "    shutil.copytree(sample_dir / 'layer', layer_dest)\n"
+                "    cfg_lines = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line for line in lines]\n"
+                "    paths.CONFIG_FILE.write_text('\\n'.join(cfg_lines) + '\\n', encoding='utf-8')\n"
+                "    configrepo.init()\n"
+                "    return sample_dir, layer_dest\n"
+                "def commit_cfg(rel, content, note='update'):\n"
+                "    _, base_sha = configrepo.read(rel)\n"
+                "    with configrepo.writer_lock() as fence:\n"
+                "        return configrepo.commit({rel: content}, {rel: base_sha}, actor='hand', source='hand', note=note, fence=fence)\n"
+                "def rendered_for(run_id, step_name):\n"
+                "    by_step = run_store.step_inputs_by_run(run_id)\n"
+                "    step_row = next(s for s in run_store.steps(run_id) if s['step'] == step_name)\n"
+                "    rows = by_step[step_row['id']]\n"
+                "    rendered_row = next(r for r in rows if r['role'] == 'rendered')\n"
+                "    return step_row, rows, blob_store.read(rendered_row['sha256']).decode('utf-8')\n"
+            )
+            script = preamble + "\n" + body + "\nprint('PROMPT_RESULT=' + json.dumps(result))\n"
+            cmd = [sys.executable, "-I", "-c", script]
+            repo_root = Path(__file__).resolve().parents[1]
+            done = subprocess.run(cmd, cwd=repo_root, env={**base_env, "PYTHONPATH": str(repo_root)},
+                                  capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+            self.assertEqual(done.returncode, 0, done.stdout + "\n" + done.stderr)
+            lines = [line for line in done.stdout.splitlines() if line.startswith("PROMPT_RESULT=")]
+            self.assertTrue(lines, done.stdout + "\n" + done.stderr)
+            return json.loads(lines[-1].removeprefix("PROMPT_RESULT="))
+
+
+class PromptBindingTests(_PromptReplayCase):
+    def test_forced_run_records_prompt_and_schema_versions_and_api_returns_them(self):
+        result = self.run_prompt_child(r"""
+setup_sample(adw=True)
+tid = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat', 'Add kumquat to notes.txt.')
+rc = run_adw(tid)
+assert rc == 0, rc
+run = run_store.newest_whole_run(replay.SAMPLE_REPO, tid)
+assert run is not None
+step_rows = run_store.steps(run['id'])
+by_name = {s['step']: s for s in step_rows}
+assert {'plan', 'build', 'verify', 'review'} <= by_name.keys(), by_name.keys()
+
+prompt_pat = re.compile(r'^prompt/[a-zA-Z0-9_-]+@[0-9a-f]{12}$')
+schema_pat = re.compile(r'^schema/[a-zA-Z0-9_-]+@[0-9a-f]{12}$')
+for sname in ('plan', 'build', 'verify', 'review'):
+    row, inputs, rendered_text = rendered_for(run['id'], sname)
+    assert prompt_pat.fullmatch(row['prompt_version'] or ''), (sname, row['prompt_version'])
+    assert row['prompt_level'] == 'engine', (sname, row['prompt_level'])
+    assert not rendered_text.startswith('---\n'), (sname, rendered_text[:60])
+    engine_body_first = prompts.body(paths.PROMPTS_DIR / f'{sname}.md').splitlines()[0].split('$')[0].strip()
+    assert engine_body_first in rendered_text, (sname, engine_body_first)
+    roles = {i['role'] for i in inputs}
+    assert {'prompt', 'inputs', 'rendered'} <= roles, (sname, roles)
+    if sname in ('plan', 'verify', 'review'):
+        assert schema_pat.fullmatch(row['schema_version'] or ''), (sname, row['schema_version'])
+        assert 'schema' in roles, (sname, roles)
+    else:
+        assert not row['schema_version'], (sname, row['schema_version'])
+
+# Verify step.list / step.get API resource projection exposes prompt_version, prompt_level, schema_version
+api_steps = api.resources('step', {'run': run['id']})
+api_by_name = {s['name']: s for s in api_steps}
+for sname in ('plan', 'build', 'verify', 'review'):
+    assert api_by_name[sname]['prompt_version'] == by_name[sname]['prompt_version']
+    assert api_by_name[sname]['prompt_level'] == 'engine'
+    assert api_by_name[sname]['schema_version'] == by_name[sname]['schema_version']
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_verify_prompt_binding_override_and_layer_refusal(self):
+        result = self.run_prompt_child(r"""
+_, layer_dest = setup_sample(adw=True)
+
+# 1. Config-level [steps.verify] prompt = { verify = "grade" } rebinds verify to grade while keeping other defaults.
+base_cfg = paths.CONFIG_FILE.read_text(encoding='utf-8')
+commit_cfg('config.toml', base_cfg + '\n[steps.verify]\nprompt = { verify = "grade" }\n', 'bind verify to grade')
+cfg = config.load()
+s_verify, prov_verify = steps.resolve(cfg, config.load_layer(layer_dest), 'verify', '', provenance=True)
+assert s_verify.prompts['verify'] == 'grade'
+assert s_verify.prompts['build'] == 'build'
+assert prov_verify['prompt']['verify']['value'] == 'grade'
+assert prov_verify['prompt']['verify']['level'] == 'config'
+assert prov_verify['prompt']['build']['level'] == 'engine'
+
+tid = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat', 'Add kumquat to notes.txt.')
+rc = run_adw(tid)
+assert rc == 0, rc
+run = run_store.newest_whole_run(replay.SAMPLE_REPO, tid)
+verify_row, _, verify_rendered = rendered_for(run['id'], 'verify')
+assert (verify_row['prompt_version'] or '').startswith('prompt/grade@'), verify_row
+assert verify_row['prompt_level'] == 'engine', verify_row
+assert 'You are the grader' in verify_rendered, verify_rendered[:200]
+
+# 2. Setting prompt or schema in the sample layer config.toml is a Problem naming the layer and key, and is not applied.
+commit_cfg('config.toml', base_cfg, 'restore default bindings')
+layer_file = layer_dest / 'config.toml'
+orig_layer = layer_file.read_text(encoding='utf-8')
+layer_file.write_text(orig_layer + '\n[steps.verify]\nprompt = { verify = "grade" }\nschema = { verify = "plan" }\n', encoding='utf-8')
+bad_layer = config.load_layer(layer_dest, strict=False, repo=replay.SAMPLE_REPO)
+problem_texts = [p.text() for p in bad_layer.problems]
+assert any(replay.SAMPLE_REPO in t and 'prompt' in t for t in problem_texts), problem_texts
+assert any(replay.SAMPLE_REPO in t and 'schema' in t for t in problem_texts), problem_texts
+merged_verify = steps.merged(config.load(), bad_layer, 'verify', '', {})
+assert merged_verify['prompt']['verify'] == 'verify', merged_verify['prompt']
+assert merged_verify['schema']['verify'] == 'verify', merged_verify['schema']
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PromptResolverTests(_PromptReplayCase):
+    def test_config_override_pinned_across_runs(self):
+        result = self.run_prompt_child(r"""
+setup_sample(adw=True)
+engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+engine_sha = hashlib.sha256(engine_raw).hexdigest()
+engine_meta, engine_body = prompts.parse(engine_raw)
+
+override_body = engine_body.rstrip() + '\n\nName the kumquat file first.\n'
+override_text = (
+    '---\n'
+    'schema: 1\n'
+    'overrides: arete/prompts/build.md\n'
+    f'base: {engine_sha}\n'
+    f'inputs: [{", ".join(engine_meta["inputs"])}]\n'
+    '---\n'
+    + override_body
+)
+
+# Run 1 starts BEFORE the config prompt override is committed; we commit the override mid-run during plan!
+tid1 = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat run 1', 'Add kumquat to notes.txt.')
+committed = {'done': False}
+real_replay_run = replay.run
+def replay_with_midrun_commit(cwd, trace, cfg_arg, on_line, resume=None, timeout=None, *, prompt=''):
+    if trace[1] == 'plan' and not committed['done']:
+        committed['done'] = True
+        commit_cfg('prompts/build.md', override_text, 'override build prompt')
+    return real_replay_run(cwd, trace, cfg_arg, on_line, resume=resume, timeout=timeout, prompt=prompt)
+
+with mock.patch.object(replay, 'run', side_effect=replay_with_midrun_commit):
+    rc1 = run_adw(tid1)
+assert rc1 == 0 and committed['done']
+r1 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid1)
+b1_row, _, b1_rendered = rendered_for(r1['id'], 'build')
+assert b1_row['prompt_level'] == 'engine', b1_row
+assert 'Name the kumquat file first.' not in b1_rendered
+
+# Run 2 launches AFTER the commit: picks up config prompt with config_index version and line in rendered blob.
+idx_row = config_store.live_item('prompt', 'build')
+assert idx_row is not None
+tid2 = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat run 2', 'Add kumquat to notes.txt.')
+rc2 = run_adw(tid2)
+assert rc2 == 0
+r2 = run_store.newest_whole_run(replay.SAMPLE_REPO, tid2)
+b2_row, _, b2_rendered = rendered_for(r2['id'], 'build')
+assert b2_row['prompt_level'] == 'config', b2_row
+assert b2_row['prompt_version'] == idx_row['version'], (b2_row['prompt_version'], idx_row['version'])
+assert 'Name the kumquat file first.' in b2_rendered
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_workspace_alias_in_config_override(self):
+        result = self.run_prompt_child(r"""
+setup_sample(adw=True)
+engine_raw = (paths.PROMPTS_DIR / 'build.md').read_bytes()
+engine_sha = hashlib.sha256(engine_raw).hexdigest()
+engine_meta, engine_body = prompts.parse(engine_raw)
+
+ws_inputs = ['workspace' if k == 'worktree' else k for k in engine_meta['inputs']]
+ws_body = engine_body.replace('$worktree', '$workspace')
+ws_override = (
+    '---\n'
+    'schema: 1\n'
+    'overrides: arete/prompts/build.md\n'
+    f'base: {engine_sha}\n'
+    f'inputs: [{", ".join(ws_inputs)}]\n'
+    '---\n'
+    + ws_body
+)
+assert prompts.check_renamed_inputs({'inputs': ws_inputs}, ws_body) == ['workspace']
+commit_cfg('prompts/build.md', ws_override, 'override build with $workspace')
+tid = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat alias', 'Add kumquat to notes.txt.')
+rc = run_adw(tid)
+assert rc == 0
+run = run_store.newest_whole_run(replay.SAMPLE_REPO, tid)
+b_row, _, b_rendered = rendered_for(run['id'], 'build')
+assert b_row['prompt_level'] == 'config', b_row
+assert '$workspace' not in b_rendered
+assert 'You are in a worktree on branch `' in b_rendered, b_rendered
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+
+class PromptLayerAndEngineTests(_PromptReplayCase):
+
+    def test_layer_append_and_overrides_refusal(self):
+        result = self.run_prompt_child(r"""
+sample_dir, layer_dest = setup_sample(adw=True)
+rel_append = f'layers/{replay.SAMPLE_REPO}/prompts/build.append.md'
+commit_cfg(rel_append, 'Also list kumquat first.\n', 'add layer append for build')
+
+tid = task_store.task_add(replay.SAMPLE_REPO, 'Add kumquat append', 'Add kumquat to notes.txt.')
+rc = run_adw(tid)
+assert rc == 0
+run = run_store.newest_whole_run(replay.SAMPLE_REPO, tid)
+b_row, b_inputs, b_rendered = rendered_for(run['id'], 'build')
+assert b_row['prompt_level'] == 'engine', b_row
+assert b_rendered.strip().endswith('Also list kumquat first.'), b_rendered[-200:]
+append_rows = [r for r in b_inputs if r['role'] == 'prompt_append']
+assert len(append_rows) == 1, append_rows
+assert append_rows[0]['name'] == f'{replay.SAMPLE_REPO}.build.append', append_rows[0]
+assert append_rows[0]['level'] == f'layer:{replay.SAMPLE_REPO}', append_rows[0]
+
+# A layer append fragment whose front matter names overrides is refused with config_invalid naming the file.
+bad_fragment = '---\noverrides: arete/prompts/build.md\n---\nNot allowed.\n'
+commit_cfg(rel_append, bad_fragment, 'bad layer append with overrides')
+tid_bad = task_store.task_add(replay.SAMPLE_REPO, 'Bad append', 'Should fail launch.')
+try:
+    run_adw(tid_bad)
+    raise AssertionError('expected ConfigInvalid on layer append with overrides')
+except prompts.ConfigInvalid as exc:
+    assert 'config_invalid' in str(exc) and 'build.append.md' in str(exc), str(exc)
+
+# Same refusal for a repo-local .agents layer!
+local_layer = sample_dir / 'repo' / '.agents' / 'prompts'
+local_layer.mkdir(parents=True, exist_ok=True)
+(local_layer / 'build.append.md').write_text(bad_fragment, encoding='utf-8')
+try:
+    prompts.validate_layer_appends(sample_dir / 'repo' / '.agents')
+    raise AssertionError('expected ConfigInvalid on repo-local layer append with overrides')
+except prompts.ConfigInvalid as exc:
+    assert 'config_invalid' in str(exc) and 'build.append.md' in str(exc), str(exc)
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])
+
+    def test_engine_prompt_front_matter_fingerprints_and_body_renderers(self):
+        result = self.run_prompt_child(r"""
+_, layer_dest = setup_sample(adw=True)
+all_prompts = sorted(paths.PROMPTS_DIR.glob('*.md'))
+assert len(all_prompts) >= 35, len(all_prompts)
+for p in all_prompts:
+    meta, body_text = prompts.parse(p.read_bytes())
+    assert meta.get('schema') == 1, (p.name, meta)
+    assert 'inputs' in meta, (p.name, meta)
+    body_ids = sorted(set(Template(body_text).get_identifiers()))
+    assert sorted(meta['inputs']) == body_ids, (p.name, meta['inputs'], body_ids)
+    assert 'workspace' not in body_ids and '$workspace' not in body_text, p.name
+
+# Every bound call's engine prompt inputs are a subset of prompts.OFFERS[call]
+for call, offered in prompts.OFFERS.items():
+    meta, _ = prompts.parse((paths.PROMPTS_DIR / f'{call}.md').read_bytes())
+    assert set(meta['inputs']) <= offered, (call, set(meta['inputs']) - offered)
+
+# render drops undeclared passed values, raises MissingInputs on missing declared input, raises on undeclared $name
+rendered_ok = prompts.render('---\nschema: 1\ninputs: [a]\n---\nHello $a', name='demo', a='world', extra='dropped')
+assert str(rendered_ok) == 'Hello world'
+assert rendered_ok.prompt_values == {'a': 'world'}
+try:
+    prompts.render('---\nschema: 1\ninputs: [a, b]\n---\nHello $a', name='demo', a='world')
+    raise AssertionError('expected MissingInputs')
+except Exception as exc:
+    assert type(exc).__name__ == 'MissingInputs', type(exc)
+try:
+    prompts.render('---\nschema: 1\ninputs: [a]\n---\nHello $a $undeclared', name='demo', a='world', undeclared='x')
+    raise AssertionError('expected ValueError for undeclared placeholder')
+except ValueError as exc:
+    assert 'undeclared' in str(exc), str(exc)
+
+# experiment.fingerprints equals hash of prompts.body of builder prompts
+cfg = config.load()
+repo = cfg.repo(replay.SAMPLE_REPO)
+layer = config.load_layer(layer_dest)
+fp = experiment.fingerprints(repo, layer)
+expected_prompt_fp = experiment.sha(*[prompts.body(paths.PROMPTS_DIR / f'{n}.md') for n in evals.BUILDER_PROMPTS])
+assert fp['prompt'] == expected_prompt_fp, (fp['prompt'], expected_prompt_fp)
+
+# document.fill and oncall.repair_prompt do not start with front matter
+doc_text = document.fill(
+    document.Brief(kind='message', action='Announce release', facts=('Shipped v1',)),
+    config.Document(), [], None,
+)
+assert not str(doc_text).startswith('---'), str(doc_text)[:60]
+oncall_text = oncall.repair_prompt(
+    {'id': 1, 'class': 'crash', 'signature': 'sig-1', 'source': 'serve', 'count': 2,
+     'first_seen': '2026-01-01T00:00:00Z', 'last_seen': '2026-01-01T00:05:00Z', 'evidence': 'boom'},
+    [], 3, layer,
+)
+assert not str(oncall_text).startswith('---'), str(oncall_text)[:60]
+result = {'ok': True}
+""")
+        self.assertTrue(result["ok"])

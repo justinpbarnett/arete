@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [attempt, checks, denied, failures, max_attempts]
+---
 A verifier used the product with your change, and it does not work yet. Attempt $attempt of $max_attempts.
 
 $failures

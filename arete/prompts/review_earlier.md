@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [blockers, fixed, reply]
+---
 ## Earlier review
 
 The last review found these blockers:

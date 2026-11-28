@@ -1,3 +1,7 @@
+---
+schema: 1
+inputs: [action, briefing, loop, mark, repo]
+---
 An arete loop wants to do something, and it waits for its owner's approval on the arete dashboard.
 Write the plain summary the owner reads before pressing Approve or Reject, often on a phone.
 

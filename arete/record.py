@@ -196,19 +196,23 @@ def attach_pin(run_id: str, resolution, *, pid: int | None = None) -> None:
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
          try_no: int = 0, auth_mode: str = "", *, inputs: Sequence[dict] = (), settings_sha: str = "",
          settings_snapshots: dict[str, str] | None = None,
-         blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+         blob_rows: tuple[tuple[str, str, int], ...] = (),
+         prompt_version: str = "", prompt_level: str = "", schema_version: str = "") -> None:
     steps(run_id, name, [(res, seconds)], effort, tier, kind, try_no, auth_mode,
           inputs=inputs, settings_sha=settings_sha, settings_snapshots=settings_snapshots,
-          blob_rows=blob_rows)
+          blob_rows=blob_rows, prompt_version=prompt_version, prompt_level=prompt_level,
+          schema_version=schema_version)
 
 
 def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
           try_no: int = 0, auth_mode: str = "", *, inputs: Sequence[dict] = (), settings_sha: str = "",
           settings_snapshots: dict[str, str] | None = None,
-          blob_rows: tuple[tuple[str, str, int], ...] = ()) -> None:
+          blob_rows: tuple[tuple[str, str, int], ...] = (),
+          prompt_version: str = "", prompt_level: str = "", schema_version: str = "") -> None:
     run_store.insert_steps(run_id, name, calls, effort, tier, kind, try_no, auth_mode,
                            inputs=inputs, settings_sha=settings_sha, settings_snapshots=settings_snapshots,
-                           blob_rows=blob_rows)
+                           blob_rows=blob_rows, prompt_version=prompt_version, prompt_level=prompt_level,
+                           schema_version=schema_version)
 
 
 def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") -> None:

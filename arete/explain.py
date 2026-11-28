@@ -5,7 +5,7 @@ import secrets
 import tempfile
 import textwrap
 
-from . import config, delivery, prompt_loader, runner
+from . import config, delivery, prompts, runner
 from .store import approvals as approvals_store
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
@@ -29,7 +29,7 @@ def write_plain_summary(approval: dict, cfg: config.Config) -> str:
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:
     item = approval["emit"]["item"]
-    text = prompt_loader.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
+    text = prompts.render_engine("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
                            mark=secrets.token_hex(8), action=approval["summary"],
                            briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     with tempfile.TemporaryDirectory() as cwd:

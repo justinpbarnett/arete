@@ -65,6 +65,7 @@ STEP = configschema.schema("step_settings", "$defs", "step")
 STEP_COUNTS = configschema.fields_of_type(STEP, "integer")
 STEP_AMOUNTS = configschema.fields_of_type(STEP, "number")
 STEP_LISTS = configschema.fields_of_type(STEP, "array")
+STEP_MAPS = configschema.fields_of_type(STEP, "object")
 INSTRUCTIONS = configschema.enum("step_settings", "$defs", "step", "properties", "instructions", "items")
 SESSIONS = configschema.enum("step_settings", "$defs", "step", "properties", "session")
 MCP_NAME = re.compile(r"[A-Za-z0-9_-]+")
@@ -618,6 +619,20 @@ def step_table(table, where: str, *, problems: list[Problem] | None = None, path
     for key in STEP_LISTS:
         if key in table and not (isinstance(table[key], list | tuple) and all(isinstance(v, str) for v in table[key])):
             raise ValueError(f"[{where}]: {key} must be a list of names, not {table[key]!r}")
+    for key in STEP_MAPS:
+        if key not in table:
+            continue
+        if scope.startswith("layer:"):
+            if problems is None:
+                raise ValueError(f"[{where}]: {key} cannot be set in {scope}; a layer only appends")
+            problems.append(Problem(path, f"[{where}]", key, table[key], scope))
+            table = {k: v for k, v in table.items() if k != key}
+            continue
+        mapping = table[key]
+        if (not isinstance(mapping, dict)
+                or any(not isinstance(ck, str) or not ck or not isinstance(cv, str) or not MCP_NAME.fullmatch(cv)
+                       for ck, cv in mapping.items())):
+            raise ValueError(f"[{where}]: {key} must map call names to valid file names, not {mapping!r}")
     if bad := [v for v in table.get("instructions", ()) if v not in INSTRUCTIONS]:
         if problems is None:
             raise ValueError(f"[{where}]: instructions {', '.join(map(repr, bad))} is not one of {', '.join(INSTRUCTIONS)}")
@@ -643,7 +658,9 @@ def step_table(table, where: str, *, problems: list[Problem] | None = None, path
                 table = {k: v for k, v in table.items() if k != "runner"}
     flag(table, "structured_output", False, f"[{where}]:")
     flag(table, "directory_cleanup", False, f"[{where}]:")
-    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else float(v) if k in STEP_AMOUNTS
+    return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS
+            else {str(ck): str(cv) for ck, cv in v.items()} if k in STEP_MAPS
+            else float(v) if k in STEP_AMOUNTS
             else v if k in STEP_COUNTS or type(v) is bool else str(v)
             for k, v in table.items()}
 
