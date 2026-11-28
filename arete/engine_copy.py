@@ -194,7 +194,23 @@ def prune_unused(*, conn=None) -> list[str]:
     return removed
 
 
+def is_adw_command(command: list[str]) -> bool:
+    return (
+        len(command) >= 4
+        and command[1:3] == ["-I", "-c"]
+        and "factory.main()" in command[3]
+    )
+
+
 def rewrite_cli_command(command: list[str], engine_sha: str, source_root: Path | None = None) -> tuple[list[str], Path | None]:
+    if is_adw_command(command):
+        copy_root = ensure(engine_sha, source_root=source_root)
+        adw_entry = (
+            f"import sys; sys.path.insert(0, {str(copy_root)!r}); "
+            "from arete import codebase, factory; codebase.load(templates=True); "
+            "factory.main()"
+        )
+        return [command[0], "-I", "-c", adw_entry, *command[4:]], copy_root
     cli_prefix = paths.cli_command()
     if len(command) < len(cli_prefix) or command[: len(cli_prefix)] != cli_prefix:
         return command, None

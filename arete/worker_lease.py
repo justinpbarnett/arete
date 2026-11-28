@@ -184,14 +184,22 @@ class AdoptedLease:
                     self.header,
                     hold_seconds=hold,
                 )
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 if self._stop.wait(timeout=min(1.0, self.heartbeat_seconds)):
                     return
                 continue
+            if self._stop.is_set() or self.closed:
+                return
             if status == 410:
                 self.lost = True
                 with suppress(OSError):
                     os.kill(os.getpid(), signal.SIGTERM)
+                # If SIGTERM is caught/delayed by cleanup, force termination so a fenced worker never lingers.
+                if not self._stop.wait(timeout=2.0):
+                    with suppress(OSError):
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    if not self._stop.wait(timeout=1.0):
+                        os._exit(143)
                 return
             if status == 200 and (
                 data.get("stop_asked")
@@ -207,10 +215,11 @@ class AdoptedLease:
         if self.closed:
             return
         self.closed = True
-        self.stop()
+        self._stop.set()
         if not self.lost:
-            with suppress(OSError):
+            with suppress(OSError, http.client.HTTPException):
                 self.client.release(self.label, self.token, self.header, outcome=outcome)
+        self.stop()
         foundation.clear_lease_fence(self.lease_id)
 
 

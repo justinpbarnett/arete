@@ -484,7 +484,7 @@ with mock.patch.object(util, "git", local_git):
 paths.CONFIG_FILE.write_text("max_parallel = 1\n" + "\n".join(cfg_lines) + "\n")
 build_json = sample / "replay" / "build.json"
 orig_build = json.loads(build_json.read_text())
-build_json.write_text(json.dumps({**orig_build, "seconds": 15}))
+build_json.write_text(json.dumps({**orig_build, "seconds": 60}))
 
 db.migrate()
 principals.seed_owner("owner@example.test")
@@ -526,8 +526,9 @@ try:
             assert st1 == 200 and first.get("run"), (st1, first)
             tid, r1 = first["task"], first["run"]
 
-            # Wait until r1 reaches "build: starting" and its build step is running (inside replay sleep, no DB tx held).
+            # Wait until r1 has entered build's replay sleep (build transcript header flushed, no DB tx held).
             r1_log = paths.RUNS_DIR / r1 / "run.log"
+            r1_rec_dir = paths.record_dir(r1)
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 row1 = run_store.run_get(r1)
@@ -536,12 +537,16 @@ try:
                     and row1.get("pid")
                     and r1_log.exists()
                     and "build: starting" in r1_log.read_text()
-                    and any(s["step"] == "build" and s.get("status") == "running" for s in run_store.steps(r1))
+                    and r1_rec_dir.exists()
+                    and any(p.stat().st_size > 0 for p in r1_rec_dir.glob("build*.jsonl*"))
                 ):
                     r1_pid = int(row1["pid"])
                     break
                 time.sleep(0.03)
             assert r1_pid, (run_store.run_get(r1), r1_log.read_text() if r1_log.exists() else "")
+            with db.reader() as c:
+                r1_lease = dict(c.execute("SELECT id, epoch, token_hash FROM leases WHERE id = ?", (row1["lease_id"],)).fetchone())
+            assert r1_lease["token_hash"], f"worker {r1} did not claim its lease before SIGSTOP: {r1_lease}"
 
             # SIGSTOP worker r1 at build: starting.
             os.kill(r1_pid, signal.SIGSTOP)
@@ -586,7 +591,7 @@ try:
 
             # Resume old worker r1 (SIGCONT) -> receives 410 on heartbeat and exits cleanly.
             os.kill(r1_pid, signal.SIGCONT)
-            deadline = time.monotonic() + 8
+            deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 if leases.worker_exited(r1_pid):
                     break
@@ -631,7 +636,7 @@ with mock.patch.object(util, "git", local_git):
 paths.CONFIG_FILE.write_text("max_parallel = 2\n" + "\n".join(cfg_lines) + "\n")
 build_json = sample / "replay" / "build.json"
 orig_build = json.loads(build_json.read_text())
-build_json.write_text(json.dumps({**orig_build, "seconds": 15}))
+build_json.write_text(json.dumps({**orig_build, "seconds": 60}))
 
 db.migrate()
 principals.seed_owner("owner@example.test")

@@ -5,6 +5,7 @@ import re
 import secrets
 import signal
 import threading
+import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from contextvars import ContextVar
@@ -31,8 +32,8 @@ LeaseFenced = foundation.LeaseFenced
 _LEASE_ID_RE = re.compile(r"^(?:L-)?([1-9][0-9]{0,17})$")
 _ACTIVE_LEASE: ContextVar[ActiveLease | None] = ContextVar("active_device_lease", default=None)
 _BEFORE_LAPSE: Callable[[dict], None] | None = None
-_WAKE_LOCK = threading.Lock()
-_WAKE_EVENTS: dict[int, threading.Event] = {}
+_WAKE_COND = threading.Condition()
+_WAKE_GEN: dict[int, int] = {}
 
 
 def current() -> ActiveLease | None:
@@ -46,36 +47,42 @@ def parse_id(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _wake_event(lease_id: int) -> threading.Event:
-    with _WAKE_LOCK:
-        ev = _WAKE_EVENTS.get(lease_id)
-        if ev is None:
-            ev = threading.Event()
-            _WAKE_EVENTS[lease_id] = ev
-        return ev
+def _current_wake_gen(lease_id: int) -> int:
+    return _WAKE_GEN.get(lease_id, 0) + _WAKE_GEN.get(0, 0)
+
+
+def wake_generation(lease_id: int) -> int:
+    with _WAKE_COND:
+        return _current_wake_gen(lease_id)
 
 
 def wake(lease_id: int) -> None:
-    with _WAKE_LOCK:
-        ev = _WAKE_EVENTS.get(lease_id)
-        if ev is not None:
-            ev.set()
+    with _WAKE_COND:
+        _WAKE_GEN[lease_id] = _WAKE_GEN.get(lease_id, 0) + 1
+        _WAKE_COND.notify_all()
 
 
 def wake_all() -> None:
-    with _WAKE_LOCK:
-        for ev in _WAKE_EVENTS.values():
-            ev.set()
+    with _WAKE_COND:
+        _WAKE_GEN[0] = _WAKE_GEN.get(0, 0) + 1
+        _WAKE_COND.notify_all()
 
 
-def wait_for_control(lease_id: int, timeout: float) -> bool:
+def wait_for_control(lease_id: int, timeout: float, *, since: int | None = None) -> bool:
     if timeout <= 0:
         return False
-    ev = _wake_event(lease_id)
-    fired = ev.wait(timeout=min(HEARTBEAT_HOLD_SECONDS, max(0.0, float(timeout))))
-    if fired:
-        ev.clear()
-    return fired
+    wait_s = min(HEARTBEAT_HOLD_SECONDS, max(0.0, float(timeout)))
+    with _WAKE_COND:
+        start_gen = _current_wake_gen(lease_id) if since is None else since
+        if _current_wake_gen(lease_id) != start_gen:
+            return True
+        deadline = time.monotonic() + wait_s
+        while _current_wake_gen(lease_id) == start_gen:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _WAKE_COND.wait(timeout=remaining)
+        return True
 
 
 def worker_exited(pid: int | None) -> bool:
@@ -451,6 +458,7 @@ def http_heartbeat(
     now = util.now()
     now_iso = util.iso(now)
     new_expires = util.iso(now + timedelta(seconds=TTL_SECONDS))
+    before_gen = wake_generation(lease_id)
     with principals.acting(actor), event_store.request_scope(f"lease:{lease_id}"), foundation.tx(fenced=False) as c:
         _check_lease_fence_in_tx(c, lease_id, epoch, run_id)
         if not device_store.renew_lease(c, lease_id, epoch, now_iso, new_expires):
@@ -466,7 +474,7 @@ def http_heartbeat(
 
     hold = min(HEARTBEAT_HOLD_SECONDS, max(0.0, float(hold_seconds or 0.0)))
     if hold > 0 and not controls and not stop_asked:
-        wait_for_control(lease_id, hold)
+        wait_for_control(lease_id, hold, since=before_gen)
         with principals.acting(actor), event_store.request_scope(f"lease:{lease_id}"), foundation.tx(fenced=False) as c:
             _check_lease_fence_in_tx(c, lease_id, epoch, effective_run_id)
             updated = dict(c.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone())

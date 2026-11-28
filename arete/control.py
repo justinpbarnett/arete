@@ -149,8 +149,15 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
     env.pop(WORKER_ENV, None)
     env.pop(worker_lease.CLAIM_STDIN_ENV, None)
     claim_payload = b""
-    if command[:len(cli_prefix)] == cli_prefix and (kind := worker_kind(command[len(cli_prefix):])):
+    kind = ""
+    worker_args: list[str] = []
+    if command[:len(cli_prefix)] == cli_prefix:
         worker_args = command[len(cli_prefix):]
+        kind = worker_kind(worker_args)
+    elif engine_copy.is_adw_command(command):
+        worker_args = command[4:]
+        kind = "adw"
+    if kind:
         env[WORKER_ENV] = kind
         effective_run_id = run_id or _command_run_id(worker_args)
         if kind == "file-rule":
