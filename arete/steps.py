@@ -220,6 +220,16 @@ def check_reach(where: str, cfg: config.Config, role_info: config.Role, which: s
         raise ValueError(f"{where}: session 'resume' needs a kept session and {role} keeps none; use fresh")
 
 
+def _repo_name_for_layer(cfg: config.Config, layer: config.RepoLayer | None) -> str:
+    if layer is None or layer.dir == Path():
+        return ""
+    resolved = layer.dir.resolve()
+    for repo in cfg.repos:
+        if repo.layer_dir.resolve() == resolved:
+            return repo.name
+    return layer.dir.parent.name if layer.dir.name == ".agents" else layer.dir.name
+
+
 def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind: str = "",
             overrides: dict | None = None, inherited: dict | None = None, *,
             ticket: tuple[str, str] | None = None, side: str = "",
@@ -228,6 +238,9 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     if (role_info := config.ROLE_BY_NAME.get(role)) is None:
         raise ValueError(f"unknown step '{step}'; use {', '.join(config.STEP_NAMES)}")
     where = f"step {role}" + (f" for {kind} tickets" if kind else "")
+    repo_name = _repo_name_for_layer(cfg, layer)
+    if why := config.paused(cfg, repo=repo_name, role=role, kind=kind, layer=layer):
+        raise config.Paused(why)
     layer = layer or config.RepoLayer(dir=Path())
     ab_name = ab_side = ""
     arm = None
@@ -239,6 +252,8 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
         arm = test[1]["arm"] if ab_side == "arm" else None
     found = merged(cfg, layer, role, kind, config.step_table(overrides or {}, f"{where}: overrides"),
                    config.step_table(inherited or {}, f"{where}: overrides"), arm)
+    if why := config.paused(cfg, repo=repo_name, role=role, kind=kind, mcp=found["mcp"], layer=layer):
+        raise config.Paused(why)
     tier = ""
     entries: tuple[dict[str, str], ...] = ()
     if found.get("model"):
@@ -302,23 +317,33 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
 
 def check(cfg: config.Config, layer: config.RepoLayer | None = None, *, defer_tiers: bool = False) -> None:
     layer = layer or config.RepoLayer(dir=Path())
+    repo_name = _repo_name_for_layer(cfg, layer)
     deferred = defer_tiers and not (layer.tier_map or cfg.tier_map) and len(set(cfg.tiers) | set(layer.tiers)) > 1
-    if not deferred:
+    if not deferred and not config.paused(cfg, repo=repo_name, layer=layer):
         tier_map(cfg, layer)
     for kind in ("", *config.KINDS):
         for role in config.STEP_ROLES:
+            if config.paused(cfg, repo=repo_name, role=role, kind=kind, layer=layer):
+                continue
             if deferred:
                 found = merged(cfg, layer, role, kind, {})
                 if found.get("tier") and not found.get("model"):
                     continue
-            resolve(cfg, layer, role, kind)
+            try:
+                resolve(cfg, layer, role, kind)
+            except config.Paused:
+                continue
     tests = experiments(cfg, layer)
     config.ab_clash(tests)
     for name, test in tests.items():
         if deferred and "tier" in test["arm"] and "model" not in test["arm"]:
             continue
         for kind in (test["kind"],) if test["kind"] else ("", *config.KINDS):
+            if config.paused(cfg, repo=repo_name, role=test["step"], kind=kind, layer=layer):
+                continue
             try:
                 resolve(cfg, layer, test["step"], kind, side="arm")
+            except config.Paused:
+                continue
             except ValueError as e:
                 raise ValueError(f"[ab.{name}]: {e}") from None
