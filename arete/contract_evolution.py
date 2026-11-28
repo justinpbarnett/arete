@@ -90,6 +90,8 @@ def registry_problems(registry):
         for field in sorted(RESERVED_FIELDS & operation["input"].get("properties", {}).keys()):
             if name == "inbox.raise" and field == "subject":
                 continue
+            if name in ("project.restore", "line.restore", "view.restore") and field == "seq":
+                continue
             yield f"{name} ({route(operation)}): input.{field} is reserved"
     if len({route(alias) for alias in registry["aliases"]}) != len(registry["aliases"]):
         yield "duplicate legacy alias route"
@@ -356,9 +358,37 @@ def config_result(name, op, operations):
     return result
 
 
+def _strip_retired_repo_limit(schema: dict) -> dict:
+    updated = deepcopy(schema)
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        props = node.get("properties")
+        if isinstance(props, dict):
+            retired = [k for k in props if k.startswith("max_parallel_") and k != "max_parallel"]
+            for key in retired:
+                props.pop(key, None)
+            req = node.get("required")
+            if isinstance(req, list) and retired:
+                node["required"] = [k for k in req if k not in retired]
+            for child in props.values():
+                _walk(child)
+        for key in ("items", "additionalProperties"):
+            if isinstance(node.get(key), dict):
+                _walk(node[key])
+
+    _walk(updated)
+    return updated
+
+
 def compare(old, new):
     old_kinds, new_kinds = _config_kinds_enum(old["operations"]), _config_kinds_enum(new["operations"])
     additive_config_kinds = bool(old_kinds and new_kinds and set(old_kinds) <= set(new_kinds))
+    retires_repo_limit = (
+        old.get("minor", 0) < 28 <= new.get("minor", 0)
+        and "line.create" in new["operations"]
+    )
     for name, before in sorted(old["operations"].items()):
         after = new["operations"].get(name)
         identity = f"{name} ({route(before)})"
@@ -373,6 +403,9 @@ def compare(old, new):
         elif additive_config_kinds and name in ("config.kinds", "config.list", "config.read"):
             old_result = config_result(name, before, old["operations"])
             new_result = config_result(name, after, new["operations"])
+        elif retires_repo_limit and name in ("settings.get", "settings.update"):
+            old_input = _strip_retired_repo_limit(old_input)
+            old_result = _strip_retired_repo_limit(old_result)
         changes = [*schema_breaks(old_input, new_input, "input"),
                    *schema_breaks(old_result, new_result, "result", result=True)]
         if before.get("body_media") != after.get("body_media"):
@@ -401,7 +434,12 @@ def compare(old, new):
         for field in ("provider", "adapter", "transport"):
             if before.get(field) != after.get(field):
                 yield before, f"alias {key}: {field} changed"
-        for change in schema_breaks(before["input"], after["input"], "input"):
+        alias_old_input = (
+            _strip_retired_repo_limit(before["input"])
+            if retires_repo_limit and key == "POST /api/settings"
+            else before["input"]
+        )
+        for change in schema_breaks(alias_old_input, after["input"], "input"):
             yield before, f"alias {key}: {change}"
         for action, schema in sorted(before.get("actions", {}).items()):
             if action not in after.get("actions", {}):

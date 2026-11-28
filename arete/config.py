@@ -448,7 +448,6 @@ class Config:
     miner_lookback_hours: float = 24
     miner_max_digest_chars: int = 90_000
     max_parallel: int = 1
-    max_parallel_per_repo: int = 1
     max_parallel_checks: int = 2
     dashboard_port: int = paths.DASHBOARD_PORT
     server_url: str = ""
@@ -559,8 +558,7 @@ def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
 
 
 def remove_controller_only_settings(data: dict) -> None:
-    for name in ("max_parallel", "max_parallel_per_repo"):
-        data.pop(name, None)
+    data.pop("max_parallel", None)
     if "jev" in data:
         for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
             data["jev"].pop(name, None)
@@ -1508,7 +1506,6 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         miner_lookback_hours=float(data.get("miner", {}).get("lookback_hours", 24)),
         miner_max_digest_chars=int(data.get("miner", {}).get("max_digest_chars", 90_000)),
         max_parallel=max(1, int(data.get("max_parallel", 1))),
-        max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
         server_url=server_url(data),

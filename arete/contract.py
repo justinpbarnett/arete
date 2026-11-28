@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 27
+MINOR = 28
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -127,7 +127,7 @@ RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "fini
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
             "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
             "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
-            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "task", "issue_key")
+            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "task", "issue_key", "line")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
                "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id", "task_id")
 RUN_STEP_SUMMARY = obj({
@@ -173,11 +173,62 @@ CHAT = obj({"id": INTEGER, **dict.fromkeys(("title", "project", "created", "upda
               "cost": NUMBER, "paid_usd": {"type": ["number", "null"]}, "ts": STRING}))}, ["id", "title"])
 HOOK_EVENT = obj({**dict.fromkeys(("ts", "hook", "kind", "cls", "detail", "error"), STRING),
                   **dict.fromkeys(("tool", "cwd", "session"), JSON), "agent": BOOLEAN}, ["ts", "kind", "cls"])
+PROJECT = obj({
+    "id": STRING,
+    "name": STRING,
+    "github": STRING,
+    "path": STRING,
+    "repo": STRING,
+    "priority": NULL_INT,
+    "rank": NULL_NUM,
+    "archived": BOOLEAN,
+    "version": INTEGER,
+    "created": STRING,
+    "updated": STRING,
+}, ["id", "name", "github", "path"])
+LINE = obj({
+    "id": STRING,
+    "kind": STRING,
+    "repo": STRING,
+    "enabled": BOOLEAN,
+    "project": STRING,
+    "name": STRING,
+    "adw_route": STRING,
+    "device_pool": array(STRING),
+    "rank": NULL_NUM,
+    "concurrency": INTEGER,
+    "wip_limit": NULL_INT,
+    "priority": NULL_INT,
+    "paused": BOOLEAN,
+    "paused_why": STRING,
+    "band": mapping(array(NUMBER)),
+    "archived": BOOLEAN,
+    "version": INTEGER,
+    "created": STRING,
+    "updated": STRING,
+}, ["id", "kind", "repo", "enabled"])
+VIEW = obj({
+    "id": STRING,
+    "label": STRING,
+    "data": mapping(JSON),
+    "name": STRING,
+    "project": NULL_TEXT,
+    "filter": STRING,
+    "filter_sql": STRING,
+    "group_by": STRING,
+    "sort": STRING,
+    "layout": STRING,
+    "columns": array(STRING),
+    "rank": NULL_NUM,
+    "version": INTEGER,
+    "created": STRING,
+    "updated": STRING,
+}, ["id", "label"])
 RESOURCE = {
     "task": TASK, "run": RUN,
-    "project": obj(dict.fromkeys(("id", "name", "github", "path"), STRING)),
-    "line": obj({"id": STRING, "kind": STRING, "repo": STRING, "enabled": BOOLEAN}),
-    "view": obj({"id": STRING, "label": STRING, "data": mapping(JSON)}, ["id", "label"]),
+    "project": PROJECT,
+    "line": LINE,
+    "view": VIEW,
     "step": obj({"id": INTEGER, "run_id": STRING, "name": STRING, "model": STRING, "runner": STRING,
                  "cost_usd": NUMBER, "seconds": NUMBER,
                  "settings_sha": NULL_TEXT,
@@ -241,6 +292,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("secret_internal", 409, "This secret is managed by its owning service."),
     ("already_resolved", 409, "This inbox item is already resolved."),
     ("still_missing", 409, "The required secret is still missing."),
+    ("line_in_use", 409, "The line is still referenced or is the last active pipeline line."),
+    ("incompatible_writers", 409, "Incompatible writers are still active; wait for them to drain or upgrade before retrying."),
     ("validation", 422, "The request failed domain validation."),
     ("gate_refused", 403, "The owner refused the pending presence request."),
     ("presence_expired", 409, "The presence approval expired before it was approved."),
@@ -265,11 +318,12 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else (
-        "task:write" if noun in ("comment", "task_ref", "task_link") else f"{noun}:write"
+        "task:write" if noun in ("comment", "task_ref", "task_link", "project", "line", "view") else f"{noun}:write"
     )
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "secret_internal", "already_resolved", "still_missing", "validation",
-                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired", "files_purged"}
+                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired", "files_purged",
+                       "line_in_use", "incompatible_writers"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
@@ -395,12 +449,19 @@ for _error in ERRORS:
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
                 "files_purged": {"purged_at": STRING},
+                "line_in_use": {"blockers": array(JSON)},
+                "incompatible_writers": {"blockers": array(STRING), "retry_guidance": STRING},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
                             "code": {"type": "string", "enum": [_code]}, **_details})
     if _code in ("forbidden", "conflict"):
         _error["schema"]["required"].remove("reason")
+    if _code == "line_in_use":
+        _error["schema"]["required"].remove("blockers")
+    if _code == "incompatible_writers":
+        _error["schema"]["required"].remove("blockers")
+        _error["schema"]["required"].remove("retry_guidance")
     if _code == "invalid_state":
         _error["schema"]["required"].remove("current")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
@@ -445,7 +506,6 @@ RESOLVED_SETTINGS = envelope({
 }, ["seq", "values", "levels", "config_commit"])
 SETTINGS_VALUES = obj({
     "max_parallel": INTEGER,
-    "max_parallel_per_repo": INTEGER,
     "parallel_max": INTEGER,
     "aliases": array(STRING),
     "models": mapping(STRING),
@@ -454,7 +514,6 @@ SETTINGS_VALUES = obj({
 })
 SETTINGS = obj({
     "max_parallel": INTEGER,
-    "max_parallel_per_repo": INTEGER,
     "parallel_max": INTEGER,
     "aliases": array(STRING),
     "models": mapping(STRING),
@@ -462,7 +521,7 @@ SETTINGS = obj({
     "version": INTEGER,
     "values": SETTINGS_VALUES,
     "roles": array(ROLE_VIEW),
-}, ["max_parallel", "max_parallel_per_repo", "parallel_max", "aliases", "models", "defaults"])
+}, ["max_parallel", "parallel_max", "aliases", "models", "defaults"])
 NORMAL_ROLE_PATCH = obj({
     "role": ROLE_ENUM,
     "runner": NULL_TEXT,
@@ -476,7 +535,6 @@ RESTORE_ROLE_PATCH = obj({
 ROLE_PATCH = {"anyOf": [NORMAL_ROLE_PATCH, RESTORE_ROLE_PATCH]}
 SETTINGS_PATCH_VALUES = obj({
     "max_parallel": {"type": ["integer", "string"]},
-    "max_parallel_per_repo": {"type": ["integer", "string"]},
     "models": mapping(STRING),
     "roles": array(ROLE_PATCH),
 }, [], additional=False)
@@ -529,18 +587,26 @@ OPERATIONS = [operation("meta.get", "meta", META),
                         obj({"name": STRING}), {"name": "example"}),
               operation("error.list", "errors", envelope({"errors": array(ERROR)})),
               operation("screen.get", "screen", envelope({"sidebar": SIDEBAR, "asks": obj({"asks": array(ASK)}),
-                        "view": mapping(JSON)}), obj({"view": STRING, "id": STRING}, []))]
+                        "view": mapping(JSON)}),
+                        obj({"view": STRING, "id": STRING, "project": STRING,
+                             "include_archived": {**BOOLEAN, "default": False}}, []))]
 PLURALS = {name: name + "s" for name in RESOURCE}
 PLURALS.update(research="research", triage="triage")
 for _name, _shape in RESOURCE.items():
     _plural = PLURALS[_name]
     _selectors = {"run": STRING} if _name == "step" else {}
+    _list_inputs = (
+        obj({"view": STRING}, []) if _name == "task"
+        else obj({"project": STRING, "include_archived": {**BOOLEAN, "default": False}}, []) if _name == "line"
+        else obj({"project": STRING}, []) if _name == "view"
+        else obj(_selectors, list(_selectors))
+    )
     _get_envelope = (
         envelope({_name: _shape, "steps": array(RUN_STEP_SUMMARY)}, ["seq", _name])
         if _name == "run" else envelope({_name: _shape})
     )
     OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
-                             obj(_selectors, list(_selectors)), dict.fromkeys(_selectors, "example")),
+                             _list_inputs, dict.fromkeys(_selectors, "example")),
                    operation(f"{_name}.get", _plural + "/{id}", _get_envelope,
                              obj({"id": STRING, **_selectors}), {"id": "example", **dict.fromkeys(_selectors, "example")})]
 CONFIG_KIND = {"type": "string", "enum": list(configkinds.REGISTRY)}
@@ -1101,6 +1167,131 @@ OPERATIONS += [
               obj({}, []),
               {}, "POST"),
 ]
+
+
+def command_result(data_schema, extra=None, extra_required=()):
+    props = {
+        "data": data_schema,
+        "event_seq": NULL_TEXT,
+        "subject": STRING,
+        "ver": INTEGER,
+        "vers": mapping(INTEGER),
+        "replayed": BOOLEAN,
+        **(extra or {}),
+    }
+    req = ["seq", "data", "event_seq", "subject", "ver", "vers", "replayed", *extra_required]
+    return envelope(props, req)
+
+
+ENTITY_HISTORY_EVENT = obj({
+    "seq": INTEGER,
+    "id": STRING,
+    "at": STRING,
+    "actor": STRING,
+    "actor_name": NULL_TEXT,
+    "ver": NULL_INT,
+    "data": mapping(JSON),
+}, ["seq", "at", "actor", "ver", "data"])
+BOOL_OR_INT = {"type": ["boolean", "integer"]}
+BASE_VERSION = {**INTEGER, "minimum": 1}
+SEQ_POS = {**INTEGER, "minimum": 1}
+
+OPERATIONS += [
+    operation(
+        "project.create", "projects", command_result(PROJECT),
+        obj({"id": STRING, "name": STRING, "repo": STRING, "priority": NULL_INT, "rank": NULL_NUM,
+             "archived": BOOL_OR_INT}, ["id", "name"]),
+        {"id": "demo-project", "name": "Demo Project"}, "POST",
+        errors=("validation",), success_status=201,
+    ),
+    operation(
+        "project.update", "projects/{project}", command_result(PROJECT),
+        obj({"project": STRING, "base_version": BASE_VERSION, "name": STRING, "repo": STRING,
+             "priority": NULL_INT, "rank": NULL_NUM, "archived": BOOL_OR_INT}, ["project", "base_version"]),
+        {"project": "replay-sample", "base_version": 1, "name": "Replay Sample"}, "PATCH",
+        errors=("validation",),
+    ),
+    operation(
+        "project.restore", "projects/{project}/restore", command_result(PROJECT),
+        obj({"project": STRING, "seq": SEQ_POS, "base_version": BASE_VERSION}, ["project", "seq", "base_version"]),
+        {"project": "replay-sample", "seq": 1, "base_version": 2}, "POST",
+        errors=("validation",),
+    ),
+    operation(
+        "project.history", "projects/{project}/history",
+        envelope({"events": array(ENTITY_HISTORY_EVENT), "next_after": NULL_INT}, ["seq", "events"]),
+        obj({"project": STRING, "limit": STRING, "after": STRING}, ["project"]),
+        {"project": "replay-sample"},
+    ),
+    operation(
+        "line.create", "lines", command_result(LINE),
+        obj({"id": STRING, "project": STRING, "name": STRING, "kind": STRING, "repo": STRING,
+             "adw_route": STRING, "device_pool": array(STRING), "rank": NULL_NUM,
+             "concurrency": INTEGER, "wip_limit": NULL_INT, "priority": NULL_INT,
+             "paused": BOOL_OR_INT, "paused_why": STRING, "band": mapping(JSON)},
+            ["id", "project", "name", "kind", "repo"]),
+        {"id": "demo-secondary", "project": "replay-sample", "name": "Secondary", "kind": "pipeline",
+         "repo": "replay-sample"}, "POST",
+        errors=("validation",), success_status=201,
+    ),
+    operation(
+        "line.update", "lines/{line}", command_result(LINE),
+        obj({"line": STRING, "base_version": BASE_VERSION, "project": STRING, "name": STRING,
+             "kind": STRING, "repo": STRING, "adw_route": STRING, "device_pool": array(STRING),
+             "rank": NULL_NUM, "concurrency": INTEGER, "wip_limit": NULL_INT, "priority": NULL_INT,
+             "paused": BOOL_OR_INT, "paused_why": STRING, "band": mapping(JSON)},
+            ["line", "base_version"]),
+        {"line": "replay-sample-pipeline", "base_version": 1, "wip_limit": 3}, "PATCH",
+        errors=("validation", "invalid_state"),
+    ),
+    operation(
+        "line.restore", "lines/{line}/restore", command_result(LINE),
+        obj({"line": STRING, "seq": SEQ_POS, "base_version": BASE_VERSION}, ["line", "seq", "base_version"]),
+        {"line": "replay-sample-pipeline", "seq": 1, "base_version": 2}, "POST",
+        errors=("validation",),
+    ),
+    operation(
+        "line.history", "lines/{line}/history",
+        envelope({"events": array(ENTITY_HISTORY_EVENT), "next_after": NULL_INT}, ["seq", "events"]),
+        obj({"line": STRING, "limit": STRING, "after": STRING}, ["line"]),
+        {"line": "replay-sample-pipeline"},
+    ),
+    operation(
+        "line.delete", "lines/{line}",
+        command_result(LINE, {"pre_removal_seq": NULL_INT}, ("pre_removal_seq",)),
+        obj({"line": STRING, "base_version": BASE_VERSION}, ["line", "base_version"]),
+        {"line": "demo-secondary", "base_version": 1}, "DELETE",
+        errors=("validation", "line_in_use", "incompatible_writers"),
+    ),
+    operation(
+        "view.create", "views", command_result(VIEW),
+        obj({"id": STRING, "name": STRING, "project": NULL_TEXT, "filter": STRING,
+             "group_by": STRING, "sort": STRING, "layout": STRING, "columns": array(STRING),
+             "rank": NULL_NUM}, ["id", "name"]),
+        {"id": "ready-view", "name": "Ready", "filter": "state = ready"}, "POST",
+        errors=("validation",), success_status=201,
+    ),
+    operation(
+        "view.update", "views/{view}", command_result(VIEW),
+        obj({"view": STRING, "base_version": BASE_VERSION, "name": STRING, "project": NULL_TEXT,
+             "filter": STRING, "group_by": STRING, "sort": STRING, "layout": STRING,
+             "columns": array(STRING), "rank": NULL_NUM}, ["view", "base_version"]),
+        {"view": "ready-view", "base_version": 1, "name": "Ready Tasks"}, "PATCH",
+        errors=("validation",),
+    ),
+    operation(
+        "view.restore", "views/{view}/restore", command_result(VIEW),
+        obj({"view": STRING, "seq": SEQ_POS, "base_version": BASE_VERSION}, ["view", "seq", "base_version"]),
+        {"view": "ready-view", "seq": 1, "base_version": 2}, "POST",
+        errors=("validation",),
+    ),
+    operation(
+        "view.history", "views/{view}/history",
+        envelope({"events": array(ENTITY_HISTORY_EVENT), "next_after": NULL_INT}, ["seq", "events"]),
+        obj({"view": STRING, "limit": STRING, "after": STRING}, ["view"]),
+        {"view": "ready-view"},
+    ),
+]
 for _op in OPERATIONS:
     if _op["name"] in ("run.stop", "serve.install"):
         optional = {"pid", "was", "ticket", "said"}
@@ -1235,7 +1426,7 @@ SESSION_INPUT = fields("prompt device model runner tools repo budget_usd")
 ALIAS_INPUTS = {
     "post_task": fields("repo prompt title kind ticket force"),
     "post_usage": BY_NAME["usage.record"]["input"],
-    "post_settings": obj({"max_parallel": JSON, "max_parallel_per_repo": JSON,
+    "post_settings": obj({"max_parallel": JSON,
                           "models": {**mapping(STRING), "type": ["object", "null"]},
                           "base_version": INTEGER}, []),
     "post_capture": fields("kind text expected actual steps"),
@@ -1372,7 +1563,7 @@ ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter":
 
 
 def complete_examples():
-    instances = {"task": "T-1", "project": "replay-sample", "line": "replay-sample", "view": "live",
+    instances = {"task": "T-1", "project": "replay-sample", "line": "replay-sample-pipeline", "view": "ready-view",
                  "run": "pip-demo-1", "step": "1", "loop": "poll", "incident": "1",
                  "triage": "demo#7", "research": "demo#7", "chat": "1"}
     for name, identity in instances.items():

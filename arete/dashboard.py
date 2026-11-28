@@ -666,6 +666,8 @@ class Handler(BaseHTTPRequestHandler):
             if row and row["status"]:
                 self.idempotent_replayed = True
                 result = json.loads(row["response"])
+                if isinstance(result, dict) and "replayed" in result:
+                    result["replayed"] = True
                 if (row["status"] == 201 and isinstance(result, dict) and isinstance(result.get("run"), dict)
                         and result["run"].get("id")):
                     self.location = f"/api/v1/runs/{quote(str(result['run']['id']), safe='')}"

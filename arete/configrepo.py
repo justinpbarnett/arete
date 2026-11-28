@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import tomllib
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -457,6 +458,8 @@ def _write_atomic_bytes(target: Path, data: bytes, mode: int | None = None) -> N
 
 @contextmanager
 def instance_fence():
+    if foundation.in_write():
+        raise ConfigRepoError("cannot acquire instance fence inside a SQLite write transaction")
     if _ACTIVE_FENCE.get() is not None:
         raise RuntimeError("instance fence is already held in this context; pass the existing fence instead of reacquiring")
     with util.lock(INSTANCE_LOCK, wait=True):
@@ -466,6 +469,19 @@ def instance_fence():
             yield fence
         finally:
             _ACTIVE_FENCE.reset(tok)
+
+
+def current_fence() -> Fence | None:
+    return _ACTIVE_FENCE.get()
+
+
+@contextmanager
+def maybe_instance_fence():
+    if (existing := _ACTIVE_FENCE.get()) is not None:
+        yield existing
+        return
+    with instance_fence() as owned:
+        yield owned
 
 
 def _verify_fence(fence: Fence | None) -> Fence | None:
@@ -973,10 +989,48 @@ def _status_paths(root: Path) -> list[str]:
     return sorted(dict.fromkeys(out))
 
 
+_PUBLICATION_VALIDATORS: dict[str, Callable[[dict[str, bytes | None], Path], None]] = {}
+
+
+def register_publication_validator(name: str, fn: Callable[[dict[str, bytes | None], Path], None]) -> None:
+    _PUBLICATION_VALIDATORS[name] = fn
+
+
+def unregister_publication_validator(name: str) -> None:
+    _PUBLICATION_VALIDATORS.pop(name, None)
+
+
+def live_tree_files(root: Path | None = None) -> dict[str, bytes]:
+    target = _root() if root is None else root
+    if not is_repo(target) or not live_sha(target):
+        return {}
+    ref = branch_name(target)
+    done = _git(["ls-tree", "-r", "-z", "--name-only", ref], target, check=False, text=False)
+    if done.returncode != 0:
+        raise ConfigRepoError(f"cannot list live config tree at {ref}")
+    out: dict[str, bytes] = {}
+    for entry in done.stdout.split(b"\0"):
+        if not entry:
+            continue
+        rel = entry.decode("utf-8", errors="replace")
+        if rel == ".gitignore" or _is_secret_rel(rel):
+            continue
+        blob = _git(["cat-file", "blob", f"{ref}:{rel}"], target, check=False, text=False)
+        if blob.returncode != 0:
+            raise ConfigRepoError(f"cannot read live config blob {ref}:{rel}")
+        out[rel] = blob.stdout
+    return out
+
+
 def _commit_files_locked(root: Path, changes: dict[str, bytes | None], actor: str, source: str, *,
                          run_id: str = "", idem: str = "", note: str = "", draft_id: str = "",
                          activate_c: bool = False, fence: Fence,
                          modes: dict[str, int] | None = None, write_files: bool = True) -> str:
+    from . import lines as lines_mod
+
+    lines_mod.validate_config_line_references(changes, root)
+    for validator in tuple(_PUBLICATION_VALIDATORS.values()):
+        validator(changes, root)
     paths_sorted = sorted(changes)
     old_blobs = {rel: _live_blob(root, rel) for rel in paths_sorted}
     previous_working: dict[str, bytes | None] = {}

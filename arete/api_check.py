@@ -565,7 +565,20 @@ class Check:
         cohorts.declare("example", replay.SAMPLE_REPO, "fixture", "single known task", tickets=[self.task],
                         closes="2099-01-01T00:00:00Z", hours=24)
         from . import drafts as drafts_mod
+        from . import lines as lines_mod
 
+        lines_mod.ensure(config.load())
+        with principals.acting(principals.owner() or "hand"):
+            if lines_mod.get_line(f"{replay.SAMPLE_REPO}-pipeline") is None:
+                lines_mod.create_line({
+                    "id": f"{replay.SAMPLE_REPO}-pipeline",
+                    "project": replay.SAMPLE_REPO,
+                    "name": replay.SAMPLE_REPO,
+                    "kind": "pipeline",
+                    "repo": replay.SAMPLE_REPO,
+                })
+            if lines_mod.get_view("fixture-view") is None:
+                lines_mod.create_view({"id": "fixture-view", "name": "Fixture View", "filter": "state = ready"})
         cur_cfg_text = paths.CONFIG_FILE.read_text()
         alt_cfg_text = cur_cfg_text.replace("max_parallel = 3", "max_parallel = 4", 1)
         if alt_cfg_text == cur_cfg_text:
@@ -578,7 +591,8 @@ class Check:
                       "n": "1", "ticket": send_ticket.ref, "ref": fixture_ref_link["ref"],
                       "link": str(fixture_link["id"]), "comment": str(fixture_comment["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
-                      "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll",
+                      "project": replay.SAMPLE_REPO, "line": f"{replay.SAMPLE_REPO}-pipeline", "view": "fixture-view",
+                      "loop": "poll",
                       "token": fixture_token["id"], "principal": f"client:{fixture_token['id']}",
                       "item": fixture_item["id"], "subscription": f"PS-{sub_id}", "sha256": fixture_sha,
                       "device": "local", "lease": fixture_lease.label, "draft": draft_for_discard["id"]}
@@ -588,6 +602,7 @@ class Check:
             resource = name.partition(".")[0]
             ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
+                      "line": "demo-secondary" if name == "line.delete" else identities["line"],
                       "chat": (str(chat_for_file) if name == "chat.file"
                                else str(chat_for_send) if name in ("chat.send", "chat.session_start")
                                else identities["chat"]),
@@ -601,6 +616,17 @@ class Check:
                 values["run"] = self.run
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
+                values["base_version"] = row["version"]
+            if name in ("project.update", "line.update", "view.update"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                values["base_version"] = row["version"]
+            if name in ("project.restore", "line.restore", "view.restore"):
+                row = self.read(f"/api/v1/{resource}s/{identities[resource]}")[resource]
+                hist = self.read(f"/api/v1/{resource}s/{identities[resource]}/history")["events"]
+                values["base_version"] = row["version"]
+                values["seq"] = hist[0]["seq"]
+            if name == "line.delete":
+                row = self.read("/api/v1/lines/demo-secondary")["line"]
                 values["base_version"] = row["version"]
             if name == "comment.update":
                 values["base_version"] = fixture_comment["version"]
@@ -805,7 +831,7 @@ def worker(lifeline):
             codebase.load()
             children = []
 
-            def spawn(repo, tid, force=False, *, run_id=""):
+            def spawn(repo, tid, force=False, *, run_id="", line=""):
                 entry = "from arete.api_check import fixture_child; fixture_child(*sys.argv[1:])"
                 child = control.launch(child_command(SOURCE, entry, repo, str(tid), run_id), start_new_session=False)
                 children.append(child)
