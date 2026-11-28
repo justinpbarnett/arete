@@ -586,7 +586,7 @@ class JiraTracker:
         approved_comments = trusted(me, approved_at, self.client.comments(tid))
         comments = [((c.get("author") or {}).get("displayName", "someone"), c.get("created", ""), c.get("body") or "")
                     for c in approved_comments]
-        directed = [text for c, text in zip(approved_comments, comments)
+        directed = [text for c, text in zip(approved_comments, comments, strict=True)
                     if not c.get("updateAuthor") or (c["updateAuthor"].get("accountId") == me)
                     or approved_at and jira.parse_time(c.get("updated") or c["created"]) <= approved_at]
         owner_comments = scope_comments(directed)
@@ -762,7 +762,7 @@ class LocalTracker:
             raise TaskError(f"no task {tid}")
         history = tasks_store.task_comments(tid)
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "") for c in history]
-        directed = [text for c, text in zip(history, comments) if c["author"] != "arete" and principals.is_person(c["author"])]
+        directed = [text for c, text in zip(history, comments, strict=True) if c["author"] != "arete" and principals.is_person(c["author"])]
         blocker_kind = ""
         if row["repo"] != self.repo.name:
             blocker = f"it is a task of {row['repo']}, not {self.repo.name}"

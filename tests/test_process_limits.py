@@ -23,7 +23,6 @@ from unittest.mock import Mock, call, patch
 
 from adws import feature
 from arete import (
-    ci,
     codebase,
     config,
     control,
@@ -1207,9 +1206,9 @@ class OrchestrationLineageTests(Isolated):
                 raise OSError("interrupted after append")
             return line
 
-        with patch.object(run_lines, "write", side_effect=interrupt_after_write):
-            with self.assertRaisesRegex(OSError, "interrupted after append"):
-                resumed.prepare()
+        with (patch.object(run_lines, "write", side_effect=interrupt_after_write),
+              self.assertRaisesRegex(OSError, "interrupted after append")):
+            resumed.prepare()
         audit, = self.audits(resumed)
         pending = ledger.snapshot(resumed.lease)["data"]["lineage_event"]
         self.assertEqual(pending["run"], resumed.run.id)
@@ -1336,9 +1335,9 @@ class OrchestrationLineageTests(Isolated):
                 record.move(prior.run.id, "interrupted", ("running",))
                 resumed = self.controller(prior.run.id)
                 with (patch.dict(OPERATIONS, {"run.wait": replace(wait, description="Updated wait")}),
-                      patch.object(delegation, "live", side_effect=lambda pid, identity: (pid, identity) == (123, 456))):
-                    with self.assertRaisesRegex(factory.Refused, f"operations_sha changed .*{reason}"):
-                        resumed.prepare()
+                      patch.object(delegation, "live", side_effect=lambda pid, identity: (pid, identity) == (123, 456)),
+                      self.assertRaisesRegex(factory.Refused, f"operations_sha changed .*{reason}")):
+                    resumed.prepare()
                 self.assertEqual(ledger.snapshot(resumed.lease)["data"]["operations_sha"], prior.data["operations_sha"])
                 stored = ledger.pending(resumed.lease) if state == "pending" else ledger.actions(resumed.lease)
                 self.assertEqual(stored[0]["state"], state)
@@ -1622,8 +1621,8 @@ class PolicyRestartLineageTests(Isolated):
 
         with (patch.object(controller, "atomic", side_effect=atomic),
               patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: controller.run.settings(roles[0]))):
-            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "model:verify:0", "effort": "low"},
-                                                     {"route_id": "review", "effort": "low"})):
+            for (op, _gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "model:verify:0", "effort": "low"},
+                                                      {"route_id": "review", "effort": "low"}), strict=True):
                 done = self.action(controller, op, args)
                 self.assertIsNone(controller.dispatch(done))
         return atomic_calls
@@ -1957,7 +1956,7 @@ class OrchestrationRecoveryFixture(Isolated):
         self.assertNotIn(action, self.producers)
         worker = SimpleNamespace(pid=123, identity=456, action=action, step=request["step"], deadline=float("inf"),
                                  cwd=Path(request["cwd"]), request=request, allow=Mock(), close=Mock(),
-                                 observations=lambda: {}, report=(0, {}), proc=SimpleNamespace(poll=lambda: None))
+                                 observations=dict, report=(0, {}), proc=SimpleNamespace(poll=lambda: None))
         worker.receipts = [{"event": "launch", "step": worker.step, "role": request["role"], "route": {}}]
 
         def receive():
@@ -2301,7 +2300,7 @@ class DependentWorkerRerunTests(OrchestrationRecoveryFixture):
         c.close()
         queued = self.receipt(c, dependent)
         self.assertTrue(ledger.queued_start(queued))
-        for selected, (op, role) in zip(originals, ops):
+        for selected, (op, role) in zip(originals, ops, strict=True):
             for standalone in (True, False):
                 with self.subTest(op=op, standalone=standalone):
                     c = self.restart(c)
@@ -3224,7 +3223,7 @@ class BudgetTests(Isolated):
         def drive(flow):
             budget = flow.ctx.run.budget
             observed.append((budget.prior_repairs, budget.prior_seconds, budget.verify_seconds,
-                             list(budget.charged.values())[0]["repair_calls"]))
+                             next(iter(budget.charged.values()))["repair_calls"]))
             return "pr", "fixture verified", url
 
         for number, sha in zip((42, 42, 43), (digit * 40 for digit in "bcd"), strict=True):
@@ -3938,9 +3937,9 @@ class OwnerAnswerBudgetFixture(PollFixture):
     def expired_question(self):
         with patch.object(util, "now", return_value=datetime(2026, 1, 1, tzinfo=UTC)):
             first, asked = self.spent_question(structured=True)
-        with patch.object(util, "now", return_value=datetime(2026, 1, 2, tzinfo=UTC)):
-            with principals.acting(principals.seed_owner("fixture@example.test")):
-                tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
+        with (patch.object(util, "now", return_value=datetime(2026, 1, 2, tzinfo=UTC)),
+              principals.acting(principals.seed_owner("fixture@example.test"))):
+            tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
         with patch.object(util, "now", return_value=datetime(2026, 1, 15, tzinfo=UTC)), \
                 patch.object(config, "load", return_value=self.cfg), \
                 patch.object(tasks, "kept_folder_removed", return_value=workspace.Release("removed")):
@@ -4977,12 +4976,12 @@ class RepairVerificationSelectionTests(RepairWorkflowFixture):
         unapproved_name = "echo unapproved"
         invalid_class = "fixture.Test; echo unapproved"
         findings = [
-            dict(problem="Immediate read shows an old value.", verification="check", check=unapproved_name,
-                 acceptance="Read the saved value after rollback."),
-            dict(problem="After a second rollback the revision is wrong.", verification="check", check="classes",
-                 test_class=invalid_class),
-            dict(problem="Live view keeps an obsolete value.", verification="in_use",
-                 verification_reason="Needs the deployed view.", acceptance=acceptance),
+            {"problem": "Immediate read shows an old value.", "verification": "check", "check": unapproved_name,
+                 "acceptance": "Read the saved value after rollback."},
+            {"problem": "After a second rollback the revision is wrong.", "verification": "check", "check": "classes",
+                 "test_class": invalid_class},
+            {"problem": "Live view keeps an obsolete value.", "verification": "in_use",
+                 "verification_reason": "Needs the deployed view.", "acceptance": acceptance},
         ]
         review = pipeline.Review.judged({"problems": [dict(p, severity="blocker") for p in findings]}, [], [], {})
         b = self.controller.job.b
@@ -4991,8 +4990,8 @@ class RepairVerificationSelectionTests(RepairWorkflowFixture):
         def select_regressions(step, _prompt, where, *, role, read_only, **_kw):
             self.assertEqual((step, where, role, read_only), ("review_selectors", self.wt, "review", True))
             return Result(True, structured={"selectors": [
-                dict(id="review-receipt:B1", verification="check", check=unapproved_name),
-                dict(id="review-receipt:B2", verification="check", check="classes", test_class=invalid_class),
+                {"id": "review-receipt:B1", "verification": "check", "check": unapproved_name},
+                {"id": "review-receipt:B2", "verification": "check", "check": "classes", "test_class": invalid_class},
             ]})
 
         with (patch.object(self.run_fixture, "agent", side_effect=select_regressions) as selector,
@@ -6501,7 +6500,7 @@ class EnvironmentRequeueTests(Isolated):
                     version = ledger.snapshot(lease)["version"]
                     accepted = ledger.accept(lease, turn, version,
                                              {"calls": [{"op": op, "args": {}} for op, _, _ in actions]}, 10)
-                    for action, (_, state, result) in zip(accepted, actions):
+                    for action, (_, state, result) in zip(accepted, actions, strict=True):
                         ledger.transition(lease, action["id"], state, result)
                     controller.perform({"op": "run.finish", "request": {"reason": "failed"}})
                     return controller.ending

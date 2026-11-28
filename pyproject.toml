@@ -24,6 +24,73 @@ wheel-exclude = ["arete/durable/node_modules/**"]
 
 [tool.ruff]
 line-length = 120
+target-version = "py313"
 
 [tool.ruff.lint]
+select = [
+    "E4",      # import errors
+    "E7",      # statement errors
+    "E9",      # runtime syntax/IO errors
+    "F",       # Pyflakes (unused imports/vars, undefined names)
+    "W",       # pycodestyle warnings
+    "B",       # flake8-bugbear (B006 mutable defaults, B007 unused loop vars, B023 closures, B904/B905/B911)
+    "ANN401",  # disallow typing.Any in annotations
+    "C4",      # flake8-comprehensions
+    "ISC",     # implicit string concatenation pitfalls
+    "PIE",     # flake8-pie common bugs and smells
+    "UP",      # pyupgrade for Python 3.13+
+    "T10",     # disallow leftover debugger statements (breakpoint(), pdb)
+    "SIM103",  # needless bool return
+    "SIM105",  # use contextlib.suppress
+    "SIM117",  # combine nested with statements
+    "SIM905",  # static str.split()
+    "RUF006",  # asyncio dangling task
+    "RUF010",  # explicit f-string conversion flag
+    "RUF012",  # mutable class attribute defaults
+    "RUF013",  # implicit Optional
+    "RUF015",  # unnecessary iterable allocation for first element
+    "RUF019",  # unnecessary key check before dict.get
+    "RUF024",  # mutable object passed to dict.fromkeys
+    "RUF034",  # useless if-else with identical arms
+    # Security rules (Bandit / S)
+    "S102",    # disallow exec()
+    "S103",    # disallow permissive chmod
+    "S108",    # flag hardcoded /tmp paths
+    "S110",    # disallow bare try-except-pass
+    "S301",    # disallow pickle
+    "S303",    # disallow insecure hash functions
+    "S304",    # disallow insecure ciphers
+    "S305",    # disallow insecure cipher modes
+    "S306",    # disallow tempfile.mktemp
+    "S307",    # disallow eval()
+    "S310",    # audit urllib schemes (use util.http_request / util.urlopen_http)
+    "S314",    # disallow unsafe xml.etree
+    "S315",    # disallow unsafe xml.sax
+    "S316",    # disallow unsafe xml.expat
+    "S317",    # disallow unsafe xml.sax
+    "S318",    # disallow unsafe xml.dom.minidom
+    "S319",    # disallow unsafe xml.dom.pulldom
+    "S321",    # disallow ftplib
+    "S323",    # disallow unverified SSL context
+    "S324",    # disallow weak hashlib hashes without usedforsecurity=False
+    "S501",    # disallow disabled TLS verification
+    "S502",    # disallow insecure SSL/TLS protocol version
+    "S503",    # disallow insecure SSL/TLS default version
+    "S504",    # disallow ssl.wrap_socket without version
+    "S505",    # disallow weak cryptographic key size
+    "S506",    # disallow unsafe yaml.load
+    "S507",    # disallow SSH AutoAddPolicy
+    "S508",    # disallow insecure SNMP version
+    "S509",    # disallow weak SNMP crypto
+    "S602",    # disallow subprocess shell=True
+    "S608",    # audit SQL string interpolation
+    "S611",    # disallow raw SQL extras
+    "S701",    # disallow disabled template autoescape
+]
 ignore = ["BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test methods frequently define synchronous stub helpers inside subTest loops,
+# declare read-only fixture dicts/lists on unittest.TestCase classes, and use /tmp
+# paths or dynamic SQL assertions in test fixtures.
+"tests/**" = ["B023", "RUF012", "S108", "S608"]

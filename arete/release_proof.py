@@ -588,7 +588,7 @@ def on_tip(repo, base, tip, previous=None, *, tickets=None):
         revision = data.get("revision") or merge_revision(repo, ticket, base)
         interval = False
         if previous and revision and revision != tip and serve_guard.SHA.fullmatch(revision):
-            def contains(ref):
+            def contains(ref, *, revision=revision):
                 return util.sh(["git", "--no-replace-objects", "merge-base", "--is-ancestor", revision, ref],
                                cwd=repo.path, timeout=10).returncode == 0
             interval = contains(tip) and not contains(previous)

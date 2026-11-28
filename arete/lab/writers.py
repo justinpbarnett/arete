@@ -132,7 +132,8 @@ def scored(brief: document.Brief, evidence: list[list[str]], text: str, title: s
     for group, said in document.fault_pairs(brief, text, samples, title):
         found[group].append(said)
     whole = f"{title}\n{text}"
-    found["missing"] += [f"left out the condition: {condition}" for condition, phrases in zip(brief.acceptance, evidence)
+    found["missing"] += [f"left out the condition: {condition}"
+                         for condition, phrases in zip(brief.acceptance, evidence, strict=False)
                          if not any(document.phrase_in(p, whole) for p in phrases)]
     return found
 
@@ -447,8 +448,8 @@ def sample_case(kind: str, thing: str, command: str) -> tuple[dict, dict[str, di
                  "action": "Ask the team to run the command and confirm in the channel.",
                  "acceptance": ["Names the command to run.", "Asks for a confirmation in the channel."],
                  "evidence": [[command], ["confirm"]]}
-        short = f"Heads up: {thing} goes stale after a deploy. Please run `{command}` and confirm here in the " \
-                "channel when it is done."
+        short = (f"Heads up: {thing} goes stale after a deploy. Please run `{command}` and confirm here in the "
+                 "channel when it is done.")
         texts = {"plain": short, "long": short + FILLER[kind], "terse": f"Run `{command}` to refresh {thing}."}
         titles = dict.fromkeys(texts, "")
     elif kind == "ticket":
@@ -457,8 +458,8 @@ def sample_case(kind: str, thing: str, command: str) -> tuple[dict, dict[str, di
                  "action": "Ask for the deploy to run the command itself.",
                  "acceptance": ["The deploy runs the command itself.", "A failed command stops the deploy."],
                  "evidence": [["deploy runs", "deploy run"], ["stops the deploy"]]}
-        short = f"The deploy runs `{command}` itself once the release step ends, so nobody has to remember it. If " \
-                "the command fails, the failure stops the deploy and the team is told."
+        short = (f"The deploy runs `{command}` itself once the release step ends, so nobody has to remember it. If "
+                 "the command fails, the failure stops the deploy and the team is told.")
         texts = {"plain": short, "long": short + FILLER[kind], "terse": f"The deploy runs `{command}` itself."}
         titles = {"plain": f"Clear {thing} after each deploy", "long": f"Clear {thing} after each deploy",
                   "terse": f"Clear {thing}"}

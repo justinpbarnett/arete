@@ -15,9 +15,10 @@ def subject(repo: str, ticket: str | int) -> str:
 
 
 def rows(c, repo: str, ticket: str | int, *, newest_first: bool = True):
-    order = "DESC" if newest_first else "ASC"
-    return c.execute("SELECT seq, at, data FROM events_log WHERE subject = ? AND kind = ? AND class = 'durable' "
-                     f"ORDER BY seq {order}", (subject(repo, ticket), KIND))
+    sql = ("SELECT seq, at, data FROM events_log WHERE subject = ? AND kind = ? AND class = 'durable' ORDER BY seq DESC"
+           if newest_first else
+           "SELECT seq, at, data FROM events_log WHERE subject = ? AND kind = ? AND class = 'durable' ORDER BY seq ASC")
+    return c.execute(sql, (subject(repo, ticket), KIND))
 
 
 def owner_review_started_at(repo: str, issue: str | int, run_id: str, attempt_id: str, *,
@@ -120,15 +121,15 @@ def record(repo: str, ticket: str | int, status: dict | None = None, *, evidence
             seen = attempts[cause]
             if attempt not in seen:
                 if seen:
-                    updates.append(dict(kind="recurring-blocker", cause=cause, attempt=attempt, message=message))
+                    updates.append({"kind": "recurring-blocker", "cause": cause, "attempt": attempt, "message": message})
                 seen.add(attempt)
                 fresh.append([cause, attempt])
         known = {u["pr"] for item in history for u in item["updates"] if u["kind"] == "prerequisite-pr"}
         for pr in prs:
             if pr["key"] not in known:
                 delivery = "deployed" if pr["deployed_release"] else pr["state"]
-                updates.append(dict(kind="prerequisite-pr", pr=pr["key"],
-                                    message=f"Found prerequisite PR {pr['url']} ({delivery})."))
+                updates.append({"kind": "prerequisite-pr", "pr": pr["key"],
+                                    "message": f"Found prerequisite PR {pr['url']} ({delivery})."})
         if fresh or updates or current != prior:
             events.emit(KIND, subject(repo, ticket), cls="durable", task=str(ticket) if str(ticket).startswith("t-")
                         else None, data={**current, "evidence": fresh, "updates": updates})

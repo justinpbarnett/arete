@@ -171,7 +171,7 @@ def read_blocking_links(issues: list[dict]) -> None:
     by_id = {row["id"]: row for row in issues if isinstance(row.get("id"), str) and row["id"]}
     query = ("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Issue { id blockedBy(first: 100) "
              "{ totalCount nodes { number state url } } } } }")
-    for ids in itertools.batched(by_id, 100):
+    for ids in itertools.batched(by_id, 100, strict=False):
         payload = Outgoing(json.dumps({"query": query, "variables": {"ids": ids}}))
         try:
             reply = json.loads(gh(["api", "graphql", "--input", "-"], input=payload, timeout=15, retry=False))
@@ -1092,12 +1092,14 @@ def token_reply(app: config.GithubApp, repo: str, retry: bool) -> dict:
         row, key = secretstore.lookup("global", APP_KEY)
         jwt = app_jwt(app, key=key.encode()) if row is not None else app_jwt(app)
     body = {"repositories": [_safe_repo(repo).rsplit("/", 1)[-1]], "permissions": CLONE_TOKEN_PERMISSIONS}
-    request = urllib.request.Request(
+    request = util.http_request(
         f"{GITHUB_API}/app/installations/{app.installation_id}/access_tokens", data=json.dumps(body).encode(),
         method="POST", headers={"Authorization": f"Bearer {jwt}", "Accept": "application/vnd.github+json",
-                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"})
+                                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "arete"},
+        schemes=("https",))
     try:
-        open_fn = _token_opener.open if urllib.request.urlopen is _STDLIB_URLOPEN else urllib.request.urlopen
+        open_fn = (_token_opener.open if urllib.request.urlopen is _STDLIB_URLOPEN
+                   else lambda req, timeout=30: util.urlopen_http(req, timeout=timeout, schemes=("https",)))
         with open_fn(request, timeout=30) as res:
             reply = json.loads(res.read())
     except urllib.error.HTTPError:

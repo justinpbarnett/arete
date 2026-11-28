@@ -80,7 +80,7 @@ class CheckProgressTests(ProgressFixture):
         events = self.events(ticket)
         self.assertEqual([tuple(item) for row in events for item in row["evidence"]], list(pairs))
         self.assertEqual([item for row in events for item in row["updates"]], [
-            dict(kind="recurring-blocker", cause=why, attempt=key, message="Check unit failed again (exit 7).")
+            {"kind": "recurring-blocker", "cause": why, "attempt": key, "message": "Check unit failed again (exit 7)."}
             for i, (why, key) in enumerate(pairs) if any(p[0] == why for p in pairs[:i])])
         return events
 

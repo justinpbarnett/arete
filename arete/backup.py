@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -521,10 +521,8 @@ def validate_archives(data):
 def rollback_install(data):
     live = paths.DB_FILE
     if data["state"] != "rolling-back":
-        try:
+        with suppress(OSError):
             save_restore(data, state="rolling-back")
-        except OSError:
-            pass
     for suffix in data["inventory"]:
         archive, original = live.with_name(data["archive"] + suffix), Path(str(live) + suffix)
         held = archive if archive.exists() else original

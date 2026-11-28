@@ -22,7 +22,7 @@ RESULT_SCHEMA = {
     "type": "object",
     "properties": {
         "sources": {"type": "array", "items": {
-            "type": "object", "properties": {key: TEXT for key in SOURCE_KEYS}, "required": list(SOURCE_KEYS)}},
+            "type": "object", "properties": dict.fromkeys(SOURCE_KEYS, TEXT), "required": list(SOURCE_KEYS)}},
         "notes": TEXT,
     },
     "required": ["sources", "notes"],

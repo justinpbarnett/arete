@@ -88,11 +88,10 @@ def versions_of(kind: str, name: str, conn: sqlite3.Connection | None = None) ->
             return versions_of(kind, name, c)
     if not available(conn):
         return []
-    order = "ver DESC, n DESC" if has_ver(conn) else "n DESC"
-    return [dict(r) for r in conn.execute(
-        f"SELECT * FROM config_index WHERE kind = ? AND name = ? ORDER BY {order}",
-        (kind, name),
-    )]
+    sql = ("SELECT * FROM config_index WHERE kind = ? AND name = ? ORDER BY ver DESC, n DESC"
+           if has_ver(conn) else
+           "SELECT * FROM config_index WHERE kind = ? AND name = ? ORDER BY n DESC")
+    return [dict(r) for r in conn.execute(sql, (kind, name))]
 
 
 def by_selector(kind: str, name: str, selector: str, conn: sqlite3.Connection | None = None) -> dict | None:
@@ -200,6 +199,6 @@ def replace_all(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.execute("DELETE FROM config_index")
     cols = COLUMNS if with_ver else COLUMNS[:-1]
     placeholders = ", ".join("?" for _ in cols)
-    sql = f"INSERT INTO config_index ({', '.join(cols)}) VALUES ({placeholders})"
+    sql = f"INSERT INTO config_index ({', '.join(cols)}) VALUES ({placeholders})"  # noqa: S608
     for row in rows:
         conn.execute(sql, tuple(row[c] for c in cols))

@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import paths, ticket_media
+from . import paths, ticket_media, util
+import contextlib
 
 MAX_EXTERNAL_ITEMS = 6
 MAX_SLACK_MESSAGES = 50
@@ -298,13 +299,14 @@ def dropbox_token() -> str:
 def _default_slack_api(method: str, params: dict[str, str], token: str) -> tuple[int, dict | None, str]:
     query = urllib.parse.urlencode(params)
     url = f"{SLACK_API_BASE}/{method}?{query}"
-    req = urllib.request.Request(
+    req = util.http_request(
         url,
         method="GET",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": "arete-evidence/1"},
+        schemes=("https",),
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with util.urlopen_http(req, timeout=HTTP_TIMEOUT, schemes=("https",)) as resp:
             raw = resp.read(MAX_TEXT_BYTES + 1)
             if len(raw) > MAX_TEXT_BYTES:
                 return resp.status, None, "Slack API response exceeded size limit"
@@ -512,7 +514,7 @@ def _default_dropbox_fetch(ref: ExternalRef, token: str, *, allow_public: bool =
     max_bytes = ticket_media.MAX_VIDEO_BYTES
     if token:
         api_arg = json.dumps({"url": ref.url}, ensure_ascii=True)
-        req = urllib.request.Request(
+        req = util.http_request(
             DROPBOX_CONTENT_URL,
             data=b"",
             method="POST",
@@ -521,9 +523,10 @@ def _default_dropbox_fetch(ref: ExternalRef, token: str, *, allow_public: bool =
                 "Dropbox-API-Arg": api_arg,
                 "User-Agent": "arete-evidence/1",
             },
+            schemes=("https",),
         )
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with util.urlopen_http(req, timeout=HTTP_TIMEOUT, schemes=("https",)) as resp:
                 data = resp.read(max_bytes + 1)
                 if len(data) > max_bytes:
                     return DropboxFetchResult(
@@ -548,10 +551,8 @@ def _default_dropbox_fetch(ref: ExternalRef, token: str, *, allow_public: bool =
                 )
         except urllib.error.HTTPError as e:
             body = ""
-            try:
+            with contextlib.suppress(OSError):
                 body = e.read(4096).decode("utf-8", errors="replace")
-            except OSError:
-                pass
             err_status, detail = _dropbox_error_status(e.code, body)
             return DropboxFetchResult(status_code=e.code, error_status=err_status, detail=detail)
         except (urllib.error.URLError, TimeoutError, OSError) as e:

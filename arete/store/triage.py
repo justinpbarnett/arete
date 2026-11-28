@@ -69,4 +69,4 @@ def triage_approval(ref: str, connect=reader) -> dict | None:
 
 def triage_prune(sources: list[str]) -> None:
     with db() as c:
-        c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)
+        c.execute(f"DELETE FROM triage WHERE source NOT IN ({','.join('?' * len(sources))})", sources)  # noqa: S608

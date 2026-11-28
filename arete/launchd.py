@@ -207,7 +207,7 @@ class Table:
                     domains.append(name)
                 elif text is not None or name in self.failed_prints:
                     unreadable = True
-        found = [(domain, label) for domain, text in zip(domains, texts)
+        found = [(domain, label) for domain, text in zip(domains, texts, strict=True)
                  for label in (running(text) or {}).get(pid, [])]
         if bundled and not found and pid in self.pids:
             owners = self.responsible_pids

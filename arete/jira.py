@@ -155,7 +155,7 @@ class Client:
         for attempt in range(retries + 1):
             from .store import factory
             factory.check_worker()
-            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            req = util.http_request(url, data=data, method=method, headers=headers)
             try:
                 with _opener.open(req, timeout=TIMEOUT) as r:
                     raw = r.read()

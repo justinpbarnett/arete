@@ -920,7 +920,7 @@ def retain_for_cleanup(run: Run, ws: Path, checkouts: list[workspace.Checkout]) 
         retained = sorted(c.prefix + name for c in checkouts for name in pr_recovery.cleanup_paths(c))
         why = f"it contains retained files ({', '.join(map(repr, retained))})" if retained else ""
     except (workspace.RunFailed, RuntimeError, OSError, ValueError) as error:
-        why = f"retained files could not be checked: {str(error)}"
+        why = f"retained files could not be checked: {error!s}"
     if why:
         workspaces.keep(ws, "operator")
         run.log(vault.hidden(f"workspace kept at {ws}: {why}"))
@@ -1020,10 +1020,8 @@ def keep_edits(run: Run) -> dict[str, tuple[str, str]]:
                 kept[c.github] = heads
         except (workspace.RunFailed, RuntimeError, OSError, ValueError) as e:
             run.log(f"could not commit the edits in {c.github}, so they stay uncommitted in {c.wt}: {e}")
-            try:
+            with suppress(RuntimeError, OSError):
                 c.onto = c.onto or git(["rev-parse", "HEAD"], c.wt).strip()
-            except (RuntimeError, OSError):
-                pass
     return kept
 
 
@@ -1126,7 +1124,7 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
         merged = pending_merge(c)
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
-            diff.counts = {name: 0 for name in brought} | diff.counts
+            diff.counts = dict.fromkeys(brought, 0) | diff.counts
         out.bases[c.github] = against
         if merged:
             out.merged.append(c)
@@ -5330,9 +5328,13 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                 except RuntimeError as e:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
-                        raise workspace.RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
+                        raise workspace.RunFailed(
+                            f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}",
+                        ) from e
                     if environment_retry:
-                        raise workspace.RunFailed(f"merging `{c.origin_base}` into the held draft conflicts in {c.github}")
+                        raise workspace.RunFailed(
+                            f"merging `{c.origin_base}` into the held draft conflicts in {c.github}",
+                        ) from e
                     rec["conflicts"] = conflicts
                     if before_resolve:
                         before_resolve()
@@ -5521,7 +5523,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     except workspace.RunFailed as e:
         for r in reds:
             r.reason = "Arete could not merge the moved base before judging this check."
-        raise workspace.RunFailed(e.why, ci.red_list(reds))
+        raise workspace.RunFailed(e.why, ci.red_list(reds)) from e
     failures = ci_failure_notes(run, reds, f"round{n}")
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""

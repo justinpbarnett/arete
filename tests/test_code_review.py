@@ -27,7 +27,7 @@ class FindingDecisionTests(unittest.TestCase):
                 code_review.disposition(self.report, decisions, self.report["trees"])
 
     def test_dismissing_every_finding_cannot_authorize_a_different_tree(self):
-        notes = dict.fromkeys(self.decisions, {"status": "nonblocking", "reason": "Outside the ticket."})
+        notes = {key: {"status": "nonblocking", "reason": "Outside the ticket."} for key in self.decisions}
         self.assertTrue(code_review.disposition(self.report, notes, self.report["trees"]).approved())
         with self.assertRaises(ValueError):
             code_review.disposition(self.report, notes, {"": "other"})

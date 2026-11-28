@@ -107,7 +107,7 @@ def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict
 def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
     from . import unblock
 
-    for url, pr in zip(urls, prs):
+    for url, pr in zip(urls, prs, strict=True):
         updated = pr.get("updatedAt", "")
         fresh[url] = seen.get(url, "")
         if updated and seen.get(url) == updated:
@@ -154,7 +154,7 @@ def sync_outcomes(cfg: config.Config) -> None:
             continue
         if not closed:
             continue
-        for url, pr in zip(urls, prs):
+        for url, pr in zip(urls, prs, strict=True):
             insights_store.close_feedback(url, pr["state"])
         closed_at = max((util.iso(util.parse_iso(pr["closedAt"]).astimezone(UTC))
                          for pr in prs if pr.get("closedAt")), default=util.iso())

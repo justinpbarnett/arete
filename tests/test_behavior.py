@@ -6078,9 +6078,9 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
 
     def test_release_is_durable_before_filesystem_removal(self):
         ws, c, _ = self.checkout("7", "done")
-        with mock.patch.object(workspace, "remove_checkouts", side_effect=OSError("interrupted")):
-            with self.assertRaisesRegex(OSError, "interrupted"):
-                workspace.remove_workspace(ws, [c])
+        with (mock.patch.object(workspace, "remove_checkouts", side_effect=OSError("interrupted")),
+              self.assertRaisesRegex(OSError, "interrupted")):
+            workspace.remove_workspace(ws, [c])
         row = workspaces.open_for(ws.name)
         self.assertEqual(row["state"], "released")
         self.assertTrue(row["released_at"])
@@ -6210,9 +6210,9 @@ class WorkspaceRemovalGuardTests(_WorkspaceWorkflowCase):
                 late.write_text("arrived under lock\n")
                 yield
 
-        with mock.patch.object(util, "repo_lock", write_under_lock):
-            with self.assertRaisesRegex(workspace.RunFailed, r"\(api/hand\.txt\)"):
-                workspace.clear_workspace(ws, [c], c.src, [])
+        with (mock.patch.object(util, "repo_lock", write_under_lock),
+              self.assertRaisesRegex(workspace.RunFailed, r"\(api/hand\.txt\)")):
+            workspace.clear_workspace(ws, [c], c.src, [])
         self.assertTrue(self.registered(c.wt))
         late.unlink()
 
@@ -7026,7 +7026,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
             (f'"ask" = {{ max_per_run = 0x4, push_contact = {contact} }} # owner attention\n' + original,
              "settle = false"),
             ('"ask" . max_per_run = 0x4 # keep the rate\n'
-             + f"ask.push_contact = {contact} # keep the contact\n" + original, "ask.settle = false\n"),
+              f"ask.push_contact = {contact} # keep the contact\n" + original, "ask.settle = false\n"),
         )
         for initial, added in forms:
             paths.CONFIG_FILE.write_text(initial)
@@ -8366,9 +8366,9 @@ class HookUploadTests(unittest.TestCase):
             self.hook("pending")
             before = files()
             out = StringIO()
-            with mock.patch.object(client, "connect", side_effect=AssertionError("doctor contacted serve")) as connect:
-                with redirect_stdout(out):
-                    cli.main(["doctor"])
+            with (mock.patch.object(client, "connect", side_effect=AssertionError("doctor contacted serve")) as connect,
+                  redirect_stdout(out)):
+                cli.main(["doctor"])
             connect.assert_not_called()
             self.assertIn("quick_check ok", out.getvalue())
             self.assertEqual(files(), before)
@@ -12533,127 +12533,127 @@ class InboxTests(_InboxCase):
         from arete.store import asks as asks_store, incidents as incidents_store
 
         posts = []
-        with mock.patch.object(webpush, "post", side_effect=lambda ep, hdrs: posts.append((ep, hdrs)) or 201):
-            with self.listen() as server:
-                cookie, _ = self.pair_and_client(server)
-                meta, _ = self.http(server, "GET", "/api/v1/meta", cookie=cookie)
-                self.assertTrue(meta["features"]["inbox"])
+        with (mock.patch.object(webpush, "post", side_effect=lambda ep, hdrs: posts.append((ep, hdrs)) or 201),
+              self.listen() as server):
+            cookie, _ = self.pair_and_client(server)
+            meta, _ = self.http(server, "GET", "/api/v1/meta", cookie=cookie)
+            self.assertTrue(meta["features"]["inbox"])
 
-                # 1. 101 pending approvals + 1 failed approval (no 100 cap).
-                for i in range(101):
-                    approvals_store.add_approval(
-                        "demo-loop", f"r-appr-{i}",
-                        {"type": "push", "item": {"title": f"Push {i}", "about": f"About {i}", "files": ["a.py"]}},
-                        f"Approve push {i}",
-                    )
-                failed_id = approvals_store.add_approval(
-                    "demo-loop", "r-appr-fail",
-                    {"type": "push", "item": {"title": "Push fail", "about": "Failed", "files": ["b.py"]}},
-                    "Approve failed push",
+            # 1. 101 pending approvals + 1 failed approval (no 100 cap).
+            for i in range(101):
+                approvals_store.add_approval(
+                    "demo-loop", f"r-appr-{i}",
+                    {"type": "push", "item": {"title": f"Push {i}", "about": f"About {i}", "files": ["a.py"]}},
+                    f"Approve push {i}",
                 )
-                approvals_store.settle_approval(failed_id, "failed", "delivery error", judged="failed")
+            failed_id = approvals_store.add_approval(
+                "demo-loop", "r-appr-fail",
+                {"type": "push", "item": {"title": "Push fail", "about": "Failed", "files": ["b.py"]}},
+                "Approve failed push",
+            )
+            approvals_store.settle_approval(failed_id, "failed", "delivery error", judged="failed")
 
-                # 2. 2 non-dependency skipped + 1 dependency_wait skipped.
-                from arete import poll
-                skips = pipeline.SkipLog({})
-                skips.note("fixture#201", tracker.Ticket("201", "#201", "Parked ticket"),
-                           "blocked by parked run r-parked", "fixture")
-                skips.note("fixture#202", tracker.Ticket("202", "#202", "Unreadable dep"),
-                           "blocked by unreadable #999", "fixture")
-                skips.note("fixture#203", tracker.Ticket("203", "#203", "Routine dep"),
-                           "waiting on #10", "fixture", blocker_kind=tracker.DEPENDENCY_WAIT)
-                poll.save_skips(skips)
+            # 2. 2 non-dependency skipped + 1 dependency_wait skipped.
+            from arete import poll
+            skips = pipeline.SkipLog({})
+            skips.note("fixture#201", tracker.Ticket("201", "#201", "Parked ticket"),
+                       "blocked by parked run r-parked", "fixture")
+            skips.note("fixture#202", tracker.Ticket("202", "#202", "Unreadable dep"),
+                       "blocked by unreadable #999", "fixture")
+            skips.note("fixture#203", tracker.Ticket("203", "#203", "Routine dep"),
+                       "waiting on #10", "fixture", blocker_kind=tracker.DEPENDENCY_WAIT)
+            poll.save_skips(skips)
 
-                # 3. 1 ready triage ticket.
-                triage_store.triage_put({
-                    "ref": "fixture/repo#301", "source": "GitHub fixture/repo", "tracker": "github", "repo": "ghfixture",
-                    "route": "triage", "title": "Ready ticket", "url": "https://github.com/fixture/repo/issues/301",
-                    "updated": util.iso(), "ready": 1, "code": 1, "size": "s", "questions": [],
-                    "plan": ["Plan"], "why": "Ready", "cost": 0.0, "ts": util.iso(), "kind": "feat",
-                    "repos": ["ghfixture"], "assumptions": [], "in_sprint": 0, "parent": "", "closed": "", "checks": [],
-                })
+            # 3. 1 ready triage ticket.
+            triage_store.triage_put({
+                "ref": "fixture/repo#301", "source": "GitHub fixture/repo", "tracker": "github", "repo": "ghfixture",
+                "route": "triage", "title": "Ready ticket", "url": "https://github.com/fixture/repo/issues/301",
+                "updated": util.iso(), "ready": 1, "code": 1, "size": "s", "questions": [],
+                "plan": ["Plan"], "why": "Ready", "cost": 0.0, "ts": util.iso(), "kind": "feat",
+                "repos": ["ghfixture"], "assumptions": [], "in_sprint": 0, "parent": "", "closed": "", "checks": [],
+            })
 
-                # 4. 2 chat drafts.
-                c1 = chats_store.chat_add("Draft one")
-                chats_store.chat_say(c1, "assistant", "draft", draft_title="First draft", draft_body="Body 1")
-                c2 = chats_store.chat_add("Draft two")
-                chats_store.chat_say(c2, "assistant", "draft", draft_title="Second draft", draft_body="Body 2")
+            # 4. 2 chat drafts.
+            c1 = chats_store.chat_add("Draft one")
+            chats_store.chat_say(c1, "assistant", "draft", draft_title="First draft", draft_body="Body 1")
+            c2 = chats_store.chat_add("Draft two")
+            chats_store.chat_say(c2, "assistant", "draft", draft_title="Second draft", draft_body="Body 2")
 
-                # 5. 4 proposals (memory, hand, approve, filing).
-                for status, title in (("memory", "Mem"), ("hand", "Hand"), ("approve", "Appr"), ("filing", "File")):
-                    approvals_store.add_proposal(
-                        f"r-p-{status}",
-                        {"layer": "repo", "repo": "fixture", "file": f"{status}.md",
-                         "change": f"Change {title}", "why": f"Detail {status}"},
-                        status,
-                    )
-
-                # 6. 1 open choice ask.
-                ask_run = record.start("pipeline", repo="fixture", issue="401")
-                asks_store.ask_add(
-                    ask_run, ask_run, "fixture", "401", "implement", "ask", "Need choice", "",
-                    [{"kind": "choice", "header": "Pick", "question": "Pick one",
-                      "options": [{"label": "A", "recommended": True}, {"label": "B"}]}], {},
+            # 5. 4 proposals (memory, hand, approve, filing).
+            for status, title in (("memory", "Mem"), ("hand", "Hand"), ("approve", "Appr"), ("filing", "File")):
+                approvals_store.add_proposal(
+                    f"r-p-{status}",
+                    {"layer": "repo", "repo": "fixture", "file": f"{status}.md",
+                     "change": f"Change {title}", "why": f"Detail {status}"},
+                    status,
                 )
-                record.move(ask_run, "needs-info", ("running",))
 
-                # 7. 1 needs-info run without an ask.
-                bare_run = record.start("pipeline", repo="fixture", issue="402")
-                record.move(bare_run, "needs-info", ("running",))
+            # 6. 1 open choice ask.
+            ask_run = record.start("pipeline", repo="fixture", issue="401")
+            asks_store.ask_add(
+                ask_run, ask_run, "fixture", "401", "implement", "ask", "Need choice", "",
+                [{"kind": "choice", "header": "Pick", "question": "Pick one",
+                  "options": [{"label": "A", "recommended": True}, {"label": "B"}]}], {},
+            )
+            record.move(ask_run, "needs-info", ("running",))
 
-                # 8. 1 alert.
-                incidents_store.alert_set("disk_low", "Disk space low", "Less than 1 GB left")
+            # 7. 1 needs-info run without an ask.
+            bare_run = record.start("pipeline", repo="fixture", issue="402")
+            record.move(bare_run, "needs-info", ("running",))
 
-                # 9. 1 blocked incident.
-                from arete.sighting import Sighting
-                inc_id, _ = incidents_store.record_incident(
-                    Sighting("fp-inc-1", "error", "oncall", "fixture", "API down", 1, "evidence", "")
-                )
-                incidents_store.update_incident(inc_id, phase="blocked", waiting="Needs owner decision")
+            # 8. 1 alert.
+            incidents_store.alert_set("disk_low", "Disk space low", "Less than 1 GB left")
 
-                inbox.sync_all()
+            # 9. 1 blocked incident.
+            from arete.sighting import Sighting
+            inc_id, _ = incidents_store.record_incident(
+                Sighting("fp-inc-1", "error", "oncall", "fixture", "API down", 1, "evidence", "")
+            )
+            incidents_store.update_incident(inc_id, phase="blocked", waiting="Needs owner decision")
 
-                listed, _ = self.http(server, "GET", self.INBOX, cookie=cookie)
-                items = listed["items"]
-                by_kind = {}
-                for it in items:
-                    by_kind.setdefault(it["kind"], []).append(it)
-                self.assertEqual(len(by_kind["approval"]), 102)
-                self.assertEqual(sum(it["subject"].startswith("skipped:") for it in by_kind["candidate"]), 2)
-                self.assertEqual(sum(it["subject"].startswith("ticket:") for it in by_kind["candidate"]), 1)
-                self.assertEqual(sum(it["subject"].startswith("chat:") for it in by_kind["proposal"]), 2)
-                self.assertEqual(sum(it["subject"].startswith("proposal:") for it in by_kind["proposal"]), 4)
-                self.assertEqual(len(by_kind["choice"]), 1)
-                self.assertEqual(len(by_kind["freeform"]), 1)
-                self.assertEqual({it["subject"] for it in by_kind["alert"]}, {"alert:disk_low", f"incident:{inc_id}"})
-                self.assertEqual(len(items), 115)
-                self.assertEqual(by_kind["choice"][0]["priority"], 1)
-                self.assertEqual(by_kind["freeform"][0]["priority"], 1)
-                self.assertEqual(by_kind["approval"][0]["priority"], 2)
-                by_sub = {it["subject"]: it for it in items}
-                self.assertEqual(by_sub["alert:disk_low"]["priority"], 2)
-                self.assertEqual(by_sub[f"incident:{inc_id}"]["priority"], 2)
-                self.assertTrue(any(it["priority"] == 3 for it in by_kind["proposal"]))
+            inbox.sync_all()
 
-                # Dependency wait is excluded from inbox, events, and push, and shown in /api/live.dependency_waits.
-                self.assertFalse(any("203" in it["subject"] for it in items))
-                with db.reader() as c:
-                    raised_events = c.execute("SELECT subject FROM events_log WHERE kind = 'inbox.raised'").fetchall()
-                self.assertEqual(len(raised_events), 115)
-                self.assertEqual(posts, [])
+            listed, _ = self.http(server, "GET", self.INBOX, cookie=cookie)
+            items = listed["items"]
+            by_kind = {}
+            for it in items:
+                by_kind.setdefault(it["kind"], []).append(it)
+            self.assertEqual(len(by_kind["approval"]), 102)
+            self.assertEqual(sum(it["subject"].startswith("skipped:") for it in by_kind["candidate"]), 2)
+            self.assertEqual(sum(it["subject"].startswith("ticket:") for it in by_kind["candidate"]), 1)
+            self.assertEqual(sum(it["subject"].startswith("chat:") for it in by_kind["proposal"]), 2)
+            self.assertEqual(sum(it["subject"].startswith("proposal:") for it in by_kind["proposal"]), 4)
+            self.assertEqual(len(by_kind["choice"]), 1)
+            self.assertEqual(len(by_kind["freeform"]), 1)
+            self.assertEqual({it["subject"] for it in by_kind["alert"]}, {"alert:disk_low", f"incident:{inc_id}"})
+            self.assertEqual(len(items), 115)
+            self.assertEqual(by_kind["choice"][0]["priority"], 1)
+            self.assertEqual(by_kind["freeform"][0]["priority"], 1)
+            self.assertEqual(by_kind["approval"][0]["priority"], 2)
+            by_sub = {it["subject"]: it for it in items}
+            self.assertEqual(by_sub["alert:disk_low"]["priority"], 2)
+            self.assertEqual(by_sub[f"incident:{inc_id}"]["priority"], 2)
+            self.assertTrue(any(it["priority"] == 3 for it in by_kind["proposal"]))
 
-                live, _ = self.http(server, "GET", "/api/live", cookie=cookie)
-                self.assertEqual([w["ticket"] for w in live["dependency_waits"]["rows"]], ["fixture#203"])
-                self.assertEqual(sorted(s["ticket"] for s in live["needs_you"]["skipped"]["rows"]),
-                                 ["fixture#201", "fixture#202"])
+            # Dependency wait is excluded from inbox, events, and push, and shown in /api/live.dependency_waits.
+            self.assertFalse(any("203" in it["subject"] for it in items))
+            with db.reader() as c:
+                raised_events = c.execute("SELECT subject FROM events_log WHERE kind = 'inbox.raised'").fetchall()
+            self.assertEqual(len(raised_events), 115)
+            self.assertEqual(posts, [])
 
-                screen, _ = self.http(server, "GET", "/api/v1/screens/triage", cookie=cookie)
-                self.assertEqual(len(screen["items"]), 115)
-                self.assertEqual(screen["counts"]["open"], 115)
+            live, _ = self.http(server, "GET", "/api/live", cookie=cookie)
+            self.assertEqual([w["ticket"] for w in live["dependency_waits"]["rows"]], ["fixture#203"])
+            self.assertEqual(sorted(s["ticket"] for s in live["needs_you"]["skipped"]["rows"]),
+                             ["fixture#201", "fixture#202"])
+
+            screen, _ = self.http(server, "GET", "/api/v1/screens/triage", cookie=cookie)
+            self.assertEqual(len(screen["items"]), 115)
+            self.assertEqual(screen["counts"]["open"], 115)
 
     @inbox_test
     def test_dependency_wait_poll_lifecycle_and_reclassification(self, _):
-        from arete import inbox, poll
+        from arete import poll
 
         repo = config.Repo("fixture", Path.cwd(), tracker="local", github="fixture/repo")
         blocker_id = task_store.task_add("fixture", "Must finish first", title="Blocker issue")
@@ -12856,8 +12856,8 @@ class InboxLifecycleTests(_InboxCase):
             self.assertEqual(set(ans), {"id", "approved", "result"})
             self.assertFalse(ans["approved"])
             self.assertEqual(approvals_store.approval(aid)["status"], "rejected")
-            resolved_a = [it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
-                          if it["subject"] == f"approval:{aid}"][0]
+            resolved_a = next(it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
+                              if it["subject"] == f"approval:{aid}")
             self.assertEqual(resolved_a["resolution"], "rejected")
             self.assertEqual(resolved_a["answered_by"], self.owner)
 
@@ -12867,8 +12867,8 @@ class InboxLifecycleTests(_InboxCase):
             # GET /api/asks still lists remaining open ask even after snooze.
             asks_before, _ = self.http(server, "GET", "/api/asks", cookie=cookie)
             self.assertEqual([a["id"] for a in asks_before["asks"]], [r2])
-            ask2_item = [it for it in self.http(server, "GET", f"{self.INBOX}?kind=choice", cookie=cookie)[0]["items"]
-                         if it["subject"] == f"ask:{r2}"][0]
+            ask2_item = next(it for it in self.http(server, "GET", f"{self.INBOX}?kind=choice", cookie=cookie)[0]["items"]
+                             if it["subject"] == f"ask:{r2}")
             self.http(server, "POST", f"{self.INBOX}/{ask2_item['id']}/snooze",
                       body={"until": util.iso(util.now() + timedelta(hours=2)), "base_version": ask2_item["version"]},
                       cookie=cookie)
@@ -12878,8 +12878,8 @@ class InboxLifecycleTests(_InboxCase):
             # POST /api/proposals/{id}/reject
             self.http(server, "POST", f"/api/proposals/{p_rej}/reject", body={}, cookie=cookie)
             self.assertEqual(approvals_store.proposal(p_rej)["status"], "rejected")
-            rej_item = [it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
-                        if it["subject"] == f"proposal:{p_rej}"][0]
+            rej_item = next(it for it in self.http(server, "GET", f"{self.INBOX}?state=resolved", cookie=cookie)[0]["items"]
+                            if it["subject"] == f"proposal:{p_rej}")
             self.assertEqual(rej_item["resolution"], "declined")
 
             # accept on approve proposal leaves item open with answer set; moving to applied resolves cleared.
@@ -13106,7 +13106,8 @@ class InboxPushTests(_InboxCase):
         token = parts["t"]
         assert parts["k"] == vapid_public_key
         h_b64, p_b64, s_b64 = token.split(".")
-        pad = lambda s: s + "=" * (-len(s) % 4)
+        def pad(s):
+            return s + "=" * (-len(s) % 4)
         claims_obj = json.loads(base64.urlsafe_b64decode(pad(p_b64)))
         assert claims_obj["aud"] == expected_aud, claims_obj
         raw_sig = base64.urlsafe_b64decode(pad(s_b64))

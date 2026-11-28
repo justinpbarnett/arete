@@ -102,7 +102,7 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
                      other_routes: set[str], excluded: set[str],
                      recovered: tuple[tracker.Ticket, ...], observe) -> Iterator[tracker.Ticket]:
     for source in ticket_queues(repo, tk):
-        def retry_failed(tid: str) -> bool:
+        def retry_failed(tid: str, *, source: tracker.Tracker = source) -> bool:
             if runlimits.latest_park(repo.name, tid)[1]:
                 return True
             if (isinstance(source, tracker.GitHubTracker)
@@ -391,7 +391,8 @@ def requeue_failures(cfg: config.Config, queue: RepoQueue, dry_run: bool, errors
         return
     if not dry_run:
         for entry in run_store.unfinished_environment_requeues(queue.repo.name):
-            guard(errors, tracker.issue_name(queue.repo.name, entry["issue"]), lambda: requeue.reconcile(source, entry))
+            guard(errors, tracker.issue_name(queue.repo.name, entry["issue"]),
+                  lambda entry=entry: requeue.reconcile(source, entry))
     recovered = []
     try:
         for issue in source.failed_queue():
@@ -565,14 +566,14 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
             try:
                 observe = None
                 if not dry_run and (repo.name in cfg.unblock_repos or isinstance(queue.tracker, tracker.GitHubTracker)):
-                    def observe(source, tickets):
+                    def observe(source, tickets, *, repo: config.Repo = repo):
                         if repo.name in cfg.unblock_repos:
                             from . import unblock
 
                             unblock.publish_queue(repo, source, tickets)
                         if isinstance(source, tracker.GitHubTracker):
                             guard(errors, f"{repo.name} dependency discovery",
-                                  lambda: environment_gaps.observe_dependencies(cfg, source))
+                                  lambda source=source: environment_gaps.observe_dependencies(cfg, source))
 
                 candidates = pick_candidates(repo, queue.tracker, skips, queue.other_routes, queue.selected,
                                              queue.recovered, observe)
@@ -712,7 +713,8 @@ def poll_admitted(dry_run: bool) -> int:
         routes = jira_routes_by_project(cfg)
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
         for queue in queues:
-            guard(errors, f"{queue.repo.name} environment requeues", lambda: requeue_failures(cfg, queue, dry_run, errors))
+            guard(errors, f"{queue.repo.name} environment requeues",
+                  lambda queue=queue: requeue_failures(cfg, queue, dry_run, errors))
         resumed = 0
         try:
             resumed = resume_environment_holds(cfg, queues, dry_run, errors, going, slots)

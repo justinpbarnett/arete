@@ -238,9 +238,9 @@ class DirectPushDelivery(unittest.TestCase):
         # Irreversible action hold from JEV prevents direct push.
         _, b, c, _, verified, review, _, _ = self._make_build(self.repo, ticket_id="8", branch="arete/8-irrev")
         irrev = jev.Risk(0.2, 0.9, {"blast": 0.2}, "JEV reads the change as one a revert will not undo (p 0.90)")
-        with mock.patch.object(jev, "ready", return_value=True), mock.patch.object(jev, "risk", return_value=irrev):
-            with self.assertRaisesRegex(workspace.RunFailed, "revert will not undo"):
-                pipeline.direct_push_checkout(b, c, verified, review, "drop table")
+        with (mock.patch.object(jev, "ready", return_value=True), mock.patch.object(jev, "risk", return_value=irrev),
+              self.assertRaisesRegex(workspace.RunFailed, "revert will not undo")):
+            pipeline.direct_push_checkout(b, c, verified, review, "drop table")
         self.assertEqual(_git(self.origin, "rev-parse", "refs/heads/main"), self.base_sha)
 
         # Missing local checks prevents direct push.
@@ -256,9 +256,9 @@ class DirectPushDelivery(unittest.TestCase):
         hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
         _, b3, c3, _, verified3, review3, _, _ = self._make_build(self.repo, ticket_id="10", branch="arete/10-prot")
         low_risk = jev.Risk(0.1, 0.05, {"blast": 0.1}, "")
-        with mock.patch.object(jev, "ready", return_value=True), mock.patch.object(jev, "risk", return_value=low_risk):
-            with self.assertRaisesRegex(workspace.RunFailed, "refused by origin"):
-                pipeline.direct_push_checkout(b3, c3, verified3, review3, "blocked by hook")
+        with (mock.patch.object(jev, "ready", return_value=True), mock.patch.object(jev, "risk", return_value=low_risk),
+              self.assertRaisesRegex(workspace.RunFailed, "refused by origin")):
+            pipeline.direct_push_checkout(b3, c3, verified3, review3, "blocked by hook")
         self.assertEqual(_git(self.origin, "rev-parse", "refs/heads/main"), self.base_sha)
 
 

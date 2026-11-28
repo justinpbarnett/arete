@@ -259,7 +259,7 @@ def report(answer: dict, urls: dict[str, str], extra: list[tuple[str, str]], sou
     if audit:
         used = sorted({*used, *(sid for sid in audit[1] if sid in urls)}, key=lambda sid: int(sid[1:]))
     cited_sources = [source_line(sid, urls, sources.get(sid, {})) for sid in used]
-    sections = list(zip(SECTIONS, (conclusions, inferences, contradictions, gaps, cited_sources)))
+    sections = list(zip(SECTIONS, (conclusions, inferences, contradictions, gaps, cited_sources), strict=True))
     if audit:
         sections.insert(SECTIONS.index("Sources"), ("Audit", audit[0]))
     parts = [link_ids(answer["answer"].strip(), urls)]

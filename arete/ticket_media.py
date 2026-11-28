@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import environment, outbound, paths, util
+import contextlib
 
 MAX_MEDIA_ITEMS = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -204,11 +205,9 @@ def is_github_attachment_url(url: str) -> bool:
     host = (parts.hostname or "").lower()
     path = parts.path or ""
     if host == "github.com":
-        if path.startswith("/user-attachments/assets/") or path.startswith("/user-attachments/files/"):
+        if path.startswith(("/user-attachments/assets/", "/user-attachments/files/")):
             return True
-        if re.match(r"^/[^/]+/[^/]+/assets/\d+/[A-Za-z0-9-]+", path):
-            return True
-        return False
+        return bool(re.match(r"^/[^/]+/[^/]+/assets/\d+/[A-Za-z0-9-]+", path))
     return host in {
         "user-images.githubusercontent.com",
         "private-user-images.githubusercontent.com",
@@ -376,7 +375,7 @@ def fetch_url(
     headers = {"Accept": "image/*,video/*,*/*;q=0.8", "User-Agent": "arete-media/1"}
     if token and host in GITHUB_AUTH_HOSTS:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, method="GET", headers=headers)
+    req = util.http_request(url, method="GET", headers=headers, schemes=allowed_schemes)
     client = opener or urllib.request.build_opener(_SafeMediaRedirectHandler(allow_http=allow_http))
     try:
         with client.open(req, timeout=DOWNLOAD_TIMEOUT) as response:
@@ -517,7 +516,7 @@ def extract_video_keyframes(
                 frames.append(out_path)
     else:
         pattern = str(frames_dir / "frame-%02d.png")
-        try:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(
                 [
                     ffmpeg,
@@ -540,8 +539,6 @@ def extract_video_keyframes(
                 check=False,
                 env=environment.build(()),
             )
-        except (OSError, subprocess.SubprocessError):
-            pass
         for candidate in sorted(frames_dir.glob("frame-*.png")):
             if candidate.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
                 frames.append(candidate)

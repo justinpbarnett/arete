@@ -49,7 +49,7 @@ def classify(saved, key, ticket):
         # Equal-length replacements preserve check identity; insertions/deletions require explicit mapping.
         if kind != "replace" or b - a != j - i:
             return None
-        for previous, latest in zip(old[a:b], new[i:j]):
+        for previous, latest in zip(old[a:b], new[i:j], strict=True):
             previous, latest = (PREFIX.sub("", line, count=1).strip() for line in (previous, latest))
             ids = KEY.findall(previous)
             if not latest or (ids and KEY.findall(latest) != ids):
@@ -68,9 +68,7 @@ def verified_change(source, remote, key, saved, parent, ticket):
     if (not saved["complete"] or remote.scope != data["destination"] or remote.account() != data["account"]
             or parent.ref != key.parent or parent.native_id != data["native_id"] or not spec_graph.authorized(ticket, parent)):
         return False
-    if isinstance(source, tracker.GitHubTracker) and requirement_revision.github_conflict(source, ticket):
-        return False
-    return True
+    return not (isinstance(source, tracker.GitHubTracker) and requirement_revision.github_conflict(source, ticket))
 
 
 def unaffected(source, remote, key, saved, parent, ticket, ref):
@@ -133,14 +131,14 @@ def explicit(source, key, token, names):
 def diff_checks(name: str, previous: list[str], latest: list[str]) -> list[dict]:
     changed = []
     if len(previous) == len(latest):
-        for before, after in zip(previous, latest):
+        for before, after in zip(previous, latest, strict=True):
             if before != after:
                 changed.append({"node": name, "before": before, "after": after})
         return changed
     old_set, new_set = set(previous), set(latest)
     removed = [c for c in previous if c not in new_set]
     added = [c for c in latest if c not in old_set]
-    for before, after in zip(removed, added):
+    for before, after in zip(removed, added, strict=False):
         changed.append({"node": name, "before": before, "after": after})
     for before in removed[len(added):]:
         changed.append({"node": name, "before": before, "after": ""})

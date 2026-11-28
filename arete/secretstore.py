@@ -974,9 +974,8 @@ def record_refused(row: dict, role: str, env_name: str, reason: str = "below_flo
     detail = json.dumps({"role": role, "env": env_name, "reason": reason})
 
     def write():
-        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError):
-            with db.tx() as c:
-                credentials.secret_event(c, row, "refused", actor, util.iso(), ok=False, detail=detail)
+        with suppress(OSError, sqlite3.Error, db.NoDatabase, db.IncompatibleSchema, RuntimeError), db.tx() as c:
+            credentials.secret_event(c, row, "refused", actor, util.iso(), ok=False, detail=detail)
 
     if db.transaction_mode() is not None:
         db.after_transaction(write)
@@ -1069,7 +1068,7 @@ def save_pending(item, record, *, create_only=False):
 def pending_binding(ref, settings, key):
     directory = store_directory(ref, settings)
     key_ref = Reference(ref.store, ref.tag, KEY_ITEM)
-    return dict(store_dir=directory, key_proof=key_proof(key, key_ref, directory))
+    return {"store_dir": directory, "key_proof": key_proof(key, key_ref, directory)}
 
 
 def retire_pending(item, raw, expected):
@@ -1088,7 +1087,7 @@ def retire_pending(item, raw, expected):
 
 
 def history_detail(kind, provider, operation_id=None):
-    return json.dumps(dict(id=operation_id, kind=kind, provider=provider))
+    return json.dumps({"id": operation_id, "kind": kind, "provider": provider})
 
 
 def save_change(c, scope, name, previous, ref, change):
@@ -1127,8 +1126,8 @@ def save_verification_key(c, row, ref, value: bytes, actor: str):
     if row and row["fingerprint"] == sha:
         return row
     return save_change(c, "global", VERIFICATION_KEY_NAME, row, ref,
-                       dict(id=secrets.token_hex(16), kind="signing_key", actor=actor,
-                            at=util.iso(), fingerprint=sha, provider=None, rotated=row is not None))
+                       {"id": secrets.token_hex(16), "kind": "signing_key", "actor": actor,
+                        "at": util.iso(), "fingerprint": sha, "provider": None, "rotated": row is not None})
 
 
 def register_verification_key(value: bytes, *, rotated: bool = False):
@@ -1234,9 +1233,9 @@ def adopt(scope, name, value, kind, *, provider=None, managed_by=None, owner_fil
                 raise StoreError("secret operation is pending")
             retire_pending(item, raw, row)
             return row
-        change = dict(id=secrets.token_hex(16), reference=str(ref), kind=kind, actor="hand", at=util.iso(),
-                      fingerprint=fingerprint, provider=provider, moved=True, rotated=False, managed_by=managed_by,
-                      **({"expose": rules} if rules is not None else {}))
+        change = {"id": secrets.token_hex(16), "reference": str(ref), "kind": kind, "actor": "hand", "at": util.iso(),
+                  "fingerprint": fingerprint, "provider": provider, "moved": True, "rotated": False, "managed_by": managed_by,
+                  **({"expose": rules} if rules is not None else {})}
         if pending:
             change = pending[0]
             if (change["fingerprint"], change["kind"], change["provider"], change.get("managed_by")) != (
@@ -1280,9 +1279,9 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider: s
             c, scope, name, row, ref, receipt, fingerprint, absent=stored is None)
         if removal:
             raise StoreError("secret removal is pending; retry the removal before setting a new value")
-        change = dict(id=secrets.token_hex(16), reference=str(ref), kind=kind, actor=actor, at=util.iso(),
-                      fingerprint=digest(key, value), provider=provider, rotated=stored is not None,
-                      managed_by=managed_by, **({"expose": rules} if rules is not None else {}))
+        change = {"id": secrets.token_hex(16), "reference": str(ref), "kind": kind, "actor": actor, "at": util.iso(),
+                  "fingerprint": digest(key, value), "provider": provider, "rotated": stored is not None,
+                  "managed_by": managed_by, **({"expose": rules} if rules is not None else {})}
         # Keep earlier operations recoverable until the outer SQLite transaction commits.
         raw = save_pending(item, dict(pending_binding(ref, settings, key), confirmed=confirmed, sets=[change]))
         data = value.encode()
@@ -1327,7 +1326,7 @@ def reconcile(scope, name, actor, *, deleting=False):
             legacy = secret_move.repo_removal(scope.removeprefix("repo:"), name)
             if legacy and target is None:
                 ref = Reference(settings.store, meta["instance_tag"], item)
-                target = dict(reference=str(ref), kind="repo_answer")
+                target = {"reference": str(ref), "kind": "repo_answer"}
         if target is None:
             return None
         ref = registry_reference(c, target, item)
@@ -1345,8 +1344,8 @@ def reconcile(scope, name, actor, *, deleting=False):
             if removal is None and not (row and row["status"] == "missing" and value is None and
                                         credentials.last_lifecycle(c, row["id"]) == "removed"):
                 metadata = row or target
-                removal = dict(id=secrets.token_hex(16), reference=str(ref), kind=metadata["kind"],
-                               provider=metadata.get("provider"), actor=actor, at=util.iso(), removed=True)
+                removal = {"id": secrets.token_hex(16), "reference": str(ref), "kind": metadata["kind"],
+                               "provider": metadata.get("provider"), "actor": actor, "at": util.iso(), "removed": True}
                 raw = save_pending(item, dict(pending_binding(ref, settings, key), confirmed=confirmed,
                                               removal=removal))
             if legacy is not None:

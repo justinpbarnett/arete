@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, replace
+from types import MappingProxyType
 
 from . import config, owner_asks, prompt_loader, routing, steps, verification_attempts
 from .agent import BUILD_TOOLS, READ_TOOLS, traits_of
@@ -138,7 +139,7 @@ def operations(protocol, *, spec=False):
 class Catalog:
     protocol = PROTOCOL
 
-    private_route = {}
+    private_route = MappingProxyType({})
 
     def __init__(self, job, protocol=PROTOCOL, private_worker_model=""):
         self.protocol = protocol

@@ -178,7 +178,7 @@ class GitHub:
             pilot.require((settings["id"], settings["nameWithOwner"]) == (self.identity.node, self.identity.name),
                           "GitHub returned merge settings for a different repository")
             reported = settings["squashMergeAllowed"], settings["autoMergeAllowed"]
-            pilot.require(all(value is None or value is checked for value, checked in zip((squash, auto), reported)),
+            pilot.require(all(value is None or value is checked for value, checked in zip((squash, auto), reported, strict=True)),
                           "GitHub reported conflicting merge settings")
             squash, auto = reported
         pilot.require(squash is True and auto is False, "GitHub must allow squash and disable deferred auto-merge")

@@ -35,7 +35,7 @@ def show(panel: dict, what: str, draw) -> None:
 def print_table(rows: list[tuple[str, ...]], width: int, indent: str = "  ") -> None:
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
     for row in rows:
-        print((indent + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) + " " + row[-1])[:width].rstrip())
+        print((indent + " ".join(f"{cell:<{w}}" for cell, w in zip(row, widths, strict=False)) + " " + row[-1])[:width].rstrip())
 
 
 def print_checks(h: dict) -> None:
@@ -246,7 +246,8 @@ def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False, 
             if on_start is not None:
                 on_start()
                 on_start = None
-            for after, rendered in lines:
+            for line_id, rendered in lines:
+                after = line_id
                 print(rendered, flush=True)
             return status == "running"
 

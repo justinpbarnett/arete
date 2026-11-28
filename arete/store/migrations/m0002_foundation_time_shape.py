@@ -51,11 +51,11 @@ def apply(conn):
     for table, columns in TIME_COLUMNS.items():
         for column in columns:
             bad = f'"{column}" IS NOT NULL AND "{column}" != \'\' AND "{column}" NOT GLOB ?'
-            if conn.execute(f'SELECT 1 FROM "{table}" WHERE {bad} '
+            if conn.execute(f'SELECT 1 FROM "{table}" WHERE {bad} '  # noqa: S608
                             f'AND strftime(\'%Y-%m-%dT%H:%M:%SZ\', "{column}") IS NULL LIMIT 1',
                             (TIME_GLOB,)).fetchone():
                 raise ValueError(f"{table}.{column}: unreadable timestamp")
-            conn.execute(f'UPDATE "{table}" SET "{column}" = strftime(\'%Y-%m-%dT%H:%M:%SZ\', "{column}") '
+            conn.execute(f'UPDATE "{table}" SET "{column}" = strftime(\'%Y-%m-%dT%H:%M:%SZ\', "{column}") '  # noqa: S608
                          f'WHERE {bad}', (TIME_GLOB,))
         invalid = " OR ".join(f'(NEW."{c}" IS NOT NULL AND NEW."{c}" != \'\' '
                               f'AND NEW."{c}" NOT GLOB \'{TIME_GLOB}\')' for c in columns)

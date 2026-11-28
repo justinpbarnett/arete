@@ -170,9 +170,7 @@ def _qa_authorized(tk, repo, policy, actor):
         return True
     if isinstance(tk, tracker.GitHubTracker) and repo.commenters:
         return actor.casefold() in {c.casefold() for c in repo.commenters}
-    if isinstance(tk, tracker.JiraTracker) and policy.get("qa_authority") in ("tracker", "team"):
-        return True
-    return False
+    return bool(isinstance(tk, tracker.JiraTracker) and policy.get("qa_authority") in ("tracker", "team"))
 
 
 def _release_owner_authorized(tk, policy, actor):

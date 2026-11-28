@@ -366,8 +366,8 @@ def prerequisite_reads(release: config.Repo | None, refs: set[tuple[str, int]], 
             pulls = gh.prerequisite_pulls(repo, number)
         except gh.GhError:
             return None
-        return [dict(key=f"{name}#{n}", url=f"https://github.com/{name}/pull/{n}", state=state,
-                     merge_commit=commit, deployed_release=deployed(name, base, commit))
+        return [{"key": f"{name}#{n}", "url": f"https://github.com/{name}/pull/{n}", "state": state,
+                     "merge_commit": commit, "deployed_release": deployed(name, base, commit)}
                 for (name, n), (state, base, commit) in sorted(pulls.items()) if (name, n) not in follow_up]
 
     return {f"{repo}#{number}": read(repo, number) for repo, number in sorted(refs)}
@@ -442,7 +442,7 @@ def retry_blocker(retry: dict) -> tuple[dict | None, set[Signature]]:
     if verification and verification.data.get("ending") == "environment-held":
         checks = (verification.data.get("verified") or {}).get("checks", [])
         found = {sig for check in checks if (sig := check_signature(check))}
-        return (None if found else dict(kind="verification", causes={"verify": "Verification did not pass"})), found
+        return (None if found else {"kind": "verification", "causes": {"verify": "Verification did not pass"}}), found
     if not verification or not verification.passed:
         return None, set()
     if (checks := finished.get("checks")) and not checks.passed:

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
@@ -269,7 +269,7 @@ def check_replay(where, deadline):
 
 
 def instance_response(where, deadline):
-    options = dict(read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
+    options = {"read_seconds": CONNECT_SECONDS, "where": where, "buffered": True, "deadline": deadline}
     try:
         return request_once("GET", META, **options)
     except Restarting as error:
@@ -617,10 +617,8 @@ def transport_budget(transport, deadline):
 
     def expire():
         # Closing alone leaves makefile() reads alive; interrupt this socket object.
-        try:
+        with suppress(OSError):
             transport.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
 
     timer = threading.Timer(budget_left(deadline), expire)
     timer.name = "arete-http-deadline"
@@ -851,7 +849,7 @@ def keyed_call(body, key, *, deadline=None):
             uncertain, pause = True, RETRY_SECONDS if restart is not None else 0
         except (Broken, InFlight) as e:
             if restart is not None and time.monotonic() >= deadline:
-                raise restart
+                raise restart from e
             failure, pause = e, getattr(e, "seconds", RETRY_SECONDS if restart is not None else 0)
             uncertain = True
         except Restarting as e:

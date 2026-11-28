@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 
@@ -258,9 +258,8 @@ class SandboxAndLocalPathsConfinementTests(unittest.TestCase):
             with self.assertRaises(sandbox.ConfinementUnavailable):
                 scratch.exposure(root, [Path(f"{root}/bad\x00grant")])
             self.assertFalse(local_paths.verify_sandbox_owned(Path(f"{root}/bad\x00name")))
-            with self.assertRaises(PermissionError):
-                with local_paths.directory_fd(Path(f"{root}/bad\x00name")):
-                    pass
+            with self.assertRaises(PermissionError), local_paths.directory_fd(Path(f"{root}/bad\x00name")):
+                pass
 
     def test_deterministic_confinement_fuzz_never_crashes(self):
         rng = random.Random(303)
@@ -272,22 +271,17 @@ class SandboxAndLocalPathsConfinementTests(unittest.TestCase):
                 self.assertIsInstance(local_paths.inside_scratch(Path(sample)), bool)
                 self.assertIsInstance(local_paths.is_verify_sandbox_path(sample), bool)
                 self.assertIsInstance(local_paths.verify_sandbox_owned(Path(sample)), bool)
-                try:
+                with suppress(sandbox.ConfinementUnavailable):
                     sandbox.canonical(Path(sample))
-                except sandbox.ConfinementUnavailable:
-                    pass
-                try:
+                with suppress(sandbox.ConfinementUnavailable):
                     scratch.exposure(Path(sample), [root])
-                except sandbox.ConfinementUnavailable:
-                    pass
 
 
 class GitDiffGuardAndWorkspaceInjectionTests(unittest.TestCase):
     def test_git_ref_validation_and_option_injection_guards(self):
         for bad_ref in ("", "--upload-pack=evil", "-b", "main\nfoo", "main foo", "a\x00b"):
-            with self.subTest(bad_ref=bad_ref):
-                with self.assertRaises(ValueError):
-                    util.validate_git_ref(bad_ref)
+            with self.subTest(bad_ref=bad_ref), self.assertRaises(ValueError):
+                util.validate_git_ref(bad_ref)
 
         wt = Path("/tmp/fake-wt")
         with self.assertRaises(ValueError):
@@ -317,9 +311,8 @@ class GitDiffGuardAndWorkspaceInjectionTests(unittest.TestCase):
 
     def test_sessions_spec_file_and_workspace_remove_untracked_block_traversal(self):
         for bad_id in ("", ".", "..", "../escape", "a/b", "/abs", "ses\x00id"):
-            with self.subTest(bad_id=bad_id):
-                with self.assertRaises(ValueError):
-                    sessions.spec_file(bad_id)
+            with self.subTest(bad_id=bad_id), self.assertRaises(ValueError):
+                sessions.spec_file(bad_id)
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td).resolve()
@@ -328,9 +321,8 @@ class GitDiffGuardAndWorkspaceInjectionTests(unittest.TestCase):
             outside = root / "outside.txt"
             outside.write_text("keep me\n")
             for bad_name in ("../outside.txt", str(outside), "sub/../../outside.txt", "a\x00b"):
-                with self.subTest(bad_name=bad_name):
-                    with self.assertRaises(ValueError):
-                        workspace.remove_untracked(wt, bad_name)
+                with self.subTest(bad_name=bad_name), self.assertRaises(ValueError):
+                    workspace.remove_untracked(wt, bad_name)
             self.assertTrue(outside.exists())
 
     def test_deterministic_git_and_vault_fuzz_never_crashes(self):

@@ -354,4 +354,4 @@ def purge(c, run_id: str) -> None:
                         builder_workspaces.release(candidate)
             tables[:0] = ["orchestration_messages", "orchestration_workers"]
         for table in tables:
-            c.execute(f"DELETE FROM {table} WHERE root = ?", (row["root"],))
+            c.execute(f"DELETE FROM {table} WHERE root = ?", (row["root"],))  # noqa: S608

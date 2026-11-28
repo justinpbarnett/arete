@@ -175,7 +175,9 @@ def exclude_retained(c, run_column):
     validate_identifier(run_column, qualified=True)
     if not installed(c):
         return ""
-    return (f" AND NOT EXISTS (SELECT 1 FROM factory_targets f WHERE f.id={run_column} "
+    if run_column not in ("q.run_id", "l.run_id"):
+        raise ValueError(f"invalid run column: {run_column!r}")
+    return (f" AND NOT EXISTS (SELECT 1 FROM factory_targets f WHERE f.id={run_column} "  # noqa: S608
             "AND f.phase IN ('stopping','paused','starting','held')) ")
 
 

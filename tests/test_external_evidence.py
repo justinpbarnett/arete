@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from arete import config, external_evidence, pipeline, prompt_loader, ticket_media, tracker
+from arete import config, external_evidence, pipeline, prompt_loader, tracker
 from tests.test_ticket_media import make_mp4_stub, make_png, stub_keyframes
 
 

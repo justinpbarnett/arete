@@ -77,7 +77,7 @@ def unfinished_resumes(statuses: tuple[str, ...], account_prefix: str) -> list[t
             AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline'
                             AND later.repo = r.repo AND later.issue = r.issue AND later.rowid > r.rowid
                             AND COALESCE(later.only_step, '') = '')
-            """, (pattern, pattern, *statuses))]
+            """, (pattern, pattern, *statuses))]  # noqa: S608
 
 
 def check_legacy_accounts() -> list[Check]:

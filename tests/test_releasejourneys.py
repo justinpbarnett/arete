@@ -184,7 +184,7 @@ class ReleaseJourneyTests(unittest.TestCase):
         if argv == releasejourneys.SETTINGS_ACTION:
             out = io.StringIO()
             with patch.multiple(paths, CONFIG_FILE=config, ISOLATED=True), contextlib.redirect_stdout(out):
-                exec(releasejourneys.SETTINGS_PROBE, {})
+                exec(releasejourneys.SETTINGS_PROBE, {})  # noqa: S102
             return 0, out.getvalue().encode()
         if argv[0] == "init":
             if config.exists() and "--force" not in argv and not overwrite:

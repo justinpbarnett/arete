@@ -141,7 +141,7 @@ def update(principal, **fields):
     if not fields or set(fields) - {"name", "kind", "role", "status", "external", "removed_at"}:
         raise ValueError("invalid principal fields")
     with foundation.tx() as c:
-        if not c.execute(f"UPDATE principals SET {', '.join(k + ' = ?' for k in fields)}, version = version + 1 "
+        if not c.execute(f"UPDATE principals SET {', '.join(k + ' = ?' for k in fields)}, version = version + 1 "  # noqa: S608
                          "WHERE id = ?", (*fields.values(), principal)).rowcount:
             raise KeyError(principal)
         if fields.keys() & {"kind", "role", "status"}:
@@ -154,7 +154,7 @@ def update(principal, **fields):
 def listing(**filters):
     filters = {k: v for k, v in filters.items() if k in ("id", "kind", "role", "status") and v}
     with foundation.reader() as c:
-        rows = c.execute("SELECT id, version, kind, name, role, status, created FROM principals" +
+        rows = c.execute("SELECT id, version, kind, name, role, status, created FROM principals" +  # noqa: S608
                          (" WHERE " + " AND ".join(k + ' = ?' for k in filters) if filters else "") +
                          " ORDER BY created, id", tuple(filters.values()))
         return [{**dict(r), "subject": f"principal:{r['id']}"} for r in rows]

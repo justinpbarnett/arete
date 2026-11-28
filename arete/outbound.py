@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import re
 import socket
 import tomllib
@@ -48,10 +49,8 @@ def keep_private(*hosts: str) -> None:
 
 
 def keep_verify_private(url: str) -> None:
-    try:
+    with contextlib.suppress(ValueError):
         keep_private(urlsplit(re.sub(r"\{port\d*\}", "0", url)).hostname or "")
-    except ValueError:
-        pass
 
 
 def keep_configured_private() -> None:

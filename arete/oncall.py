@@ -406,7 +406,7 @@ def bounded(scope: str, rule: frozenset[tuple[str, str]]) -> str:
 
 
 def fingerprint_of(kind: str, scope: str, signature: str) -> str:
-    return hashlib.sha1(f"{kind}\n{scope}\n{signature}".encode()).hexdigest()[:16]
+    return hashlib.sha1(f"{kind}\n{scope}\n{signature}".encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 def questions(policies: Policies, incident: dict) -> dict[str, dict]:
@@ -425,7 +425,7 @@ def subject(incident: dict) -> str:
 
 
 def shapes(evidence: str) -> set[str]:
-    return {hashlib.sha1(sources.signature(line).encode()).hexdigest()[:8]
+    return {hashlib.sha1(sources.signature(line).encode(), usedforsecurity=False).hexdigest()[:8]
             for line in evidence.splitlines() if FAILURE.search(line)}
 
 

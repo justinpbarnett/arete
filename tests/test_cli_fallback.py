@@ -257,7 +257,7 @@ class CliRouteFallbackTests(unittest.TestCase):
             "POST /api/tasks": {"run": "r1", "task": "t-1234", "state": "running"},
             "GET /api/tasks": {"tasks": [summary, parent_summary]},
             **{route: {**row, "comments": [], "runs": [], "children": []}
-               for route, row in zip(task_details, (task, parent))},
+               for route, row in zip(task_details, (task, parent), strict=True)},
             "GET /api/v1/tasks": {"seq": seq, "tasks": [parent, task]},
             "POST /api/runs/r1/stop": stop, "POST /api/v1/runs/r1/stop": {"seq": seq, **stop},
             "POST /api/asks/1/answer": {}, "POST /api/runs/r1/resume": {}, "POST /api/runs/r1/repair": {},
@@ -285,7 +285,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         }
         after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
                  "session start --attach work": [info, feed, info, feed, info]}
-        values = dict(task="t-1234", run="r1", session="r1", id=1, step="build", name="example", chat=1)
+        values = {"task": "t-1234", "run": "r1", "session": "r1", "id": 1, "step": "build", "name": "example", "chat": 1}
         command_values = {
             "webhook example": dict(values, id="example"),
             "webhook example --rotate": dict(values, loop="example"),
@@ -492,10 +492,11 @@ class CliRouteFallbackTests(unittest.TestCase):
             return legacy_status, {"error": "The legacy request failed.", "code": "legacy_error"}, {"Retry-After": "0"}
 
         with self.stub(response), mock.patch.object(client, "RESTART_WAIT_SECONDS", 0):
-            for status, reason, headers in ((404, "not_found", {}), (405, "method_not_allowed", {}),
-                                            (409, "unknown_route", {}),
-                                            (422, "unknown_route", {}), (503, "unknown_route", {}),
-                                            (503, "draining", {"Retry-After": "0"})):
+            for status, reason, case_headers in ((404, "not_found", {}), (405, "method_not_allowed", {}),
+                                                 (409, "unknown_route", {}),
+                                                 (422, "unknown_route", {}), (503, "unknown_route", {}),
+                                                 (503, "draining", {"Retry-After": "0"})):
+                headers = case_headers
                 with self.subTest(status=status, reason=reason):
                     seen.clear()
                     self.problem("stop r1", reason)

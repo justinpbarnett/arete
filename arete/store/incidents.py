@@ -95,7 +95,7 @@ def update_incident(incident_id: int, note: str = "", **fields) -> None:
         fields["closed"] = util.iso()
     with db() as c:
         if fields:
-            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",  # noqa: S608
                       (*fields.values(), incident_id))
         if note:
             c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
@@ -126,7 +126,7 @@ def set_repair(repair_id: int, **fields) -> None:
     if not fields:
         return
     with db() as c:
-        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",  # noqa: S608
                   (*fields.values(), repair_id))
 
 
@@ -142,7 +142,7 @@ def parsed(row: dict) -> dict:
 def incidents(connect=reader, limit: int = 200, open_first: bool = False) -> list[dict]:
     order = "state != 'open', " if open_first else ""
     with connect() as c:
-        return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "
+        return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "  # noqa: S608
                                                    "LIMIT ?", (limit,))]
 
 
@@ -201,11 +201,11 @@ def prune(c, days: float = 14, keep_days: float = 30) -> None:
     since = util.iso(util.now() - timedelta(days=days))
     old = util.iso(util.now() - timedelta(days=days * 4))
     kept = util.iso(util.now() - timedelta(days=keep_days))
-    done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"
+    done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"  # noqa: S608
     c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (since, f"{SEEN_AGAIN}:%"))
-    c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))
-    c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))
-    c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))
+    c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))  # noqa: S608
+    c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))  # noqa: S608
+    c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))  # noqa: S608
     c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)")
     c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
     c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
@@ -221,7 +221,7 @@ def write_alias(c, fingerprint: str, incident_id: int, note: str) -> None:
 def write_mark(c, incident_id: int, fields: dict, note: str) -> None:
     validate_columns(fields, INCIDENT_UPDATABLE_FIELDS, "incidents")
     if fields:
-        c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
+        c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",  # noqa: S608
                   (*fields.values(), incident_id))
     c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
               (incident_id, util.iso(), note))

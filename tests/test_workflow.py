@@ -73,9 +73,9 @@ class ParallelDurationHistoryTests(unittest.TestCase):
         def record_result(item):
             _, batch = item
             started.append(batch.identifier)
-            runner.results[batch.identifier] = dict(
-                ran=batch.count, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5,
-            )
+            runner.results[batch.identifier] = {
+                "ran": batch.count, "errors": [], "failures": [], "skipped": [], "unexpected": [], "seconds": 2.5,
+            }
 
         with mock.patch.object(runner, "child", new=record_result), redirect_stdout(StringIO()):
             self.assertEqual(runner.run(tests), 0)
@@ -94,7 +94,7 @@ class ParallelDurationHistoryTests(unittest.TestCase):
         self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
         runner = parallel.Runner(SimpleNamespace(slowest=0))
         runner.folder = tempfile.mkdtemp(dir=self.history.parent)
-        runner.results[self.b] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5)
+        runner.results[self.b] = {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [], "seconds": 2.5}
         first_writer = """
 import os
 import sys
@@ -308,7 +308,7 @@ class ParallelClassDeadlineTests(unittest.TestCase):
 
             with mock.patch.object(time, "sleep", side_effect=sleep):
                 Sleeper("test_sleep").test_sleep()
-            result = json.dumps(dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[]))
+            result = json.dumps({"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": []})
 
         def start(*args, **kwargs):
             getloadavg.assert_called_once_with()
@@ -608,9 +608,9 @@ class PipelineNoSlotTests(unittest.TestCase):
         self.assertTrue(record.move(run, "pr", ("running",), pr_url=url))
         with redirect_stdout(StringIO()):
             pipeline.run_lines.write(run, "execution", path=path)
-        pipeline.insights_store.add_feedback([dict(pr_url=url, kind="comment", gh_id=1, repo=self.repo.name, issue=tid,
-                                                   body="Please revise", created="2026-01-01T00:00:00Z",
-                                                   status="new", pr_state="OPEN")])
+        pipeline.insights_store.add_feedback([{"pr_url": url, "kind": "comment", "gh_id": 1, "repo": self.repo.name, "issue": tid,
+                                                   "body": "Please revise", "created": "2026-01-01T00:00:00Z",
+                                                   "status": "new", "pr_state": "OPEN"}])
 
     def assert_original_refusal(self, line, name="fixture#765"):
         self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
@@ -902,18 +902,18 @@ class PrepareResumeTests(unittest.TestCase):
     def test_interrupted_prepare_still_refuses_resume(self):
         first = self.controller("first")
         prepare = mock.Mock(side_effect=RuntimeError("prepare interrupted"))
-        with mock.patch.dict(factory.STEPS, prepare=prepare):
-            with self.assertRaisesRegex(RuntimeError, "prepare interrupted"):
-                first.prepare()
+        with (mock.patch.dict(factory.STEPS, prepare=prepare),
+              self.assertRaisesRegex(RuntimeError, "prepare interrupted")):
+            first.prepare()
         saved = ledger.snapshot(first.lease)["data"]
         self.assertIs(saved["preparing"], True)
         self.assertNotIn("prepared", saved)
         record.settle(first.run.id, "interrupted")
         resumed = self.controller("resumed", first.run.id)
         prepare.reset_mock()
-        with mock.patch.dict(factory.STEPS, prepare=prepare):
-            with self.assertRaisesRegex(factory.Refused, "preparation was interrupted before durable workspace authority"):
-                resumed.prepare()
+        with (mock.patch.dict(factory.STEPS, prepare=prepare),
+              self.assertRaisesRegex(factory.Refused, "preparation was interrupted before durable workspace authority")):
+            resumed.prepare()
         prepare.assert_not_called()
 
 
@@ -1718,10 +1718,10 @@ class RestoredPRRevisionTests(unittest.TestCase):
             return self.head
 
         with (mock.patch.object(pipeline, "git", return_value="") as git,
-              mock.patch.object(workspace, "remote_head", side_effect=remote_head)):
-            with self.assertRaisesRegex(orchestration.RetargetedPR, "from `main` to `release`"):
-                pipeline.push_caught_up_head(self.job.b, c, self.job.branch, "catch-up-head",
-                                             check_targets=self.job.check_publication_targets)
+              mock.patch.object(workspace, "remote_head", side_effect=remote_head),
+              self.assertRaisesRegex(orchestration.RetargetedPR, "from `main` to `release`")):
+            pipeline.push_caught_up_head(self.job.b, c, self.job.branch, "catch-up-head",
+                                         check_targets=self.job.check_publication_targets)
         git.assert_called_once_with(["diff", "--cached", "--name-only"], c.wt)
         self.assertEqual(self.pr_details.call_args_list, [mock.call(c.pr)] * 3)
 
@@ -3927,9 +3927,9 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
             self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
             failed_ci = ci.SECTION.search(self.pr_text).group().strip()
             self.assertNotIn(measurement, self.pr_text)
-            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
-                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
-                    controller.publish(self.disclosure)
+            with (mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")),
+                  self.assertRaisesRegex(ValueError, "could not update the unverified requirement")):
+                controller.publish(self.disclosure)
             self.assertTrue(controller.data["ci_failed"])
             gh.gh.assert_not_called()
             controller.finish_publication.assert_not_called()
@@ -3962,9 +3962,9 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
                     {"what": self.disclosure["requirement"], "how": "Run the class alone", "saw": "4.2 s", "passed": True},
                 ],
             })
-            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
-                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
-                    controller.publish()
+            with (mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")),
+                  self.assertRaisesRegex(ValueError, "could not update the unverified requirement")):
+                controller.publish()
             self.assertTrue(controller.data["ci_failed"])
             self.assertEqual(self.pr_text, ci.with_section(published, failed_ci))
             gh.gh.assert_not_called()
@@ -4417,9 +4417,9 @@ class RedPublicationLifecycleTests(PublicationFixture):
         self.assertTrue(self.build.restage().empty)
 
         action = {**self.action, "op": "run.finish", "request": {"reason": "noop"}}
-        with mock.patch.object(flows, "finish", return_value=("pr", "No change needed.", self.checkout.pr)) as finish:
-            with self.assertRaisesRegex(ValueError, r"retry CI through publication\.request, repair, or finish failed"):
-                controller.perform(action)
+        with (mock.patch.object(flows, "finish", return_value=("pr", "No change needed.", self.checkout.pr)) as finish,
+              self.assertRaisesRegex(ValueError, r"retry CI through publication\.request, repair, or finish failed")):
+            controller.perform(action)
 
         finish.assert_not_called()
         self.assertIsNone(controller.ending)
@@ -5249,9 +5249,9 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.publication_job(repo, branch, verified=verify.Verified("pass"))
         controller.stamp("verify", {"verdict": "pass"})
 
-        with mock.patch.object(pipeline, "commit_and_push", side_effect=AssertionError("unexpected push")) as push:
-            with self.assertRaisesRegex(workspace.RunFailed, "the final orchestrated tree undid every change"):
-                controller.dispatch(self.action)
+        with (mock.patch.object(pipeline, "commit_and_push", side_effect=AssertionError("unexpected push")) as push,
+              self.assertRaisesRegex(workspace.RunFailed, "the final orchestrated tree undid every change")):
+            controller.dispatch(self.action)
         push.assert_not_called()
         self.assertEqual(self.git("diff", "--cached", "--name-only", c.base_commit), "")
         self.assertNotIn("publication_intent", controller.data)
@@ -5268,9 +5268,9 @@ class PendingBaseMergePublicationTests(PublicationFixture):
             return push(args, cwd) if args[0] == "push" else util.git(args, cwd, **kw)
 
         with (mock.patch.object(workspace, "remote_head", return_value=c.lease),
-              mock.patch.object(pipeline, "git", side_effect=git)):
-            with self.assertRaisesRegex(workspace.RunFailed, "the push to fixture/repo failed"):
-                controller.dispatch(self.action)
+              mock.patch.object(pipeline, "git", side_effect=git),
+              self.assertRaisesRegex(workspace.RunFailed, "the push to fixture/repo failed")):
+            controller.dispatch(self.action)
         push.assert_called_once_with(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch],
                                      self.root)
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
@@ -5906,24 +5906,25 @@ class CatchUpRepairFixture(PublicationFixture):
             self.labels.update(add)
 
         patches = {
-            pipeline: dict(git=mock.Mock(side_effect=git), run_checks=mock.Mock(side_effect=check, wraps=pipeline.run_checks),
-                           check_in_use=mock.Mock(side_effect=verification), _review=mock.Mock(side_effect=review),
-                           release_workspace=mock.DEFAULT),
-            workspace: dict(fetch=mock.DEFAULT, remote_head=mock.Mock(side_effect=lambda *_: self.head)),
-            runlimits: dict(branch_head=mock.Mock(side_effect=lambda *_: self.head)),
-            ci: dict(watch=mock.Mock(side_effect=ci_watch)),
-            jev: dict(ready=mock.Mock(return_value=True), risk=mock.Mock(return_value=SimpleNamespace(hold=""))),
-            gh: dict(open_pr_url=mock.Mock(return_value=""), pr_create=mock.Mock(side_effect=create_pr),
-                     pr_merge_details=mock.Mock(side_effect=lambda _: {"state": "OPEN", "isDraft": self.draft,
+            pipeline: {"git": mock.Mock(side_effect=git),
+                       "run_checks": mock.Mock(side_effect=check, wraps=pipeline.run_checks),
+                       "check_in_use": mock.Mock(side_effect=verification), "_review": mock.Mock(side_effect=review),
+                       "release_workspace": mock.DEFAULT},
+            workspace: {"fetch": mock.DEFAULT, "remote_head": mock.Mock(side_effect=lambda *_: self.head)},
+            runlimits: {"branch_head": mock.Mock(side_effect=lambda *_: self.head)},
+            ci: {"watch": mock.Mock(side_effect=ci_watch)},
+            jev: {"ready": mock.Mock(return_value=True), "risk": mock.Mock(return_value=SimpleNamespace(hold=""))},
+            gh: {"open_pr_url": mock.Mock(return_value=""), "pr_create": mock.Mock(side_effect=create_pr),
+                 "pr_merge_details": mock.Mock(side_effect=lambda _: {"state": "OPEN", "isDraft": self.draft,
                          "headRefOid": self.head, "baseRefName": "main", "baseRefOid": self.base}),
-                     pr_body=mock.Mock(side_effect=lambda _: self.body), pr_edit_body=mock.Mock(side_effect=edit_body),
-                     pr_comment=mock.DEFAULT, find_own_pr_comment=mock.Mock(return_value=None),
-                     pr_set_draft=mock.Mock(side_effect=lambda _, draft: setattr(self, "draft", draft)),
-                     pr_draft_and_head=mock.Mock(side_effect=lambda _: (self.draft, self.head)),
-                     merge_readiness=mock.Mock(return_value=("", "")), pr_merge_auto=mock.Mock(side_effect=merge),
-                     issue_labels=mock.Mock(side_effect=label), issue_comment=mock.Mock(
+                     "pr_body": mock.Mock(side_effect=lambda _: self.body), "pr_edit_body": mock.Mock(side_effect=edit_body),
+                     "pr_comment": mock.DEFAULT, "find_own_pr_comment": mock.Mock(return_value=None),
+                     "pr_set_draft": mock.Mock(side_effect=lambda _, draft: setattr(self, "draft", draft)),
+                     "pr_draft_and_head": mock.Mock(side_effect=lambda _: (self.draft, self.head)),
+                     "merge_readiness": mock.Mock(return_value=("", "")), "pr_merge_auto": mock.Mock(side_effect=merge),
+                     "issue_labels": mock.Mock(side_effect=label), "issue_comment": mock.Mock(
                          side_effect=lambda _repo, _number, body: self.comments.append(body)),
-                     issue=mock.Mock(return_value={"labels": []})),
+                     "issue": mock.Mock(return_value={"labels": []})},
         }
         for module, replacements in patches.items():
             self.enterContext(mock.patch.multiple(module, **replacements))
@@ -7456,19 +7457,19 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                 controller.close()
 
         patches = {
-            pipeline: dict(merge_evidence_hold=mock.Mock(return_value=""), git=mock.Mock(side_effect=git),
-                           has_merge_base=mock.Mock(side_effect=lambda _, head, sha: caught_up.get(head, original_bases.get(head)) == sha),
-                           catch_up_base=mock.Mock(side_effect=catch_up), checkout_patch=mock.Mock(return_value="diff"),
-                           publish_gate_evidence=mock.DEFAULT, comment_catch_up_ci=mock.DEFAULT, note_review=mock.DEFAULT),
-            workspace: dict(fetch=mock.Mock(side_effect=fetch)),
-            gh: dict(pr_merge_details=mock.Mock(side_effect=lambda pr, repo="": {
+            pipeline: {"merge_evidence_hold": mock.Mock(return_value=""), "git": mock.Mock(side_effect=git),
+                           "has_merge_base": mock.Mock(side_effect=lambda _, head, sha: caught_up.get(head, original_bases.get(head)) == sha),
+                           "catch_up_base": mock.Mock(side_effect=catch_up), "checkout_patch": mock.Mock(return_value="diff"),
+                           "publish_gate_evidence": mock.DEFAULT, "comment_catch_up_ci": mock.DEFAULT, "note_review": mock.DEFAULT},
+            workspace: {"fetch": mock.Mock(side_effect=fetch)},
+            gh: {"pr_merge_details": mock.Mock(side_effect=lambda pr, repo="": {
                 "state": "OPEN", "isDraft": False, "headRefOid": heads[f"https://github.com/{repo}/pull/{pr}" if repo else pr],
                 "baseRefName": "main", "baseRefOid": base, "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE"}),
-                merge_ci_passed=mock.Mock(return_value=True), pr_merge_auto=mock.Mock(side_effect=merge),
-                pr_comment=mock.DEFAULT),
-            jev: dict(ready=mock.Mock(return_value=True), risk=mock.Mock(return_value=SimpleNamespace(hold=""))),
-            ci: dict(watch=mock.Mock(side_effect=watch_ci)),
-            flows: dict(ended=mock.Mock(return_value=("pr", "published", ""))),
+                "merge_ci_passed": mock.Mock(return_value=True), "pr_merge_auto": mock.Mock(side_effect=merge),
+                "pr_comment": mock.DEFAULT},
+            jev: {"ready": mock.Mock(return_value=True), "risk": mock.Mock(return_value=SimpleNamespace(hold=""))},
+            ci: {"watch": mock.Mock(side_effect=watch_ci)},
+            flows: {"ended": mock.Mock(return_value=("pr", "published", ""))},
         }
         for module, replacements in patches.items():
             self.enterContext(mock.patch.multiple(module, **replacements))
@@ -7502,7 +7503,7 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
             self.assertEqual(second_result.result(timeout=1.5)["ending"], "pr")
         self.assertEqual(merged, [1, 2])
         self.assertEqual((first.job.b.catch_ups, second.job.b.catch_ups), (2 if ci_after_base_move else 1, 1))
-        self.assertEqual(set(sha for pr, sha in reads if pr == b.pr), {"main-after-1"})
+        self.assertEqual({sha for pr, sha in reads if pr == b.pr}, {"main-after-1"})
         self.assertEqual(slots.runs_waiting_for_merge_lease(), [])
         gh.pr_comment.assert_not_called()
 
@@ -7842,9 +7843,8 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
 
         worker.close.side_effect = close
         with (mock.patch.object(pipeline, "keep_edits") as keep,
-              mock.patch.object(util, "group_alive", return_value=True)):
-            with self.assertRaises(RuntimeError) as raised:
-                self.ctrl.drive()
+              mock.patch.object(util, "group_alive", return_value=True), self.assertRaises(RuntimeError) as raised):
+            self.ctrl.drive()
         self.assertIs(raised.exception, error)
         worker.close.assert_called_once_with()
         self.assertEqual(ledger.actions(self.ctrl.lease)[0]["state"], "running")
@@ -8555,9 +8555,9 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
               mock.patch.object(first, "publication_ci", return_value=None),
               mock.patch.object(pipeline, "commit_and_push", side_effect=OSError("lost push reply")) as push,
-              mock.patch.object(pipeline.time, "sleep")):
-            with self.assertRaises(pipeline.CatchUpPushUnconfirmed) as unconfirmed:
-                first.publish()
+              mock.patch.object(pipeline.time, "sleep"),
+              self.assertRaises(pipeline.CatchUpPushUnconfirmed) as unconfirmed):
+            first.publish()
         first.release_merge_lease()
         self.assertTrue(unconfirmed.exception.retryable)
         self.assertEqual(push.call_count, 3)
@@ -9415,7 +9415,7 @@ assert secretstore.read('global', 'OPENAI_API_KEY') == b'offline-deploy-key'
                    "approvals", "rotate_when_due", "prune_when_due", "sweep_when_due", "sweep_workspaces_when_due",
                    "expire_asks", "release_closed_when_due", "remind")
         with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
-                                  **{action: mock.DEFAULT for action in actions}) as stages,
+                                  **dict.fromkeys(actions, mock.DEFAULT)) as stages,
               mock.patch.object(db, "ensure_schema"),
               mock.patch.object(serve.loop_store, "loop_states", return_value={}),
               mock.patch.object(serve.codebase, "RELEASE", ""),
@@ -10135,7 +10135,7 @@ sys.exit(int(sys.stdin.read()))
                          add_dirs=[self.added], auth=accounts.Auth(), timeout=3)
 
     def settings(self, argv):
-        return tomllib.loads("\n".join(value for flag, value in zip(argv, argv[1:]) if flag == "-c"))
+        return tomllib.loads("\n".join(value for flag, value in zip(argv, argv[1:], strict=False) if flag == "-c"))
 
     def grants(self, settings, profile):
         self.assertEqual(settings["default_permissions"], profile)
@@ -11925,7 +11925,7 @@ class MinerGitHubTransportTests(unittest.TestCase):
             ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/9/merge", "--input", "-"],
         ]
         replies = [subprocess.CompletedProcess(cmd, 0, body, "") for cmd, body in
-                   zip(commands, ['{"login":"operator"}', "", '{"merged":true}'])]
+                   zip(commands, ['{"login":"operator"}', "", '{"merged":true}'], strict=True)]
         with mock.patch.object(util, "sh_with_network", side_effect=replies) as transport, \
                 mock.patch.object(gh, "merge_readiness", return_value=("", "")):
             self.assertEqual(gh.me.__wrapped__(), "operator")
@@ -13419,7 +13419,7 @@ class MinerLifecycleTests(unittest.TestCase):
             unobserved_grade = verify.Verified("fail", checks=[{**observed_failure, "saw": "Service unavailable"}])
             unavailable_grade = verify.Verified("fail", checks=[{**observed_failure, "saw": "exit 126: unavailable"}])
             timeout_command = subprocess.TimeoutExpired(task.check, 60)
-            for baseline_grade, candidate_grade, candidate_command, exit_code, closes in (
+            for baseline_grade, candidate_grade, command, exit_code, closes in (
                 (passed, failed, timeout_command, 124, True),
                 (passed, failed, subprocess.CompletedProcess(task.check, 127, "", "command not found"), 127, True),
                 (passed, blocked_with_failure, timeout_command, 124, True),
@@ -13429,6 +13429,7 @@ class MinerLifecycleTests(unittest.TestCase):
                 (passed, unavailable_grade, timeout_command, 124, False),
                 (timeout_grade, failed, timeout_command, 124, False),
             ):
+                candidate_command = command
                 with self.subTest(main=baseline_grade, candidate=candidate_grade, exit_code=exit_code):
                     self.calls.clear()
                     self.comments.clear()

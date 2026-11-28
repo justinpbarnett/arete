@@ -35,8 +35,8 @@ def poll_fixture(root, state, *, dry_run=False, can_start=False, preflight=None,
     cfg = config.Config(repos=[repo])
     number = FOLLOW_UP if dependencies else TICKET
     labels = (tracker.LABEL, "agent:pr") if at_capacity and held is None else (tracker.LABEL,)
-    ticket = dict(number=number, title="Follow-up", state="OPEN", author={"login": "owner"}, createdAt=FINISHED,
-                  labels=[{"name": label} for label in labels], body="" if state == "removed" else "Waits on #41\nUnrelated: #99")
+    ticket = {"number": number, "title": "Follow-up", "state": "OPEN", "author": {"login": "owner"}, "createdAt": FINISHED,
+                  "labels": [{"name": label} for label in labels], "body": "" if state == "removed" else "Waits on #41\nUnrelated: #99"}
     listed = {number: ticket}
     if held is not None:
         listed[READY] = dict(ticket, number=READY, title="Ready", body="", createdAt=STARTED)
@@ -139,7 +139,7 @@ class ProgressFixture(unittest.TestCase):
         seed_db(self.root / "state")
 
     def run_row(self, run_id, status="running", **fields):
-        runs.insert_run(run_id, dict(kind="pipeline", repo=REPO, issue=self.issue, status=status, started=self.started) | fields)
+        runs.insert_run(run_id, {"kind": "pipeline", "repo": REPO, "issue": self.issue, "status": status, "started": self.started} | fields)
 
     def fields(self, row, **expected):
         self.assertEqual({key: row[key] for key in expected}, expected)
@@ -334,7 +334,7 @@ class TicketProgressTests(ProgressFixture):
         self.assertIn("workspace becomes restorable", saved["next_event"])
 
     def assert_capacity_scan(self, held):
-        options = dict(at_capacity=True, held=held)
+        options = {"at_capacity": True, "held": held}
         self.assertEqual(poll_dependencies(self.root, "open", dry_run=True, **options), {})
         self.assertEqual((self.progress(FOLLOW_UP), sources.tickets_passed_over()), ({}, []))
         skips = poll_dependencies(self.root, "open", **options)

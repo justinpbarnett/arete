@@ -19,6 +19,7 @@ from . import accounts, config, contract, outbound, paths, refusals, util
 from .store import db as foundation
 from .store import inbox as inbox_store
 from .store import push as push_store
+import contextlib
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
@@ -80,10 +81,8 @@ def private_key_file() -> Path:
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(pem)
-            try:
+            with contextlib.suppress(FileExistsError):
                 os.link(temp, target)
-            except FileExistsError:
-                pass
         finally:
             os.unlink(temp)
     if stat.S_IMODE(target.stat().st_mode) & 0o077:
@@ -141,8 +140,8 @@ def subject(cfg: config.Config, row: dict) -> str:
 
 
 def post(endpoint: str, headers: dict) -> int:
-    request = urllib.request.Request(endpoint, data=b"", headers=headers, method="POST")
     try:
+        request = util.http_request(endpoint, data=b"", headers=headers, method="POST")
         with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as reply:
             return reply.status
     except urllib.error.HTTPError as e:

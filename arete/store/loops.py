@@ -48,7 +48,7 @@ def set_loop_state(name: str, **fields) -> None:
     fields["updated"] = util.iso()
     with db() as c:
         c.execute("INSERT OR IGNORE INTO loop_state (loop) VALUES (?)", (name,))
-        c.execute(f"UPDATE loop_state SET {', '.join(f'{k} = ?' for k in fields)} WHERE loop = ?",
+        c.execute(f"UPDATE loop_state SET {', '.join(f'{k} = ?' for k in fields)} WHERE loop = ?",  # noqa: S608
                   (*fields.values(), name))
 
 
@@ -165,7 +165,7 @@ def end_claim(run_id: str, how: str, summary: str) -> None:
 
 def release_settled_claims() -> None:
     with db() as c:
-        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
+        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "  # noqa: S608
                          "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
                          f"{factory.exclude_retained(c, 'q.run_id')} "
                          "AND (r.status IS NULL OR r.status != 'running')").fetchall()

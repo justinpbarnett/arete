@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
 from pathlib import Path
@@ -543,10 +543,8 @@ def prepare(route: Route, *, delegation_only: bool = False, structured: bool = F
 def cleanup(folder: Path) -> None:
     for name in ("auth.json", "models.json", "settings.json", "models-store.json"):
         (folder / name).unlink(missing_ok=True)
-    try:
+    with suppress(OSError):
         folder.rmdir()
-    except OSError:
-        pass
 
 
 def binary() -> str:

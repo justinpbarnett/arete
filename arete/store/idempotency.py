@@ -50,12 +50,15 @@ def complete(context, status, payload, seq):
 
 def overwrite(actor, key, status, payload, seq, *, expected_status=202, connection=None):
     def _apply(c):
-        where = "actor = ? AND key = ?"
-        args = [status, payload, seq, actor, key]
         if expected_status is not None:
-            where += " AND status = ?"
-            args.append(expected_status)
-        return c.execute(f"UPDATE idempotency SET status = ?, response = ?, last_seq = ? WHERE {where}", args).rowcount
+            return c.execute(
+                "UPDATE idempotency SET status = ?, response = ?, last_seq = ? WHERE actor = ? AND key = ? AND status = ?",
+                (status, payload, seq, actor, key, expected_status),
+            ).rowcount
+        return c.execute(
+            "UPDATE idempotency SET status = ?, response = ?, last_seq = ? WHERE actor = ? AND key = ?",
+            (status, payload, seq, actor, key),
+        ).rowcount
 
     if connection is not None:
         return _apply(connection)

@@ -46,7 +46,7 @@ def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", conne
 def adopt_source(old: str, new: str) -> None:
     with db() as c:
         for table in ("cursors", "seen", "source_owners"):
-            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))
+            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))  # noqa: S608
 
 
 def source_owner(source: str) -> str | None:

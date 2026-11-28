@@ -623,9 +623,8 @@ def log_snapshot_error(ws: Path, run_id: str, error: Exception) -> None:
     line = f"{util.iso()} could not record files in {ws}: {util.first_line(str(error), 300)}"
     print(line, flush=True)
     if run_id and Path(run_id).name == run_id and run_id not in (".", ".."):
-        with suppress(OSError):
-            with (paths.RUNS_DIR / run_id / "run.log").open("a") as log:
-                log.write(line + "\n")
+        with suppress(OSError), (paths.RUNS_DIR / run_id / "run.log").open("a") as log:
+            log.write(line + "\n")
 
 
 def unrecorded_files(ws: Path, names: list[str], source: Path, copies: list[str], made: dict,
@@ -867,10 +866,8 @@ def tree_bytes(d: Path) -> int:
     total = 0
     for root, dirs, files in os.walk(d):
         for n in dirs + files:
-            try:
+            with suppress(OSError):
                 total += Path(root, n).lstat().st_size
-            except OSError:
-                pass
     return total
 
 
@@ -905,10 +902,10 @@ def held_summary_row(row: dict) -> dict:
     why = row["last_sweep_error"] or row["kept_reason"]
     if blocked and not why:
         why = "workspace removal blocked" + (f" ({', '.join(names[:5])})" if names else "")
-    return dict(name=row["name"], path=str(paths.WORKTREES_DIR / row["name"]), run=run_id,
-                status=run.get("status") or row["kept_reason"],
-                since=run.get("finished") or run.get("started") or row["made_at"],
-                bytes=row["bytes"], blocked=blocked, why=why, names=names)
+    return {"name": row["name"], "path": str(paths.WORKTREES_DIR / row["name"]), "run": run_id,
+                "status": run.get("status") or row["kept_reason"],
+                "since": run.get("finished") or run.get("started") or row["made_at"],
+                "bytes": row["bytes"], "blocked": blocked, "why": why, "names": names}
 
 
 class RunFailed(Exception):

@@ -3,10 +3,10 @@ from __future__ import annotations
 import builtins
 import json
 import threading
+from collections.abc import Callable
 from contextlib import nullcontext
 from contextvars import ContextVar
 from datetime import timedelta
-from typing import Any
 
 from . import (
     api_http,
@@ -69,7 +69,7 @@ def _approvals_items(c) -> list[dict]:
     rows = [
         approvals_store.approval_of(r)
         for r in c.execute(
-            "SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "
+            "SELECT a.*, COALESCE(r.repo, '') AS run_repo FROM approvals a "  # noqa: S608
             "LEFT JOIN runs r ON r.id = a.run_id "
             f"WHERE a.status IN ({','.join('?' * len(approvals_store.DECIDABLE))}) "
             "ORDER BY a.id DESC",
@@ -160,7 +160,7 @@ def _runs_items(c) -> list[dict]:
     rows = [
         dict(r)
         for r in c.execute(
-            f"SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.status = 'needs-info' "
+            f"SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.status = 'needs-info' "  # noqa: S608
             f"AND {run_store.WHOLE_RUN} AND {run_store.LIVE_RUN} "
             "AND NOT EXISTS (SELECT 1 FROM asks a WHERE a.run = r.id "
             "  AND (a.status = 'open' OR (a.status = 'answered' AND a.taken_by = ''))) "
@@ -431,7 +431,7 @@ def _workspaces_items(c) -> list[dict]:
     return items
 
 
-ADAPTERS: dict[str, tuple[str, Any]] = {
+ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
     "runs": ("run:%", _runs_items),
@@ -564,7 +564,7 @@ def triage_screen(connect=foundation.reader) -> dict:
     }
 
 
-def subject_object(item: dict, connect=foundation.reader) -> Any:
+def subject_object(item: dict, connect=foundation.reader) -> dict | None:
     subj = item["subject"]
     kind, _, ident = subj.partition(":")
     with connect() as c:
@@ -1084,7 +1084,7 @@ def resolve(
 
     actor = principals.current()
     prefix, _, ident = subject.partition(":")
-    handler_result: Any = {}
+    handler_result: object = {}
     stored_answer = str(answer or "")
     resolution = ""
     keep_open = False
