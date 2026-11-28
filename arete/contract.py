@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 31
+MINOR = 32
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -481,7 +481,9 @@ for _error in ERRORS:
 
 
 META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha": STRING}),
-                 "server": obj({"engine_sha": STRING}), "oldest_client": obj(dict.fromkeys(OLDEST_CLIENT, STRING)),
+                 "server": obj({"engine_sha": STRING, "version": STRING, "started": STRING,
+                                "python": STRING, "state_dir": STRING, "config_file": STRING}, ["engine_sha"]),
+                 "oldest_client": obj(dict.fromkeys(OLDEST_CLIENT, STRING)),
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
@@ -1398,7 +1400,9 @@ BY_NAME["usage.record"]["input"]["properties"].update(
     ms={"type": "integer", "minimum": 0, "maximum": 86400000})
 BY_NAME["meta.get"]["example"]["result"].update(
     api={"version": VERSION, "minor": MINOR, "contract_sha": "0" * 64},
-    server={"engine_sha": "code.7b1170924da4"}, oldest_client=OLDEST_CLIENT,
+    server={"engine_sha": "code.7b1170924da4", "version": "0.1.0", "started": "2026-01-01T00:00:00Z",
+            "python": "3.13.0", "state_dir": "~/.local/state/arete", "config_file": "~/.config/arete/config.toml"},
+    oldest_client=OLDEST_CLIENT,
     instance={"id": "a1b2c3d4", "tag": "demo", "name": "Demo", "created": "2026-01-01T00:00:00Z"},
     stream={"complete": True, "head": "0.1", "trim": {}})
 ALIASES = []
