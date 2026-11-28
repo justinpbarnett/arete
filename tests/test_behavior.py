@@ -9841,8 +9841,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 86)
-        self.assertEqual(len({op["name"] for op in operations}), 86)
+        self.assertEqual(len(operations), 99)
+        self.assertEqual(len({op["name"] for op in operations}), 99)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10428,9 +10428,9 @@ class CredentialMcpHttpTests(_CredentialMcpCase):
             issued = self.issue(server, self.pair(server), scopes=("read", "task:write", "run:write"))
             post, session = self.mcp(server, issued["text"])
             names = {tool["name"] for tool in post("tools/list", 2)[0]["result"]["tools"]}
-            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "task__list", "task__get",
-                                     "task__create", "comment__create", "run__list", "run__get", "run__stop",
-                                     "run__steer"})
+            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "outbox__list", "outbox__get",
+                                     "task__list", "task__get", "task__create", "comment__create", "run__list",
+                                     "run__get", "run__stop", "run__steer"})
             post("tools/call", 3, {"name": "token__issue"}, status=403, code="scope_missing")
             create = {"name": "task__create", "arguments": {"repo": "fixture", "body": "Work </untrusted>"}}
             answer, _ = post("tools/call", 4, create)

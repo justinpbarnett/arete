@@ -6,8 +6,8 @@ from urllib.parse import unquote
 
 from . import (
     api_http, board, codebase, config, configitems, configkinds, configrepo, contract, control, credential_http, events,
-    inbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage, util, webhooks,
-    webpush,
+    inbox, outbox, pi, record, refusals, secretstore, settings, tasks, ticket_media, tool_events, triage, util,
+    webhooks, webpush,
 )
 from .store import chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -57,7 +57,7 @@ def meta():
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
             "stream": stream,
-            "features": {"inbox": True},
+            "features": {"inbox": True, "outbox": True},
             "push": {"vapid_public_key": _vapid_public_key()}}
 
 
@@ -294,6 +294,14 @@ def read(name, values, handler):
         return inbox.triage_screen()
     if name == "push.list":
         return {"subscriptions": webpush.list_v1()}
+    if name == "outbox.list":
+        return {"items": outbox.list_items(state=values.get("state"), task=values.get("task"), run=values.get("run"))}
+    if name == "outbox.get":
+        return outbox.get(values["item"])
+    if name == "outbox.preview":
+        return outbox.preview(values["item"])
+    if name == "outbox.history":
+        return {"events": outbox.history(values["item"])}
     if name == "cohort.get":
         from . import cohorts
 
@@ -415,6 +423,23 @@ def dispatch(handler, op, path_values, query):
                 secretstore.migrate_registry()
             if name == "secret.set":
                 return set_secret(handler, op, identity)
+            if (name in ("outbox.approve", "outbox.retry", "outbox.reject")
+                    and (handler.credential is None or handler.credential.kind != "session")
+                    and outbox.needs_presence(name, identity["item"])):
+                if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                    credential_http.require_presence(handler.credential)
+                return inbox.defer_presence(
+                    handler,
+                    op,
+                    values,
+                    path_values,
+                    before_defer=lambda: outbox.validate_for_presence(
+                        name,
+                        identity["item"],
+                        base_version=values.get("base_version"),
+                        rev=values.get("rev"),
+                    ),
+                )
             if name == "inbox.upload_evidence":
                 return upload_inbox_evidence(handler, op, identity)
             if getattr(handler, "awaiting_presence", False):
@@ -458,7 +483,8 @@ def command(handler, op, values, path_values, *, claim=None):
         lambda: execute(name, values, handler))
     return handler.keyed_action(op["method"], op["path"], path_values, action,
                                 atomic=not read_only and name not in ("run.stop", "serve.install", "inbox.resolve",
-                                                                      "settings.update", "loop.enable", "loop.disable"),
+                                                                      "settings.update", "loop.enable", "loop.disable",
+                                                                      "outbox.approve", "outbox.retry", "outbox.reject"),
                                 status=op["success_status"],
                                 redact=name in ("token.issue", "token.rotate", "webhook.rotate"),
                                 claim=claim, read_only=read_only)
@@ -540,6 +566,26 @@ def mutation(name, values, handler):
         result = {"subscription": webpush.subscribe_v1(values, principals.contact(handler.person))}
     elif name == "push.remove":
         result = webpush.remove_v1(values["subscription"])
+    elif name == "outbox.edit":
+        result = {"item": outbox.edit(values["item"], body=values["body"], base_rev=values["base_rev"],
+                                      base_version=values["base_version"])}
+    elif name == "outbox.open":
+        result = {"item": outbox.open(values["item"], base_version=values["base_version"])}
+    elif name == "outbox.approve":
+        result = {"item": outbox.approve(values["item"], rev=values["rev"], base_version=values["base_version"])}
+    elif name == "outbox.undo":
+        result = {"item": outbox.undo(values["item"], base_version=values["base_version"])}
+    elif name == "outbox.hold":
+        result = {"item": outbox.hold(values["item"], base_version=values["base_version"])}
+    elif name == "outbox.release":
+        result = {"item": outbox.release(values["item"], base_version=values["base_version"])}
+    elif name == "outbox.reject":
+        result = {"item": outbox.reject(values["item"], reason=values.get("reason", ""),
+                                        base_version=values["base_version"])}
+    elif name == "outbox.retry":
+        result = {"item": outbox.retry(values["item"], base_version=values["base_version"])}
+    elif name == "outbox.discard":
+        result = {"item": outbox.discard(values["item"], base_version=values["base_version"])}
     else:
         raise contract.Problem("not_found", f"Unknown operation {name}")
     return with_seq(result)
