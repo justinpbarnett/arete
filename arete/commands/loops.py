@@ -52,7 +52,8 @@ def loop_requeue(args) -> int:
         item_id = int(args.id)
     except ValueError:
         raise control.Refused("arete loop requeue needs a numeric queue ID") from None
-    loop_store.requeue_item(item_id)
+    with foundation.tx() as c:
+        loop_store.requeue_item(c, item_id)
     print(f"queue item {item_id} is pending again")
     return 0
 
@@ -160,7 +161,8 @@ def loop_status(args) -> int:
     if d["waiting"]:
         print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
     for item in d["dead"]:
-        print(f"  dead item {item['id']}: run {item['run_id']}, {util.count(item['events'], 'event')}, "
+        inbox_note = f", inbox {item['inbox_id']}" if item.get("inbox_id") else ""
+        print(f"  dead item {item['id']}: run {item['run_id']}, {util.count(item['events'], 'event')}{inbox_note}, "
               f"{item['dead_at']}: {item['dead_reason']}")
     if d["state"]:
         print(f"  memory: {json.dumps(d['state'])[:300]}")

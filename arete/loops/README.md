@@ -15,9 +15,9 @@ A folder that does not validate shows as broken in `arete loop list` and on the 
 
 ## Kinds
 
-Queued events survive a failed run or a requested stop as a dead item. A budget exceeded during execution also makes the input dead; a budget hold before execution leaves it waiting without using a retry. A killed run or a signal without a stop request returns its input to the queue once. A second interruption makes it dead, even across serve restarts. Done and ordinary skipped runs consume their input.
+Queued events survive a failed run or a requested stop as a dead item and land in the inbox (`queue.dead`, verbs `requeue` and `dismiss`). A budget exceeded during execution also makes the input dead and raises an inbox item; a budget hold before execution leaves it waiting without using a retry. A killed run or a signal without a stop request returns its input to the queue and runs again up to `[run] max_attempts` (default 2), even across serve restarts, before going dead in the inbox. Done and ordinary skipped runs consume their input.
 
-`arete loop list` shows dead counts. `arete loop status NAME` lists each dead queue ID, run, event count, time and reason. `arete loop requeue ID` resets its retry count and returns the same events to the queue. Dead items expire after 56 days; waiting inputs and active claims do not expire. Empty schedule inputs are deleted on failure, stop or exhausted retries. Recovery coalesces an empty input with an already waiting fire of the same trigger.
+`arete loop list` shows dead counts. `arete loop status NAME` lists each dead queue ID, inbox ID, run, event count, time and reason. `arete loop requeue ID` (or resolving its inbox item with `requeue`) resets its retry count and returns the same events to the queue; `dismiss` deletes the dead row. Dead items expire after 56 days (resolving their inbox item as `expired`); waiting inputs and active claims do not expire. Empty schedule inputs are deleted on failure, stop or exhausted retries. Recovery coalesces an empty input with an already waiting fire of the same trigger.
 
 | Kind | What one run does |
 |---|---|
@@ -63,6 +63,7 @@ runner = ""                    # claude | pi, to force one
 tools = ["Read", "Glob", "Grep"]       # Read Glob Grep LS, plus Edit MultiEdit Write Bash
 device = "local"               # a device from ~/.config/arete/devices.toml; an exe device gives each run a sandbox of its own
 timeout_minutes = 30
+max_attempts = 2               # whole number above 0; retries after a kill or unsolicited signal before landing in the inbox
 budget_usd = 0.50              # pi only: stop one run when it spends this
 daily_budget_usd = 2.00        # pi only: refuse to start when the last 24 hours spent this
 queue = ""                     # share a named queue with other loops; [serve.queues] sets how many run at once

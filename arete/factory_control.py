@@ -293,7 +293,7 @@ def resume_target(target):
                     return update(key, "held", "Inspect interrupted command effects before retrying")
                 if not c.execute("SELECT 1 FROM queue WHERE run_id=?", (key,)).fetchone():
                     return update(key, "held", "No retained queue input for this loop")
-                loop_store.release_claimed_items(key)
+                loop_store.end_claim(c, key, "release", "", count_attempt=False)
                 update(key, "continued", "Original queue input released")
         else:
             update(key, "held", "Inspect interrupted work before retrying")

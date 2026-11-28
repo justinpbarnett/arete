@@ -421,24 +421,26 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
     with util.lock_file(loop_store.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
-        fire = loop_store.queue_item(item) if item is not None else None
-        if item is not None and (not fire or fire["run_id"] is not None):
-            raise control.NotFound(f"queue item {item} is gone or already claimed")
         for stale in run_store.runs_marked_running():
             if stale["kind"] == "loop" and stale["loop"] == loop.name:
                 record.interrupt(stale)
-        run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
-                      trigger="try" if trial else (fire["trigger"] if fire else "manual"),
-                      events=list(events or (fire["payload"] if fire else [])))
-        record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
-                     repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
-                     device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
-                     log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
-                     runner=routing.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
-        if fire and not loop_store.take_queue_item(item, run.id):
-            why = f"queue item {item} was taken by another run"
-            settle(run, "skipped", why)
-            raise control.NotFound(why)
+        model = loop.model_for(cfg) if loop.agent else ""
+        runner_name = routing.route(model, loop.runner)[0] if loop.agent else ""
+        with foundation.tx() as c:
+            fire = loop_store.queue_item(item, c) if item is not None else None
+            if item is not None and (not fire or fire["run_id"] is not None or fire.get("dead_at") is not None):
+                raise control.NotFound(f"queue item {item} is gone or already claimed")
+            run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
+                          trigger="try" if trial else (fire["trigger"] if fire else "manual"),
+                          events=list(events or (fire["payload"] if fire else [])))
+            record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
+                         repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
+                         device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
+                         log=paths.short_path(run.log_file), model=model, runner=runner_name)
+            if fire and not loop_store.claim(c, item, run.id):
+                raise control.NotFound(f"queue item {item} was taken by another run")
+        if fire and fire.get("last_run"):
+            run.write_log(f"continues {fire['last_run']}")
         if run.events:
             util.write_json(run.events_file, run.events)
         if not detach:
@@ -478,8 +480,10 @@ def carry_opened(run_id: str) -> str:
 
 def carry(run: LoopRun) -> str:
     if spent := spent_limit(run.loop, run.cfg):
-        loop_store.release_claimed_items(run.id)
-        return settle(run, "skipped", f"budget: {spent} is spent, so its input waits in the queue")
+        summary = f"budget: {spent} is spent, so its input waits in the queue"
+        with foundation.tx() as c:
+            loop_store.end_claim(c, run.id, "release", summary, count_attempt=False)
+            return settle(run, "skipped", summary)
     run.scratch.mkdir(parents=True, exist_ok=True)
     how = "drop"
     try:
@@ -494,14 +498,17 @@ def carry(run: LoopRun) -> str:
             run.log("error", traceback.format_exc().strip())
         status, summary = devices.outcome_of(e, run.id)
         if status == "stopped":
-            how = "dead" if summary == record.STOPPED else "retry"
+            how = "dead" if summary == record.STOPPED else "release"
     summary = devices.with_left_up(summary, run.id)
     from .store import factory
     if factory.interrupted(run.id):
         if status != "done":
             return settle(run, "interrupted", "Paused by the factory switch")
-    loop_store.end_claim(run.id, "dead" if status == "failed" else how, summary)
-    return settle(run, status, summary)
+    with foundation.tx() as c:
+        loop_store.end_claim(
+            c, run.id, "dead" if status == "failed" else how, summary, max_attempts=run.loop.max_attempts
+        )
+        return settle(run, status, summary)
 
 
 def settle(run: LoopRun, status: str, summary: str) -> str:
@@ -569,7 +576,8 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     partial = code == mergecheck.INCOMPLETE_EXIT and mergecheck.builtin(loop) and bool(found)
     if code != 0 and not partial:
         if mergecheck.builtin(loop) and code == mergecheck.HOLD_EXIT:
-            loop_store.release_claimed_items(run.id)
+            with foundation.tx() as c:
+                loop_store.end_claim(c, run.id, "release", "", count_attempt=False)
             return "skipped", "merge-check quota hold; input waits until the next UTC day"
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     if not found and (not said or mergecheck.builtin(loop)):

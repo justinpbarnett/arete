@@ -489,6 +489,7 @@ class Server:
         self.guard("stage:secret-move", self.move_secrets_when_due)
         self.guard("stage:secret-check", self.check_secrets_when_due)
         self.guard("stage:reap", self.reap)
+        self.guard("stage:claims", self.release_claims)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
             now = util.now()
@@ -511,7 +512,7 @@ class Server:
         for name, action, args in stages:
             factory_state.admit()
             self.guard(f"stage:{name}", action, *args)
-        tick_stages = {"stage:reap", "stage:secret-move", "stage:secret-check",
+        tick_stages = {"stage:reap", "stage:claims", "stage:secret-move", "stage:secret-check",
                        *(f"stage:{name}" for name, _, _ in stages)}
         return states is not None and not any(key in tick_stages or key.startswith(("loop:", "secret-check:"))
                                               for key in self.failing)
@@ -567,10 +568,14 @@ class Server:
         self.secrets_checked_at = now
 
     def reap(self) -> None:
-        for row in record.reap(tickets=False):
+        for row in record.reap(tickets=False, release_claims=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
             self.swept = 0.0
         sessions.tell_chats()
+
+    def release_claims(self) -> None:
+        with foundation.tx() as c:
+            loop_store.release_settled_claims(c)
 
     def step_loop(self, loop: Loop, st: dict, now: datetime) -> None:
         self.schedule(loop, st, now)
@@ -1109,7 +1114,7 @@ class Server:
         if not loop or not loop.enabled or loop.error:
             with foundation.tx() as c:
                 factory_state.admit(c)
-                loop_store.drop_queue_item(item["id"])
+                loop_store.drop_queue_item(c, item["id"])
             self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
             return
         why = self.dispatch_item(item, loop, slots)
