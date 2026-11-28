@@ -349,6 +349,71 @@ def shelve_item(
     return decode(after), seq, True
 
 
+def latest_transition_at(c, numeric_id: int) -> str | None:
+    row = c.execute(
+        "SELECT at FROM events_log WHERE subject = ? AND kind IN ('inbox.changed', 'inbox.resolved') "
+        "ORDER BY seq DESC LIMIT 1",
+        (f"inbox:{numeric_id}",),
+    ).fetchone()
+    return str(row["at"]) if row and row["at"] else None
+
+
+def other_open_by_kind_and_subject(c, kind: str, subject: str, exclude_id: int) -> dict | None:
+    row = c.execute(
+        "SELECT * FROM inbox WHERE kind = ? AND subject = ? AND state != 'resolved' AND id != ? "
+        "ORDER BY id DESC LIMIT 1",
+        (kind, subject, exclude_id),
+    ).fetchone()
+    return decode(row)
+
+
+def reopen_item(
+    c,
+    numeric_id: int,
+    *,
+    base_version: int,
+) -> tuple[dict | None, int | None, bool]:
+    row = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
+    if row is None or row["version"] != base_version:
+        return decode(row), None, False
+    state = row["state"]
+    new_ver = row["version"] + 1
+    if state == "snoozed":
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
+            "version = ? WHERE id = ? AND state = 'snoozed' AND version = ?",
+            (new_ver, numeric_id, base_version),
+        ).rowcount
+    elif state == "shelved":
+        enc_detail = row["detail"]
+        if row["kind"] == "fault":
+            detail = json.loads(row["detail"] or "{}")
+            if isinstance(detail, dict):
+                detail.pop("shelved_reason", None)
+                detail.pop("shelve_until", None)
+                enc_detail = _encode_json(detail)
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', shelve_reason = '', shelve_until = '', "
+            "shelves = MAX(0, shelves - 1), detail = ?, version = ? "
+            "WHERE id = ? AND state = 'shelved' AND version = ?",
+            (enc_detail, new_ver, numeric_id, base_version),
+        ).rowcount
+    elif state == "resolved":
+        changed = c.execute(
+            "UPDATE inbox SET state = 'open', answer = '', answered_by = '', answered_at = '', "
+            "resolution = '', resolved = '', snooze_until = '', snooze_watch = '', snooze_watch_ver = 0, "
+            "shelve_until = '', version = ? WHERE id = ? AND state = 'resolved' AND version = ?",
+            (new_ver, numeric_id, base_version),
+        ).rowcount
+    else:
+        return decode(row), None, False
+    after = c.execute("SELECT * FROM inbox WHERE id = ?", (numeric_id,)).fetchone()
+    if not changed:
+        return decode(after), None, False
+    seq = _emit(c, "inbox.changed", after, {"reopened": True})
+    return decode(after), seq, True
+
+
 def reopen_due(c, now: str | None = None) -> list[dict]:
     if not available(c):
         return []

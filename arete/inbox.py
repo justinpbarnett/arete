@@ -53,6 +53,7 @@ _HTTP_STATUS_RE = re.compile(r"\b(?:HTTP\s+)?([45]\d{2})\b")
 _NON_WORD_RE = re.compile(r"[^a-z0-9]+")
 
 PRESENCE_TTL_MINUTES = 10
+REOPEN_WINDOW_SECONDS = 10
 RESERVED_MANUAL_PREFIXES = (
     "presence:",
     "approval:",
@@ -664,7 +665,7 @@ def _config_items(c) -> list[dict]:
             if rel:
                 disk = paths.CONFIG_DIR / rel
                 try:
-                    if not disk.is_file() or disk.read_bytes() != d["body"].encode("utf-8"):
+                    if d["body"] is None or not disk.is_file() or disk.read_bytes() != d["body"].encode("utf-8"):
                         continue
                 except OSError:
                     continue
@@ -1709,6 +1710,91 @@ def shelve(item_id: str | int, *, base_version: int, reason: str, until: str | N
         return updated
 
 
+def _approval_was_sent(c, item: dict) -> bool:
+    subject = item["subject"]
+    if subject.startswith("presence:"):
+        return True
+    if subject.startswith("approval:"):
+        ident = subject.removeprefix("approval:")
+        if ident.isdecimal():
+            from .store import outbox as outbox_store
+
+            row = outbox_store.get_by_legacy_approval(c, int(ident)) or outbox_store.get_row(c, int(ident))
+            if row is not None:
+                return row["state"] != "failed"
+        return True
+    if subject.startswith("outbox:"):
+        ident = subject.removeprefix("outbox:")
+        if ident.isdecimal():
+            from .store import outbox as outbox_store
+
+            row = outbox_store.get_row(c, int(ident))
+            if row is not None:
+                return row["state"] in ("sent", "sending") or bool(row["sent_at"])
+        return False
+    return True
+
+
+def reopen(item_id: str | int, *, base_version: int) -> dict:
+    numeric = inbox_store.parse_id(item_id)
+    if numeric is None:
+        raise contract.Problem("not_found", f"No inbox item {item_id}")
+    with foundation.tx() as c:
+        current = inbox_store.get(numeric, connect=lambda: nullcontext(c))
+        if current is None:
+            raise contract.Problem("not_found", f"No inbox item {item_id}")
+        if current["version"] != base_version:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=current)
+        state = current["state"]
+        if state == "open":
+            raise contract.Problem("already_open", f"Inbox item {current['id']} is already open.", item=current["id"])
+        if state in ("snoozed", "shelved"):
+            pass
+        elif state == "resolved":
+            if current["kind"] == "candidate" and current["resolution"] in ("declined", "decline"):
+                pass
+            elif current["kind"] == "approval" and (
+                current["resolution"] == "approved" or current["answer"] == "approve"
+            ):
+                if _approval_was_sent(c, current):
+                    raise contract.Problem("already_sent", f"Inbox item {current['id']} was already sent.")
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+            elif current["kind"] == "outbox" and (
+                current["resolution"] == "approved" or current["answer"] == "approve"
+            ):
+                if _approval_was_sent(c, current):
+                    raise contract.Problem("already_sent", f"Inbox item {current['id']} was already sent.")
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+            else:
+                raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+        else:
+            raise contract.Problem("not_reversible", f"Inbox item {current['id']} cannot be reopened.")
+
+        last_at = inbox_store.latest_transition_at(c, numeric)
+        if not last_at:
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.")
+        try:
+            elapsed = (util.now() - util.parse_iso(last_at)).total_seconds()
+        except (ValueError, TypeError):
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.") from None
+        if elapsed > REOPEN_WINDOW_SECONDS:
+            raise contract.Problem("too_late", f"Inbox item {current['id']} can no longer be reopened.")
+
+        if state == "resolved":
+            other = inbox_store.other_open_by_kind_and_subject(c, current["kind"], current["subject"], numeric)
+            if other is not None:
+                raise contract.Problem(
+                    "already_open",
+                    f"Another inbox item {other['id']} is already open for {current['kind']} {current['subject']}.",
+                    item=other["id"],
+                )
+
+        updated, _, ok = inbox_store.reopen_item(c, numeric, base_version=base_version)
+        if not ok:
+            raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=updated)
+        return updated
+
+
 def _redact_ask_answers(questions: list[dict], answers: list[dict]) -> list[dict]:
     safe = []
     for i, ans in enumerate(answers):
@@ -1930,6 +2016,19 @@ def _execute_pending_command(req: dict, secret_value: str | None) -> tuple[int, 
             presence_passed=True,
         )
         return 200, api.with_seq(rolled)
+    if op_name == "config.delete":
+        from . import drafts
+
+        deleted = drafts.delete_item(
+            values["kind"],
+            values["name"],
+            values["base_version"],
+            actor,
+            idem=req.get("idem", ""),
+            why=str(values.get("why") or ""),
+            presence_passed=True,
+        )
+        return 200, api.with_seq(deleted)
     if op_name == "settings.update":
         from . import settings
 
@@ -2054,7 +2153,7 @@ def _resolve_presence(
             raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=resolved)
 
         req = {**pending["request"], "idem": key}
-        run_outside_tx = req["operation"] in ("config.activate", "config.rollback", "settings.update")
+        run_outside_tx = req["operation"] in ("config.activate", "config.rollback", "config.delete", "settings.update")
         if req["operation"] in ("outbox.approve", "outbox.retry", "outbox.reject"):
             from .store import outbox as outbox_store
 

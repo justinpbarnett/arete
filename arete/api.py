@@ -18,6 +18,7 @@ from . import (
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
 from .store import devices as device_store
+from .store import idempotency as claims_store
 from .store import tasks as task_store
 from .store import tokens, writes
 
@@ -653,7 +654,14 @@ def read_config(verb, values):
     kind = values["kind"]
     if verb == "list":
         return {"items": configitems.listing(kind)}
-    found = configitems.item(kind, values["name"], level=values.get("level"))
+    historical = verb == "versions" or (
+        verb == "read" and (values.get("version") is not None or values.get("from") not in (None, "working"))
+    )
+    found = (
+        configitems.item_or_historical(kind, values["name"], level=values.get("level"))
+        if historical
+        else configitems.item(kind, values["name"], level=values.get("level"))
+    )
     if verb == "read":
         return {"item": configitems.read(found, version=values.get("version"), level=values.get("level"),
                                          from_ref=values.get("from"), file=values.get("file"))}
@@ -691,7 +699,20 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
             return {"draft_id": draft_row["id"], "gate": "C", "check_report": report}
         return None
     if name == "config.rollback":
-        found = configitems.item(values["kind"], values["name"])
+        found = configitems.item_or_historical(values["kind"], values["name"])
+        if configitems.is_tombstone_selector(found, str(values["to"])):
+            raise contract.Problem(
+                "validation",
+                f"Version {values['to']} of {values['kind']}/{values['name']} is a deletion tombstone and cannot be rolled back to as file bytes.",
+            )
+        live_row = drafts._current_ver_row(values["kind"], values["name"], found["path"])
+        live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+        if not drafts._matches_base_version(values["base_version"], live_ver, live_row):
+            raise contract.Problem(
+                "version_conflict",
+                f"Config item {values['kind']}/{values['name']} is at version {live_ver}, not {values['base_version']}.",
+                current={"kind": values["kind"], "name": values["name"], "version": live_ver},
+            )
         target = configitems.read(found, version=str(values["to"]))
         content = target["content"]
         if not isinstance(content, str):
@@ -703,6 +724,12 @@ def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None
         )
         if report["ok"] and report["gate"] == "C":
             return {"kind": values["kind"], "name": values["name"], "to": values["to"],
+                    "gate": "C", "check_report": report}
+        return None
+    if name == "config.delete":
+        _, _, report = drafts.inspect_delete(values["kind"], values["name"], values["base_version"], actor, root=root)
+        if report["gate"] == "C":
+            return {"kind": values["kind"], "name": values["name"], "delete": True,
                     "gate": "C", "check_report": report}
         return None
     if name == "settings.update":
@@ -797,19 +824,25 @@ def dispatch(handler, op, path_values, query):
                 return upload_inbox_evidence(handler, op, identity)
             if name == "blob.put":
                 return put_blob(handler, op, identity)
-            if (name in ("config.activate", "config.rollback", "settings.update")
+            if (name in ("config.activate", "config.rollback", "config.delete", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values, handler)
-                if extra_detail is not None:
-                    if handler.credential is None or "Idempotency-Key" not in handler.headers:
-                        credential_http.require_presence(handler.credential)
-                    return inbox.defer_presence(
-                        handler,
-                        op,
-                        values,
-                        path_values,
-                        extra_detail=extra_detail,
-                    )
+                idem_key = handler.headers.get("Idempotency-Key")
+                actor_claim = claims_store.lookup(handler.actor, idem_key) if idem_key else None
+                if actor_claim is not None and actor_claim["status"]:
+                    return inbox.defer_presence(handler, op, values, path_values)
+                person_claim = claims_store.lookup(handler.person, idem_key) if idem_key else None
+                if person_claim is None or not person_claim["status"]:
+                    extra_detail = _needs_config_presence(name, values, handler)
+                    if extra_detail is not None:
+                        if handler.credential is None or "Idempotency-Key" not in handler.headers:
+                            credential_http.require_presence(handler.credential)
+                        return inbox.defer_presence(
+                            handler,
+                            op,
+                            values,
+                            path_values,
+                            extra_detail=extra_detail,
+                        )
             if getattr(handler, "awaiting_presence", False):
                 if name == "secret.remove":
                     secret_set_options(identity["scope"], identity["name"])
@@ -850,7 +883,7 @@ _NON_ATOMIC_COMMANDS = frozenset((
     "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
-    "config.draft", "config.check", "config.activate", "config.rollback", "config.try", "draft.discard",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try", "draft.discard",
 ))
 
 
@@ -996,6 +1029,21 @@ def mutation(name, values, handler):
                 values["base_version"],
                 _config_actor(handler),
                 idem=key,
+                presence_passed=presence_ok,
+            )
+        except drafts.PresenceRequired:
+            raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required") from None
+    elif name == "config.delete":
+        key = handler.headers.get("Idempotency-Key", "") if handler else ""
+        presence_ok = bool(handler and handler.credential is not None and handler.credential.kind == "session")
+        try:
+            result = drafts.delete_item(
+                values["kind"],
+                values["name"],
+                values["base_version"],
+                _config_actor(handler),
+                idem=key,
+                why=str(values.get("why") or ""),
                 presence_passed=presence_ok,
             )
         except drafts.PresenceRequired:
@@ -1342,6 +1390,8 @@ def mutation(name, values, handler):
     elif name == "inbox.shelve":
         result = {"item": inbox.shelve(values["item"], base_version=values["base_version"],
                                        reason=values["reason"], until=values.get("until"))}
+    elif name == "inbox.reopen":
+        result = {"item": inbox.reopen(values["item"], base_version=values["base_version"])}
     elif name == "inbox.resolve":
         result = inbox.resolve(
             values["item"],

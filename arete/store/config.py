@@ -11,6 +11,7 @@ COLUMNS = (
     "kind", "name", "origin", "path", "sha256", "version", "n",
     "commit_sha", "author", "source", "note", "at", "live", "fields", "ver",
 )
+DELETED_SUFFIX = "@deleted"
 
 
 def available(conn: sqlite3.Connection | None = None) -> bool:
@@ -77,6 +78,34 @@ def live_by_path(path: str, conn: sqlite3.Connection | None = None) -> dict | No
         return None
     row = conn.execute(
         "SELECT * FROM config_index WHERE live = 1 AND path = ? ORDER BY ver DESC, n DESC LIMIT 1",
+        (path,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_item(kind: str, name: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    if conn is None:
+        with foundation.reader() as c:
+            return latest_item(kind, name, c)
+    if not available(conn):
+        return None
+    order = "ver DESC, n DESC" if has_ver(conn) else "n DESC"
+    row = conn.execute(
+        f"SELECT * FROM config_index WHERE kind = ? AND name = ? ORDER BY {order} LIMIT 1",  # noqa: S608
+        (kind, name),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_by_path(path: str, conn: sqlite3.Connection | None = None) -> dict | None:
+    if conn is None:
+        with foundation.reader() as c:
+            return latest_by_path(path, c)
+    if not available(conn):
+        return None
+    order = "ver DESC, n DESC" if has_ver(conn) else "n DESC"
+    row = conn.execute(
+        f"SELECT * FROM config_index WHERE path = ? ORDER BY {order} LIMIT 1",  # noqa: S608
         (path,),
     ).fetchone()
     return dict(row) if row else None
@@ -192,6 +221,62 @@ def upsert_live(conn: sqlite3.Connection, *, kind: str, name: str, origin: str, 
 
 def mark_deleted(conn: sqlite3.Connection, origin: str, path: str) -> None:
     conn.execute("UPDATE config_index SET live = 0 WHERE origin = ? AND path = ? AND live = 1", (origin, path))
+
+
+def record_deleted(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    name: str,
+    origin: str,
+    path: str,
+    commit_sha: str,
+    author: str,
+    source: str,
+    note: str,
+    at: str,
+    ver: int | None = None,
+) -> int:
+    with_ver = has_ver(conn)
+    if ver is None:
+        ver = 0 if origin == "engine" else (max_ver(conn, kind, name) + 1 if with_ver else 0)
+    tombstone = f"{kind}/{name}{DELETED_SUFFIX}"
+    fields_json = '{"deleted":true}'
+    conn.execute("UPDATE config_index SET live = 0 WHERE origin = ? AND path = ? AND live = 1", (origin, path))
+    existing = conn.execute(
+        "SELECT n FROM config_index WHERE origin = ? AND path = ? AND sha256 = ''",
+        (origin, path),
+    ).fetchone()
+    if existing:
+        if with_ver:
+            conn.execute(
+                "UPDATE config_index SET kind = ?, name = ?, version = ?, commit_sha = ?, author = ?, source = ?, "
+                "note = ?, at = ?, live = 0, fields = ?, ver = ? WHERE origin = ? AND path = ? AND sha256 = ''",
+                (kind, name, tombstone, commit_sha, author, source, note, at, fields_json, ver, origin, path),
+            )
+        else:
+            conn.execute(
+                "UPDATE config_index SET kind = ?, name = ?, version = ?, commit_sha = ?, author = ?, source = ?, "
+                "note = ?, at = ?, live = 0, fields = ? WHERE origin = ? AND path = ? AND sha256 = ''",
+                (kind, name, tombstone, commit_sha, author, source, note, at, fields_json, origin, path),
+            )
+    else:
+        n = next_n(conn, origin, path)
+        if with_ver:
+            conn.execute(
+                "INSERT INTO config_index "
+                "(kind, name, origin, path, sha256, version, n, commit_sha, author, source, note, at, live, fields, ver) "
+                "VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (kind, name, origin, path, tombstone, n, commit_sha, author, source, note, at, fields_json, ver),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO config_index "
+                "(kind, name, origin, path, sha256, version, n, commit_sha, author, source, note, at, live, fields) "
+                "VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (kind, name, origin, path, tombstone, n, commit_sha, author, source, note, at, fields_json),
+            )
+    return ver
 
 
 def replace_all(conn: sqlite3.Connection, rows: list[dict]) -> None:

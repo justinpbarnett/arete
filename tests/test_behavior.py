@@ -7325,7 +7325,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try")
+            assert tuple(ops) == ("kinds", *configkinds.VERBS, "draft", "check", "activate", "rollback", "try", "delete")
             assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
                        for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 149)
-        self.assertEqual(len({op["name"] for op in operations}), 149)
+        self.assertEqual(len(operations), 151)
+        self.assertEqual(len({op["name"] for op in operations}), 151)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
