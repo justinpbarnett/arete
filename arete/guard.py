@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, jev, paths, record, sandbox, scratch, util
+from . import config, jev, local_paths, paths, record, sandbox, scratch, util
 from .agent import Result
 
 FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS")
@@ -49,23 +50,203 @@ LOGIN_FILES = tuple(paths.HOME / p for p in (
     ".local/share/opencode/auth.json"))
 
 
+GLOB_CHARS = re.compile(r"[*?\[]")
+ANSI_C_QUOTE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                 "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+FLAG_PATH = re.compile(r"^-[A-Za-z0-9]+([/~$].*)$")
+SHORT_FLAG_DOT = re.compile(r"^-[A-Za-z](\.[^/].*)$")
+FAIL_CLOSED_REASON = "Arete could not verify the agent's file or command permissions."
+
+
+def _safe_spellings(path: Path | str) -> tuple[Path, ...] | None:
+    if local_paths.has_null(path):
+        return None
+    try:
+        raw = Path(path)
+        return (Path(os.path.normpath(raw.absolute())), raw.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _is_subpath(child: tuple[str, ...], root: tuple[str, ...]) -> bool:
+    return len(child) >= len(root) and child[:len(root)] == root
+
+
+def _glob_matches_target(gparts: tuple[str, ...], target: tuple[str, ...]) -> bool:
+    for i, part in enumerate(gparts):
+        if part == "**":
+            return i <= len(target) and all(fnmatch.fnmatchcase(target[j], gparts[j]) for j in range(i))
+        if i >= len(target):
+            return True
+        if not fnmatch.fnmatchcase(target[i], part):
+            return False
+    return len(gparts) == len(target)
+
+
+def _decode_ansi_c_body(body: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        if body[i] != "\\" or i + 1 >= len(body):
+            out.append(body[i])
+            i += 1
+            continue
+        ch = body[i + 1]
+        if ch in ANSI_C_SIMPLE:
+            out.append(ANSI_C_SIMPLE[ch])
+            i += 2
+        elif ch == "x":
+            digits = re.match(r"[0-9A-Fa-f]{1,2}", body[i + 2:])
+            if digits:
+                out.append(chr(int(digits.group(0), 16)))
+                i += 2 + len(digits.group(0))
+            else:
+                out.append("\\x")
+                i += 2
+        elif ch in ("u", "U"):
+            width = 4 if ch == "u" else 8
+            digits = re.match(rf"[0-9A-Fa-f]{{1,{width}}}", body[i + 2:])
+            if digits:
+                code = int(digits.group(0), 16)
+                out.append(chr(code) if code <= 0x10FFFF else "")
+                i += 2 + len(digits.group(0))
+            else:
+                out.append("\\" + ch)
+                i += 2
+        elif ch in "01234567":
+            digits = re.match(r"[0-7]{1,3}", body[i + 1:])
+            out.append(chr(int(digits.group(0), 8) & 0xFF))
+            i += 1 + len(digits.group(0))
+        else:
+            out.append("\\" + ch)
+            i += 2
+    return "".join(out)
+
+
+def _decode_ansi_c(text: str) -> str:
+    if "$'" not in text:
+        return text
+    return ANSI_C_QUOTE.sub(lambda m: _decode_ansi_c_body(m.group(1)), text)
+
+
+def _command_parts(command: str) -> list[str]:
+    texts = [command]
+    decoded = _decode_ansi_c(command)
+    if decoded != command:
+        texts.append(decoded)
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def emit(token: str) -> None:
+        cleaned = token.strip()
+        if not cleaned:
+            return
+        variants = [cleaned]
+        stripped = cleaned.strip("'\"")
+        if stripped and stripped != cleaned:
+            variants.append(stripped)
+        for item in variants:
+            if item not in seen:
+                seen.add(item)
+                parts.append(item)
+            for pattern in (FLAG_PATH, SHORT_FLAG_DOT):
+                if m := pattern.match(item):
+                    suffix = m.group(1)
+                    if suffix not in seen:
+                        seen.add(suffix)
+                        parts.append(suffix)
+
+    for text in texts:
+        try:
+            words = shlex.split(text)
+        except ValueError:
+            words = text.split()
+        for word in words:
+            for chunk in re.split(r"[=<>;|&()`]", word):
+                emit(chunk)
+            if any(c in word for c in " \t\r\n'\"{}[],"):
+                for chunk in re.split(r"[\s=<>;|&()`'\"{}\[\],]+", word):
+                    emit(chunk)
+                try:
+                    for sub in shlex.split(word):
+                        for chunk in re.split(r"[=<>;|&()`]", sub):
+                            emit(chunk)
+                except ValueError:
+                    pass
+    return parts
+
+
+def _secret_glob_match(pattern_path: Path) -> bool:
+    if local_paths.has_null(pattern_path):
+        return True
+    text = str(pattern_path)
+    prefix = GLOB_CHARS.split(text, maxsplit=1)[0]
+    parent = Path(prefix) if prefix.endswith("/") else Path(prefix).parent
+    if not str(parent) or not parent.is_dir():
+        return False
+    rel_glob = text[len(str(parent).rstrip("/")):].lstrip("/")
+    if not rel_glob or "/" in rel_glob:
+        return False
+    leaf_folded = rel_glob.casefold()
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.startswith(".") and not rel_glob.startswith("."):
+            continue
+        if fnmatch.fnmatchcase(entry.casefold(), leaf_folded):
+            candidate = parent / entry
+            if sandbox.secret_path(candidate):
+                return True
+            try:
+                if sandbox.secret_path(candidate.resolve()):
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class Floor:
     closed: tuple[Path, ...]
     files: tuple[Path, ...]
     open: tuple[Path, ...]
 
+    def _folded_sets(self) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...], set[tuple[str, ...]]]:
+        roots = tuple(local_paths.folded_parts(p) for root in self.closed for p in (_safe_spellings(root) or ()))
+        opened = tuple(local_paths.folded_parts(p) for root in self.open for p in (_safe_spellings(root) or ()))
+        files = {local_paths.folded_parts(p) for file in self.files for p in (_safe_spellings(file) or ())}
+        return roots, opened, files
+
     def denies(self, path: Path | str) -> bool:
-        roots = tuple(p for root in self.closed for p in (root.absolute(), root.resolve()))
-        opened = tuple(p for root in self.open for p in (root.absolute(), root.resolve()))
-        files = {p for file in self.files for p in (file.absolute(), file.resolve())}
-        for candidate in (Path(path).absolute(), Path(path).resolve()):
-            if candidate in files:
+        candidates = _safe_spellings(path)
+        if candidates is None:
+            return True
+        roots, opened, files = self._folded_sets()
+        for candidate in candidates:
+            cparts = local_paths.folded_parts(candidate)
+            if cparts in files:
                 return True
-            closed_depth = max((len(p.parts) for p in roots if candidate.is_relative_to(p)), default=-1)
-            open_depth = max((len(p.parts) for p in opened if candidate.is_relative_to(p)), default=-1)
+            closed_depth = max((len(p) for p in roots if _is_subpath(cparts, p)), default=-1)
+            open_depth = max((len(p) for p in opened if _is_subpath(cparts, p)), default=-1)
             if closed_depth >= 0 and closed_depth >= open_depth:
                 return True
+        return False
+
+    def denies_glob(self, pattern: Path | str) -> bool:
+        candidates = _safe_spellings(pattern)
+        if candidates is None:
+            return True
+        roots, opened, files = self._folded_sets()
+        for candidate in candidates:
+            gparts = local_paths.folded_parts(candidate)
+            for target in (*roots, *files):
+                if any(_is_subpath(gparts, o) and len(o) > len(target) for o in opened):
+                    continue
+                if _glob_matches_target(gparts, target):
+                    return True
         return False
 
 
@@ -89,19 +270,22 @@ def floor(run_id: str, cwd: Path | str, add_dirs) -> Floor:
 
 def launch_refusal(run_id: str, cwd: Path | str, add_dirs) -> str:
     boundary = floor(run_id, cwd, add_dirs)
-    own = run_folders(run_id)
+    own = tuple(local_paths.folded_parts(p) for folder in run_folders(run_id) for p in (_safe_spellings(folder) or ()))
+    worktrees = tuple(local_paths.folded_parts(p) for p in (_safe_spellings(paths.WORKTREES_DIR) or ()))
+    closed_roots = tuple(local_paths.folded_parts(p) for root in boundary.closed for p in (_safe_spellings(root) or ()))
     for target in (cwd, *add_dirs):
-        for candidate in (Path(target).absolute(), Path(target).resolve()):
-            for root in boundary.closed:
-                for closed in (root.absolute(), root.resolve()):
-                    if not candidate.is_relative_to(closed):
-                        continue
-                    allowed = any(candidate.is_relative_to(p) for folder in own
-                                  for p in (folder.absolute(), folder.resolve()))
-                    allowed = allowed or candidate.parent in (paths.WORKTREES_DIR.absolute(),
-                                                               paths.WORKTREES_DIR.resolve())
-                    if not allowed:
-                        return reach(str(target))
+        candidates = _safe_spellings(target)
+        if candidates is None:
+            return reach(str(target))
+        for candidate in candidates:
+            cparts = local_paths.folded_parts(candidate)
+            for closed in closed_roots:
+                if not _is_subpath(cparts, closed):
+                    continue
+                allowed = any(_is_subpath(cparts, folder) for folder in own)
+                allowed = allowed or cparts[:-1] in worktrees
+                if not allowed:
+                    return reach(str(target))
     return ""
 
 
@@ -121,13 +305,29 @@ def wanted(tools: list[str] | None) -> bool:
 
 
 def secret_named(command: str, cwd: str) -> str:
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        words = command.split()
-    for part in (p for w in words for p in re.split(r"[=<>;|&()`]", w) if p):
-        path = Path(os.path.expanduser(part))
-        if sandbox.secret_path(path) and (path if path.is_absolute() else Path(cwd) / path).exists():
+    if local_paths.has_null(command) or local_paths.has_null(cwd):
+        return command
+    for part in _command_parts(command):
+        if local_paths.has_null(part):
+            return part
+        path = paths.expand(part)
+        full = path if path.is_absolute() else Path(cwd) / path
+        if GLOB_CHARS.search(part):
+            if _secret_glob_match(full):
+                return part
+            continue
+        try:
+            exists = full.exists() or full.is_symlink()
+        except (OSError, ValueError):
+            return part
+        if not exists:
+            continue
+        if sandbox.secret_path(path) or sandbox.secret_path(full):
+            return part
+        try:
+            if sandbox.secret_path(full.resolve()):
+                return part
+        except (OSError, RuntimeError, ValueError):
             return part
     return ""
 
@@ -138,47 +338,75 @@ def main(judge: bool = False, opened=()) -> int:
         boundary = floor(os.environ.get("ARETE_RUN_ID", ""), payload.get("cwd") or os.getcwd(), opened)
         reason = decide(payload, judge, boundary)
     except Exception:
-        return 0
+        reason = FAIL_CLOSED_REASON
     if reason:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": reason}}))
     return 0
 
 
+def _denies_path_or_glob(boundary, path: Path) -> bool:
+    if boundary.denies(path):
+        return True
+    if GLOB_CHARS.search(str(path)) and hasattr(boundary, "denies_glob"):
+        return boundary.denies_glob(path)
+    return False
+
+
+def _secret_target(target: str, path: Path) -> bool:
+    if sandbox.secret_path(target) or sandbox.secret_path(path):
+        return True
+    try:
+        return sandbox.secret_path(path.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
 def decide(payload: dict, judge: bool = False, boundary: Floor | None = None) -> str:
+    from . import codex
+
     tool = payload.get("tool_name", "")
     args = payload.get("tool_input") or {}
     cwd = str(payload.get("cwd") or os.getcwd())
+    if local_paths.has_null(cwd):
+        return reach(cwd)
     boundary = boundary or floor(os.environ.get("ARETE_RUN_ID", ""), cwd, [])
     if tool in FILE_TOOLS:
         target = str(args.get("file_path") or args.get("notebook_path") or args.get("path") or "")
-        if tool == "Glob" and not target:
-            pattern = str(args.get("pattern") or "")
-            if Path(pattern).is_absolute():
-                prefix = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
-                target = prefix if prefix.endswith("/") or prefix == pattern else str(Path(prefix).parent)
+        pattern = str(args.get("pattern") or "") if tool == "Glob" else ""
+        if local_paths.has_null(target) or local_paths.has_null(pattern):
+            return reach(target or pattern)
+        if tool == "Glob" and pattern:
+            expanded_pattern = paths.expand(pattern)
+            base = paths.expand(target) if target else Path(cwd)
+            base = base if base.is_absolute() else Path(cwd) / base
+            full_pattern = expanded_pattern if expanded_pattern.is_absolute() else base / expanded_pattern
+            prefix = GLOB_CHARS.split(str(full_pattern), maxsplit=1)[0]
+            prefix_path = Path(prefix if prefix.endswith("/") or prefix == str(full_pattern) else str(Path(prefix).parent))
+            if _denies_path_or_glob(boundary, prefix_path) or _denies_path_or_glob(boundary, full_pattern):
+                return reach(pattern)
+            if sandbox.secret_path(expanded_pattern) or sandbox.secret_path(full_pattern):
+                return kept_out(tool, pattern)
         if not target and tool in ("Glob", "Grep", "LS"):
             target = cwd
-        path = Path(paths.expand(target))
+        path = paths.expand(target)
         path = path if path.is_absolute() else Path(cwd) / path
-        if target and boundary.denies(path):
+        if target and _denies_path_or_glob(boundary, path):
             return reach(target)
-        return kept_out(tool, target) if target and sandbox.secret_path(target) else ""
+        return kept_out(tool, target) if target and _secret_target(target, path) else ""
     command = str(args.get("command") or "").strip() if tool == "Bash" else ""
     if not command:
         return ""
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        words = command.split()
-    keychain_reads = {"find-generic-password", "find-internet-password", "dump-keychain", "export"}
-    if any(Path(word).name == "security" and any(w in keychain_reads for w in words[i + 1:])
-           for i, word in enumerate(words)):
-        return reach("security keychain items")
-    for part in (p for word in words for p in re.split(r"[=<>;|&()`]", word) if p):
-        path = Path(paths.expand(part))
+    if local_paths.has_null(command):
+        return reach("command with null byte")
+    if reason := codex.keychain_refusal(command):
+        return reason
+    for part in _command_parts(command):
+        if local_paths.has_null(part):
+            return reach(part)
+        path = paths.expand(part)
         path = path if path.is_absolute() else Path(cwd) / path
-        if boundary.denies(path):
+        if _denies_path_or_glob(boundary, path):
             return reach(part)
     if secret := secret_named(command, cwd):
         return kept_out(tool, secret)

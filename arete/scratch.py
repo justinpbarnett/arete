@@ -1173,8 +1173,8 @@ def traversed(path: Path) -> tuple[set[Path], Path]:
         part = pending.pop()
         try:
             target = Path(os.readlink(current / part)) if part != ".." and (current / part).is_symlink() else None
-        except OSError as e:
-            raise sandbox.ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
+        except (OSError, ValueError, RuntimeError) as e:
+            raise sandbox.ConfinementUnavailable(f"{path} cannot be checked: {e}") from e
         if part == "..":
             current = current.parent
         elif target is not None:
@@ -1210,10 +1210,15 @@ def exposure(path: Path, grants) -> Path | None:
     ends = spellings(final)
     folders = set().union(ends, *(spellings(d) for d in seen), *(set(e.parents) for e in ends))
     for grant in grants:
-        roots = spellings(Path(grant).resolve()) | spellings(Path(grant))
+        try:
+            grant_path = Path(grant)
+            resolved = sandbox.real_path(grant_path)
+        except (OSError, ValueError, RuntimeError) as e:
+            raise sandbox.ConfinementUnavailable(f"{grant} cannot be checked") from e
+        roots = spellings(resolved) | spellings(grant_path)
         if any(r.is_relative_to(e) for r in roots for e in ends) or any(
                 d.is_relative_to(r) for d in folders for r in roots):
-            return Path(grant).resolve()
+            return resolved
     return None
 
 

@@ -168,6 +168,7 @@ class HookFloor:
     base_denies: Callable[[Path], bool]
     roots: set[tuple[str, ...]]
     recursive: bool
+    base_denies_glob: Callable[[Path], bool] | None = None
 
     def denies(self, path: Path) -> bool:
         for candidate in path_spellings(path) if self.roots else ():
@@ -175,6 +176,9 @@ class HookFloor:
                    for root in self.roots):
                 return True
         return self.base_denies(path)
+
+    def denies_glob(self, pattern: Path) -> bool:
+        return bool(self.base_denies_glob and self.base_denies_glob(pattern))
 
 
 def cmd_guard(args) -> int:
@@ -191,7 +195,7 @@ def cmd_guard(args) -> int:
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, args.open)
         floor = replace(floor, closed=(*floor.closed, *(paths.expand(path) for path in args.closed)))
         roots = {spelling for root in sandbox.secret_store_roots() for spelling in path_spellings(root)}
-        boundary = HookFloor(floor.denies, roots, tool in ("Grep", "Glob"))
+        boundary = HookFloor(floor.denies, roots, tool in ("Grep", "Glob"), floor.denies_glob)
         if roots and tool == "Glob":
             values = payload.get("tool_input") or {}
             target = cwd / paths.expand(values.get("path") or ".") / search_path(values.get("pattern") or "")
