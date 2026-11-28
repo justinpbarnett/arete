@@ -115,15 +115,17 @@ def metadata(c):
             "head": f"{epoch}.{head}"}
 
 
-def trim():
+def trim(*, derived_days: float = 90, notice_days: float = 7) -> int:
     c = foundation.write_connection()
-    for cls, days in (("derived", 90), ("notice", 7)):
+    removed = 0
+    for cls, days in (("derived", derived_days), ("notice", notice_days)):
         old = int(c.execute("SELECT value FROM schema_meta WHERE key = ?", (f"trim_{cls}",)).fetchone()[0])
         mark = c.execute("SELECT COALESCE(MAX(seq), 0) FROM events_log WHERE class = ? AND at < ?",
                          (cls, util.iso(util.now() - timedelta(days=days)))).fetchone()[0]
         mark = max(old, mark)
         c.execute("UPDATE schema_meta SET value = ? WHERE key = ?", (str(mark), f"trim_{cls}"))
-        c.execute("DELETE FROM events_log WHERE class = ? AND seq <= ?", (cls, mark))
+        removed += c.execute("DELETE FROM events_log WHERE class = ? AND seq <= ?", (cls, mark)).rowcount
+    return removed
 
 
 MAX_FILTER_ITEMS = 100

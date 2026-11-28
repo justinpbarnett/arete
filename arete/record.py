@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Self
 
 from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
-from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import insights as insights_store
 from .store import loops as loop_store
@@ -786,14 +785,6 @@ class Stored:
     written: float
 
 
-@dataclass(frozen=True)
-class Pruned:
-    removed: tuple[Stored, ...]
-    left: int
-    left_bytes: int
-    over: bool
-
-
 def scanned(run_id: str, folder: Path) -> Stored:
     size, marks = 0, []
 
@@ -833,97 +824,14 @@ def runs_bytes() -> int:
     return sum(scanned(p.name, p).size for p in run_folders())
 
 
-@dataclass(frozen=True)
-class Purged:
-    folders: int
-    size: int
-    errors: tuple[str, ...]
-
-
-def legacy_firing(folder: Path) -> bool:
-    entries = {p.name: p for p in folder.iterdir()}
-    if "run.log" not in entries or set(entries) - {"run.log", "events.json", "scratch", "record"}:
-        return False
-    if any(p.is_symlink() for p in entries.values()):
-        return False
-    log = entries["run.log"]
-    if not log.is_file() or log.stat().st_mtime >= time.time() - 14 * 86400:
-        return False
-    if "events.json" in entries and not entries["events.json"].is_file():
-        return False
-    if "scratch" in entries and (not entries["scratch"].is_dir() or any(entries["scratch"].iterdir())):
-        return False
-    if "record" in entries:
-        if not entries["record"].is_dir():
-            return False
-        contents = list(entries["record"].iterdir())
-        if any(p.name != "steps.jsonl.gz" or p.is_symlink() or not p.is_file() for p in contents):
-            return False
-    return True
-
-
-def purge_folders() -> Purged:
-    queued, known = run_store.purge_inventory()
-    folders, size, errors = 0, 0, []
-    for run_id in sorted(queued):
-        folder = paths.RUNS_DIR / run_id
-        try:
-            if not one_component(run_id) or folder.is_symlink():
-                raise ValueError(f"unsafe run folder {run_id}")
-            if folder.exists():
-                measured = scanned(run_id, folder).size
-                shutil.rmtree(folder)
-                folders, size = folders + 1, size + measured
-            if not folder.exists():
-                run_store.forget_purge(run_id)
-        except (OSError, ValueError) as e:
-            errors.append(f"{run_id}: {type(e).__name__}: {e}")
-    for folder in run_folders():
-        if folder.name in known or folder.name in queued:
-            continue
-        try:
-            if legacy_firing(folder):
-                measured = scanned(folder.name, folder).size
-                shutil.rmtree(folder)
-                folders, size = folders + 1, size + measured
-        except OSError as e:
-            errors.append(f"{folder.name}: {type(e).__name__}: {e}")
-    return Purged(folders, size, tuple(errors))
-
-
-def kept(records: Sequence[Stored]) -> set[str]:
-    ids = [r.run_id for r in records]
-    recent = time.time() - LIVE_SECONDS
-    return (run_store.record_pins() | approvals_store.runs_cited_by_kept_proposals(ids)
-            | {r["id"] for r in run_store.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
-
-
-def prune(days: float, max_gb: float) -> Pruned:
-    records = stored()
-    protected = kept(records)
-    limit = max_gb * GB
-    oldest_allowed = time.time() - days * 86400
-    left_bytes, left, removed = runs_bytes(), len(records), []
-    for r in records:
-        if r.run_id in protected or not (r.written < oldest_allowed or left_bytes > limit):
-            continue
-        folder = paths.record_dir(r.run_id)
-        shutil.rmtree(folder, ignore_errors=True)
-        if folder.exists():
-            continue
-        removed.append(r)
-        left, left_bytes = left - 1, left_bytes - r.size
-    return Pruned(tuple(removed), left, left_bytes, left_bytes > limit)
-
-
 def one_component(run_id: str) -> bool:
     return run_id not in ("", ".", "..") and "/" not in run_id and os.sep not in run_id
 
 
 def pin(run_id: str) -> None:
-    if not one_component(run_id) or not paths.record_dir(run_id).is_dir():
+    if not one_component(run_id):
         raise LookupError(f"no record for run {run_id}")
-    run_store.pin_record(run_id)
+    run_store.pin_record(run_id, require_record_dir=lambda: paths.record_dir(run_id).is_dir())
 
 
 def unpin(run_id: str) -> None:

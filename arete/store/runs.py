@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import math
 import sqlite3
-from datetime import timedelta
 
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
 from ._rows import json_dict, validate_columns
-from .db import SPEC_DELIVERY_SCHEMA, WORKER_EXCHANGE_SCHEMA, db, migration_applied, reader, tx
+from .db import db, migration_applied, reader, tx
 
 STEP_LABEL_FIELDS = frozenset(("atom", "ab", "ab_side", "effort", "tier", "kind", "auth_mode"))
 
@@ -597,8 +597,15 @@ def issue_running(repo: str, issue: int | str) -> bool:
                          (repo, issue)).fetchone() is not None
 
 
-def pin_record(run_id: str) -> bool:
+def pin_record(run_id: str, *, require_record_dir: Callable[[], bool] | None = None) -> bool:
     with db() as c:
+        row = c.execute("SELECT files_purged FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row and row["files_purged"]:
+            raise refusals.Conflict(f"run {run_id} files were removed on {row['files_purged']}")
+        if c.execute("SELECT 1 FROM run_purges WHERE run_id = ?", (run_id,)).fetchone():
+            raise refusals.Conflict(f"run {run_id} is already queued for removal")
+        if require_record_dir is not None and not require_record_dir():
+            raise LookupError(f"no record for run {run_id}")
         return c.execute("INSERT OR IGNORE INTO record_pins (run_id, pinned) VALUES (?, ?)",
                          (run_id, util.iso())).rowcount > 0
 
@@ -616,48 +623,6 @@ def record_pins(connect=reader) -> set[str]:
 def last_step_id(run_id: str) -> int:
     with reader() as c:
         return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
-
-
-def prune(c, days: float = 14, lines_days: float = 90) -> None:
-    with writes.atomic():
-        _prune(c, days, lines_days)
-
-
-def _prune(c, days, lines_days):
-    since = util.iso(util.now() - timedelta(days=days))
-    lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
-    c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "  # noqa: S608
-              f"WHERE {FIRINGS} AND started < ?", (now, since))
-    c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))  # noqa: S608
-    for row in c.execute(f"SELECT id FROM runs WHERE {FIRINGS} AND started < ?", (since,)).fetchall():  # noqa: S608
-        writes.update("runs", row["id"], {}, delete=True, kind="run.deleted")
-    keep_workers = (
-        "AND NOT EXISTS (SELECT 1 FROM orchestration_workers w JOIN orchestrations o ON o.root=w.root "
-        "WHERE w.phase NOT IN ('completed','integrated','cancelled') "
-        "AND EXISTS (SELECT 1 FROM json_each(o.data,'$.runs') WHERE value=runs.id)) "
-    ) if migration_applied(WORKER_EXCHANGE_SCHEMA, c) else ""
-    keep_specs = (
-        "AND NOT EXISTS (SELECT 1 FROM spec_deliveries s WHERE s.repo = runs.repo AND s.issue = runs.issue "
-        "AND s.state != 'complete') "
-    ) if migration_applied(SPEC_DELIVERY_SCHEMA, c) else ""
-    eligible = c.execute(
-        "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "  # noqa: S608
-        "AND status NOT IN ('running', 'pr', 'needs-info') "
-        "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-        + keep_workers + keep_specs
-        + "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
-        "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
-        "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
-        "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "
-        "AND (run_id = runs.id OR instr(COALESCE(evidence, ''), runs.id) > 0)) "
-        "AND NOT EXISTS (SELECT 1 FROM runs recent WHERE recent.repo = runs.repo "
-        "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
-    for row in eligible:
-        c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
-        writes.update("runs", row["id"], {"files_purged": now})
-        from . import orchestration
-
-        orchestration.purge(c, row["id"])
 
 
 def running_runs(conn):
@@ -789,11 +754,15 @@ def finished_runs_since(since: str, until: str = "9999") -> list[dict]:
                                            "ORDER BY started", (since, until))]
 
 
-def purge_inventory() -> tuple[set[str], set[str]]:
-    with db() as c:
-        queued = {r["run_id"] for r in c.execute("SELECT run_id FROM run_purges")}
-        known = {r["id"] for r in c.execute("SELECT id FROM runs")}
-    return queued, known
+def purge_queue(connect=reader) -> list[dict]:
+    with connect() as c:
+        return [
+            dict(r)
+            for r in c.execute(
+                "SELECT p.run_id, p.reason, p.queued, COALESCE(r.kind, '') AS kind "
+                "FROM run_purges p LEFT JOIN runs r ON r.id = p.run_id ORDER BY p.run_id"
+            )
+        ]
 
 
 def forget_purge(run_id: str) -> None:

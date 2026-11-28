@@ -280,8 +280,7 @@
         "max_attempts": {"type": "integer"},
         "incident_budget_usd": {"type": "number"},
         "daily_budget_usd": {"type": "number"},
-        "cooldown_minutes": {"type": "number"},
-        "keep_days": {"type": "number"}
+        "cooldown_minutes": {"type": "number"}
       },
       "additionalProperties": false,
       "x-arete-reach": true
@@ -329,16 +328,6 @@
         "auto": {"type": "boolean"},
         "route_fixes": {"type": "boolean"},
         "auto_per_refresh": {"type": "integer"}
-      },
-      "additionalProperties": false
-    },
-    "retention": {
-      "type": "object",
-      "properties": {
-        "days": {"type": "number"},
-        "max_gb": {"type": "number"},
-        "lines_days": {"type": "number"},
-        "db_max_mb": {"type": "number"}
       },
       "additionalProperties": false
     },

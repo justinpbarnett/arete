@@ -10,10 +10,11 @@ TABLES = {}
 FIELDS = {
     "runs": frozenset(("kind", "repo", "issue", "loop", "loop_kind", "pid", "started", "finished", "status",
                        "summary", "cost_usd", "tokens_in", "tokens_out", "pr_url", "branch", "only_step",
-                       "files_purged", "mined_until", "stop_asked", "ab_held", "active_seconds", "verify_seconds",
-                       "verify_open_seconds", "repair_calls", "measured_at", "schema_version", "label_pending",
-                       "landed", "device", "attempts", "model", "runner", "log", "trigger", "queue", "grp", "lock",
-                       "moved", "wait_minutes", "engine_sha", "failure", "dry_run", "environment_retry_of")),
+                       "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held", "active_seconds",
+                       "verify_seconds", "verify_open_seconds", "repair_calls", "measured_at", "schema_version",
+                       "label_pending", "landed", "device", "attempts", "model", "runner", "log", "trigger", "queue",
+                       "grp", "lock", "moved", "wait_minutes", "engine_sha", "failure", "dry_run",
+                       "environment_retry_of")),
     "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated")),
     "task_comments": frozenset(("task", "author", "body", "ts")),
 }

@@ -1,0 +1,87 @@
+{
+  "type": "object",
+  "properties": {
+    "firings": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "queue": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0},
+        "max_gb": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "folders": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "events_log": {
+      "type": "object",
+      "properties": {
+        "notice_days": {"type": "number", "exclusiveMinimum": 0},
+        "derived_days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "idempotency": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "loop_events": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "incidents": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0},
+        "notes_days": {"type": "number", "exclusiveMinimum": 0},
+        "keep_days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "dead_letters": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "events_file": {
+      "type": "object",
+      "properties": {
+        "days": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "db": {
+      "type": "object",
+      "properties": {
+        "max_mb": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

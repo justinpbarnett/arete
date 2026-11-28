@@ -92,7 +92,7 @@ are accepted within the window. Malformed records and incomplete final lines are
 
 Heartbeat checks run independently of serve installation/liveness: `db:slow` warns on a transaction strictly above
 five seconds in the rolling last hour and names its caller; `db:size` warns when DB + WAL exceed
-`[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
+`[db] max_mb` in `retention.toml` (default 500 MiB); `runs:size` warns above half `[records] max_gb` (decimal GB), counting record/
 and all other run-folder bytes. These checks read current files, so they also work before the first collection.
 
 ## Serve
@@ -176,7 +176,6 @@ max_attempts = 2
 incident_budget_usd = 5.0
 daily_budget_usd = 10.0
 cooldown_minutes = 30
-keep_days = 30
 
 [[oncall.source]]
 path = "~/Library/Logs/myapp/*.log"
@@ -234,7 +233,7 @@ A repeat of an open incident's fingerprint, minutes or hours later, updates it i
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
 The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines read under the set it was opened under, and only while its own file is still under that set, or, once that file is gone, while the config holds no other set.
 The append-only `incident_notes` table records what happened and when.
-Evidence is scrubbed of secrets and home paths before it is stored, and `store.prune` trims both tables.
+Evidence is scrubbed of secrets and home paths before it is stored, and the hourly retention pass trims both tables using `[incidents]` in `retention.toml`.
 
 **Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, oldest first however many are open, and the answers become one stored decision:
 
@@ -278,7 +277,6 @@ Task start, run stop, the route lookup, the check run and the alerts go through 
 | `incident_budget_usd` | 5.0 | paid spend on one incident's repairs, counted like `store.runs.paid_by_run`; past it the incident is `blocked` |
 | `daily_budget_usd` | 10.0 | paid spend of all repairs started in the last 24 hours; past it incidents wait |
 | `cooldown_minutes` | 30 | pause after each ended attempt |
-| `keep_days` | 30 | days a closed incident keeps its notes and evidence; 0 or more, fractions allowed |
 
 **Steering.** `cancel` stops the incident's running repair through `control.stop_run` and starts the cooldown; `dismiss` closes an open incident; `retry` re-arms one, so its attempts, spend and cooldown count from that point; `off` and `on` flip a runtime switch (the cursor `oncall:switch`, not config).
 Each action writes a note on the incident, and a refused one (an unknown id, a repair still running) exits 1 with one line.
@@ -304,8 +302,8 @@ Evidence and log text are never sent.
 The alert clears when the incident resolves or is dismissed.
 
 **Audit and retention.** Every decision, wake, recheck, escalation, dismiss, retry, cancel and switch is a note on the incident with its time.
-Notes and evidence of a closed incident (resolved or dismissed) stay `keep_days` days after it closes and are then removed by the hourly prune, which keeps the incident row.
-Repeat `seen again` notes older than 14 days are dropped, and an open incident unseen for 56 days is removed.
+Notes and evidence of a closed incident (resolved or dismissed) stay `[incidents] keep_days` (default 30) days after it closes and are then removed by the hourly retention pass, which keeps the incident row.
+Repeat `seen again` notes older than `[incidents] notes_days` (default 14) days are dropped, and an open incident unseen for `[incidents] days` (default 56) days is removed. Configure these in `retention.toml` (see [Retention](#retention)).
 Nothing in an incident goes to GitHub, Jira or a notification beyond the one sanitized escalation line.
 
 ```
@@ -757,16 +755,31 @@ Executable proposals show the same compiler command used for verification, the o
 
 Review proposals under **Needs you → By hand** or in `arete status`. Bring any approved change through the repository's usual review process and run its existing checks. Mark done clears the inbox item and leaves the proposal file for reference. A materially revised proposal can return for review.
 
-### Retention
+### Retention (`retention.toml`)
 
-The hourly prune in `arete serve` removes zero-cost command-loop firing rows, feed entries and run folders after 14 days. Folder deletions are queued in the database and retried after a filesystem failure. Old rowless folders are removed only when their contents match the legacy firing shape: `run.log`, optionally `events.json`, an empty `scratch/`, and `record/` containing only `steps.jsonl.gz`.
-Raw `record/` folders go oldest first after `[retention] days` (default 30, counted from the record's last write), or while all files in `runs/` exceed `max_gb` (default 20, decimal GB, `10^9` bytes).
-A record stays while pinned, cited by a proposal other than rejected, skipped or filed, running, or written in the last hour. Merged proposals keep their cited records until the run folder expires.
-Run folders, including logs, evidence and continuation files, go after `lines_days` (default 90, counted from finish or, if unfinished, start). Their runs, feed and steps history rows stay, with a file-removal date; resume then asks you to start the ticket again with `POST /api/tasks`. A folder stays while its run is running, pr or needs-info, pinned, has an open or answered but untaken ask, is cited by a proposal other than merged, rejected, skipped or filed, or shares a repo and ticket with a run started inside `lines_days`.
+All retention horizons live in one policy file: engine defaults at `arete/defaults/retention.toml` and installation overrides at `retention.toml` in the config repo root (config kind `retention`). Every value is a finite number above 0 (fractions allowed), and `[records] days` may not exceed `[folders] days`. Legacy `[retention]` and `[oncall] keep_days` entries in `config.toml` are moved into `retention.toml` automatically on upgrade and rejected thereafter.
+
+| Table | Keys and defaults | Store |
+| --- | --- | --- |
+| `[firings]` | `days = 14` | zero-cost command-loop firings (`done` or `skipped`); deletes their `runs`, `steps`, `feed` rows and run folder |
+| `[queue]` | `days = 14` | non-dead `queue` rows naming a settled run |
+| `[records]` | `days = 30`, `max_gb = 20` | `runs/<id>/record` folders (oldest first by age, or while all bytes in `runs/` exceed decimal `max_gb` = `10^9` bytes); sets `runs.records_purged` |
+| `[folders]` | `days = 90` | the rest of `runs/<id>` and, for session runs, `sessions/<id>`; keeps `runs` and `steps` rows with `runs.files_purged` set, deletes `feed` rows |
+| `[events_log]` | `notice_days = 7`, `derived_days = 90` | `events_log` trim windows (`durable` rows are never trimmed) |
+| `[idempotency]` | `days = 30` | `idempotency` rows |
+| `[loop_events]` | `days = 56` | loop `events` rows |
+| `[incidents]` | `days = 56`, `notes_days = 14`, `keep_days = 30` | inactive incidents, repeat `seen again` notes, and notes/evidence of closed incidents |
+| `[dead_letters]` | `days = 56` | dead `queue` rows (and expires their open `queue.dead` inbox items) |
+| `[events_file]` | `days = 90` | monthly `events-YYYYMM.jsonl` hook event archives |
+| `[db]` | `max_mb = 500` | `db:size` health warning threshold in MiB (deletes nothing) |
+
+The hourly retention pass in `arete serve` runs in one sequence: snapshot first (a failed snapshot skips every deleting phase), measure `runs/` and `record/` folders on serve's pool outside any transaction, apply all row deletes and `run_purges` marks in one `tx()` with events, remove only the folders or `record/` paths named in `run_purges` (leaving `runs/chat`, `eva-*-prompts` and `min-*` untouched), and rotate `events.jsonl`.
+No purge row is written for a run that is pinned (`record_pins`), `running`, `pr` or `needs-info`, has an open or answered-but-untaken ask, or is cited by a kept proposal. A run keeps its folder while any run sharing its `chain` or its `(repo, issue)` started inside `[folders] days`. A record written in the last hour stays.
+`tasks.resume`, `tasks.repair` and `tasks.run_step` refuse a run with `files_purged`, naming the date; `run.pin` refuses a run with `files_purged` or a waiting `run_purges` row.
 `arete record pin RUN_ID` keeps a record; `arete record unpin RUN_ID` lets it age out like any other.
 `arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
-Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
-Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
+Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this.
+Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `[events_file] days` ago are removed.
 
 ## Backups
 
@@ -776,7 +789,7 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Each table appears in exactly one owner's `TABLES`, mapped to its retention policy. A future aggregate gains a valid migration area by adding its public module and literal `TABLES` dictionary before adding its migration. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
-Import connections with `from arete.store import db` and persistence functions through their owner modules. `store.runs` owns recording SQL, history, billing helpers (`paid_by_run`, `loop_spent_since`), reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. The relocated numbered migrations and `latest.txt` retain their original bytes.
+Import connections with `from arete.store import db` and persistence functions through their owner modules. `store.runs` owns recording SQL, history, billing helpers (`paid_by_run`, `loop_spent_since`), reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.retention` runs the unified retention pass across runs, events, idempotency, loops and incidents in one `tx()`, after the server's checked backup. The relocated numbered migrations and `latest.txt` retain their original bytes.
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
 
@@ -1099,7 +1112,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
 | `[orchestration]` | `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, and `progress_seconds = 30`. Set `max_builders` to enable private builder turns and cap concurrent writers per run. The controller can assign independent work within the worker and builder limits. Each configured limit takes an integer from 1 to 10000. [Orchestration](docs/orchestration.md) |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
-| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
+| `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. Incident retention lives in `retention.toml` `[incidents]`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796), `owner`, the tailnet login the page opens for (default: the login that owns this machine), and `https` (default `false`; `true` fetches a tailscale certificate that lists the machine and tailnet name in public certificate transparency logs, and plain HTTP then gets a 308). See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
@@ -1109,7 +1122,6 @@ private_key = "~/.config/arete/github-app.pem"
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. `paid` limits paid routes by provider and price. See [Steps](#steps). |
 | `[chat]` | `context_tokens` (default 40000, at least 100) is how many tokens of the chat's saved messages go into each turn before older ones are folded into a saved summary (the new message is not counted). `summary_model` (default `haiku`) writes that summary. `max_sessions` (default 2, at least 1) is the most task sessions one chat has running. `budget_usd` (default 10) is the dollars one chat may spend on its replies and its sessions. |
 | `[capture]` | `vision` (default none): the name of a file in the config folder, such as `vision.md`, that says what the app is for. The feedback composer's vision check reads it; a path that is absolute, holds `..` or leaves the folder is refused at load. With no key, no file or an empty file, that check holds and says what to add. `evidence_branch` (default `feedback-evidence`): the branch that holds uploaded evidence, a plain branch name with no `..`. `public_evidence` (default false): a public repo, or one whose visibility cannot be read, holds delivery of a request with evidence unless this is true. |
-| `[retention]` | `days` (default 30) expires raw records; `max_gb` (default 20) counts all run-folder bytes and removes eligible records oldest first; `lines_days` (default 90, at least `days`) expires run folders while keeping history rows; `db_max_mb` (default 500 MiB) sets the DB + WAL health warning threshold. Protected data stays. Positive fractions are allowed. See [Retention](#retention). |
 | `[replay]` | `all` (default false, sends every agent call to the replay runner) and `dir` (the folder of answers; `ARETE_REPLAY_DIR` wins over it). See [Replay](#replay). |
 | `[environment]` | `pass`, the names of more server variables that local agents and the commands that run a repo's code get, each an exact name, a prefix ending in `*`, or `"*"` for all. `[environment.providers]` maps a pi provider to more names its agents get, such as `amazon-bedrock = ["AWS_*"]`. See [An agent's environment](#an-agents-environment). |
 

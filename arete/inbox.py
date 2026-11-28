@@ -19,6 +19,7 @@ from . import (
     paths,
     pipeline,
     principals,
+    retention,
     secretstore,
     tasks,
     tracker,
@@ -506,54 +507,85 @@ def _config_paused_lines(problem: config.Problem, cfg: config.Config) -> list[st
 
 def _config_items(c) -> list[dict]:
     cfg, _ = config.load_or_problem()
-    if not cfg.problems:
-        return []
-    grouped: dict[tuple[str, str], list[config.Problem]] = {}
-    for problem in cfg.problems:
-        if problem.scope.startswith("layer:"):
-            repo_name = problem.scope.removeprefix("layer:")
-            key = (f"config:step_settings/{repo_name}", repo_name)
-        else:
-            key = ("config:step_settings/defaults", "")
-        grouped.setdefault(key, []).append(problem)
     items = []
-    for (subject, line), file_problems in grouped.items():
-        entries = [
-            {
-                "path": p.path,
-                "section": p.section,
-                "name": p.name,
-                "value": p.value,
-                "scope": p.scope,
-                "pauses": _config_paused_lines(p, cfg),
-                "text": p.text(),
+    if cfg.problems:
+        grouped: dict[tuple[str, str], list[config.Problem]] = {}
+        for problem in cfg.problems:
+            if problem.scope.startswith("layer:"):
+                repo_name = problem.scope.removeprefix("layer:")
+                key = (f"config:step_settings/{repo_name}", repo_name)
+            else:
+                key = ("config:step_settings/defaults", "")
+            grouped.setdefault(key, []).append(problem)
+        for (subject, line), file_problems in grouped.items():
+            entries = [
+                {
+                    "path": p.path,
+                    "section": p.section,
+                    "name": p.name,
+                    "value": p.value,
+                    "scope": p.scope,
+                    "pauses": _config_paused_lines(p, cfg),
+                    "text": p.text(),
+                }
+                for p in file_problems
+            ]
+            first = file_problems[0]
+            label = f"layer {line}" if line else "config.toml"
+            if first.section or first.name:
+                title = f"Invalid config in {label}: {f'{first.section} {first.name}'.strip()}"
+            else:
+                title = f"{label} does not load"
+            detail = {
+                "path": first.path,
+                "problems": entries,
+                "summary": "; ".join(p.text() for p in file_problems),
+                "stamp": util.digest(json.dumps(entries, sort_keys=True, default=str)),
             }
-            for p in file_problems
-        ]
-        first = file_problems[0]
-        label = f"layer {line}" if line else "config.toml"
-        if first.section or first.name:
-            title = f"Invalid config in {label}: {f'{first.section} {first.name}'.strip()}"
-        else:
-            title = f"{label} does not load"
-        detail = {
-            "path": first.path,
-            "problems": entries,
-            "summary": "; ".join(p.text() for p in file_problems),
-            "stamp": util.digest(json.dumps(entries, sort_keys=True, default=str)),
-        }
-        items.append({
-            "kind": "config_invalid",
-            "subject": subject,
-            "task_id": "",
-            "run_id": "",
-            "line": line,
-            "priority": 1,
-            "title": title,
-            "detail": detail,
-            "verbs": ["continue"],
-            "options": [],
-        })
+            items.append({
+                "kind": "config_invalid",
+                "subject": subject,
+                "task_id": "",
+                "run_id": "",
+                "line": line,
+                "priority": 1,
+                "title": title,
+                "detail": detail,
+                "verbs": ["continue"],
+                "options": [],
+            })
+    ret_path = retention.policy_file()
+    if ret_path.is_file():
+        try:
+            retention.load(ret_path)
+        except Exception as e:
+            detail_text = f"{type(e).__name__}: {e}"
+            entry = {
+                "path": str(ret_path),
+                "section": "",
+                "name": "",
+                "value": detail_text,
+                "scope": "global",
+                "pauses": ["retention"],
+                "text": detail_text,
+            }
+            items.append({
+                "kind": "config_invalid",
+                "subject": "config:retention/defaults",
+                "task_id": "",
+                "run_id": "",
+                "line": "",
+                "priority": 1,
+                "title": f"{retention.FILENAME} does not load",
+                "detail": {
+                    "path": str(ret_path),
+                    "problems": [entry],
+                    "summary": detail_text,
+                    "stamp": util.digest(json.dumps([entry], sort_keys=True, default=str)),
+                },
+                "verbs": ["continue"],
+                "options": [],
+            })
     return items
 
 

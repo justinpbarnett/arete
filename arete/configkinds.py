@@ -71,6 +71,7 @@ REGISTRY = {
     "attention": kind("attention", "check", Home("config.toml", "defaults")),
     "sound": kind("sound", "check", Home("sounds/{name}.toml")),
     "experiment": kind("experiment", "review", Home("experiments/{name}.toml")),
+    "retention": kind("retention", "check", Home("retention.toml", "defaults")),
 }
 
 

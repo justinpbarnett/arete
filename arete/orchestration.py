@@ -120,7 +120,11 @@ class RetargetedPR(ValueError):
         super().__init__(f"The PR base changed from `{previous}` to `{current}`. A person needs to revise it.")
 
 
-def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
+LEGACY_POLICY_RETENTION = {"days": 30, "max_gb": 20, "lines_days": 90, "db_max_mb": 500}
+LEGACY_ONCALL_KEEP_DAYS = 30.0
+
+
+def policy_fingerprint(cfg, layer, closed_context, *, resume=False, legacy_retention=False):
     effective = config.policy_dict(layer)
     effective.pop("factory_path")
     effective["orchestration"].pop("max_builders", None)
@@ -133,6 +137,10 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     for field in ("server_url", "unblock_repos", "unblock_step"):
         policy_config.pop(field)
     policy_config["max_parallel_checks"] = config.Config.max_parallel_checks
+    if legacy_retention:
+        policy_config["retention"] = dict(LEGACY_POLICY_RETENTION)
+        if isinstance(policy_config.get("oncall"), dict):
+            policy_config["oncall"] = {**policy_config["oncall"], "keep_days": LEGACY_ONCALL_KEEP_DAYS}
     if resume:
         config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
@@ -1038,8 +1046,13 @@ class Controller(worker_turns.WorkerTurns):
         return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=not authorized)
 
     def matches_policy(self, saved, current):
-        return saved == current or saved == policy_fingerprint(
-            self.job.cfg, self.job.layer, self.run.closed_context)
+        if saved == current:
+            return True
+        return saved in (
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=True, legacy_retention=True),
+            policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=False, legacy_retention=True),
+        )
 
     def fingerprint(self):
         pr_recovery.check_staging(self.job.checkouts)
