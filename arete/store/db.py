@@ -89,14 +89,16 @@ class FixtureConnection(ScrubbingConnection):
 
 
 def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streaming: bool = False,
-               timeout: float | None = None) -> sqlite3.Connection:
+               timeout: float | None = None, foreign_keys: bool = True) -> sqlite3.Connection:
     if streaming and not readonly:
         raise ValueError("a streaming database connection must be read-only")
+    fk_pragma = "PRAGMA foreign_keys = ON" if foreign_keys else "PRAGMA foreign_keys = OFF"
     if not paths.ISOLATED:
         mode = "ro" if readonly else "rwc" if create else "rw"
         conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True,
                                timeout=30 if timeout is None else timeout, factory=ScrubbingConnection)
         try:
+            conn.execute(fk_pragma)
             if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
                 conn.execute("PRAGMA synchronous=OFF")
                 conn.execute("PRAGMA temp_store=MEMORY")
@@ -144,6 +146,7 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
                                timeout=30 if deadline is None else max(0, deadline - time.monotonic()),
                                factory=FixtureConnection)
         conn.handles = retained if streaming else handles
+        conn.execute(fk_pragma)
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
         if os.environ.get("ARETE_TEST_FAST_SYNC") == "1":
@@ -206,6 +209,9 @@ TASK_IDENTITY_BACKFILL_SCHEMA = 58
 TASK_IDENTITY_CONTRACT_SCHEMA = 59
 BLOBS_RETENTION_SCHEMA = 60
 PR_REFS_RECONCILE_SCHEMA = 61
+RUNS_FOREIGN_KEYS_SCHEMA = 62
+RUN_LEASES_SCHEMA = 63
+RUNS_ONE_LIVE_SCHEMA = 64
 TASK_ADMISSION_CAPABILITY = "task_admission_v1"
 PROCESS_CAPABILITIES = (TASK_ADMISSION_CAPABILITY,)
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
@@ -227,7 +233,7 @@ NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
                              TRIAGE_VERSION_SCHEMA, OUTBOX_BACKFILL_SCHEMA,
                              STEPS_LIFECYCLE_SCHEMA, RECORD_TURNS_SCHEMA, DERIVED_SCHEMA, CONFIG_DRAFTS_SCHEMA,
                              TASK_IDENTITY_EXPAND_SCHEMA, TASK_IDENTITY_BACKFILL_SCHEMA,
-                             BLOBS_RETENTION_SCHEMA))
+                             BLOBS_RETENTION_SCHEMA, RUNS_FOREIGN_KEYS_SCHEMA, RUN_LEASES_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()
@@ -323,6 +329,44 @@ def _task_identity_process_blockers(beat: dict, n: int) -> list[str]:
     return blockers
 
 
+def live_lease_schema_counts(conn) -> dict[int | None, int]:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'").fetchone():
+        return {}
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(leases)")}
+    if "schema_version" in lease_cols:
+        sql = (
+            "SELECT COALESCE(l.schema_version, r.schema_version) AS sv, COUNT(*) AS n "
+            "FROM leases l LEFT JOIN runs r ON r.id = l.run_id "
+            "WHERE l.released IS NULL GROUP BY sv"
+        )
+    else:
+        sql = (
+            "SELECT r.schema_version AS sv, COUNT(*) AS n "
+            "FROM leases l LEFT JOIN runs r ON r.id = l.run_id "
+            "WHERE l.released IS NULL GROUP BY sv"
+        )
+    counts: dict[int | None, int] = {}
+    for row in conn.execute(sql):
+        sv = int(row["sv"]) if row["sv"] is not None else None
+        counts[sv] = int(row["n"])
+    return counts
+
+
+def _open_lease_blockers(conn, n: int) -> list[str]:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'").fetchone():
+        return []
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(leases)")}
+    sv_expr = "COALESCE(l.schema_version, r.schema_version)" if "schema_version" in lease_cols else "r.schema_version"
+    now_iso = util.iso()
+    rows = conn.execute(
+        f"SELECT l.id, {sv_expr} AS sv FROM leases l LEFT JOIN runs r ON r.id = l.run_id "  # noqa: S608
+        f"WHERE l.released IS NULL AND l.expires >= ? AND ({sv_expr} IS NULL OR {sv_expr} < ?) "
+        "ORDER BY l.id",
+        (now_iso, n),
+    ).fetchall()
+    return [f"lease L-{row['id']}" for row in rows]
+
+
 def contract_blockers(conn, n):
     from .. import control, launch_lease, record
 
@@ -354,6 +398,7 @@ def contract_blockers(conn, n):
                         blockers.append(row["id"])
             else:
                 blockers.append(row["id"])
+        blockers.extend(_open_lease_blockers(conn, n))
         beat = control.database_beat()
         if not isinstance(beat, dict):
             beat = {}
@@ -369,6 +414,7 @@ def contract_blockers(conn, n):
                     blockers.append(row["id"])
         elif workspace_contract and settled_run_process_alive(row):
             blockers.append(row["id"])
+    blockers.extend(_open_lease_blockers(conn, n))
     if workspace_contract:
         beat, seen = util.read_json_snapshot(paths.DB_FILE.with_name(control.BEAT_FILE.name), {})
         if not isinstance(beat, dict):
@@ -378,7 +424,7 @@ def contract_blockers(conn, n):
         blockers.extend(workspace_admission_blockers())
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
-    elif n in (DEVICES_CONTRACT_SCHEMA, OUTBOX_CONTRACT_SCHEMA, PR_REFS_RECONCILE_SCHEMA):
+    elif n in (DEVICES_CONTRACT_SCHEMA, OUTBOX_CONTRACT_SCHEMA, PR_REFS_RECONCILE_SCHEMA, RUNS_ONE_LIVE_SCHEMA):
         beat = control.database_beat()
         if problem := workspace_serve_blocker(beat, n):
             blockers.append(problem)
@@ -665,7 +711,16 @@ def migrate(contracts=True, *, workspace_snapshots: Path | None = None, through:
                 started = time.monotonic()
                 try:
                     timing = dbstats.Timing(paths.DB_FILE, "write")
-                    with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
+                    fk_off = bool(getattr(migration, "foreign_keys_off", False)) or migration.n in (
+                        WORKSPACE_CONTRACT_SCHEMA, OUTBOX_APPROVALS_SCHEMA, OUTBOX_CONTRACT_SCHEMA,
+                        TASK_IDENTITY_CONTRACT_SCHEMA,
+                    )
+                    with owning_transaction(
+                        lambda fk_off=fk_off: connect_db(paths.DB_FILE, foreign_keys=not fk_off),
+                        "BEGIN EXCLUSIVE",
+                        timing,
+                        after_commit=(lambda c: c.execute("PRAGMA foreign_keys = ON")) if fk_off else None,
+                    ) as writer:
                         if migration.n == WORKSPACE_CONTRACT_SCHEMA:
                             source = workspace_contract.snapshot_source(writer, workspace_snapshots)
                             explicit = workspace_snapshots is not None
@@ -779,7 +834,8 @@ def checked_connection(*, timeout: float | None = None, on_demand: bool = False,
 
 
 @contextmanager
-def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True, before_commit=None):
+def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True, before_commit=None,
+                       after_commit=None):
     conn = None
     failed = False
     try:
@@ -796,6 +852,8 @@ def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=
                 if before_commit is not None:
                     before_commit()
                 conn.execute("COMMIT")
+                if after_commit is not None:
+                    after_commit(conn)
             finally:
                 if timing:
                     timing.committed()

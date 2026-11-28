@@ -9727,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 151)
-        self.assertEqual(len({op["name"] for op in operations}), 151)
+        self.assertEqual(len(operations), 155)
+        self.assertEqual(len({op["name"] for op in operations}), 155)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -11591,8 +11591,10 @@ with record_config_writes() as callers:
         'note': 'check it',
     }
     res = SimpleNamespace(ok=True, structured=answer, model='sonnet', runner='replay', error='', usage_limit=False)
+    from arete import record as record_mod
+    draft_run_id = record_mod.start('draft', run_id='draft-run-1')
     with mock.patch('arete.runner.run', return_value=res):
-        made = scaffold.write_draft('draft-run-1', scaffold.DraftRequest('watch things'), config.load(), lambda *a: None)
+        made = scaffold.write_draft(draft_run_id, scaffold.DraftRequest('watch things'), config.load(), lambda *a: None)
     assert made['name'] == 'drafted-watch'
     assert not loops.find('drafted-watch').enabled
     control.switch('drafted-watch', True)
@@ -11902,9 +11904,16 @@ paths.CONFIG_FILE.write_text('max_parallel = 1\n')
 configrepo.init()
 with api_server(scopes=('read', 'config:activate')) as (api, owner):
     with db.tx() as c:
-        c.execute("UPDATE principals SET id = 'u:1a2b3c4d' WHERE id = ?", (owner,))
+        c.execute(
+            "INSERT INTO principals (id, kind, role, name, status, external, version, created, removed_at) "
+            "SELECT 'u:1a2b3c4d', kind, role, name, 'removed', external, version, created, removed_at "
+            "FROM principals WHERE id = ?",
+            (owner,),
+        )
         c.execute("UPDATE principal_logins SET principal = 'u:1a2b3c4d' WHERE principal = ?", (owner,))
         c.execute("UPDATE tokens SET principal = 'u:1a2b3c4d' WHERE principal = ?", (owner,))
+        c.execute("DELETE FROM principals WHERE id = ?", (owner,))
+        c.execute("UPDATE principals SET status = 'active' WHERE id = 'u:1a2b3c4d'")
         _, tok = token_store.issue('u:1a2b3c4d', 'Scoped', ['read', 'config:activate'])
     api.token = tok
     cur = api.read('/api/v1/settings')['settings']
@@ -22221,8 +22230,12 @@ try:
     with principals.acting(owner), \
             mock.patch.object(config, "load", return_value=cfg), \
             mock.patch.object(pipeline, "spawn_run", side_effect=AssertionError("unexpected spawn_run")):
-        ans3 = tasks.start_ticket(cfg, ry, "ABC-12")
-    assert ans3["state"] == "running" and ans3["run"] == rid1, ans3
+        try:
+            tasks.start_ticket(cfg, ry, "ABC-12")
+        except control.Busy as exc:
+            assert rid1 in str(exc) and "already running" in str(exc) and exc.details.get("run") == rid1, exc
+        else:
+            raise AssertionError("expected control.Busy while rid1 is live")
 finally:
     holder_stop.write_text("stop")
     holder.wait(timeout=5)

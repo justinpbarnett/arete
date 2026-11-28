@@ -100,7 +100,10 @@ def main(argv: list[str] | None = None) -> int:
         upload_on_write = args.cmd not in ("doctor", "install") and not getattr(args, "dry_run", False)
         with client.invocation(upload_on_write=upload_on_write), principals.acting(
                 "hand" if recovery else principals.cli_actor):
-            return args.fn(args) or 0
+            from . import worker_lease
+
+            with worker_lease.adopted_if_present():
+                return args.fn(args) or 0
     except foundation.LeaseFenced as e:
         from . import util
 

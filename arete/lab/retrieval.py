@@ -792,7 +792,7 @@ def run(repo_name: str, suite: str, split: str = "", dry_run: bool = False, as_j
     from .. import configrepo, pins
 
     pin_res = pins.resolve("eval", repo=repo, cfg=cfg if not configrepo.is_repo() else None)
-    run_id = record.start("eval", tag=f"retrieval-{repo.name}", repo=repo.name, resolution=pin_res)
+    run_id = record.import_run("eval", tag=f"retrieval-{repo.name}", repo=repo.name, resolution=pin_res)
     with record.failed_on_crash(run_id), pins.use(pin_res):
         where = paths.RUNS_DIR / run_id
         run_dir = where / "retrieval"

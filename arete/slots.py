@@ -26,6 +26,15 @@ CHECK_SLOT_POLL_SECONDS = 0.25
 
 
 def _row_holds_lock(row: dict, lock_kind: str) -> bool:
+    if lock_kind in ("pipeline", "slot") and row.get("lease_id") is not None:
+        from . import leases
+
+        if not leases.is_live(row):
+            return False
+        if lock_kind == "pipeline":
+            return True
+        if util.lock_is_held(f"slot-run-{row['id']}"):
+            return True
     task_id = row.get("task_id")
     if lock_kind == "pipeline" and row.get("kind") == "pipeline" and row.get("lock"):
         if util.lock_is_held(row["lock"]):
@@ -92,6 +101,7 @@ class RunSlot:
     tid: str
     max_parallel: int
     task_id: int | None = None
+    run_id: str = ""
     held: TextIO | None = None
     held_extra: TextIO | None = None
 
@@ -100,10 +110,24 @@ class RunSlot:
             from .store import tasks as task_store
 
             if not task_store.is_contracted():
-                self.held_extra = hold(self.repo, self.tid)
-            self.held = util.hold_lock(run_store.run_lock("slot", task=int(self.task_id)))
+                f_extra = util.lock_file(run_store.run_lock("slot", self.repo, self.tid))
+                if util.flock_now(f_extra):
+                    self.held_extra = f_extra
+                else:
+                    f_extra.close()
+            f = util.lock_file(run_store.run_lock("slot", task=int(self.task_id)))
+            if util.flock_now(f):
+                self.held = f
+            else:
+                f.close()
+                self.held = util.hold_lock(f"slot-run-{self.run_id}") if self.run_id else None
         else:
-            self.held = hold(self.repo, self.tid)
+            f = util.lock_file(run_store.run_lock("slot", self.repo, self.tid))
+            if util.flock_now(f):
+                self.held = f
+            else:
+                f.close()
+                self.held = util.hold_lock(f"slot-run-{self.run_id}") if self.run_id else None
 
     def take(self, log: Callable[[str], None],
              waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:

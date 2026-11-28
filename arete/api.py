@@ -1206,8 +1206,14 @@ def mutation(name, values, handler):
                                  values.get("base_version"))
         _set_run_location(handler, started["run"], created=True)
         result = {"run": run_object(runs.run_get(started["run"]))}
+    elif name == "lease.revoke":
+        lease_num = leases.parse_id(values["lease"])
+        if lease_num is None:
+            raise contract.Problem("not_found", f"No lease {values['lease']}.")
+        revoked = leases.http_revoke(lease_num, reason=str(values.get("reason") or ""))
+        result = {"lease": revoked["lease"]}
     elif name == "run.import":
-        run_id = record.start(
+        run_id = record.import_run(
             values["kind"],
             status="queued",
             pid=None,

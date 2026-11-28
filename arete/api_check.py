@@ -645,7 +645,8 @@ class Check:
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
                 denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401,
-                          "secret.set": 426, "secret.remove": 202, "webhook.rotate": 426, "push.subscribe": 202}
+                          "secret.set": 426, "secret.remove": 202, "webhook.rotate": 426, "push.subscribe": 202,
+                          "lease.claim": 403, "lease.heartbeat": 403, "lease.release": 403}
                 if name in denied:
                     self.request(method, path, values, headers=key, status=denied[name])
                     continue
@@ -696,6 +697,11 @@ class Check:
                     with (patch.object(control, "launch", return_value=dummy_proc),
                           patch.object(control, "detach", return_value=dummy_proc)):
                         headers, raw = self.request(method, path, values, headers=key, status=op["success_status"])
+                    if name == "loop.start":
+                        started_run = json.loads(raw).get("run")
+                        started_id = started_run["id"] if isinstance(started_run, dict) else started_run
+                        if started_id:
+                            record.settle(started_id, "done")
                 elif name in ("run.resume", "run.repair", "run.step"):
                     q_run = pipeline.queue_run(replay.SAMPLE_REPO, self.task)
                     stub_ans = tasks_mod.answer(self.task, replay.SAMPLE_REPO, q_run, "queued", "started")
@@ -790,7 +796,8 @@ def worker(lifeline):
             require(not paths.DB_FILE.exists(), "state database already exists")
             (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
-            body = "\n".join(config) + '\ngithub = "sample/replay"\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
+            body = ("max_parallel_per_repo = 3\n" + "\n".join(config)
+                    + '\ngithub = "sample/replay"\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n')
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
             config_fixture_git("init", "-q", "-b", "main")
             config_fixture_git("add", "--", "config.toml")

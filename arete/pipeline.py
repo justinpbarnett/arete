@@ -2661,10 +2661,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if task_num is not None
         else run_store.run_lock("pipeline", repo.name, tid)
     )
+    from . import leases
+
     with workspaces.ticket_lock(
         repo.name, tid, task_id=task_num, lookup=not (persist_run or given_run_id),
     ) as got, ExitStack() as pin_stack:
-        if not got:
+        if not got and not (given_run_id and leases.owns_lock(given_run_id, lock)):
             print(f"{name} is already running")
             return 0
         if given_run_id and persist_run:
@@ -2924,14 +2926,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         lock = run_store.run_lock("pipeline", task=int(task_num))
                 if task_num is not None and not pin_stack.enter_context(
                     workspaces.ticket_lock(repo.name, tid, task_id=task_num)
-                ):
+                ) and not (given_run_id and leases.owns_lock(given_run_id, lock)):
                     print(f"{name} is already running")
                     return 0
-            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel, task_id=task_num)
+            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel, task_id=task_num, run_id=given_run_id)
             if need_slot:
                 slot.hold()
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
-                       if (done := record.interrupt(dead_row))]
+                       if dead_row["id"] != given_run_id and not leases.is_live(dead_row)
+                       and (done := record.interrupt(dead_row))]
             if settled and may_revise:
                 feedback = pending_feedback(repo.name, tid)
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
@@ -2953,12 +2956,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     return 2
             answering_earlier = bool(earlier) and earlier["status"] == "needs-info"
+            given_existing = run_store.run_get(given_run_id) if given_run_id else None
             if script and script.continues:
                 continues_id = script.continues
                 restart_kind = script.restart or ("step" if script.only else "resume")
             elif script and script.repairs:
                 continues_id = script.repairs
                 restart_kind = script.restart or "resume"
+            elif given_existing and given_existing.get("restart") == "lease" and given_existing.get("continues"):
+                continues_id = str(given_existing["continues"])
+                restart_kind = "lease"
             elif restarting:
                 continues_id = earlier["id"]
                 restart_kind = "interrupted"
@@ -7265,7 +7272,7 @@ def spawn_run(repo_name: str, tid: str, force: bool = False, *, spec: bool = Fal
                       **({"run_id": run_id} if run_id else {}))
     if run_id:
         record.write_launch(run_id, cmd, RUNS_LOG)
-    return control.launch(cmd, RUNS_LOG)
+    return control.launch(cmd, RUNS_LOG, run_id=run_id)
 
 
 def run_skipped(name: str) -> dict:

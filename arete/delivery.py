@@ -370,7 +370,7 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
     ob_id = int(row["id"])
 
     def log(kind: str, text: str) -> None:
-        if row.get("run_id"):
+        if row.get("run_id") and run_store.run_get(row["run_id"]):
             run_store.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
     try:

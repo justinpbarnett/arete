@@ -21,6 +21,7 @@ COOKIE = "__Host-arete_session"
 PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set", "webhook.rotate"}
+WORKER_ONLY_OPERATIONS = {"lease.claim", "lease.heartbeat", "lease.release"}
 PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove", "webhook.rotate", "push.subscribe"}
 WRITES = ("POST", "PATCH", "PUT", "DELETE")
 SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|inbox:(?:raise|resolve)|config:(?:draft|activate)|run:start")
@@ -279,6 +280,8 @@ def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
     if requires_credential and credential is None:
         raise unauthenticated(handler, write, secure)
+    if name in WORKER_ONLY_OPERATIONS:
+        raise problem("forbidden")
     if credential is not None and credential.kind == "lease":
         if name == "lease.get":
             target_lease = unquote(handler.operation[1].get("lease", ""))

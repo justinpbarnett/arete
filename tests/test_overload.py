@@ -386,11 +386,13 @@ class OverloadRunTests(unittest.TestCase):
         def launch(prompt, cwd, **kw):
             self.calls.append(kw["model"])
             return next(results)
+        from arete import record as record_mod
+        run_id = record_mod.start("session")
         with (mock.patch.object(runner, "pick", self.route_chain(auth, which, models)),
               mock.patch.object(getattr(runner, which), "run", launch),
               mock.patch.object(runner, "wait_until", side_effect=AssertionError("unexpected limit wait"))):
             res = runner.run("review", ".", model=models[0], runner=which, cfg=self.cfg,
-                             wait_out_limits=False, say=lambda text: None, trace=("overload-run", "review"))
+                             wait_out_limits=False, say=lambda text: None, trace=(run_id, "review"))
         return auth, res
 
     def test_overloaded_route_returns_without_waiting_for_its_limit(self):

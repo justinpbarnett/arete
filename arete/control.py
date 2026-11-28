@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -57,8 +58,10 @@ class NotFound(refusals.NotFound, LookupError):
 
 
 class Busy(refusals.Conflict, RuntimeError):
-    def __init__(self, name: str) -> None:
-        super().__init__(f"{name} is running; stop it or wait")
+    def __init__(self, name: str, *, run_id: str = "") -> None:
+        self.run_id = run_id
+        self.details = {"run": run_id} if run_id else {}
+        super().__init__(f"{name} is already running; stop it or wait")
 
 
 class Refused(refusals.Invalid, ValueError):
@@ -112,16 +115,28 @@ def require_worker(kind, *, development=False):
     raise Refused(f"{kind} in this form is started by Arete")
 
 
-def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
-    return launch(command(args), log_name, keep)
+def _command_run_id(args: list[str]) -> str:
+    for i, item in enumerate(args):
+        if item == "--run-id" and i + 1 < len(args):
+            return args[i + 1]
+        if item.startswith("--run-id="):
+            return item.partition("=")[2]
+    if len(args) >= 3 and args[0] == "session" and args[1] == "exec":
+        return args[2]
+    return ""
+
+
+def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = (), *,
+           run_id: str = "") -> subprocess.Popen:
+    return launch(command(args), log_name, keep, run_id=run_id)
 
 
 def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = (), *,
-           start_new_session: bool = True) -> subprocess.Popen:
+           start_new_session: bool = True, run_id: str = "") -> subprocess.Popen:
     paths.ensure_dirs()
     if configrepo.is_repo():
         configrepo.commit_hand_edits()
-    from . import factory_control
+    from . import codebase, engine_copy, factory_control, leases, worker_lease, worker_listener
     from .store import factory
 
     version = factory.admit()
@@ -133,15 +148,74 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
         env[factory.CONTINUATION] = parent
     cli_prefix = paths.cli_command()
     env.pop(WORKER_ENV, None)
+    env.pop(worker_lease.CLAIM_STDIN_ENV, None)
+    claim_payload = b""
     if command[:len(cli_prefix)] == cli_prefix and (kind := worker_kind(command[len(cli_prefix):])):
+        worker_args = command[len(cli_prefix):]
         env[WORKER_ENV] = kind
+        effective_run_id = run_id or _command_run_id(worker_args)
         if kind == "file-rule":
-            env["ARETE_RUN_ID"] = record.new_id(kind)
+            effective_run_id = effective_run_id or record.new_id(kind)
+            env["ARETE_RUN_ID"] = effective_run_id
+        run_row = None
+        if effective_run_id and paths.DB_FILE.is_file():
+            try:
+                run_row = run_store.run_get(effective_run_id)
+            except (OSError, foundation.NoDatabase, foundation.IncompatibleSchema):
+                run_row = None
+        engine_sha = str((run_row or {}).get("engine_sha") or codebase.STAMP or "").strip()
+        if not engine_sha:
+            engine_sha = codebase.load()
+        if engine_sha and run_row is not None:
+            try:
+                command, copy_root = engine_copy.rewrite_cli_command(command, engine_sha)
+                if copy_root is not None:
+                    env["ARETE_ENGINE_COPY"] = str(copy_root)
+                    env["ARETE_ENGINE_SHA"] = engine_sha
+                    env["PYTHONDONTWRITEBYTECODE"] = "1"
+            except (OSError, ValueError):
+                pass
+        worker_url = worker_listener.current_url()
+        if worker_url and effective_run_id and run_row is not None:
+            with foundation.tx(fenced=False) as c:
+                lease_id = run_row.get("lease_id")
+                if lease_id is None and c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'"
+                ).fetchone():
+                    lease_id = leases.ensure_run_lease(
+                        c,
+                        effective_run_id,
+                        device=str(run_row.get("device") or "local"),
+                        engine_sha=engine_sha,
+                        schema_version=run_row.get("schema_version"),
+                    )
+                    c.execute("UPDATE runs SET lease_id = ? WHERE id = ?", (lease_id, effective_run_id))
+                if lease_id is not None:
+                    claim_token = leases.issue_claim_token(c, effective_run_id, int(lease_id))
+                    claim_payload = (
+                        json.dumps({
+                            "claim_token": claim_token,
+                            "worker_url": worker_url,
+                            "run_id": effective_run_id,
+                            "lease_id": int(lease_id),
+                        }) + "\n"
+                    ).encode("utf-8")
+                    env[worker_lease.CLAIM_STDIN_ENV] = "1"
+    stdin_arg = subprocess.PIPE if claim_payload else subprocess.DEVNULL
     with open(paths.LOG_DIR / log_name, "a") as log:
-        key, proc = factory_control.spawn(subprocess.Popen, command, stdin=subprocess.DEVNULL, stdout=log,
+        key, proc = factory_control.spawn(subprocess.Popen, command, stdin=stdin_arg, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=start_new_session, pass_fds=keep,
                                 env={**env, "ARETE_ACTOR": principals.current(),
                                      "ARETE_VIA": events.provenance() or ""})
+    if claim_payload and proc.stdin is not None:
+        try:
+            proc.stdin.write(claim_payload)
+            proc.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
     launch_lease.passed()
     def reap():
         proc.wait()
@@ -182,22 +256,33 @@ def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
             return {"id": run_id, "stopped": True}
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
-    with record.dead(r) as gone:
-        if gone:
-            if not (r := record.ask_stop(run_id, base_version)):
-                raise NotFound(f"no run {run_id}")
-            if r["status"] != "running":
-                raise Refused(f"{run_id} is not running; it ended {r['status']}")
-            devices.release(run_id, lambda text: run_store.add_feed(run_id, "device", text))
-            if r["kind"] in record.TICKET_KINDS:
-                return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
-            record.interrupt(r, devices.left_up(run_id))
-            return {"id": run_id, "stopped": True, "was": "gone"}
+    from . import leases
+    from .store import devices as device_store
+
+    if r.get("lease_id") is not None:
+        gone = not leases.is_live(r)
+    else:
+        with record.dead(r) as dead_flag:
+            gone = dead_flag
+    if gone:
+        if not (r := record.ask_stop(run_id, base_version)):
+            raise NotFound(f"no run {run_id}")
+        if r["status"] != "running":
+            raise Refused(f"{run_id} is not running; it ended {r['status']}")
+        devices.release(run_id, lambda text: run_store.add_feed(run_id, "device", text))
+        if r["kind"] in record.TICKET_KINDS:
+            return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
+        record.interrupt(r, devices.left_up(run_id))
+        return {"id": run_id, "stopped": True, "was": "gone"}
     if not r["pid"]:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
     r = record.ask_stop(run_id, base_version) or r
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
+    if r.get("lease_id") is not None:
+        with foundation.tx(fenced=False) as c:
+            device_store.insert_run_control(c, run_id, int(r["lease_id"]), "stop", {"run_id": run_id})
+        leases.wake(int(r["lease_id"]))
     pid = int(r["pid"])
     for kill in (os.killpg, os.kill):
         try:

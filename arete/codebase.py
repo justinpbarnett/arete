@@ -118,6 +118,21 @@ def load(*, templates: bool = False) -> str:
     global RELEASE, STAMP
     if STAMP:
         return STAMP
+    pinned_file = CHECKOUT / ".engine_sha"
+    if pinned_file.is_file():
+        try:
+            pinned_sha = pinned_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pinned_sha = ""
+        if pinned_sha:
+            import_everything()
+            if templates:
+                from . import paths, prompt_loader
+
+                prompt_loader.load_templates(paths.PROMPTS_DIR)
+            STAMP = pinned_sha
+            RELEASE = pinned_sha if re.fullmatch(r"[0-9a-f]{40}", pinned_sha) else ""
+            return STAMP
     before, _ = inventory()
     import_everything()
     if templates:

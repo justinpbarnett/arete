@@ -27,6 +27,7 @@ class Migration:
     sha256: str
     sql: str | None
     apply: object
+    foreign_keys_off: bool = False
 
 
 def owners():
@@ -76,7 +77,16 @@ def load(folder=None):
         if (("SQL" in namespace) + ("apply" in namespace) != 1
                 or not (isinstance(sql, str) or callable(apply))):
             raise Refused(f"{path.name}: provide exactly one SQL string or apply(conn)")
-        found[n] = Migration(n, path.name, "loops" if area == "work" else area, phase, hashlib.sha256(data).hexdigest(), sql, apply)
+        found[n] = Migration(
+            n,
+            path.name,
+            "loops" if area == "work" else area,
+            phase,
+            hashlib.sha256(data).hexdigest(),
+            sql,
+            apply,
+            bool(namespace.get("FOREIGN_KEYS_OFF", False)),
+        )
     if not found or sorted(found) != list(range(1, max(found) + 1)):
         names = ", ".join(m.name for m in found.values())
         raise Refused(f"{names}: migration numbers must run from 1 without gaps")

@@ -34,6 +34,12 @@ LEASE_MUTABLE_COLUMNS = frozenset((
     "last_sweep_error",
     "sweep_gave_up",
     "token_hash",
+    "device_version",
+    "engine_sha",
+    "schema_version",
+    "line_shape",
+    "renewed",
+    "expires",
 ))
 
 DEVICE_PROBES_RETENTION_DAYS = 90
@@ -264,6 +270,10 @@ def latest_device_probes(connect=reader) -> dict[str, dict]:
 
 # --- Leases & Lease Tokens ---
 
+def _lease_columns(c: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in c.execute("PRAGMA table_info(leases)")}
+
+
 def insert_lease(
     c: sqlite3.Connection,
     *,
@@ -272,13 +282,110 @@ def insert_lease(
     device_version: str,
     created: str,
     expires: str,
+    engine_sha: str = "",
+    schema_version: int | None = None,
+    line_shape: str = "",
 ) -> int:
+    cols = _lease_columns(c)
+    if "engine_sha" in cols:
+        cur = c.execute(
+            "INSERT INTO leases (run_id, device, device_version, epoch, token_hash, created, renewed, expires, "
+            "version, engine_sha, schema_version, line_shape) "
+            "VALUES (?, ?, ?, 1, '', ?, '', ?, 1, ?, ?, ?)",
+            (run_id, device, device_version, created, expires, engine_sha or "", schema_version, line_shape or ""),
+        )
+    else:
+        cur = c.execute(
+            "INSERT INTO leases (run_id, device, device_version, epoch, token_hash, created, renewed, expires, version) "
+            "VALUES (?, ?, ?, 1, '', ?, '', ?, 1)",
+            (run_id, device, device_version, created, expires),
+        )
+    return int(cur.lastrowid)
+
+
+def unclaimed_lease_for_run(
+    c: sqlite3.Connection,
+    run_id: str,
+    device: str | None = None,
+) -> dict | None:
+    if not _has_table(c, "leases"):
+        return None
+    if device is not None:
+        row = c.execute(
+            "SELECT * FROM leases WHERE run_id = ? AND device = ? AND released IS NULL "
+            "AND token_hash = '' AND vm_name = '' ORDER BY id DESC LIMIT 1",
+            (run_id, device),
+        ).fetchone()
+    else:
+        row = c.execute(
+            "SELECT * FROM leases WHERE run_id = ? AND released IS NULL "
+            "AND token_hash = '' AND vm_name = '' ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def active_engine_shas(c: sqlite3.Connection) -> set[str]:
+    if not _has_table(c, "leases"):
+        return set()
+    cols = _lease_columns(c)
+    if "engine_sha" in cols:
+        rows = c.execute(
+            "SELECT DISTINCT COALESCE(NULLIF(l.engine_sha, ''), NULLIF(r.engine_sha, ''), '') "
+            "FROM leases l LEFT JOIN runs r ON r.id = l.run_id WHERE l.released IS NULL"
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT DISTINCT COALESCE(NULLIF(r.engine_sha, ''), '') "
+            "FROM leases l LEFT JOIN runs r ON r.id = l.run_id WHERE l.released IS NULL"
+        ).fetchall()
+    return {str(r[0]) for r in rows if r[0]}
+
+
+def insert_run_control(
+    c: sqlite3.Connection,
+    run_id: str,
+    lease_id: int | None,
+    kind: str,
+    payload: dict | None = None,
+) -> int:
+    if not _has_table(c, "run_controls"):
+        return 0
     cur = c.execute(
-        "INSERT INTO leases (run_id, device, device_version, epoch, token_hash, created, renewed, expires, version) "
-        "VALUES (?, ?, ?, 1, '', ?, '', ?, 1)",
-        (run_id, device, device_version, created, expires),
+        "INSERT INTO run_controls (run_id, lease_id, kind, payload, created, acked) VALUES (?, ?, ?, ?, ?, NULL)",
+        (run_id, lease_id, kind, json.dumps(payload or {}), util.iso()),
     )
     return int(cur.lastrowid)
+
+
+def pending_run_controls(
+    c: sqlite3.Connection,
+    run_id: str,
+    lease_id: int | None = None,
+) -> list[dict]:
+    if not _has_table(c, "run_controls"):
+        return []
+    if lease_id is not None:
+        rows = c.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? AND (lease_id IS NULL OR lease_id = ?) "
+            "AND acked IS NULL ORDER BY id",
+            (run_id, lease_id),
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT * FROM run_controls WHERE run_id = ? AND acked IS NULL ORDER BY id",
+            (run_id,),
+        ).fetchall()
+    return [{**dict(r), "payload": json_dict(r["payload"])} for r in rows]
+
+
+def ack_run_controls(c: sqlite3.Connection, control_ids: list[int], at: str) -> None:
+    if not control_ids or not _has_table(c, "run_controls"):
+        return
+    c.executemany(
+        "UPDATE run_controls SET acked = ? WHERE id = ? AND acked IS NULL",
+        [(at, int(cid)) for cid in control_ids],
+    )
 
 
 def set_lease_token(c: sqlite3.Connection, lease_id: int, token_hash: str, created: str) -> None:

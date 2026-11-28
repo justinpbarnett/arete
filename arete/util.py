@@ -50,8 +50,20 @@ def engine_commit() -> str:
     return codebase.STAMP
 
 
+_CLOCK: Callable[[], datetime] | None = None
+
+
+def set_clock(fn: Callable[[], datetime] | None) -> None:
+    global _CLOCK
+    _CLOCK = fn
+
+
+def clock() -> Callable[[], datetime] | None:
+    return _CLOCK
+
+
 def now() -> datetime:
-    return datetime.now(UTC)
+    return _CLOCK() if _CLOCK is not None else datetime.now(UTC)
 
 
 def iso(dt: datetime | None = None) -> str:

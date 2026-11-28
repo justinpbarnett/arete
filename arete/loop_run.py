@@ -425,59 +425,60 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
         foundation.require_workspace_contract()
     except foundation.IncompatibleSchema as e:
         raise control.Refused(str(e)) from e
-    with util.lock_file(loop_store.loop_lock(loop.name)) as held:
-        if not util.take_lock(held, wait=False):
-            raise control.Busy(loop.name)
-        for stale in run_store.runs_marked_running():
-            if stale["kind"] == "loop" and stale["loop"] == loop.name:
-                record.interrupt(stale)
-        from . import pins, principals
+    from . import leases, pins, principals
 
-        loop_actor = principals.current()
-        started_by_val = loop_actor if loop_actor.startswith(("u:", "client:", "rule:")) else f"rule:{loop.name}"
-        pin_res = None
-        if not detach:
-            pin_res = pins.resolve("loop", repo=loop.repo or None, loop_name=loop.name,
-                                   cfg=cfg if not configrepo.is_repo() else None)
-            cfg = pin_res.cfg
-            loop = control.working_loop(name, cfg)
-        model = loop.model_for(cfg) if loop.agent else ""
-        runner_name = routing.route(model, loop.runner)[0] if loop.agent else ""
-        with foundation.tx() as c:
-            fire = loop_store.queue_item(item, c) if item is not None else None
-            if item is not None and (not fire or fire["run_id"] is not None or fire.get("dead_at") is not None):
-                raise control.NotFound(f"queue item {item} is gone or already claimed")
-            run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
-                          trigger="try" if trial else (fire["trigger"] if fire else "manual"),
-                          events=list(events or (fire["payload"] if fire else [])))
-            continues_id = (fire.get("last_run") or None) if fire else None
-            restart_kind = "interrupted" if continues_id else ""
-            with principals.acting(started_by_val):
-                record.start("loop", run_id=run.id, status="queued" if detach else "running",
-                             lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
-                             repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
-                             device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
-                             log=paths.short_path(run.log_file), model=model, runner=runner_name,
-                             continues=continues_id, restart=restart_kind,
-                             resolution=pin_res, loop_payer=loop.payer)
-            if fire and not loop_store.claim(c, item, run.id):
-                raise control.NotFound(f"queue item {item} was taken by another run")
-        if fire and fire.get("last_run"):
-            run.write_log(f"continues {fire['last_run']}")
-        if run.events:
-            util.write_json(run.events_file, run.events)
-        if not detach:
-            with (pins.use(pin_res) if pin_res is not None else nullcontext()):
-                carry(run)
-            return run_store.run_get(run.id)
-        record.write_launch(run.id, control.command(["loop", "exec", "--run-id", run.id]), control.DETACHED_LOG)
-        from . import inbox
-
-        if inbox.check_run_missing_secrets(run.id, repo=loop.repo or "", loop=loop.name):
-            return run_store.run_get(run.id)
+    lock_name = loop_store.loop_lock(loop.name)
+    loop_actor = principals.current()
+    started_by_val = loop_actor if loop_actor.startswith(("u:", "client:", "rule:")) else f"rule:{loop.name}"
+    pin_res = None
+    if not detach:
+        pin_res = pins.resolve("loop", repo=loop.repo or None, loop_name=loop.name,
+                               cfg=cfg if not configrepo.is_repo() else None)
+        cfg = pin_res.cfg
+        loop = control.working_loop(name, cfg)
+    model = loop.model_for(cfg) if loop.agent else ""
+    runner_name = routing.route(model, loop.runner)[0] if loop.agent else ""
+    with foundation.tx() as c:
+        leases.settle_dead_on_lock(c, lock_name)
+        existing_queued = c.execute(
+            "SELECT id FROM runs WHERE lock = ? AND status = 'queued' ORDER BY started DESC LIMIT 1",
+            (lock_name,),
+        ).fetchone()
+        if existing_queued is not None:
+            raise control.Busy(f"run {existing_queued['id']}", run_id=str(existing_queued["id"]))
+        fire = loop_store.queue_item(item, c) if item is not None else None
+        if item is not None and (not fire or fire["run_id"] is not None or fire.get("dead_at") is not None):
+            raise control.NotFound(f"queue item {item} is gone or already claimed")
+        run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
+                      trigger="try" if trial else (fire["trigger"] if fire else "manual"),
+                      events=list(events or (fire["payload"] if fire else [])))
+        continues_id = (fire.get("last_run") or None) if fire else None
+        restart_kind = "interrupted" if continues_id else ""
         with principals.acting(started_by_val):
-            proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
-        util.mark_holder(held, proc.pid)
+            record.start("loop", run_id=run.id, status="queued" if detach else "running",
+                         lock=lock_name, pid=None if detach else os.getpid(),
+                         repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
+                         device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
+                         log=paths.short_path(run.log_file), model=model, runner=runner_name,
+                         continues=continues_id, restart=restart_kind,
+                         resolution=pin_res, loop_payer=loop.payer)
+        if fire and not loop_store.claim(c, item, run.id):
+            raise control.NotFound(f"queue item {item} was taken by another run")
+    if fire and fire.get("last_run"):
+        run.write_log(f"continues {fire['last_run']}")
+    if run.events:
+        util.write_json(run.events_file, run.events)
+    if not detach:
+        with (pins.use(pin_res) if pin_res is not None else nullcontext()):
+            carry(run)
+        return run_store.run_get(run.id)
+    record.write_launch(run.id, control.command(["loop", "exec", "--run-id", run.id]), control.DETACHED_LOG)
+    from . import inbox
+
+    if inbox.check_run_missing_secrets(run.id, repo=loop.repo or "", loop=loop.name):
+        return run_store.run_get(run.id)
+    with principals.acting(started_by_val):
+        proc = control.detach(["loop", "exec", "--run-id", run.id], run_id=run.id)
     return began(run, proc) if wait else run_store.run_get(run.id)
 
 

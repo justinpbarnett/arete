@@ -149,7 +149,7 @@ def start_draft(request: DraftRequest) -> dict:
             "--run-id", run_id, "--", request.sentence]
     record.write_launch(run_id, control.command(args), DRAFTS_LOG)
     with record.failed_on_crash(run_id):
-        control.detach(args, DRAFTS_LOG)
+        control.detach(args, DRAFTS_LOG, run_id=run_id)
     return run_store.run_get(run_id)
 
 
