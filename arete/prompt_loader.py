@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, fields
 from pathlib import Path
-from string import Template
+from string import Formatter, Template
 
 from . import owner_asks, paths
 
@@ -97,11 +97,28 @@ def slug(text: str, n: int = 40) -> str:
     return s or "change"
 
 
+_SAFE_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FORMATTER = Formatter()
+
+
+def _safe_format(template: str, values: dict) -> str:
+    parts: list[str] = []
+    for literal, field_name, format_spec, conversion in _FORMATTER.parse(template):
+        if literal:
+            parts.append(literal)
+        if field_name is None:
+            continue
+        if conversion or format_spec or not _SAFE_FIELD.fullmatch(field_name) or field_name not in values:
+            raise ValueError(f"unsupported template field: {field_name!r}")
+        parts.append(str(values[field_name]))
+    return "".join(parts)
+
+
 def fill_template(template: str, default: str, **values) -> str:
     try:
-        return template.format(**values)
+        return _safe_format(template, values)
     except (KeyError, IndexError, ValueError, AttributeError, TypeError):
-        return default.format(**values)
+        return _safe_format(default, values)
 
 
 @dataclass(frozen=True)

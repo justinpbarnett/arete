@@ -8,6 +8,7 @@ from functools import lru_cache
 
 from .. import paths, principals, refusals, util
 from . import db, events
+from ._rows import validate_identifier
 
 TABLES = {"factory_state": "kept", "factory_targets": "kept", "factory_processes": "until settled",
           "session_checkpoints": "until session ends"}
@@ -171,6 +172,7 @@ def interrupted(run, c=None):
 
 
 def exclude_retained(c, run_column):
+    validate_identifier(run_column, qualified=True)
     if not installed(c):
         return ""
     return (f" AND NOT EXISTS (SELECT 1 FROM factory_targets f WHERE f.id={run_column} "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import os
 import re
 import shutil
@@ -50,10 +51,10 @@ TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<url>https?://[^\s)]+)(?:\s+[\"'][^\"']*[\"'])?\)")
-MD_LINK_RE = re.compile(r"(?<!!)\[(?P<alt>[^\]]*)\]\((?P<url>https?://[^\s)]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+MD_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\[\]\n]*)\]\((?P<url>https?://[^\s)]+)(?:\s+[\"'][^\"']*[\"'])?\)")
+MD_LINK_RE = re.compile(r"(?<!!)\[(?P<alt>[^\[\]\n]*)\]\((?P<url>https?://[^\s)]+)(?:\s+[\"'][^\"']*[\"'])?\)")
 HTML_MEDIA_RE = re.compile(
-    r"<(?P<tag>img|video|source)\b[^>]*?\bsrc=[\"'](?P<url>https?://[^\"'\s>]+)[\"'][^>]*>",
+    r"<(?P<tag>img|video|source)\b[^<>\n]*?\bsrc=[\"'](?P<url>https?://[^\"'\s>]+)[\"'][^<>\n]*>",
     re.IGNORECASE,
 )
 BARE_URL_RE = re.compile(r"(?<![(\"'=])(?P<url>https?://[^\s<>)\"']+)")
@@ -75,8 +76,7 @@ class MediaRef:
 
     def to_dict(self) -> dict:
         url = ""
-        if self.url:
-            parts = urllib.parse.urlsplit(self.url)
+        if self.url and (parts := _safe_urlsplit(self.url)) is not None:
             url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         return {
             "source": self.source,
@@ -165,24 +165,42 @@ def _clean_url(raw: str) -> str:
     return url.rstrip(".,;:!?]>\"'")
 
 
+def _safe_urlsplit(url: str) -> urllib.parse.SplitResult | None:
+    try:
+        return urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+
+
 def _url_extension(url: str) -> str:
-    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path or "")
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return ""
+    path = urllib.parse.unquote(parts.path or "")
     return Path(path).suffix.lower()
 
 
 def _url_filename(url: str, fallback: str = "") -> str:
-    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path or "").rstrip("/")
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return fallback
+    path = urllib.parse.unquote(parts.path or "").rstrip("/")
     name = Path(path).name if path else ""
     return name or fallback
 
 
 def is_slack_or_dropbox_url(url: str) -> bool:
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return False
+    host = (parts.hostname or "").lower()
     return host in DROPBOX_HOSTS or host == "slack.com" or host.endswith(".slack.com")
 
 
 def is_github_attachment_url(url: str) -> bool:
-    parts = urllib.parse.urlsplit(url)
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return False
     host = (parts.hostname or "").lower()
     path = parts.path or ""
     if host == "github.com":
@@ -221,8 +239,8 @@ def kind_from_hint(url: str = "", name: str = "", mime_type: str = "", tag: str 
 
 
 def _is_media_candidate_url(url: str, *, explicit_tag: bool) -> bool:
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+    parts = _safe_urlsplit(url)
+    if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         return False
     if is_slack_or_dropbox_url(url):
         return False
@@ -316,15 +334,17 @@ class _SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urljoin(req.full_url, newurl)
-        parts = urllib.parse.urlsplit(target)
+        parts = _safe_urlsplit(target)
+        if parts is None:
+            raise urllib.error.URLError("redirected to invalid URL")
         allowed_schemes = ("https", "http") if self.allow_http else ("https",)
         host = (parts.hostname or "").lower()
         if parts.scheme.lower() not in allowed_schemes or not host or outbound.private_host(host):
             raise urllib.error.URLError("redirected to disallowed host")
         new = super().redirect_request(req, fp, code, msg, headers, target)
         if new is not None:
-            old_parts = urllib.parse.urlsplit(req.full_url)
-            if (parts.scheme.lower(), parts.netloc.lower()) != (old_parts.scheme.lower(), old_parts.netloc.lower()):
+            old_parts = _safe_urlsplit(req.full_url)
+            if old_parts is None or (parts.scheme.lower(), parts.netloc.lower()) != (old_parts.scheme.lower(), old_parts.netloc.lower()):
                 new.remove_header("Authorization")
                 new.remove_header("Cookie")
         return new
@@ -348,10 +368,10 @@ def fetch_url(
     allow_http: bool = False,
     opener=None,
 ) -> MediaFetchResult:
-    parts = urllib.parse.urlsplit(url)
+    parts = _safe_urlsplit(url)
     allowed_schemes = ("https", "http") if allow_http else ("https",)
-    host = (parts.hostname or "").lower()
-    if parts.scheme.lower() not in allowed_schemes or not host or outbound.private_host(host):
+    host = (parts.hostname or "").lower() if parts is not None else ""
+    if parts is None or parts.scheme.lower() not in allowed_schemes or not host or outbound.private_host(host):
         return MediaFetchResult(error_status="inaccessible", detail="refused private or unsupported media URL")
     headers = {"Accept": "image/*,video/*,*/*;q=0.8", "User-Agent": "arete-media/1"}
     if token and host in GITHUB_AUTH_HOSTS:
@@ -430,7 +450,7 @@ def _probe_video_duration(video_path: Path) -> float | None:
         duration = float(res.stdout.strip())
     except ValueError:
         return None
-    return duration if duration > 0 else None
+    return duration if math.isfinite(duration) and duration > 0 else None
 
 
 def sample_timestamps(duration: float, max_frames: int = MAX_KEYFRAMES) -> list[float]:
@@ -592,8 +612,17 @@ def materialize_media_bytes(
             detail=f"{kind} exceeds the {cap // (1024 * 1024)} MB cap",
         )
     dest.mkdir(parents=True, exist_ok=True)
+    root = dest.resolve()
     filename = _with_extension(ref.name or ref.attachment_id or kind, ext)
     out_path = dest / f"{safe_filename(prefix, default='media')}-{filename}"
+    resolved = out_path.resolve()
+    if resolved.parent != root:
+        return MediaOutcome(
+            status="unsupported",
+            ref=ref,
+            ticket_ref=ticket_ref,
+            detail="refused media filename outside destination directory",
+        )
     out_path.write_bytes(data)
     if kind == "video":
         extract = keyframe_extractor or extract_video_keyframes
