@@ -60,7 +60,7 @@ class Noisy(unittest.TestCase):
 
 
 class Sleeper(unittest.TestCase):
-    class_timeout = 0.25
+    class_timeout = 0.4
 
     def test_hangs(self):
         time.sleep(60)
@@ -98,7 +98,7 @@ class AssertionWithReplacePatched(BusySolo):
 
 
 class BusyTimeout(BusySolo):
-    class_timeout = 0.3
+    class_timeout = 0.5
 
     def test_hangs(self):
         if self.attempt <= 2:
@@ -124,7 +124,7 @@ class StateWriterTwo(unittest.TestCase):
 
 
 class BusyTimeoutThenFailure(BusySolo):
-    class_timeout = 0.3
+    class_timeout = 0.5
 
     def test_hangs_on_first_solo_attempt(self):
         if self.attempt == 1:
@@ -194,7 +194,7 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertRegex(output, r"(?m)^class exceeded (?:0\.75s|[\d.]+s \(deadline 0\.75s x load [\d.]+\))$")
+        self.assertRegex(output, r"(?m)^class exceeded (?:1\.2s|[\d.]+s \(deadline 1\.2s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)
@@ -245,7 +245,7 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertIn(f"{identifier}: starting alone at host load 21", output)
         self.assertIn(f"{identifier}: failures", output)
         before_failure = output.partition(f"{identifier}: failures")[0]
-        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 0\.9s x load [\d.]+\)\nPython class stack")
+        self.assertRegex(before_failure, r"class exceeded [\d.]+s \(deadline 1\.5s x load [\d.]+\)\nPython class stack")
         self.assertIn("in test_hangs_on_first_solo_attempt\n", before_failure)
         self.assertIn("AssertionError: assertion on the extra solo attempt", output)
         self.assertIn(f"Failed classes: {identifier}", output)

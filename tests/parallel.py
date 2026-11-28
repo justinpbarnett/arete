@@ -52,7 +52,7 @@ PRELOAD_MODULES = (
 
 def default_jobs():
     cpus = os.cpu_count() or 4
-    return max(6, min(cpus, 12))
+    return max(4, min(cpus, 12))
 
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))
@@ -390,7 +390,7 @@ class ForkSlot:
         reply = self.read_message()
         return ForkProcess(self, identifier, reply["pid"])
 
-    def close(self):
+    def close_pipes(self):
         for fd_name in ("req_w", "rep_r"):
             fd = getattr(self, fd_name, None)
             if fd is not None:
@@ -399,9 +399,12 @@ class ForkSlot:
                     os.close(fd)
                 except OSError:
                     pass
+
+    def close(self, timeout=0.5):
+        self.close_pipes()
         if self.server is not None:
             try:
-                self.server.wait(timeout=1)
+                self.server.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(self.server.pid, signal.SIGKILL)
@@ -490,7 +493,10 @@ class ForkPool:
             slots = list(self.slots)
             self.slots.clear()
         for slot in slots:
-            slot.close()
+            slot.close_pipes()
+        deadline = time.monotonic() + 0.5
+        for slot in slots:
+            slot.close(timeout=max(0.0, deadline - time.monotonic()))
 
 
 @dataclass

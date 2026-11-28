@@ -71,7 +71,8 @@ class StagingRelease(unittest.TestCase):
 
             def log_message(self, *args):
                 pass
-        http = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), API))
+        with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+            http = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), API))
         t = threading.Thread(target=http.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         t.start()
         self.addCleanup(t.join, 5)

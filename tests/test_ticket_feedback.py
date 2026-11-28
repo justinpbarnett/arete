@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import isolate_live_state
+from support import isolate_live_state, seed_db
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 from arete import (
@@ -29,7 +29,8 @@ from arete.store import db as foundation
 from arete.store import feedback as feedback_store
 from arete.store import specs as spec_store
 
-isolate_live_state()
+def setUpModule():
+    isolate_live_state()
 
 
 class _FeedbackDbCase(unittest.TestCase):
@@ -52,7 +53,7 @@ class _FeedbackDbCase(unittest.TestCase):
             patches.enter_context(mock.patch.object(paths, name, value))
         patches.enter_context(mock.patch.object(foundation, "_CHECKED", set()))
         paths.ensure_dirs()
-        foundation.migrate()
+        seed_db(state)
 
 
 class CommenterAuthorizationTests(_FeedbackDbCase):
