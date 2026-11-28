@@ -58,7 +58,7 @@ TYPES = {"object": (dict,), "array": (list, tuple), "integer": (int,), "number":
          "boolean": (bool,), "string": (str,), "null": (type(None),)}
 
 
-def validate(name: str, value, *, where: str | None = None) -> None:
+def validate(name: str, value, *, where: str | None = None, allow_read_only: bool = False) -> None:
     folder, filename = paths.CONFIG_SCHEMAS_DIR, f"{name}.json"
     shape = _document(folder / filename)
     where = where or name
@@ -75,12 +75,12 @@ def validate(name: str, value, *, where: str | None = None) -> None:
         if (resolved.get("type") != "object" or resolved.get("additionalProperties") is not False
                 or not resolved.get("properties")):
             raise ValueError(f"{where}: {domain} rules need a strict schema for writes")
-    check(value, shape, folder, filename, where)
+    check(value, shape, folder, filename, where, allow_read_only=allow_read_only)
 
 
-def check(value, shape: dict, folder: Path, filename: str, where: str) -> None:
+def check(value, shape: dict, folder: Path, filename: str, where: str, *, allow_read_only: bool = False) -> None:
     shape, filename = resolve(shape, folder, filename)
-    if shape.get("x-arete-read-only"):
+    if shape.get("x-arete-read-only") and not allow_read_only:
         raise ValueError(f"{where} is unavailable for writes")
     if types := shape.get("type"):
         types = [types] if isinstance(types, str) else types
@@ -110,7 +110,7 @@ def check(value, shape: dict, folder: Path, filename: str, where: str) -> None:
         for key, entry in value.items():
             field = properties.get(key, additional)
             if isinstance(field, dict):
-                check(entry, field, folder, filename, f"{where}.{key}")
+                check(entry, field, folder, filename, f"{where}.{key}", allow_read_only=allow_read_only)
     elif isinstance(value, (list, tuple)):
         if "minItems" in shape and len(value) < shape["minItems"]:
             raise ValueError(f"{where} must contain at least {shape['minItems']} items")
@@ -122,4 +122,4 @@ def check(value, shape: dict, folder: Path, filename: str, where: str) -> None:
                 seen_items.append(item)
         if "items" in shape:
             for index, item in enumerate(value):
-                check(item, shape["items"], folder, filename, f"{where}[{index}]")
+                check(item, shape["items"], folder, filename, f"{where}[{index}]", allow_read_only=allow_read_only)

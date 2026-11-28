@@ -320,6 +320,9 @@ def _validate_content(
     staged_targets: dict[str, object] | None = None,
     extra_adws: set[str] | None = None,
 ) -> None:
+    classified = configkinds.classify(rel)
+    if classified is not None and classified[0] == "library":
+        raise ConfigRepoError(f"{rel}: config kind 'library' is read only")
     parsed: dict | None = None
     if rel.endswith(".toml"):
         try:
@@ -342,7 +345,6 @@ def _validate_content(
         except Exception as e:
             raise ConfigRepoError(f"{retention.FILENAME} failed validation: {e}") from e
         return
-    classified = configkinds.classify(rel)
     if classified is not None and isinstance(parsed, dict):
         kind, item_name = classified
         if kind == "device":

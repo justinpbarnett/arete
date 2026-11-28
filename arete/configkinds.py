@@ -72,6 +72,7 @@ REGISTRY = {
     "sound": kind("sound", "check", Home("sounds/{name}.toml")),
     "experiment": kind("experiment", "review", Home("experiments/{name}.toml")),
     "retention": kind("retention", "check", Home("retention.toml", "defaults")),
+    "library": kind("library", "check", Home("libraries/{name}.toml")),
 }
 
 

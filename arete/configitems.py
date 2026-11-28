@@ -72,6 +72,18 @@ def _enrich(entry: dict, conn=None) -> dict:
 
 
 def _engine_items(kind: str) -> dict[str, dict]:
+    if kind == "library":
+        target = paths.ENGINE_ADWS_DIR / "library.toml"
+        if not target.is_file():
+            return {}
+        return {
+            "adw": _enrich({
+                "kind": "library",
+                "name": "adw",
+                "path": "arete/adws/library.toml",
+                "engine": str(target),
+            }),
+        }
     if kind not in ("target", "rule"):
         return {}
     folder = paths.DEFAULTS_DIR / f"{kind}s"
@@ -92,6 +104,9 @@ def _engine_items(kind: str) -> dict[str, dict]:
 def listing(kind: str, *, name: str | None = None, conn=None) -> list[dict]:
     if kind not in configkinds.REGISTRY:
         raise refusals.NotFound(f"Unknown config kind {kind}")
+    if kind == "library":
+        return [entry for item_name, entry in sorted(_engine_items(kind).items())
+                if name is None or item_name == name]
     root = paths.CONFIG_DIR.resolve()
     found = {}
     for home in configkinds.REGISTRY[kind].home:
@@ -160,7 +175,7 @@ def _engine_item(kind: str, name: str) -> dict | None:
                 }),
                 "_engine_file": str(target),
             }
-    if kind == "adw" and re.fullmatch(configkinds.NAME_PATTERN, name):
+    if kind == "adw" and name != "library" and re.fullmatch(configkinds.NAME_PATTERN, name):
         target = paths.ENGINE_ADWS_DIR / f"{name}.toml"
         if target.is_file():
             return {
@@ -172,6 +187,20 @@ def _engine_item(kind: str, name: str) -> dict | None:
         if target.is_file():
             return {
                 **_enrich({"kind": kind, "name": name, "path": "arete/routes/adw.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "library" and name == "adw":
+        target = paths.ENGINE_ADWS_DIR / "library.toml"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": "arete/adws/library.toml", "engine": str(target)}),
+                "_engine_file": str(target),
+            }
+    if kind == "prompt" and re.fullmatch(configkinds.PROMPT_NAME_PATTERN, name):
+        target = paths.PROMPTS_DIR / f"{name}.md"
+        if target.is_file():
+            return {
+                **_enrich({"kind": kind, "name": name, "path": f"arete/prompts/{name}.md", "engine": str(target)}),
                 "_engine_file": str(target),
             }
     return None
@@ -194,6 +223,8 @@ def item(kind: str, name: str, *, level: str | None = None, conn=None) -> dict:
         if level is not None and entry["level"] != level:
             raise refusals.NotFound(f"No config item {kind}/{name} at level {level}")
         return entry
+    if level is None and kind == "prompt" and (engine := _engine_item(kind, name)) is not None:
+        return engine
     raise refusals.NotFound(f"No config item {kind}/{name}")
 
 
@@ -246,6 +277,15 @@ def read(found: dict, *, version: str | None = None, level: str | None = None,
     public = {k: v for k, v in found.items() if not k.startswith("_")}
     if "_engine_file" in found:
         engine_path = Path(found["_engine_file"])
+        if public["kind"] == "library":
+            if file:
+                raise refusals.NotFound(f"No file {file} for {found['kind']}/{found['name']}")
+            from . import adw_library
+
+            try:
+                return {**public, "content": adw_library.load(engine_path)}
+            except ValueError as error:
+                raise refusals.Invalid(str(error)) from error
         if file:
             engine_path = engine_path.parent / _validate_subfile(file)
             if not engine_path.is_file():

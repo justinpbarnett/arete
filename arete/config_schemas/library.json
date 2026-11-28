@@ -1,0 +1,89 @@
+{
+  "type": "object",
+  "x-arete-read-only": true,
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "portType": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+          "glyph": {"type": "string", "minLength": 1},
+          "word": {"type": "string", "minLength": 1}
+        },
+        "required": ["id", "glyph", "word"],
+        "additionalProperties": false
+      }
+    },
+    "step": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+          "kind": {"type": "string", "enum": ["agent", "script"]},
+          "prompt": {"type": "string"},
+          "role": {"type": "string"},
+          "in": {"type": "array", "items": {"$ref": "#/$defs/pin"}},
+          "out": {"type": "array", "items": {"$ref": "#/$defs/pin"}},
+          "outcomes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "enum": ["done", "pass", "fail", "feedback"]}
+          },
+          "band": {
+            "type": "array",
+            "items": {"type": "number"}
+          },
+          "about": {"type": "string", "minLength": 1}
+        },
+        "required": ["id", "kind", "prompt", "role", "in", "out", "outcomes", "band", "about"],
+        "additionalProperties": false
+      }
+    },
+    "trigger": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+          "kind": {"type": "string", "enum": ["manual", "source", "schedule", "event"]},
+          "params": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+                "type": {"type": "string", "enum": ["string", "string[]", "boolean", "integer", "number"]},
+                "hint": {"type": "string", "minLength": 1}
+              },
+              "required": ["name", "type", "hint"],
+              "additionalProperties": false
+            }
+          },
+          "out": {"type": "array", "items": {"$ref": "#/$defs/pin"}}
+        },
+        "required": ["id", "kind", "params", "out"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["portType", "step", "trigger"],
+  "additionalProperties": false,
+  "$defs": {
+    "pin": {
+      "type": "object",
+      "properties": {
+        "pin": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"},
+        "type": {"type": "string", "minLength": 1, "pattern": "^[a-z][a-z0-9_-]*$"}
+      },
+      "required": ["pin", "type"],
+      "additionalProperties": false
+    }
+  }
+}
