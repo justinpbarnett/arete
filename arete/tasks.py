@@ -179,8 +179,14 @@ def held(cfg: config.Config, line_or_repo: dict | str | config.Repo | None, tid:
         line_row = lines_mod.resolve_line_read(repo_name, tid, cfg=cfg)
     if repo_name and (why := config.repo_paused(cfg, repo_name)):
         return why
-    going = lines_mod.live_runs_by_line()
-    wip = lines_mod.wip_counts_by_line()
+    from collections import Counter
+
+    going = lines_mod.live_runs_by_line() if line_row is not None else Counter()
+    wip = (
+        lines_mod.wip_counts_by_line()
+        if line_row is not None and line_row.get("wip_limit") is not None
+        else Counter()
+    )
     return pipeline.held_back(cfg, line_row, going, slots.slots_free_to_start(cfg.max_parallel), wip)
 
 

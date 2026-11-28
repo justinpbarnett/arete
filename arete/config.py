@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import math
 import os
 import pwd
@@ -1933,6 +1934,25 @@ def _scope_matches(scope: str, *, repo: str = "", role: str = "", kind: str = ""
     return False
 
 
+_PROMPT_PROBLEMS_SCOPE: ContextVar[tuple[int, tuple] | None] = ContextVar("arete_prompt_problems_scope", default=None)
+
+
+@contextlib.contextmanager
+def prompt_binding_scope(cfg: Config):
+    cached = _PROMPT_PROBLEMS_SCOPE.get()
+    if cached is not None and cached[0] == id(cfg):
+        yield cached[1]
+        return
+    from . import prompts
+
+    probs = tuple(prompts.binding_problems(cfg))
+    tok = _PROMPT_PROBLEMS_SCOPE.set((id(cfg), probs))
+    try:
+        yield probs
+    finally:
+        _PROMPT_PROBLEMS_SCOPE.reset(tok)
+
+
 def paused(cfg: Config, repo: str = "", role: str = "", kind: str = "", mcp: tuple[str, ...] | list[str] = (),
            *, oncall: bool = False, layer: RepoLayer | None = None) -> str:
     problems = (*cfg.problems, *(layer.problems if layer else ()))
@@ -1940,9 +1960,14 @@ def paused(cfg: Config, repo: str = "", role: str = "", kind: str = "", mcp: tup
         if _scope_matches(problem.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
             return problem.text()
     if role:
-        from . import prompts
+        cached = _PROMPT_PROBLEMS_SCOPE.get()
+        if cached is not None and cached[0] == id(cfg):
+            prompt_probs = cached[1]
+        else:
+            from . import prompts
 
-        for pp in prompts.binding_problems(cfg):
+            prompt_probs = prompts.binding_problems(cfg)
+        for pp in prompt_probs:
             if _scope_matches(pp.scope, repo=repo, role=role, kind=kind, mcp=mcp, oncall=oncall):
                 return pp.message
     return ""
@@ -1972,14 +1997,12 @@ def repo_paused(cfg: Config, repo_name: str, *, kind: str = "") -> str:
             return f"{type(e).__name__}: {e}"
         if why := paused(cfg, repo=repo_name, layer=layer):
             return why
-    from . import prompts
-
-    prompt_probs = prompts.binding_problems(cfg)
-    if not cfg.problems and not (layer and layer.problems) and not prompt_probs:
-        return ""
-    for k in (kind,) if kind else ("", *KINDS):
-        for role in STEP_ROLES:
-            mcps = _configured_mcps(cfg, layer, role, k)
-            if why := paused(cfg, repo=repo_name, role=role, kind=k, mcp=mcps, layer=layer):
-                return why
+    with prompt_binding_scope(cfg) as prompt_probs:
+        if not cfg.problems and not (layer and layer.problems) and not prompt_probs:
+            return ""
+        for k in (kind,) if kind else ("", *KINDS):
+            for role in STEP_ROLES:
+                mcps = _configured_mcps(cfg, layer, role, k)
+                if why := paused(cfg, repo=repo_name, role=role, kind=k, mcp=mcps, layer=layer):
+                    return why
     return ""
