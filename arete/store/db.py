@@ -128,6 +128,8 @@ SPEC_DELIVERY_SCHEMA = 29
 SPEC_GRAPH_SCHEMA = 30
 FACTORY_SCHEMA = 31
 TICKET_FEEDBACK_SCHEMA = 32
+CONFIG_INDEX_SCHEMA = 33
+CONFIG_VER_SCHEMA = 34
 INHERITED_SERVE_CHILDREN = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 INHERITED_SERVE_IDENTITIES = "ARETE_SERVE_RESTARTED_CHILD_IDENTITIES"
 WORKSPACE_CHILD_PIDS = "workspace_contract_children"
@@ -139,7 +141,8 @@ WORKSPACE_HANDOFF = ("the installation's legacy snapshot directory in [serve] wo
 # Unrelated writers can use older databases. Spec graph migrations are serve-owned.
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract"
              and m.n not in (WORKSPACE_SNAPSHOT_SCHEMA, WORKER_EXCHANGE_SCHEMA, SECRET_REGISTRY_SCHEMA, SPEC_DELIVERY_SCHEMA,
-                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA))
+                             SPEC_GRAPH_SCHEMA, FACTORY_SCHEMA, TICKET_FEEDBACK_SCHEMA, CONFIG_INDEX_SCHEMA,
+                             CONFIG_VER_SCHEMA))
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
 _OWNER = threading.local()

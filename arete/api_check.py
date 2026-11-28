@@ -456,6 +456,10 @@ class Check:
             if name in ("task.update", "run.stop"):
                 row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
                 values["base_version"] = row["version"]
+            if name == "config.diff":
+                values["from"], values["to"] = "1", "2"
+            if name == "settings.update":
+                values["base_version"] = self.read("/api/v1/settings")["settings"]["version"]
             if name == "task.create":
                 values["repo"] = replay.SAMPLE_REPO
             if method == "GET":
@@ -542,6 +546,9 @@ def worker(lifeline):
             config_fixture_git("commit", "-qm", "Initial config fixture")
             paths.CONFIG_FILE.write_text("max_parallel = 3\n" + body)
             db.migrate()
+            from . import configrepo
+
+            configrepo.rebuild_index()
             principals.seed_owner(LOGIN)
             tokens.init_owner()
             token = credential_files.read_client(db.schema_metadata()["instance_tag"])

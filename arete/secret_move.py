@@ -207,7 +207,7 @@ def env_contents(text):
 
 
 def copy_jira_fields(source, values):
-    from . import settings
+    from . import configrepo, settings
 
     fields = {field: values[env] for env, field in JIRA_FIELDS.items() if values.get(env)}
     if not fields:
@@ -222,8 +222,15 @@ def copy_jira_fields(source, values):
         lines = paths.CONFIG_FILE.read_text().splitlines(keepends=True)
         for key, value in fields.items():
             settings.set_key(lines, "jira", key, json.dumps(value, ensure_ascii=False))
-        settings.write_checked("".join(lines), lambda cfg: (
-            "Jira settings failed readback" if any(getattr(cfg.jira, k) != v for k, v in fields.items()) else ""))
+        updated = "".join(lines)
+        def refusal(cfg):
+            return "Jira settings failed readback" if any(getattr(cfg.jira, k) != v for k, v in fields.items()) else ""
+        if configrepo.is_repo():
+            settings.write_checked(updated, refusal)
+        else:
+            settings.check_draft(updated, refusal)
+            mode = stat.S_IMODE(paths.CONFIG_FILE.stat().st_mode)
+            util.write_durably(paths.CONFIG_FILE, updated.encode(), mode)
 
 
 def adopt_values(scope, values, active, provider=lambda _name: None):

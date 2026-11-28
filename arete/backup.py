@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import fcntl
-import io
 import json
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
-import tarfile
 import tempfile
 import threading
 import uuid
@@ -16,7 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import config, paths, util
+from . import config, configrepo, paths, util
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -25,7 +23,7 @@ KEEP_DAYS = 14
 RESTORE_GAP = 10_000
 SNAPSHOT = re.compile(r"^arete-(\d{8}T\d{6})(\d{6})?Z-([a-z][a-z0-9-]*)\.db$")
 REASON = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
-ARCHIVE = re.compile(r"^config-(\d{4}-\d{2}-\d{2})\.tar\.gz$")
+ARCHIVE = re.compile(r"^config-(\d{4}-\d{2}-\d{2})\.(?:bundle|tar\.gz)$")
 SQLITE_MAGIC = b"SQLite format 3\x00"
 LAST = "last.json"
 LOCK = threading.RLock()
@@ -165,34 +163,17 @@ def retain(folder: Path) -> None:
 
 def forbidden_name(name: str) -> bool:
     name = name.lower()
-    return (name == "verification-authority" or name == ".env" or name.startswith(".env.")
-            or name == "pi.env" or name.endswith(".env"))
+    return (name in ("verification-authority", ".env", "pi.env", "hooks", "secrets")
+            or name.startswith(".env.") or name.endswith((".env", ".secret", ".secrets")))
 
 
-def add_tree(tar: tarfile.TarFile, root: Path, arcname: str) -> None:
-    if root.is_symlink() or not root.is_dir():
-        return
-    tar.add(root, arcname=arcname, recursive=False)
-    for here, folders, files in os.walk(root, followlinks=False):
-        folders[:] = sorted(d for d in folders if not forbidden_name(d) and not (Path(here) / d).is_symlink())
-        for name in sorted(files):
-            p = Path(here) / name
-            if not forbidden_name(name) and not p.is_symlink() and p.is_file():
-                tar.add(p, arcname=f"{arcname}/{p.relative_to(root)}", recursive=False)
-        for d in folders:
-            tar.add(Path(here) / d, arcname=f"{arcname}/{(Path(here) / d).relative_to(root)}", recursive=False)
-
-
-def layers_bundle() -> bytes | None:
-    layers = paths.CONFIG_DIR / "layers"
-    if not (layers / ".git").exists() and not layers.is_symlink():
-        return None
-    if layers.is_symlink() or (layers / ".git").is_symlink() or not (layers / ".git").is_dir():
-        raise RuntimeError("layers is linked or has no plain .git folder, so it is not bundled")
+def _check_config_history(root: Path) -> None:
+    if root.is_symlink() or (root / ".git").is_symlink() or not (root / ".git").is_dir():
+        raise RuntimeError("config folder is linked or has no plain .git folder, so it is not bundled")
     listed = subprocess.run(["git", "log", "--all", "--root", "-m", "--no-renames", "--raw", "--format=", "-z"],
-                            check=False, cwd=layers, capture_output=True, timeout=300)
+                            check=False, cwd=root, capture_output=True, timeout=300)
     if listed.returncode != 0:
-        raise RuntimeError(f"listing layers history failed ({listed.returncode})")
+        raise RuntimeError(f"listing config history failed ({listed.returncode})")
     records = iter(listed.stdout.decode(errors="replace").split("\0"))
     for header in records:
         header = header.lstrip("\n")
@@ -200,45 +181,45 @@ def layers_bundle() -> bytes | None:
             continue
         modes = re.fullmatch(r":([0-7]{6}) ([0-7]{6}) [0-9a-f]+ [0-9a-f]+ [A-Z][0-9]*", header)
         if modes is None:
-            raise RuntimeError("layers history has an unrecognized raw header; the bundle was not made")
+            raise RuntimeError("config history has an unrecognized raw header; the bundle was not made")
         path = next(records, None)
         if not path:
-            raise RuntimeError("layers history has a missing pathname; the bundle was not made")
+            raise RuntimeError("config history has a missing pathname; the bundle was not made")
         if "120000" in modes.groups():
-            raise RuntimeError("layers history holds a symlink; the bundle was not made")
+            raise RuntimeError("config history holds a symlink; the bundle was not made")
         if any(forbidden_name(part) for part in path.split("/")):
-            raise RuntimeError(f"layers history holds {path}, which never leaves the machine; the bundle was not made")
-    res =subprocess.run(["git", "bundle", "create", "-", "--all"], check=False, cwd=layers, capture_output=True, timeout=300)
-    if res.returncode != 0 or not res.stdout:
-        raise RuntimeError(f"git bundle of layers failed ({res.returncode}): "
-                           f"{util.first_line(res.stderr.decode(errors='replace'), 200)}")
-    return res.stdout
+            raise RuntimeError(f"config history holds {path}, which never leaves the machine; the bundle was not made")
 
 
-def build_archive(day: str) -> Path:
+def build_bundle(day: str) -> tuple[Path, str]:
+    root = paths.CONFIG_DIR.resolve()
+    configrepo.ensure_repo()
+    _check_config_history(root)
     folder = paths.backups_dir()
-    final = folder / f"config-{day}.tar.gz"
-    handle, name = tempfile.mkstemp(dir=folder, prefix=f".config-{day}-", suffix=".tar.gz.tmp")
+    folder.mkdir(parents=True, exist_ok=True)
+    final = folder / f"config-{day}.bundle"
+    handle, name = tempfile.mkstemp(dir=folder, prefix=f".config-{day}-", suffix=".bundle.tmp")
     os.close(handle)
     draft = Path(name)
     try:
-        with tarfile.open(draft, "w:gz") as tar:
-            for name in ("config.toml", "loop-switches.json"):
-                p = paths.CONFIG_DIR / name
-                if p.is_file() and not p.is_symlink():
-                    tar.add(p, arcname=name, recursive=False)
-            add_tree(tar, paths.CONFIG_DIR / "loops", "loops")
-            if (bundle := layers_bundle()) is not None:
-                member = tarfile.TarInfo("layers.bundle")
-                member.size, member.mtime, member.mode = len(bundle), int(util.now().timestamp()), 0o600
-                tar.addfile(member, io.BytesIO(bundle))
+        res = subprocess.run(["git", "bundle", "create", str(draft), "--all"], check=False, cwd=root,
+                             capture_output=True, timeout=300)
+        if res.returncode != 0 or not draft.is_file() or draft.stat().st_size == 0:
+            raise RuntimeError(f"git bundle create failed ({res.returncode}): "
+                               f"{util.first_line(res.stderr.decode(errors='replace'), 200)}")
+        verified = subprocess.run(["git", "bundle", "verify", str(draft)], check=False, cwd=root,
+                                  capture_output=True, timeout=300)
+        if verified.returncode != 0:
+            raise RuntimeError(f"git bundle verify failed ({verified.returncode}): "
+                               f"{util.first_line(verified.stderr.decode(errors='replace'), 200)}")
         util.flush_file(draft)
         os.replace(draft, final)
         util.flush_folder(folder)
     except BaseException:
         draft.unlink(missing_ok=True)
         raise
-    return final
+    live = configrepo.live_sha(root)
+    return final, live
 
 
 def copied_today(day: str) -> bool:
@@ -251,13 +232,15 @@ def run_copy(snapshot_file: Path, copy_to: str, day: str) -> str:
         with folder_lock("copy", wait=False) as mine:
             if not mine or (copy_to and copied_today(day)):
                 return ""
-            archive = build_archive(day)
+            bundle, live = build_bundle(day)
+            update_last(config_bundle=bundle.name, config_live_sha=live, live_sha=live)
             if not copy_to:
                 return ""
             with LOCK:
-                IN_FLIGHT.update((snapshot_file, archive))
-            res = util.sh(["rsync", "-t", str(snapshot_file), str(archive), copy_to], timeout=3600)
-            fields = {"copy_exit": res.returncode, "copy_attempted_at": util.iso()}
+                IN_FLIGHT.update((snapshot_file, bundle))
+            res = util.sh(["rsync", "-t", str(snapshot_file), str(bundle), copy_to], timeout=3600)
+            fields = {"copy_exit": res.returncode, "copy_attempted_at": util.iso(),
+                      "config_bundle": bundle.name, "config_live_sha": live, "live_sha": live}
             if res.returncode == 0:
                 fields.update(copied_at=util.iso(), copied_file=snapshot_file.name)
             update_last(**fields)
@@ -267,14 +250,14 @@ def run_copy(snapshot_file: Path, copy_to: str, day: str) -> str:
         return f"{type(e).__name__}: {util.first_line(str(e), 300)}"
     finally:
         with LOCK:
-            IN_FLIGHT.difference_update((snapshot_file, paths.backups_dir() / f"config-{day}.tar.gz"))
+            IN_FLIGHT.difference_update((snapshot_file, paths.backups_dir() / f"config-{day}.bundle"))
             COPYING.discard(day)
 
 
 def daily_copy(snapshot_file: Path, copy_to: str, submit=None):
     day = util.now().strftime("%Y-%m-%d")
     with LOCK:
-        archived = (paths.backups_dir() / f"config-{day}.tar.gz").exists()
+        archived = (paths.backups_dir() / f"config-{day}.bundle").exists()
         if day in COPYING or (copy_to and copied_today(day)) or (not copy_to and archived):
             return None
         COPYING.add(day)

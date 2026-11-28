@@ -797,8 +797,8 @@ Durable installation metadata recovers an interruption between renames before se
 Within a restore generation a reader that has seen N never receives a newly allocated line below N; a generation change restarts that run's feed. The CLI follower and both dashboard feed clients reset their cursor to zero when `restore_epoch` changes.
 While `arete.db` is missing or empty and a snapshot exists, Arete refuses to start a new empty file and names the newest snapshot instead.
 
-After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `.env`, `.env.*`, `pi.env`, `*.env` files and `verification-authority/` are left out. Layers history containing forbidden names or symlinks, including deleted entries, refuses bundling.
-Set the destination to copy the day's snapshot and archive with `rsync -t`:
+After the first snapshot of each UTC day Arete builds `config-<day>.bundle` in `backups/` from the config Git repository (`git bundle create <file> --all`, verified with `git bundle verify`) and records the bundled `live` commit SHA in `last.json`. Config history containing forbidden secret names or symlinks refuses bundling.
+Set the destination to copy the day's snapshot and bundle with `rsync -t`:
 
 ```toml
 [backup]
@@ -1033,7 +1033,8 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
 - adw scripts: `adws/` here, or the folder `[factory] adws` names (see The adw scripts); `adws/README.md` is the guide for an agent that steers runs
 - `justfile`: the `adw` recipes that steer runs through the server (see From the CLI)
-- Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
+- Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; each loop's `enabled` switch lives in its `loop.toml` (engine and repo loops use a switch-only `loops/<name>/loop.toml` in the config repo)
+- Config repo: `~/.config/arete/` is a single Git repository on branch `live` (initialized by `arete init` and `arete serve` once secret files have left the config folder). Every config write goes through `arete/configrepo.py` with per-path base-blob checking, durable flush-before-rename, actor IDs without emails, and a derived SQLite `config_index`. Loadable hand edits left in the working tree are committed as actor `hand` before the next loop fire or child launch, while invalid TOML stays uncommitted and is logged once per blob. A pre-commit hook validates every staged TOML file and `config.toml` and refuses unfenced commits on `live`.
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
 - State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, workspace cleanup state, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
@@ -1307,7 +1308,7 @@ A heading or formatting change without a lesson change is a no-op, preserving th
 A layer outside the repo is made a git repo, and arete commits each accepted rewrite there, so its log shows what was learned and from which run.
 A clean run learns nothing.
 
-Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
+Lessons merge when runs overlap. The learn step reads `expertise.md` and its Git blob ID when it starts, not the copy the run planned with, and runs outside the config lock. It commits through the config repo with that per-path base blob, so commits to another repo's layer never cause a refusal. When another run changed `expertise.md` meanwhile, `configrepo.commit` refuses with `stale_base`; learn reads the new head and runs again outside the lock (`learn2`, then `learn3`) up to 3 refusals. After 3 refusals, or when a retry gives no usable file, the rewrite and report are saved in the run folder and not applied; a rewrite whose base moved is never written. The commit holds `expertise.md` alone, authored as `run:<id>/learn`, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
 
 ### Enroll the delivery target
 

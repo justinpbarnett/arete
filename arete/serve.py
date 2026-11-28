@@ -977,6 +977,10 @@ class Server:
             loop_store.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
+        from . import configrepo
+
+        if configrepo.is_repo():
+            configrepo.commit_hand_edits()
         with foundation.tx() as c:
             factory_state.admit(c)
             queued = sources.fire(loop, trigger)
@@ -1421,6 +1425,12 @@ def run(with_dashboard: bool = True) -> NoReturn:
         server.report_config()
         if not server.contracts_waiting and not server.config_problem:
             server.guard("stage:secret-move", server.move_secrets_when_due)
+            from . import configrepo
+
+            try:
+                configrepo.init()
+            except configrepo.ConfigRepoError as e:
+                server.say(f"config repo init deferred: {e}")
             server.read_config()
         for note in start_notes(server.cfg):
             server.say(note)

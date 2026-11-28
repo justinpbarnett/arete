@@ -6801,22 +6801,23 @@ class ConfigKindRegistryTests(unittest.TestCase):
         with cls.server() as api:
             published = api.read("/api/v1/contract")["operations"]
             ops = {op["name"].partition(".")[2]: op for op in published if op["name"].startswith("config.")}
-            assert tuple(ops) == configkinds.VERBS
-            assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds for op in ops.values())
+            assert tuple(ops) == ("kinds", *configkinds.VERBS)
+            assert all(tuple(op["input"]["properties"]["kind"]["enum"]) == kinds
+                       for verb, op in ops.items() if verb != "kinds")
             assert ops["diff"]["input"]["required"] == ["kind", "name"]
             items = api.read("/api/v1/config/step_settings")["items"]
             assert [(found["name"], found["path"]) for found in items] == [
                 ("defaults", "config.toml"), (layer.name, f"{relative}/config.toml")]
             assert api.read(f"/api/v1/config/step_settings/{layer.name}")["item"]["content"] == (
                 layer / "config.toml").read_text()
-            assert api.read("/api/v1/config/prompt")["items"] == [
-                {"kind": "prompt", "name": append_name, "path": append.relative_to(root).as_posix()},
-                {"kind": "prompt", "name": "unrelated", "path": "prompts/unrelated.md"}]
+            assert [(found["kind"], found["name"], found["path"]) for found in api.read("/api/v1/config/prompt")["items"]] == [
+                ("prompt", append_name, append.relative_to(root).as_posix()),
+                ("prompt", "unrelated", "prompts/unrelated.md")]
             assert api.read("/api/v1/config/prompt/unrelated")["item"]["content"] == prompt.read_text()
             cls.assert_config_history(api, f"prompt/{append_name}", append, commits, old, new, "Working append",
                                       git_root=root / "layers")
-            _, error = api.request("GET", "/api/v1/config/feat", status=400)
-            assert json.loads(error)["code"] == "invalid_input"
+            _, error = api.request("GET", "/api/v1/config/feat", status=404)
+            assert json.loads(error)["code"] == "not_found"
             parser = argparse.ArgumentParser()
             api_commands.register(parser.add_subparsers(required=True))
             args = parser.parse_args(["config", "list", "step_settings"])
@@ -6832,7 +6833,8 @@ class ConfigKindRegistryTests(unittest.TestCase):
                     assert parser.parse_args(["mcp-config"]).fn(None) == 0
             tools, selected = (json.loads(line)["result"] for line in output.getvalue().splitlines())
             assert {tool["name"] for tool in tools["tools"]} == {"config_" + verb for verb in ops}
-            assert all(tuple(tool["inputSchema"]["properties"]["kind"]["enum"]) == kinds for tool in tools["tools"])
+            assert all(tuple(tool["inputSchema"]["properties"]["kind"]["enum"]) == kinds
+                       for tool in tools["tools"] if tool["name"] != "config_kinds")
             assert not selected["isError"]
             assert json.loads(selected["content"][0]["text"])["item"]["name"] == layer.name
         return True
@@ -6853,9 +6855,11 @@ class ConfigKindRegistryTests(unittest.TestCase):
         route = f"/api/v1/config/{item}"
         kind, name = item.split("/")
         relative = path.relative_to(paths.CONFIG_DIR).as_posix()
-        assert api.read(route)["item"] == {"kind": kind, "name": name, "content": path.read_text(),
-                                           "path": relative}
-        assert api.read(f"{route}/versions")["versions"] == versions
+        got_item = api.read(route)["item"]
+        assert {k: got_item[k] for k in ("kind", "name", "content", "path")} == {
+            "kind": kind, "name": name, "content": path.read_text(), "path": relative}
+        got_versions = api.read(f"{route}/versions")["versions"]
+        assert got_versions[:len(versions)] == versions
         latest, first = versions
         diff = api.read(f"{route}/diff?from={first}&to={latest}")["diff"].splitlines()
         git_path = path.relative_to(git_root).as_posix()
@@ -6897,9 +6901,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
             items = api.read(f"/api/v1/config/{kind}")["items"]
             assert len(items) == len(expected)
             assert {found["name"]: found["path"] for found in items} == expected
-            assert api.read(f"/api/v1/config/{kind}/defaults/versions")["versions"] == []
-            _, error = api.request("GET", f"/api/v1/config/{kind}/defaults/diff", status=404)
-            assert json.loads(error)["code"] == "unavailable"
+            assert len(api.read(f"/api/v1/config/{kind}/defaults/versions")["versions"]) >= 1
             for repo_name, address, old, new, working in cases:
                 cls.assert_config_history(api, f"{kind}/{address}", root / repo_name / "config.toml",
                                           histories[address], old, new, working, git_root=root)
@@ -6939,6 +6941,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
         path = copy / "steps.toml"
         path.write_text(path.read_text().replace("timeout_minutes = 15", "timeout_minutes = 16", 1))
         with mock.patch.object(paths, "DEFAULTS_DIR", copy):
+            steps.engine_defaults.cache_clear()
             cfg = config.load(strict=True)
             assert steps.resolve(cfg, None, "learn").timeout_minutes == 16
             path.write_text("schema = 9\n")
@@ -7097,6 +7100,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "wait r1": "GET /api/runs/{run}/events",
         "lines r1": "GET /api/runs/{run}/events",
         "status": None,
+        "config kinds": "GET /api/v1/config",
         "config list step_settings": "GET /api/v1/config/{kind}",
         "config read step_settings defaults": "GET /api/v1/config/{kind}/{name}",
         "config versions step_settings defaults": "GET /api/v1/config/{kind}/{name}/versions",
@@ -9325,8 +9329,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 70)
-        self.assertEqual(len({op["name"] for op in operations}), 70)
+        self.assertEqual(len(operations), 74)
+        self.assertEqual(len({op["name"] for op in operations}), 74)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -11086,3 +11090,948 @@ class CredentialInstanceTests(_CredentialCase):
             self.assertEqual(foreign, self.request(server, "GET", self.TASKS, bearer=unknown, status=401)[0])
             digest.assert_not_called()
             compare.assert_not_called()
+
+
+class _ConfigRepoCase(unittest.TestCase):
+    def run_isolated(self, script: str):
+        with tempfile.TemporaryDirectory(prefix="arete-cfgrepo-") as directory:
+            root = Path(directory).resolve()
+            env = api_check.isolated_env(root)
+            preamble = (
+                "import fcntl, inspect, json, os, shutil, subprocess, tempfile, threading, tomllib\n"
+                "from contextlib import contextmanager, redirect_stdout\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "from arete import (api_check, backup, config, configkinds, configrepo, control, dashboard, "
+                "eval_mine, loop_run, loops, paths, pipeline, principals, replay, scaffold, serve, settings, "
+                "sources, tailnet, util)\n"
+                "from arete.commands import setup\n"
+                "from arete.lab import optimize\n"
+                "from arete.store import config as config_store, db, tokens as token_store\n"
+                "root = Path.cwd()\n"
+                "def git_out(cwd, *args):\n"
+                "    return subprocess.check_output(['git', *args], cwd=cwd, text=True).strip()\n"
+                "@contextmanager\n"
+                "def record_config_writes():\n"
+                "    cfg_root = paths.CONFIG_DIR.resolve()\n"
+                "    callers = []\n"
+                "    orig_replace, orig_move = os.replace, shutil.move\n"
+                "    orig_wt, orig_wb = Path.write_text, Path.write_bytes\n"
+                "    def note(target):\n"
+                "        p = Path(target).resolve()\n"
+                "        if p == cfg_root or p.is_relative_to(cfg_root):\n"
+                "            for frame in inspect.stack()[2:]:\n"
+                "                fn = Path(frame.filename).as_posix()\n"
+                "                if '/arete/' in fn:\n"
+                "                    callers.append((fn.rsplit('/arete/', 1)[1], str(p)))\n"
+                "                    break\n"
+                "    def w_replace(src, dst, *a, **kw):\n"
+                "        note(dst); return orig_replace(src, dst, *a, **kw)\n"
+                "    def w_move(src, dst, *a, **kw):\n"
+                "        note(dst); return orig_move(src, dst, *a, **kw)\n"
+                "    def w_wt(self, *a, **kw):\n"
+                "        note(self); return orig_wt(self, *a, **kw)\n"
+                "    def w_wb(self, *a, **kw):\n"
+                "        note(self); return orig_wb(self, *a, **kw)\n"
+                "    with (mock.patch.object(os, 'replace', w_replace), mock.patch.object(shutil, 'move', w_move), "
+                "mock.patch.object(Path, 'write_text', w_wt), mock.patch.object(Path, 'write_bytes', w_wb)):\n"
+                "        yield callers\n"
+                "@contextmanager\n"
+                "def api_server(scopes=('*',), login=api_check.LOGIN):\n"
+                "    with redirect_stdout(StringIO()):\n"
+                "        db.migrate()\n"
+                "        owner = principals.seed_owner(login)\n"
+                "    if configrepo.is_repo():\n"
+                "        configrepo.reconcile()\n"
+                "    with db.tx() as c:\n"
+                "        token_store.ensure_key(c)\n"
+                "        _, token = token_store.issue(owner, 'Config repo test', list(scopes))\n"
+                "    node = SimpleNamespace(names={api_check.ADDRESS})\n"
+                "    logins = tailnet.Logins(tailnet.ScratchHost())\n"
+                "    logins.of = lambda _: login\n"
+                "    with mock.patch('socket.getfqdn', return_value=api_check.ADDRESS):\n"
+                "        server = tailnet.Server(api_check.ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)\n"
+                "    with server:\n"
+                "        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .02})\n"
+                "        thread.start()\n"
+                "        try:\n"
+                "            yield api_check.Check(server.server_port, root, [], token=token), owner\n"
+                "        finally:\n"
+                "            server.shutdown()\n"
+                "            thread.join()\n"
+                "with (api_check.offline(), mock.patch.object(pipeline, 'spawn_run') as _sp, "
+                "mock.patch.object(loop_run, 'launch') as _ll, mock.patch.object(sources, 'fire') as _sf, "
+                "mock.patch.object(serve.Server, 'scan_oncall') as _so):\n"
+            )
+            indented = "\n".join("    " + line if line else "" for line in script.splitlines())
+            run_isolated_behavior_child(self, root, env, preamble + indented + "\n")
+
+
+class ConfigRepoCoreTests(_ConfigRepoCase):
+    def test_one_writer_and_no_switches_file_in_source(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+with record_config_writes() as callers:
+    configrepo.init()
+    answer = {
+        'name': 'drafted-watch',
+        'loop_toml': 'kind = "command"\ndescription = "test"\n[run]\ncommand = ["true"]\n',
+        'prompt_md': '',
+        'files': [],
+        'note': 'check it',
+    }
+    res = SimpleNamespace(ok=True, structured=answer, model='sonnet', runner='replay', error='', usage_limit=False)
+    with mock.patch('arete.runner.run', return_value=res):
+        made = scaffold.write_draft('draft-run-1', scaffold.DraftRequest('watch things'), config.load(), lambda *a: None)
+    assert made['name'] == 'drafted-watch'
+    assert not loops.find('drafted-watch').enabled
+    control.switch('drafted-watch', True)
+    assert loops.find('drafted-watch').enabled
+    control.switch('drafted-watch', False)
+    assert not loops.find('drafted-watch').enabled
+assert callers, 'expected recorded config writes'
+assert all(src == 'configrepo.py' for src, _ in callers), callers
+assert not (paths.CONFIG_DIR / 'loop-switches.json').exists()
+pkg = paths.PACKAGE_DIR
+for py in pkg.rglob('*.py'):
+    assert 'SWITCHES_FILE' not in py.read_text(), f'SWITCHES_FILE found in {py}'
+""")
+
+    def test_index_rebuilds_identically_and_stale_base_refuses(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+_, b1 = configrepo.read('config.toml')
+configrepo.commit({'config.toml': 'max_parallel = 2\n'}, {'config.toml': b1}, actor='u:1a2b3c4d', source='dashboard')
+control.switch('poll', False)
+paths.CONFIG_FILE.write_text('max_parallel = 3\n')
+configrepo.commit_hand_edits()
+before_rows = config_store.all_rows()
+assert before_rows
+live_pairs = [(r['origin'], r['path']) for r in before_rows if r['live'] == 1]
+assert len(live_pairs) == len(set(live_pairs))
+with db.tx() as c:
+    c.execute('DELETE FROM config_index')
+configrepo.rebuild_index()
+after_rows = config_store.all_rows()
+assert after_rows == before_rows, (before_rows, after_rows)
+
+# Stale base must leave working tree, live, config_index, and events_log unchanged.
+wt_before = paths.CONFIG_FILE.read_bytes()
+live_before = configrepo.live_sha()
+idx_before = config_store.all_rows()
+with db.reader() as c:
+    ev_before = c.execute('SELECT COUNT(*) FROM events_log').fetchone()[0]
+try:
+    configrepo.commit({'config.toml': 'max_parallel = 4\n'}, {'config.toml': b1}, actor='u:1a2b3c4d', source='dashboard')
+    raise AssertionError('expected StaleBase')
+except configrepo.StaleBase as e:
+    assert 'config.toml' in str(e) and e.code == 'stale_base'
+assert paths.CONFIG_FILE.read_bytes() == wt_before
+assert configrepo.live_sha() == live_before
+assert config_store.all_rows() == idx_before
+with db.reader() as c:
+    assert c.execute('SELECT COUNT(*) FROM events_log').fetchone()[0] == ev_before
+""")
+
+    def test_flush_before_rename_and_ids_not_names(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+_, b1 = configrepo.read('config.toml')
+events_order = []
+orig_fsync, orig_fcntl, orig_replace = os.fsync, fcntl.fcntl, os.replace
+def rec_fsync(fd):
+    events_order.append(('fsync', fd)); return orig_fsync(fd)
+def rec_fcntl(fd, cmd, *a):
+    if hasattr(fcntl, 'F_FULLFSYNC') and cmd == fcntl.F_FULLFSYNC:
+        events_order.append(('fullfsync', fd))
+    return orig_fcntl(fd, cmd, *a)
+def rec_replace(src, dst):
+    if Path(dst).name == 'config.toml':
+        events_order.append(('replace', str(dst)))
+    return orig_replace(src, dst)
+with (mock.patch.object(os, 'fsync', rec_fsync), mock.patch.object(fcntl, 'fcntl', rec_fcntl),
+      mock.patch.object(os, 'replace', rec_replace)):
+    sha1 = configrepo.commit({'config.toml': 'max_parallel = 2\n'}, {'config.toml': b1},
+                             actor='u:1a2b3c4d', source='dashboard')
+rep_idx = next(i for i, e in enumerate(events_order) if e[0] == 'replace')
+assert any(e[0] in ('fsync', 'fullfsync') for e in events_order[:rep_idx]), events_order
+assert any(e[0] == 'fsync' for e in events_order[rep_idx + 1:]), events_order
+
+paths.CONFIG_FILE.write_text('max_parallel = 3\n')
+shas = configrepo.commit_hand_edits()
+assert len(shas) == 1
+for sha, expected_actor in ((sha1, 'u:1a2b3c4d'), (shas[0], 'hand')):
+    fields = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%an|%ae|%cn|%ce', sha).split('|')
+    assert fields == [expected_actor] * 4, fields
+    assert all('@' not in f for f in fields)
+    body = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%B', sha)
+    assert f'Arete-Actor: {expected_actor}' in body
+_, b3 = configrepo.read('config.toml')
+for bad in ('', 'owner', 'a@b'):
+    try:
+        configrepo.commit({'config.toml': 'max_parallel = 4\n'}, {'config.toml': b3}, actor=bad, source='dashboard')
+        raise AssertionError(f'should refuse {bad!r}')
+    except configrepo.ConfigRepoError:
+        pass
+""")
+
+
+class ConfigRepoInitTests(_ConfigRepoCase):
+    def test_init_migrates_backups_layers_and_loop_switches(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+cfg_dir = paths.CONFIG_DIR
+bak1 = cfg_dir / 'config.toml.bak-old'
+bak2 = cfg_dir / 'config.toml.bak-new'
+bak1.write_text('max_parallel = 1\n')
+bak2.write_text('max_parallel = 2\n')
+os.utime(bak1, (1000, 1000))
+os.utime(bak2, (2000, 2000))
+(cfg_dir / 'config.toml').write_text('max_parallel = 3\n')
+
+priv = cfg_dir / 'loops' / 'my-watch'
+priv.mkdir(parents=True)
+(priv / 'loop.toml').write_text('kind = "command"\nenabled = true\n[run]\ncommand = ["true"]\n')
+(cfg_dir / 'loop-switches.json').write_text(json.dumps({'poll': False, 'my-watch': False}))
+
+layers = cfg_dir / 'layers'
+sample = layers / 'sample'
+sample.mkdir(parents=True)
+git_env = {**os.environ, 'GIT_AUTHOR_NAME': 'hand', 'GIT_AUTHOR_EMAIL': 'hand',
+           'GIT_COMMITTER_NAME': 'hand', 'GIT_COMMITTER_EMAIL': 'hand'}
+subprocess.check_call(['git', 'init', '-q', '-b', 'main'], cwd=layers, env=git_env)
+for n in (1, 2, 3):
+    (sample / 'expertise.md').write_text(f'lesson {n}\n')
+    subprocess.check_call(['git', 'add', '.'], cwd=layers, env=git_env)
+    subprocess.check_call(['git', '-c', 'commit.gpgsign=false', 'commit', '-qm', f'layer {n}'], cwd=layers, env=git_env)
+(sample / 'expertise.md').write_text('lesson 4 uncommitted\n')
+
+configrepo.init()
+assert git_out(cfg_dir, 'symbolic-ref', '--short', 'HEAD') == 'live'
+cfg_commits = git_out(cfg_dir, 'log', '--reverse', '--format=%H', 'live', '--', 'config.toml').splitlines()
+assert [git_out(cfg_dir, 'cat-file', 'blob', f'{c}:config.toml') for c in cfg_commits] == [
+    'max_parallel = 1', 'max_parallel = 2', 'max_parallel = 3']
+layer_msgs = git_out(cfg_dir, 'log', '--format=%s', 'live', '--', 'layers/sample').splitlines()
+assert any('layer 1' in m for m in layer_msgs) and any('layer 3' in m for m in layer_msgs)
+assert any('import uncommitted' in m for m in layer_msgs)
+assert not (layers / '.git').exists()
+assert not (cfg_dir / 'loop-switches.json').exists()
+assert not bak1.exists() and not bak2.exists()
+assert tomllib.loads((priv / 'loop.toml').read_text())['enabled'] is False
+assert tomllib.loads((cfg_dir / 'loops' / 'poll' / 'loop.toml').read_text()) == {'enabled': False}
+loaded = {l.name: l for l in loops.load_all()}
+assert loaded['poll'].enabled is False and not loaded['poll'].error
+assert loaded['my-watch'].enabled is False and not loaded['my-watch'].error
+assert not any('another loop is already named' in l.error for l in loaded.values())
+assert git_out(cfg_dir, 'config', '--local', 'core.fsync') == 'committed,reference,index'
+assert git_out(cfg_dir, 'config', '--local', 'core.fsyncMethod') == 'fsync'
+tip = configrepo.live_sha()
+configrepo.init()
+assert configrepo.live_sha() == tip
+""")
+
+    def test_init_refuses_secrets_and_outside_paths(self):
+        self.run_isolated(r"""
+for name, setup_fn in (
+    ('pi.env', lambda d: (d / 'pi.env').write_text('OPENAI_API_KEY=x\n')),
+    ('hooks/x.secret', lambda d: ((d / 'hooks').mkdir(), (d / 'hooks' / 'x.secret').write_text('secret'))),
+    ('verification-authority', lambda d: (d / 'verification-authority').mkdir()),
+):
+    sub = root / ('cfg-' + name.replace('/', '-').replace('.', '-'))
+    sub.mkdir()
+    setup_fn(sub)
+    with mock.patch.multiple(paths, CONFIG_DIR=sub, CONFIG_FILE=sub / 'config.toml'):
+        try:
+            configrepo.init()
+            raise AssertionError(f'should refuse {name}')
+        except configrepo.ConfigRepoError as e:
+            assert name.split('/')[-1] in str(e) or name in str(e), str(e)
+        assert not (sub / '.git').exists()
+outside_cfg = root / 'cfg-outside'
+outside_cfg.mkdir()
+outside_dir = root / 'elsewhere'
+outside_dir.mkdir()
+(outside_cfg / 'config.toml').write_text(f'[serve]\nloop_dirs = [{json.dumps(str(outside_dir))}]\n')
+with mock.patch.multiple(paths, CONFIG_DIR=outside_cfg, CONFIG_FILE=outside_cfg / 'config.toml'):
+    try:
+        configrepo.init()
+        raise AssertionError('should refuse outside loop_dirs')
+    except configrepo.ConfigRepoError:
+        pass
+    assert not (outside_cfg / '.git').exists()
+""")
+
+
+class ConfigRepoSafetyTests(_ConfigRepoCase):
+    def test_hand_edits_logged_once_and_hook_refuses_bad_hand_commit(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+paths.CONFIG_FILE.write_text('max_parallel = 2\n')
+with mock.patch('arete.factory_control.spawn', return_value=('k', SimpleNamespace(pid=1, wait=lambda: 0))):
+    control.launch(['true'])
+assert git_out(paths.CONFIG_DIR, 'cat-file', 'blob', 'live:config.toml') == 'max_parallel = 2'
+assert git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%an', 'live') == 'hand'
+
+# Invalid hand edit stays uncommitted and is logged once across two launches.
+tip_before = configrepo.live_sha()
+paths.CONFIG_FILE.write_text('max_parallel = [broken\n')
+err_buf = StringIO()
+with (mock.patch('sys.stderr', err_buf),
+      mock.patch('arete.factory_control.spawn', return_value=('k', SimpleNamespace(pid=1, wait=lambda: 0)))):
+    control.launch(['true'])
+    control.launch(['true'])
+assert configrepo.live_sha() == tip_before
+assert err_buf.getvalue().count('config hand edit not committed') == 1, err_buf.getvalue()
+
+# Hand git commit of invalid config.toml is refused by pre-commit hook.
+paths.CONFIG_FILE.write_text('[research]\nz = 1\n')
+hook_env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_CONFIG_')}
+hook_env.update({'GIT_AUTHOR_NAME': 'hand', 'GIT_AUTHOR_EMAIL': 'hand',
+                 'GIT_COMMITTER_NAME': 'hand', 'GIT_COMMITTER_EMAIL': 'hand'})
+subprocess.check_call(['git', 'add', '--', 'config.toml'], cwd=paths.CONFIG_DIR, env=hook_env)
+bad_commit = subprocess.run(
+    ['git', '-c', f'core.hooksPath={paths.CONFIG_DIR / ".git" / "hooks"}', '-c', 'commit.gpgsign=false',
+     'commit', '-m', 'bad hand commit'],
+    cwd=paths.CONFIG_DIR, env=hook_env, capture_output=True, text=True,
+)
+assert bad_commit.returncode != 0, bad_commit.stdout + bad_commit.stderr
+assert 'z' in (bad_commit.stderr + bad_commit.stdout)
+""")
+
+    def test_loop_switch_commits_only_loop_toml_and_emits_event(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+with db.reader() as c:
+    before_ev = c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'config.loop.changed'").fetchone()[0]
+control.switch('poll', False)
+changed = git_out(paths.CONFIG_DIR, 'diff-tree', '--no-commit-id', '--name-only', '-r', 'live').splitlines()
+assert changed == ['loops/poll/loop.toml'], changed
+with db.reader() as c:
+    after_ev = c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'config.loop.changed'").fetchone()[0]
+assert after_ev == before_ev + 1
+assert not (paths.CONFIG_DIR / 'loop-switches.json').exists()
+""")
+
+
+class ConfigRepoWritersTests(_ConfigRepoCase):
+    def test_one_writer_for_init_settings_and_optimize_and_no_optimize_put(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+with record_config_writes() as callers:
+    with redirect_stdout(StringIO()):
+        assert setup.cmd_init(SimpleNamespace(force=False)) == 0
+    settings.save({'max_parallel': 2})
+    assert config.load().max_parallel == 2
+
+    # Prepare an optimize trail and run apply_winner + roll_back through configrepo.
+    sample_dir = root / 'opt-sample'
+    sample_lines = optimize.sample(sample_dir)
+    layer_dest = paths.CONFIG_DIR / 'layers' / replay.SAMPLE_REPO
+    shutil.copytree(sample_dir / 'layer', layer_dest)
+    rewritten = [f'layer = {json.dumps(str(layer_dest))}' if line.startswith('layer = ') else line
+                 for line in sample_lines if not line.startswith('#')]
+    _, blob = configrepo.read('config.toml')
+    configrepo.commit({'config.toml': '\n'.join(rewritten) + '\n'}, {'config.toml': blob},
+                      actor='hand', source='hand', note='seed optimize sample')
+    cfg_now = config.load()
+    layer_now = config.load_layer(layer_dest)
+    baseline_set = optimize.settled_now(cfg_now, layer_now, 'build')
+    inh = {r: optimize.settled_now(cfg_now, layer_now, r) for r, b in config.INHERITS.items() if b == 'build'}
+    winner_cfg = optimize.edited(paths.CONFIG_FILE.read_text(), 'steps.build', {'effort': 'low'})
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / 'config.toml'
+        p.write_text(winner_cfg)
+        wcfg = config.load(p, strict=True, base_dir=paths.CONFIG_DIR)
+    winner_set = optimize.settled_now(wcfg, layer_now, 'build')
+    winner_inh = {r: optimize.settled_now(wcfg, layer_now, r) for r in inh}
+    exp_dir = paths.STATE_DIR / 'experiments' / 'sample-search'
+    exp_dir.mkdir(parents=True)
+    trail = exp_dir / 'trail.jsonl'
+    search_ev = {'event': 'search', 'design': {'name': 'sample-search', 'repo': replay.SAMPLE_REPO, 'atom': 'build'},
+                 'baseline': {'settings': baseline_set, 'inheritors': inh}}
+    end_ev = {'event': 'end', 'promotable': True, 'champion': 'cheap', 'overrides': {'effort': 'low'},
+              'settings': winner_set, 'inheritors': winner_inh}
+    with redirect_stdout(StringIO()):
+        assert optimize.apply_winner(exp_dir, trail, [search_ev, end_ev], end_ev) == 0
+    assert config.load().steps['build']['effort'] == 'low'
+    applied_events = [json.loads(line) for line in trail.read_text().splitlines() if line.strip()]
+    with redirect_stdout(StringIO()):
+        assert optimize.roll_back(exp_dir, trail, [search_ev, end_ev, *applied_events]) == 0
+    assert config.load().steps['build']['effort'] == 'medium'
+
+assert callers
+assert all(src == 'configrepo.py' for src, _ in callers), callers
+for py in paths.PACKAGE_DIR.rglob('*.py'):
+    text = py.read_text()
+    assert 'optimize.put' not in text and 'def put(data: bytes)' not in text, str(py)
+""")
+
+    def test_v1_settings_save_uses_actor_id_not_email(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+with api_server(scopes=('read', 'config:activate')) as (api, owner):
+    with db.tx() as c:
+        c.execute("UPDATE principals SET id = 'u:1a2b3c4d' WHERE id = ?", (owner,))
+        c.execute("UPDATE principal_logins SET principal = 'u:1a2b3c4d' WHERE principal = ?", (owner,))
+        c.execute("UPDATE tokens SET principal = 'u:1a2b3c4d' WHERE principal = ?", (owner,))
+        _, tok = token_store.issue('u:1a2b3c4d', 'Scoped', ['read', 'config:activate'])
+    api.token = tok
+    cur = api.read('/api/v1/settings')['settings']
+    _, raw = api.request('PATCH', '/api/v1/settings',
+                         {'base_version': cur['version'], 'values': {'max_parallel': 2}},
+                         headers={'Idempotency-Key': 'actor-id-check-1'})
+    saved = json.loads(raw)['settings']
+    assert saved['version'] == cur['version'] + 1
+    meta = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%an|%ae|%cn|%ce', 'live').split('|')
+    body = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%B', 'live')
+    assert len(set(meta)) == 1 and '@' not in meta[0] and meta[0].startswith('client:'), meta
+    assert f'Arete-Actor: {meta[0]}' in body
+    # Direct settings.save with person id u:1a2b3c4d
+    with principals.acting('u:1a2b3c4d'):
+        settings.save({'max_parallel': 3})
+    meta2 = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%an|%ae|%cn|%ce', 'live').split('|')
+    assert meta2 == ['u:1a2b3c4d'] * 4, meta2
+""")
+
+
+class ConfigRepoLearnTests(_ConfigRepoCase):
+    def test_one_writer_learn_and_eval_mine_and_source_check(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+lines, _ = api_check.prepare_replay(root)
+layer = paths.CONFIG_DIR / 'layers' / 'sample'
+layer.mkdir(parents=True)
+(layer / 'config.toml').write_text((root / 'sample/layer/config.toml').read_text())
+(layer / 'expertise.md').write_text('# Expertise\n- initial lesson\n')
+(layer / 'other.txt').write_text('unrelated file\n')
+rewritten = [f'layer = {json.dumps(str(layer))}' if l.startswith('layer = ') else l for l in lines]
+paths.CONFIG_FILE.write_text('\n'.join(rewritten) + '\n')
+configrepo.init()
+repo = config.Repo('sample', root / 'sample/repo', github='demo/sample', layer=layer)
+run_dir = paths.RUNS_DIR / 'run-learn-1'
+run_dir.mkdir(parents=True)
+class FakeRun:
+    def __init__(self, rid, rdir, repo_obj):
+        self.id, self.dir, self.repo, self.ref = rid, rdir, repo_obj, '#1'
+        self.story = ['hit a snag and fixed it']
+        self.logs = []
+    def log(self, msg):
+        self.logs.append(msg)
+    def save(self, name, text):
+        (self.dir / name).write_text(text)
+    def agent(self, call, prompt, wt, **kw):
+        return SimpleNamespace(ok=True, structured={
+            'added': ['new lesson from run 1'], 'removed': [], 'expertise': '# Expertise\n- initial lesson\n- new lesson from run 1'})
+
+with record_config_writes() as callers:
+    fake = FakeRun('run-learn-1', run_dir, repo)
+    sha = pipeline._learn(fake, repo.path, layer / 'expertise.md', 'Fix thing', True)
+    assert sha
+    # Eval mine save
+    eval_run = eval_mine.EvalRun(id='run-eval-1', repo=repo, dir=paths.RUNS_DIR / 'run-eval-1', task='t1')
+    eval_run.dir.mkdir(parents=True)
+    cand = eval_mine.Candidate(repo=repo, layer=config.load_layer(layer),
+                               run={'repo': 'sample', 'pr_url': 'https://github.com/demo/sample/pull/1', 'issue': '1'})
+    ticket = SimpleNamespace(ref='#1', title='Fix thing')
+    draft = eval_mine.Draft('Fix thing', 'Do the thing', 'Check it works', 'a' * 40, cand.pr_url)
+    saved_path = eval_mine.save(eval_run, cand, ticket, draft, SimpleNamespace(), SimpleNamespace())
+    assert saved_path
+
+assert callers and all(src == 'configrepo.py' for src, _ in callers), callers
+learn_meta = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%an|%ae|%cn|%ce', sha).split('|')
+assert learn_meta == ['run:run-learn-1/learn'] * 4, learn_meta
+learn_body = git_out(paths.CONFIG_DIR, 'show', '-s', '--format=%B', sha)
+assert 'Arete-Source: agent' in learn_body and 'Arete-Run: run-learn-1' in learn_body
+for py in paths.PACKAGE_DIR.rglob('*.py'):
+    text = py.read_text()
+    for banned in ('commit_written', 'commit_layer', 'layer_lock'):
+        assert banned not in text, f'{banned} found in {py}'
+assert 'git_as_owner' not in (paths.PACKAGE_DIR / 'configrepo.py').read_text()
+""")
+
+    def test_learn_overlap_no_cross_repo_refusal_and_lock_free(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+layer = paths.CONFIG_DIR / 'layers' / 'sample'
+other = paths.CONFIG_DIR / 'layers' / 'other'
+layer.mkdir(parents=True)
+other.mkdir(parents=True)
+(layer / 'expertise.md').write_text('# Expertise\n- base\n')
+(layer / 'unrelated.md').write_text('untouched\n')
+(other / 'expertise.md').write_text('# Other\n- o1\n')
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+repo = config.Repo('sample', root / 'repo', layer=layer)
+(layer / 'unrelated.md').write_text('dirty unrelated\n')
+
+# 1. No cross-repo refusal & config-repo lock is free during learn call.
+calls_1 = []
+class CrossRepoRun:
+    def __init__(self, rid):
+        self.id, self.repo, self.ref = rid, repo, '#2'
+        self.dir = paths.RUNS_DIR / rid
+        self.dir.mkdir(parents=True)
+        self.story = ['learned something']
+        self.logs = []
+    def log(self, m): self.logs.append(m)
+    def save(self, n, t): (self.dir / n).write_text(t)
+    def agent(self, call, prompt, wt, **kw):
+        calls_1.append(call)
+        with util.lock('config-repo', wait=False) as got:
+            assert got, 'config-repo lock should be free during learn call'
+        _, ob = configrepo.read('layers/other/expertise.md')
+        configrepo.commit({'layers/other/expertise.md': '# Other\n- o1\n- o2\n'},
+                          {'layers/other/expertise.md': ob}, actor='run:other/learn', source='agent', run_id='other')
+        return SimpleNamespace(ok=True, structured={
+            'added': ['lesson A'], 'removed': [], 'expertise': '# Expertise\n- base\n- lesson A'})
+
+r1 = CrossRepoRun('run-cross-1')
+sha1 = pipeline._learn(r1, root, layer / 'expertise.md', 'Cross', True)
+assert sha1 and calls_1 == ['learn'], (calls_1, r1.logs)
+assert not any('runs again' in line for line in r1.logs)
+changed = git_out(paths.CONFIG_DIR, 'diff-tree', '--no-commit-id', '--name-only', '-r', sha1).splitlines()
+assert changed == ['layers/sample/expertise.md'], changed
+assert (layer / 'unrelated.md').read_text() == 'dirty unrelated\n'
+
+# 2. Overlapping run merges both lessons on retry (learn2), and failed 2nd pass writes nothing.
+calls_2 = []
+class OverlapRun(CrossRepoRun):
+    def __init__(self, rid, tag, fail_second=False):
+        super().__init__(rid)
+        self.tag = tag
+        self.fail_second = fail_second
+    def agent(self, call, prompt, wt, **kw):
+        calls_2.append((self.id, call))
+        if call == 'learn':
+            cur, b = configrepo.read('layers/sample/expertise.md')
+            configrepo.commit({'layers/sample/expertise.md': cur + f'- peer {self.tag}\n'},
+                              {'layers/sample/expertise.md': b}, actor='run:peer/learn', source='agent', run_id='peer')
+            return SimpleNamespace(ok=True, structured={
+                'added': [f'mine {self.tag}'], 'removed': [], 'expertise': cur.strip() + f'\n- mine {self.tag}'})
+        if self.fail_second:
+            return SimpleNamespace(ok=False, structured={})
+        cur, _ = configrepo.read('layers/sample/expertise.md')
+        return SimpleNamespace(ok=True, structured={
+            'added': [f'mine {self.tag}'], 'removed': [], 'expertise': cur.strip() + f'\n- mine {self.tag}'})
+
+r2 = OverlapRun('run-overlap-2', 'two')
+sha2 = pipeline._learn(r2, root, layer / 'expertise.md', 'Overlap', True)
+assert sha2 and ('run-overlap-2', 'learn2') in calls_2
+content = (layer / 'expertise.md').read_text()
+assert 'peer two' in content and 'mine two' in content
+
+r3 = OverlapRun('run-fail2-3', 'three', fail_second=True)
+sha3 = pipeline._learn(r3, root, layer / 'expertise.md', 'Fail2', True)
+assert sha3 == '' and (r3.dir / 'expertise.md').is_file()
+assert 'run:run-fail2-3/learn' not in git_out(paths.CONFIG_DIR, 'log', '--format=%an', 'live')
+""")
+
+    def test_learn_refusal_cap_saves_in_run_without_commit(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+layer = paths.CONFIG_DIR / 'layers' / 'sample'
+layer.mkdir(parents=True)
+(layer / 'expertise.md').write_text('# Expertise\n- start\n')
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+repo = config.Repo('sample', root / 'repo', layer=layer)
+calls = []
+counter = [0]
+class ContendedRun:
+    def __init__(self, rid):
+        self.id, self.repo, self.ref = rid, repo, '#3'
+        self.dir = paths.RUNS_DIR / rid
+        self.dir.mkdir(parents=True)
+        self.story = ['always contended']
+        self.logs = []
+    def log(self, m): self.logs.append(m)
+    def save(self, n, t): (self.dir / n).write_text(t)
+    def agent(self, call, prompt, wt, **kw):
+        calls.append(call)
+        counter[0] += 1
+        cur, b = configrepo.read('layers/sample/expertise.md')
+        configrepo.commit({'layers/sample/expertise.md': cur + f'- rival {counter[0]}\n'},
+                          {'layers/sample/expertise.md': b}, actor='run:rival/learn', source='agent', run_id='rival')
+        return SimpleNamespace(ok=True, structured={
+            'added': [f'mine {counter[0]}'], 'removed': [], 'expertise': cur.strip() + f'\n- mine {counter[0]}'})
+
+r = ContendedRun('run-cap-1')
+sha = pipeline._learn(r, root, layer / 'expertise.md', 'Cap', True)
+assert sha == ''
+assert calls == ['learn', 'learn2', 'learn3'], calls
+assert (r.dir / 'expertise.md').is_file() and (r.dir / 'expertise-report.md').is_file()
+assert any('saved in the run, not applied' in line for line in r.logs), r.logs
+assert 'Arete-Run: run-cap-1' not in git_out(paths.CONFIG_DIR, 'log', '--format=%B', 'live')
+""")
+
+
+class ConfigRepoRoutesBackupTests(_ConfigRepoCase):
+    def test_loop_switch_routes_idempotency_and_scope(self):
+        self.run_isolated(r"""
+paths.CONFIG_FILE.write_text('max_parallel = 1\n')
+configrepo.init()
+with api_server(scopes=('read', 'config:activate', 'loop:write')) as (api, owner):
+    with db.reader() as c:
+        ev0 = c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'config.loop.changed'").fetchone()[0]
+    _, raw1 = api.request('POST', '/api/loops/poll/disable', {})
+    assert json.loads(raw1)['enabled'] is False
+    c1 = configrepo.live_sha()
+    assert git_out(paths.CONFIG_DIR, 'diff-tree', '--no-commit-id', '--name-only', '-r', c1).splitlines() == ['loops/poll/loop.toml']
+
+    _, raw2 = api.request('POST', '/api/v1/loops/poll/enable', {}, headers={'Idempotency-Key': 'loop-idem-key-1'})
+    body2 = json.loads(raw2)
+    assert body2['loop']['name'] == 'poll' and body2['loop']['enabled'] is True
+    c2 = configrepo.live_sha()
+    assert c2 != c1
+    assert git_out(paths.CONFIG_DIR, 'diff-tree', '--no-commit-id', '--name-only', '-r', c2).splitlines() == ['loops/poll/loop.toml']
+    with db.reader() as c:
+        ev2 = c.execute("SELECT COUNT(*) FROM events_log WHERE kind = 'config.loop.changed'").fetchone()[0]
+    assert ev2 == ev0 + 2
+
+    # Replay same idempotency key -> no new commit.
+    h3, _ = api.request('POST', '/api/v1/loops/poll/enable', {}, headers={'Idempotency-Key': 'loop-idem-key-1'})
+    assert h3.get('Idempotent-Replayed') == 'true'
+    assert configrepo.live_sha() == c2
+
+    # Token without config:activate gets 403.
+    with db.tx():
+        _, read_tok = token_store.issue(owner, 'No activate', ['read', 'loop:write'])
+    api.request('POST', '/api/v1/loops/poll/disable', {}, status=403,
+                headers={'Authorization': f'Bearer {read_tok}', 'Idempotency-Key': 'loop-idem-key-2'})
+""")
+
+    def test_daily_copy_bundles_config_repo_without_loose_files(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+copy_dest = root / 'offsite'
+copy_dest.mkdir()
+paths.CONFIG_FILE.write_text(f'max_parallel = 1\n[backup]\ncopy_to = {json.dumps(str(copy_dest))}\n')
+configrepo.init()
+snap = backup.snapshot('daily')
+assert snap is not None
+err = backup.daily_copy(snap, str(copy_dest))
+assert err == '', err
+bundles = list(copy_dest.glob('config-*.bundle'))
+assert len(bundles) == 1, list(copy_dest.iterdir())
+bundle = bundles[0]
+verified = subprocess.run(['git', 'bundle', 'verify', str(bundle)], cwd=paths.CONFIG_DIR, capture_output=True, text=True)
+assert verified.returncode == 0, verified.stderr
+heads = subprocess.check_output(['git', 'bundle', 'list-heads', str(bundle)], text=True).splitlines()
+live_entries = [line.split()[0] for line in heads if line.endswith('refs/heads/live')]
+assert live_entries == [configrepo.live_sha()], (live_entries, configrepo.live_sha())
+assert backup.read_last().get('config_live_sha') == configrepo.live_sha()
+names = {p.name for p in copy_dest.iterdir()}
+assert 'config.toml' not in names and 'layers.bundle' not in names
+assert not any(n.endswith(('.env', '.secret', '.secrets', '.tar.gz')) for n in names), names
+""")
+
+
+class ConfigRegistryVersioningTests(_ConfigRepoCase):
+    def test_config_kinds_ver_sequence_rebuild_and_settings_conflicts(self):
+        self.run_isolated(r"""
+with redirect_stdout(StringIO()):
+    db.migrate()
+bytes_a = 'max_parallel = 1\n'
+bytes_b = 'max_parallel = 2\n'
+paths.CONFIG_FILE.write_text(bytes_a)
+configrepo.init()
+_, b1 = configrepo.read('config.toml')
+configrepo.commit({'config.toml': bytes_b}, {'config.toml': b1}, actor='u:1a2b3c4d', source='dashboard')
+_, b2 = configrepo.read('config.toml')
+configrepo.commit({'config.toml': bytes_a}, {'config.toml': b2}, actor='u:1a2b3c4d', source='dashboard')
+
+import hashlib
+rows = {r['sha256']: r for r in config_store.versions_of('step_settings', 'defaults')}
+sha_a = hashlib.sha256(bytes_a.encode()).hexdigest()
+sha_b = hashlib.sha256(bytes_b.encode()).hexdigest()
+assert rows[sha_a]['ver'] == 3 and rows[sha_a]['live'] == 1
+assert rows[sha_b]['ver'] == 2 and rows[sha_b]['live'] == 0
+with db.reader() as c:
+    ev_vers = [r[0] for r in c.execute(
+        "SELECT ver FROM events_log WHERE kind = 'config.step_settings.changed' ORDER BY seq")]
+assert ev_vers == [1, 2, 3], ev_vers
+
+keyed_before = sorted((r['kind'], r['name'], r['origin'], r['path'], r['sha256'], r['ver'], r['live'])
+                      for r in config_store.all_rows())
+with db.tx() as c:
+    c.execute('DELETE FROM config_index')
+configrepo.rebuild_index()
+keyed_after = sorted((r['kind'], r['name'], r['origin'], r['path'], r['sha256'], r['ver'], r['live'])
+                     for r in config_store.all_rows())
+assert keyed_after == keyed_before
+
+with api_server(scopes=('read', 'config:activate', 'settings:write')) as (api, _):
+    kinds_resp = api.read('/api/v1/config')['kinds']
+    assert [k['kind'] for k in kinds_resp] == list(configkinds.REGISTRY) and len(kinds_resp) == 19
+    for row in kinds_resp:
+        assert row['verbs'] == ['list', 'read', 'versions', 'diff']
+        api.read(f"/api/v1/config/{row['kind']}")
+    api.request('GET', '/api/v1/config/nope', status=404)
+
+    vers_resp = api.read('/api/v1/config/step_settings/defaults/versions')
+    assert [e['version'] for e in vers_resp['entries']] == [3, 2, 1]
+    assert all(e['content_version'].startswith('step_settings/defaults@') for e in vers_resp['entries'])
+    diff_text = api.read('/api/v1/config/step_settings/defaults/diff?from=2&to=3')['diff']
+    assert '-max_parallel = 2' in diff_text and '+max_parallel = 1' in diff_text
+    assert api.read('/api/v1/config/step_settings/defaults?version=2')['item']['content'] == bytes_b
+    assert api.read('/api/v1/config/step_settings/defaults?level=engine')['item']['level'] == 'engine'
+
+    got = api.read('/api/v1/settings')['settings']
+    assert got['version'] == 3
+    # Stale base_version 2 -> 409 version_conflict with current at version 3
+    _, stale_raw = api.request('PATCH', '/api/v1/settings',
+                               {'base_version': 2, 'values': {'max_parallel': 2}},
+                               status=409, headers={'Idempotency-Key': 'stale-key-1'})
+    stale = json.loads(stale_raw)
+    assert stale['code'] == 'version_conflict' and stale['current']['version'] == 3
+    assert paths.CONFIG_FILE.read_text() == bytes_a
+
+    # Matching base_version 3 -> 200, version 4, one event at ver 4
+    _, ok_raw = api.request('PATCH', '/api/v1/settings',
+                            {'base_version': 3, 'values': {'max_parallel': 2}},
+                            headers={'Idempotency-Key': 'ok-key-1'})
+    assert json.loads(ok_raw)['settings']['version'] == 4
+    with db.reader() as c:
+        assert c.execute("SELECT MAX(ver) FROM events_log WHERE kind = 'config.step_settings.changed'").fetchone()[0] == 4
+
+    # Invalid value -> 422 and no commit
+    tip_4 = configrepo.live_sha()
+    api.request('PATCH', '/api/v1/settings',
+                {'base_version': 4, 'values': {'max_parallel': 'x'}},
+                status=422, headers={'Idempotency-Key': 'bad-val-1'})
+    assert configrepo.live_sha() == tip_4
+
+    # Frozen alias POST /api/settings without base_version -> 200, version 5
+    _, legacy_raw = api.request('POST', '/api/settings', {'max_parallel': 3})
+    assert json.loads(legacy_raw)['version'] == 5
+""")
+
+
+class ConfigRegistryRoleViewTests(_ConfigRepoCase):
+    def test_role_view_patch_reset_and_restore_alias_and_canonical(self):
+        self.run_isolated(r"""
+seed = (
+    '# top comment\n'
+    'max_parallel = 2\n'
+    '[models]\n'
+    'build = "sonnet"\n'
+    'plan = ""\n'
+    '\n'
+    '[tiers.default.fast]\n'
+    'model = "sonnet"\n'
+    '\n'
+    '[steps.implement]\n'
+    '# keep this comment\n'
+    'model = "opus"\n'
+    'runner = "claude"\n'
+    'effort = "high"\n'
+    'tools = ["Read", "Glob", "Grep", "Edit", "Write", "TodoWrite"]\n'
+    'tier = "fast"\n'
+    'provider = "anthropic"\n'
+)
+paths.CONFIG_FILE.write_text(seed)
+configrepo.init()
+with api_server(scopes=('read', 'config:activate')) as (api, _):
+    got = api.read('/api/v1/settings')['settings']
+    assert isinstance(got['version'], int) and got['version'] >= 1
+    assert isinstance(got['values'], dict)
+    roles = got['values']['roles']
+    assert [r['role'] for r in roles] == [r.name for r in config.ROLES]
+    assert all(r['level'] is None for r in roles)
+    by_role = {r['role']: r for r in roles}
+    assert by_role['build']['overrides'] == {
+        'models': {'build': 'sonnet'},
+        'steps': {'implement': {'runner': 'claude', 'model': 'opus', 'effort': 'high'}},
+    }
+    assert by_role['plan']['overrides'] == {'models': {'plan': ''}, 'steps': {}}
+    assert by_role['check_repair']['overrides'] == {'models': {}, 'steps': {}}
+    snap_build = by_role['build']['overrides']
+
+    # Normal patch edits existing alias [steps.implement] and clears legacy [models].build
+    _, raw = api.request('PATCH', '/api/v1/settings', {
+        'base_version': got['version'],
+        'values': {'roles': [{'role': 'build', 'model': 'haiku', 'effort': 'low'}]},
+    }, headers={'Idempotency-Key': 'role-patch-1'})
+    after_patch = json.loads(raw)['settings']
+    b_after = {r['role']: r for r in after_patch['values']['roles']}['build']
+    assert b_after['overrides'] == {
+        'models': {},
+        'steps': {'implement': {'runner': 'claude', 'model': 'haiku', 'effort': 'low'}},
+    }
+    parsed = tomllib.loads(paths.CONFIG_FILE.read_text())
+    assert 'implement' in parsed['steps'] and 'build' not in parsed['steps']
+    assert parsed['steps']['implement']['tier'] == 'fast' and parsed['steps']['implement']['provider'] == 'anthropic'
+    assert '# keep this comment' in paths.CONFIG_FILE.read_text()
+
+    # Reset clears owned fields at [steps.implement] while keeping table & unrelated fields
+    _, raw2 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': after_patch['version'],
+        'values': {'roles': [{'role': 'build', 'runner': None, 'model': None, 'effort': None}]},
+    }, headers={'Idempotency-Key': 'role-reset-1'})
+    after_reset = json.loads(raw2)['settings']
+    b_reset = {r['role']: r for r in after_reset['values']['roles']}['build']
+    assert b_reset['overrides'] == {'models': {}, 'steps': {'implement': {}}}
+
+    # Atomic restore puts back exact alias key, simultaneous legacy+step models, raw strings, and keeps non-owned fields
+    _, raw3 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': after_reset['version'],
+        'values': {'roles': [{'role': 'build', 'restore': snap_build}]},
+    }, headers={'Idempotency-Key': 'role-restore-1'})
+    after_restore = json.loads(raw3)['settings']
+    b_restored = {r['role']: r for r in after_restore['values']['roles']}['build']
+    assert b_restored['overrides'] == snap_build
+    parsed3 = tomllib.loads(paths.CONFIG_FILE.read_text())
+    assert parsed3['steps']['implement']['tier'] == 'fast' and parsed3['steps']['implement']['provider'] == 'anthropic'
+    assert 'build' not in parsed3['steps']
+""")
+
+    def test_role_restore_physical_key_switch_empty_tables_and_legacy_models(self):
+        self.run_isolated(r"""
+seed = (
+    'max_parallel = 1\n'
+    '[tiers.default.primary]\n'
+    'model = "sonnet"\n'
+    '[steps.build]\n'
+    'model = "opus"\n'
+    'tier = "primary"\n'
+)
+paths.CONFIG_FILE.write_text(seed)
+configrepo.init()
+with api_server(scopes=('read', 'config:activate')) as (api, _):
+    s0 = api.read('/api/v1/settings')['settings']
+    # Restore with saved physical key [steps.implement] empty -> carries tier="primary" into sole [steps.implement]
+    _, raw1 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s0['version'],
+        'values': {'roles': [{'role': 'build', 'restore': {'models': {'build': ''}, 'steps': {'implement': {}}}}]},
+    }, headers={'Idempotency-Key': 'role-switch-1'})
+    s1 = json.loads(raw1)['settings']
+    b1 = {r['role']: r for r in s1['values']['roles']}['build']
+    assert b1['overrides'] == {'models': {'build': ''}, 'steps': {'implement': {}}}
+    p1 = tomllib.loads(paths.CONFIG_FILE.read_text())
+    assert 'implement' in p1['steps'] and 'build' not in p1['steps'] and p1['steps']['implement']['tier'] == 'primary'
+
+    # Restore steps:{} retains table when non-owned fields require it, vs drops empty table when none exist
+    _, raw2 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s1['version'],
+        'values': {'roles': [{'role': 'build', 'restore': {'models': {}, 'steps': {}}}]},
+    }, headers={'Idempotency-Key': 'role-keep-nonowned-1'})
+    s2 = json.loads(raw2)['settings']
+    assert 'implement' in tomllib.loads(paths.CONFIG_FILE.read_text())['steps']
+
+    # For a role with NO non-owned fields, normal patch creates canonical table and restore steps:{} removes it
+    _, raw3 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s2['version'],
+        'values': {'roles': [{'role': 'check_repair', 'model': 'sonnet'}]},
+    }, headers={'Idempotency-Key': 'role-inh-1'})
+    s3 = json.loads(raw3)['settings']
+    assert 'check_repair' in tomllib.loads(paths.CONFIG_FILE.read_text())['steps']
+    _, raw4 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s3['version'],
+        'values': {'roles': [{'role': 'check_repair', 'restore': {'models': {}, 'steps': {}}}]},
+    }, headers={'Idempotency-Key': 'role-inh-restore-1'})
+    s4 = json.loads(raw4)['settings']
+    assert 'check_repair' not in tomllib.loads(paths.CONFIG_FILE.read_text())['steps']
+
+    # Replay same idempotency key makes no new commit
+    tip = configrepo.live_sha()
+    h_rep, _ = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s3['version'],
+        'values': {'roles': [{'role': 'check_repair', 'restore': {'models': {}, 'steps': {}}}]},
+    }, headers={'Idempotency-Key': 'role-inh-restore-1'})
+    assert h_rep.get('Idempotent-Replayed') == 'true' and configrepo.live_sha() == tip
+
+    # Legacy models wire-write and empty-string reset still work identically
+    _, raw5 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s4['version'],
+        'values': {'models': {'plan': 'haiku'}},
+    }, headers={'Idempotency-Key': 'legacy-models-1'})
+    s5 = json.loads(raw5)['settings']
+    assert s5['models']['plan'] == 'haiku'
+    _, raw6 = api.request('PATCH', '/api/v1/settings', {
+        'base_version': s5['version'],
+        'values': {'models': {'plan': ''}},
+    }, headers={'Idempotency-Key': 'legacy-models-2'})
+    s6 = json.loads(raw6)['settings']
+    assert s6['models']['plan'] == '' and 'plan' not in (tomllib.loads(paths.CONFIG_FILE.read_text()).get('models') or {})
+""")
+
+
+class ConfigRegistryRoleRejectionsTests(_ConfigRepoCase):
+    def test_role_patch_rejects_invalid_conflicting_provenance_and_malformed_restores(self):
+        self.run_isolated(r"""
+paths.CONFIG_FILE.write_text('max_parallel = 1\n[models]\nbuild = "sonnet"\n')
+configrepo.init()
+with api_server(scopes=('read', 'config:activate')) as (api, _):
+    cur = api.read('/api/v1/settings')['settings']
+    ver = cur['version']
+    tip_before = configrepo.live_sha()
+    bytes_before = paths.CONFIG_FILE.read_bytes()
+    with db.reader() as c:
+        ev_before = c.execute('SELECT COUNT(*) FROM events_log').fetchone()[0]
+
+    bad_payloads = [
+        # Duplicate role entries
+        {'roles': [{'role': 'build', 'model': 'opus'}, {'role': 'build', 'effort': 'high'}]},
+        # Conflicting models + roles in same request
+        {'models': {'build': 'opus'}, 'roles': [{'role': 'build', 'model': 'opus'}]},
+        # Blind RoleView round trip (level / overrides outside restore)
+        {'roles': [{r['role']: r for r in cur['values']['roles']}['build']]},
+        {'roles': [{'role': 'build', 'level': None}]},
+        {'roles': [{'role': 'build', 'overrides': {'models': {}, 'steps': {}}}]},
+        # Restore mixed with normal fields
+        {'roles': [{'role': 'build', 'model': 'opus', 'restore': {'models': {}, 'steps': {}}}]},
+        # Malformed partial restore (missing steps or models)
+        {'roles': [{'role': 'build', 'restore': {'models': {}}}]},
+        {'roles': [{'role': 'build', 'restore': {'steps': {}}}]},
+        # Null raw values in restore
+        {'roles': [{'role': 'build', 'restore': {'models': {'build': None}, 'steps': {}}}]},
+        {'roles': [{'role': 'build', 'restore': {'models': {}, 'steps': {'build': {'model': None}}}}]},
+        # Inherited-only role with non-empty models in restore
+        {'roles': [{'role': 'check_repair', 'restore': {'models': {'check_repair': 'opus'}, 'steps': {}}}]},
+        # Legacy alias key in models (implement is not in MODEL_ROLES)
+        {'roles': [{'role': 'build', 'restore': {'models': {'implement': 'opus'}, 'steps': {}}}]},
+        # Foreign-role physical keys and unknown physical keys
+        {'roles': [{'role': 'build', 'restore': {'models': {'plan': 'opus'}, 'steps': {}}}]},
+        {'roles': [{'role': 'build', 'restore': {'models': {}, 'steps': {'plan': {}}}}]},
+        {'roles': [{'role': 'build', 'restore': {'models': {}, 'steps': {'bogus': {}}}}]},
+        # Alias + canonical conflict (maxProperties=1)
+        {'roles': [{'role': 'build', 'restore': {'models': {}, 'steps': {'build': {}, 'implement': {}}}}]},
+        # Incompatible runner/model and runner-specific effort
+        {'roles': [{'role': 'build', 'runner': 'codex', 'model': 'opus'}]},
+        {'roles': [{'role': 'build', 'runner': 'claude', 'model': 'opus', 'effort': 'ultra'}]},
+    ]
+    for i, vals in enumerate(bad_payloads):
+        api.request('PATCH', '/api/v1/settings', {'base_version': ver, 'values': vals},
+                    status=422, headers={'Idempotency-Key': f'reject-role-{i}'})
+
+    assert configrepo.live_sha() == tip_before
+    assert paths.CONFIG_FILE.read_bytes() == bytes_before
+    with db.reader() as c:
+        assert c.execute('SELECT COUNT(*) FROM events_log').fetchone()[0] == ev_before
+""")
+
