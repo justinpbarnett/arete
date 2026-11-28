@@ -145,29 +145,8 @@ def fresh_candidates(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.Ski
             if owned := spec_graph.queue_blocker(source, tid):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, owned, repo.name)
                 continue
-            if isinstance(source, tracker.GitHubTracker):
-                from .store import outbox as outbox_store
-
-                if item_id := outbox_store.pending_label_item(f"github:{source.repo.github}#{int(t.id)}"):
-                    skips.note(
-                        tracker.ticket_name(repo.name, t.ref),
-                        t,
-                        f"its label item OB-{item_id} is not sent yet",
-                        repo.name,
-                    )
-                    continue
-            elif isinstance(source, tracker.JiraTracker):
-                from .store import outbox as outbox_store
-
-                if item_id := outbox_store.pending_label_item(f"jira:{t.id}"):
-                    skips.note(
-                        tracker.ticket_name(repo.name, t.ref),
-                        t,
-                        f"its label item OB-{item_id} is not sent yet",
-                        repo.name,
-                    )
-                    continue
-            elif owed := run_store.pending_label(repo.name, t.id):
+            if (not isinstance(source, (tracker.GitHubTracker, tracker.JiraTracker))
+                    and (owed := run_store.pending_label(repo.name, t.id))):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
             if feedback_store.has_open_clarification(repo.name, tid):

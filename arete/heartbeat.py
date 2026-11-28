@@ -62,6 +62,7 @@ def check_costs() -> list[Check]:
 def unfinished_resumes(statuses: tuple[str, ...], account_prefix: str) -> list[tuple[str, bool]]:
     pattern = account_prefix + "%"
     with foundation.reader() as c:
+        ic = run_store.issue_col(c)
         return [(row["id"], bool(row["legacy"])) for row in c.execute(f"""
             SELECT r.id, (
                 EXISTS (SELECT 1 FROM asks a WHERE a.run = r.id
@@ -76,7 +77,7 @@ def unfinished_resumes(statuses: tuple[str, ...], account_prefix: str) -> list[t
             ) AS legacy FROM runs r
             WHERE r.kind = 'pipeline' AND {run_store.WHOLE_RUN} AND r.status IN ({','.join('?' * len(statuses))})
             AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline'
-                            AND later.repo = r.repo AND later.issue = r.issue AND {run_store.later_than(c, 'later', 'r')}
+                            AND later.repo = r.repo AND later.{ic} = r.{ic} AND {run_store.later_than(c, 'later', 'r')}
                             AND COALESCE(later.only_step, '') = '')
             """, (pattern, pattern, *statuses))]  # noqa: S608
 

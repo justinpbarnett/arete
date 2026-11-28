@@ -2240,8 +2240,8 @@ stopped = runner.Stopped(SimpleNamespace(session=saved, turns=2), SimpleNamespac
 assert runner.continues(stopped, picked, True)
 
 with db.tx() as c:
-    c.execute("INSERT INTO runs (id, kind, repo, issue, task_id, status, started) VALUES "
-              "('old-run', 'pipeline', 'fixture', 1, 1, 'needs-info', ?)", (util.iso(),))
+    c.execute("INSERT INTO runs (id, kind, repo, issue_key, task_id, status, started) VALUES "
+              "('old-run', 'pipeline', 'fixture', '1', 1, 'needs-info', ?)", (util.iso(),))
 asks.ask_add('old-ask', 'old-run', 'fixture', '1', 'build', 'call', '', '', [], asdict(saved))
 assert heartbeat.check_legacy_accounts()[0].detail == '0 active v1 holds, 1 unfinished runs with v1 sessions'
 """)
@@ -9470,8 +9470,8 @@ class VersionedApiTests(unittest.TestCase):
         self.cfg.arete_repo = self.repo.name
         source = triage.GitHubSource(self.repo.github, [self.repo])
         ticket = triage.Candidate("fixture#7", "7", "Question", gh.issue_url(self.repo.github, 7), "old")
-        triage_store.triage_put(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
-                                         questions=["What happened?"]))
+        triage_store.record_verdict(triage.row(source, ticket, updated="old", ready=0, code=1, repo=self.repo.name,
+                                               questions=["What happened?"]), ensure_listed=True)
         chat_id = chats_store.chat_add(self.repo.name)
         chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Draft", draft_body="Chat issue body")
         approval_emit = {"type": "ticket", "item": {"repo": self.repo.name, "title": "Delivery",
@@ -9728,8 +9728,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 167)
-        self.assertEqual(len({op["name"] for op in operations}), 167)
+        self.assertEqual(len(operations), 168)
+        self.assertEqual(len({op["name"] for op in operations}), 168)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -12959,13 +12959,13 @@ class InboxTests(_InboxCase):
             poll.save_skips(skips)
 
             # 3. 1 ready triage ticket.
-            triage_store.triage_put({
+            triage_store.record_verdict({
                 "ref": "fixture/repo#301", "source": "GitHub fixture/repo", "tracker": "github", "repo": "ghfixture",
                 "route": "triage", "title": "Ready ticket", "url": "https://github.com/fixture/repo/issues/301",
                 "updated": util.iso(), "ready": 1, "code": 1, "size": "s", "questions": [],
                 "plan": ["Plan"], "why": "Ready", "cost": 0.0, "ts": util.iso(), "kind": "feat",
                 "repos": ["ghfixture"], "assumptions": [], "in_sprint": 0, "parent": "", "closed": "", "checks": [],
-            })
+            }, ensure_listed=True)
 
             # 4. 2 chat drafts.
             c1 = chats_store.chat_add("Draft one")
@@ -17727,9 +17727,9 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
     start_after = item_row(start_item["id"])["state"]
     labels_after_discard = sorted(fake.labels[("acme/sample", 9)])
 
-    # Part 2: finished run with unsent label items -> poll.next_ticket skips naming OB-<id>
+    # Part 2: finished run with unsent label items -> poll.next_ticket skips by task state
     fake.seed_issue("acme/sample", 10, title="Waiting ticket", labels=("agent",))
-    rid2 = support.start_pipeline(repo="sample", issue="10")
+    rid2 = support.start_pipeline(repo=repo, issue="10")
     rdir2 = paths.RUNS_DIR / rid2
     rdir2.mkdir(parents=True, exist_ok=True)
     run2 = pipeline.Run(rid2, repo, rdir2, cfg=cfg, tracker=tk, tid="10")
@@ -17760,7 +17760,8 @@ emit_result({
         self.assertEqual(result["start_after"], "discarded")
         self.assertEqual(result["labels_after_discard"], ["agent", "agent:pr"])
         self.assertIsNone(result["picked_before"])
-        self.assertTrue(any(result["pending_id"] in line for line in result["skip_lines_before"]), result["skip_lines_before"])
+        self.assertIsNone(result["picked_after"])
+        self.assertFalse(any("not sent yet" in line for line in result["skip_lines_before"]), result["skip_lines_before"])
         self.assertFalse(any("not sent yet" in line for line in result["skip_lines_after"]), result["skip_lines_after"])
 
     def test_run_say_feedback_prs_and_store_answer_route_through_outbox(self):
@@ -17975,7 +17976,7 @@ src_name = triage.sources(cfg)[0].name
 fake.seed_issue("acme/sample", 30, title="Triage item", labels=("triage",), updated_at="2026-11-28T00:00:00Z")
 owner = principals.seed_owner("owner@example.test")
 
-triage_store.triage_put({
+triage_store.record_verdict({
     "ref": "gh:acme/sample#30",
     "source": src_name,
     "tracker": "github",
@@ -17999,7 +18000,7 @@ triage_store.triage_put({
     "parent": "",
     "closed": "",
     "checks": [],
-})
+}, ensure_listed=True)
 
 with mock.patch.object(gh, "gh", side_effect=fake), \
         mock.patch.object(outbound, "keep_configured_private"), \
@@ -19495,7 +19496,7 @@ with api_server() as (port, _, req):
         record.settle(json.loads(raw)["id"], "done")
         # /api/triage/{ref}/research
         cand = triage.Candidate("demo#7", "7", "Demo", "https://example.invalid/7", "old")
-        triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), cand, updated="old"))
+        triage_store.record_verdict(triage.row(triage.GitHubSource("demo/repo", []), cand, updated="old"), ensure_listed=True)
         with mock.patch.object(research, "ticket", return_value={"ref": "demo#7"}), \
              mock.patch.object(research, "run_now", return_value=0):
             st, hdr, raw = req("POST", "/api/triage/demo%237/research", {}, headers={"Idempotency-Key": "alias-triage-res"})
@@ -19869,15 +19870,15 @@ repo = cfg.repo(replay.SAMPLE_REPO)
 with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
     src = triage.JiraSource("APP", [repo], jira_cfg=cfg.jira)
     cand = triage.Candidate("APP-7", "APP-7", "Fix login", src.client.browse_url("APP-7"), "2026-11-28T00:00:00.000+0000")
-    triage_store.triage_put(triage.row(
+    triage_store.record_verdict(triage.row(
         src, cand, updated="2026-11-28T00:00:00.000+0000", ready=0, code=1, repo=repo.name,
         questions=["Which endpoint?", "What status code?"],
-    ))
+    ), ensure_listed=True)
     initial = next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")
     v1 = int(initial["version"])
 
     # Update row once so v1 becomes stale, then call api.triage_send with stale v1 -> 409 version_conflict.
-    triage_store.triage_put({**initial, "summary": "Refreshed triage"})
+    triage_store.record_verdict({**initial, "summary": "Refreshed triage"}, ensure_listed=True)
     v2 = int(next(r for r in triage_store.triage_rows() if r["ref"] == "APP-7")["version"])
     assert v2 > v1
     with mock.patch.object(triage, "sources", return_value=[src]):
@@ -22320,7 +22321,8 @@ with principals.acting(owner), mock.patch.object(config, "load", return_value=cf
     triage_row = {"ref": "old-name#42", "repo": "old-name", "source": "github", "title": "Widget bug",
                   "url": "https://github.com/acme/widget/issues/42",
                   "kind": "fix", "size": "S", "score": 8, "reason": "good", "state": "open", "reviewed": util.iso()}
-    triage_store.triage_put(triage_row)
+    triage_store.record_verdict(triage_row, ensure_listed=True)
+    stored_triage = triage_store.triage_rows()[0]
     triage_store.triage_approve(triage_row, owner)
     insights_store.research_set(
         "old-name#42", repo="old-name", ticket="42",
@@ -22342,7 +22344,7 @@ with db.reader() as c:
         nulls = c.execute(f"SELECT count(*) FROM {tbl} {where}").fetchone()[0]
         assert nulls == 0, (tbl, nulls)
     ref_ids = {}
-    for tbl in ("triage", "triage_approvals", "research"):
+    for tbl in ("triage_verdicts", "triage_approvals", "research"):
         rows = [dict(r) for r in c.execute(f"SELECT * FROM {tbl}")]
         assert rows and all(r["ref_id"] is not None for r in rows), (tbl, rows)
         ref_ids[tbl] = rows[0]["ref_id"]
@@ -22351,7 +22353,6 @@ with db.reader() as c:
 with mock.patch.object(config, "load", return_value=cfg_new):
     sent_rows = triage.sent()
     assert any(row["run"] and row["run"]["id"] == w_run for row in sent_rows), sent_rows
-    stored_triage = triage_store.triage_rows()[0]
     cand = research.candidate(stored_triage)
     assert cand is not None and cand.id == "42", cand
 
@@ -23664,7 +23665,7 @@ with api_check.offline():
 
         with db.tx() as c:
             c.execute(
-                "INSERT INTO runs (id, kind, repo, issue, task_id, status, started, schema_version, capabilities) "
+                "INSERT INTO runs (id, kind, repo, issue_key, task_id, status, started, schema_version, capabilities) "
                 "VALUES ('old-queued-writer', 'pipeline', 'demo', ?, ?, 'queued', ?, 59, ?)",
                 (t_hist, t_hist_num, util.iso(), json.dumps(["task_admission_v1"])),
             )
@@ -23954,3 +23955,784 @@ class SettingsShellTests(unittest.TestCase):
             assert.equal(SECTIONS.length, 13);
         """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class SyncTests(unittest.TestCase):
+    """End-to-end acceptance tests for #305, #889, #890, and #891."""
+
+    class_timeout = 30
+
+    def _run_sync_child(self, body: str) -> dict:
+        prelude = r"""
+import concurrent.futures
+import contextlib
+import http.client
+import json
+import os
+import re
+import socket
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from arete import (
+    accounts,
+    api,
+    api_check,
+    config,
+    contract,
+    dashboard,
+    gh,
+    inbox,
+    jira,
+    mcp_http,
+    outbox,
+    paths,
+    pipeline,
+    poll,
+    principals,
+    record,
+    replay,
+    research,
+    sync as sync_mod,
+    tailnet,
+    tasks,
+    tracker,
+    triage,
+    util,
+)
+from arete.store import (
+    asks as ask_store,
+    blobs as blob_store,
+    db,
+    inbox as inbox_store,
+    insights as insights_store,
+    outbox as outbox_store,
+    runs as run_store,
+    tasks as task_store,
+    tokens as token_store,
+    triage as triage_store,
+)
+
+ROOT = Path(os.environ["ARETE_STATE_DIR"]).parent
+replay.sample(ROOT / "repos" / "sample")
+
+def _forbid(name):
+    def _deny(*_args, **_kwargs):
+        raise AssertionError(f"forbidden outside call: {name}")
+    return _deny
+
+_FORBID_PATCHES = [
+    mock.patch.object(urllib.request, "urlopen", side_effect=_forbid("urllib.request.urlopen")),
+    mock.patch.object(accounts, "read", side_effect=_forbid("accounts.read")),
+    mock.patch.object(gh, "gh", side_effect=_forbid("gh.gh")),
+]
+for _p in _FORBID_PATCHES:
+    _p.start()
+
+@contextlib.contextmanager
+def live_dashboard(login="owner@example.test"):
+    logins = tailnet.Logins(mock.Mock())
+    logins.of = lambda _: login
+    with mock.patch("socket.getfqdn", return_value="127.0.0.1"):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    server.node = SimpleNamespace(names={"127.0.0.1"})
+    server.logins = logins
+    server.tls = object()
+    server.pending_secrets = {}
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield server, port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+def http_json(port, method, path, body=None, *, token="", headers=None):
+    hdrs = dict(headers or {})
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    raw = None
+    if body is not None:
+        raw = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        conn.request(method, path, body=raw, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        return resp.status, json.loads(data) if data else {}
+    finally:
+        conn.close()
+
+def emit(payload):
+    print("BEHAVIOR_RESULT=" + json.dumps(payload))
+"""
+        root, env = isolated_behavior_environment(self)
+        env["ARETE_DRIVE_FLUSH"] = "0"
+        command = api_check.child_command(api_check.SOURCE, prelude + "\n" + body)
+        done = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(done.returncode, 0, f"sync child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+        for line in reversed(done.stdout.splitlines()):
+            if line.startswith("BEHAVIOR_RESULT="):
+                return json.loads(line.removeprefix("BEHAVIOR_RESULT="))
+        self.fail(f"missing BEHAVIOR_RESULT in stdout:\n{done.stdout}\n{done.stderr}")
+
+    def test_sync_link_conflicts_primary_related_state_as_truth_and_retry(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+with db.tx() as c:
+    token_store.ensure_key(c)
+    token_row, bearer = token_store.issue(owner, "sync-test", ["*"])
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo(
+    "sample", repo_dir, github="owner/sample", tracker="github", pipeline=True,
+    jira_project="ABC", parts=[config.Part("", "owner/sample")],
+)
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+# Fake Jira store editable between calls
+jira_issues = {
+    "ABC-7": {
+        "key": "ABC-7",
+        "fields": {
+            "summary": "Remote title",
+            "description": "Remote body",
+            "status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-alice"},
+            "labels": ["agent", "backend"],
+        },
+    },
+    "ABC-11": {
+        "key": "ABC-11",
+        "fields": {
+            "summary": "Shared ref R initial",
+            "description": "",
+            "status": {"name": "Open"},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-bob"},
+            "labels": [],
+        },
+    },
+    "ABC-12": {
+        "key": "ABC-12",
+        "fields": {
+            "summary": "Related only S",
+            "description": "",
+            "status": {"name": "Open"},
+            "updated": "2026-11-28T01:00:00.000+0000",
+            "updateAuthor": {"accountId": "jira-carol"},
+            "labels": [],
+        },
+    },
+}
+jira_changelogs = {k: [] for k in jira_issues}
+
+class FakeJiraClient:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def issue(self, key, fields=None):
+        return json.loads(json.dumps(jira_issues[key]))
+    def changelog(self, key):
+        return list(jira_changelogs.get(key, ()))
+    def search(self, jql, fields=None, limit=20, include=None):
+        return []
+
+fake_jira = FakeJiraClient()
+
+# Fake GitHub store editable between polls
+gh_issues = {
+    7: {
+        "number": 7,
+        "title": "GH Ticket 7",
+        "body": "Body 7",
+        "state": "OPEN",
+        "url": "https://github.com/owner/sample/issues/7",
+        "createdAt": "2026-11-28T00:00:00Z",
+        "updatedAt": "2026-11-28T01:00:00Z",
+        "author": {"login": "owner"},
+        "labels": [{"name": "agent"}],
+    }
+}
+
+def fake_gh_issues(repo_slug, label, limit=50):
+    return [json.loads(json.dumps(v)) for v in gh_issues.values() if any(lb["name"] == label for lb in v["labels"])]
+
+def fake_gh_issue(repo_slug, num):
+    return json.loads(json.dumps(gh_issues[int(num)]))
+
+with (
+    mock.patch.object(config, "load", return_value=cfg),
+    mock.patch.object(config, "load_or_problem", return_value=(cfg, "")),
+    mock.patch.object(jira.Client, "from_env", return_value=fake_jira),
+    mock.patch.object(gh, "issues", side_effect=fake_gh_issues),
+    mock.patch.object(gh, "issue", side_effect=fake_gh_issue),
+    mock.patch.object(gh, "open_issue_blockers", return_value=[]),
+    live_dashboard() as (_, port),
+):
+    # 1. Link Jira ABC-7 as primary on T through POST /api/v1/tasks/T/refs
+    with principals.acting(owner):
+        tid = task_store.task_add("sample", "Initial body", title="Initial local title")
+    task_before = task_store.task_get(tid)
+    state_before = task_before["state"]
+
+    st, linked = http_json(
+        port, "POST", f"/api/v1/tasks/{tid}/refs",
+        {"system": "jira", "key": "ABC-7", "role": "primary"},
+        token=bearer, headers={"Idempotency-Key": "sync-link-1"},
+    )
+    assert st in (200, 201), (st, linked)
+    ref_id_str = linked["ref"]["id"]
+    ref_num = int(ref_id_str.removeprefix("R-"))
+
+    st, ref_resp = http_json(port, "GET", f"/api/v1/refs/{ref_id_str}", token=bearer)
+    assert st == 200, (st, ref_resp)
+    ref_obj = ref_resp["ref"]
+    assert ref_obj["ext_state"] == "In Review", ref_obj
+    assert ref_obj["sync"] == "synced", ref_obj
+    fields_by_name = {f["field"]: f for f in ref_obj["fields"]}
+    assert "title" in fields_by_name, fields_by_name
+    assert fields_by_name["title"]["owner"] == "remote", fields_by_name["title"]
+    assert fields_by_name["title"]["base"] == fields_by_name["title"]["remote"] == "Remote title", fields_by_name["title"]
+
+    st, task_resp = http_json(port, "GET", f"/api/v1/tasks/{tid}", token=bearer)
+    assert st == 200, (st, task_resp)
+    assert task_resp["task"]["title"] == "Remote title", task_resp["task"]
+    assert task_resp["task"]["state"] == state_before, task_resp["task"]
+
+    # 2. PATCH /api/v1/tasks/T -> local edit drafts outbox item with ref_id, left unsent
+    t_ver = task_resp["task"]["version"]
+    st, patched = http_json(
+        port, "PATCH", f"/api/v1/tasks/{tid}",
+        {"title": "Local title", "base_version": t_ver},
+        token=bearer, headers={"Idempotency-Key": "sync-patch-1"},
+    )
+    assert st == 200, (st, patched)
+    assert patched["task"]["title"] == "Local title"
+    with db.reader() as c:
+        drafts = [dict(r) for r in c.execute("SELECT * FROM outbox WHERE kind = 'issue' AND ref_id = ?", (ref_num,))]
+    assert len(drafts) == 1 and drafts[0]["state"] == "draft", drafts
+
+    # Remote edits summary with newer stamp; POST /api/v1/tasks/T/sync called twice with Prefer: wait=10
+    jira_issues["ABC-7"]["fields"]["summary"] = "Remote edit"
+    jira_issues["ABC-7"]["fields"]["updated"] = "2026-11-28T02:00:00.000+0000"
+    for idx in (1, 2):
+        st, sync_res = http_json(
+            port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+            token=bearer, headers={"Idempotency-Key": f"sync-call-{idx}", "Prefer": "wait=10"},
+        )
+        assert st == 200, (st, sync_res)
+
+    with db.reader() as c:
+        open_conflicts = [
+            dict(r) for r in c.execute(
+                "SELECT * FROM inbox WHERE kind = 'conflict' AND subject = ? AND state = 'open'",
+                (f"ref:{ref_num}",),
+            )
+        ]
+        rf_title = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        ref_row = dict(c.execute("SELECT * FROM refs WHERE id = ?", (ref_num,)).fetchone())
+    assert len(open_conflicts) == 1, open_conflicts
+    assert rf_title["conflict"] == 1, rf_title
+    assert ref_row["sync"] == "conflict", ref_row
+    assert task_store.task_get(tid)["title"] == "Local title"
+
+    # Resolve first conflict with take_remote
+    conflict_id = inbox_store.format_id(open_conflicts[0]["id"])
+    st, res_tr = http_json(
+        port, "POST", f"/api/v1/inbox/{conflict_id}/resolve",
+        {"verb": "take_remote", "base_version": open_conflicts[0]["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-res-tr"},
+    )
+    assert st == 200, (st, res_tr)
+    assert task_store.task_get(tid)["title"] == "Remote edit"
+    with db.reader() as c:
+        rf_after_tr = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        draft_after_tr = dict(c.execute("SELECT * FROM outbox WHERE id = ?", (drafts[0]["id"],)).fetchone())
+    assert rf_after_tr["base"] == "Remote edit" and rf_after_tr["conflict"] == 0, rf_after_tr
+    assert draft_after_tr["state"] == "discarded", draft_after_tr
+
+    # Second conflict resolved with keep_local
+    t_now = task_store.task_get(tid)
+    st, patched2 = http_json(
+        port, "PATCH", f"/api/v1/tasks/{tid}",
+        {"title": "Local title 2", "base_version": t_now["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-patch-2"},
+    )
+    assert st == 200, (st, patched2)
+    jira_issues["ABC-7"]["fields"]["summary"] = "Remote edit 2"
+    jira_issues["ABC-7"]["fields"]["updated"] = "2026-11-28T03:00:00.000+0000"
+    st, _ = http_json(
+        port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+        token=bearer, headers={"Idempotency-Key": "sync-call-3", "Prefer": "wait=10"},
+    )
+    assert st == 200
+    with db.reader() as c:
+        conflict2 = dict(c.execute(
+            "SELECT * FROM inbox WHERE kind = 'conflict' AND subject = ? AND state = 'open'",
+            (f"ref:{ref_num}",),
+        ).fetchone())
+        draft2 = dict(c.execute(
+            "SELECT * FROM outbox WHERE kind = 'issue' AND ref_id = ? AND state = 'draft' ORDER BY id DESC LIMIT 1",
+            (ref_num,),
+        ).fetchone())
+    st, res_kl = http_json(
+        port, "POST", f"/api/v1/inbox/{inbox_store.format_id(conflict2['id'])}/resolve",
+        {"verb": "keep_local", "base_version": conflict2["version"]},
+        token=bearer, headers={"Idempotency-Key": "sync-res-kl"},
+    )
+    assert st == 200, (st, res_kl)
+    assert task_store.task_get(tid)["title"] == "Local title 2"
+    with db.reader() as c:
+        rf_after_kl = dict(c.execute("SELECT * FROM ref_fields WHERE ref = ? AND field = 'title'", (ref_num,)).fetchone())
+        draft2_after = dict(c.execute("SELECT * FROM outbox WHERE id = ?", (draft2["id"],)).fetchone())
+    assert rf_after_kl["base"] == "Remote edit 2" and rf_after_kl["conflict"] == 0, rf_after_kl
+    assert draft2_after["state"] == "draft", draft2_after
+
+    # Verify task.sync 202 watch path when outside work exceeds Prefer: wait, and MCP full profile
+    slow_fut = concurrent.futures.Future()
+    with mock.patch.object(sync_mod, "fetch_async", return_value=slow_fut):
+        st202, body202 = http_json(
+            port, "POST", f"/api/v1/tasks/{tid}/sync", {},
+            token=bearer, headers={"Idempotency-Key": "sync-slow-202", "Prefer": "wait=0"},
+        )
+    assert st202 == 202 and body202.get("watch") == "/api/v1/events?idem=sync-slow-202", (st202, body202)
+    from types import SimpleNamespace
+    full_cred = SimpleNamespace(profile="full", commands=None, allows=lambda _s: True)
+    remote_cred = SimpleNamespace(profile="remote", commands=None, allows=lambda _s: True)
+    full_tools = {t["name"] for t in mcp_http.tool_list(full_cred)["tools"]}
+    remote_tools = {t["name"] for t in mcp_http.tool_list(remote_cred)["tools"]}
+    assert "task__sync" in full_tools and "task__sync" not in remote_tools
+
+    # 3. Primary vs related refs: R primary on T1 and related on T2; S related on T3 only
+    with principals.acting(owner):
+        t1 = task_store.task_add("sample", "", title="T1 orig")
+        t2 = task_store.task_add("sample", "", title="T2 orig")
+        t3 = task_store.task_add("sample", "", title="T3 orig")
+        with db.tx() as c:
+            r_ref, _ = task_store.TaskStore.ensure_ref(c, "jira", "ABC-11", kind="ticket", actor=owner)
+            s_ref, _ = task_store.TaskStore.ensure_ref(c, "jira", "ABC-12", kind="ticket", actor=owner)
+            task_store.TaskStore.link_ref(c, t1, r_ref["num"], {"role": "primary"}, owner)
+            task_store.TaskStore.link_ref(c, t2, r_ref["num"], {"role": "related"}, owner)
+            task_store.TaskStore.link_ref(c, t3, s_ref["num"], {"role": "related"}, owner)
+    sync_mod.fetch(r_ref["num"], cfg=cfg)
+    assert task_store.task_get(t1)["title"] == "Shared ref R initial"
+    assert task_store.task_get(t2)["title"] == "T2 orig"
+
+    jira_issues["ABC-11"]["fields"]["summary"] = "Shared ref R updated"
+    jira_issues["ABC-11"]["fields"]["updated"] = "2026-11-28T04:00:00.000+0000"
+    jira_issues["ABC-11"]["fields"]["updateAuthor"] = {"accountId": "jira-dave"}
+    sync_mod.fetch(r_ref["num"], cfg=cfg)
+    assert task_store.task_get(t1)["title"] == "Shared ref R updated"
+    assert task_store.task_get(t2)["title"] == "T2 orig"
+    with db.reader() as c:
+        t1_events = [dict(r) for r in c.execute("SELECT actor FROM events_log WHERE task = ? ORDER BY seq DESC", (t1,))]
+    assert any(e["actor"] == "ext:jira:jira-dave" for e in t1_events), t1_events
+
+    with db.reader() as c:
+        inbox_before_s = c.execute("SELECT count(*) FROM inbox WHERE kind = 'conflict'").fetchone()[0]
+    sync_mod.fetch(s_ref["num"], cfg=cfg)
+    assert task_store.task_get(t3)["title"] == "T3 orig"
+    with db.reader() as c:
+        inbox_after_s = c.execute("SELECT count(*) FROM inbox WHERE kind = 'conflict'").fetchone()[0]
+        s_row = dict(c.execute("SELECT * FROM refs WHERE id = ?", (s_ref["num"],)).fetchone())
+        s_fields = [dict(r) for r in c.execute("SELECT * FROM ref_fields WHERE ref = ?", (s_ref["num"],))]
+    assert inbox_after_s == inbox_before_s
+    assert s_row["title"] == "Related only S" and any(f["field"] == "title" for f in s_fields)
+
+    # 4. GitHub state as truth: review task with unsent label items (held, then failed exhausted) -> next_ticket None
+    for prior_tid in (tid, t1, t2, t3):
+        task_store.task_set_state(prior_tid, "done")
+    tk = tracker.GitHubTracker(repo)
+    with principals.acting(owner), db.tx() as c:
+        gh_tnum, gh_ikey = task_store.TaskStore.task_for_ticket(c, repo, "7", owner, cfg=cfg)
+    gh_tid = task_store.format_task_id(gh_tnum)
+    rid = record.start("pipeline", repo=repo.name, issue="7", task_id=gh_tnum, issue_key=gh_ikey)
+    rdir = paths.RUNS_DIR / rid
+    rdir.mkdir(parents=True, exist_ok=True)
+    run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tk, tid="7", task_id=gh_tnum)
+    run.enter("running")
+    run.enter("pr")
+    record.settle(rid, "pr", "opened")
+    assert task_store.task_get(gh_tid)["state"] == "review"
+    with db.reader() as c:
+        ob_ids = [int(r["id"]) for r in c.execute("SELECT id FROM outbox WHERE object = 'github:owner/sample#7' AND kind = 'label' ORDER BY id")]
+    assert len(ob_ids) == 2, ob_ids
+
+    # Case 4a: both label items held
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'held' WHERE id IN (?, ?)", tuple(ob_ids))
+    assert poll.next_ticket(repo, tk, pipeline.SkipLog({})) is None
+
+    # Case 4b: both label items failed with attempts used up
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'failed', attempts = 5 WHERE id IN (?, ?)", tuple(ob_ids))
+    assert poll.next_ticket(repo, tk, pipeline.SkipLog({})) is None
+
+    # 5. Start item sent, final item held; fake shows agent + agent:running -> tasks.view and GET /api/v1/tasks/T both answer review
+    with db.tx() as c:
+        c.execute("UPDATE outbox SET state = 'sent', sent_ref = 'label:agent:running', sent_at = ? WHERE id = ?", (util.iso(), ob_ids[0]))
+        c.execute("UPDATE outbox SET state = 'held' WHERE id = ?", (ob_ids[1],))
+    gh_issues[7]["labels"] = [{"name": "agent"}, {"name": "agent:running"}]
+    view_res = tasks.view("7", "sample")
+    assert view_res["state"] == "review", view_res
+    st, api_task_res = http_json(port, "GET", f"/api/v1/tasks/{gh_tid}", token=bearer)
+    assert st == 200 and api_task_res["task"]["state"] == "review", api_task_res
+
+    # 6. Retry via label removal: task is needs-you (fault=1), final label item (add agent:failed) sent;
+    #    fake drops agent:failed, keeps agent, newer stamp from another login -> next poll returns T to ready (fault=0)
+    rid_fail = record.start("pipeline", repo=repo.name, issue="7", task_id=gh_tnum, issue_key=gh_ikey)
+    rdir_fail = paths.RUNS_DIR / rid_fail
+    rdir_fail.mkdir(parents=True, exist_ok=True)
+    run_fail = pipeline.Run(rid_fail, repo, rdir_fail, cfg=cfg, tracker=tk, tid="7", task_id=gh_tnum)
+    run_fail.enter("failed")
+    record.settle(rid_fail, "failed", "boom")
+    assert (task_store.task_get(gh_tid)["state"], task_store.task_get(gh_tid)["fault"]) == ("needs-you", 1)
+    with db.tx() as c:
+        c.execute(
+            "UPDATE outbox SET state = 'discarded' WHERE object = 'github:owner/sample#7' AND kind = 'label' AND state = 'held'"
+        )
+        newest_ob = c.execute(
+            "SELECT id FROM outbox WHERE object = 'github:owner/sample#7' AND kind = 'label' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        c.execute("UPDATE outbox SET state = 'sent', sent_ref = 'label:agent:failed', sent_at = ? WHERE id = ?", (util.iso(), newest_ob))
+
+    gh_issues[7]["labels"] = [{"name": "agent"}]
+    gh_issues[7]["updatedAt"] = "2026-11-28T05:00:00Z"
+    gh_issues[7]["updatedBy"] = {"login": "octo-reviewer"}
+    picked = poll.next_ticket(repo, tk, pipeline.SkipLog({}))
+    assert picked is not None and picked.id == "7", picked
+    t_after_retry = task_store.task_get(gh_tid)
+    assert (t_after_retry["state"], t_after_retry["fault"]) == ("ready", 0), t_after_retry
+    with db.reader() as c:
+        retry_events = [dict(r) for r in c.execute("SELECT actor FROM events_log WHERE task = ? ORDER BY seq DESC", (gh_tid,))]
+    assert any(e["actor"] == "ext:github:octo-reviewer" for e in retry_events), retry_events
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_runs_issue_key_contract_indexes_guards_and_query_plans(self):
+        res = self._run_sync_child(r"""
+# Seed DB right before m0065_runs_issue_key_contract
+db.migrate(through=64)
+with db.tx() as c:
+    # Verify pre-m0063 indexes are on runs.issue
+    idx_before = {
+        name: [r[2] for r in c.execute(f"PRAGMA index_info({name})")]
+        for name in ("runs_ticket", "runs_ticket_seq")
+    }
+    assert idx_before["runs_ticket"] == ["repo", "issue", "kind", "started"], idx_before
+    assert idx_before["runs_ticket_seq"] == ["repo", "issue", "seq"], idx_before
+
+    # Seed 5 integer and 3 text issue rows with issue_key filled
+    owner_p = principals.seed_owner("owner@example.test")
+    seed_keys = [101, 102, 103, 104, 105, "ABC-7", "T-7", "proj-9"]
+    for i, val in enumerate(seed_keys, 1):
+        c.execute(
+            "INSERT INTO tasks (id, repo, title, body, kind, state, owner, origin, created, updated) "
+            "VALUES (?, 'sample', ?, '', 'feat', 'done', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (i, f"Task {val}", owner_p, f"u:{owner_p}"),
+        )
+        c.execute(
+            "INSERT INTO runs (id, kind, repo, issue, issue_key, task_id, status, started, finished, seq) "
+            "VALUES (?, 'pipeline', 'sample', ?, ?, ?, 'done', ?, ?, ?)",
+            (f"r-{i}", val, str(val), i, f"2026-01-01T00:00:0{i}Z", f"2026-01-01T00:01:0{i}Z", i),
+        )
+    # 1. Running process older than #303 expand (schema_version < 57) blocks contract
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, issue_key, status, started, pid, schema_version, seq) "
+        "VALUES ('r-old-live', 'loop', '', NULL, NULL, 'running', '2026-01-01T00:05:00Z', ?, 56, 99)",
+        (os.getpid(),),
+    )
+
+assert db.migrate() is True
+with db.reader() as c:
+    cols = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+    assert "issue" in cols, cols
+
+# 2. Settle old process, corrupt 1 issue_key -> contract migration refuses and leaves issue column
+with db.tx() as c:
+    c.execute("UPDATE runs SET status = 'done', finished = '2026-01-01T00:06:00Z' WHERE id = 'r-old-live'")
+    c.execute("UPDATE runs SET issue_key = 'WRONG' WHERE id = 'r-1'")
+
+refused = False
+try:
+    db.migrate()
+except RuntimeError as exc:
+    refused = "disagrees" in str(exc)
+assert refused, "expected m0065 to refuse mismatched issue_key"
+with db.reader() as c:
+    assert "issue" in {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+
+# 3. Fix issue_key and run db.migrate() -> drops runs.issue, rebuilds indexes on issue_key
+with db.tx() as c:
+    c.execute("UPDATE runs SET issue_key = '101' WHERE id = 'r-1'")
+assert db.migrate() is False
+
+with db.reader() as c:
+    cols_after = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
+    assert "issue" not in cols_after, cols_after
+    idx_after = {
+        name: [r[2] for r in c.execute(f"PRAGMA index_info({name})")]
+        for name in ("runs_ticket", "runs_ticket_seq")
+    }
+    assert idx_after["runs_ticket"] == ["repo", "issue_key", "kind", "started"], idx_after
+    assert idx_after["runs_ticket_seq"] == ["repo", "issue_key", "seq"], idx_after
+
+# All 8 keys read back, the 3 text ones exact
+expected_keys = ["101", "102", "103", "104", "105", "ABC-7", "T-7", "proj-9"]
+got_keys = [run_store.run_get(f"r-{i}")["issue"] for i in range(1, 9)]
+assert got_keys == expected_keys, (got_keys, expected_keys)
+for key in ("ABC-7", "T-7", "proj-9"):
+    found = run_store.ticket_runs("sample", key)
+    assert len(found) == 1 and found[0]["issue"] == key, (key, found)
+
+# 4. EXPLAIN QUERY PLAN checks for runs_ticket and runs_ticket_seq
+with db.reader() as c:
+    plan_ticket = "\n".join(
+        r[3] for r in c.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue_key = ? "
+            "ORDER BY started DESC LIMIT 1",
+            ("sample", "ABC-7"),
+        )
+    )
+    plan_later = "\n".join(
+        r[3] for r in c.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue_key = ? "
+            f"AND {run_store.WHOLE_RUN} AND seq > (SELECT seq FROM runs WHERE id = ?) ORDER BY seq LIMIT 1",
+            ("sample", "ABC-7", "r-6"),
+        )
+    )
+    plan_asks = "\n".join(
+        r[3] for r in c.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM asks WHERE status = 'open' AND {ask_store._latest(c)} ORDER BY asked, rowid"
+        )
+    )
+assert "USING INDEX runs_ticket (repo=? AND issue_key=?" in plan_ticket, plan_ticket
+assert "USING INDEX runs_ticket_seq (repo=? AND issue_key=?" in plan_later, plan_later
+assert "USING INDEX runs_ticket_seq (repo=? AND issue_key=?" in plan_asks, plan_asks
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_triage_verdicts_board_view_overflow_toggle_own_move_and_to_pipeline(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo(
+    "sample", repo_dir, tracker="jira", jira_project="ABC", pipeline=True,
+    parts=[config.Part("", "owner/sample")],
+)
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+U1 = "2026-11-28T01:00:00.000+0000"
+U2 = "2026-11-28T02:00:00.000+0000"
+listed_issues = [
+    {"key": "ABC-7", "fields": {"summary": "Ticket 7", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+    {"key": "ABC-8", "fields": {"summary": "Ticket 8", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+]
+
+class FakeJira:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def search(self, jql, fields=None, limit=50, include=None):
+        return [json.loads(json.dumps(x)) for x in listed_issues[:limit]]
+    def issue(self, key, fields=None):
+        for item in listed_issues:
+            if item["key"] == key:
+                return json.loads(json.dumps(item))
+        return {"key": key, "fields": {"summary": key, "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}}
+    def changelog(self, key):
+        return []
+    def comments(self, key):
+        return []
+    def me(self):
+        return {"accountId": "me-1"}
+
+fake_jira = FakeJira()
+triage_calls = {}
+staged_calls = {}
+
+def fake_triage_one(cfg_arg, src, cand, ticket_text="", **kw):
+    triage_calls[cand.ref] = triage_calls.get(cand.ref, 0) + 1
+    return (
+        {
+            "ready": True,
+            "code": True,
+            "size": "s",
+            "kind": "feat",
+            "repos": ["sample"],
+            "why": f"Verdict #{triage_calls[cand.ref]}",
+            "plan": ["Step 1"],
+            "questions": [],
+            "assumptions": [],
+            "checks": [],
+        },
+        0.25,
+        "",
+    )
+
+def fake_staged(cfg_arg, row, **kw):
+    staged_calls[row["ref"]] = staged_calls.get(row["ref"], 0) + 1
+    return "report"
+
+with (
+    mock.patch.object(jira.Client, "from_env", return_value=fake_jira),
+    mock.patch.object(triage, "triage_one", side_effect=fake_triage_one),
+    mock.patch.object(research, "staged", side_effect=fake_staged),
+    principals.acting(owner),
+):
+    # 1. Read ABC-7 and ABC-8 at U1; write DONE research row for ABC-7
+    triage.refresh(cfg, False)
+    assert triage_calls.get("ABC-7") == 1 and triage_calls.get("ABC-8") == 1, triage_calls
+    insights_store.research_set(
+        "ABC-7", repo="sample", ticket="ABC-7",
+        url=fake_jira.browse_url("ABC-7"), title="Ticket 7",
+        updated=triage_store.iso_updated(U1), status="done", report="Paid report for ABC-7",
+    )
+    res_before = insights_store.research_get("ABC-7")
+    assert res_before is not None and res_before["report"] == "Paid report for ABC-7"
+
+    # 2. Fake lists 50 newer tickets (pushing ABC-7 and ABC-8 out); refresh + research.tidy
+    listed_issues[:] = [
+        {"key": f"ABC-{100 + i}", "fields": {"summary": f"New {i}", "updated": U2, "status": {"name": "To Do"}, "labels": ["triage"]}}
+        for i in range(50)
+    ]
+    triage.refresh(cfg, False)
+    research.tidy()
+    assert "ABC-7" not in {r["ref"] for r in triage_store.triage_rows()}
+
+    # 3. ABC-7 returns at U1 -> back on board with first verdict, no new triage_one call, research unchanged
+    listed_issues[:] = [
+        {"key": "ABC-7", "fields": {"summary": "Ticket 7", "updated": U1, "status": {"name": "To Do"}, "labels": ["triage"]}},
+    ]
+    triage.refresh(cfg, False)
+    research.tidy()
+    board_by_ref = {r["ref"]: r for r in triage_store.triage_rows()}
+    assert "ABC-7" in board_by_ref and board_by_ref["ABC-7"]["why"] == "Verdict #1", board_by_ref
+    assert triage_calls["ABC-7"] == 1, triage_calls
+    assert staged_calls.get("ABC-7", 0) == 0, staged_calls
+    res_after = insights_store.research_get("ABC-7")
+    assert res_after["report"] == "Paid report for ABC-7" and res_after["report_blob"] == res_before["report_blob"]
+
+    # 4. Turn off repo in config -> refresh -> board empty; turn back on -> refresh -> ABC-7 back with old verdict
+    repo.pipeline = False
+    triage.refresh(cfg, False)
+    assert triage_store.triage_rows() == []
+    repo.pipeline = True
+    triage.refresh(cfg, False)
+    board_after_toggle = {r["ref"]: r for r in triage_store.triage_rows()}
+    assert "ABC-7" in board_after_toggle and board_after_toggle["ABC-7"]["why"] == "Verdict #1"
+    assert triage_calls["ABC-7"] == 1, triage_calls
+    assert insights_store.research_get("ABC-7")["report"] == "Paid report for ABC-7"
+
+    # 5. ABC-8 was pushed out of read; research.own_move({"ref": "ABC-8"}, Moved(U1, U2)); ABC-8 listed at U2 -> no triage_one, copy verdict cost=0, judged_updated=U2
+    research.own_move({"ref": "ABC-8"}, tracker.Moved(before=U1, after=U2))
+    listed_issues.append(
+        {"key": "ABC-8", "fields": {"summary": "Ticket 8", "updated": U2, "status": {"name": "To Do"}, "labels": ["triage"]}}
+    )
+    triage.refresh(cfg, False)
+    assert triage_calls["ABC-8"] == 1, triage_calls
+    with db.reader() as c:
+        v8 = [dict(r) for r in c.execute("SELECT * FROM triage_verdicts WHERE ref = 'ABC-8' ORDER BY id")]
+    assert len(v8) == 2, v8
+    assert v8[-1]["cost"] == 0.0 and v8[-1]["judged_updated"] == triage_store.iso_updated(U2), v8[-1]
+
+    # 6. triage.to_pipeline on ABC-7 removes it from triage_rows() immediately while triage_verdicts rows stay
+    src = triage.JiraSource("ABC", [repo], jira_cfg=cfg.jira)
+    row_7 = next(r for r in triage_store.triage_rows() if r["ref"] == "ABC-7")
+    with mock.patch.object(src, "approve", return_value=None):
+        triage.to_pipeline(src, row_7, owner)
+    assert "ABC-7" not in {r["ref"] for r in triage_store.triage_rows()}
+    with db.reader() as c:
+        v7 = [dict(r) for r in c.execute("SELECT * FROM triage_verdicts WHERE ref = 'ABC-7'")]
+    assert len(v7) >= 1, v7
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_research_keep_blobs_and_no_delete_sql(self):
+        res = self._run_sync_child(r"""
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+repo_dir = ROOT / "repos" / "sample"
+repo = config.Repo("sample", repo_dir, tracker="jira", jira_project="ABC", pipeline=True, parts=[config.Part("", "owner/sample")])
+cfg = config.Config(repos=[repo], jira=config.JiraConfig(project="ABC"))
+cfg.jev.enabled = False
+
+class EmptyJira:
+    base = "https://jira.example.test"
+    def browse_url(self, key):
+        return f"{self.base}/browse/{key}"
+    def search(self, jql, fields=None, limit=50, include=None):
+        return []
+
+delivered_8_days_ago = "2026-11-20T00:00:00Z"
+report_text = "# Paid Research Report for ABC-9\n\nFindings preserved in blobs."
+with principals.acting(owner), mock.patch.object(jira.Client, "from_env", return_value=EmptyJira()):
+    insights_store.research_set(
+        "ABC-9",
+        repo="sample",
+        ticket="ABC-9",
+        url="https://jira.example.test/browse/ABC-9",
+        title="Closed research ticket",
+        updated=delivered_8_days_ago,
+        status="done",
+        delivered=delivered_8_days_ago,
+        report=report_text,
+    )
+    md_file = paths.STATE_DIR / "research" / "ABC-9.md"
+    md_file.parent.mkdir(parents=True, exist_ok=True)
+    md_file.write_text(report_text)
+
+    # Refresh (ABC-9 no longer listed) + research.tidy() + delete research/ABC-9.md
+    triage.refresh(cfg, False)
+    research.tidy()
+    if md_file.exists():
+        md_file.unlink()
+    assert not md_file.exists()
+
+    # research.shown("ABC-9") returns report text from blobs
+    shown_text = research.shown("ABC-9")
+    assert shown_text == report_text, shown_text
+
+    # Verify research table has no report column and stores report_blob pointing into blobs
+    with db.reader() as c:
+        rcols = {r[1] for r in c.execute("PRAGMA table_info(research)")}
+        assert "report" not in rcols and "report_blob" in rcols, rcols
+        sha = c.execute("SELECT report_blob FROM research WHERE ref = 'ABC-9'").fetchone()[0]
+    assert sha and blob_store.read(sha).decode() == report_text
+
+# Scan every file under arete/ for DELETE FROM triage_verdicts|research
+arete_dir = Path(sync_mod.__file__).resolve().parent
+pattern = re.compile(r"DELETE\s+FROM\s+(?:triage_verdicts|research)\b", re.IGNORECASE)
+matches = []
+for p in sorted(arete_dir.rglob("*")):
+    if not p.is_file() or "__pycache__" in p.parts:
+        continue
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        continue
+    if pattern.search(text):
+        matches.append(str(p.relative_to(arete_dir)))
+assert matches == [], f"forbidden DELETE SQL found in: {matches}"
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])

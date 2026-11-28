@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 32
+MINOR = 33
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -36,6 +36,15 @@ def mapping(values):
     return obj({}, [], values)
 
 
+REF_FIELD = obj({
+    "field": STRING,
+    "base": NULL_TEXT,
+    "remote": NULL_TEXT,
+    "remote_at": NULL_TEXT,
+    "remote_by": NULL_TEXT,
+    "owner": STRING,
+    "conflict": INTEGER,
+}, ["field", "base", "remote", "owner", "conflict"])
 REF = obj({
     "id": STRING,
     "system": {**STRING, "enum": ["github", "jira", "slack", "email", "meeting", "intake"]},
@@ -48,12 +57,17 @@ REF = obj({
     "facts": mapping(JSON),
     "run_id": NULL_TEXT,
     "remote_updated": NULL_TEXT,
+    "remote_actor": NULL_TEXT,
     "fetched_at": NULL_TEXT,
     "sync": {**STRING, "enum": ["local", "synced", "ahead", "behind", "conflict", "off"]},
+    "fields": array(REF_FIELD),
     "version": INTEGER,
     "created": STRING,
     "updated": STRING,
-})
+}, [
+    "id", "system", "kind", "key", "connector", "title", "url", "ext_state", "facts",
+    "run_id", "remote_updated", "fetched_at", "sync", "version", "created", "updated",
+])
 TASK_REF = obj({
     "id": INTEGER,
     "task": STRING,
@@ -895,6 +909,14 @@ OPERATIONS += [
     operation("task.restore", "tasks/{task}/restore", envelope({"task": TASK}),
               obj({"task": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["task"]),
               {"task": "T-1"}, "POST", errors=("invalid_state", "task_version_conflict")),
+    {**operation("task.sync", "tasks/{task}/sync",
+                 {"anyOf": [
+                     envelope({"task": TASK, "ref": REF, "fields": array(REF_FIELD)}),
+                     envelope({"accepted": BOOLEAN, "watch": STRING, "task": STRING}),
+                 ]},
+                 obj({"task": STRING}), {"task": "T-1"}, "POST",
+                 errors=("invalid_state", "upstream_failed")),
+     "scope": "run:start"},
     operation("comment.create", "tasks/{task}/comments", envelope({"task": TASK}),
               obj({"task": STRING, "body": STRING}), {"task": "T-1", "body": "Reply"}, "POST"),
     operation("comment.update", "tasks/{task}/comments/{comment}", envelope({"comment": TASK_COMMENT}),
@@ -925,7 +947,9 @@ OPERATIONS += [
               obj({"task": STRING, "ref": STRING}), {"task": "T-1", "ref": "R-1"}, "DELETE"),
     operation("ref.list", "refs", envelope({"refs": array(REF)}),
               obj({"system": STRING, "kind": STRING, "key": STRING, "sync": STRING}, [])),
-    operation("ref.get", "refs/{ref}", envelope({"ref": REF, "tasks": array(REF_TASK_LINK)}),
+    operation("ref.get", "refs/{ref}",
+              envelope({"ref": REF, "tasks": array(REF_TASK_LINK), "fields": array(REF_FIELD)},
+                       ["seq", "ref", "tasks"]),
               obj({"ref": STRING}), {"ref": "R-1"}),
     operation("ref.history", "refs/{ref}/history", envelope({"events": array(INBOX_EVENT)}),
               obj({"ref": STRING}), {"ref": "R-1"}),

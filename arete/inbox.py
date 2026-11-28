@@ -72,6 +72,7 @@ RESERVED_MANUAL_PREFIXES = (
     "outbox:",
     "secret:",
     "step:",
+    "ref:",
     "project:",
     "line:",
     "view:",
@@ -178,14 +179,15 @@ def _asks_items(c) -> list[dict]:
 
 
 def _runs_items(c) -> list[dict]:
+    ic = run_store.issue_col(c)
     private_clause = (
-        "AND NOT EXISTS (SELECT 1 FROM private_evidence e WHERE e.repo = r.repo "
-        "  AND e.ticket = CAST(r.issue AS TEXT) AND e.status = 'open') "
+        f"AND NOT EXISTS (SELECT 1 FROM private_evidence e WHERE e.repo = r.repo "  # noqa: S608
+        f"  AND e.ticket = CAST(r.{ic} AS TEXT) AND e.status = 'open') "
         if evidence_store.available(c)
         else ""
     )
     rows = [
-        dict(r)
+        run_store.run_row(r)
         for r in c.execute(
             f"SELECT r.* FROM runs r WHERE r.kind = 'pipeline' AND r.status = 'needs-info' "  # noqa: S608
             f"AND {run_store.WHOLE_RUN} AND {run_store.LIVE_RUN} "
@@ -193,7 +195,7 @@ def _runs_items(c) -> list[dict]:
             "  AND (a.status = 'open' OR (a.status = 'answered' AND a.taken_by = ''))) "
             f"{private_clause}"
             "AND NOT EXISTS (SELECT 1 FROM runs later WHERE later.kind = 'pipeline' "
-            f"  AND later.repo = r.repo AND later.issue = r.issue AND {run_store.WHOLE_RUN} "
+            f"  AND later.repo = r.repo AND later.{ic} = r.{ic} AND {run_store.WHOLE_RUN} "
             f"  AND {run_store.LIVE_RUN} AND {run_store.later_than(c, 'later', 'r')}) "
             f"ORDER BY r.started, {run_store.seq_col(c, 'r')}"
         )
@@ -316,9 +318,10 @@ def _proposals_items(c) -> list[dict]:
 
 
 def _skipped_items(c) -> list[dict]:
+    ic = run_store.issue_col(c)
     running = {
-        (r["repo"], str(r["issue"]))
-        for r in c.execute("SELECT repo, issue FROM runs WHERE status = 'running' AND issue IS NOT NULL")
+        (r["repo"], str(r[ic]))
+        for r in c.execute(f"SELECT repo, {ic} FROM runs WHERE status = 'running' AND {ic} IS NOT NULL")  # noqa: S608
     }
     cfg, problem = config.load_or_problem()
     unblock_repos = set() if problem else set(cfg.unblock_repos)
@@ -1579,6 +1582,10 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
             if sep and run_id and node:
                 steps_found = _node_terminal_steps(c, run_id, node)
                 return steps_found[0] if steps_found else None
+        if kind == "ref" and ident.isdecimal():
+            from .store import tasks as task_store
+
+            return task_store.TaskStore.ref_get(c, int(ident))
     return None
 
 
@@ -2376,6 +2383,31 @@ def resolve(
             base_version=base_version,
             actor=principals.current(),
         )
+    if subject.startswith("ref:") and item["kind"] == "conflict":
+        from . import sync as sync_mod
+
+        ident_ref = subject.partition(":")[2]
+        if not ident_ref.isdecimal():
+            raise contract.Problem("validation", f"Invalid conflict subject {subject!r}")
+        actor = principals.current()
+        now = util.iso()
+        with foundation.tx() as c:
+            res_data = sync_mod.resolve_conflict(c, int(ident_ref), verb, actor=actor)
+            resolved_item, _, changed = inbox_store.resolve_item(
+                c,
+                numeric,
+                resolution=verb,
+                answer=verb,
+                answered_by=actor,
+                answered_at=now,
+                base_version=base_version,
+            )
+            if not changed:
+                current = inbox_store.get(numeric, connect=lambda: nullcontext(c)) or item
+                if current["state"] == "resolved":
+                    raise contract.Problem("already_resolved", f"Inbox item {item['id']} is already resolved.", current=current)
+                raise contract.Problem("version_conflict", f"Inbox item {item['id']} changed.", current=current)
+        return {"item": resolved_item, "result": res_data}
 
     if (item["kind"] == "approval" or subject.startswith("approval:")) and not allow_legacy_auth:
         if credential is None or credential.kind != "session":

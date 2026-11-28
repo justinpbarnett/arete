@@ -60,6 +60,10 @@ def run_object(row):
 
 
 def serialize(value, schema):
+    if isinstance(value, dict) and "anyOf" in schema:
+        for branch in schema["anyOf"]:
+            if isinstance(branch, dict) and "properties" in branch:
+                return serialize(value, branch)
     if isinstance(value, dict) and "properties" in schema:
         additional = schema.get("additionalProperties")
         return {k: serialize(v, schema["properties"].get(k, additional)) for k, v in value.items()
@@ -635,6 +639,7 @@ def read(name, values, handler, *, conn=None):
         return {
             "ref": serialize(ref_row, contract.REF),
             "tasks": [serialize(t, contract.REF_TASK_LINK) for t in linked],
+            "fields": [serialize(f, contract.REF_FIELD) for f in ref_row.get("fields", [])],
         }
     if name == "ref.history":
         with foundation.reader() as c:
@@ -1034,7 +1039,7 @@ def dispatch(handler, op, path_values, query):
 _NON_ATOMIC_COMMANDS = frozenset((
     "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
     "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
-    "task.create", "task.update", "task.run", "session.start", "run.resume", "run.repair", "run.step",
+    "task.create", "task.update", "task.run", "task.sync", "task_ref.link", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
     "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
@@ -1314,6 +1319,10 @@ def mutation(name, values, handler):
             raise contract.Problem("validation", str(error)) from None
         result = {"comment": serialize(needed(updated, raw_cid), contract.TASK_COMMENT)}
     elif name == "task_ref.link":
+        from contextlib import suppress
+
+        from . import sync as sync_mod
+
         with foundation.tx() as c:
             try:
                 linked = task_store.TaskStore.link_ref(c, values["task"], values, values, principals.current())
@@ -1325,7 +1334,44 @@ def mutation(name, values, handler):
                 raise contract.Problem("not_found", str(error)) from None
             except ValueError as error:
                 raise contract.Problem("validation", str(error)) from None
+        if ref_row is not None and not ref_row.get("fetched_at") and ref_row.get("system") in ("github", "jira"):
+            with suppress(Exception):
+                fetched = sync_mod.fetch(ref_row["num"])
+                if fetched is not None:
+                    ref_row = fetched
         result = {"task_ref": serialize(linked, contract.TASK_REF), "ref": serialize(ref_row, contract.REF)}
+    elif name == "task.sync":
+        from . import sync as sync_mod
+        from . import tracker as tracker_mod
+
+        task_row = needed(task_store.task_get(values["task"]), values["task"])
+        primary_ref = task_row.get("primary_ref")
+        if not primary_ref:
+            raise contract.Problem("invalid_state", f"Task {task_row['id']} has no primary ref")
+        key = (handler.headers.get("Idempotency-Key") if handler else None) or secrets.token_hex(12)
+        wait_seconds = prefer_wait(handler, default=2.0, maximum=10.0)
+        future = sync_mod.fetch_async(primary_ref["num"], idem=key)
+        try:
+            synced_ref = future.result(timeout=wait_seconds)
+        except concurrent.futures.TimeoutError:
+            if handler is not None:
+                handler.success_status = 202
+            result = {
+                "accepted": True,
+                "watch": f"/api/v1/events?idem={quote(key, safe='')}",
+                "task": task_row["id"],
+            }
+        except tracker_mod.ERRORS as error:
+            raise contract.Problem("upstream_failed", str(error)) from None
+        except LookupError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        else:
+            updated_task = needed(task_store.task_get(task_row["id"]), task_row["id"])
+            result = {
+                "task": serialize(updated_task, contract.TASK),
+                "ref": serialize(synced_ref, contract.REF),
+                "fields": [serialize(f, contract.REF_FIELD) for f in synced_ref.get("fields", [])],
+            }
     elif name == "task_ref.update":
         with foundation.tx() as c:
             try:

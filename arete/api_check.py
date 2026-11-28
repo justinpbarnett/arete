@@ -516,28 +516,41 @@ class Check:
         fixture_fault_item = inbox_store.get_open_by_kind_and_subject("fault", f"step:{fault_run}/verify")
         sub_id = push.push_add("http://127.0.0.1:9999/fixture-push", "fixturep256dh", "fixtureauth", "Fixture", LOGIN)
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
-        triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
+        triage_store.record_verdict(
+            triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"),
+            ensure_listed=True,
+            key_override="demo/repo#7",
+        )
         sample_cfg = config.load()
         sample_repo = sample_cfg.repo(replay.SAMPLE_REPO)
         send_src = triage.GitHubSource(sample_repo.github or f"owner/{sample_repo.name}", [sample_repo])
         send_ticket = triage.Candidate(f"{sample_repo.name}#9", "9", "Fixture send ticket", "https://example.invalid/9", "old")
-        triage_store.triage_put({
-            **triage.row(send_src, send_ticket, updated="old"),
-            "repo": sample_repo.name,
-            "repos": [sample_repo.name],
-            "ready": True,
-            "code": 1,
-            "questions": [],
-        })
+        triage_store.record_verdict(
+            {
+                **triage.row(send_src, send_ticket, updated="old"),
+                "repo": sample_repo.name,
+                "repos": [sample_repo.name],
+                "ready": True,
+                "code": 1,
+                "questions": [],
+            },
+            ensure_listed=True,
+            key_override=f"{send_src.key}#9",
+        )
         insights.research_set(ticket.ref, status="done", title="Fixture research")
         stopped = record.start("loop", pid=0)
         session = record.start("session")
         run_task = task_store.task_add(replay.SAMPLE_REPO, "Task to start via task.run", "Run me", "feat")
+        sync_task = task_store.task_add(replay.SAMPLE_REPO, "Task to sync via task.sync", "Sync me", "feat")
         task_store.task_comment(self.task, principals.owner(), "Initial comment for check")
         fixture_comment = task_store.task_comments(self.task)[0]
         with db.tx() as conn:
             fixture_ref_link = task_store.TaskStore.link_ref(
                 conn, self.task, "slack:C1/1700000000.000001", {"role": "related", "interpretation": "Fixture ref"},
+                principals.owner(),
+            )
+            task_store.TaskStore.link_ref(
+                conn, sync_task, "slack:C1/1700000000.000002", {"role": "primary", "interpretation": "Sync ref"},
                 principals.owner(),
             )
             fixture_link = task_store.TaskStore.create_link(
@@ -612,7 +625,9 @@ class Check:
                                else str(chat_for_send) if name in ("chat.send", "chat.session_start")
                                else identities["chat"]),
                       "item": ob_item if resource == "outbox" else identities["item"],
-                      "task": run_task if name == "task.run" else identities["task"],
+                      "task": (run_task if name == "task.run"
+                               else sync_task if name == "task.sync"
+                               else identities["task"]),
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
