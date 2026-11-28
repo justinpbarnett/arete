@@ -121,10 +121,13 @@ def build_event(p: dict) -> dict | None:
 
 
 def append_hook_event(event):
+    from . import scrub
+
+    line = scrub.text(json.dumps(event, ensure_ascii=False), "hook", event.get("hook") or "hook")
     with event_lock("hook-events"):
         finish_ingest()
         with paths.EVENTS_FILE.open("a+b") as out:
-            out.write(line_break(out) + (json.dumps(event, ensure_ascii=False) + "\n").encode())
+            out.write(line_break(out) + (line + "\n").encode())
 
 
 @contextlib.contextmanager
@@ -279,9 +282,12 @@ def main() -> int:
                 append_hook_event(ev)
     except Exception as e:
         with contextlib.suppress(OSError):
+            from . import scrub
+
             paths.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            msg = scrub.text(f"{datetime.now().isoformat()} {type(e).__name__}: {e}\n", "log", "hook")
             with open(paths.LOG_DIR / "hook-errors.log", "a") as f:
-                f.write(f"{datetime.now().isoformat()} {type(e).__name__}: {e}\n")
+                f.write(msg)
     return 0
 
 

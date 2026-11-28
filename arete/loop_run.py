@@ -28,6 +28,7 @@ from . import (
     environment,
     gh,
     jev,
+    scrub,
     loops,
     outbound,
     paths,
@@ -231,13 +232,15 @@ class OutputSinks:
             self.stack.close()
 
 
-def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line, sinks=None) -> None:
+def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line, sinks=None, *,
+                extra=(), subject: str = "") -> None:
     owns_sinks = sinks is None
     sinks = sinks or OutputSinks(output, on_line)
     try:
         for line in proc.stdout:
-            lines.append(line)
-            sinks.write(line)
+            clean = scrub.text(line, "command_output", subject, extra=extra)
+            lines.append(clean)
+            sinks.write(clean)
     finally:
         if owns_sinks:
             sinks.close()
@@ -273,15 +276,20 @@ def defer_loop_stop():
 
 
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float | None, env: dict, device: devices.Device,
-                stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
+                stdin: str = "", output: Path | None = None, on_line=None,
+                role: str | None = None, repo: str | None = None, subject: str = "") -> tuple[int, str]:
+    exposed = environment.role_secrets(role, repo=repo)
+    given = tuple(exposed.values())
+    label = subject or role or (argv[0] if argv else "command")
     if device.remote:
         lines = []
         delivered = 0
         sinks = OutputSinks(output, on_line)
 
         def emit(text):
-            lines.append(text)
-            sinks.write(text)
+            clean = scrub.text(text, "command_output", label, extra=given)
+            lines.append(clean)
+            sinks.write(clean)
 
         def line(text):
             nonlocal delivered
@@ -292,7 +300,8 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float | None, env:
             emit(f"[arete] {'reattaching' if kind == 'attach' else 'lost the device'} at byte {offset}\n")
 
         try:
-            result = device_turns.run(device, argv, cwd, env, stdin, timeout=timeout, on_line=line,
+            remote_env = {**exposed, **(env or {})}
+            result = device_turns.run(device, argv, cwd, remote_env, stdin, timeout=timeout, on_line=line,
                                      on_mark=mark, leaf=f"command-{next(COMMAND_LEAVES)}", merge_stderr=True)
             return result.returncode, "".join(lines)
         except (device_turns.Lost, subprocess.TimeoutExpired) as error:
@@ -316,17 +325,19 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float | None, env:
     deadline = None if timeout is None else time.monotonic() + timeout
     from . import scratch
 
+    child_env = environment.build((), {**exposed, **(env or {})})
     proc = sinks = None
     killed = False
     try:
         with defer_loop_stop():
             proc = scratch.spawn(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  actor_confined=trusted, stderr=subprocess.STDOUT, text=True, errors="replace",
-                                 env={**os.environ, **env} if local else None, **util.own_group_args())
+                                 env=child_env, **util.own_group_args())
         threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()
         lines: list[str] = []
         sinks = OutputSinks(output, on_line)
-        copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line, sinks), daemon=True)
+        copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line, sinks),
+                                  kwargs={"extra": given, "subject": label}, daemon=True)
         copier.start()
         copier.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if not copier.is_alive() and exits_by(proc, deadline):
@@ -542,7 +553,8 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     started = time.monotonic()
     timeout = None if releasejourneys.builtin(loop) and not run.device.remote else loop.timeout_minutes * 60
     code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=timeout, env=env,
-                             device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run))
+                             device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run),
+                             role=f"loop:{loop.name}", repo=loop.repo or None, subject=f"{run.id}/{loop.name}")
     lines = [line for line in text.split("\n") if line.strip()]
     found, said = [], []
     for line in lines:
@@ -679,7 +691,8 @@ def watch_input(run: LoopRun) -> list[dict]:
         return run.events
     repo_dir = str(loop.work_repo(run.cfg).path) if loop.repo else ""
     code, text = run_command(loop.script, loop.dir, timeout=loop.timeout_minutes * 60,
-                             env={**loops.check_env(loop, run.id), "ARETE_REPO_DIR": repo_dir}, device=devices.LOCAL)
+                             env={**loops.check_env(loop, run.id), "ARETE_REPO_DIR": repo_dir}, device=devices.LOCAL,
+                             role=f"loop:{loop.name}", repo=loop.repo or None, subject=f"{run.id}/{loop.name}")
     if code != 0:
         raise RuntimeError(f"script exit {code}: {util.last_line(text, 300)}")
     if not text.strip():

@@ -655,7 +655,8 @@ def push_evidence(src: Path, github: str, run_id: str, files: list[Path]) -> dic
     blobs = ""
     for f in files:
         command = sandbox.protected_command(["git", "hash-object", "-w", "--stdin"], src)
-        done = subprocess.run(command, check=False, cwd=src, input=contents[f], capture_output=True, timeout=300)
+        done = subprocess.run(command, check=False, cwd=src, input=contents[f], capture_output=True, timeout=300,
+                              env=environment.build(()))
         if done.returncode != 0:
             raise RuntimeError(f"git hash-object: {util.git_error(done.stderr.decode(errors='replace'))}")
         blobs += f"100644 blob {done.stdout.decode().strip()}\t{f.name}\n"

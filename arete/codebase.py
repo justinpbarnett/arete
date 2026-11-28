@@ -64,9 +64,10 @@ def import_everything() -> None:
 
 
 def git(*args: str) -> str | None:
+    env = {k: v for k in ("PATH", "HOME", "TMPDIR", "USER", "LANG", "LC_ALL", "TZ") if (v := os.environ.get(k)) is not None}
     try:
         done = subprocess.run(["git", "--no-optional-locks", "-C", str(CHECKOUT), *args], check=False,
-                              capture_output=True, text=True, timeout=GIT_SECONDS, stdin=subprocess.DEVNULL)
+                              capture_output=True, text=True, timeout=GIT_SECONDS, stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return done.stdout if done.returncode == 0 else None

@@ -919,7 +919,7 @@ class ClaudeOpenRouterTests(unittest.TestCase):
                 hook, = (hook for group in hooks if "Bash" in group["matcher"].split("|") for hook in group["hooks"])
                 payload = {"cwd": str(self.repo), "tool_name": "Bash",
                            "tool_input": {"command": shlex.join(["cat", str(login)])}}
-                decision = util.sh(shlex.split(hook["command"]), cwd=self.repo, env=env, inherit=False,
+                decision = util.sh(shlex.split(hook["command"]), cwd=self.repo, env=env,
                                    input=json.dumps(payload))
                 self.assertEqual(decision.returncode, 0, decision.stderr)
                 reply = json.loads(decision.stdout or "{}")

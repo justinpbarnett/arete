@@ -236,7 +236,7 @@ def run_cleanup_probe(version: str) -> Cleanup:
 def cleanup() -> Cleanup:
     if sys.platform not in SANDBOX_PLATFORMS:
         return Cleanup("unchecked", f"codex sandbox is not available on {sys.platform}", {})
-    found = util.sh([binary(), "--version"], timeout=CLEANUP_TIMEOUT_SECONDS, env=agent_env(), inherit=False)
+    found = util.sh([binary(), "--version"], timeout=CLEANUP_TIMEOUT_SECONDS, env=agent_env())
     if found.returncode != 0:
         return Cleanup("unchecked", probe_failure(found, "codex --version"), {})
     words = found.stdout.split()
@@ -371,7 +371,7 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
         granted |= {path: "write" for path in both(temp_dir)}
     metadata = {path: "read" for root in [cwd, *add_dirs] for path in both(root / ".git")}
     result = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd=cwd,
-                     timeout=10, env=agent_env(), inherit=False)
+                     timeout=10, env=agent_env())
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     authority = sandbox.authority_roots() if authority is None else authority
@@ -824,7 +824,7 @@ def reset_time(text: str) -> datetime | None:
 def login(env: dict | None = None) -> tuple[bool, str, str]:
     if paths.ISOLATED:
         return False, paths.ISOLATED_LOGINS, ""
-    res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env(), inherit=False)
+    res = util.sh([binary(), "login", "status"], timeout=10, env=env if env is not None else agent_env())
     said = f"{res.stdout}\n{res.stderr}"
     if "ChatGPT" in said and res.returncode == 0:
         return True, "logged in with ChatGPT", CHATGPT_PROVIDER
