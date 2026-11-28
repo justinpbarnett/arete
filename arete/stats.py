@@ -24,7 +24,91 @@ class MonetaryProjection(Protocol):
     ) -> tuple[int | None, float | None, str]: ...
 
 
-MONETARY_PRODUCER: MonetaryProjection | None = None
+def round_div_half_even(total: int, count: int) -> int:
+    if count <= 0:
+        raise ValueError("count must be positive")
+    quotient, remainder = divmod(abs(total), count)
+    twice = remainder * 2
+    if twice > count or (twice == count and (quotient & 1) == 1):
+        quotient += 1
+    return -quotient if total < 0 else quotient
+
+
+def _mean_from_step_rows(
+    step_rows: list[tuple[object, ...]],
+) -> tuple[int | None, float | None]:
+    run_totals: dict[str, int] = {}
+    run_known: set[str] = set()
+    for run_id, _step_id, cost_nusd, _version in step_rows:
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        if isinstance(cost_nusd, int) and not isinstance(cost_nusd, bool):
+            run_known.add(run_id)
+            run_totals[run_id] = run_totals.get(run_id, 0) + cost_nusd
+    if not run_known:
+        return None, None
+    total = sum(run_totals[rid] for rid in run_known)
+    mean_nusd = round_div_half_even(total, len(run_known))
+    return mean_nusd, mean_nusd / 1_000_000_000
+
+
+class StoredMoneyProjection:
+    capability: str = "stored-money-v1"
+
+    def for_prompt(
+        self, conn: sqlite3.Connection, name: str, start: str, end: str
+    ) -> tuple[int | None, float | None, str]:
+        if not name or not _has_step_cost_nusd(conn):
+            return None, None, _revision_digest(("prompt_money", name, start, end, False))
+        prefix = f"prompt/{name}@"
+        upper = f"prompt/{name}A"
+        run_ids = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT s.run_id FROM steps s "
+                "WHERE s.prompt_version >= ? AND s.prompt_version < ? "
+                "AND s.ts >= ? AND s.ts < ? "
+                "AND s.run_id IS NOT NULL AND s.run_id != '' "
+                "ORDER BY s.run_id ASC",
+                (prefix, upper, start, end),
+            ).fetchall()
+        ]
+        if not run_ids:
+            return None, None, _revision_digest(("prompt_money", name, start, end, True, ()))
+        placeholders = ",".join("?" * len(run_ids))
+        step_rows = [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT run_id, id, cost_nusd, version FROM steps "  # noqa: S608
+                f"WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, id ASC",
+                run_ids,
+            ).fetchall()
+        ]
+        mean_nusd, mean_usd = _mean_from_step_rows(step_rows)
+        rev = _revision_digest(("prompt_money", name, start, end, True, run_ids, step_rows))
+        return mean_nusd, mean_usd, rev
+
+    def for_adw(
+        self, conn: sqlite3.Connection, name: str, start: str, end: str
+    ) -> tuple[int | None, float | None, str]:
+        if not name or not _has_step_cost_nusd(conn):
+            return None, None, _revision_digest(("adw_money", name, start, end, False))
+        step_rows = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT r.id, s.id, s.cost_nusd, s.version "
+                "FROM runs r LEFT JOIN steps s ON s.run_id = r.id "
+                "WHERE r.adw IS NOT NULL AND r.adw = ? AND r.started >= ? AND r.started < ? "
+                "ORDER BY r.id ASC, s.id ASC",
+                (name, start, end),
+            ).fetchall()
+        ]
+        mean_nusd, mean_usd = _mean_from_step_rows(step_rows)
+        rev = _revision_digest(("adw_money", name, start, end, True, step_rows))
+        return mean_nusd, mean_usd, rev
+
+
+MONETARY_PRODUCER: MonetaryProjection | None = StoredMoneyProjection()
 
 _PROMPT_SQL = (
     "SELECT s.id, s.run_id, s.status, s.ok, s.seconds, s.ts, s.prompt_version, s.version, "

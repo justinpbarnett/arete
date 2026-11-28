@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 35
+MINOR = 36
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -250,7 +250,8 @@ RESOURCE = {
     "line": LINE,
     "view": VIEW,
     "step": obj({"id": INTEGER, "run_id": STRING, "name": STRING, "model": STRING, "runner": STRING,
-                 "cost_usd": NUMBER, "seconds": NUMBER,
+                 "cost_usd": NUMBER, "paid_usd": NULL_NUM, "price_version": NULL_TEXT, "auth_mode": NULL_TEXT,
+                 "seconds": NUMBER,
                  "settings_sha": NULL_TEXT,
                  "settings": {"type": ["object", "null"], "additionalProperties": JSON},
                  "inputs": {"type": ["array", "null"], "items": mapping(JSON)},
@@ -680,6 +681,13 @@ NODE_STATS = obj({
     "passRate": NULL_INT,
     "medianSeconds": NULL_NUM,
 })
+INSIGHT_CHART = {**STRING, "enum": ["shipped", "flow", "needs-you", "cost", "grid", "burnup", "evals", "jev"]}
+INSIGHT_FIELDS = {
+    "chart": INSIGHT_CHART,
+    "series": JSON,
+    "derived_seq": INTEGER,
+    "stale": BOOLEAN,
+}
 ADW_STATS_FIELDS = {
     "runs": INTEGER,
     "passRate": NULL_INT,
@@ -780,6 +788,24 @@ OPERATIONS += [
     operation("adw.stats", "config/adw/{name}/stats",
               envelope(ADW_STATS_FIELDS),
               obj({"name": CONFIG_NAME}), {"name": "feature"}),
+    {**operation(
+        "insight.get",
+        "insights/{chart}",
+        envelope(INSIGHT_FIELDS),
+        obj(
+            {
+                "chart": INSIGHT_CHART,
+                "days": STRING,
+                "by": STRING,
+                "min_seq": STRING,
+                "price_version": STRING,
+                "run_id": STRING,
+                "step": STRING,
+            },
+            ["chart"],
+        ),
+        {"chart": "cost"},
+    ), "scope": "read"},
     operation("config.versions", "config/{kind}/{name}/versions",
               envelope({"versions": array(STRING), "entries": array(CONFIG_VERSION)}, required=["seq", "versions"]),
               obj(CONFIG_ID), CONFIG_EXAMPLE),
@@ -1776,6 +1802,7 @@ ALIAS_ROUTES = (
     ("GET", "/api/health", "get_health"),
     ("GET", "/api/triage", "get_triage"),
     ("GET", "/api/outcomes", "get_outcomes"),
+    ("GET", "/api/insights/*", "get_insight"),
     ("GET", "/api/find", "get_find"),
     ("GET", "/api/usage", "get_usage"),
     ("GET", "/api/settings", "get_settings"),

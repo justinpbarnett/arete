@@ -65,10 +65,40 @@ def cmd_hold(args) -> int:
         return 1
 
 
+def _fetch_cost_insight(days: float | None, by: str | None = None, *, price_version: str | None = None,
+                        run_id: str | None = None, step: str | None = None) -> dict:
+    from urllib.parse import urlencode
+
+    from .. import client, insights
+
+    params: dict[str, str] = {}
+    if days is not None:
+        params["days"] = str(days)
+    if by:
+        params["by"] = by
+    if price_version:
+        params["price_version"] = price_version
+    if run_id:
+        params["run_id"] = run_id
+    if step:
+        params["step"] = step
+    if client.configured_server() is not None:
+        path = "/api/v1/insights/cost" + ("?" + urlencode(params) if params else "")
+        return client.request("GET", path)["series"]
+    return insights.query(
+        "cost",
+        days=days,
+        by=by,
+        price_version=price_version,
+        run_id=run_id,
+        step=step,
+    )[0]["series"]
+
+
 def cmd_costs(args) -> int:
     from pathlib import Path
 
-    from .. import control, record, util
+    from .. import record, util
 
     correct = getattr(args, "correct", None)
     backfill = getattr(args, "backfill", False)
@@ -101,8 +131,11 @@ def cmd_costs(args) -> int:
 
     if args.by or args.json:
         return print_step_costs(args.by or ["step"], args.days, args.json)
-    with foundation.one_read():
-        c = control.costs(args.days, connect=foundation.reader)
+    try:
+        c = _fetch_cost_insight(args.days)
+    except Exception as e:
+        print(e, file=sys.stderr)
+        return 1
     print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; subscription calls count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
@@ -156,11 +189,11 @@ def cmd_ab(args) -> int:
 
 
 def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
-    from .. import control
-
-    days, since = control.cost_window(days)
-    with foundation.one_read():
-        found = [(by, control.step_costs(by, days, connect=foundation.reader, since=since)) for by in groupings]
+    try:
+        found = [(by, _fetch_cost_insight(days, by)) for by in groupings]
+    except Exception as e:
+        print(e, file=sys.stderr)
+        return 1
     c = found[-1][1]
     waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
              "subscription_usd": c["subscription_usd"]}
@@ -263,12 +296,24 @@ def prices_compared(file: str | None, importing: bool) -> int:
         print(e, file=sys.stderr)
         return 1
     found = prices.diff(old if file is not None else None, new, util.now())
-    print_lines([*(json.dumps(f, ensure_ascii=False) for f in found),
-                 json.dumps({"source": new["source"], "observed": new["observed"], "version": new["version"],
-                             "routes": len(new["routes"]), "against": old["version"] if file is not None and old else None,
-                             "findings": dict(Counter(f["finding"] for f in found)), "imported": importing})])
+    summary = {
+        "source": new["source"],
+        "observed": new["observed"],
+        "version": new["version"],
+        "routes": len(new["routes"]),
+        "against": old["version"] if file is not None and old else None,
+        "findings": dict(Counter(f["finding"] for f in found)),
+        "imported": importing,
+    }
     if importing:
-        prices.store(new)
+        try:
+            imported = prices.import_models(new)
+            summary["content_version"] = imported["content_version"]
+            summary["commit"] = imported["commit"]
+        except Exception as e:
+            print(e, file=sys.stderr)
+            return 1
+    print_lines([*(json.dumps(f, ensure_ascii=False) for f in found), json.dumps(summary)])
     return 0
 
 
@@ -283,9 +328,24 @@ def prices_import(args) -> int:
 def prices_recompute(args) -> int:
     from .. import prices
 
+    pv = getattr(args, "price_version", None)
     try:
-        print_lines([json.dumps(prices.recompute(args.run_id, args.step), ensure_ascii=False)])
-    except ValueError as e:
+        if pv:
+            series = _fetch_cost_insight(None, price_version=pv, run_id=args.run_id, step=args.step)
+            matched = series.get("steps") or []
+            if not matched:
+                raise ValueError(f"no step for run {args.run_id} step {args.step}")
+            print_lines([json.dumps({
+                "run": args.run_id,
+                "step": args.step,
+                "price_version": pv,
+                "cost_usd": series["cost_usd"],
+                "paid_usd": series["paid_usd"],
+                "steps": matched,
+            }, ensure_ascii=False)])
+        else:
+            print_lines([json.dumps(prices.recompute(args.run_id, args.step), ensure_ascii=False)])
+    except Exception as e:
         print(e, file=sys.stderr)
         return 1
     return 0
@@ -335,7 +395,8 @@ def register(sub) -> None:
     a = psub.add_parser("diff", help="diff a snapshot file, or the stored snapshot, against the stored one")
     a.add_argument("file", metavar="FILE", nargs="?", default=None, help="the snapshot file")
     a.set_defaults(fn=prices_diff, local_read=True)
-    a = psub.add_parser("recompute", help="reprice one step of a run from the stored snapshot")
+    a = psub.add_parser("recompute", help="reprice one step of a run from the stored snapshot or a price version")
     a.add_argument("run_id", metavar="RUN_ID")
     a.add_argument("step", metavar="STEP")
+    a.add_argument("--price-version", default=None, help="price version to reprice against via insight.get")
     a.set_defaults(fn=prices_recompute, local_read=True)

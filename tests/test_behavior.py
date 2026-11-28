@@ -9733,8 +9733,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 176)
-        self.assertEqual(len({op["name"] for op in operations}), 176)
+        self.assertEqual(len(operations), 177)
+        self.assertEqual(len({op["name"] for op in operations}), 177)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -18909,8 +18909,14 @@ p_c.wait(timeout=5)
 record.settle(rid_c, "stopped")
 step_c = run_store.steps(rid_c)[0]
 
-with mock.patch.object(run_store, "billing_of", lambda step, local: "api_key" if step.get("runner") == "replay" else agent.billing_of(step, local)):
-    spent = run_store.loop_spent_since(since, loop="demo")
+# Replay steps store paid_nusd=0; once marked paid, loop_spent_since sums stored paid_nusd across all 3 runs.
+assert run_store.loop_spent_since(since, loop="demo") == 0.0
+with foundation.tx() as c:
+    c.execute(
+        "UPDATE steps SET paid_nusd = cost_nusd, auth_mode = 'api_key' WHERE run_id IN (?, ?, ?)",
+        (rid_a, rid_b, rid_c),
+    )
+spent = run_store.loop_spent_since(since, loop="demo")
 
 # Try and report: continued run's try matches run.jsonl and steps; factory.tally sums steps by node; record.label_step.
 write_answer("plan", {"ok": True, "text": "p1", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.005}]})

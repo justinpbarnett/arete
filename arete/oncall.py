@@ -927,7 +927,7 @@ def _repair_runs(repair: dict, limit: int = 50) -> list[dict]:
 
 def spent(cfg: config.Config, repairs: list[dict]) -> float:
     ids = [r["id"] for x in repairs if x["task"] for r in _repair_runs(x, limit=50)]
-    return sum(run_store.paid_by_run(ids, local_providers=cfg.local_providers).values())
+    return sum(run_store.paid_nusd_by_run(ids).values()) / 1_000_000_000
 
 
 def last_run_id(repair: dict) -> str:

@@ -57,7 +57,7 @@ REGISTRY = {
     "step_settings": kind("step_settings", "review", Home("config.toml", "defaults"),
                           Home("layers/{repo}/config.toml", "{repo}")),
     "models": kind("models", "check", Home("models/{name}.toml")),
-    "prices": kind("prices", "check", Home("prices/{name}.json")),
+    "prices": kind("prices", "check", Home("prices/{name}.toml")),
     "budgets": kind("budgets", "review", Home("budgets/{name}.toml")),
     "connector": kind("connector", "review", Home("connectors/{name}.toml")),
     "source": kind("source", "review", Home("sources/{name}.toml")),

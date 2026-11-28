@@ -1541,6 +1541,13 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
                                 for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
+    if isinstance(source, Path) and (source.parent / "prices" / "billing.toml").is_file():
+        from . import prices as prices_mod
+
+        billing_policy = prices_mod.load_billing(source.parent, cfg=cfg)
+        if billing_policy.content_version:
+            cfg.local_providers = list(billing_policy.local_providers)
+            cfg.pricing = billing_policy.as_cfg_pricing()
     cfg.routing = routing_table(data.get("routing", {}), default_modes=PAYMENT_MODES,
                                 problems=problems, path=source, scope="global")
     cfg.jira = jira_table(data.get("jira", {}))

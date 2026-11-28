@@ -501,11 +501,19 @@ def drop_draft(chat_id: int) -> dict:
 
 def limits(chat_id: int, row: dict, cfg: config.Config) -> dict:
     links = chats_store.chat_sessions(chat_id)
-    paid = run_store.paid_by_run([link["run_id"] for link in links])
+    paid_nusd = run_store.paid_nusd_by_run([link["run_id"] for link in links])
     running = [link for link in links if link["status"] in ("running", "queued")]
-    spent = row["paid_usd"] + replying.get(chat_id, 0) + sum(
-        max(link["budget_usd"] or 0, paid.get(link["run_id"], 0)) if link["status"] in ("running", "queued")
-        else paid.get(link["run_id"], 0) for link in links)
+    base_nusd = int(row["paid_nusd"]) if row.get("paid_nusd") is not None else int(util.nusd(row["paid_usd"]) or 0)
+    replying_nusd = int(util.nusd(replying.get(chat_id, 0)) or 0)
+    links_nusd = 0
+    for link in links:
+        run_paid = paid_nusd.get(link["run_id"], 0)
+        if link["status"] in ("running", "queued"):
+            budget_nusd = int(util.nusd(link["budget_usd"] or 0) or 0)
+            links_nusd += max(budget_nusd, run_paid)
+        else:
+            links_nusd += run_paid
+    spent = (base_nusd + replying_nusd + links_nusd) / 1_000_000_000
     return {"max_sessions": cfg.chat.max_sessions, "running": len(running), "budget_usd": cfg.chat.budget_usd,
             "spent": round(spent, 4), "left": round(cfg.chat.budget_usd - spent, 4)}
 

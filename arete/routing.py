@@ -689,6 +689,13 @@ class Discovery:
             found.append(Way(link, "pi", link.model, "pi_key", "paid", "api_key"))
         return found
 
+    def _reference_snapshot(self) -> dict | None:
+        from . import pins
+
+        if (pin := pins.current()) is not None:
+            return pin.reference_prices
+        return prices.load()
+
     def quote(self, way: Way, request_tokens: int = 0) -> Quote:
         if not (self.priced or self.paid.capped):
             return Quote()
@@ -699,7 +706,7 @@ class Discovery:
         rate = self.cfg.pricing.get(name) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
             return Quote(rate[0], rate[1], source="pricing")
-        snapshot = self.remembered("price_snapshot", prices.load)
+        snapshot = self.remembered("price_snapshot", self._reference_snapshot)
         if found := prices.applied(snapshot, way.runner, (way.model,), util.now(), request_tokens or None):
             return Quote(*prices.per_million_usd(found), source="snapshot", applied=found)
         if way.runner != "pi":
@@ -992,5 +999,4 @@ def described_selection(selection: Selection, settings, request_tokens: int) -> 
 def loop_budget_left(cfg: config.Config) -> float | None:
     if not cfg.daily_budget_usd:
         return None
-    return cfg.daily_budget_usd - run_store.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
-                                                         cfg.local_providers)
+    return cfg.daily_budget_usd - run_store.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None)
