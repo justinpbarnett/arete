@@ -883,7 +883,8 @@ _NON_ATOMIC_COMMANDS = frozenset((
     "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
     "triage.refresh", "triage.research", "health.check", "incident.scan",
-    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try", "draft.discard",
+    "config.draft", "config.check", "config.activate", "config.rollback", "config.delete", "config.try",
+    "config.ask", "config.promote", "draft.discard",
 ))
 
 
@@ -989,6 +990,7 @@ def mutation(name, values, handler):
             why=values.get("why", ""),
             instruction=values.get("instruction", ""),
             model=values.get("model", ""),
+            level=values.get("level"),
             run_check=values.get("check", True),
         )
         result = {"draft": drafts.public(draft_row), "report": report}
@@ -1056,6 +1058,26 @@ def mutation(name, values, handler):
             values["steps"],
             _config_actor(handler),
         )
+    elif name == "config.ask":
+        run_row = drafts.start_config_ask(
+            values["kind"],
+            values["name"],
+            instruction=values["instruction"],
+            base_version=values["base_version"],
+            actor=_config_actor(handler),
+            level=values.get("level"),
+        )
+        if handler is not None and run_row:
+            handler.success_status = 202
+            handler.location = f"/api/v1/runs/{quote(run_row['id'], safe='')}"
+        result = {"run": run_object(run_row)}
+    elif name == "config.promote":
+        item = drafts.promote(
+            values["kind"],
+            values["name"],
+            actor=_config_actor(handler),
+        )
+        result = {"item": item}
     elif name == "draft.discard":
         result = {"draft": drafts.public(drafts.discard(values["draft"], reason=values.get("reason")))}
     elif name in ("loop.enable", "loop.disable"):

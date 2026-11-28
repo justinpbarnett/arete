@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 28
+MINOR = 29
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -238,6 +238,7 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("internal_error", 500, "The server could not complete the request."),
     ("not_implemented", 501, "The server does not implement this method."),
     ("secret_store_missing", 501, "This instance has no secret store configured."),
+    ("outbox_missing", 501, "This instance has no outbox configured."),
     ("secret_internal", 409, "This secret is managed by its owning service."),
     ("already_resolved", 409, "This inbox item is already resolved."),
     ("too_late", 409, "The ten-second window to reopen this inbox item has closed."),
@@ -274,9 +275,10 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         "task:write" if noun in ("comment", "task_ref", "task_link") else f"{noun}:write"
     )
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
-                       "secret_store_missing", "secret_internal", "already_resolved", "too_late", "already_sent",
-                       "not_reversible", "already_open", "referenced", "engine_default", "still_missing", "validation",
-                       "gate_refused", "presence_expired", "lease_fenced", "lease_expired", "files_purged"}
+                       "secret_store_missing", "outbox_missing", "secret_internal", "already_resolved", "too_late",
+                       "already_sent", "not_reversible", "already_open", "referenced", "engine_default",
+                       "still_missing", "validation", "gate_refused", "presence_expired", "lease_fenced",
+                       "lease_expired", "files_purged"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
@@ -403,13 +405,16 @@ for _error in ERRORS:
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
                 "files_purged": {"purged_at": STRING},
-                "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
+                "forbidden": {"reason": STRING}, "conflict": {"reason": STRING},
+                "validation": {"path": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
                             "code": {"type": "string", "enum": [_code]}, **_details})
     if _code in ("forbidden", "conflict"):
         _error["schema"]["required"].remove("reason")
-    if _code == "invalid_state":
+    elif _code == "validation":
+        _error["schema"]["required"].remove("path")
+    elif _code == "invalid_state":
         _error["schema"]["required"].remove("current")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
                          "detail": _description, "error": _description}
@@ -556,8 +561,24 @@ CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkind
                "description": "For step_settings, defaults selects config.toml and defaults@layer selects "
                               "layers/defaults/config.toml."}
 CONFIG_ID = {"kind": CONFIG_KIND, "name": CONFIG_NAME}
+CONFIG_PROMPT_APPEND = obj({
+    "layer": STRING,
+    "name": STRING,
+    "path": STRING,
+    "version": STRING,
+}, ["layer", "name", "path", "version"])
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
-CONFIG_ITEM_RICH = {**CONFIG_ITEM, "subject": STRING, "version": INTEGER, "content_version": STRING, "level": STRING}
+CONFIG_ITEM_RICH = {
+    **CONFIG_ITEM,
+    "subject": STRING,
+    "version": INTEGER,
+    "content_version": STRING,
+    "level": STRING,
+    "overrides": NULL_TEXT,
+    "base": NULL_TEXT,
+    "drift": BOOLEAN,
+    "appends": array(CONFIG_PROMPT_APPEND),
+}
 CONFIG_ITEM_SCHEMA = obj(CONFIG_ITEM_RICH, ["kind", "name", "path"])
 CONFIG_READ_ITEM_SCHEMA = obj({**CONFIG_ITEM_RICH, "content": {"type": ["string", "object"]}},
                               ["kind", "name", "path", "content"])
@@ -567,6 +588,11 @@ CONFIG_VERSION = obj({"version": INTEGER, "content_version": STRING, "commit_sha
                       "origin": STRING, "path": STRING, "n": INTEGER, "author": STRING, "source": STRING,
                       "note": STRING, "at": STRING, "live": BOOLEAN})
 CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
+CHECK_WARNING = obj({
+    "code": STRING,
+    "path": STRING,
+    "message": STRING,
+}, ["code", "path", "message"])
 CHECK_STAGE = obj({
     "name": STRING,
     "ok": BOOLEAN,
@@ -579,7 +605,8 @@ CHECK_REPORT = obj({
     "stages": array(CHECK_STAGE),
     "gate": {**STRING, "enum": ["A", "B", "C"]},
     "exposes": array(STRING),
-})
+    "warnings": array(CHECK_WARNING),
+}, ["validator", "ok", "stages", "gate", "exposes"])
 CONFIG_DRAFT = obj({
     "id": STRING,
     "kind": STRING,
@@ -651,7 +678,7 @@ OPERATIONS += [
     {**operation("config.draft", "config/{kind}/{name}/draft",
                  envelope({"draft": CONFIG_DRAFT, "report": {"anyOf": [CHECK_REPORT, {"type": "null"}]}}, ["seq", "draft"]),
                  obj({**CONFIG_ID, "body": STRING, "base_version": CONFIG_BASE_VER, "why": STRING,
-                      "instruction": STRING, "model": STRING, "path": STRING, "check": BOOLEAN},
+                      "instruction": STRING, "model": STRING, "path": STRING, "level": STRING, "check": BOOLEAN},
                      [*CONFIG_ID, "body"]),
                  {**CONFIG_EXAMPLE, "body": "max_parallel = 2\n"}, "PUT",
                  errors=("validation", "invalid_state"), success_status=201),
@@ -683,6 +710,19 @@ OPERATIONS += [
                  {**CONFIG_EXAMPLE, "draft": "CD-1", "steps": ["plan"]}, "POST",
                  errors=("validation", "invalid_state", "files_purged"), success_status=201),
      "scope": "config:draft"},
+    {**operation("config.ask", "config/{kind}/{name}/ask",
+                 envelope({"run": RUN}, ["seq", "run"]),
+                 obj({**CONFIG_ID, "instruction": STRING, "base_version": CONFIG_BASE_VER, "level": STRING},
+                     [*CONFIG_ID, "instruction", "base_version"]),
+                 {"kind": "prompt", "name": "build", "instruction": "Mention kumquat", "base_version": 0}, "POST",
+                 errors=("validation", "invalid_state"), success_status=202),
+     "scope": "config:draft"},
+    {**operation("config.promote", "config/{kind}/{name}/promote",
+                 envelope({"item": OUTBOX_ITEM}),
+                 obj(CONFIG_ID),
+                 {"kind": "prompt", "name": "build"}, "POST",
+                 errors=("validation", "outbox_missing"), success_status=201),
+     "scope": "config:activate"},
     operation("draft.list", "drafts", envelope({"drafts": array(CONFIG_DRAFT)}),
               obj({"state": STRING, "kind": STRING, "name": STRING, "author": STRING}, [])),
     operation("draft.get", "drafts/{draft}", envelope({"draft": CONFIG_DRAFT}),

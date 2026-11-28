@@ -23,7 +23,7 @@
     ],
     "step names": [
       "ValueError",
-      "[steps]: unknown step a, z; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+      "[steps]: unknown step a, z; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, config_ask, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
     ],
     "step keys": [
       "ValueError",
@@ -63,7 +63,7 @@
     ],
     "kind step names": [
       "ValueError",
-      "[kinds.feat.steps]: unknown step bad; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+      "[kinds.feat.steps]: unknown step bad; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, config_ask, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
     ],
     "pricing number": [
       "ValueError",
@@ -307,7 +307,7 @@
     ],
     "ab step": [
       "ValueError",
-      "[ab.test]: unknown step []; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+      "[ab.test]: unknown step []; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, config_ask, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
     ],
     "ab kind": [
       "ValueError",
@@ -405,7 +405,8 @@
       "research_audit",
       "explain",
       "document",
-      "capture_evidence"
+      "capture_evidence",
+      "config_ask"
     ],
     "MODEL_FALLBACKS": [
       [
@@ -455,6 +456,10 @@
       [
         "capture_evidence",
         "sonnet"
+      ],
+      [
+        "config_ask",
+        "sonnet"
       ]
     ],
     "INHERITS": [
@@ -502,6 +507,7 @@
       "explain",
       "document",
       "capture_evidence",
+      "config_ask",
       "check_repair",
       "review_repair",
       "ci_repair",
@@ -531,6 +537,7 @@
       "explain",
       "document",
       "capture_evidence",
+      "config_ask",
       "check_repair",
       "review_repair",
       "ci_repair",
@@ -539,7 +546,7 @@
       "implement"
     ]
   },
-  "cli": "8b97af33dfa29f6211434b51613033155aa918fcccc8a4696527b58a36f3bc76",
+  "cli": "f63dd2f224193152a84ee33da94feef9595c91827a1097919bf4ca1bd376a034",
   "settings": {
     "steps": {
       "": {
@@ -565,6 +572,7 @@
         "explain": "312e41fcb7f61c415c1184d6f742c8a7ee187ce4a8c8158d55e4b81b189144fa",
         "document": "927d608c7ceb135f2312c6f6b31fd770eb105781dcd42e5aa50532b73eeea8cf",
         "capture_evidence": "327ac5fe9c2998096989b23b4e3086628d03e8cbeb90cd0f5e6e10495439361e",
+        "config_ask": "cf427b8f324a22c0a247e1c8bb225cf0336205558807c0209fffdc344ac421f3",
         "check_repair": "d1a4097257223079d591de83ccc4fc7cf7e35e8c120142c48615d622268b4117",
         "review_repair": "18474ce1fc9ee6bd000d70b9e9564370e1517bb5d20e7b059153a0ac646be683",
         "ci_repair": "973ae4da472f28a098c88844ff98603cf42b0829177f18285101c1534cbbceb8",
@@ -595,6 +603,7 @@
         "explain": "312e41fcb7f61c415c1184d6f742c8a7ee187ce4a8c8158d55e4b81b189144fa",
         "document": "927d608c7ceb135f2312c6f6b31fd770eb105781dcd42e5aa50532b73eeea8cf",
         "capture_evidence": "327ac5fe9c2998096989b23b4e3086628d03e8cbeb90cd0f5e6e10495439361e",
+        "config_ask": "cf427b8f324a22c0a247e1c8bb225cf0336205558807c0209fffdc344ac421f3",
         "check_repair": "711b7ef6c1a8b8593c44221d9ec7d10996834fe223dc1768b0385c89049a5871",
         "review_repair": "7f68e34948c4db7aa6d248f30348ecf81d7ed51dfd7e3a3153bb64c85bddbf0d",
         "ci_repair": "56c3409bb616edfa01f699fefdb64303ff08959fa01881258ec075ac24835271",
@@ -625,6 +634,7 @@
         "explain": "312e41fcb7f61c415c1184d6f742c8a7ee187ce4a8c8158d55e4b81b189144fa",
         "document": "927d608c7ceb135f2312c6f6b31fd770eb105781dcd42e5aa50532b73eeea8cf",
         "capture_evidence": "327ac5fe9c2998096989b23b4e3086628d03e8cbeb90cd0f5e6e10495439361e",
+        "config_ask": "cf427b8f324a22c0a247e1c8bb225cf0336205558807c0209fffdc344ac421f3",
         "check_repair": "d1a4097257223079d591de83ccc4fc7cf7e35e8c120142c48615d622268b4117",
         "review_repair": "18474ce1fc9ee6bd000d70b9e9564370e1517bb5d20e7b059153a0ac646be683",
         "ci_repair": "973ae4da472f28a098c88844ff98603cf42b0829177f18285101c1534cbbceb8",

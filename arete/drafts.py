@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import sqlite3
 import statistics
 from datetime import timedelta
 from difflib import unified_diff
 from pathlib import Path
 
-from . import configitems, configkinds, configrepo, contract, paths, pins, principals, record, util
+from . import configitems, configkinds, configrepo, contract, paths, pins, principals, prompts, record, util
 from .store import blobs as blob_store
 from .store import config as config_store
 from .store import db as foundation
@@ -52,6 +54,9 @@ WATCH_WINDOW_DAYS = 30
 WATCH_RUN_SAMPLE = 10
 PASSED_STATUSES = frozenset(("done", "pr", "merged"))
 SETTLED_EXCLUDED = frozenset(("queued", "running", "needs-info"))
+CONFIG_ASK_TRIES = 3
+CONFIG_ASK_LOG = "config-ask.log"
+PROMOTABLE_KINDS = frozenset(("prompt", "schema", "adw", "routes", "step_settings"))
 
 
 class PresenceRequired(Exception):
@@ -738,6 +743,51 @@ def _live_ver_for(kind: str, name: str, path: str, conn=None) -> int:
     return 0
 
 
+def _prepare_prompt_draft(
+    name: str,
+    body: str,
+    *,
+    path: str = "",
+    level: str | None = None,
+) -> tuple[str, str, str]:
+    clean_level = (level or "").strip()
+    is_layer = False
+    if clean_level:
+        if clean_level == "config":
+            is_layer = False
+        elif clean_level.startswith("layer:"):
+            repo_name = clean_level.removeprefix("layer:").strip()
+            if not repo_name or not re.fullmatch(configkinds.NAME_PATTERN, repo_name):
+                raise contract.Problem("validation", f"Invalid layer level {clean_level!r}.", path="level")
+            is_layer = True
+            if not path:
+                if name.endswith(".append") and "." in name[:-7]:
+                    _, _, stem = name[:-7].partition(".")
+                    path = f"layers/{repo_name}/prompts/{stem}.append.md"
+                else:
+                    path = f"layers/{repo_name}/prompts/{name}.append.md"
+                    name = f"{repo_name}.{name}.append"
+        else:
+            raise contract.Problem("validation", f"Unsupported config draft level {clean_level!r}.", path="level")
+
+    rel = path or default_path("prompt", name)
+    if is_layer or rel.startswith("layers/") or name.endswith(".append"):
+        try:
+            fm, _ = prompts.parse(body)
+        except ValueError:
+            fm = {}
+        if "overrides" in fm:
+            raise contract.Problem(
+                "validation",
+                "Layer prompt fragment may not declare overrides.",
+                path="bytes",
+            )
+        return name, rel, body
+
+    prepared = prompts.fill_override_front_matter(name, body)
+    return name, rel, prepared
+
+
 def create_and_check(
     kind: str,
     name: str,
@@ -750,13 +800,17 @@ def create_and_check(
     instruction: str = "",
     model: str = "",
     evidence: object = None,
+    level: str | None = None,
     run_check: bool = True,
 ) -> tuple[dict, dict | None]:
     from . import configcheck
 
     if kind not in configkinds.REGISTRY:
         raise contract.Problem("not_found", f"Unknown config kind {kind}")
-    rel = path or default_path(kind, name)
+    if kind == "prompt":
+        name, rel, body = _prepare_prompt_draft(name, body, path=path, level=level)
+    else:
+        rel = path or default_path(kind, name)
     actor = author or principals.current()
     root = paths.CONFIG_DIR.resolve()
     old_bytes = configrepo.live_bytes(rel, root) if configrepo.is_repo(root) else (
@@ -1617,3 +1671,294 @@ def watch_tick() -> list[dict]:
             )
             results.append({"draft": draft["id"], "watch": outcome, "reasons": reasons})
     return results
+
+
+# ---------------------------------------------------------------------------
+# config.ask (config_ask role) and config.promote
+# ---------------------------------------------------------------------------
+
+def start_config_ask(
+    kind: str,
+    name: str,
+    *,
+    instruction: str,
+    base_version: str | int,
+    actor: str = "",
+    level: str | None = None,
+) -> dict:
+    from . import control
+
+    if kind not in configkinds.REGISTRY:
+        raise contract.Problem("not_found", f"Unknown config kind {kind}")
+    clean_instruction = str(instruction or "").strip()
+    if not clean_instruction:
+        raise contract.Problem("validation", "instruction is required for config.ask.")
+    # Verify target config item exists (or resolves from engine).
+    configitems.item(kind, name)
+
+    who = actor or principals.current()
+    run_id = record.start(
+        "draft",
+        trigger="manual",
+        status="queued",
+        pid=None,
+        started_by=who,
+        summary=f"config.ask {kind}/{name}: {util.first_line(clean_instruction, 160)}",
+    )
+    args = [
+        "config", "ask-run",
+        "--run-id", run_id,
+        "--kind", kind,
+        "--name", name,
+        "--base-version", str(base_version),
+        "--instruction", clean_instruction,
+    ]
+    if level:
+        args.extend(["--level", level])
+    record.write_launch(run_id, control.command(args), CONFIG_ASK_LOG)
+    with record.failed_on_crash(run_id):
+        control.detach(args, CONFIG_ASK_LOG)
+    return run_store.run_get(run_id)
+
+
+def _live_state_for_base_check(kind: str, name: str, rel: str) -> tuple[int, dict | None]:
+    lookup_kind = "step_settings" if kind == "attention" else kind
+    live_row = config_store.live_item(lookup_kind, name) or config_store.live_by_path(rel)
+    live_ver = int(live_row["ver"]) if live_row and live_row.get("ver") is not None else 0
+    return live_ver, live_row
+
+
+def run_config_ask(
+    kind: str,
+    name: str,
+    *,
+    instruction: str,
+    base_version: str | int,
+    run_id: str = "",
+    level: str | None = None,
+) -> dict:
+    from . import configcheck, runner, steps
+
+    pin_res = pins.resolve("draft")
+    cfg = pin_res.cfg
+    clean_instruction = str(instruction or "").strip()
+    if run_id:
+        record.claim(run_id, pid=os.getpid(), resolution=pin_res)
+    else:
+        run_id = record.start(
+            "draft",
+            trigger="manual",
+            summary=f"config.ask {kind}/{name}: {util.first_line(clean_instruction, 160)}",
+            resolution=pin_res,
+        )
+
+    def tell(feed_kind: str, text: str) -> None:
+        run_store.add_feed(run_id, feed_kind, text)
+
+    with pins.use(pin_res), record.stoppable(), record.failed_on_crash(run_id):
+        found = configitems.item(kind, name)
+        loaded = configitems.read(found)
+        current_content = loaded["content"]
+        current_text = current_content if isinstance(current_content, str) else json.dumps(current_content, indent=2)
+        target_name = name
+        rel = default_path(kind, name)
+        if kind == "prompt" and level and level.startswith("layer:"):
+            repo_name = level.removeprefix("layer:").strip()
+            if not name.endswith(".append"):
+                rel = f"layers/{repo_name}/prompts/{name}.append.md"
+                target_name = f"{repo_name}.{name}.append"
+
+        live_ver, live_row = _live_state_for_base_check(kind, target_name, rel)
+        if not _matches_base_version(base_version, live_ver, live_row):
+            msg = f"version_conflict: {kind}/{target_name} is at version {live_ver}, not {base_version}"
+            record.settle(run_id, "failed", end_line=f"failed: {msg}", summary=msg[:500])
+            return {"run": run_id, "status": "failed", "code": "version_conflict", "error": msg}
+
+        step_cfg = steps.resolve(cfg, None, "config_ask")
+        ask_schema = prompts.engine_schema("config_ask")
+        root = paths.CONFIG_DIR.resolve()
+        old_bytes = configrepo.live_bytes(rel, root) if configrepo.is_repo(root) else (
+            (root / rel).read_bytes() if (root / rel).is_file() else None
+        )
+        actor = f"run:{run_id}/config_ask"
+        work = paths.draft_dir(run_id)
+        work.mkdir(parents=True, exist_ok=True)
+        feedback = ""
+        candidate_body = ""
+        why_text = ""
+        used_model = step_cfg.model
+        last_problems: list[str] = []
+        valid = False
+        try:
+            for attempt in range(1, CONFIG_ASK_TRIES + 1):
+                tell("config_ask", f"drafting {kind}/{target_name}, try {attempt} of {CONFIG_ASK_TRIES}")
+                rendered = prompts.render_engine(
+                    "config_ask",
+                    kind=kind,
+                    item_name=target_name,
+                    path=rel,
+                    instruction=clean_instruction,
+                    current=current_text,
+                    feedback=feedback,
+                )
+                res = runner.run(
+                    rendered,
+                    work,
+                    model=step_cfg.model,
+                    runner=step_cfg.runner,
+                    effort=step_cfg.effort_on(step_cfg.runner),
+                    trace=(run_id, "config_ask"),
+                    cfg=cfg,
+                    tools=[],
+                    json_schema=ask_schema,
+                    persist=False,
+                    timeout=step_cfg.timeout_minutes * 60,
+                    wait_out_limits=False,
+                    atom="config_ask",
+                    try_no=attempt,
+                )
+                used_model = res.model or step_cfg.model
+                record.note(run_id, model=used_model, runner=res.runner)
+                if not res.ok:
+                    last_problems = [f"the model failed: {util.first_line(res.error, 300)}"]
+                    tell("config_ask", f"  {last_problems[0]}")
+                    if res.usage_limit:
+                        break
+                    feedback = (
+                        "## Check problems from previous try\n\n"
+                        + "\n".join(f"- {p}" for p in last_problems)
+                        + "\n\nFix these problems and return the whole updated body and why."
+                    )
+                    continue
+                answer = res.structured if isinstance(res.structured, dict) else {}
+                raw_body = answer.get("body")
+                why_text = str(answer.get("why") or "").strip()
+                if not isinstance(raw_body, str) or not raw_body.strip():
+                    last_problems = ["response body must be a non-empty string"]
+                    tell("config_ask", f"  {last_problems[0]}")
+                    feedback = (
+                        "## Check problems from previous try\n\n"
+                        "- response `body` must be a non-empty string.\n\n"
+                        "Fix this and return the whole updated body and why."
+                    )
+                    continue
+                try:
+                    if kind == "prompt":
+                        _, rel, candidate_body = _prepare_prompt_draft(target_name, raw_body, path=rel, level=level)
+                    else:
+                        candidate_body = raw_body
+                except contract.Problem as exc:
+                    last_problems = [str(exc)]
+                    tell("config_ask", f"  validation failed: {last_problems[0]}")
+                    feedback = (
+                        "## Check problems from previous try\n\n"
+                        f"- {last_problems[0]}\n\n"
+                        "Fix this and return the whole updated body and why."
+                    )
+                    continue
+                report = configcheck.check(
+                    kind,
+                    target_name,
+                    rel,
+                    candidate_body,
+                    author=actor,
+                    config_dir=root,
+                    old_bytes=old_bytes,
+                )
+                if report["ok"]:
+                    valid = True
+                    break
+                last_problems = [p for st in report["stages"] for p in st.get("problems", ())] or ["configcheck failed"]
+                tell("config_ask", f"  check failed: {'; '.join(last_problems)}")
+                feedback = (
+                    "## Check problems from previous try\n\n"
+                    + "\n".join(f"- {p}" for p in last_problems)
+                    + "\n\nPrevious body:\n\n```\n"
+                    + candidate_body
+                    + "\n```\n\nFix all problems and return the whole updated body and why."
+                )
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+        if not valid:
+            msg = f"no valid draft after {CONFIG_ASK_TRIES} tries: {'; '.join(last_problems)}"
+            record.settle(run_id, "failed", end_line=f"failed: {msg}", summary=msg[:500])
+            return {"run": run_id, "status": "failed", "error": msg}
+
+        live_ver, live_row = _live_state_for_base_check(kind, target_name, rel)
+        if not _matches_base_version(base_version, live_ver, live_row):
+            msg = f"version_conflict: {kind}/{target_name} moved to version {live_ver}, expected {base_version}"
+            record.settle(run_id, "failed", end_line=f"failed: {msg}", summary=msg[:500])
+            return {"run": run_id, "status": "failed", "code": "version_conflict", "error": msg}
+
+        draft_row, _ = create_and_check(
+            kind,
+            target_name,
+            candidate_body,
+            author=actor,
+            path=rel,
+            base_version=base_version,
+            why=why_text,
+            instruction=clean_instruction,
+            model=used_model,
+            level=level,
+            run_check=True,
+        )
+        summary = f"drafted {draft_row['id']} for {kind}/{target_name}"
+        record.settle(run_id, "done", end_line=f"done: {summary}", summary=summary)
+        return {"run": run_id, "status": "done", "draft": public(draft_row)}
+
+
+def promote(kind: str, name: str, *, actor: str = "") -> dict:
+    from . import api, config, outbox
+    from .store import outbox as outbox_store
+
+    if kind not in PROMOTABLE_KINDS:
+        raise contract.Problem("not_found", f"Config kind {kind!r} does not support promote.")
+    features = (api.meta().get("features") or {})
+    if not features.get("outbox"):
+        raise contract.Problem("outbox_missing", "This instance has no outbox configured.")
+    with foundation.reader() as c:
+        if not outbox_store.available(c):
+            raise contract.Problem("outbox_missing", "This instance has no outbox configured.")
+
+    found = configitems.item(kind, name)
+    loaded = configitems.read(found)
+    content = loaded["content"]
+    content_text = content if isinstance(content, str) else json.dumps(content, indent=2)
+    digest = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+
+    cfg, _ = config.load_or_problem()
+    engine_repo = next((r.github for r in cfg.repos if r.name == cfg.arete_repo and r.github), "")
+    if not engine_repo:
+        engine_repo = "justinpbarnett/arete"
+
+    engine_path = (
+        f"arete/prompts/{name}.md" if kind == "prompt"
+        else f"arete/schemas/{name}.json" if kind == "schema"
+        else f"arete/adws/{name}.toml" if kind == "adw"
+        else f"arete/routes/{name}.toml" if kind == "routes"
+        else "arete/defaults/steps.toml"
+    )
+    payload = {
+        "action": "create",
+        "repo": engine_repo,
+        "title": f"Promote config {kind}/{name} to engine",
+        "body": f"Promote `{kind}/{name}` (`{loaded['path']}`) to `{engine_path}`.\n\nContent version: `{loaded['content_version']}`",
+        "kind": kind,
+        "name": name,
+        "engine_path": engine_path,
+        "content": content_text,
+    }
+    item_id = outbox.draft(
+        target="github",
+        kind="pr",
+        object=f"github:{engine_repo}",
+        audience="public",
+        body=json.dumps(payload),
+        drafted_by=actor or principals.current(),
+        slot=f"config-promote:{kind}:{name}:{digest[:12]}",
+        summary=f"Promote {kind}/{name} to engine",
+        hold_as_draft=True,
+    )
+    return outbox_store.get(item_id)

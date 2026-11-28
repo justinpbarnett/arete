@@ -153,7 +153,7 @@ def needs_ver_rebuild(conn: sqlite3.Connection) -> bool:
     if not available(conn) or not has_ver(conn):
         return False
     return conn.execute(
-        "SELECT 1 FROM config_index WHERE origin != 'engine' AND ver = 0 LIMIT 1"
+        "SELECT 1 FROM config_index WHERE origin != 'engine' AND sha256 != 'absent' AND ver = 0 LIMIT 1"
     ).fetchone() is not None
 
 
@@ -242,7 +242,7 @@ def record_deleted(
         ver = 0 if origin == "engine" else (max_ver(conn, kind, name) + 1 if with_ver else 0)
     tombstone = f"{kind}/{name}{DELETED_SUFFIX}"
     fields_json = '{"deleted":true}'
-    conn.execute("UPDATE config_index SET live = 0 WHERE origin = ? AND path = ? AND live = 1", (origin, path))
+    mark_deleted(conn, origin, path)
     existing = conn.execute(
         "SELECT n FROM config_index WHERE origin = ? AND path = ? AND sha256 = ''",
         (origin, path),

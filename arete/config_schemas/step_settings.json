@@ -90,6 +90,7 @@
         "explain": {"$ref": "#/$defs/step"},
         "document": {"$ref": "#/$defs/step"},
         "capture_evidence": {"$ref": "#/$defs/step"},
+        "config_ask": {"$ref": "#/$defs/step"},
         "check_repair": {"$ref": "#/$defs/step"},
         "review_repair": {"$ref": "#/$defs/step"},
         "ci_repair": {"$ref": "#/$defs/step"},

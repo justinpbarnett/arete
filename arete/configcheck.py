@@ -307,6 +307,31 @@ def _validate_schema(kind: str, name: str, path: str, parsed: object, raw_bytes:
     return problems
 
 
+def _extract_step_prompt_maps(parsed: dict) -> tuple[dict[str, dict], dict[str, dict[str, dict]]]:
+    cfg_steps: dict[str, dict] = {}
+    raw_steps = parsed.get("steps")
+    if isinstance(raw_steps, dict):
+        for role_name, tbl in raw_steps.items():
+            if isinstance(tbl, dict):
+                canonical = config.STEP_ALIASES.get(role_name, role_name)
+                cfg_steps[canonical] = tbl
+    cfg_kinds: dict[str, dict[str, dict]] = {}
+    raw_kinds = parsed.get("kinds")
+    if isinstance(raw_kinds, dict):
+        for tk, k_tbl in raw_kinds.items():
+            if not isinstance(k_tbl, dict):
+                continue
+            k_steps = k_tbl.get("steps")
+            if isinstance(k_steps, dict):
+                role_map: dict[str, dict] = {}
+                for role_name, tbl in k_steps.items():
+                    if isinstance(tbl, dict):
+                        canonical = config.STEP_ALIASES.get(role_name, role_name)
+                        role_map[canonical] = tbl
+                cfg_kinds[str(tk)] = role_map
+    return cfg_steps, cfg_kinds
+
+
 def _validate_references(
     kind: str,
     name: str,
@@ -316,9 +341,10 @@ def _validate_references(
     *,
     staged_targets: dict[str, object] | None = None,
     extra_adws: set[str] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[dict[str, str]]]:
     where = path or f"{kind}/{name}"
     problems: list[str] = []
+    warnings: list[dict[str, str]] = []
     if kind == "rule" and isinstance(parsed, dict):
         try:
             targets = outbox_config.load_targets(config_dir)
@@ -350,30 +376,58 @@ def _validate_references(
                         for server in table["mcp"]:
                             if isinstance(server, str) and known_mcp and server not in known_mcp:
                                 problems.append(f"{where}: step {step_name} references unknown mcp server {server!r}")
+            cfg_steps, cfg_kinds = _extract_step_prompt_maps(parsed)
+            for pp in prompts.binding_problems(None, config_dir=config_dir, cfg_steps=cfg_steps, cfg_kinds=cfg_kinds):
+                problems.append(pp.message)
+    elif kind == "schema" and isinstance(parsed, dict):
+        engine_file = paths.SCHEMAS_DIR / f"{name}.json"
+        if not engine_file.is_file():
+            problems.append(f"{where}: unknown engine schema {name!r}")
+        else:
+            try:
+                eng = json.loads(engine_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                problems.append(f"{where}: could not read engine schema: {error}")
+            else:
+                if eng.get("type") == "object" and "type" in parsed and parsed.get("type") != "object":
+                    problems.append(f"{where}: schema type must be 'object'")
+                if "properties" in parsed and not isinstance(parsed.get("properties"), dict):
+                    problems.append(f"{where}: properties must be a JSON object")
+                eng_required = set(eng.get("required") or ())
+                raw_req = parsed.get("required")
+                if raw_req is not None and (not isinstance(raw_req, list) or not all(isinstance(x, str) for x in raw_req)):
+                    problems.append(f"{where}: required must be a list of field names")
+                else:
+                    new_required = set(raw_req or ())
+                    if dropped := sorted(eng_required - new_required):
+                        problems.append(
+                            f"{where}: drops required field(s) {', '.join(dropped)} from engine schema {name}"
+                        )
     elif kind == "prompt" and isinstance(parsed, str):
-        # If overriding an engine prompt, ensure template placeholders match (allowing renamed aliases).
-        if not name.endswith(".append"):
-            engine_file = paths.PROMPTS_DIR / f"{name}.md"
-            if engine_file.is_file():
+        if not name.endswith(".append") and not path.startswith("layers/"):
+            cfg_file = config_dir / "config.toml"
+            if cfg_file.is_file():
                 try:
-                    _, eng_body = prompts.parse(engine_file.read_text(encoding="utf-8"))
-                    new_meta, new_body = prompts.parse(parsed)
-                    before_raw = set(prompt_loader.parse_template(str(engine_file), eng_body).get_identifiers())
-                    after_raw = set(prompt_loader.parse_template(where, new_body).get_identifiers())
-                    if "inputs" in new_meta and isinstance(new_meta["inputs"], list):
-                        declared = set(new_meta["inputs"])
-                        if undeclared := sorted(after_raw - declared):
-                            problems.append(f"{where}: undeclared inputs in body: {', '.join(undeclared)}")
-                    before = {prompts.RENAMED_INPUTS.get(k, k) for k in before_raw}
-                    after = {prompts.RENAMED_INPUTS.get(k, k) for k in after_raw}
-                    if before != after:
-                        if dropped := before - after:
-                            problems.append(f"{where}: drops required placeholders {', '.join(sorted(dropped))}")
-                        if added := after - before:
-                            problems.append(f"{where}: adds unknown placeholders {', '.join(sorted(added))}")
-                except (OSError, ValueError) as error:
-                    problems.append(f"{where}: {error}")
-    return problems
+                    cfg_obj = config.load(cfg_file, strict=False, base_dir=config_dir)
+                except Exception:
+                    cfg_obj = config.load_or_problem()[0]
+            else:
+                cfg_obj = config.load_or_problem()[0]
+            p_probs, p_warns = prompts.validate_override(name, where, parsed, cfg=cfg_obj, config_dir=config_dir)
+            problems.extend(p_probs)
+            warnings.extend(p_warns)
+        else:
+            try:
+                meta, body_text = prompts.parse(parsed)
+                for old_name in prompts.check_renamed_inputs(meta, body_text):
+                    warnings.append({
+                        "code": "input_renamed",
+                        "path": where,
+                        "message": f"{where}: input {old_name!r} was renamed to {prompts.RENAMED_INPUTS[old_name]!r}",
+                    })
+            except ValueError as error:
+                problems.append(f"{where}: {error}")
+    return problems, warnings
 
 
 def _compute_floor(
@@ -716,6 +770,12 @@ def _stage_resolve(
         with tempfile.TemporaryDirectory(prefix="arete-check-resolve-") as tmp:
             overlay = Path(tmp)
             _overlay_config_dir(config_dir, path, raw_bytes, overlay)
+            if kind == "prompt" and (path.startswith("layers/") or name.endswith(".append")):
+                try:
+                    prompts.validate_layer_appends((overlay / path).parent.parent)
+                except prompts.ConfigInvalid as error:
+                    problems.append(str(error))
+                    return problems, notes, None, None
             cfg_file = overlay / "config.toml"
             if cfg_file.is_file():
                 try:
@@ -873,6 +933,7 @@ def check(
     """Run configcheck stages 1..stop_after in order, stopping at the first failure."""
     root = (config_dir or paths.CONFIG_DIR).resolve()
     stages: list[dict] = []
+    warnings: list[dict[str, str]] = []
     gate = "B"
     exposes: list[str] = []
 
@@ -922,7 +983,7 @@ def check(
             raw_bytes = body
         except UnicodeDecodeError as error:
             stages.append(_stage("parse", False, [f"{path or kind}: invalid UTF-8: {error}"]))
-            return {"validator": VALIDATOR, "ok": False, "stages": stages, "gate": gate, "exposes": exposes}
+            return {"validator": VALIDATOR, "ok": False, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
     else:
         text = body
         raw_bytes = body.encode("utf-8")
@@ -931,21 +992,23 @@ def check(
     parsed, parse_problems, parse_notes = _parse_body(kind, path, text)
     stages.append(_stage("parse", not parse_problems, parse_problems, parse_notes))
     if parse_problems or stop_after <= 1:
-        return {"validator": VALIDATOR, "ok": not parse_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        return {"validator": VALIDATOR, "ok": not parse_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 2: schema
     schema_problems = _validate_schema(kind, name, path, parsed, raw_bytes)
     stages.append(_stage("schema", not schema_problems, schema_problems))
     if schema_problems or stop_after <= 2:
-        return {"validator": VALIDATOR, "ok": not schema_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        return {"validator": VALIDATOR, "ok": not schema_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 3: references
-    ref_problems = _validate_references(
+    ref_problems, ref_warnings = _validate_references(
         kind, name, path, parsed, root, staged_targets=staged_targets, extra_adws=extra_adws
     )
-    stages.append(_stage("references", not ref_problems, ref_problems))
+    warnings.extend(ref_warnings)
+    ref_notes = [f"{w['code']}: {w['message']}" for w in ref_warnings]
+    stages.append(_stage("references", not ref_problems, ref_problems, ref_notes))
     if ref_problems or stop_after <= 3:
-        return {"validator": VALIDATOR, "ok": not ref_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        return {"validator": VALIDATOR, "ok": not ref_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 4: floor (gate calculation)
     if old_bytes is None and path:
@@ -956,13 +1019,13 @@ def check(
     gate, exposes, floor_notes = _compute_floor(kind, name, path, parsed, raw_bytes, old_bytes, author)
     stages.append(_stage("floor", True, [], [f"gate {gate}", *floor_notes]))
     if stop_after <= 4:
-        return {"validator": VALIDATOR, "ok": True, "stages": stages, "gate": gate, "exposes": exposes}
+        return {"validator": VALIDATOR, "ok": True, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 5: resolve
     res_problems, res_notes, _, _ = _stage_resolve(kind, name, path, raw_bytes, root)
     stages.append(_stage("resolve", not res_problems, res_problems, res_notes))
     if res_problems or stop_after <= 5:
-        return {"validator": VALIDATOR, "ok": not res_problems, "stages": stages, "gate": gate, "exposes": exposes}
+        return {"validator": VALIDATOR, "ok": not res_problems, "stages": stages, "gate": gate, "exposes": exposes, "warnings": warnings}
 
     # Stage 6: dry_run
     dry_problems, dry_notes = _stage_dry_run(kind, name, path, parsed, raw_bytes, root, author)
@@ -974,6 +1037,7 @@ def check(
         "stages": stages,
         "gate": gate,
         "exposes": exposes,
+        "warnings": warnings,
     }
 
 
