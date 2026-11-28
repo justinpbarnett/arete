@@ -15,6 +15,7 @@ import { normalizePrimary } from "./ui-list.js";
 import { pairedBrowser } from "./browser-auth.js";
 import { browserPaired } from "./ui-notice.js";
 import { initSettingsPrefs } from "./ui-settings.js";
+import "./ui-settings-credentials.js";
 
 initSettingsPrefs();
 
@@ -70,6 +71,8 @@ listen((selected) => {
   if (opensItem) {
     const focus = document.getElementById("pane-focus");
     if (focus) { focus.scrollTop = 0; focus.focus({ preventScroll: true }); }
+  } else if (selected.screen === "settings" && document.querySelector("#pane-focus [data-list]")) {
+    activatePane("focus");
   } else if (selected.screen !== "run") activatePane("queue");
   start(via);
   via = "hash";

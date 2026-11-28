@@ -23954,3 +23954,351 @@ class SettingsShellTests(unittest.TestCase):
             assert.equal(SECTIONS.length, 13);
         """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class SettingsTableAndCredentialsTests(unittest.TestCase):
+    def test_settings_frame_and_credentials_assets_served_and_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        frame_path = web / "ui-settings-frame.js"
+        cred_path = web / "ui-settings-credentials.js"
+        css_path = web / "ui-settings.css"
+        html_path = web / "ui.html"
+        frame_text = frame_path.read_text(encoding="utf-8")
+        cred_text = cred_path.read_text(encoding="utf-8")
+        css_text = css_path.read_text(encoding="utf-8")
+        html_text = html_path.read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        self.assertIn("/ui-settings-frame.js", served)
+        self.assertIn("/ui-settings-credentials.js", served)
+        self.assertEqual(served["/ui-settings-frame.js"][0], frame_path.read_bytes())
+        self.assertEqual(served["/ui-settings-credentials.js"][0], cred_path.read_bytes())
+        self.assertIn("/ui-settings-frame.js", html_text)
+        self.assertIn("/ui-settings-credentials.js", html_text)
+        for needle in ("/api/v1/secrets", "text/plain", 'type="password"', 'autocomplete="off"'):
+            self.assertIn(needle, cred_text)
+        for forbidden in ("data-draft", "localStorage", "console.log", "style=", "innerHTML"):
+            self.assertNotIn(forbidden, cred_text)
+            self.assertNotIn(forbidden, frame_text)
+        for forbidden in ("ui-settings-tables.js", "ui-settings-credentials.js"):
+            self.assertNotIn(forbidden, frame_text)
+        for forbidden in ("style=", "innerHTML"):
+            self.assertNotIn(forbidden, css_text)
+
+    def test_settings_frame_facets_sort_remove_undo_stale_and_picker(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import {
+              createSettingsTable, runTableRemove, registerSettingsForm, getSettingsForm,
+              listSettingsForms, registerCreatePicker, openSettingsCreate,
+            } from "./arete/web/ui-settings-frame.js";
+            import { deleteConfigWithUndo } from "./arete/web/ui-write.js";
+            import { undo } from "./arete/web/ui-undo.js";
+            import { notice, staleWrite } from "./arete/web/ui-notice.js";
+
+            const rows = [
+              { id: "dev-b", name: "beta", kind: "ssh", state: "stopped", version: 2 },
+              { id: "dev-a", name: "alpha", kind: "local", state: "up", version: 3 },
+              { id: "dev-c", name: "gamma", kind: "ssh", state: "up", version: 1 },
+            ];
+            const table = createSettingsTable({
+              rows,
+              facets: [
+                { key: "state", label: "State", value: (r) => r.state },
+                { key: "kind", label: "Kind", value: (r) => r.kind },
+              ],
+              sorts: [
+                { id: "source", label: "Source order" },
+                { id: "name", label: "Name", key: "name" },
+              ],
+              searchText: (r) => `${r.name} ${r.kind} ${r.state}`,
+            });
+
+            assert.equal(table.countText(), "3 of 3");
+            assert.equal(table.facetCount("state", "up"), 2);
+            assert.equal(table.facetCount("kind", "ssh"), 2);
+
+            table.pick("state", "up");
+            assert.equal(table.countText(), "2 of 3");
+            assert.deepEqual(table.rows().map((r) => r.id), ["dev-a", "dev-c"]);
+
+            table.setSort("name");
+            assert.deepEqual(table.rows().map((r) => r.id), ["dev-a", "dev-c"]);
+            table.setQuery("gam");
+            assert.equal(table.countText(), "1 of 3");
+            assert.deepEqual(table.rows().map((r) => r.id), ["dev-c"]);
+
+            table.clearFilters();
+            assert.equal(table.countText(), "3 of 3");
+            table.select("dev-a");
+            assert.equal(table.selectedRow().id, "dev-a");
+            table.move(1);
+            assert.equal(table.selectedRow().id, "dev-b");
+            table.move(-1);
+            assert.equal(table.selectedRow().id, "dev-a");
+
+            registerSettingsForm("scratch-item", { section: "scratch", noun: "device", fields: [{ name: "name" }] });
+            assert.equal(getSettingsForm("scratch-item")?.noun, "device");
+            assert.ok(listSettingsForms().some((item) => item.kind === "scratch-item"));
+            let openedLocal = 0;
+            let openedPicker = 0;
+            openSettingsCreate({ kind: "scratch-item", section: "scratch", fromKey: true, openLocal: () => { openedLocal += 1; } });
+            assert.equal(openedLocal, 1);
+            registerCreatePicker(() => { openedPicker += 1; return true; });
+            openSettingsCreate({ kind: "scratch-item", section: "scratch", fromKey: true, openLocal: () => { openedLocal += 1; } });
+            assert.equal(openedPicker, 1);
+            assert.equal(openedLocal, 1);
+            openSettingsCreate({ kind: "scratch-item", section: "scratch", fromKey: false, openLocal: () => { openedLocal += 1; } });
+            assert.equal(openedLocal, 2);
+            registerCreatePicker(null);
+            registerSettingsForm("scratch-item", null);
+
+            const requests = [];
+            let liveRows = [...rows];
+            globalThis.fetch = async (url, init) => {
+              requests.push({ url, method: init.method, headers: init.headers, body: init.body });
+              if (url === "/api/v1/config/device/alpha" && init.method === "DELETE") {
+                liveRows = liveRows.filter((r) => r.id !== "dev-a");
+                return Response.json({
+                  version: 4,
+                  previous_version: 3,
+                  previous_content_version: "cv-3",
+                });
+              }
+              if (url === "/api/v1/config/device/alpha/rollback" && init.method === "POST") {
+                const payload = JSON.parse(init.body);
+                assert.equal(payload.to, "cv-3");
+                assert.equal(payload.base_version, 4);
+                liveRows = [...liveRows, { id: "dev-a", name: "alpha", kind: "local", state: "up", version: 5 }];
+                return Response.json({ version: 5 });
+              }
+              if (url === "/api/v1/config/device/beta" && init.method === "DELETE") {
+                return Response.json(
+                  { code: "version_conflict", error: "stale version", current: { version: 9 } },
+                  { status: 409 },
+                );
+              }
+              return Response.json({}, { status: 404 });
+            };
+
+            const removed = await runTableRemove(table, rows[1], "cleanup", {
+              noun: "device",
+              onRemove: async (row, why) => {
+                const { undo: undoEntry } = await deleteConfigWithUndo("device", row.name, row, {
+                  why,
+                  onRestored: () => table.setRows(liveRows),
+                });
+                table.setRows(liveRows);
+                return { label: `Removed device ${row.name}`, undo: undoEntry };
+              },
+            });
+            assert.equal(removed.ok, true);
+            assert.equal(table.total(), 2);
+            assert.equal(requests[0].method, "DELETE");
+            assert.equal(JSON.parse(requests[0].body).base_version, 3);
+            assert.equal(requests[0].headers.get("X-Arete"), "1");
+            assert.match(requests[0].headers.get("Idempotency-Key"), /^[0-9a-f]{32}$/);
+
+            await undo();
+            assert.equal(table.total(), 3);
+            const restored = table.state.rows.find((r) => r.id === "dev-a");
+            assert.equal(restored.name, "alpha");
+            assert.equal(restored.kind, "local");
+            assert.equal(restored.state, "up");
+            assert.equal(requests[1].url, "/api/v1/config/device/alpha/rollback");
+
+            staleWrite.value = "";
+            const conflict = await runTableRemove(table, rows[0], "", {
+              noun: "device",
+              onRemove: async (row) => deleteConfigWithUndo("device", row.name, row),
+            });
+            assert.equal(conflict.ok, false);
+            assert.equal(table.total(), 3);
+            assert.equal(table.state.stale["dev-b"].current.version, 9);
+            assert.ok(staleWrite.value.includes("changed"));
+
+            const nonUndo = await runTableRemove(table, rows[2], "rotate", {
+              noun: "credential",
+              undoable: false,
+              undoNotice: "A removed credential cannot be restored. Add it again.",
+              onRemove: async () => ({ label: "Removed credential gamma", undoable: false }),
+            });
+            assert.equal(nonUndo.ok, true);
+            const beforeCount = requests.length;
+            await undo();
+            assert.equal(requests.length, beforeCount);
+            assert.equal(notice.value, "A removed credential cannot be restored. Add it again.");
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_credentials_writes_checks_remove_non_undo_and_no_secret_echo(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import {
+              buildCredentialRows, submitCredentialValue, checkCredential, removeCredential,
+              CREDENTIAL_UNDO_NOTICE, validateCredentialInput,
+            } from "./arete/web/ui-settings-credentials.js";
+            import { getSettingsForm, createSettingsTable, runTableRemove } from "./arete/web/ui-settings-frame.js";
+            import { undo } from "./arete/web/ui-undo.js";
+            import { notice } from "./arete/web/ui-notice.js";
+
+            const rows = buildCredentialRows(
+              [
+                { name: "GITHUB_TOKEN", scope: "global", present: true, check_ok: true, service: "github", uses: ["github source"], rotated: "2026-10-24T00:00:00Z", last_checked: "2026-11-28T12:00:00Z" },
+                { name: "ASANA_TOKEN", scope: "global", present: false, check_ok: null, service: "asana", uses: ["asana source"], rotated: null, last_checked: null },
+                { name: "SLACK_BOT_TOKEN", scope: "global", present: true, check_ok: false, service: "slack", uses: [], rotated: null, last_checked: "2026-11-28T11:00:00Z" },
+              ],
+              {
+                by_priority: {
+                  high: [{
+                    id: "TR-201",
+                    kind: "continue",
+                    subject: "secret:global/ASANA_TOKEN",
+                    run_id: "run_0c6d",
+                    detail: {
+                      name: "ASANA_TOKEN",
+                      scope: "global",
+                      missing_since: "2026-11-13T13:12:00Z",
+                      waiting: ["run:run_0c6d", "run:run_9a1b", "outbox:OB-308"],
+                    },
+                  }],
+                },
+              },
+              [{ id: "acct-slack", service: "slack", usage: "outbox", secret_name: "SLACK_BOT_TOKEN" }],
+            );
+
+            assert.equal(rows.length, 3);
+            const missing = rows.find((r) => r.name === "ASANA_TOKEN");
+            assert.equal(missing.status, "missing");
+            assert.equal(missing.rowClass, "set-row-ny");
+            assert.deepEqual(missing.waitingLinks.map((l) => l.href), [
+              "#run/run_0c6d", "#run/run_9a1b", "#outbox/OB-308", "#triage/TR-201",
+            ]);
+            assert.equal(rows.find((r) => r.name === "GITHUB_TOKEN").status, "valid");
+            assert.equal(rows.find((r) => r.name === "SLACK_BOT_TOKEN").status, "failed");
+            assert.equal(rows.find((r) => r.name === "SLACK_BOT_TOKEN").usedByText, "slack, slack outbox");
+
+            assert.notEqual(validateCredentialInput("global", "bad-name", "secret-val-1234"), "");
+            assert.equal(validateCredentialInput("global", "ASANA_TOKEN", "secret-val-1234"), "");
+
+            const secretValue = "super-secret-token-987654321";
+            const calls = [];
+            globalThis.fetch = async (url, init) => {
+              calls.push({ url, method: init.method, headers: init.headers, body: init.body });
+              if (url === "/api/v1/secrets/global/ASANA_TOKEN/value" && init.method === "PUT") {
+                return Response.json({ secret: { name: "ASANA_TOKEN", scope: "global", present: true, check_ok: null } });
+              }
+              if (url === "/api/v1/secrets/global/GITHUB_TOKEN/check" && init.method === "POST") {
+                return Response.json({ secret: { name: "GITHUB_TOKEN", scope: "global", present: true, check_ok: true } });
+              }
+              if (url === "/api/v1/secrets/global/GITHUB_TOKEN" && init.method === "DELETE") {
+                return Response.json({ secret: { name: "GITHUB_TOKEN", scope: "global", present: false, check_ok: null } });
+              }
+              return Response.json({ error: "unexpected" }, { status: 400 });
+            };
+
+            const saved = await submitCredentialValue("global", "ASANA_TOKEN", secretValue);
+            assert.equal(saved.secret.present, true);
+            assert.equal(calls[0].method, "PUT");
+            assert.equal(calls[0].headers.get("Content-Type"), "text/plain");
+            assert.equal(calls[0].headers.get("X-Arete"), "1");
+            assert.match(calls[0].headers.get("Idempotency-Key"), /^[0-9a-f]{32}$/);
+            assert.equal(calls[0].body, secretValue);
+
+            const form = getSettingsForm("credential");
+            assert.ok(form);
+            assert.equal(form.sensitive, true);
+            assert.equal(form.fields.find((f) => f.name === "value").type, "password");
+            const payload = { name: "ASANA_TOKEN", scope: "global", value: secretValue };
+            await form.submit(payload);
+            assert.equal(payload.value, "");
+            assert.equal(notice.value.includes(secretValue), false);
+
+            const checked = await checkCredential("global", "GITHUB_TOKEN");
+            assert.equal(checked.secret.check_ok, true);
+            assert.equal(calls.at(-1).method, "POST");
+            assert.equal(calls.at(-1).url, "/api/v1/secrets/global/GITHUB_TOKEN/check");
+
+            const table = createSettingsTable({ rows });
+            const rm = await runTableRemove(table, rows[0], "compromised", {
+              noun: "credential",
+              undoable: false,
+              undoNotice: CREDENTIAL_UNDO_NOTICE,
+              onRemove: async (row) => {
+                await removeCredential(row.scope, row.name);
+                return { label: `Removed credential ${row.name}`, undoable: false, undoNotice: CREDENTIAL_UNDO_NOTICE };
+              },
+            });
+            assert.equal(rm.ok, true);
+            assert.equal(calls.at(-1).method, "DELETE");
+            assert.equal(calls.at(-1).url, "/api/v1/secrets/global/GITHUB_TOKEN");
+            assert.equal(calls.at(-1).body, "{}");
+
+            const callCount = calls.length;
+            await undo();
+            assert.equal(calls.length, callCount);
+            assert.equal(notice.value, "A removed credential cannot be restored. Add it again.");
+            assert.equal(notice.value.includes(secretValue), false);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_credentials_real_api_never_echoes_and_resolves_waiting_runs(self):
+        from arete import inbox as inbox_mod
+        from arete import secretstore as secret_store_mod
+        from arete.store import devices as device_store_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "config"
+            secret_dir = root / "secrets"
+            cfg_dir.mkdir(mode=0o700)
+            secret_dir.mkdir(mode=0o700)
+            cfg_file = cfg_dir / "arete.toml"
+            cfg_file.write_text(f'[secrets]\nstore = "pve_store"\nstore_dir = "{secret_dir}"\n', encoding="utf-8")
+            with mock.patch.object(paths, "CONFIG_FILE", cfg_file):
+                db.migrate()
+                actor = principals.seed_owner("owner@example.test")
+                with principals.acting(actor):
+                    secret_store_mod.put("global", "GITHUB_TOKEN", "ghp_initial_value_1234", "api_key", actor, provider="github")
+                    secret_store_mod.put("global", "SLACK_BOT_TOKEN", "xoxb_initial_value_5678", "api_key", actor, provider="slack")
+                    secret_store_mod.put("global", "ASANA_TOKEN", "asana_old_token_0000", "api_key", actor, provider="asana")
+                    secret_store_mod.remove("global", "ASANA_TOKEN", actor)
+                    with db.tx() as c:
+                        c.execute(
+                            "UPDATE secrets SET required = 1 WHERE scope = 'global' AND name = 'ASANA_TOKEN'"
+                        )
+                        device_store_mod.open_wait(c, "run:run_0c6d", "secret:global/ASANA_TOKEN", "missing ASANA_TOKEN")
+                        device_store_mod.open_wait(c, "run:run_9a1b", "secret:global/ASANA_TOKEN", "missing ASANA_TOKEN")
+                        inbox_mod.sync(c, "secrets")
+
+                    listed_before = api.execute("secret.list", {})
+                    by_name = {item["name"]: item for item in listed_before["secrets"]}
+                    self.assertFalse(by_name["ASANA_TOKEN"]["present"])
+                    self.assertTrue(by_name["GITHUB_TOKEN"]["present"])
+                    self.assertTrue(by_name["SLACK_BOT_TOKEN"]["present"])
+
+                    triage_before = api.execute("triage_screen.get", {})
+                    cont_items = [
+                        item for item in triage_before["by_priority"]["high"]
+                        if item["kind"] == "continue" and item["subject"] == "secret:global/ASANA_TOKEN"
+                    ]
+                    self.assertEqual(len(cont_items), 1)
+                    self.assertEqual(set(cont_items[0]["detail"]["waiting"]), {"run:run_0c6d", "run:run_9a1b"})
+
+                    typed_secret = "asana_live_secret_do_not_echo_42"
+                    secret_store_mod.put("global", "ASANA_TOKEN", typed_secret, "api_key", actor, provider="asana")
+
+                    listed_after = api.execute("secret.list", {})
+                    after_json = json.dumps(listed_after)
+                    self.assertNotIn(typed_secret, after_json)
+                    self.assertTrue(next(item for item in listed_after["secrets"] if item["name"] == "ASANA_TOKEN")["present"])
+
+                    triage_after = api.execute("triage_screen.get", {})
+                    still_open = [
+                        item for item in triage_after["by_priority"]["high"]
+                        if item["kind"] == "continue" and item["subject"] == "secret:global/ASANA_TOKEN"
+                    ]
+                    self.assertEqual(still_open, [])
+                    _, served = dashboard.web_snapshot()
+                    for asset in ("/ui.html", "/ui-settings-credentials.js", "/ui-settings-frame.js"):
+                        self.assertNotIn(typed_secret.encode(), served[asset][0])

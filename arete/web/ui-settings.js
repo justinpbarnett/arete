@@ -7,6 +7,7 @@ import { webFetch } from "./ui-request.js";
 import { prepareWrite, sendWrite } from "./ui-write.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 import { safeLink } from "./ui-operations.js";
+import { onLiveEvent } from "./ui-live.js";
 
 const html = htm.bind(h);
 
@@ -271,6 +272,17 @@ async function loadUsage() {
   } else {
     usageState.value = { data: prev.data, error: res.error ?? { status: null, message: "Malformed response" }, loaded: true };
   }
+}
+
+let secretsRefresh = null;
+
+export function refreshSettingsSecrets() {
+  if (!secretsRefresh) {
+    secretsRefresh = Promise.all([loadSecrets(), loadTriage(), loadAccounts()]).finally(() => {
+      secretsRefresh = null;
+    });
+  }
+  return secretsRefresh;
 }
 
 function loadOverview() {
@@ -847,6 +859,11 @@ export class SettingsFocus extends Component {
       thisDeviceState.value;
       this.setState({ revision: this.state.revision + 1 });
     });
+    this.unsubLive = onLiveEvent((event) => {
+      if (event.kind === "credential.changed" || event.kind.startsWith("inbox.") || event.kind === "reset") {
+        refreshSettingsSecrets();
+      }
+    });
     loadOverview();
     const [sectionId] = resolveSection(this.props.route?.path?.[0]);
     if (sectionId === "about") loadUsage();
@@ -866,6 +883,7 @@ export class SettingsFocus extends Component {
   }
   componentWillUnmount() {
     this.unsub?.();
+    this.unsubLive?.();
   }
   render({ route, now, retry }) {
     const [id, title] = resolveSection(route?.path?.[0]);

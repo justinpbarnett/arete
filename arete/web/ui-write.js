@@ -11,7 +11,50 @@ export function prepareWrite(url, data = {}, object = null, options = {}) {
   delete body.base_version;
   if (object?.version != null) body.base_version = object.version;
   return Object.freeze({ url, method: options.method ?? "POST", body: JSON.stringify(body),
+    type: options.type ?? "application/json",
     key: idempotencyKey(), keepalive: Boolean(options.keepalive), versioned: body.base_version != null });
+}
+
+export function prepareTextWrite(url, text, options = {}) {
+  return Object.freeze({
+    url,
+    method: options.method ?? "PUT",
+    body: String(text),
+    type: options.type ?? "text/plain",
+    key: idempotencyKey(),
+    keepalive: Boolean(options.keepalive),
+    versioned: false,
+  });
+}
+
+export function prepareConfigDelete(kind, name, object = null, why = "") {
+  const url = `/api/v1/config/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`;
+  const data = why ? { why } : {};
+  return prepareWrite(url, data, object, { method: "DELETE" });
+}
+
+export function prepareConfigRollback(kind, name, deleted) {
+  const url = `/api/v1/config/${encodeURIComponent(kind)}/${encodeURIComponent(name)}/rollback`;
+  const to = deleted?.previous_content_version ?? deleted?.previous_version;
+  const version = deleted?.version;
+  return prepareWrite(url, { to }, version != null ? { version } : null, { method: "POST" });
+}
+
+export async function deleteConfigWithUndo(kind, name, object, { why = "", label = "", onRestored = null } = {}) {
+  const result = await sendWrite(prepareConfigDelete(kind, name, object, why));
+  let rollbackRequest = null;
+  return {
+    result,
+    undo: {
+      label: label || `Removed ${kind} ${name}`,
+      inverse: async () => {
+        if (!rollbackRequest) rollbackRequest = prepareConfigRollback(kind, name, result);
+        const restored = await sendWrite(rollbackRequest);
+        await onRestored?.(restored);
+        return restored;
+      },
+    },
+  };
 }
 
 const publications = new Map();
@@ -76,10 +119,13 @@ export async function sendWrite(request, onResponse = null) {
   const data = await response.json().catch(() => null);
   const valid = data && typeof data === "object" && !Array.isArray(data);
   if (!response.ok) {
-    let message = typeof data?.error === "string" ? data.error : `Request failed (${response.status})`;
+    let message = typeof data?.error === "string" ? data.error
+      : typeof data?.detail === "string" ? data.detail : `Request failed (${response.status})`;
     if (response.status === 401 && request.url !== "/api/v1/auth/pairings/claim") message = pairingHelp();
     const error = new Error(message);
     error.status = response.status;
+    error.code = typeof data?.code === "string" ? data.code : null;
+    error.reason = typeof data?.reason === "string" ? data.reason : null;
     error.conflict = response.status === 409 && (data?.code ?? data?.error) === "version_conflict";
     if (error.conflict) staleWrite.value = "This item changed. Review the latest version before trying again.";
     error.current = data?.current;

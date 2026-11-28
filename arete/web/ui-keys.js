@@ -118,6 +118,7 @@ export function actionContext() {
 
 function destructive() {
   const context = actionContext();
+  if (context?.remove) { context.remove(); return; }
   if (context?.item) perform(actions[context.item.verb ?? "remove"], context);
 }
 
@@ -134,8 +135,10 @@ function currentIndex(list) {
 
 function place(list, row) {
   listId = list.dataset.list;
-  cursors.set(listId, itemId(row));
+  const id = itemId(row);
+  cursors.set(listId, id);
   marks();
+  list.uiSelect?.(id);
   row.scrollIntoView({ block: "nearest" });
 }
 
@@ -306,7 +309,10 @@ function normal(event) {
     if (action) { perform(action, context); return true; }
     if (key === "R" && readRetry.peek()) { readRetry.peek()(); return true; }
   }
-  if (key === "c" && focusedList()?.uiCreate) { focusedList().uiCreate(); return true; }
+  if (key === "c") {
+    const target = focusedList()?.uiCreate ? focusedList() : lists("focus").find((el) => el.uiCreate);
+    if (target?.uiCreate) { target.uiCreate(); return true; }
+  }
   if (key === "g" || key === "d" || key === "z") { pending.value = key; return true; }
   const screen = screenKeys.find(([letter]) => letter === key);
   if (screen) { go(screen[3]); return true; }
@@ -356,12 +362,13 @@ function onKey(event) {
     if (submit && !submit.disabled) form.requestSubmit(submit);
     else if (!form) {
       const context = actionContext();
-      if (context?.primary) perform(context.primary, context);
+      if (context?.onPrimary) context.onPrimary();
+      else if (context?.primary) perform(context.primary, context);
     }
     event.preventDefault(); return;
   }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
-  if (event.key === "Escape" && !sheet.value && (dismissMenu() || focusedList()?.uiDismiss?.())) {
+  if (event.key === "Escape" && !sheet.value && (dismissMenu() || focusedList()?.uiDismiss?.() || lists("focus").some((el) => el.uiDismiss?.()))) {
     if (writable(event.target)) event.target.blur();
     mode.value = "NORMAL";
     event.preventDefault();

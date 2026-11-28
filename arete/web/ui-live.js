@@ -11,6 +11,16 @@ const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
 const cache = { sidebar: null, live: null, questions: null, serve: null, heartbeatAt: 0, errors: {}, failures: 0, settled: false };
 export const screenReads = signal({});
+const liveListeners = new Set();
+export function onLiveEvent(listener) {
+  liveListeners.add(listener);
+  return () => liveListeners.delete(listener);
+}
+function notifyLive(event) {
+  for (const listener of liveListeners) {
+    try { listener(event); } catch { continue; }
+  }
+}
 let active;
 let feed;
 let transport = null;
@@ -536,6 +546,7 @@ function update(event) {
     Object.assign(rs, blankRuns(), { id: rs.id });
     publishRuns();
     invalidate(run, all(run));
+    notifyLive(event);
   } else if (event.kind === "transport") {
     transport = event.transport;
   } else if (event.kind === "serve.beat") {
@@ -544,6 +555,9 @@ function update(event) {
       snapshot.value = snapshotOf();
     }
     if (rs.detail?.run.status === "running") invalidate(run, ["transcript"]);
+  } else if (event.kind === "credential.changed" || event.kind.startsWith("inbox.")) {
+    invalidate(run, run.screen === "settings" ? ["shell", "health"] : ["shell"]);
+    notifyLive(event);
   } else if (event.kind.startsWith("run.") || event.kind.startsWith("step.")
       || run.screen === "board" && (event.kind.startsWith("task.") || event.kind === "principal.changed")) {
     run.duringRead?.push(event);
