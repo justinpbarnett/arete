@@ -643,6 +643,159 @@ kind = "pass"
                 self.assertIn(expected_token, str(ctx.exception))
 
 
+CLEAN_FEATURE_GRAPH_TOML = FEATURE_GRAPH_TOML.replace(
+    'name = "feature"\n',
+    'name = "feature"\n\n[[trigger]]\nid = "manual"\nkind = "manual"\n',
+    1,
+).replace(
+    'inputs = { round = "build" }',
+    'inputs = { round = "build", feedback = "", asks = "" }',
+    1,
+).replace(
+    'inputs = { round = "fix{try}", attempt = "{try}", tries = "{tries}" }',
+    'inputs = { round = "fix{try}", attempt = "{try}", tries = "{tries}", asks = "" }',
+    1,
+).replace(
+    'inputs = { round = "review_fix{prev?}" }',
+    'inputs = { round = "review_fix{prev?}", asks = "" }',
+    1,
+).replace(
+    'inputs = { round = "check_repair{outer.prev}_{try}", attempt = "{try}", tries = "{tries}" }',
+    'inputs = { round = "check_repair{outer.prev}_{try}", attempt = "{try}", tries = "{tries}", asks = "" }',
+    1,
+) + """
+[[wire]]
+from = "manual.done"
+to = "prepare.in"
+kind = "pass"
+
+[[wire]]
+from = "manual.task"
+to = "prepare.task"
+kind = "data"
+
+[[wire]]
+from = "prepare.task"
+to = "plan.task"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "fix_checks.tree"
+kind = "data"
+
+[[wire]]
+from = "plan.plan"
+to = "fix_checks.plan"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "review_fix.tree"
+kind = "data"
+
+[[wire]]
+from = "plan.plan"
+to = "review_fix.plan"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "review_check_fix.tree"
+kind = "data"
+
+[[wire]]
+from = "plan.plan"
+to = "review_check_fix.plan"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "checks.tree"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "review_checks.tree"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "learn_failed.tree"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "verify.tree"
+kind = "data"
+
+[[wire]]
+from = "plan.plan"
+to = "verify.plan"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "review.tree"
+kind = "data"
+
+[[wire]]
+from = "plan.plan"
+to = "review.plan"
+kind = "data"
+
+[[wire]]
+from = "verify.report"
+to = "review.report"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "learn.tree"
+kind = "data"
+
+[[wire]]
+from = "prepare.task"
+to = "document.task"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "document.tree"
+kind = "data"
+
+[[wire]]
+from = "review.verdict"
+to = "document.verdict"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "pr.tree"
+kind = "data"
+
+[[wire]]
+from = "implement.diff"
+to = "pr.diff"
+kind = "data"
+
+[[wire]]
+from = "document.text"
+to = "pr.text"
+kind = "data"
+
+[[wire]]
+from = "prepare.tree"
+to = "ci.tree"
+kind = "data"
+
+[[wire]]
+from = "ci.report"
+to = "publish.report"
+kind = "data"
+"""
+
+
 class AdwGraphDraftVersionsAndLayoutTests(unittest.TestCase):
     def test_draft_activate_layout_move_versions_diff_and_same_run_steps(self):
         script = f"""
@@ -657,7 +810,7 @@ from arete import (
 )
 from arete.store import db, tokens
 
-GRAPH_V1 = {FEATURE_GRAPH_TOML!r}
+GRAPH_V1 = {CLEAN_FEATURE_GRAPH_TOML!r}
 GRAPH_V2 = GRAPH_V1.replace(
     'id = "plan"\\nstep = "plan"\\nname = "Plan"\\nmodel = "plan"\\ntimeout = 15\\nx = 320\\ny = 0',
     'id = "plan"\\nstep = "plan"\\nname = "Plan"\\nmodel = "plan"\\ntimeout = 15\\nx = 360\\ny = 40',

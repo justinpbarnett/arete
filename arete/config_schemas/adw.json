@@ -57,6 +57,54 @@
           }
         ]
       }
+    },
+    "trigger": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"},
+          "kind": {"type": "string", "enum": ["manual", "source", "schedule", "event"]},
+          "source": {"type": "string", "minLength": 1},
+          "every": {"type": "string", "minLength": 1},
+          "cron": {"type": "string", "minLength": 1},
+          "event": {
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+            ]
+          },
+          "rule": {"type": "string", "minLength": 1},
+          "ref": {"type": "string", "minLength": 1},
+          "name": {"type": "string"},
+          "label": {"type": "string"},
+          "x": {"type": "integer"},
+          "y": {"type": "integer"},
+          "params": {"type": "object"},
+          "repo": {"type": "string"},
+          "ticket": {"type": "string"},
+          "adw": {"type": "string"},
+          "dry_run": {"type": "boolean"},
+          "repos": {"type": "array", "items": {"type": "string"}},
+          "watch": {"type": "array", "items": {"type": "string"}},
+          "branch": {"type": "string"},
+          "jql": {"type": "string"},
+          "limit": {"type": "integer"},
+          "on_update": {"type": "boolean"},
+          "path": {"type": "string"},
+          "pattern": {"type": "string"},
+          "command": {"type": "string"},
+          "timeout": {"type": "number"},
+          "trust": {"type": "string"},
+          "tracker": {"type": "string"},
+          "loop": {"type": "string"},
+          "run_at_load": {"type": "boolean"},
+          "repaired_by": {"type": "boolean"},
+          "group": {"type": "string"}
+        },
+        "required": ["id", "kind"],
+        "additionalProperties": false
+      }
     }
   },
   "required": ["schema", "name"],

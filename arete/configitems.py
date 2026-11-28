@@ -123,6 +123,17 @@ def _prompt_fields(name: str, raw: bytes, conn=None) -> dict[str, object]:
     }
 
 
+def _adw_fields(name: str, raw: bytes) -> dict[str, object]:
+    from . import adw
+
+    triggers: list[dict[str, object]] = []
+    if raw:
+        with suppress(UnicodeDecodeError, tomllib.TOMLDecodeError):
+            parsed = tomllib.loads(raw.decode("utf-8"))
+            triggers = adw.serialize_triggers(name, parsed)
+    return {"triggers": triggers}
+
+
 def _enrich(entry: dict, conn=None) -> dict:
     kind, name, rel = entry["kind"], entry["name"], entry["path"]
     if entry.get("engine"):
@@ -139,6 +150,8 @@ def _enrich(entry: dict, conn=None) -> dict:
         }
         if kind == "prompt":
             out.update(_prompt_fields(name, raw, conn))
+        elif kind == "adw":
+            out.update(_adw_fields(name, raw))
         return out
     lookup_kind = "step_settings" if kind == "attention" and rel == "config.toml" else kind
     row = config_store.live_item(lookup_kind, name, conn) or config_store.live_by_path(rel, conn)
@@ -161,6 +174,8 @@ def _enrich(entry: dict, conn=None) -> dict:
     }
     if kind == "prompt":
         out.update(_prompt_fields(name, raw, conn))
+    elif kind == "adw":
+        out.update(_adw_fields(name, raw))
     return out
 
 
@@ -531,6 +546,8 @@ def read(found: dict, *, version: str | None = None, level: str | None = None,
                 raise refusals.Invalid(str(error)) from error
         else:
             content = raw_text
+            if public["kind"] == "adw" and not file:
+                public.update(_adw_fields(public["name"], raw_text.encode("utf-8")))
         if matched_ver is not None:
             public["version"] = matched_ver
         if matched_cv is not None:

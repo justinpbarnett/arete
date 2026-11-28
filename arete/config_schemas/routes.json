@@ -20,7 +20,8 @@
         "event": {"$ref": "#/$defs/string_or_list"},
         "repaired_by": {"type": "boolean"},
         "repo": {"$ref": "#/$defs/string_or_list"},
-        "kind": {"$ref": "#/$defs/string_or_list"}
+        "kind": {"$ref": "#/$defs/string_or_list"},
+        "source": {"$ref": "#/$defs/string_or_list"}
       },
       "additionalProperties": false
     },

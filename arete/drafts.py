@@ -962,6 +962,16 @@ def _matches_base_version(base_version: str | int, live_ver: int, live_row: dict
     return live_row is not None and text in (live_row.get("version"), live_row.get("commit_sha"))
 
 
+def _report_findings(report: object) -> list[dict[str, object]]:
+    if not isinstance(report, dict):
+        return []
+    out: list[dict[str, object]] = []
+    for st in report.get("stages") or ():
+        if isinstance(st, dict) and isinstance(st.get("findings"), list):
+            out.extend(f for f in st["findings"] if isinstance(f, dict))
+    return out
+
+
 def _validate_base_and_check_for_activation(
     draft: dict,
     actor: str,
@@ -981,7 +991,16 @@ def _validate_base_and_check_for_activation(
             f"Run-authored gate C draft {draft['id']} cannot be activated directly; accept it to create an owner draft.",
         )
     if draft["state"] not in ("draft", "valid"):
-        raise contract.Problem("invalid_state", f"Draft {draft['id']} in state {draft['state']!r} cannot be activated.")
+        extra: dict[str, object] = {}
+        if draft["state"] == "invalid":
+            findings = _report_findings(draft.get("check_report"))
+            if findings or draft["kind"] == "adw":
+                extra["findings"] = findings
+        raise contract.Problem(
+            "invalid_state",
+            f"Draft {draft['id']} in state {draft['state']!r} cannot be activated.",
+            **extra,
+        )
 
     rel = draft["path"] or default_path(draft["kind"], draft["name"])
     live_row = _current_ver_row(draft["kind"], draft["name"], rel)
@@ -1010,6 +1029,13 @@ def _validate_base_and_check_for_activation(
                 move(c, draft["numeric_id"], draft["state"], "invalid", sync_inbox=False)
             _sync_inbox(c)
         problems = [p for st in report["stages"] for p in st.get("problems", ())]
+        findings = _report_findings(report)
+        if findings or draft["kind"] == "adw":
+            raise contract.Problem(
+                "invalid_state",
+                "; ".join(problems) or f"Draft {draft['id']} failed configcheck.",
+                findings=findings,
+            )
         raise contract.Problem("validation", "; ".join(problems) or f"Draft {draft['id']} failed configcheck.")
 
     if report["gate"] == "C" and draft["author"].startswith("run:"):
