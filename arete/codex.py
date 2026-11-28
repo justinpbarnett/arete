@@ -1363,7 +1363,7 @@ def guard_main(judge: bool, rules: list[str], opened=()) -> int:
     try:
         reason = guard_reason(json.load(sys.stdin), judge, rules, opened)
     except Exception:
-        return 0
+        reason = guard.FAIL_CLOSED_REASON
     return write_guard_decision(reason)
 
 

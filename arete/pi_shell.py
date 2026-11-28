@@ -33,19 +33,24 @@ CREDENTIAL = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|C
 
 
 def rules_match(command: str, rules: tuple[str, ...]) -> bool:
-    return "Bash" in rules or any(fnmatch.fnmatchcase(command, rule[5:-1]) for rule in rules
-                                  if rule.startswith("Bash(") and rule.endswith(")"))
+    if "Bash" in rules:
+        return True
+    stripped = command.lstrip()
+    return any(fnmatch.fnmatchcase(candidate, rule[5:-1])
+               for rule in rules if rule.startswith("Bash(") and rule.endswith(")")
+               for candidate in (command, stripped))
 
 
 def simple_command(command: str) -> bool:
-    if "$(" in command or "`" in command:
+    if not isinstance(command, str) or "\x00" in command or "$(" in command or "`" in command:
         return False
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     try:
-        return all(not word or any(c not in ";&|()<>\n" for c in word) for word in lexer)
+        words = list(lexer)
+        return bool(words) and all(not word or any(c not in ";&|()<>\n" for c in word) for word in words)
     except ValueError:
         return False
 
@@ -68,11 +73,12 @@ def runtime_roots() -> tuple[Path, ...]:
 
 def command_env(passing, extra, hidden=()) -> dict[str, str]:
     source = environment.build(passing or [], extra)
+    secrets_hidden = tuple(s for s in hidden if isinstance(s, str) and s)
     clean = {name: value for name, value in source.items()
-             if not CREDENTIAL.search(name) and name not in environment.SHELL_HOOKS
+             if not CREDENTIAL.search(name) and name.upper() not in environment.SHELL_HOOKS
              and not name.upper().startswith(environment.LOADER_HOOKS)
-             and not name.startswith(("ARETE_PI_", "PI_", "CLAUDE", "CODEX"))
-             and not any(secret in value for secret in hidden)}
+             and not name.upper().startswith(("ARETE_PI_", "PI_", "CLAUDE", "CODEX"))
+             and not any(secret in value for secret in secrets_hidden)}
     clean.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_COUNT="2",
                  GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0="/dev/null",
                  GIT_CONFIG_KEY_1="core.fsmonitor", GIT_CONFIG_VALUE_1="false", xcrun_nocache="1")
@@ -156,7 +162,8 @@ class Shell:
         if type(request) is not dict or request.keys() - {"command", "timeout"}:
             raise ValueError("shell accepts only command and timeout")
         command, timeout = request.get("command"), request.get("timeout", MAX_SECONDS)
-        if not isinstance(command, str) or not command.strip() or len(command.encode()) > MAX_REQUEST:
+        if (not isinstance(command, str) or not command.strip() or "\x00" in command
+                or len(command.encode()) > MAX_REQUEST):
             raise ValueError("shell needs a bounded nonempty command")
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= MAX_SECONDS:
             raise ValueError(f"shell timeout must be positive and at most {MAX_SECONDS} seconds")

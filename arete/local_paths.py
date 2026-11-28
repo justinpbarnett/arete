@@ -3,6 +3,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -20,8 +21,25 @@ ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CON
                     f"selected for isolation (unset ones go to its config and state folders)")
 
 
+def has_null(path: Path | str) -> bool:
+    try:
+        return "\x00" in os.fspath(path)
+    except TypeError:
+        return True
+
+
+def folded_parts(path: Path) -> tuple[str, ...]:
+    return tuple(unicodedata.normalize("NFD", part).casefold() for part in path.parts)
+
+
 def inside_scratch(d: Path) -> bool:
-    return any(part.startswith(SCRATCH_PREFIX) for part in (*d.absolute().parts, *Path(os.path.realpath(d)).parts))
+    if has_null(d):
+        return False
+    try:
+        parts = (*d.absolute().parts, *Path(os.path.realpath(d)).parts)
+    except (OSError, ValueError):
+        return False
+    return any(part.casefold().startswith(SCRATCH_PREFIX) for part in parts)
 
 
 def valid_scratch(root: str) -> os.stat_result | None:
@@ -40,9 +58,11 @@ def valid_scratch(root: str) -> os.stat_result | None:
 
 
 def scratch_root(p: Path) -> Path | None:
+    if has_null(p):
+        return None
     full = Path(os.path.abspath(p))
     for d in (full, *full.parents):
-        if d.name.startswith(SCRATCH_PREFIX):
+        if d.name.casefold().startswith(SCRATCH_PREFIX):
             return d if valid_scratch(str(d)) else None
     return None
 
@@ -77,6 +97,8 @@ def open_directory(part: str, parent: int, above_target: bool) -> int:
 
 @contextmanager
 def directory_fd(p: Path, parent: int | None = None, create: bool = False, *, durable: bool = False):
+    if has_null(p):
+        raise PermissionError("directory traversal refused")
     parts = p.parts
     if ".." in parts or (parent is not None and p.is_absolute()):
         raise PermissionError("directory traversal refused")
@@ -168,13 +190,16 @@ def log_dir(home: Path, state: Path, isolated: bool) -> Path:
 
 
 def is_verify_sandbox_path(rel: str) -> bool:
-    parts = Path(rel).parts
-    return bool(parts) and parts[0] == VERIFY_SCRATCH_ROOT.name
+    if not isinstance(rel, str) or has_null(rel):
+        return False
+    p = Path(rel)
+    parts = p.parts
+    return bool(parts) and not p.is_absolute() and ".." not in parts and parts[0] == VERIFY_SCRATCH_ROOT.name
 
 
 def verify_sandbox_owned(base: Path) -> bool:
     try:
-        if base.is_symlink():
+        if has_null(base) or base.is_symlink():
             return False
         with directory_fd(base.resolve()) as base_fd, directory_fd(VERIFY_SCRATCH_ROOT, base_fd) as folder:
             if os.fstat(folder).st_uid != os.getuid():
@@ -187,5 +212,5 @@ def verify_sandbox_owned(base: Path) -> bool:
                 return marker.read(len(VERIFY_SCRATCH_CONTENT) + 2) in (
                     VERIFY_SCRATCH_CONTENT, VERIFY_SCRATCH_CONTENT + b"\n",
                 )
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         return False

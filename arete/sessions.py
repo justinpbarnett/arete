@@ -104,6 +104,9 @@ class Spec:
 
 
 def spec_file(session_id: str) -> Path:
+    if (not isinstance(session_id, str) or not session_id or "\x00" in session_id
+            or Path(session_id).name != session_id or session_id in (".", "..")):
+        raise ValueError(f"invalid session id: {session_id!r}")
     return SESSIONS_DIR / session_id / "session.json"
 
 
@@ -376,8 +379,10 @@ def github_url(github: str) -> str:
 
 
 def clone(device: ssh.Device | str, github: str, base: str, branch: str, folder: str, token: str) -> str:
+    util.validate_git_ref(base, "base branch")
+    util.validate_git_ref(branch, "branch")
     q, where = shlex.quote, ssh.remote_dir(folder)
-    steps = [f"{GIT_WITH_TOKEN} clone -q --no-checkout --template= --branch {q(base)} {q(github_url(github))} {where}",
+    steps = [f"{GIT_WITH_TOKEN} clone -q --no-checkout --template= --branch={q(base)} -- {q(github_url(github))} {where}",
              "unset arete_token", f"cd {where}",
              f"GIT_LFS_SKIP_SMUDGE=1 {GIT_NO_HOOKS} checkout -q -f -b {q(branch)}",
              "{ git config user.email >/dev/null || { git config user.name arete && git config user.email arete@localhost; }; }",
@@ -398,18 +403,21 @@ def commit_all(device: ssh.Device | str, folder: str, message: str, deny: list[s
 
 
 def bundle(device: ssh.Device | str, folder: str, branch: str, since: str) -> str:
+    util.validate_git_ref(branch, "branch")
+    util.validate_git_ref(since, "since ref")
     q = shlex.quote
     script = (f"cd {ssh.remote_dir(folder)} && f=$(mktemp) && {{ git bundle create -q \"$f\" {q(f'refs/heads/{branch}')} "
-              f"--not {q(since)}; s=$?; if [ $s -eq 0 ]; then base64 < \"$f\"; s=$?; fi; rm -f \"$f\"; exit $s; }}")
+              f"--not {q(since)} --; s=$?; if [ $s -eq 0 ]; then base64 < \"$f\"; s=$?; fi; rm -f \"$f\"; exit $s; }}")
     return run_script(device, script, f"bundling {branch}", timeout=CLONE_SECONDS)
 
 
 def clone_repo(spec: Spec, cfg: config.Config, device: devices.Device) -> str:
+    util.validate_git_ref(spec.base, "base branch")
     repo = cfg.repo(spec.repo)
     token = gh.clone_token(cfg.github_app, spec.github)
     head = clone(device, spec.github, spec.base, spec.branch, spec.cwd, token)
     with util.repo_lock(repo.path):
-        util.git(["fetch", "-q", "origin", spec.base], repo.path, timeout=600)
+        util.git(["fetch", "-q", "--", "origin", spec.base], repo.path, timeout=600)
         util.git(["cat-file", "-e", f"{head}^{{commit}}"], repo.path)
     spec.cloned = spec.fetched = head
     save_spec(spec)
@@ -418,13 +426,14 @@ def clone_repo(spec: Spec, cfg: config.Config, device: devices.Device) -> str:
 
 
 def fetch_back(spec: Spec, repo: config.Repo, device: devices.Device, head: str) -> None:
+    util.validate_git_ref(spec.branch, "branch")
     ref = f"refs/heads/{spec.branch}"
     text = bundle(device, spec.cwd, spec.branch, spec.fetched)
     with tempfile.TemporaryDirectory() as tmp:
         file = Path(tmp) / "work.bundle"
         file.write_bytes(base64.b64decode(text))
         with util.repo_lock(repo.path):
-            util.git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", str(file), f"+{ref}:{ref}"],
+            util.git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags", "--", str(file), f"+{ref}:{ref}"],
                      repo.path, timeout=600)
             fetched = util.git(["rev-parse", ref], repo.path).strip()
     if fetched != head:
@@ -433,9 +442,11 @@ def fetch_back(spec: Spec, repo: config.Repo, device: devices.Device, head: str)
 
 
 def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
+    util.validate_git_ref(spec.cloned, "cloned ref")
+    util.validate_git_ref(spec.fetched, "fetched ref")
     found = {path: path for path in diffguard.between(repo.path, spec.cloned, spec.fetched, deny=spec.deny).denied}
     empty = util.git(["hash-object", "-t", "tree", os.devnull], repo.path).strip()
-    listed = util.git(["rev-list", "--reverse", "--parents", f"{spec.cloned}..{spec.fetched}"], repo.path)
+    listed = util.git(["rev-list", "--reverse", "--parents", f"{spec.cloned}..{spec.fetched}", "--"], repo.path)
     for line in listed.splitlines():
         commit, *parents = line.split()
         for parent in parents or [empty]:
@@ -443,13 +454,15 @@ def denied_work(spec: Spec, repo: config.Repo) -> list[str]:
                 found.setdefault(path, f"{path} in {commit[:10]}")
             if vault.every():
                 patch = util.git(["diff", *vault.SCAN, "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", parent,
-                                  commit], repo.path)
+                                  commit, "--"], repo.path)
                 for entry in vault.refusals(patch):
                     found.setdefault(entry, f"{entry} in {commit[:10]}")
     return list(found.values())
 
 
 def push_fetched(spec: Spec, repo: config.Repo) -> None:
+    util.validate_git_ref(spec.branch, "branch")
+    util.validate_git_ref(spec.fetched, "fetched commit")
     if repo.target_branch and spec.branch == repo.target_branch:
         raise ValueError(f"a session cannot push its work branch to the saved target {repo.target_branch}")
     if denied := denied_work(spec, repo):
@@ -458,7 +471,7 @@ def push_fetched(spec: Spec, repo: config.Repo) -> None:
             log_line(spec, "error", f"not pushing {spec.branch}: its commits touch denied paths {held}")
         spec.held = held
         return
-    util.git(["push", "-q", "origin", f"{spec.fetched}:refs/heads/{spec.branch}"], repo.path, timeout=600)
+    util.git(["push", "-q", "--", "origin", f"{spec.fetched}:refs/heads/{spec.branch}"], repo.path, timeout=600)
     spec.pushed, spec.held = spec.fetched, ""
     log_line(spec, "device", f"pushed {spec.fetched[:10]} to {spec.branch}")
 

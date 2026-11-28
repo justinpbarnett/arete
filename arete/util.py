@@ -69,7 +69,12 @@ def foreground_maintenance(env: dict) -> dict:
         held = max(int(env.get("GIT_CONFIG_COUNT", "0")), 0)
     except ValueError:
         held = 0
-    set_false = {env.get(f"GIT_CONFIG_KEY_{i}") for i in range(held) if env.get(f"GIT_CONFIG_VALUE_{i}") == "false"}
+    set_false = set()
+    for key, value in env.items():
+        if key.startswith("GIT_CONFIG_KEY_"):
+            suffix = key.removeprefix("GIT_CONFIG_KEY_")
+            if suffix.isdigit() and int(suffix) < held and env.get(f"GIT_CONFIG_VALUE_{suffix}") == "false":
+                set_false.add(value)
     missing = [key for key in FOREGROUND_MAINTENANCE if key not in set_false]
     if not missing:
         return env
@@ -285,7 +290,15 @@ def _check_git(args: list[str], res: subprocess.CompletedProcess) -> None:
         raise RuntimeError(f"git {git_command(args)}: {git_error(_s(res.stderr or res.stdout))}")
 
 
+def validate_git_ref(ref: str, label: str = "git ref") -> str:
+    if (not isinstance(ref, str) or not ref or ref.startswith("-")
+            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ref)):
+        raise ValueError(f"invalid {label}: {ref!r}")
+    return ref
+
+
 def deploy_fast_forward(src: Path, tip: str) -> None:
+    validate_git_ref(tip, "commit")
     args = ["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip]
     path = _deploy_index_lock(src)
     with ExitStack() as cleanup:
@@ -512,14 +525,16 @@ def repo_lock(src: Path):
 
 
 def add_worktree(src: Path, wt: Path, branch: str, start: str, reset: bool = False) -> None:
+    validate_git_ref(branch, "branch")
+    validate_git_ref(start, "start ref")
     with repo_lock(src):
         branch_existed = bool(git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip())
         path_existed = wt.exists()
         try:
-            git(["worktree", "add", "-q", "--no-track", "-B" if reset else "-b", branch, str(wt), start], src)
+            git(["worktree", "add", "-q", "--no-track", "-B" if reset else "-b", branch, "--", str(wt), start], src)
         except BaseException:
             if not path_existed:
-                git(["worktree", "remove", "--force", str(wt)], src, check=False)
+                git(["worktree", "remove", "--force", "--", str(wt)], src, check=False)
                 shutil.rmtree(wt, ignore_errors=True)
             if not branch_existed:
                 _drop_branch(src, branch)
@@ -527,12 +542,14 @@ def add_worktree(src: Path, wt: Path, branch: str, start: str, reset: bool = Fal
 
 
 def delete_branch(src: Path, branch: str) -> None:
+    validate_git_ref(branch, "branch")
     with repo_lock(src):
         _drop_branch(src, branch)
 
 
 def _drop_branch(src: Path, branch: str) -> None:
-    git(["branch", "-D", branch], src, check=False)
+    validate_git_ref(branch, "branch")
+    git(["branch", "-D", "--", branch], src, check=False)
     if git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip():
         return
     for attempt in range(5):
@@ -597,13 +614,15 @@ def last_line(text: str, n: int = 160) -> str:
 
 
 def matches_any(path: str, globs: list[str]) -> bool:
+    folded = path.casefold()
     for g in globs:
-        if g.endswith("/") and (path.startswith(g) or path == g.rstrip("/")):
-            return True
-        if fnmatch.fnmatch(path, g):
-            return True
-        if g.endswith("/**") and path.startswith(g[:-3] + "/"):
-            return True
+        for candidate, pattern in ((path, g), (folded, g.casefold())):
+            if pattern.endswith("/") and (candidate.startswith(pattern) or candidate == pattern.rstrip("/")):
+                return True
+            if fnmatch.fnmatchcase(candidate, pattern):
+                return True
+            if pattern.endswith("/**") and candidate.startswith(pattern[:-3] + "/"):
+                return True
     return False
 
 
