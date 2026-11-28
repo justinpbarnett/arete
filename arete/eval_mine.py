@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, prompt_loader, record, tracker, util, verify, workspace
+from . import config, configrepo, gh, paths, prompt_loader, record, tracker, util, verify, workspace
 from .agent import READ_TOOLS
 from .evals import (
     EVALS,
@@ -21,10 +22,7 @@ from .evals import (
     load_tasks,
     prepare,
 )
-from .pipeline import (
-    MAX_DIFF_IN_PROMPT,
-    commit_layer,
-)
+from .pipeline import MAX_DIFF_IN_PROMPT
 from .store import approvals as approvals_store
 from .store import runs as run_store
 from .util import git
@@ -263,10 +261,22 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
     if c.repo.layer:
         name = free_name(wanted, lambda n: (c.layer.evals_dir / f"{n}.toml").exists())
         f = c.layer.evals_dir / f"{name}.toml"
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(draft.toml)
-        read_back(DirSource(c.layer.dir), "evals", name, draft)
-        commit = commit_layer(c.layer.dir, f"{c.repo.name}: eval {name}\n\n{summary}\n\nArete-Run: {run.id}", [f])
+        with tempfile.TemporaryDirectory(prefix="arete-eval-mine-") as tmp:
+            staged = Path(tmp) / "evals" / f"{name}.toml"
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_text(draft.toml)
+            read_back(DirSource(Path(tmp)), "evals", name, draft)
+        cfg_root = paths.CONFIG_DIR.resolve()
+        rel = f.resolve().relative_to(cfg_root).as_posix()
+        configrepo.ensure_repo()
+        commit = configrepo.commit(
+            {rel: draft.toml},
+            {rel: configrepo.ABSENT},
+            actor=f"run:{run.id}/eval_mine",
+            source="agent",
+            run_id=run.id,
+            note=f"{c.repo.name}: eval {name}",
+        )
         run.log(f"saved {paths.short_path(f)}" + (f" ({commit[:12]})" if commit else ""))
         return paths.short_path(f)
     base = c.repo.target_branch or c.layer.base_branch or gh.default_branch(c.repo.github)

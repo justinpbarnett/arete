@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from .. import __version__, client, config, paths, routing, steps
+from .. import __version__, client, config, configrepo, paths, principals, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -83,7 +83,15 @@ def cmd_init(args) -> int:
     if paths.CONFIG_FILE.exists() and not args.force:
         print(f"{paths.CONFIG_FILE} exists; pass --force to overwrite")
         return 1
-    paths.CONFIG_FILE.write_text(DEFAULT_CONFIG)
+    configrepo.init()
+    _, base_blob = configrepo.read("config.toml")
+    configrepo.commit(
+        {"config.toml": DEFAULT_CONFIG},
+        {"config.toml": base_blob},
+        actor=principals.current(),
+        source="engine",
+        note="arete init",
+    )
     print(f"wrote {paths.CONFIG_FILE}")
     print(f"state in {paths.STATE_DIR}, logs in {paths.LOG_DIR}")
     return 0

@@ -11,12 +11,14 @@ from pathlib import Path
 from . import (
     codebase,
     config,
+    configrepo,
     control,
     cron,
     devices,
     loop_run,
     loops,
     paths,
+    principals,
     record,
     runner,
     sources,
@@ -188,13 +190,39 @@ def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) ->
             kept = paths.short_path(folder)
             raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
                                   f"{kept}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(folder), dest)
+        cfg_root = paths.CONFIG_DIR.resolve()
+        dest_resolved = dest.resolve()
+        if not dest_resolved.is_relative_to(cfg_root):
+            kept = paths.short_path(folder)
+            raise control.Refused(f"private loop folder {dest} is outside the config folder {cfg_root}; "
+                                  f"its draft stays in {kept}")
+        rel_dir = dest_resolved.relative_to(cfg_root).as_posix()
+        changes: dict[str, bytes] = {}
+        base: dict[str, str] = {}
+        modes: dict[str, int] = {}
+        for item in sorted(folder.rglob("*")):
+            if not item.is_file():
+                continue
+            rel_file = f"{rel_dir}/{item.relative_to(folder).as_posix()}"
+            raw = item.read_bytes()
+            if item.name == "loop.toml":
+                raw = configrepo._set_enabled_toml(raw.decode("utf-8"), False).encode("utf-8")
+            changes[rel_file] = raw
+            base[rel_file] = configrepo.ABSENT
+            modes[rel_file] = item.stat().st_mode & 0o777
+        configrepo.ensure_repo()
+        actor = f"run:{run_id}/draft" if run_id else principals.current()
+        try:
+            configrepo.commit(changes, base, actor=actor, source="agent", run_id=run_id,
+                              note=f"draft loop {folder.name}", modes=modes)
+        except configrepo.StaleBase as e:
+            kept = paths.short_path(folder)
+            raise control.Refused(f"a loop named {folder.name} appeared while this one drafted; its draft stays in "
+                                  f"{kept}") from e
     finally:
         if not kept:
             shutil.rmtree(work, ignore_errors=True)
     loop = loops.find(folder.name)
-    loops.set_enabled(loop, False)
     loop_toml = (dest / "loop.toml").read_text()
     run_store.add_feed(run_id, "toml", loop_toml.rstrip())
     if note := str(answer.get("note") or "").strip():
