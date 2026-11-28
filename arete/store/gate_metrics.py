@@ -1,9 +1,9 @@
 """Checks, verification retries and publication measured from completed orchestrator actions."""
 
-import json
 import statistics
 
 from .. import util
+from ._rows import json_list
 from .db import reader
 
 
@@ -47,7 +47,7 @@ def check_verification(since: str, connect=reader) -> dict:
 
 
 def names(raw) -> tuple[str, ...]:
-    return tuple(sorted(name.strip().casefold() for name in json.loads(raw or "[]") if isinstance(name, str)))
+    return tuple(sorted(name.strip().casefold() for name in json_list(raw) if isinstance(name, str)))
 
 
 def summarize(rows, since: str) -> dict:

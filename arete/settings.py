@@ -14,8 +14,8 @@ RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per
 MODEL_ALIASES = ("opus", "sonnet", "haiku")
 MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+|"
                       r"(?:codex:)?(?:gpt-|codex-)[A-Za-z0-9._:-]+|codex:[A-Za-z0-9._-]+")
-TABLE_HEADER = re.compile(r"\s*\[")
-ASSIGNMENT = re.compile(r"""(?:[A-Za-z0-9_. \t-]|"(?:[^"\\]|\\.)*"|'[^']*')+=[ \t]*""")
+TABLE_HEADER = re.compile(r"^[ \t]*\[")
+ASSIGNMENT = re.compile(r"""^(?:[A-Za-z0-9_. \t-]|"(?:[^"\\]|\\.)*"|'[^']*')+=[ \t]*""")
 ASSIGNMENT_END = re.compile(r"[#\r\n]")
 INLINE_FIELD_END = re.compile(r"[#,}\r\n]")
 TOML_TRIVIA = re.compile(r"(?:[ \t\r\n]|#[^\r\n]*)*")
@@ -129,19 +129,29 @@ def inline_attention(statement: str, start: int, remaining: dict) -> str:
     while True:
         field_start = TOML_TRIVIA.match(statement, start).end()
         kept.append(statement[start:field_start])
+        if field_start >= len(statement):
+            raise Refused("The inline [ask] table in config.toml is malformed.")
         if statement[field_start] == "}":
             kept.append(inline_additions(remaining))
             break
         start = field_start
         end = attention_assignment_end(statement, start, INLINE_FIELD_END)
         field = statement[start:end]
-        key, old = next(iter(tomllib.loads(field).items()))
+        parsed_field = complete_toml(field)
+        if not parsed_field:
+            raise Refused("The inline [ask] table in config.toml is malformed.")
+        key, old = next(iter(parsed_field.items()))
         if key in remaining:
             value = remaining.pop(key)
             if value != old or type(value) is not type(old):
-                field = replace_attention_value(field, ASSIGNMENT.match(field).end(), len(field), value)
+                matched = ASSIGNMENT.match(field)
+                if matched is None:
+                    raise Refused("The inline [ask] table in config.toml is malformed.")
+                field = replace_attention_value(field, matched.end(), len(field), value)
         trimmed = field.rstrip(" \t")
         delimiter = TOML_TRIVIA.match(statement, end).end()
+        if delimiter >= len(statement):
+            raise Refused("The inline [ask] table in config.toml is malformed.")
         if statement[delimiter] == "}":
             trivia = field[len(trimmed):] + statement[end:delimiter]
             if remaining:
@@ -168,7 +178,7 @@ def instead_of(text: str) -> str:
 
 def run_limit_from(key: str, value) -> int:
     text = value.strip() if isinstance(value, str) else json.dumps(value)
-    if not text.isdecimal() or len(text) > len(str(PARALLEL_MAX)) or not 1 <= int(text) <= PARALLEL_MAX:
+    if not (text.isascii() and text.isdecimal()) or len(text) > len(str(PARALLEL_MAX)) or not 1 <= int(text) <= PARALLEL_MAX:
         raise Refused(f"{RUN_LIMITS[key]} takes a whole number from 1 to {PARALLEL_MAX}{instead_of(text)}")
     return int(text)
 

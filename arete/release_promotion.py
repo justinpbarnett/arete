@@ -113,21 +113,37 @@ def branch(repo, name):
 
 
 def parent(repo, revision):
-    commit = gh.gh_json(["api", f"repos/{repo.github}/git/commits/{revision}"], timeout=15, retry=False)
+    proof.need(isinstance(revision, str) and serve_guard.SHA.fullmatch(revision),
+               "production requires a valid commit SHA")
+    commit = gh.gh_json(["api", f"repos/{gh._safe_repo(repo.github)}/git/commits/{revision}"], timeout=15, retry=False)
+    if not isinstance(commit, dict):
+        raise proof.Held("could not read commit metadata")
     parents = commit.get("parents") or []
-    proof.need(commit.get("sha") == revision and len(parents) == 1,
+    proof.need(commit.get("sha") == revision and len(parents) == 1 and isinstance(parents[0], dict)
+               and serve_guard.SHA.fullmatch(str(parents[0].get("sha") or "")),
                "production requires an isolated single-parent change")
     return parents[0]["sha"]
 
 
+def _comment_body_text(raw) -> str:
+    if isinstance(raw, dict):
+        try:
+            return adf.to_text(raw)
+        except ValueError:
+            return ""
+    return raw if isinstance(raw, str) else ""
+
+
 def comments(repo, ticket, tk):
     if isinstance(tk, tracker.GitHubTracker):
-        rows = pages(f"repos/{repo.github}/issues/{int(ticket)}/comments?per_page=100")
-        return [((r.get("user") or {}).get("login", ""), r.get("body") or "", r.get("created_at", ""),
-                 r.get("updated_at", ""), str(r.get("id", ""))) for r in rows]
+        rows = pages(f"repos/{gh._safe_repo(repo.github)}/issues/{int(ticket)}/comments?per_page=100")
+        return [((r.get("user") or {}).get("login", ""), _comment_body_text(r.get("body")),
+                 r.get("created_at", ""), r.get("updated_at", ""), str(r.get("id", "")))
+                for r in rows if isinstance(r, dict)]
     rows = tk.client.comments(ticket)
-    return [((r.get("author") or {}).get("accountId", ""), adf.to_text(r["body"]) if isinstance(r["body"], dict)
-             else r["body"], r.get("created", ""), r.get("updated", ""), str(r.get("id", ""))) for r in rows]
+    return [((r.get("author") or {}).get("accountId", ""), _comment_body_text(r.get("body")),
+             r.get("created", ""), r.get("updated", ""), str(r.get("id", "")))
+            for r in rows if isinstance(r, dict)]
 
 
 def review_comments(tk, repo, ticket, policy, revision):
@@ -147,7 +163,7 @@ def review_comments(tk, repo, ticket, policy, revision):
         if directive or matched_prod or line.rstrip(".!").casefold() in EXPLICIT:
             if not explicit_sha and policy.get("qa_require_revision"):
                 continue
-            if (cid.isdigit() and (not explicit_sha or explicit_sha.lower() == revision.lower())
+            if (cid.isascii() and cid.isdigit() and (not explicit_sha or explicit_sha.lower() == revision.lower())
                     and (not edited or util.parse_iso(edited) == util.parse_iso(at))):
                 url = (gh.issue_url(repo.github, ticket) + "#issuecomment-" + cid if isinstance(tk, tracker.GitHubTracker)
                        else tk.client.comment_url(ticket, cid))
@@ -616,6 +632,9 @@ def peer_promotion(repo, ticket, state, policy):
 
 def isolate_revision(repo, revision, production, production_branch, *, on_prepared=None):
     """Cherry-pick a single staged commit onto production in an isolated worktree and push non-force."""
+    proof.need(serve_guard.SHA.fullmatch(revision or "") and serve_guard.SHA.fullmatch(production or "")
+               and config.valid_target_branch(production_branch),
+               "per-change isolation requires validated commit SHAs and branch names")
     proof.need(repo.path.is_dir() and (repo.path / ".git").exists(),
                "per-change isolation requires a local repository checkout")
     with util.repo_lock(repo.path):

@@ -20,6 +20,8 @@ _TEXT_MARKS = {"strong", "em", "strike", "underline", "code", "subsup", "textCol
 _NODE_MARKS = {"text": _TEXT_MARKS | {"link", "annotation"},
                "media": {"link", "border", "annotation", "dataConsumer"}, "mediaSingle": {"link"}}
 _MAX_RENDERED_CHARS = 1_000_000
+_MAX_DEPTH = 64
+_MAX_NODES = 100_000
 
 
 @dataclass(frozen=True, eq=False, slots=True)
@@ -42,8 +44,9 @@ def to_text(value: object) -> str:
             or type(value.get("version")) is not int or value["version"] != 1):
         raise ValueError("expected plain text, null, or an ADF v1 document")
     parts: list[tuple[str, _LinkTargets | None]] = []
+    budget = [_MAX_NODES]
     try:
-        _read_node(value, "doc", {"doc"}, parts)
+        _read_node(value, "doc", {"doc"}, parts, budget=budget)
     except RecursionError:
         raise ValueError("ADF nesting is too deep to read") from None
     return _render_text(parts)
@@ -53,29 +56,47 @@ def task_items(value: object) -> tuple[str, ...]:
     if not isinstance(value, dict):
         return ()
     items = []
-    pending = [value]
+    pending: list[tuple[object, int]] = [(value, 0)]
+    seen = 0
     while pending:
-        node = pending.pop()
-        kind = node["type"]
+        node, depth = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        seen += 1
+        if seen > _MAX_NODES or depth > _MAX_DEPTH:
+            raise ValueError("ADF nesting or size exceeds the readable limit")
+        kind = node.get("type")
+        if not isinstance(kind, str):
+            continue
         if kind == "taskItem":
-            parts = []
-            _read_node(node, kind, {kind}, parts)
+            parts: list[tuple[str, _LinkTargets | None]] = []
+            _read_node(node, kind, {kind}, parts, depth=depth, budget=[_MAX_NODES - seen + 1])
             items.append(_render_text(parts).split("\n", 1)[0])
             continue
-        if kind == "listItem" and (first := node["content"][0])["type"] == "paragraph":
+        children = node.get("content")
+        if (kind == "listItem" and isinstance(children, list) and children
+                and isinstance(children[0], dict) and children[0].get("type") == "paragraph"):
             parts = []
-            _read_node(first, kind, {"paragraph"}, parts)
+            _read_node(children[0], kind, {"paragraph"}, parts, depth=depth + 1, budget=[_MAX_NODES - seen + 1])
             if checkbox := re.match(r"^\[[ xX]\][ \t]+([^\n]+)", _render_text(parts)):
                 items.append(checkbox[1])
-        if kind not in ("blockquote", "codeBlock"):
-            pending.extend(reversed(node.get("content", [])))
+        if kind not in ("blockquote", "codeBlock") and isinstance(children, list):
+            pending.extend((child, depth + 1) for child in reversed(children))
     return tuple(items)
 
 
 def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, _LinkTargets | None]],
-               inherited_links: _LinkTargets | None = None) -> None:
+               inherited_links: _LinkTargets | None = None, *, depth: int = 0,
+               budget: list[int] | None = None) -> None:
     def refuse(reason: str):
         raise ValueError(f"ADF {path}: {reason}")
+
+    if depth > _MAX_DEPTH:
+        raise ValueError("ADF nesting is too deep to read")
+    if budget is not None:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise ValueError("ADF document exceeds the readable node limit")
 
     if not isinstance(node, dict) or not isinstance(node.get("type"), str) or node["type"] not in allowed:
         refuse("unsupported or misplaced node type")
@@ -125,7 +146,8 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
         for i, child in enumerate(children):
             if i and separator:
                 parts.append((separator, None))
-            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts, context)
+            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts, context,
+                       depth=depth + 1, budget=budget)
         return
     else:
         if "content" in node:
@@ -203,7 +225,7 @@ def _render_text(parts: list[tuple[str, _LinkTargets | None]]) -> str:
     return "\n".join(output)
 
 
-_INLINE = re.compile(r"`(?P<code>[^`]+)`|\*\*(?P<strong>[^*]+)\*\*|\[(?P<link>[^\]]+)\]\((?P<href>https?://[^)\s]+)\)")
+_INLINE = re.compile(r"`(?P<code>[^`]+)`|\*\*(?P<strong>[^*]+)\*\*|\[(?P<link>[^\[\]\n]+)\]\((?P<href>https?://[^)\s]+)\)")
 
 
 def _text(text: str, *marks: dict) -> dict:

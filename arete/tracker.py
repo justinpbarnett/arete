@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -100,12 +101,13 @@ def github_issue_identity(repo: str, tid: str | int) -> str:
 
 
 def jira_issue_identity(site: str, issue_id) -> str:
-    if not isinstance(site, str) or not str(issue_id or "").isdigit():
+    raw = str(issue_id or "")
+    if not isinstance(site, str) or not (raw.isascii() and raw.isdigit()):
         return ""
     url = urlsplit(site)
     if not url.scheme or not url.netloc:
         return ""
-    return f"jira:{url.scheme.casefold()}://{url.netloc.casefold()}{url.path.rstrip('/')}:{int(issue_id)}"
+    return f"jira:{url.scheme.casefold()}://{url.netloc.casefold()}{url.path.rstrip('/')}:{int(raw)}"
 
 
 def is_task_id(tid) -> bool:
@@ -153,7 +155,10 @@ def batch_ids(t: Ticket) -> list[str]:
         raise TaskError("a batch needs its only plain, unindented Batch issues: line first, before any nonblank content, "
                         "with comma-separated #numbers from this repo; repeated directives, even in examples, are refused")
     named = re.findall(r"#([0-9]+)", header[1])
-    own = str(int(t.id))
+    raw_id = str(t.id).strip()
+    if not (raw_id.isascii() and raw_id.isdigit() and int(raw_id) > 0):
+        raise TaskError("a batch is only supported for numeric GitHub issues")
+    own = str(int(raw_id))
     if own not in named or len(named) > 20:
         raise TaskError("a batch must include its own issue and name at most 20 issues")
     return [own, *sorted(set(named) - {own}, key=int)]
@@ -195,7 +200,7 @@ class GitHubTracker:
 
     def normalize(self, tid: str | int) -> str:
         s = str(tid).strip().lstrip("#")
-        if not s.isdigit():
+        if not (s.isascii() and s.isdigit()) or int(s) <= 0:
             raise ValueError(f"'{tid}' is not an issue number")
         return str(int(s))
 
@@ -212,9 +217,12 @@ class GitHubTracker:
 
     def remember(self, tid: str, issue: dict) -> Ticket:
         tid = str(tid)
+        raw_labels = issue.get("labels") if isinstance(issue, dict) else ()
+        labels = [label["name"] for label in (raw_labels or ())
+                  if isinstance(label, dict) and isinstance(label.get("name"), str)]
         ticket = Ticket(tid, self.ref(tid), issue.get("title") or "", body=issue.get("body") or "",
                         url=issue.get("url", ""), created=issue.get("createdAt", ""),
-                        labels=[label["name"] for label in issue.get("labels", [])], github_repo=self.repo.github)
+                        labels=labels, github_repo=self.repo.github)
         try:
             ticket.github_blockers = gh.open_issue_blockers(self.repo.github, int(tid), issue)
         except (gh.GhError, TypeError, ValueError) as error:
@@ -347,8 +355,9 @@ class GitHubTracker:
         labels = ticket.labels
         spec = SPEC_LABEL in labels
         author = (i.get("author") or {}).get("login", "")
-        comments = [(self.owner if not spec else c["author"]["login"], c.get("createdAt", ""), c.get("body", ""))
-                    for c in i.get("comments", []) if self.by_publisher(c, spec)]
+        comments = [(self.owner if not spec else ((c.get("author") or {}).get("login") or ""),
+                     c.get("createdAt", ""), c.get("body") or "")
+                    for c in (i.get("comments") or []) if isinstance(c, dict) and self.by_publisher(c, spec)]
         publisher = "the configured GitHub user" if spec else self.owner
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_publisher(i, spec) else f"it was opened by {author or 'someone else'}, not {publisher}") or (
@@ -453,12 +462,12 @@ class JiraTracker:
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         if not self.project:
             raise jira.JiraError(f"{self.repo.name}: no Jira project; set [jira] project or jira_project on the repo")
-        route = f'labels = "{self.route}"'
+        route = f"labels = {json.dumps(self.route)}"
         fields = [*SEARCH_FIELDS, "description"]
         issues = self.client.search(candidates_jql(self.project, route), fields, limit=20)
         if parked:
             failed = self.label_name("failed")
-            jql = candidates_jql(self.project, f'{route} AND labels = "{failed}"', include_state=failed)
+            jql = candidates_jql(self.project, f"{route} AND labels = {json.dumps(failed)}", include_state=failed)
             issues.extend(self.client.search(jql, fields, limit=20, include=lambda i: parked(i["key"])))
         return [search_ticket(self.client, i) for i in issues]
 
@@ -477,7 +486,7 @@ class JiraTracker:
         return category != "done" if category else None
 
     def replied(self) -> list[Ticket]:
-        jql = candidates_jql(self.project, f'labels = "{self.route}" AND labels = "{self.label_name("needs-info")}"',
+        jql = candidates_jql(self.project, f"labels = {json.dumps(self.route)} AND labels = {json.dumps(self.label_name('needs-info'))}",
                              skip_states=False)
         me = self.client.me().get("accountId", "")
         out = []
@@ -530,9 +539,14 @@ class JiraTracker:
         directed = [text for c, text in zip(approved_comments, comments)
                     if not c.get("updateAuthor") or (c["updateAuthor"].get("accountId") == me)
                     or approved_at and jira.parse_time(c.get("updated") or c["created"]) <= approved_at]
-        images = [Image(str(a["id"]), a.get("filename") or "image", int(a.get("size") or 0))
-                  for a in trusted(me, approved_at, f.get("attachment") or [])
-                  if (a.get("mimeType") or "").startswith("image/")]
+        images = []
+        for a in trusted(me, approved_at, [x for x in (f.get("attachment") or []) if isinstance(x, dict)]):
+            if (a.get("mimeType") or "").startswith("image/") and a.get("id") is not None:
+                try:
+                    size = int(a.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                images.append(Image(str(a["id"]), str(a.get("filename") or "image"), max(0, size)))
         return Ticket(tid, tid, f.get("summary", ""), body=body, comments=comments_text(comments), owner_comments=scope_comments(directed),
                       saved_scope_matches=same_comment_scope(comments, directed, saved_comments), open=((status.get("statusCategory") or {}).get("key") != "done"),
                       kind="fix" if itype in FIX_TYPES or FIX_LABELS & set(labels) else "feat",
@@ -541,14 +555,19 @@ class JiraTracker:
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         out = SavedImages()
+        root = dest.resolve()
         for img in t.images:
             if len(out.paths) >= MAX_IMAGES or img.size > MAX_IMAGE_BYTES:
                 out.left_out.append(img.name)
                 continue
             dest.mkdir(parents=True, exist_ok=True)
-            path = dest / f"{img.id}-{safe_filename(img.name)}"
+            name = f"{safe_filename(img.id)}-{safe_filename(img.name)}"
+            path = (dest / name).resolve()
+            if not path.is_relative_to(root) or path.parent != root:
+                out.left_out.append(img.name)
+                continue
             path.write_bytes(self.client.attachment(img.id))
-            out.paths.append(path)
+            out.paths.append(dest / name)
         return out
 
     def prepare(self) -> list[str]:
@@ -733,8 +752,8 @@ def route_label(repo: config.Repo) -> str:
 
 
 def candidates_jql(project: str, extra: str = "", skip_states: bool = True, *, include_state: str = "") -> str:
-    skip = ", ".join(f'"{s}"' for s in sorted(JIRA_STATE_LABELS - {include_state}))
-    parts = [f'project = "{project}"', f'labels = "{LABEL}"', "assignee = currentUser()", "statusCategory != Done"]
+    skip = ", ".join(json.dumps(s) for s in sorted(JIRA_STATE_LABELS - {include_state}))
+    parts = [f"project = {json.dumps(project)}", f"labels = {json.dumps(LABEL)}", "assignee = currentUser()", "statusCategory != Done"]
     if skip_states:
         parts.append(f"labels not in ({skip})")
     if extra:
@@ -911,9 +930,13 @@ def route_blocker(routes: set[str], labels: list[str]) -> str:
 WAIT_LINE = re.compile(r"^[ \t]*(?:[-*+][ \t]+|#{1,6}[ \t]+)?(?:\*\*|__)?"
                        r"(?:waits[ \t]+on|blocked[ \t]+by)\b(?:\*\*|__)?[ \t]*:?[ \t]*(?:\*\*|__)?(.*)$",
                        re.IGNORECASE | re.MULTILINE)
-WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
-WAIT_GITHUB = re.compile(r"(?<![\w/])(?:([\w.-]+/[\w.-]+)#([0-9]+)\b|"
-                         r"https://github\.com/([\w.-]+/[\w.-]+)/issues/([0-9]+)\b|#([0-9]+)\b)", re.IGNORECASE)
+WAIT_REF = re.compile(r"(?<![\w/])#([1-9][0-9]{0,18})(?![0-9])")
+WAIT_GITHUB = re.compile(
+    r"(?<![\w./-])(?:([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]{0,18})(?![0-9])|"
+    r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)/issues/([1-9][0-9]{0,18})(?![0-9])|"
+    r"#([1-9][0-9]{0,18})(?![0-9]))",
+    re.IGNORECASE,
+)
 WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
 WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
@@ -923,9 +946,11 @@ def waits_on(body: str) -> list[int]:
     for rest in WAIT_LINE.findall(body or ""):
         for number in WAIT_REF.findall(rest):
             try:
-                found.append(int(number))
+                num = int(number)
             except ValueError:
                 continue
+            if num > 0:
+                found.append(num)
     return list(dict.fromkeys(found))
 
 
@@ -937,7 +962,11 @@ def github_waits(body: str, repo: str) -> list[tuple[str, int]]:
                 issue = int(number or url_number or local)
             except ValueError:
                 continue
-            found.append(((qualified or url_repo or repo).casefold(), issue))
+            target_repo = (qualified or url_repo or repo).casefold()
+            parts = target_repo.split("/")
+            if issue <= 0 or len(parts) != 2 or any(p in ("", ".", "..") or p.startswith("-") for p in parts):
+                continue
+            found.append((target_repo, issue))
     return list(dict.fromkeys(found))
 
 

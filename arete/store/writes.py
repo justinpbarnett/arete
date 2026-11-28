@@ -35,6 +35,8 @@ def validate_version(value):
 
 
 def current(c, table, identity):
+    if table not in FIELDS:
+        raise ValueError(f"invalid versioned table: {table!r}")
     column = IDENTITY[table]
     row = c.execute(f"SELECT {column}, * FROM {table} WHERE {column} = ?", (identity,)).fetchone()
     return dict(row) if row else None
@@ -60,6 +62,8 @@ def atomic():
 
 
 def fields_for(table, fields):
+    if table not in FIELDS:
+        raise ValueError(f"invalid versioned table: {table!r}")
     if set(fields) - FIELDS[table]:
         raise ValueError(f"invalid {table} fields: {', '.join(sorted(set(fields) - FIELDS[table]))}")
 

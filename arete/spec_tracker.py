@@ -15,7 +15,7 @@ DIGEST_PATTERN = "[a-f0-9]{64}"
 GH_MARKER = re.compile(re.escape(gh.key_mark(CREATION_KEY + "TOKEN")).replace("TOKEN", DIGEST_PATTERN))
 JIRA_MARKER = re.compile(re.escape(CREATION_LABEL) + DIGEST_PATTERN)
 NUMBER = re.compile(r"[1-9][0-9]*")
-GH_REPO = r"[a-z0-9-]+/[a-z0-9_.-]+"
+GH_REPO = r"[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_.-]*"
 GH_REF = re.compile(rf"(?:({GH_REPO})?#)?({NUMBER.pattern})", re.IGNORECASE | re.ASCII)
 GH_URL = re.compile(rf"https://github\.com/({GH_REPO})/issues/({NUMBER.pattern})/?", re.IGNORECASE | re.ASCII)
 
@@ -129,14 +129,19 @@ class GitHub:
         return match[1].casefold() if match else ""
 
     def item(self, row, *, scoped=True):
+        if not isinstance(row, dict):
+            raise Held("GitHub returned an unrecognized issue")
         repo = self.slug(row)
+        raw_labels = row.get("labels")
         if ("pull_request" in row or not valid_native(row.get("number")) or not repo
-                or row.get("state") not in ("open", "closed")):
+                or row.get("state") not in ("open", "closed")
+                or not isinstance(raw_labels, list)
+                or any(not isinstance(lb, dict) or not isinstance(lb.get("name"), str) for lb in raw_labels)):
             raise Held("GitHub returned an unrecognized issue")
         if scoped and repo not in self.allowed_repos:
             raise Held(f"GitHub returned a native child outside the configured authority: {repo}#{row['number']}")
         return confirmed_item(self.reference(repo, row["number"]), row.get("id"), row.get("title"), row.get("body") or "",
-                              [label["name"] for label in row["labels"]], row["state"] == "open")
+                              [label["name"] for label in raw_labels], row["state"] == "open")
 
     def read(self, ref):
         item = self.item(self.get(self.path(ref)))
@@ -369,8 +374,16 @@ class Jira:
         self.send("POST", self.path(ref) + "/comment", {"body": adf.from_markdown(markdown)})
 
     def commented(self, ref, token, account):
-        return any((row.get("author") or {}).get("accountId") == account
-                   and f"aretespec{token}" in adf.to_text(row["body"]).splitlines() for row in self.client.comments(ref))
+        for row in self.client.comments(ref):
+            if not isinstance(row, dict) or (row.get("author") or {}).get("accountId") != account:
+                continue
+            try:
+                text = adf.to_text(row.get("body"))
+            except ValueError:
+                continue
+            if f"aretespec{token}" in text.splitlines():
+                return True
+        return False
 
 
 def one(items):

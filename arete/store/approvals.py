@@ -5,6 +5,7 @@ import secrets
 
 from .. import util
 from . import insights
+from ._rows import json_dict
 from .db import db, reader
 
 TABLES = {
@@ -53,7 +54,7 @@ def approval(approval_id: int) -> dict | None:
 
 
 def approval_of(row) -> dict:
-    return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
+    return {**dict(row), "emit": json_dict(row["emit"]), "review": json_dict(row["review"])}
 
 
 def claim_approval(approval_id: int, until: str, came_from: tuple[str, ...] = DECIDABLE, *, previous="") -> str:

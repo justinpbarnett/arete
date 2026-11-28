@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from .. import owner_asks, util
+from ._rows import json_dict, json_list
 from .db import db, reader
 
 # Ignore a question from a ticket that has since started another whole run.
@@ -30,8 +31,8 @@ def take_messages(run_id: str) -> list[str]:
 
 
 def ask_row(r) -> dict:
-    return {**dict(r), "questions": json.loads(r["questions"]), "session": json.loads(r["session"] or "{}"),
-            "answers": json.loads(r["answers"] or "[]"), "staged_answers": json.loads(r["staged_answers"])}
+    return {**dict(r), "questions": json_list(r["questions"]), "session": json_dict(r["session"]),
+            "answers": json_list(r["answers"]), "staged_answers": json_dict(r["staged_answers"])}
 
 
 def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
