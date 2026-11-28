@@ -78,6 +78,6 @@ def apply(conn) -> None:
         "WHERE vm_name != '' AND (released IS NULL OR outcome = 'delete_failed')"
     )
     conn.execute(
-        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 41 "
-        "THEN '41' ELSE value END WHERE key = 'oldest_writer'"
+        "UPDATE schema_meta SET value = CASE WHEN CAST(COALESCE(value, '0') AS INTEGER) < 43 "
+        "THEN '43' ELSE value END WHERE key = 'oldest_writer'"
     )

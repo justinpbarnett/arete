@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -89,12 +90,64 @@ class WorkflowNotForPR(GhError):
     pass
 
 
+_MARK_TAG_RE = re.compile(r"^[0-9a-f]{8}$")
+_MARK_CACHE_LOCK = threading.Lock()
+_MARK_CACHE: dict[tuple, tuple[str, bool]] = {}
+
+
+def clear_mark_cache() -> None:
+    with _MARK_CACHE_LOCK:
+        _MARK_CACHE.clear()
+
+
+def _db_file_key() -> tuple | None:
+    try:
+        st = paths.DB_FILE.stat()
+    except OSError:
+        return None
+    if st.st_size == 0:
+        return None
+    return (str(paths.DB_FILE), st.st_dev, st.st_ino, getattr(st, "st_birthtime", None))
+
+
+def _mark_meta() -> tuple[str, bool]:
+    key = _db_file_key()
+    if key is None:
+        return "", True
+    with _MARK_CACHE_LOCK:
+        cached = _MARK_CACHE.get(key)
+        if cached is not None:
+            return cached
+    from .store import db
+
+    try:
+        meta = db.schema_metadata()
+    except (OSError, sqlite3.Error, RuntimeError):
+        return "", True
+    tag = str(meta.get("instance_tag") or "")
+    if not _MARK_TAG_RE.fullmatch(tag):
+        return "", True
+    result = (tag, meta.get("accepts_bare_mark") == "1")
+    with _MARK_CACHE_LOCK:
+        _MARK_CACHE[key] = result
+    return result
+
+
+def instance_mark() -> str:
+    tag, _ = _mark_meta()
+    return f"<!-- arete:{tag} -->" if tag else ARETE_MARK
+
+
 def marked(body: str) -> str:
-    return f"{body.rstrip()}\n\n{ARETE_MARK}"
+    return f"{body.rstrip()}\n\n{instance_mark()}"
 
 
 def has_arete_mark(body: str | None) -> bool:
-    return ARETE_MARK in (body or "")
+    text = body or ""
+    tag, accepts_bare = _mark_meta()
+    if tag and f"<!-- arete:{tag} -->" in text:
+        return True
+    return accepts_bare and ARETE_MARK in text
 
 
 class Outgoing(str):

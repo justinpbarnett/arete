@@ -116,6 +116,7 @@ def settle_approval(approval_id: int, status: str, outcome: str, result: str = "
         if judged:
             insights.judge_approval(c, approval_id, outcome)
         _sync_inbox(c, "approvals")
+        _sync_inbox(c, "outbox")
         return True
 
 

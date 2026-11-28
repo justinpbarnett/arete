@@ -39,6 +39,7 @@ from . import (
     loop_run,
     loops,
     oncall,
+    outbox,
     paths,
     pilot,
     principals,
@@ -453,6 +454,8 @@ class Server:
         self.contracts_waiting = False
         self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
+        self.outbox_pool = factory_control.WorkPool(1, thread_name_prefix="outbox")
+        self.outbox_job: Future | None = None
 
     def say(self, text: str) -> None:
         print(f"{util.iso()} {text}", flush=True)
@@ -682,6 +685,7 @@ class Server:
         for released in delivery.release_lapsed():
             self.say(f"approval #{released}: {delivery.cut_off('claim expired')}")
         self.start_approval_jobs()
+        self.start_outbox_job()
 
     def rotate_when_due(self) -> None:
         if time.monotonic() - self.rotated > ROTATE_SECONDS:
@@ -1270,6 +1274,20 @@ class Server:
             self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 
+    def start_outbox_job(self) -> None:
+        if self.outbox_job is not None and not self.outbox_job.done():
+            return
+        self.outbox_job = None
+        with foundation.tx() as c:
+            outbox.sweep(c, self.started)
+        self.outbox_job = self.outbox_pool.submit(self.do_outbox_job)
+
+    def do_outbox_job(self) -> None:
+        try:
+            outbox.send_due()
+        except Exception as e:
+            self.say(f"outbox send failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+
     def retry_once(self, item: dict, why: str) -> None:
         self.say(f"{item['loop']}: queue item {item['id']} failed to start, {why}; "
                  "the recovery sweep handles its claim")
@@ -1288,6 +1306,8 @@ class Server:
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
             return running[0]
+        if (job := getattr(self, "outbox_job", None)) and not job.done():
+            return "an outbox delivery is still running"
         if self.oncall and not self.oncall.done():
             return "an on-call scan is still running"
         if self.sweeping():

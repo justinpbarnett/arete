@@ -9844,8 +9844,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 92)
-        self.assertEqual(len({op["name"] for op in operations}), 92)
+        self.assertEqual(len(operations), 105)
+        self.assertEqual(len({op["name"] for op in operations}), 105)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -10431,9 +10431,9 @@ class CredentialMcpHttpTests(_CredentialMcpCase):
             issued = self.issue(server, self.pair(server), scopes=("read", "task:write", "run:write"))
             post, session = self.mcp(server, issued["text"])
             names = {tool["name"] for tool in post("tools/list", 2)[0]["result"]["tools"]}
-            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "task__list", "task__get",
-                                     "task__create", "comment__create", "run__list", "run__get", "run__stop",
-                                     "run__steer"})
+            self.assertEqual(names, {"screen__get", "inbox__list", "inbox__get", "outbox__list", "outbox__get",
+                                     "task__list", "task__get", "task__create", "comment__create", "run__list",
+                                     "run__get", "run__stop", "run__steer"})
             post("tools/call", 3, {"name": "token__issue"}, status=403, code="scope_missing")
             create = {"name": "task__create", "arguments": {"repo": "fixture", "body": "Work </untrusted>"}}
             answer, _ = post("tools/call", 4, create)
@@ -14424,7 +14424,7 @@ assert loaded_remote == old_parsed, (loaded_remote, old_parsed)
 
         # Part B: Contract migration gate, copy of two vms rows, view, lapse + sweep, and refusal on unmatched device.
         self._run_child(r"""
-setup_scratch(migrate_through=39)
+setup_scratch(migrate_through=41)
 host = FakeProxmoxHost(Path(os.environ["TMPDIR"]))
 prox_dev = devices.get("prox")
 created_ts = util.iso(util.now() - timedelta(minutes=5))
@@ -14441,15 +14441,15 @@ with foundation.tx(fenced=False) as c:
         ("arete-legacy-2", None, json.dumps(__import__("dataclasses").asdict(prox_dev)), 102, created_ts),
     )
     c.execute(
-        "INSERT INTO runs (id, kind, status, started, pid, schema_version) VALUES (?, 'loop', 'running', ?, ?, 39)",
+        "INSERT INTO runs (id, kind, status, started, pid, schema_version) VALUES (?, 'loop', 'running', ?, ?, 41)",
         ("old-blocker", created_ts, os.getpid()),
     )
 
-# Contract waits while old running run holds the gate (expand m0040 applies, contract m0041 waits).
+# Contract waits while old running run holds the gate (expand m0042 applies, contract m0043 waits).
 waiting = foundation.migrate()
 assert waiting is True
 with foundation.reader() as c:
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 40
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 42
 
 # Release gate -> contract runs and copies both vms rows into open leases + creates vms view.
 with foundation.tx(fenced=False) as c:
@@ -14457,7 +14457,7 @@ with foundation.tx(fenced=False) as c:
 waiting = foundation.migrate()
 assert waiting is False
 with foundation.reader() as c:
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 41
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 43
     view_rows = [(r["name"], r["vmid"]) for r in c.execute("SELECT name, vmid FROM vms ORDER BY vmid")]
     assert view_rows == [("arete-legacy-1", 101), ("arete-legacy-2", 102)], view_rows
 
@@ -14474,7 +14474,7 @@ assert not (host.vms_dir / "101.conf").exists() and not (host.vms_dir / "102.con
 
         # Part C: Unmatched vms row refuses the contract naming row + delete_command().
         self._run_child(r"""
-setup_scratch(migrate_through=40)
+setup_scratch(migrate_through=42)
 ghost = devices.Device("ghost", "proxmox", host="root@ghost.test", template="9000")
 with foundation.tx(fenced=False) as c:
     c.execute(

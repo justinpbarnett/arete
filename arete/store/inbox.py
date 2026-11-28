@@ -14,7 +14,7 @@ TABLES = {
 
 KINDS = frozenset((
     "approval", "choice", "continue", "freeform", "proposal", "candidate", "alert", "workspace", "config_invalid",
-    "queue.dead", "evidence",
+    "queue.dead", "evidence", "outbox",
 ))
 STATES = frozenset(("open", "snoozed", "shelved", "paused", "resolved"))
 PRIORITIES = (1, 2, 3)
@@ -42,13 +42,17 @@ def decode(row) -> dict | None:
     if row is None:
         return None
     d = dict(row)
-    return {
+    detail = json.loads(d["detail"] or "{}")
+    out = {
         **d,
         "id": format_id(d["id"]),
-        "detail": json.loads(d["detail"] or "{}"),
+        "detail": detail,
         "verbs": json.loads(d["verbs"] or "[]"),
         "options": json.loads(d["options"] or "[]"),
     }
+    if isinstance(detail, dict) and "outbox_id" in detail:
+        out["outbox_id"] = detail["outbox_id"]
+    return out
 
 
 def _event_data(row, extra: dict | None = None) -> dict:

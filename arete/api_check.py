@@ -429,11 +429,12 @@ class Check:
 
     def shapes(self):
         from . import (
-            agent, cohorts, contract, dashboard, devices, leases, paths, principals, private_evidence, record, replay,
+            agent, cohorts, contract, dashboard, devices, leases, outbox, paths, principals, private_evidence, record,
+            replay,
             secretstore, triage,
         )
         from .sighting import Sighting
-        from .store import chats, incidents, insights, push, runs, tokens
+        from .store import chats, db, incidents, insights, push, runs, tokens
         from .store import evidence as evidence_store
         from .store import inbox as inbox_store
         from .store import triage as triage_store
@@ -446,6 +447,30 @@ class Check:
         incident, _ = incidents.record_incident(Sighting("check", "expected", "fixture", "", "fixture incident", 1, "", ""))
         incidents.alert_set("fixture-alert", None)
         fixture_item = inbox_store.get_open_by_subject("alert:fixture-alert")
+        with db.tx() as c:
+            ob_main = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                   body="Fixture outbox body", drafted_by="hand", slot="check-main")
+            ob_undo = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                   body="Fixture undo", drafted_by="hand", slot="check-undo")
+            ob_hold = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                   body="Fixture hold", drafted_by="hand", slot="check-hold")
+            ob_reject = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                     body="Fixture reject", drafted_by="hand", slot="check-reject")
+            ob_retry = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                    body="Fixture retry", drafted_by="hand", slot="check-retry")
+            ob_discard = outbox.draft(c, target="github", kind="comment", object="github:demo/repo#7",
+                                      body="Fixture discard", drafted_by="hand", slot="check-discard")
+            c.execute("UPDATE outbox SET state = 'approved', send_at = '2099-01-01T00:00:00Z' WHERE id IN (?, ?)",
+                      (ob_undo, ob_hold))
+            c.execute("UPDATE outbox SET state = 'failed', error = 'fixture' WHERE id = ?", (ob_retry,))
+        outbox_targets = {
+            "outbox.undo": f"OB-{ob_undo}",
+            "outbox.hold": f"OB-{ob_hold}",
+            "outbox.release": f"OB-{ob_hold}",
+            "outbox.reject": f"OB-{ob_reject}",
+            "outbox.retry": f"OB-{ob_retry}",
+            "outbox.discard": f"OB-{ob_discard}",
+        }
         ev_id = private_evidence.request_id(replay.SAMPLE_REPO, self.task, "jira:attachment:fixture-1")
         evidence_store.upsert_missing(
             ev_id,
@@ -485,7 +510,9 @@ class Check:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
             resource = name.partition(".")[0]
+            ob_item = outbox_targets.get(name, f"OB-{ob_main}")
             target = {**values, **identities, "id": identities.get(resource, ""),
+                      "item": ob_item if resource == "outbox" else identities["item"],
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -497,6 +524,13 @@ class Check:
                 values["base_version"] = row["version"]
             if name in ("inbox.snooze", "inbox.shelve", "inbox.resolve"):
                 values["base_version"] = self.read(f"/api/v1/inbox/{identities['item']}")["item"]["version"]
+            if resource == "outbox" and method != "GET":
+                cur_ob = self.read(f"/api/v1/outbox/{ob_item}")["item"]
+                values["base_version"] = cur_ob["version"]
+                if name == "outbox.edit":
+                    values["base_rev"] = cur_ob["rev"]
+                elif name == "outbox.approve":
+                    values["rev"] = cur_ob["rev"]
             if name == "config.diff":
                 values["from"], values["to"] = "1", "2"
             if name == "settings.update":

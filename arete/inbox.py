@@ -59,6 +59,7 @@ RESERVED_MANUAL_PREFIXES = (
     "evidence:",
     "config:",
     "queue:",
+    "outbox:",
 )
 
 
@@ -607,6 +608,73 @@ def _queue_dead_items(c) -> list[dict]:
     return [queue_dead_spec(dict(r), r["events_count"]) for r in rows]
 
 
+def _outbox_items(c) -> list[dict]:
+    from . import outbox
+    from .store import outbox as outbox_store
+
+    if not outbox_store.available(c):
+        return []
+    items = []
+    for row in outbox_store.inbox_pending_items(c):
+        ob_id = outbox_store.format_id(row["id"])
+        title = row["plain_summary"] or row["summary"] or f"{row['kind']} on {row['object'] or row['target']}"
+        detail = {
+            "outbox_id": ob_id,
+            "id": row["id"],
+            "rev": row["rev"],
+            "version": row["version"],
+            "state": row["state"],
+            "target": row["target"],
+            "kind": row["kind"],
+            "object": row["object"],
+            "audience": row["audience"],
+            "summary": row["summary"],
+            "stamp": f"{row['state']}:{row['rev']}:{row['version']}",
+        }
+        items.append({
+            "kind": "outbox",
+            "subject": f"outbox:{row['id']}",
+            "task_id": str(row["task_id"] or ""),
+            "run_id": str(row["run_id"] or ""),
+            "line": str(row["loop"] or row["object"] or row["target"] or ""),
+            "priority": 2,
+            "title": title,
+            "detail": detail,
+            "verbs": ["approve", "reject"],
+            "options": [],
+        })
+    cutoff = util.iso(util.now() - timedelta(seconds=outbox.STALE_SENDING_SECONDS))
+    for row in outbox_store.inbox_stale_sending_items(c, cutoff):
+        ob_id = outbox_store.format_id(row["id"])
+        title = row["plain_summary"] or row["summary"] or f"Sending {ob_id}"
+        detail = {
+            "outbox_id": ob_id,
+            "id": row["id"],
+            "rev": row["rev"],
+            "version": row["version"],
+            "state": row["state"],
+            "target": row["target"],
+            "kind": row["kind"],
+            "object": row["object"],
+            "audience": row["audience"],
+            "sending_since": row["sending_since"],
+            "stamp": f"sending:{row['sending_since']}",
+        }
+        items.append({
+            "kind": "outbox",
+            "subject": f"outbox:{row['id']}",
+            "task_id": str(row["task_id"] or ""),
+            "run_id": str(row["run_id"] or ""),
+            "line": str(row["loop"] or row["object"] or row["target"] or ""),
+            "priority": 3,
+            "title": title,
+            "detail": detail,
+            "verbs": [],
+            "options": [],
+        })
+    return items
+
+
 ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "approvals": ("approval:%", _approvals_items),
     "asks": ("ask:%", _asks_items),
@@ -621,6 +689,7 @@ ADAPTERS: dict[str, tuple[str, Callable[..., list[dict]]]] = {
     "workspaces": ("workspace:%", _workspaces_items),
     "config": ("config:%", _config_items),
     "queue": ("queue:%", _queue_dead_items),
+    "outbox": ("outbox:%", _outbox_items),
 }
 
 
@@ -781,6 +850,10 @@ def subject_object(item: dict, connect=foundation.reader) -> dict | None:
             return private_evidence.safe_view(row) if row else None
         if kind == "queue" and ident.isdecimal():
             return loop_store.queue_item(int(ident), c)
+        if kind == "outbox" and ident.isdecimal():
+            from .store import outbox as outbox_store
+
+            return outbox_store.get_detail(int(ident), connect=lambda: nullcontext(c))
         if kind == "presence":
             actor, _, key = ident.partition("/")
             pending = inbox_store.get_pending(c, actor, key)
@@ -991,6 +1064,7 @@ def defer_presence(
     hash_body=None,
     secret_value: str | None = None,
     fingerprint: str | None = None,
+    before_defer: Callable[[], None] | None = None,
 ) -> dict:
     from . import dashboard, idempotency
 
@@ -1017,6 +1091,8 @@ def defer_presence(
             return result
         if row:
             raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
+        if before_defer is not None:
+            before_defer()
 
         expires = util.iso(util.now() + timedelta(minutes=PRESENCE_TTL_MINUTES))
         summary = _args_summary(op["name"], values, fingerprint=fingerprint)
@@ -1105,6 +1181,21 @@ def _execute_pending_command(req: dict, secret_value: str | None) -> tuple[int, 
     if op_name == "push.subscribe":
         sub = webpush.subscribe_v1(values, principals.contact(person))
         return 201, api.with_seq({"subscription": sub})
+    if op_name == "outbox.approve":
+        from . import outbox
+
+        updated = outbox.approve(values["item"], rev=values["rev"], base_version=values["base_version"])
+        return 200, api.with_seq({"item": updated})
+    if op_name == "outbox.retry":
+        from . import outbox
+
+        updated = outbox.retry(values["item"], base_version=values["base_version"])
+        return 200, api.with_seq({"item": updated})
+    if op_name == "outbox.reject":
+        from . import outbox
+
+        updated = outbox.reject(values["item"], reason=str(values.get("reason") or ""), base_version=values["base_version"])
+        return 200, api.with_seq({"item": updated})
     raise contract.Problem("not_found", f"Unsupported pending operation {op_name}")
 
 
@@ -1216,19 +1307,36 @@ def _resolve_presence(
         if not ok:
             raise contract.Problem("version_conflict", f"Inbox item {current['id']} changed.", current=resolved)
 
-        with principals.acting(actor), event_store.caused_by(approval_seq), event_store.collect_receipts() as collected:
-            cmd_status, cmd_result = _execute_pending_command(pending["request"], secret_value)
-        last_seq = collected[-1][0] if collected else approval_seq
-        inbox_store.delete_pending(c, actor, key)
-        claims_store.overwrite(actor, key, cmd_status, api_http.json_bytes(cmd_result), last_seq,
-                               expected_status=202, connection=c)
-        if has_secret:
-            def _drop_secret(k=(actor, key), m=secrets_map):
-                with _SECRETS_LOCK:
-                    m.pop(k, None)
+        req = pending["request"]
+        legacy_outbox = False
+        if req["operation"] in ("outbox.approve", "outbox.retry", "outbox.reject"):
+            from .store import outbox as outbox_store
 
-            foundation.after_commit(_drop_secret)
-        return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
+            ob_row = outbox_store.get_raw(req["values"]["item"], connect=lambda: nullcontext(c))
+            legacy_outbox = ob_row is not None and ob_row.get("legacy_approval") is not None
+
+        if legacy_outbox:
+            inbox_store.delete_pending(c, actor, key)
+        else:
+            with principals.acting(actor), event_store.caused_by(approval_seq), event_store.collect_receipts() as collected:
+                cmd_status, cmd_result = _execute_pending_command(req, secret_value)
+            last_seq = collected[-1][0] if collected else approval_seq
+            inbox_store.delete_pending(c, actor, key)
+            claims_store.overwrite(actor, key, cmd_status, api_http.json_bytes(cmd_result), last_seq,
+                                   expected_status=202, connection=c)
+            if has_secret:
+                def _drop_secret(k=(actor, key), m=secrets_map):
+                    with _SECRETS_LOCK:
+                        m.pop(k, None)
+
+                foundation.after_commit(_drop_secret)
+            return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
+
+    with principals.acting(actor), event_store.caused_by(approval_seq), event_store.collect_receipts() as collected:
+        cmd_status, cmd_result = _execute_pending_command(req, secret_value)
+    last_seq = collected[-1][0] if collected else approval_seq
+    claims_store.overwrite(actor, key, cmd_status, api_http.json_bytes(cmd_result), last_seq, expected_status=202)
+    return {"item": resolved, "result": {"approved": True, "status": cmd_status}}
 
 
 def _resolve_queue_dead(
@@ -1456,6 +1564,21 @@ def resolve(
                 handler_result = {"workspace": ws_id, "state": (updated_ws or row)["state"]}
                 resolution = "removed"
             stored_answer = verb
+        elif prefix == "outbox":
+            from . import outbox
+
+            ob_id = int(ident)
+            if verb == "approve":
+                if outbox.needs_presence("outbox.approve", ob_id) and not allow_legacy_auth:
+                    if credential is None or credential.kind != "session":
+                        raise contract.Problem("forbidden", "The request was not authorized.", reason="presence_required")
+                rev = item["detail"].get("rev")
+                handler_result = outbox.approve(ob_id, rev=rev)
+                resolution = "approved"
+            else:
+                handler_result = outbox.reject(ob_id, reason=str(reason or answer or ""))
+                resolution = "rejected"
+            stored_answer = verb
         elif prefix == "evidence":
             from . import private_evidence
 
@@ -1613,3 +1736,4 @@ def tick(pending_secrets=None) -> None:
         sync(c, "skipped")
         sync(c, "ready")
         sync(c, "config")
+        sync(c, "outbox")
