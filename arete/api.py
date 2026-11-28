@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import json
+import platform
 import re
 import secrets
 import zlib
 from collections import Counter
-import concurrent.futures
+from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
 from . import (
-    api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo, contract, control,
-    credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals, secretstore, settings,
-    stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
+    IMPORTED_NS, __version__, api_http, board, codebase, config, configcheck, configitems, configkinds, configrepo,
+    contract, control, credential_http, devices, drafts, events, inbox, leases, outbox, paths, pi, record, refusals,
+    secretstore, settings, stats, tasks, ticket_media, tool_events, triage, util, webhooks, webpush,
 )
 from .store import blobs, chats, credentials, insights, principals, runs
 from .store import db as foundation
@@ -85,7 +87,13 @@ def meta():
         stream = events.metadata(conn)
     deprecated = sorted(f"{entry['method']} {entry['path']}" for entry in contract.ALIASES if entry.get("deprecated"))
     return {"api": {"version": contract.VERSION, "minor": contract.MINOR, "contract_sha": contract.digest()},
-            "server": {"engine_sha": codebase.STAMP}, "oldest_client": contract.OLDEST_CLIENT,
+            "server": {"engine_sha": codebase.STAMP,
+                       "version": __version__,
+                       "started": util.iso(datetime.fromtimestamp(IMPORTED_NS / 1_000_000_000, tz=UTC)),
+                       "python": platform.python_version(),
+                       "state_dir": paths.short_path(paths.STATE_DIR),
+                       "config_file": paths.short_path(paths.CONFIG_FILE)},
+            "oldest_client": contract.OLDEST_CLIENT,
             "instance": {k: data[f"instance_{k}"] for k in ("id", "tag", "name", "created")},
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
