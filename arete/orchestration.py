@@ -618,9 +618,10 @@ class Controller(worker_turns.WorkerTurns):
             job.pop(key, None)
         prepared["ticket"] = {key: getattr(ticket, key) for key in flows.TICKET_FIELDS}
         prepared["ticket"]["comments"] = ticket.owner_comments or ""
-        if hasattr(self.run.tracker, "save_images"):
+        run_dir = getattr(self.run, "dir", None)
+        if run_dir is not None and hasattr(self.run.tracker, "save_images"):
             attachments, attachment_dirs, manifest = pipeline.collect_ticket_attachments(
-                self.run.tracker, ticket, self.run.dir, log=self.run.log,
+                self.run.tracker, ticket, Path(run_dir), log=getattr(self.run, "log", None),
             )
             if attachments or manifest["media"] or manifest["external"]:
                 prepared["attachments"] = attachments
