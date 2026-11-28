@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from . import alerts, config, configschema, doctor, paths, tool_events, tracker, util
+from . import alerts, config, configschema, derived, doctor, paths, tool_events, tracker, util
 from .heartbeat import mark_loop
 from .store import approvals as approvals_store
 from .store import incidents as incident_store
@@ -288,9 +288,11 @@ def doctor_findings(results: list[doctor.Result]) -> list[Finding]:
     return out
 
 
-def audit(cfg: config.Config) -> tuple[list[Finding], list[str], list[doctor.Result]]:
+def audit(cfg: config.Config, *, record_derived: bool = True) -> tuple[list[Finding], list[str], list[doctor.Result]]:
     skills, names = check_skills(cfg)
     results = doctor.run()
+    if record_derived:
+        derived.record_audit_results(results)
     findings = skills + check_hooks(cfg) + check_repos(cfg) + check_events(cfg, names) + doctor_findings(results)
     return findings, run_stats(), results
 
@@ -327,7 +329,7 @@ def run(dry_run: bool = False) -> int:
             print("audit already running")
             return 0
         try:
-            findings, stats, results = audit(cfg)
+            findings, stats, results = audit(cfg, record_derived=not dry_run)
         except Exception as e:
             print(f"audit crashed: {type(e).__name__}: {e}")
             if not dry_run:

@@ -453,6 +453,7 @@ class Server:
         self.authority_problem = ""
         self.factory_suspended = False
         self.contracts_waiting = False
+        self.derived_started = False
         self.job_pools = {job.note: factory_control.WorkPool(1, thread_name_prefix=job.note) for job in APPROVAL_JOBS}
         self.jobs: dict[str, Future] = {}
         self.outbox_pool = factory_control.WorkPool(1, thread_name_prefix="outbox")
@@ -530,12 +531,21 @@ class Server:
         self.config_good = True
         return True
 
+    def start_derived(self) -> list[dict]:
+        from . import derived
+
+        rebuilt = derived.rebuild_stale_on_startup(contracts_waiting=self.contracts_waiting, say=self.say)
+        self.derived_started = True
+        return rebuilt
+
     def tick(self) -> bool:
         if self.contracts_waiting:
             if not paths.DB_FILE.is_file() or not paths.DB_FILE.stat().st_size:
                 raise foundation.missing_database()
             self.contracts_waiting = foundation.migrate()
         foundation.ensure_schema()
+        if not self.contracts_waiting and not self.derived_started:
+            self.guard("stage:derived-start", self.start_derived)
         if not self.guard("tick:load", self.load) or self.code_problem:
             return False
         if self.contracts_waiting:
@@ -1641,6 +1651,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
             except configrepo.ConfigRepoError as e:
                 server.say(f"config repo init deferred: {e}")
             server.read_config()
+            server.guard("stage:derived-start", server.start_derived)
             if not server.config_problem:
                 server.guard("stage:secret-move", server.move_secrets_when_due)
                 from . import inbox
