@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 23
+MINOR = 24
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -152,6 +152,7 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("secret_store_missing", 501, "This instance has no secret store configured."),
     ("secret_internal", 409, "This secret is managed by its owning service."),
     ("already_resolved", 409, "This inbox item is already resolved."),
+    ("still_missing", 409, "The required secret is still missing."),
     ("validation", 422, "The request failed domain validation."),
     ("gate_refused", 403, "The owner refused the pending presence request."),
     ("presence_expired", 409, "The presence approval expired before it was approved."),
@@ -177,7 +178,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
-                       "secret_store_missing", "secret_internal", "already_resolved", "validation",
+                       "secret_store_missing", "secret_internal", "already_resolved", "still_missing", "validation",
                        "gate_refused", "presence_expired", "lease_fenced", "lease_expired"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
@@ -200,6 +201,52 @@ def sample(schema):
     return {"string": "example", "integer": 1, "number": 1, "boolean": True, "array": []}[kind]
 
 
+INBOX_CONTINUE_DETAIL = obj({
+    "name": STRING,
+    "scope": STRING,
+    "required": BOOLEAN,
+    "status": STRING,
+    "missing_since": NULL_TEXT,
+    "last_check": obj({"checked_at": NULL_TEXT, "ok": {"type": ["boolean", "null"]}}, ["checked_at", "ok"]),
+    "waiting": array(STRING),
+    "group_key": STRING,
+    "group_members": array(STRING),
+    "stamp": STRING,
+}, ["name", "scope", "last_check", "waiting", "group_key", "group_members"], additional=JSON)
+INBOX_JIDOKA = obj({
+    "detect": STRING,
+    "stop": STRING,
+    "fix": STRING,
+    "prevent": STRING,
+}, ["detect", "stop", "fix", "prevent"])
+INBOX_STOP_DETAIL = obj({
+    "run_id": STRING,
+    "node": STRING,
+    "error": STRING,
+    "error_class": STRING,
+    "attempts": INTEGER,
+    "jidoka": INBOX_JIDOKA,
+    "last_lines": array(STRING),
+    "group_key": STRING,
+    "stamp": STRING,
+}, ["node", "jidoka", "last_lines", "group_key"], additional=JSON)
+INBOX_FAULT_DETAIL = obj({
+    "run_id": STRING,
+    "node": STRING,
+    "error": STRING,
+    "error_class": STRING,
+    "attempts": INTEGER,
+    "last_lines": array(STRING),
+    "shelved_reason": NULL_TEXT,
+    "shelve_until": NULL_TEXT,
+    "group_key": STRING,
+    "stamp": STRING,
+}, ["node", "error", "attempts", "last_lines", "group_key"], additional=JSON)
+INBOX_DETAIL_SHAPES = {
+    "continue": INBOX_CONTINUE_DETAIL,
+    "stop": INBOX_STOP_DETAIL,
+    "fault": INBOX_FAULT_DETAIL,
+}
 INBOX_ITEM = obj({
     **dict.fromkeys(("id", "kind", "subject", "task_id", "run_id", "line", "title", "state", "snooze_until",
                      "snooze_watch", "shelve_reason", "shelve_until", "answer", "answered_by", "answered_at",
@@ -564,10 +611,16 @@ OPERATIONS += [
                  "POST", errors=("already_resolved", "invalid_state", "validation")), "scope": "inbox:resolve"},
     {**operation("inbox.resolve", "inbox/{item}/resolve", envelope({"item": INBOX_ITEM, "result": JSON}),
                  obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}, "verb": STRING,
-                      "option": JSON, "answer": STRING, "answers": array(JSON), "reason": STRING},
+                      "option": JSON, "answer": STRING, "answers": array(JSON), "reason": STRING,
+                      "fix": STRING, "prevent": STRING},
                      ["item", "base_version", "verb"]),
                  {"item": "TR-1", "base_version": 1, "verb": "continue"},
                  "POST", errors=("already_resolved", "invalid_state", "validation", "gate_refused", "presence_expired")),
+     "scope": "inbox:resolve"},
+    {**operation("inbox.retry", "inbox/{item}/retry", envelope({"item": INBOX_ITEM, "result": JSON}),
+                 obj({"item": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["item"]),
+                 {"item": "TR-1"},
+                 "POST", errors=("already_resolved", "invalid_state", "validation", "still_missing")),
      "scope": "inbox:resolve"},
     {**operation("inbox.upload_evidence", "inbox/{item}/evidence",
                  envelope({"item": INBOX_ITEM, "evidence": mapping(JSON), "result": JSON}),

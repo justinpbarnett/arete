@@ -15,6 +15,26 @@ def secrets(c):
     return [dict(row) for row in c.execute("SELECT * FROM secrets ORDER BY scope, name")]
 
 
+def missing_required(c, scopes=None):
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'secrets'").fetchone() is None:
+        return []
+    if scopes is None:
+        rows = c.execute(
+            "SELECT * FROM secrets WHERE required = 1 AND status = 'missing' ORDER BY scope, name"
+        ).fetchall()
+    else:
+        scope_list = [s for s in scopes if s]
+        if not scope_list:
+            return []
+        placeholders = ",".join("?" for _ in scope_list)
+        rows = c.execute(
+            f"SELECT * FROM secrets WHERE required = 1 AND status = 'missing' AND scope IN ({placeholders}) "  # noqa: S608
+            "ORDER BY scope, name",
+            scope_list,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def history(c, secret_id):
     return [dict(row) for row in c.execute(
         "SELECT id, event, actor, ok, fingerprint_after, detail, at FROM secret_events WHERE secret_id = ? ORDER BY id",

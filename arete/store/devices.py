@@ -470,6 +470,38 @@ def clear_waits_for_blocker(c: sqlite3.Connection, blocker: str) -> int:
     return cur.rowcount
 
 
+def open_waits_for_blocker(c: sqlite3.Connection, blocker: str) -> list[dict]:
+    if not _has_table(c, "waits"):
+        return []
+    return [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM waits WHERE blocker = ? AND cleared IS NULL ORDER BY opened, id",
+            (blocker,),
+        )
+    ]
+
+
+def open_secret_waits(c: sqlite3.Connection) -> list[dict]:
+    if not _has_table(c, "waits"):
+        return []
+    return [
+        dict(r)
+        for r in c.execute(
+            "SELECT * FROM waits WHERE cleared IS NULL AND blocker LIKE 'secret:%' ORDER BY opened, id"
+        )
+    ]
+
+
+def has_open_waits(c: sqlite3.Connection, subject: str) -> bool:
+    if not _has_table(c, "waits"):
+        return False
+    return c.execute(
+        "SELECT 1 FROM waits WHERE subject = ? AND cleared IS NULL LIMIT 1",
+        (subject,),
+    ).fetchone() is not None
+
+
 def open_waits_for_subject(subject: str, connect=reader) -> list[dict]:
     with connect() as c:
         if not _has_table(c, "waits"):

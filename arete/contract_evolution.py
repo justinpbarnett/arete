@@ -109,6 +109,9 @@ def openapi(registry, minor, source_hashes, oldest_client):
         code = error["code"]
         schemas[f"problem.{code}"] = error["schema"]
         errors[code] = {k: error[k] for k in ("status", "description", "example")}
+    for kind, detail_schema in sorted(contract.INBOX_DETAIL_SHAPES.items()):
+        schemas[f"inbox.detail.{kind}"] = detail_schema
+    inbox_detail_refs = {kind: ref(f"inbox.detail.{kind}") for kind in sorted(contract.INBOX_DETAIL_SHAPES)}
     for op in registry["operations"]:
         name, method, path = (op[k] for k in ("name", "method", "path"))
         schemas[f"{name}.input"] = op["input"]
@@ -128,6 +131,8 @@ def openapi(registry, minor, source_hashes, oldest_client):
                     "examples": {code: {"value": errors[code]["example"]} for code in codes}}}}
             responses[str(status)] = {"$ref": f"#/components/responses/{key}"}
         entry = {"operationId": name, "responses": responses, "x-arete-errors": op["errors"]}
+        if name in ("inbox.list", "inbox.get", "triage_screen.get"):
+            entry["x-arete-detail-shapes"] = inbox_detail_refs
         if name in credential_http.PRESENCE:
             entry["x-arete-presence"] = True
         if "deprecated" in op:

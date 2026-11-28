@@ -471,6 +471,10 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
                 carry(run)
             return run_store.run_get(run.id)
         record.write_launch(run.id, control.command(["loop", "exec", "--run-id", run.id]), control.DETACHED_LOG)
+        from . import inbox
+
+        if inbox.check_run_missing_secrets(run.id, repo=loop.repo or "", loop=loop.name):
+            return run_store.run_get(run.id)
         with principals.acting(started_by_val):
             proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
         util.mark_holder(held, proc.pid)

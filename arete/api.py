@@ -643,7 +643,7 @@ def dispatch(handler, op, path_values, query):
 
 
 _NON_ATOMIC_COMMANDS = frozenset((
-    "run.stop", "serve.install", "inbox.resolve", "settings.update", "loop.enable", "loop.disable",
+    "run.stop", "serve.install", "inbox.resolve", "inbox.retry", "settings.update", "loop.enable", "loop.disable",
     "device.probe", "outbox.approve", "outbox.retry", "outbox.reject", "chat.file", "triage.send",
     "task.create", "task.run", "session.start", "run.resume", "run.repair", "run.step",
     "loop.start", "loop.try", "loop.draft", "chat.create", "chat.send", "chat.session_start",
@@ -975,6 +975,15 @@ def mutation(name, values, handler):
             answer=values.get("answer"),
             answers=values.get("answers"),
             reason=values.get("reason"),
+            fix=values.get("fix"),
+            prevent=values.get("prevent"),
+            credential=handler.credential,
+            pending_secrets=inbox.server_secrets(handler.server),
+        )
+    elif name == "inbox.retry":
+        result = inbox.retry_item(
+            values["item"],
+            base_version=values.get("base_version"),
             credential=handler.credential,
             pending_secrets=inbox.server_secrets(handler.server),
         )
