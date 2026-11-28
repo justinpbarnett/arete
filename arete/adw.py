@@ -270,20 +270,34 @@ def always_finishes(entries: list[dict]) -> bool:
     return False
 
 
-def validate_adw(data: object, *, where: str = "adw") -> list[str]:
+def _validate_and_steps(data: object, *, where: str = "adw") -> tuple[list[dict] | None, list[str]]:
     errors: list[str] = []
     try:
         configschema.validate("adw", data, where=where)
     except ValueError as e:
         errors.append(str(e))
-        return errors
+        return None, errors
     assert isinstance(data, dict)
     if not _valid_name(data["name"]):
         errors.append(f"{where}.name: invalid ADW name {data['name']!r}")
-    _validate_step_list(data["steps"], f"{where}.steps", 0, errors, allow_empty=False)
-    if not errors and not always_finishes(data["steps"]):
+    from . import adw_library, adwgraph
+
+    if adwgraph.is_graph(data):
+        try:
+            compiled = adwgraph.compile(data, adw_library.load())
+        except adwgraph.GraphError as e:
+            errors.append(f"{where}: {e}")
+            return None, errors
+    else:
+        compiled = data["steps"]
+    _validate_step_list(compiled, f"{where}.steps", 0, errors, allow_empty=False)
+    if not errors and not always_finishes(compiled):
         errors.append(f"{where}.steps: steps can reach their end without a finish")
-    return errors
+    return (None if errors else compiled), errors
+
+
+def validate_adw(data: object, *, where: str = "adw") -> list[str]:
+    return _validate_and_steps(data, where=where)[1]
 
 
 def parse_rule_set(raw_set: dict, *, where: str = "set") -> dict[str, dict]:
@@ -379,14 +393,16 @@ def load(cfg: config.Config | None, name: str, *, config_dir: Path | None = None
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise AdwError(f"{path}: invalid TOML: {e}") from e
-    if errors := validate_adw(data, where=str(path)):
+    compiled, errors = _validate_and_steps(data, where=str(path))
+    if errors:
         raise AdwError("; ".join(errors))
+    assert compiled is not None
     if data["name"] != name:
         raise AdwError(f"{path}: name {data['name']!r} does not match file name {name!r}")
     sha = hashlib.sha256(raw).hexdigest()
     return Adw(
         name=name,
-        steps=tuple(data["steps"]),
+        steps=tuple(compiled),
         path=path,
         level=level,
         raw=raw,
@@ -1210,7 +1226,7 @@ def check_draft(kind: str, data: object, *, cfg: config.Config | None = None,
     requires_accept = not can_auto_activate(kind, actor) if actor else gate == "review"
     if kind == "adw":
         loc = where or "adw"
-        errors = validate_adw(data, where=loc)
+        compiled, errors = _validate_and_steps(data, where=loc)
         if errors:
             return {
                 "status": "invalid",
@@ -1225,11 +1241,12 @@ def check_draft(kind: str, data: object, *, cfg: config.Config | None = None,
                 },
             }
         assert isinstance(data, dict)
+        assert compiled is not None
         raw = repr(data).encode("utf-8")
         sha = hashlib.sha256(raw).hexdigest()
         adw_obj = Adw(
             name=str(data["name"]),
-            steps=tuple(data["steps"]),
+            steps=tuple(compiled),
             path=Path(loc),
             level="draft",
             raw=raw,

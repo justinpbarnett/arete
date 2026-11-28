@@ -15,12 +15,24 @@ FIELDS = {
                        "label_pending", "landed", "device", "attempts", "model", "runner", "log", "trigger", "queue",
                        "grp", "lock", "moved", "wait_minutes", "engine_sha", "failure", "dry_run",
                        "environment_retry_of", "config_commit", "resolved_sha", "continues", "chain", "restart",
-                       "started_by", "payer", "seq", "adw", "adw_version", "adw_rule")),
-    "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated")),
-    "task_comments": frozenset(("task", "author", "body", "ts")),
+                       "started_by", "payer", "seq", "adw", "adw_version", "adw_rule",
+                       "task_id", "issue_key", "capabilities")),
+    "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated",
+                        "num", "project", "line", "fault", "fault_detail", "priority", "rank",
+                        "owner", "origin", "delegate", "estimate", "answer")),
+    "task_comments": frozenset(("task", "task_id", "author", "body", "ts", "num", "audience", "ref",
+                                "remote_id", "outbox_id", "created", "updated")),
 }
 IDENTITY = {"runs": "id", "tasks": "id", "task_comments": "rowid"}
 SUBJECT = {"runs": "run", "tasks": "task", "task_comments": "task_comment"}
+
+
+def _identity_column(c, table: str) -> str:
+    if table == "task_comments":
+        cols = {r[1] for r in c.execute("PRAGMA table_info(task_comments)")}
+        if "id" in cols:
+            return "id"
+    return IDENTITY[table]
 
 
 class VersionConflict(refusals.Conflict):
@@ -39,7 +51,7 @@ def validate_version(value):
 def current(c, table, identity):
     if table not in FIELDS:
         raise ValueError(f"invalid versioned table: {table!r}")
-    column = IDENTITY[table]
+    column = _identity_column(c, table)
     row = c.execute(f"SELECT {column}, * FROM {table} WHERE {column} = ?", (identity,)).fetchone()  # noqa: S608
     return dict(row) if row else None
 
@@ -72,24 +84,52 @@ def fields_for(table, fields):
 
 def emit(c, table, identity, row, kind):
     data = row
+    subject_id = identity
+    task_tag = row.get("issue", row.get("task", row.get("id")))
     if table == "runs":
         data = {**row, "run": identity}
-        issue = row.get("issue")
-        if isinstance(issue, str) and issue.startswith("t-"):
-            task = c.execute("SELECT id, state, updated, version FROM tasks WHERE id = ? AND repo = ?",
-                             (issue, row["repo"])).fetchone()
+        if row.get("task_id") is not None:
+            task_tag = f"T-{row['task_id']}"
+            task_cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            if "num" in task_cols:
+                task = c.execute("SELECT id, num, state, updated, version FROM tasks WHERE num = ?",
+                                 (row["task_id"],)).fetchone()
+            else:
+                task = c.execute("SELECT id, state, updated, version FROM tasks WHERE id = ?",
+                                 (row["task_id"],)).fetchone()
             if task:
-                data["board_task"] = dict(task)
-    return events.emit(kind, f"{SUBJECT[table]}:{identity}", cls="derived", ver=row["version"],
-                       task=row.get("issue", row.get("task", row.get("id"))), data=data)
+                td = dict(task)
+                td["id"] = f"T-{td.get('num', td['id'])}"
+                data["board_task"] = td
+        else:
+            issue = row.get("issue")
+            if isinstance(issue, str) and issue.startswith("t-"):
+                task = c.execute("SELECT id, state, updated, version FROM tasks WHERE id = ? AND repo = ?",
+                                 (issue, row["repo"])).fetchone()
+                if task:
+                    data["board_task"] = dict(task)
+    elif table == "tasks":
+        num = row.get("num") if row.get("num") is not None else (row["id"] if isinstance(row.get("id"), int) else None)
+        if num is not None:
+            subject_id = num
+            task_tag = f"T-{num}"
+            data = {**row, "id": f"T-{num}"}
+    elif table == "task_comments":
+        if row.get("task_id") is not None:
+            task_tag = f"T-{row['task_id']}"
+        elif row.get("num") is not None:
+            subject_id = row["num"]
+    return events.emit(kind, f"{SUBJECT[table]}:{subject_id}", cls="derived", ver=row["version"],
+                       task=task_tag, data=data)
 
 
 def insert(table, fields, identity=None, kind=None):
     fields_for(table, fields)
     values = dict(fields)
-    if identity is not None:
-        values[IDENTITY[table]] = identity
     with atomic() as c:
+        column = _identity_column(c, table)
+        if identity is not None:
+            values[column] = identity
         if table in ("tasks", "runs"):
             from . import factory
 
@@ -109,6 +149,7 @@ def update(table, identity, fields, *, base_version=None, expect=(), increments=
     if (table != "runs" and increments) or set(increments) - {"cost_usd", "tokens_in", "tokens_out"}:
         raise ValueError("invalid arithmetic fields")
     with atomic() as c:
+        column = _identity_column(c, table)
         row = current(c, table, identity)
         if row is None:
             return None
@@ -117,7 +158,7 @@ def update(table, identity, fields, *, base_version=None, expect=(), increments=
         status = "status" if table == "runs" else "state"
         if expect and row[status] not in expect:
             return None
-        where, args = f"{IDENTITY[table]} = ?", [identity]
+        where, args = f"{column} = ?", [identity]
         if base_version is not None:
             where += " AND version = ?"
             args.append(base_version)

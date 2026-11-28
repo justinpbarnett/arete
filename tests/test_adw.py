@@ -26,7 +26,7 @@ def _run_isolated_child(script: str, *args: str, timeout: int = 60) -> dict:
             "PYTHONPATH": str(REPO_ROOT),
         }
         proc = subprocess.run(
-            [sys.executable, "-I", "-B", "-c", script, str(root), *args],
+            [sys.executable, "-I", "-B", "-c", "from tests import support\n" + script, str(root), *args],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
@@ -343,7 +343,7 @@ lock_held_during_route = []
 real_route = adw.route
 def spy_route(cfg, repo, t, **kw):
     from arete.store import workspaces
-    lock_name = run_store.run_lock("pipeline", repo.name, t)
+    lock_name = run_store.run_lock("pipeline", task=task_store.parse_task_num(t))
     lock_held_during_route.append((lock_name in workspaces.TICKET_LOCKS.get(), util.lock_is_held(lock_name)))
     return real_route(cfg, repo, t, **kw)
 
@@ -391,7 +391,7 @@ r_rev = run_store.newest_whole_run("replay-sample", tid)
 assert (r_rev["adw"], r_rev["adw_rule"]) == ("revise", "feedback-revise"), r_rev
 
 # 3. Interrupted run with a repair source -> repair / interrupted-repair
-int_id = record.start("pipeline", repo="replay-sample", issue=tid, adw="repair")
+int_id = support.start_pipeline(repo="replay-sample", issue=tid, adw="repair")
 run_lines.write(int_id, "repair", source=r1["id"])
 record.settle(int_id, "interrupted")
 with mock.patch.object(adw, "drive", return_value=lambda fl: ("done", "repaired", "")):
@@ -404,7 +404,7 @@ assert (r_int_rep["adw"], r_int_rep["adw_rule"]) == ("repair", "interrupted-repa
 
 # 4. Answered ask run -> @continue with the asked run's ADW
 tid_ask = task_store.task_add("replay-sample", "Ask test", "Ask body", "feat")
-ask_run = record.start("pipeline", repo="replay-sample", issue=tid_ask, adw="revise")
+ask_run = support.start_pipeline(repo="replay-sample", issue=tid_ask, adw="revise")
 record.settle(ask_run, "needs-info")
 ask_store.ask_add("ask-1", ask_run, "replay-sample", tid_ask, "plan", "plan", "why", "",
                   [{"kind": "text", "header": "Q", "question": "Which?"}], {})
@@ -419,7 +419,7 @@ assert (r_ans["adw"], r_ans["adw_rule"], r_ans["continues"]) == ("revise", "@con
 
 # 5. --repair -> @repair, and tasks.repair builds --repair
 tid_rep = task_store.task_add("replay-sample", "Repair test", "Repair body", "feat")
-held_run = record.start("pipeline", repo="replay-sample", issue=tid_rep, adw="feature")
+held_run = support.start_pipeline(repo="replay-sample", issue=tid_rep, adw="feature")
 record.settle(held_run, "pr", pr_url="https://github.com/owner/sample/pull/2")
 with mock.patch.object(adw, "drive", return_value=lambda fl: ("done", "repaired", "")):
     try:
@@ -430,7 +430,7 @@ r_rep = run_store.newest_whole_run("replay-sample", tid_rep)
 assert (r_rep["adw"], r_rep["adw_rule"]) == ("repair", "@repair"), r_rep
 
 # 6. tasks.run_step refuses run with NULL adw, and --continue --only gives @continue
-classic_id = record.start("pipeline", repo="replay-sample", issue=tid_rep)
+classic_id = support.start_pipeline(repo="replay-sample", issue=tid_rep)
 record.settle(classic_id, "done")
 try:
     tasks.run_step(classic_id, "plan", {})
@@ -635,7 +635,7 @@ assert blk_feat.startswith("plan has no eligible route"), blk_feat
 
 # 2. Revise ticket (with pending feedback) NOT blocked on plan
 t_rev = task_store.task_add("replay-sample", "Rev", "Body", "feat")
-r_rev = record.start("pipeline", repo="replay-sample", issue=t_rev, adw="feature")
+r_rev = support.start_pipeline(repo="replay-sample", issue=t_rev, adw="feature")
 record.settle(r_rev, "pr", pr_url="https://github.com/owner/sample/pull/10")
 insights_store.add_feedback([{
     "pr_url": "https://github.com/owner/sample/pull/10", "repo": "replay-sample", "issue": t_rev,
@@ -648,9 +648,9 @@ assert blk_rev == "", blk_rev
 
 # 3. Interrupted ticket with a repair source blocked on review_repair
 t_rep = task_store.task_add("replay-sample", "Rep", "Body", "feat")
-r_src = record.start("pipeline", repo="replay-sample", issue=t_rep, adw="feature")
+r_src = support.start_pipeline(repo="replay-sample", issue=t_rep, adw="feature")
 record.settle(r_src, "pr", pr_url="https://github.com/owner/sample/pull/11")
-r_int = record.start("pipeline", repo="replay-sample", issue=t_rep, adw="repair")
+r_int = support.start_pipeline(repo="replay-sample", issue=t_rep, adw="repair")
 run_lines.write(r_int, "repair", source=r_src)
 record.settle(r_int, "interrupted")
 ticket_rep = tracker.Ticket(t_rep, t_rep, "Rep", kind="feat")
@@ -794,9 +794,9 @@ assert nodes[0]["step"] == "prepare" and nodes[1]["step"] == "plan" and nodes[2]
 # 5. Valid routes draft stage 6 lists ONLY seeded chore tasks whose ADW changes
 t_chore = task_store.task_add("replay-sample", "Chore task", "Body", "chore")
 t_feat = task_store.task_add("replay-sample", "Feat task", "Body", "feat")
-r_c = record.start("pipeline", repo="replay-sample", issue=t_chore, adw="feature")
+r_c = support.start_pipeline(repo="replay-sample", issue=t_chore, adw="feature")
 record.settle(r_c, "done")
-r_f = record.start("pipeline", repo="replay-sample", issue=t_feat, adw="feature")
+r_f = support.start_pipeline(repo="replay-sample", issue=t_feat, adw="feature")
 record.settle(r_f, "done")
 
 draft_routes = {

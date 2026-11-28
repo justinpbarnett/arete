@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from arete import board, config, control, paths, record, tasks
+from tests import support
 from arete.orchestration_api import WORKER_PROTOCOL
 from arete.store import db as foundation
 from arete.store import orchestration as ledger
@@ -72,7 +73,7 @@ class RerunViewEligibilityTests(unittest.TestCase):
         return action
 
     def stopped_run(self, issue, phase):
-        run = record.start("pipeline", run_id=f"run-{phase}", repo="fixture", issue=str(issue))
+        run = support.start_pipeline(run_id=f"run-{phase}", repo="fixture", issue=str(issue))
         lease = ledger.acquire(run, "", {"protocol": WORKER_PROTOCOL,
                                         "prepared": {"checkouts": [{"wt": str(self.tree)}]}})
         check = self.action(lease, "checks.run")["id"]

@@ -1043,12 +1043,14 @@ def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> N
 
 
 def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Session, atom: str,
-                     try_no: int) -> tuple[list[dict], tuple[tuple[str, str, int], ...], str, str, str, str]:
+                     try_no: int) -> tuple[
+    list[dict], dict[str, tuple[str, bytes]], tuple[tuple[str, str, int], ...], str, str, str, str
+]:
     from . import factory, pins, prompt_loader, prompts
     from .store import blobs as blob_store
 
     if not trace[0]:
-        return [], (), "", "", "", ""
+        return [], {}, (), "", "", "", ""
     pin = pins.current()
     items: list[dict] = []
     blobs_to_write: dict[str, tuple[str, bytes]] = {}
@@ -1157,13 +1159,12 @@ def _step_inputs_for(prompt: str, trace: tuple[str, str], kw: dict, resume: Sess
         origin_run = getattr(resume, "origin_run", "") or trace[0]
         items.append({"role": "session", "name": resume.id, "version": origin_run, "call": call_no})
 
-    blob_rows: list[tuple[str, str, int]] = []
-    for sha, (blob_kind, data) in blobs_to_write.items():
-        blob_store.write_file(data, sha)
-        blob_rows.append((sha, blob_kind, len(data)))
+    blob_rows: list[tuple[str, str, int]] = [
+        (sha, blob_kind, len(data)) for sha, (blob_kind, data) in blobs_to_write.items()
+    ]
 
     settings_sha = pin.settings_sha_for(atom or trace[1]) if pin is not None else ""
-    return items, tuple(blob_rows), settings_sha, step_prompt_version, step_prompt_level, step_schema_version
+    return items, blobs_to_write, tuple(blob_rows), settings_sha, step_prompt_version, step_prompt_level, step_schema_version
 
 
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
@@ -1232,21 +1233,26 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             return token_cost(openrouter_quote.rates, res.tokens_in, res.tokens_out, res.cache_read, res.cache_write)
         return 0.0 if on_local else priced(res, cfg)
 
-    (step_inputs, step_blob_rows, step_settings_sha, step_prompt_version,
+    (step_inputs, step_blob_payloads, step_blob_rows, step_settings_sha, step_prompt_version,
      step_prompt_level, step_schema_version) = _step_inputs_for(prompt, trace, kw, resume, atom, try_no)
 
     def persist(res: Result) -> None:
+        from .store import blobs as blob_store
+
         try:
             if trace[0]:
-                record.steps(trace[0], trace[1],
-                             [(call, call.call_seconds if res.calls else time.monotonic() - started)
-                              for call in res.calls or [res]], effort=kw.get("effort", ""),
-                             tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "",
-                             inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows,
-                             prompt_version=step_prompt_version, prompt_level=step_prompt_level,
-                             schema_version=step_schema_version,
-                             step_id=step_id, chat_id=chat_id, device=target.name, account_id=account_id,
-                             runner_version=rec.runner_version or rver, unread=rec.unread_count)
+                with (blob_store.lock() if step_blob_payloads else nullcontext()):
+                    for sha, (_, data) in step_blob_payloads.items():
+                        blob_store.write_file(data, sha)
+                    record.steps(trace[0], trace[1],
+                                 [(call, call.call_seconds if res.calls else time.monotonic() - started)
+                                  for call in res.calls or [res]], effort=kw.get("effort", ""),
+                                 tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "",
+                                 inputs=step_inputs, settings_sha=step_settings_sha, blob_rows=step_blob_rows,
+                                 prompt_version=step_prompt_version, prompt_level=step_prompt_level,
+                                 schema_version=step_schema_version,
+                                 step_id=step_id, chat_id=chat_id, device=target.name, account_id=account_id,
+                                 runner_version=rec.runner_version or rver, unread=rec.unread_count)
                 if rec.unread_count > 0 and paths.DB_FILE.exists():
                     from .store import incidents as incident_store
 

@@ -24,7 +24,7 @@ class StopVersionTests(unittest.TestCase):
 
     def test_stop_accepts_version_before_progress_updates(self):
         pid = 12345
-        run = record.start("pipeline", pid=pid)
+        run = support.start_pipeline(pid=pid)
         before = runs.run_get(run)
         measured_at = "2030-01-02T03:04:05Z"
         runs.checkpoint(run, 1, 0, 0, 0, measured_at)
@@ -42,13 +42,13 @@ class StopVersionTests(unittest.TestCase):
         self.assertTrue(runs.run_get(run)["stop_asked"])
 
     def test_stop_refuses_version_before_run_ended(self):
-        run = record.start("pipeline")
+        run = support.start_pipeline()
         before = runs.run_get(run)["version"]
         self.assertTrue(record.settle(run, "done"))
         self.assert_stop_conflict(run, before)
 
     def test_stop_refuses_version_before_launcher_recorded_pid(self):
-        run = record.start("pipeline", pid=None)
+        run = support.start_pipeline(pid=None)
         before = runs.run_get(run)["version"]
         record.note(run, pid=12345)
         self.assert_stop_conflict(run, before)

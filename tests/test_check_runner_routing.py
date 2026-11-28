@@ -1,6 +1,7 @@
 from unittest import mock
 
 from arete import orchestration, owner_asks, pipeline, poll, record, tasks
+from tests import support
 from arete.store import asks, tasks as task_store
 from tests.test_process_limits import Isolated
 
@@ -12,7 +13,7 @@ class SharedCheckRunnerTests(Isolated):
     def hold(self, ticket, *, call=owner_asks.CHECK_RUNNER_CALL, repo=None):
         request = owner_asks.check_runner_request(self.blocked)
         repo = repo or self.repo.name
-        rid = record.start("pipeline", repo=repo, issue=ticket)
+        rid = support.start_pipeline(repo=repo, issue=ticket)
         record.move(rid, "needs-info", ("running",))
         first = asks.ask_add(rid, rid, repo, ticket, "checks", call, request["why"],
                              request["tried"], request["questions"], {})
@@ -24,7 +25,7 @@ class SharedCheckRunnerTests(Isolated):
         follower, again = self.hold(second_ticket)
         unrelated, _ = self.hold("12", repo="another", call="orchestrate")
         obsolete, _ = self.hold("99")
-        record.start("pipeline", repo=self.repo.name, issue="99")
+        support.start_pipeline(repo=self.repo.name, issue="99")
         self.assertTrue(first)
         self.assertFalse(again)
         rows = {row["id"]: row for row in tasks.asks_view()["asks"]}
@@ -55,7 +56,7 @@ class SharedCheckRunnerTests(Isolated):
         request = owner_asks.check_runner_request(self.blocked)
 
         def hold_and_notify(tid):
-            run = mock.Mock(id=record.start("pipeline", repo=self.repo.name, issue=tid), tid=tid, repo=self.repo,
+            run = mock.Mock(id=support.start_pipeline(repo=self.repo.name, issue=tid), tid=tid, repo=self.repo,
                             dry_run=False, alone=False, config=self.cfg)
             ask = {**request, "ask_id": run.id, "step": "checks", "call": owner_asks.CHECK_RUNNER_CALL}
             self.assertEqual(pipeline._ask(run, self.root, [], "Runner needed", "Blocked", [ask], {})[0], "needs-info")

@@ -240,12 +240,15 @@ def resolve(text, *, kinds=("token", "session", "claim", "ask"), step=None, leas
         if not row["run_id"] or not step:
             raise InvalidCredential()
         actor = f"run:{row['run_id']}/{step}"
+    elif kind == "token" and row["run_id"]:
+        actor = f"run:{row['run_id']}"
     else:
         actor = f"client:{identity}" if kind == "token" else person
     return Credential(identity, person, role, actor, kind, frozenset(json.loads(row["scopes"])),
                       meta["token_key_ref"], meta["restore_epoch"],
                       meta["token_generation"], deadline_of(row), row["profile"],
-                      frozenset(json.loads(row["commands"])) if row["commands"] is not None else None)
+                      frozenset(json.loads(row["commands"])) if row["commands"] is not None else None,
+                      run_id=row["run_id"])
 
 
 def rotation_lineage(credential):

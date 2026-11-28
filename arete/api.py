@@ -39,11 +39,21 @@ def prefer_wait(handler, *, default: float = 2.0, maximum: float = 10.0) -> floa
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
          "board": "Board"}
-BOARD_STATES = ("needs-info", "failed", "running", "pr", "todo", "done", "closed")
+BOARD_STATES = ("needs-you", "needs-info", "failed", "running", "review", "pr", "ready", "todo", "intake", "done", "closed")
 
 
 def run_object(row):
-    return {k: row[k] for k in (*contract.RUN_TEXT, *contract.RUN_NUMBERS) if k in row} if row else None
+    if not row:
+        return None
+    out = {k: row[k] for k in (*contract.RUN_TEXT, *contract.RUN_NUMBERS) if k in row}
+    task_id = row.get("task_id")
+    if task_id is not None:
+        out["task"] = task_store.format_task_id(int(task_id))
+    if "task_id" in row:
+        out["task_id"] = int(task_id) if task_id is not None else None
+    if "issue_key" in row:
+        out["issue_key"] = row.get("issue_key")
+    return out
 
 
 def serialize(value, schema):
@@ -80,7 +90,7 @@ def meta():
             "schema": {"version": int(data["schema_version"]),
                        "oldest_writer": int(data["oldest_writer"]) if data["oldest_writer"] is not None else None},
             "stream": stream,
-            "features": {"inbox": True, "outbox": True, "run_start_tx": True},
+            "features": {"inbox": True, "outbox": True, "run_start_tx": True, "refs": True},
             "deprecated": deprecated,
             "push": {"vapid_public_key": _vapid_public_key()}}
 
@@ -455,10 +465,18 @@ def read(name, values, handler):
         except ValueError as error:
             raise contract.Problem("invalid_input", str(error)) from None
     if name == "blob.get":
-        found = blobs.get(values["sha256"])
-        if found is None:
+        meta_row = blobs.meta(values["sha256"])
+        if meta_row is None:
             raise contract.Problem("not_found", f"No blob {values['sha256']}")
-        meta_row, raw = found
+        if purged := meta_row.get("purged_at"):
+            raise contract.Problem(
+                "files_purged",
+                f"blob {values['sha256']} was removed on {purged}",
+                purged_at=purged,
+            )
+        raw = blobs.read(values["sha256"])
+        if raw is None:
+            raise contract.Problem("not_found", f"No blob {values['sha256']}")
         try:
             encoded, encoding = raw.decode("utf-8"), "utf-8"
         except UnicodeDecodeError:
@@ -498,6 +516,12 @@ def read(name, values, handler):
         if not after.isascii() or not after.isdecimal() or len(after) > 18:
             raise contract.Problem("invalid_input", "after must be a nonnegative decimal cursor")
         found = control.feed(values["run"], int(after))
+        if purged := found["run"].get("files_purged"):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} files were removed on {purged}",
+                purged_at=purged,
+            )
         return {"lines": found["lines"], "after": max([int(after), *[r["id"] for r in found["lines"]]])}
     identity = values.get("id", "")
     if name == "run.diff":
@@ -509,12 +533,68 @@ def read(name, values, handler):
         return {"diff": diff}
     if name == "task.history":
         task = needed(task_store.task_get(identity), identity)
-        return {"comments": task_store.versioned_comments(identity),
-                "runs": [run_object(r) for r in runs.ticket_runs(task["repo"], identity, limit=500)]}
+        num = task.get("num")
+        with foundation.reader() as c:
+            expanded = task_store.has_identity_expand(c)
+            task_events = (
+                task_store.TaskStore.task_history_events(c, int(num), task.get("raw_id"))
+                if num is not None
+                else []
+            )
+        task_runs = (
+            runs.ticket_runs(int(num), limit=500)
+            if expanded and num is not None
+            else runs.ticket_runs(task["repo"], task["id"], limit=500)
+        )
+        return {
+            "comments": [serialize(row, contract.TASK_COMMENT) for row in task_store.versioned_comments(task["id"])],
+            "runs": [run_object(r) for r in task_runs],
+            "events": task_events,
+        }
+    if name == "task_ref.list":
+        task = needed(task_store.task_get(values["task"]), values["task"])
+        with foundation.reader() as c:
+            items = task_store.TaskStore.task_refs(c, int(task["num"])) if task.get("num") is not None else []
+        return {"refs": [serialize(r, contract.TASK_REF) for r in items]}
+    if name == "task_link.list":
+        task = needed(task_store.task_get(values["task"]), values["task"])
+        with foundation.reader() as c:
+            items = task_store.TaskStore.task_links(c, int(task["num"])) if task.get("num") is not None else []
+        return {"links": [serialize(link, contract.TASK_LINK) for link in items]}
+    if name == "ref.list":
+        with foundation.reader() as c:
+            items = task_store.TaskStore.ref_list(
+                c,
+                system=values.get("system"),
+                kind=values.get("kind"),
+                key=values.get("key"),
+                sync=values.get("sync"),
+            )
+        return {"refs": [serialize(r, contract.REF) for r in items]}
+    if name == "ref.get":
+        with foundation.reader() as c:
+            ref_row = needed(task_store.TaskStore.ref_get(c, values["ref"]), values["ref"])
+            linked = task_store.TaskStore.ref_tasks(c, ref_row["num"])
+        return {
+            "ref": serialize(ref_row, contract.REF),
+            "tasks": [serialize(t, contract.REF_TASK_LINK) for t in linked],
+        }
+    if name == "ref.history":
+        with foundation.reader() as c:
+            ref_row = needed(task_store.TaskStore.ref_get(c, values["ref"]), values["ref"])
+            history = task_store.TaskStore.ref_history(c, ref_row["num"])
+        return {"events": history}
     if name == "turn.list":
         raw_try = values["try"]
         if not raw_try.isascii() or not raw_try.isdecimal() or int(raw_try) < 1:
             raise contract.Problem("invalid_input", "try must be a positive integer")
+        run_row = runs.run_get(values["run"])
+        if run_row is not None and (purged := run_row.get("records_purged") or run_row.get("files_purged")):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} records were removed on {purged}",
+                purged_at=purged,
+            )
         matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
         if not matched_steps:
             raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
@@ -525,6 +605,13 @@ def read(name, values, handler):
             raise contract.Problem("invalid_input", "try must be a positive integer")
         if not raw_n.isascii() or not raw_n.isdecimal() or int(raw_n) < 1:
             raise contract.Problem("invalid_input", "n must be a positive integer")
+        run_row = runs.run_get(values["run"])
+        if run_row is not None and (purged := run_row.get("records_purged") or run_row.get("files_purged")):
+            raise contract.Problem(
+                "files_purged",
+                f"run {values['run']} records were removed on {purged}",
+                purged_at=purged,
+            )
         matched_steps, turn_rows = runs.run_step_turns(values["run"], values["node"], int(raw_try))
         if not matched_steps:
             raise contract.Problem("not_found", f"No step {values['node']} try {raw_try} on run {values['run']}")
@@ -546,8 +633,8 @@ def read(name, values, handler):
         steps = [serialize(s, contract.RUN_STEP_SUMMARY) for s in proj.get("steps", ())]
         return {"run": run_view, "steps": steps}
     if action == "get" and resource == "task":
-        needed(task_store.task_get(identity), identity)
-        return {"task": serialize(projection("task", identity), contract.TASK)}
+        task = needed(task_store.task_get(identity), identity)
+        return {"task": serialize(task, contract.TASK)}
     rows = [serialize(row, contract.RESOURCE[resource]) for row in resources(resource, values)]
     if action == "list":
         return {contract.PLURALS[resource]: rows}
@@ -588,9 +675,9 @@ def _resolve_activate_draft_id(values: dict) -> str:
     return found[0]["id"]
 
 
-def _needs_config_presence(name: str, values: dict) -> dict | None:
+def _needs_config_presence(name: str, values: dict, handler=None) -> dict | None:
     """Return extra_detail dict if this config/settings write requires Gate C presence, else None."""
-    actor = principals.current()
+    actor = _config_actor(handler)
     root = paths.CONFIG_DIR.resolve()
     if name == "config.activate":
         draft_id = _resolve_activate_draft_id(values)
@@ -712,7 +799,7 @@ def dispatch(handler, op, path_values, query):
                 return put_blob(handler, op, identity)
             if (name in ("config.activate", "config.rollback", "settings.update")
                     and (handler.credential is None or handler.credential.kind != "session")):
-                extra_detail = _needs_config_presence(name, values)
+                extra_detail = _needs_config_presence(name, values, handler)
                 if extra_detail is not None:
                     if handler.credential is None or "Idempotency-Key" not in handler.headers:
                         credential_http.require_presence(handler.credential)
@@ -797,10 +884,14 @@ def _resolve_events_input(raw_events):
     if isinstance(raw_events, list):
         return raw_events
     if isinstance(raw_events, str):
-        found = blobs.get(raw_events)
-        if found is None:
+        meta_row = blobs.meta(raw_events)
+        if meta_row is None:
             raise contract.Problem("not_found", f"No blob {raw_events}")
-        _, raw = found
+        if purged := meta_row.get("purged_at"):
+            raise contract.Problem("files_purged", f"blob {raw_events} was removed on {purged}", purged_at=purged)
+        raw = blobs.read(raw_events)
+        if raw is None:
+            raise contract.Problem("not_found", f"No blob {raw_events}")
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as error:
@@ -831,7 +922,7 @@ def _config_actor(handler) -> str:
     if cred is not None:
         if cred.actor.startswith("run:"):
             return cred.actor
-        if cred.principal.startswith("u:"):
+        if cred.principal.startswith(("u:", "run:")):
             return cred.principal
         return cred.actor
     return principals.current()
@@ -957,14 +1048,23 @@ def mutation(name, values, handler):
     elif name == "task.create" and values.get("start"):
         ticket = (values.get("ticket") or "").strip()
         body = (values.get("body") or "").strip()
-        started = tasks.start(
-            values["repo"],
-            prompt=body,
-            title=values.get("title", ""),
-            kind=values.get("kind", ""),
-            ticket=ticket,
-            force=values.get("force") is not False,
-        )
+        extra = {k: values[k] for k in task_store.WRITABLE_TASK_EXTRA_FIELDS if k in values}
+        if extra and not ticket and body:
+            repo = tasks.repo_named(config.load(), values["repo"])
+            tid_created = task_store.task_add(
+                repo.name, body, title=values.get("title", "").strip() or tasks.title_of(body),
+                kind=values.get("kind") or "feat", extra=extra,
+            )
+            started = tasks.begin_prompt(config.load(), repo, tid_created)
+        else:
+            started = tasks.start(
+                values["repo"],
+                prompt=body,
+                title=values.get("title", ""),
+                kind=values.get("kind", ""),
+                ticket=ticket,
+                force=values.get("force") is not False,
+            )
         run_id = started.get("run", "")
         run_row = runs.run_get(run_id) if run_id else None
         tid = started.get("task") or ticket or ""
@@ -982,7 +1082,7 @@ def mutation(name, values, handler):
         tid = values["task"].strip()
         repo_name = (values.get("repo") or "").strip()
         if not repo_name:
-            found_task = task_store.task_get(tid.lower())
+            found_task = task_store.task_get(tid)
             if found_task is None:
                 raise control.NotFound(f"no task {tid}")
             repo_name, tid = found_task["repo"], found_task["id"]
@@ -994,6 +1094,86 @@ def mutation(name, values, handler):
             "run": run_object(run_row), "task": started["task"], "repo": started["repo"],
             "state": started["state"], "why": started["why"],
         }
+    elif name == "comment.update":
+        raw_cid = str(values["comment"]).strip()
+        if not (raw_cid.isascii() and raw_cid.isdigit()) or int(raw_cid) <= 0:
+            raise contract.Problem("validation", "comment id must be a positive integer")
+        fields = {k: values[k] for k in task_store.COMMENT_UPDATABLE_FIELDS if k in values}
+        if not fields or ("body" in fields and not str(fields["body"]).strip()):
+            raise contract.Problem("validation", "send a non-empty body or audience to update the comment")
+        try:
+            updated = task_store.task_comment_update(values["task"], int(raw_cid), values["base_version"], fields)
+        except LookupError as error:
+            raise contract.Problem("not_found", str(error)) from None
+        except ValueError as error:
+            raise contract.Problem("validation", str(error)) from None
+        result = {"comment": serialize(needed(updated, raw_cid), contract.TASK_COMMENT)}
+    elif name == "task_ref.link":
+        with foundation.tx() as c:
+            try:
+                linked = task_store.TaskStore.link_ref(c, values["task"], values, values, principals.current())
+                ref_row = task_store.TaskStore.ref_get(c, linked["ref_id"])
+            except task_store.PrimaryRefConflict as error:
+                raise contract.Problem("invalid_state", str(error),
+                                       current=serialize(error.current, contract.TASK_REF)) from None
+            except LookupError as error:
+                raise contract.Problem("not_found", str(error)) from None
+            except ValueError as error:
+                raise contract.Problem("validation", str(error)) from None
+        result = {"task_ref": serialize(linked, contract.TASK_REF), "ref": serialize(ref_row, contract.REF)}
+    elif name == "task_ref.update":
+        with foundation.tx() as c:
+            try:
+                linked = task_store.TaskStore.update_ref_link(
+                    c, values["task"], values["ref"], values, principals.current(),
+                    base_version=values.get("base_version"),
+                )
+                ref_row = task_store.TaskStore.ref_get(c, linked["ref_id"])
+            except task_store.PrimaryRefConflict as error:
+                raise contract.Problem("invalid_state", str(error),
+                                       current=serialize(error.current, contract.TASK_REF)) from None
+            except LookupError as error:
+                raise contract.Problem("not_found", str(error)) from None
+            except ValueError as error:
+                raise contract.Problem("validation", str(error)) from None
+        result = {"task_ref": serialize(linked, contract.TASK_REF), "ref": serialize(ref_row, contract.REF)}
+    elif name == "task_ref.unlink":
+        with foundation.tx() as c:
+            try:
+                ok, task_num, ref_dict = task_store.TaskStore.unlink_ref(
+                    c, values["task"], values["ref"], principals.current(),
+                )
+            except LookupError as error:
+                raise contract.Problem("not_found", str(error)) from None
+        result = {"unlinked": ok, "task": task_store.format_task_id(task_num), "ref": ref_dict["id"]}
+    elif name == "task_link.create":
+        with foundation.tx() as c:
+            try:
+                created_link = task_store.TaskStore.create_link(
+                    c,
+                    values["task"],
+                    values["kind"],
+                    other_task=values.get("other_task"),
+                    other_key=values.get("other_key"),
+                    origin=values.get("origin") or "person",
+                )
+            except LookupError as error:
+                raise contract.Problem("not_found", str(error)) from None
+            except ValueError as error:
+                raise contract.Problem("validation", str(error)) from None
+        result = {"link": serialize(created_link, contract.TASK_LINK)}
+    elif name == "task_link.delete":
+        raw_lid = str(values["link"]).strip()
+        if not (raw_lid.isascii() and raw_lid.isdigit()) or int(raw_lid) <= 0:
+            raise contract.Problem("invalid_input", "link id must be a positive integer")
+        with foundation.tx() as c:
+            try:
+                deleted = task_store.TaskStore.delete_link(c, values["task"], int(raw_lid))
+            except LookupError as error:
+                raise contract.Problem("not_found", str(error)) from None
+        if not deleted:
+            raise contract.Problem("not_found", f"No link {raw_lid} on {values['task']}")
+        result = {"deleted": True, "id": int(raw_lid)}
     elif name.startswith("task.") or name == "comment.create":
         result = {"task": change_task(name, values)}
     elif name == "session.start":
@@ -1290,20 +1470,34 @@ def change_task(name, values):
         raise contract.Problem("invalid_input", "A task needs a body and a supported kind")
     if name == "task.create":
         repo = tasks.repo_named(config.load(), values["repo"])
-        identity = task_store.task_add(repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
-                                       kind=kind)
+        extra = {k: values[k] for k in task_store.WRITABLE_TASK_EXTRA_FIELDS if k in values}
+        identity = task_store.task_add(
+            repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
+            kind=kind, extra=extra,
+        )
     else:
-        identity = values.get("task", values.get("id", "")).strip().lower()
+        identity = values.get("task", values.get("id", "")).strip()
         if name == "task.close":
-            open_states = tuple(state for state in config.TASK_STATES if state not in config.TASK_FINISHED)
-            if not task_store.task_set_state(identity, "closed", from_states=open_states):
+            open_states = tuple(state for state in config.ALL_TASK_STATES if state not in config.TASK_FINISHED)
+            if not task_store.task_set_state(identity, "closed", 0, from_states=open_states):
                 raise contract.Problem("invalid_state", f"Task {identity} cannot be closed")
+        elif name == "task.restore":
+            try:
+                restored = task_store.task_restore(identity, values.get("base_version"))
+            except writes.VersionConflict as error:
+                raise contract.Problem("task_version_conflict", str(error),
+                                       current=serialize(error.current, contract.TASK)) from error
+            except task_store.TaskStateError as error:
+                raise contract.Problem("invalid_state", str(error)) from error
+            return serialize(needed(restored, identity), contract.TASK)
         elif name == "comment.create":
-            if not task_store.task_comment(identity, "owner", body):
+            actor = principals.current()
+            author = actor if principals.is_person(actor) else "owner"
+            if not task_store.task_comment(identity, author, body):
                 raise control.NotFound(f"no task {identity}")
         else:
             fields = {key: value for key, value in values.items() if key not in ("id", "base_version")}
-            if not fields or ("state" in fields and fields["state"] not in config.TASK_STATES):
+            if not fields or ("state" in fields and fields["state"] not in config.ALL_TASK_STATES):
                 raise contract.Problem("invalid_input", "Send at least one editable field and a supported state")
             try:
                 changed = task_store.task_update(identity, values["base_version"], fields)

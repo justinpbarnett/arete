@@ -418,7 +418,12 @@ def compare(old, new):
             changes.append("request body media type changed")
         for code in sorted(set(before["errors"]) | set(after["errors"])):
             error = f"errors.{code}"
-            if code not in before["errors"] or code not in after["errors"] or code not in new["errors"]:
+            if code not in before["errors"]:
+                if code in after["errors"] and code in new["errors"] and code not in old["errors"]:
+                    continue
+                changes.append(f"{error} declaration changed")
+                continue
+            if code not in after["errors"] or code not in new["errors"]:
                 changes.append(f"{error} declaration changed")
                 continue
             previous, current = old["errors"][code], new["errors"][code]

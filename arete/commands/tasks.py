@@ -58,7 +58,7 @@ def task_show(args) -> int:
 
 
 def task_reply(args) -> int:
-    tid = args.id.strip().lower()
+    tid = args.id.strip()
     text = " ".join(args.text).strip()
     if not text:
         print('arete task reply ID "your reply"', file=sys.stderr)
@@ -69,7 +69,7 @@ def task_reply(args) -> int:
 
 
 def task_close(args) -> int:
-    tid = args.id.strip().lower()
+    tid = args.id.strip()
     client.call("POST", f"/api/v1/tasks/{quote(tid, safe='')}/close")
     print(f"{tid}: closed")
     return 0
@@ -190,7 +190,7 @@ def register(sub) -> None:
     t.set_defaults(fn=task_add)
     t = tsub.add_parser("list", help="one JSON line per task, oldest first")
     t.add_argument("--repo", default="")
-    t.add_argument("--state", default="", choices=config.TASK_STATES)
+    t.add_argument("--state", default="", choices=config.ALL_TASK_STATES)
     t.set_defaults(fn=task_list)
     t = steering(tsub.add_parser("show", help="a task or a tracker item with its runs and children, as indented JSON"))
     t.add_argument("id")

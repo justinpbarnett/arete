@@ -54,13 +54,30 @@ def _sync_inbox(c, *sources: str) -> None:
 
 def ask_add(ask_id: str, run: str, repo: str, ticket: str, step: str, call: str, why: str, tried: str,
             questions: list[dict], session: dict, *, recovery_route: str = "owner") -> bool:
+    from . import tasks as task_store
+
     with db() as c:
         first = call != owner_asks.CHECK_RUNNER_CALL or c.execute(
             f"SELECT 1 FROM asks WHERE status='open' AND call=? AND {_latest(c)} LIMIT 1", (call,)).fetchone() is None  # noqa: S608
-        c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
-                  "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
-                   json.dumps(session), recovery_route))
+        if task_store.has_identity_expand(c):
+            task_num: int | None = None
+            if run:
+                rrow = c.execute("SELECT task_id FROM runs WHERE id = ?", (run,)).fetchone()
+                if rrow and rrow["task_id"] is not None:
+                    task_num = int(rrow["task_id"])
+            if task_num is None:
+                task_num = task_store.TaskStore.find_task_num(c, repo, str(ticket))
+            c.execute(
+                "INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
+                "session, recovery_route, task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
+                 json.dumps(session), recovery_route, task_num),
+            )
+        else:
+            c.execute("INSERT OR REPLACE INTO asks (id, run, repo, ticket, step, call, why, tried, questions, asked, "
+                      "session, recovery_route) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (ask_id, run, repo, str(ticket), step, call, why, tried, json.dumps(questions), util.iso(),
+                       json.dumps(session), recovery_route))
         _sync_inbox(c, "asks", "runs")
         return first
 

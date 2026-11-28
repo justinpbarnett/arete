@@ -14,7 +14,7 @@ from .store import db, orchestration, runs, tasks
 from .store import zte as store
 from .zte_github import GitHub, Identity, IssueApp
 
-TASK = re.compile(r"t-[0-9a-f]{40}\Z")
+TASK = re.compile(r"(?:T-[0-9]+|t-[0-9a-f]{40})\Z")
 CANONICAL = ("justinpbarnett/arete", 1446501487, "R_kgDOVjfcbw", 42453910)
 REHEARSAL = ("justinpbarnett/arete-zte-rehearsal-20261118-2f303b9", 1463520326, "R_kgDOVzuMRg", 42453910)
 POLICY_FILE = paths.ZTE_AUTHORITY / "zte.toml"
@@ -205,12 +205,13 @@ def task_version(delivery: store.Delivery, signal: pilot.Signal, *states: str, u
     if until is not None:
         pilot.candidate_time_left(until, 1)
     task = tasks.task_get(delivery.task)
+    allowed = set(states) | {config.canonical_task_state(s)[0] for s in states}
     pilot.require(task and task["repo"] == delivery.repo and task["title"] == pilot.TASK_TITLE
                   and task["kind"] == pilot.TASK_KIND and task["body"] == signal.task() and not task["parent"]
-                  and task["state"] in states, "the reserved ZTE task changed")
+                  and task["state"] in allowed, "the reserved ZTE task changed")
     if until is not None:
         pilot.candidate_time_left(until, 1)
-    pilot.require(all(note["author"] == "arete" for note in tasks.task_comments(delivery.task)),
+    pilot.require(all(not principals.is_person(note["author"]) for note in tasks.task_comments(delivery.task)),
                   "the reserved ZTE task changed")
     return task["version"]
 

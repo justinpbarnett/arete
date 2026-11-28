@@ -66,8 +66,28 @@ def cursors(connect=reader) -> list[dict]:
 
 
 def pass_over(repo: str, issue: str) -> None:
+    from .. import principals
+    from . import tasks as task_store
+
     with db() as c:
-        c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
+        if task_store.has_identity_expand(c):
+            task_num: int | None = None
+            try:
+                task_num, _ = task_store.TaskStore.task_for_ticket(c, repo, str(issue), principals.current())
+            except LookupError:
+                task_num = task_store.TaskStore.find_task_num(c, repo, str(issue))
+            c.execute(
+                "INSERT OR IGNORE INTO passed_over (repo, issue, since, task_id) VALUES (?,?,?,?)",
+                (repo, str(issue), util.iso(), task_num),
+            )
+            if task_num is not None:
+                c.execute(
+                    "UPDATE passed_over SET task_id = ? WHERE repo = ? AND issue = ? AND task_id IS NULL",
+                    (task_num, repo, str(issue)),
+                )
+        else:
+            c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)",
+                      (repo, str(issue), util.iso()))
 
 
 def tickets_passed_over() -> list[dict]:

@@ -2239,8 +2239,8 @@ stopped = runner.Stopped(SimpleNamespace(session=saved, turns=2), SimpleNamespac
 assert runner.continues(stopped, picked, True)
 
 with db.tx() as c:
-    c.execute("INSERT INTO runs (id, kind, repo, issue, status, started) VALUES "
-              "('old-run', 'pipeline', 'fixture', 1, 'needs-info', ?)", (util.iso(),))
+    c.execute("INSERT INTO runs (id, kind, repo, issue, task_id, status, started) VALUES "
+              "('old-run', 'pipeline', 'fixture', 1, 1, 'needs-info', ?)", (util.iso(),))
 asks.ask_add('old-ask', 'old-run', 'fixture', '1', 'build', 'call', '', '', [], asdict(saved))
 assert heartbeat.check_legacy_accounts()[0].detail == '0 active v1 holds, 1 unfinished runs with v1 sessions'
 """)
@@ -3699,6 +3699,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from arete import config, paths, pipeline, record, sandbox, util, workspace
 from arete.store import db, runs, workspaces
+from tests import support
 from tests.support import WORKSPACE_GIT_IDENTITY, init_workspace_repo, seed_db, write_workspace_output
 
 sandbox.AUTHORITY = paths.CONFIG_DIR / 'fixture-authority'
@@ -3863,7 +3864,7 @@ def add_checkout(ticket, *, onto="", part=""):
 
 def checkout(ticket, status, *, onto="", part=""):
     ws, c = add_checkout(ticket, onto=onto, part=part)
-    rid = record.start("pipeline", repo=repo.name, issue=ticket, status=status)
+    rid = support.start_pipeline(repo=repo.name, issue=ticket, status=status)
     wid = workspaces.claim(ws, repo.name, ticket, rid, checkouts=[c])
     workspace.note_made(ws, [c])
     return ws, c, rid, wid
@@ -3967,11 +3968,11 @@ gone, _, _, gid = checkout("4", "done")
 shutil.rmtree(gone)
 failed, _, _, fid = checkout("5", "failed")
 running, _, _, rid = checkout("6", "running")
-local = tasks.task_add(repo.name, "closed task", reserved_id="t-a123")
+local = tasks.task_add(repo.name, "closed task")
 tasks.task_set_state(local, "closed")
 closed, _, _, cid = checkout(local, "failed")
-record.start("pipeline", repo=repo.name, issue="1", status="failed", only_step="build")
-with (util.lock(runs.run_lock("pipeline", repo.name, "2")) as got,
+support.start_pipeline(repo=repo.name, issue="1", status="failed", only_step="build")
+with (util.lock(runs.run_lock("pipeline", task=runs.run_get(workspaces.get(lid)["owner_run"])["task_id"])) as got,
       patch.object(tracker, "for_repo", side_effect=AssertionError("external tracker lookup"))):
     assert got
     workspaces.sweep(cfg)
@@ -4024,7 +4025,7 @@ workspace.add_worktree(saved, "saved", saved.origin_base)
 saved.onto = util.git(["rev-parse", "HEAD"], saved.wt).strip()
 (saved.wt / "notes.txt").write_text("kept edits\n")
 util.git([*WORKSPACE_GIT_IDENTITY, "commit", "-qam", "keep edits"], saved.wt)
-rid = record.start("pipeline", repo=repo.name, issue="7", status="done")
+rid = support.start_pipeline(repo=repo.name, issue="7", status="done")
 wid = workspaces.claim(ws, repo.name, "7", rid, checkouts=[clean, saved])
 workspace.note_made(ws, [clean, saved])
 workspaces.sweep(cfg)
@@ -4122,7 +4123,7 @@ rows += ((ended, ended_id, "kept"),)
 protected = {}
 for ticket, status in (("10", "running"), ("11", "done")):
     ws = paths.WORKTREES_DIR / f"sample-{ticket}"
-    rid = record.start("pipeline", repo=repo.name, issue=ticket, status=status)
+    rid = support.start_pipeline(repo=repo.name, issue=ticket, status=status)
     protected[ws] = workspaces.get(workspaces.claim(ws, repo.name, ticket, rid))
 lstat = Path.lstat
 
@@ -4131,7 +4132,8 @@ def deny_workspace_lookup(path):
         raise PermissionError("workspace inspection denied")
     return lstat(path)
 
-with util.lock(runs.run_lock("pipeline", repo.name, "11")) as got, patch.object(Path, "lstat", deny_workspace_lookup):
+locked_task = runs.run_get(protected[paths.WORKTREES_DIR / "sample-11"]["owner_run"])["task_id"]
+with util.lock(runs.run_lock("pipeline", task=locked_task)) as got, patch.object(Path, "lstat", deny_workspace_lookup):
     assert got
     sweep()
 check_failures("workspace inspection denied")
@@ -4245,7 +4247,7 @@ from arete.store import runs, tasks as task_store
 ticket = task_store.task_add(repo.name, "Preserve replacement worktree")
 ws = paths.WORKTREES_DIR / f"sample-{ticket}"
 c = workspace.Checkout("", repo.github, src, ws, "main")
-rid = record.start("pipeline", repo=repo.name, issue=ticket, status="needs-info")
+rid = support.start_pipeline(repo=repo.name, issue=ticket, status="needs-info")
 wid = workspaces.claim(ws, repo.name, ticket, rid, checkouts=[c])
 workspaces.sweep(cfg)
 assert workspaces.get(wid)["state"] == "removed"
@@ -5181,7 +5183,7 @@ workspaces.sweep(config.Config())
 assert workspaces.open_for(vacant.name)["id"] == row["id"]
 with util.lock(runs.run_lock("pipeline", "sample", "9")) as held:
     assert held and recover(vacant) == 1
-rid = record.start("pipeline", repo="sample", issue="9")
+rid = support.start_pipeline(repo="sample", issue="9")
 assert recover(vacant) == 1
 record.settle(rid, "done")
 with patch.object(json, "load", side_effect=AssertionError("unexpected legacy read")):
@@ -5222,7 +5224,7 @@ row = workspaces.open_for(ws.name)
 assert row["kept_reason"] == workspaces.SNAPSHOT_UNAVAILABLE
 parser = cli.parser()
 args = parser.parse_args(["migrate", "--retry-quarantined-workspace", ws.name, "--workspace-snapshots", str(legacy)])
-with util.lock(runs.run_lock("pipeline", repo.name, "7")) as held:
+with util.lock(runs.run_lock("pipeline", task=runs.run_get(rid)["task_id"])) as held:
     assert held and args.fn(args) == 1
 original = json.loads(path.read_text())
 wrong = {**original, "\0owner": {**original["\0owner"], "run": "replacement"}}
@@ -5251,7 +5253,7 @@ def deny(pathname, *args, **kwargs):
 with patch.object(os, "open", side_effect=deny):
     assert not db.migrate(workspace_snapshots=legacy)
 assert workspaces.open_for(ws.name)["repo"] == ""
-with util.lock(runs.run_lock("pipeline", repo.name, "7")) as held:
+with util.lock(runs.run_lock("pipeline", task=runs.run_get(rid)["task_id"])) as held:
     assert held
     with case.assertRaises(ValueError):
         workspaces.retry_quarantine(ws.name, legacy)
@@ -5752,7 +5754,7 @@ with scratch_records():
     root.rename(Path.cwd() / "archived-scratch")
     (ws / ".venv/output").write_text("after scratch settled")
     with patch.object(scratch, "holders", return_value=[]):
-        with util.lock(runs.run_lock("pipeline", repo.name, row["ticket"])) as got:
+        with util.lock(runs.run_lock("pipeline", task=run["task_id"])) as got:
             assert got
             pipeline.retry_scratch()
             assert workspaces.get(wid)["retained"] == made[workspace.RETAINED_KEY]
@@ -5852,7 +5854,7 @@ with patch.object(util, "now", return_value=util.parse_iso(newer)):
 from arete import heartbeat
 
 t = util.iso(util.parse_iso("2026-01-01T00:00:00+00:00"))
-rid = record.start("pipeline", started=t, finished=t, status="failed")
+rid = support.start_pipeline(started=t, finished=t, status="failed")
 with db.tx() as c:
     c.execute("INSERT INTO workspaces (name, state, kept_reason, owner_run, made_at) VALUES (?,?,?,?,?)",
               ("saved", "kept", "failed", rid, t))
@@ -5972,7 +5974,7 @@ from arete import board, inbox
 
 cfg = config.Config(repos=[config.Repo("sample", Path.cwd()), config.Repo("sample-app", Path.cwd())])
 db.migrate()
-record.start("pipeline", repo="sample", issue="app-stray", status="done")
+support.start_pipeline(repo="sample", issue="app-stray", status="done")
 for name, old in (("sample-app-stray", True), ("sample-app-young", False)):
     folder = paths.WORKTREES_DIR / name
     folder.mkdir(parents=True)
@@ -6037,7 +6039,7 @@ class _WorkspaceWorkflowCase(unittest.TestCase):
         c = workspace.Checkout(part, self.repo.github, self.repo.path, ws / part, "main")
         workspace.add_worktree(c, f"arete/{tid}", "main")
         write_workspace_output(c.wt, "home\n")
-        rid = record.start("pipeline", repo=self.repo.name, issue=tid, status=status, **fields)
+        rid = support.start_pipeline(repo=self.repo.name, issue=tid, status=status, **fields)
         run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=tracker.for_ticket(self.cfg, self.repo, tid),
                            tid=tid)
         run.dir.mkdir(parents=True)
@@ -6770,7 +6772,7 @@ timeout_minutes = 40
                     record.claim(run_id)
                 else:
                     rid = record.new_id("pip")
-                    record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                    support.start_pipeline(run_id=rid, repo=repo_name, issue=ticket_id)
                 return SimpleNamespace(poll=lambda: None, pid=os.getpid())
 
             def post_task(ticket_id):
@@ -6940,7 +6942,7 @@ timeout_minutes = 40
                     record.claim(run_id)
                 else:
                     rid = record.new_id("pip")
-                    record.start("pipeline", run_id=rid, repo=repo_name, issue=ticket_id)
+                    support.start_pipeline(run_id=rid, repo=repo_name, issue=ticket_id)
                 return SimpleNamespace(poll=lambda: None, pid=os.getpid())
 
             def post_task(ticket_id):
@@ -8364,7 +8366,7 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
             code, lines, err = self.cli("task add --repo replay-sample change")
             self.assertEqual(code, 0, (lines, err))
             task = lines[0]
-            self.assertEqual(task_store.task_get(task)["state"], "todo")
+            self.assertEqual(task_store.task_get(task)["state"], "ready")
             self.assertFalse(runs.runs())
             self.assertEqual(json.loads(self.cli("task list")[1][0])["id"], task)
             before = task_store.task_get(task)["version"]
@@ -8376,7 +8378,10 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
                     client.call("PATCH", path, {"base_version": before, "title": "Stale"})
                 self.assertEqual(stale.exception.code, 409)
             self.assertEqual(self.cli(f"task reply {task} reply")[0], 0)
-            self.assertEqual([(c["author"], c["body"]) for c in task_store.task_comments(task)], [("owner", "reply")])
+            comments = task_store.task_comments(task)
+            self.assertEqual(len(comments), 1)
+            self.assertEqual(comments[0]["body"], "reply")
+            self.assertTrue(comments[0]["author"].startswith("u:"), comments[0]["author"])
             self.assertEqual(self.cli(f"task close {task}")[0], 0)
             self.problem(f"task close {task}", "invalid_state")
             run = record.start("session", run_id="r1", pid=None)
@@ -9151,7 +9156,7 @@ class VerifyFaultTests(unittest.TestCase):
 
     def start_run(self, run):
         with principals.acting(self.actor):
-            run_store.insert_run(run, {"kind": "pipeline", "started": util.iso(), "status": "running"})
+            run_store.insert_run(run, {"kind": "pipeline", "task_id": 1, "started": util.iso(), "status": "running"})
 
     def test_default_conflict_matches_contract_and_sets_dashboard_stale_notice(self):
         self.mark_scratch()
@@ -9165,7 +9170,7 @@ class VerifyFaultTests(unittest.TestCase):
         schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
         problem = json.loads(raw)
         contract.validate(problem, schema)
-        self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+        self.assertEqual(problem["current"], api.run_object(current))
         self.assertEqual(run_store.run_get(run), current)
 
         result = subprocess.run(["node", "--input-type=module", "-e", """
@@ -9215,7 +9220,7 @@ class VerifyFaultTests(unittest.TestCase):
                 status, problem = self.request(endpoint, method, route, body=body)
                 self.assertEqual(status, 409)
                 contract.validate(problem, schema)
-                self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+                self.assertEqual(problem["current"], api.run_object(current))
 
         route = f"/api/feed/{run}"
         explicit = '{ "fault": "armed" }\n'
@@ -9250,7 +9255,7 @@ class VerifyFaultTests(unittest.TestCase):
                     contract.validate(problem, conflict["schema"])
                     current = conflict["example"]["current"]
                     if selects_run:
-                        current = {k: v for k, v in run_store.run_get(run).items() if k in contract.RUN["properties"]}
+                        current = api.run_object(run_store.run_get(run))
                     self.assertEqual(problem["current"], current)
 
     def test_drop_closes_open_streams_and_reconnect_resumes_after_last_event(self):
@@ -9722,8 +9727,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 139)
-        self.assertEqual(len({op["name"] for op in operations}), 139)
+        self.assertEqual(len(operations), 151)
+        self.assertEqual(len({op["name"] for op in operations}), 151)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])
@@ -9814,7 +9819,9 @@ class VersionedApiTests(unittest.TestCase):
         self.assertEqual(unchanged["Arete-Seq"], before["seq"])
 
         run = f"board-{task}"
-        fields = {"kind": "pipeline", "repo": self.repo.name, "issue": task, "status": "running", "started": util.iso()}
+        fields = {"kind": "pipeline", "repo": self.repo.name, "issue": task,
+                  "task_id": task_store.parse_task_num(task), "issue_key": task,
+                  "status": "running", "started": util.iso()}
         run_store.insert_run(run, fields)
         task_store.task_set_state(task, "running")
         active, _ = request(board_url)
@@ -10817,7 +10824,7 @@ class CredentialDashboardTests(unittest.TestCase):
 class CredentialSessionStopTests(_CredentialCase):
     @credential_test
     def test_legacy_stop_requires_a_session_run(self, _):
-        runs = [record.start(kind, pid=None) for kind in ("pipeline", "loop")]
+        runs = [support.start_pipeline(pid=None), record.start("loop", pid=None)]
         session = record.start("session", pid=None)
         with self.listen() as server:
             token = self.issue(server, self.pair(server), scopes=("session:write",))["text"]
@@ -10852,7 +10859,7 @@ class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
             self.request(server, "POST", route, bearer=self.owner_text, key=key, body={**body, "prompt": "Changed"},
                          status=422, code="idempotency_key_reused")
             self.task(server, bearer=self.owner_text, key=key, status=422, code="idempotency_key_reused")
-        self.assertEqual([row["id"] for row in task_store.tasks()], [task])
+        self.assertEqual([row["id"] for row in task_store.tasks()], ["T-1"])
         self.assertEqual([row["id"] for row in run_store.runs()], [run])
 
     @credential_test
@@ -11302,7 +11309,7 @@ class CredentialRotationTests(_CredentialCase):
 class _CredentialStreamCase(_CredentialCase):
     def large_streams(self):
         payload = "x" * (1 << 20)
-        run = record.start("pipeline", repo="fixture")
+        run = support.start_pipeline(repo="fixture")
         run_lines.path(run).parent.mkdir(parents=True, exist_ok=True)
         run_lines.path(run).write_bytes(dashboard.event_line({"seq": 1, "event": run_lines.END, "body": payload}))
         with db.tx():
@@ -11440,7 +11447,7 @@ class CredentialRestoreTests(_CredentialCase):
 class CredentialAuthTests(_CredentialCase):
     @credential_test
     def test_ask_actor_resolves_only_for_worker(self, _):
-        run = record.start("pipeline", repo="fixture")
+        run = support.start_pipeline(repo="fixture")
         _, text = token_store.issue(self.owner, "Ask", ["read"], kind="ask", run_id=run)
         context = token_store.resolve(text, step="implement")
         self.assertEqual((context.actor, context.principal), (f"run:{run}/implement", self.owner))
@@ -12517,7 +12524,7 @@ class SecretScrubRecordsTests(_SecretChildCase):
         self.run_secret_child(SECRET_SCRUB_FIXTURE + r"""
 with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
     planted_secret()
-    run_id = record.start('pipeline', repo='demo', issue='1')
+    run_id = support.start_pipeline(repo='demo', issue='1')
     with record.Recorder(run_id, 'build', {'runner': 'claude', 'model': 'fixture'}) as rec:
         rec.line(json.dumps({'type': 'message', 'text': f'line {PLANTED}'}))
         call = Result(ok=False, error=f'call err {PLANTED}', runner='claude', model='fixture')
@@ -12630,12 +12637,12 @@ class SecretScrubApiAndTokensTests(_SecretChildCase):
 with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
     planted_secret()
     tid = task_store.task_add('demo', 'initial body', 'secret task')
-    run_id = record.start('pipeline', repo='demo', issue=str(tid))
+    run_id = support.start_pipeline(repo='demo', issue=str(tid))
     record.step(run_id, 'build', Result(ok=False, error='initial', runner='claude', model='fixture'), 0.1)
     # Plant raw values directly via sqlite3 and run.jsonl, bypassing write-time scrubbing.
     raw_conn = sqlite3.connect(paths.DB_FILE)
     try:
-        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'db task {PLANTED}', tid))
+        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'db task {PLANTED}', task_store.parse_task_num(tid)))
         raw_conn.execute('UPDATE steps SET error = ? WHERE run_id = ?', (f'db step {PLANTED}', run_id))
         raw_conn.execute('UPDATE runs SET summary = ? WHERE id = ?', (f'db run {PLANTED}', run_id))
         raw_conn.commit()
@@ -12668,7 +12675,7 @@ with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
     token_marker = f'[token:{tid_hex}]'
     safe_ident = 'car_tag_1_x'
 
-    run_id = record.start('pipeline', repo='demo', issue='2')
+    run_id = support.start_pipeline(repo='demo', issue='2')
     with record.Recorder(run_id, 'plan', {'runner': 'claude', 'model': 'fixture'}) as rec:
         rec.line(json.dumps({'text': f'tok={full_token} id={safe_ident}'}))
     rec_text = gzip.decompress(record.find_record(run_id, 'plan').read_bytes()).decode()
@@ -12682,7 +12689,7 @@ with mock.patch.object(urllib.request, 'urlopen', side_effect=forbid_network):
     task_id = task_store.task_add('demo', 'clean', 'token task')
     raw_conn = sqlite3.connect(paths.DB_FILE)
     try:
-        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'api {full_token} {safe_ident}', task_id))
+        raw_conn.execute('UPDATE tasks SET body = ? WHERE id = ?', (f'api {full_token} {safe_ident}', task_store.parse_task_num(task_id)))
         raw_conn.commit()
     finally:
         raw_conn.close()
@@ -12983,7 +12990,7 @@ class InboxTests(_InboxCase):
                 )
 
             # 6. 1 open choice ask.
-            ask_run = record.start("pipeline", repo="fixture", issue="401")
+            ask_run = support.start_pipeline(repo="fixture", issue="401")
             asks_store.ask_add(
                 ask_run, ask_run, "fixture", "401", "implement", "ask", "Need choice", "",
                 [{"kind": "choice", "header": "Pick", "question": "Pick one",
@@ -12992,7 +12999,7 @@ class InboxTests(_InboxCase):
             record.move(ask_run, "needs-info", ("running",))
 
             # 7. 1 needs-info run without an ask.
-            bare_run = record.start("pipeline", repo="fixture", issue="402")
+            bare_run = support.start_pipeline(repo="fixture", issue="402")
             record.move(bare_run, "needs-info", ("running",))
 
             # 8. 1 alert.
@@ -13053,8 +13060,8 @@ class InboxTests(_InboxCase):
         blocker_id = task_store.task_add("fixture", "Must finish first", title="Blocker issue")
         waiter_id = task_store.task_add("fixture", f"Waits on {blocker_id}", title="Waiting ticket")
         parked_id = task_store.task_add("fixture", "Work", title="Parked ticket")
-        mixed_id = task_store.task_add("fixture", f"Waits on {blocker_id}, t-999999", title="Mixed ticket")
-        parked_run = record.start("pipeline", repo="fixture", issue=parked_id)
+        mixed_id = task_store.task_add("fixture", f"Waits on {blocker_id}, T-999999", title="Mixed ticket")
+        parked_run = support.start_pipeline(repo="fixture", issue=parked_id)
         record.move(parked_run, "needs-info", ("running",))
         with db.tx() as c:
             c.execute("UPDATE runs SET label_pending = 'needs-info' WHERE id = ?", (parked_run,))
@@ -13214,12 +13221,12 @@ class InboxLifecycleTests(_InboxCase):
             "demo", "r-a", {"type": "ticket", "item": {"title": "Reject me", "body": "x", "repo": "fixture"}},
             "Reject me",
         )
-        r1 = record.start("pipeline", repo="fixture", issue="501")
+        r1 = support.start_pipeline(repo="fixture", issue="501")
         asks_store.ask_add(r1, r1, "fixture", "501", "implement", "ask", "Q1", "",
                            [{"kind": "choice", "header": "P1", "question": "P1",
                              "options": [{"label": "yes", "recommended": True}, {"label": "no"}]}], {})
         record.move(r1, "needs-info", ("running",))
-        r2 = record.start("pipeline", repo="fixture", issue="502")
+        r2 = support.start_pipeline(repo="fixture", issue="502")
         asks_store.ask_add(r2, r2, "fixture", "502", "implement", "ask", "Q2", "",
                            [{"kind": "choice", "header": "P2", "question": "P2",
                              "options": [{"label": "x", "recommended": True}, {"label": "y"}]}], {})
@@ -13239,7 +13246,7 @@ class InboxLifecycleTests(_InboxCase):
 
         def fake_launch(command, log_path):
             launch_lease.passed()
-            record.start("pipeline", repo="fixture", issue="501")
+            support.start_pipeline(repo="fixture", issue="501")
             proc = mock.Mock(pid=os.getpid())
             proc.poll.return_value = None
             return proc
@@ -13591,7 +13598,7 @@ class InboxPushTests(_InboxCase):
                       cookie=cookie, status=201)
 
             # Single open ask -> 1 post with TTL 86400, Urgency high, Topic tr-<id>, valid VAPID JWT.
-            r1 = record.start("pipeline", repo="fixture", issue="601")
+            r1 = support.start_pipeline(repo="fixture", issue="601")
             asks_store.ask_add(r1, r1, "fixture", "601", "implement", "ask", "Need input", "",
                                [{"kind": "choice", "header": "Q", "question": "Q",
                                  "options": [{"label": "1", "recommended": True}]}], {})
@@ -13605,8 +13612,8 @@ class InboxPushTests(_InboxCase):
 
             # Two asks opened in one tx() -> ONE post.
             posts.clear()
-            r2 = record.start("pipeline", repo="fixture", issue="602")
-            r3 = record.start("pipeline", repo="fixture", issue="603")
+            r2 = support.start_pipeline(repo="fixture", issue="602")
+            r3 = support.start_pipeline(repo="fixture", issue="603")
             with db.tx():
                 asks_store.ask_add(r2, r2, "fixture", "602", "implement", "ask", "Q2", "",
                                    [{"kind": "choice", "header": "A", "question": "A",
@@ -13624,7 +13631,7 @@ class InboxPushTests(_InboxCase):
             self.assertEqual(posts, [])
 
             # HIGH needs-info run without ask -> 1 post.
-            r4 = record.start("pipeline", repo="fixture", issue="604")
+            r4 = support.start_pipeline(repo="fixture", issue="604")
             record.move(r4, "needs-info", ("running",))
             self.assertEqual(len(posts), 1)
 
@@ -13647,12 +13654,12 @@ class InboxPushTests(_InboxCase):
             self.http(server, "POST", self.PUSH, body={"endpoint": ep1, "keys": keys, "label": "D1"},
                       cookie=cookie, status=201)
 
-            r_open = record.start("pipeline", repo="fixture", issue="701")
+            r_open = support.start_pipeline(repo="fixture", issue="701")
             asks_store.ask_add(r_open, r_open, "fixture", "701", "implement", "ask", "Open ask", "",
                                [{"kind": "choice", "header": "Q", "question": "Q",
                                  "options": [{"label": "1", "recommended": True}]}], {})
             record.move(r_open, "needs-info", ("running",))
-            r_snoozed = record.start("pipeline", repo="fixture", issue="702")
+            r_snoozed = support.start_pipeline(repo="fixture", issue="702")
             asks_store.ask_add(r_snoozed, r_snoozed, "fixture", "702", "implement", "ask", "Snoozed ask", "",
                                [{"kind": "choice", "header": "Q", "question": "Q",
                                  "options": [{"label": "1", "recommended": True}]}], {})
@@ -13813,6 +13820,7 @@ from arete.store import incidents as incident_store
 from arete.store import loops as loop_store
 from arete.store import retention as retention_store
 from arete.store import runs as run_store
+from tests import support
 
 paths.ensure_dirs()
 foundation.migrate()
@@ -13838,7 +13846,7 @@ def backdate_run(run_id: str, days: float, *, record_mtime_days: float | None = 
 def seed_run(kind: str, status: str, days: float, *, with_record: bool = True, record_bytes: int = 64,
              record_mtime_days: float | None = None, with_step: bool = False, with_feed: bool = False,
              session_dir: bool = False, **fields) -> str:
-    rid = record.start(kind, **fields)
+    rid = support.start_pipeline(**fields) if kind == "pipeline" else record.start(kind, **fields)
     folder = paths.RUNS_DIR / rid
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "run.log").write_text("log line\n", encoding="utf-8")
@@ -14033,7 +14041,7 @@ for label, fn in (
 ):
     try:
         fn()
-    except (control.Refused, refusals.Conflict) as e:
+    except refusals.Refusal as e:
         refusals_seen[label] = str(e)
 
 print("BEHAVIOR_RESULT=" + json.dumps({
@@ -14119,7 +14127,7 @@ try:
         pin_refused = False
         try:
             record.pin(old_pipe)
-        except refusals.Conflict:
+        except (refusals.Conflict, refusals.Gone):
             pin_refused = True
 
         # Next pass completes file removal and clears run_purges.
@@ -14344,6 +14352,812 @@ print("BEHAVIOR_RESULT=" + json.dumps({
         self.assertTrue(res["validator_rejected_all"])
 
 
+class RunRetentionBlobsTurnsTests(_RetentionChildCase):
+    def test_blobs_step_inputs_turn_index_and_draft_keeps(self):
+        res = self.run_retention_child(r"""
+import gzip
+
+from arete import drafts
+from arete.store import blobs as blob_store
+
+retention.policy_file().write_text(
+    "[firings]\ndays = 14\n"
+    "[records]\ndays = 30\nmax_gb = 20\n"
+    "[folders]\ndays = 90\n",
+    encoding="utf-8",
+)
+
+
+def write_turn_record(run_id: str, step_id: int, step_name: str = "build") -> Path:
+    rec_dir = paths.RUNS_DIR / run_id / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    target = rec_dir / f"{step_name}.jsonl.gz"
+    header = {
+        "arete": "header",
+        "step": step_name,
+        "step_id": step_id,
+        "runner": "claude",
+        "model": "sonnet",
+        "started": "2026-01-01T00:00:00Z",
+    }
+    clock = {"arete": "clock", "seconds": 1.25}
+    turn_ev = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"worked on {run_id}"}],
+            "usage": {"input_tokens": 12, "cache_read_input_tokens": 0, "output_tokens": 8},
+        },
+    }
+    raw = (
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(turn_ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    target.write_bytes(raw)
+    return target
+
+
+def seed_rich(kind: str, days: float, *, issue: str = "", loop: str = "", loop_kind: str = "",
+              inputs_payload: bytes, rendered_payload: bytes, resolved_payload: bytes | None = None,
+              shared_sha: str = "") -> dict:
+    extra = {"repo": "app", "issue": issue} if issue else {"loop": loop, "loop_kind": loop_kind}
+    rid = support.start_pipeline(**extra) if kind == "pipeline" else record.start(kind, **extra)
+    folder = paths.RUNS_DIR / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "run.log").write_text("line\n", encoding="utf-8")
+    in_sha = blob_store.put(inputs_payload, "inputs")
+    ren_sha = blob_store.put(rendered_payload, "rendered")
+    res_sha = blob_store.put(resolved_payload, "resolved") if resolved_payload is not None else ""
+    snap_body = json.dumps({"run": rid}, sort_keys=True)
+    snap_sha = blob_store.digest(snap_body.encode("utf-8"))
+    step_inputs = [
+        {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+        {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+    ]
+    if shared_sha:
+        step_inputs.append({"role": "inputs", "name": "shared", "sha256": shared_sha, "call": 1})
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic",
+                       cost_usd=0.0 if loop_kind == "command" else 0.1), 1.0)],
+        inputs=step_inputs,
+        settings_sha=snap_sha,
+        settings_snapshots={snap_sha: snap_body},
+    )
+    sid = run_store.last_step_id(rid)
+    write_turn_record(rid, sid, "build")
+    run_store.add_feed(rid, "note", "feed")
+    record.settle(rid, "done", summary="done")
+    backdate_run(rid, days)
+    return {"id": rid, "step_id": sid, "inputs_sha": in_sha, "rendered_sha": ren_sha,
+            "resolved_sha": res_sha, "snap_sha": snap_sha}
+
+
+shared_sha = blob_store.put(b'{"shared":true}', "inputs")
+fresh = seed_rich("pipeline", 5, issue="1", inputs_payload=b'{"r":"fresh"}',
+                  rendered_payload=b"fresh prompt", resolved_payload=b'{"res":"fresh"}',
+                  shared_sha=shared_sha)
+firing_15 = seed_rich("loop", 15, loop="ping", loop_kind="command",
+                      inputs_payload=b'{"r":"firing"}', rendered_payload=b"firing prompt")
+run_31 = seed_rich("pipeline", 31, issue="2", inputs_payload=b'{"r":"31d"}',
+                   rendered_payload=b"31d prompt", resolved_payload=b'{"res":"31d"}',
+                   shared_sha=shared_sha)
+run_91 = seed_rich("pipeline", 91, issue="3", inputs_payload=b'{"r":"91d"}',
+                   rendered_payload=b"91d prompt", resolved_payload=b'{"res":"91d"}')
+run_40_active_ev = seed_rich("pipeline", 40, issue="4", inputs_payload=b'{"r":"40a"}',
+                             rendered_payload=b"40a prompt")
+run_40_active_author = seed_rich("pipeline", 40, issue="5", inputs_payload=b'{"r":"40auth"}',
+                                 rendered_payload=b"40auth prompt")
+run_40_active_legacy = seed_rich("pipeline", 40, issue="6", inputs_payload=b'{"r":"40leg"}',
+                                 rendered_payload=b"40leg prompt")
+run_40_declined = seed_rich("pipeline", 40, issue="7", inputs_payload=b'{"r":"40dec"}',
+                            rendered_payload=b"40dec prompt")
+run_40_discarded = seed_rich("pipeline", 40, issue="8", inputs_payload=b'{"r":"40disc"}',
+                             rendered_payload=b"40disc prompt")
+
+# Seed active, declined, and discarded drafts citing the 40-day runs via evidence, author, and legacy_proposal.
+drafts.add(kind="prompt", name="plan", body="ok", state="active", evidence={"run": run_40_active_ev["id"]})
+drafts.add(kind="prompt", name="build", body="ok", state="active", author=f"run:{run_40_active_author['id']}/build")
+with foundation.tx() as c:
+    c.execute(
+        "INSERT INTO proposals (id, run_id, layer, repo, file, change, why, evidence, confidence, status, pr_url, created) "
+        "VALUES (901, ?, 'app', 'app', 'f.md', 'c', 'w', '[]', 0.9, 'rejected', '', ?)",
+        (run_40_active_legacy["id"], util.iso()),
+    )
+    c.execute("UPDATE config_drafts SET legacy_proposal = NULL WHERE id = 901")
+    drafts.add(c, kind="prompt", name="legacy-holder", body="ok", state="active", evidence={}, legacy_proposal=901)
+drafts.add(kind="prompt", name="plan", body="no", state="declined", evidence={"run": run_40_declined["id"]})
+drafts.add(kind="prompt", name="plan", body="no2", state="discarded", evidence={"run": run_40_discarded["id"]})
+
+record.rebuild_turn_index()
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+with foundation.reader() as c:
+    r31_row = dict(c.execute("SELECT files_purged, records_purged FROM runs WHERE id = ?", (run_31["id"],)).fetchone())
+    r31_turns = c.execute("SELECT COUNT(*) FROM turn_index WHERE run_id = ?", (run_31["id"],)).fetchone()[0]
+    r31_in_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["inputs_sha"],)).fetchone())
+    r31_ren_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["rendered_sha"],)).fetchone())
+    r31_res_blob = dict(c.execute("SELECT kind, purged_at, purge_reason FROM blobs WHERE sha256 = ?", (run_31["resolved_sha"],)).fetchone())
+    r31_snap = c.execute("SELECT 1 FROM settings_snapshots WHERE sha256 = ?", (run_31["snap_sha"],)).fetchone()
+    shared_blob = dict(c.execute("SELECT purged_at, purge_reason FROM blobs WHERE sha256 = ?", (shared_sha,)).fetchone())
+
+    r91_row = dict(c.execute("SELECT files_purged, records_purged FROM runs WHERE id = ?", (run_91["id"],)).fetchone())
+    r91_si = c.execute("SELECT COUNT(*) FROM step_inputs WHERE step_id = ?", (run_91["step_id"],)).fetchone()[0]
+
+    f15_run = c.execute("SELECT 1 FROM runs WHERE id = ?", (firing_15["id"],)).fetchone()
+    f15_si = c.execute("SELECT COUNT(*) FROM step_inputs WHERE step_id = ?", (firing_15["step_id"],)).fetchone()[0]
+    f15_turns = c.execute("SELECT COUNT(*) FROM turn_index WHERE run_id = ?", (firing_15["id"],)).fetchone()[0]
+    f15_in_blob = dict(c.execute("SELECT purged_at, purge_reason FROM blobs WHERE sha256 = ?", (firing_15["inputs_sha"],)).fetchone())
+
+    r40_active_ev_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_ev["id"],)).fetchone()[0]
+    r40_active_auth_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_author["id"],)).fetchone()[0]
+    r40_active_leg_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_active_legacy["id"],)).fetchone()[0]
+    r40_dec_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_declined["id"],)).fetchone()[0]
+    r40_disc_rp = c.execute("SELECT records_purged FROM runs WHERE id = ?", (run_40_discarded["id"],)).fetchone()[0]
+
+# Resurrection check: rewriting the purged inputs blob clears purged_at and purge_reason and restores file.
+blob_store.put(b'{"r":"31d"}', "inputs")
+resurrected = blob_store.meta(run_31["inputs_sha"])
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "r31_folder": (paths.RUNS_DIR / run_31["id"]).is_dir(),
+    "r31_record_gone": not (paths.RUNS_DIR / run_31["id"] / "record").exists(),
+    "r31_records_purged": bool(r31_row["records_purged"]),
+    "r31_files_purged": r31_row["files_purged"],
+    "r31_turns": r31_turns,
+    "r31_inputs_purged": bool(r31_in_blob["purged_at"]) and r31_in_blob["purge_reason"] == "retention",
+    "r31_rendered_purged": bool(r31_ren_blob["purged_at"]) and r31_ren_blob["purge_reason"] == "retention",
+    "r31_rendered_file_gone": not blob_store.blob_path(run_31["rendered_sha"]).exists(),
+    "r31_resolved_kept": r31_res_blob["purged_at"] is None and blob_store.blob_path(run_31["resolved_sha"]).is_file(),
+    "r31_snap_kept": r31_snap is not None,
+    "shared_blob_kept": shared_blob["purged_at"] is None and blob_store.blob_path(shared_sha).is_file(),
+    "r91_kept_si": bool(r91_row["files_purged"]) and r91_si == 2 and not (paths.RUNS_DIR / run_91["id"]).exists(),
+    "f15_purged": (f15_run is None and f15_si == 0 and f15_turns == 0
+                   and not (paths.RUNS_DIR / firing_15["id"]).exists()
+                   and bool(f15_in_blob["purged_at"]) and f15_in_blob["purge_reason"] == "retention"
+                   and not blob_store.blob_path(firing_15["inputs_sha"]).exists()),
+    "active_ev_kept": r40_active_ev_rp is None and (paths.RUNS_DIR / run_40_active_ev["id"] / "record").is_dir(),
+    "active_author_kept": r40_active_auth_rp is None and (paths.RUNS_DIR / run_40_active_author["id"] / "record").is_dir(),
+    "active_legacy_kept": r40_active_leg_rp is None and (paths.RUNS_DIR / run_40_active_legacy["id"] / "record").is_dir(),
+    "declined_gone": bool(r40_dec_rp) and not (paths.RUNS_DIR / run_40_declined["id"] / "record").exists(),
+    "discarded_gone": bool(r40_disc_rp) and not (paths.RUNS_DIR / run_40_discarded["id"] / "record").exists(),
+    "resurrected": (resurrected["purged_at"] is None and resurrected["purge_reason"] is None
+                    and blob_store.blob_path(run_31["inputs_sha"]).is_file()),
+}))
+""")
+        self.assertTrue(res["r31_folder"])
+        self.assertTrue(res["r31_record_gone"])
+        self.assertTrue(res["r31_records_purged"])
+        self.assertIsNone(res["r31_files_purged"])
+        self.assertEqual(res["r31_turns"], 0)
+        self.assertTrue(res["r31_inputs_purged"])
+        self.assertTrue(res["r31_rendered_purged"])
+        self.assertTrue(res["r31_rendered_file_gone"])
+        self.assertTrue(res["r31_resolved_kept"])
+        self.assertTrue(res["r31_snap_kept"])
+        self.assertTrue(res["shared_blob_kept"])
+        self.assertTrue(res["r91_kept_si"])
+        self.assertTrue(res["f15_purged"])
+        self.assertTrue(res["active_ev_kept"])
+        self.assertTrue(res["active_author_kept"])
+        self.assertTrue(res["active_legacy_kept"])
+        self.assertTrue(res["declined_gone"])
+        self.assertTrue(res["discarded_gone"])
+        self.assertTrue(res["resurrected"])
+
+    def test_turn_index_rebuild_matches_live_after_pass_and_between_phases(self):
+        res = self.run_retention_child(r"""
+import gzip
+
+retention.policy_file().write_text(
+    "[firings]\ndays = 14\n[records]\ndays = 30\nmax_gb = 20\n[folders]\ndays = 90\n",
+    encoding="utf-8",
+)
+
+
+def seed_with_turns(kind: str, days: float, **extra) -> str:
+    rid = support.start_pipeline(**extra) if kind == "pipeline" else record.start(kind, **extra)
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic",
+                       cost_usd=0.0 if extra.get("loop_kind") == "command" else 0.1), 1.0)],
+    )
+    sid = run_store.last_step_id(rid)
+    rec_dir = paths.RUNS_DIR / rid / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    header = {"arete": "header", "step": "build", "step_id": sid, "runner": "claude",
+              "model": "sonnet", "started": "2026-01-01T00:00:00Z"}
+    clock = {"arete": "clock", "seconds": 0.5}
+    ev = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": rid}],
+          "usage": {"input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 4}}}
+    (rec_dir / "build.jsonl.gz").write_bytes(
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    record.settle(rid, "done", summary="done")
+    backdate_run(rid, days)
+    return rid
+
+
+kept_5 = seed_with_turns("pipeline", 5, repo="app", issue="1")
+rec_31 = seed_with_turns("pipeline", 31, repo="app", issue="2")
+old_91 = seed_with_turns("pipeline", 91, repo="app", issue="3")
+fir_15 = seed_with_turns("loop", 15, loop="ping", loop_kind="command")
+record.rebuild_turn_index()
+
+
+def dump_turns() -> list[dict]:
+    with foundation.reader() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM turn_index ORDER BY step_id, n").fetchall()]
+
+
+before_count = len(dump_turns())
+policy = retention.load_live()
+measured = retention_store.measure()
+with principals.acting("hand"):
+    retention_store.prune_rows(policy, measured)
+
+# Between rows tx and file phase: record files still exist on disk, but rebuild adds no purged row back.
+files_still_present_between = (
+    (paths.RUNS_DIR / rec_31 / "record").is_dir()
+    and (paths.RUNS_DIR / old_91 / "record").is_dir()
+    and (paths.RUNS_DIR / fir_15 / "record").is_dir()
+)
+live_between = dump_turns()
+record.rebuild_turn_index()
+rebuilt_between = dump_turns()
+
+# Now run file phase and rebuild again.
+retention_store.prune_files()
+live_after = dump_turns()
+record.rebuild_turn_index()
+rebuilt_after = dump_turns()
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "before_count": before_count,
+    "files_still_present_between": files_still_present_between,
+    "live_between_runs": [r["run_id"] for r in live_between],
+    "between_equal": rebuilt_between == live_between,
+    "after_equal": rebuilt_after == live_after == live_between,
+    "kept_5": kept_5,
+}))
+""")
+        self.assertEqual(res["before_count"], 4)
+        self.assertTrue(res["files_still_present_between"])
+        self.assertEqual(res["live_between_runs"], [res["kept_5"]])
+        self.assertTrue(res["between_equal"])
+        self.assertTrue(res["after_equal"])
+
+    def test_failed_blob_unlink_retries_on_next_pass(self):
+        res = self.run_retention_child(r"""
+from arete.store import blobs as blob_store
+
+retention.policy_file().write_text("[records]\ndays = 30\nmax_gb = 20\n[folders]\ndays = 90\n", encoding="utf-8")
+rid = support.start_pipeline(repo="app", issue="50")
+in_sha = blob_store.put(b'{"retry":"blob"}', "inputs")
+ren_sha = blob_store.put(b"retry rendered", "rendered")
+run_store.insert_steps(
+    rid,
+    "build",
+    [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic", cost_usd=0.1), 1.0)],
+    inputs=[
+        {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+        {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+    ],
+)
+record.settle(rid, "done", summary="done")
+backdate_run(rid, 31)
+
+target_paths = {str(blob_store.blob_path(in_sha)), str(blob_store.blob_path(ren_sha))}
+real_unlink = os.unlink
+
+
+def failing_unlink(path, *args, **kwargs):
+    if str(path) in target_paths:
+        raise OSError("simulated unlink failure")
+    return real_unlink(path, *args, **kwargs)
+
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        with mock.patch("os.unlink", side_effect=failing_unlink):
+            server.prune_data()
+        after_fail = {
+            "in_purged_at": bool(blob_store.meta(in_sha)["purged_at"]),
+            "in_file_exists": blob_store.blob_path(in_sha).is_file(),
+            "ren_file_exists": blob_store.blob_path(ren_sha).is_file(),
+            "error_logged": any("file purge failed" in line for line in said),
+        }
+        server.prune_data()
+        after_retry = {
+            "in_purged_at": bool(blob_store.meta(in_sha)["purged_at"]),
+            "in_file_exists": blob_store.blob_path(in_sha).exists(),
+            "ren_file_exists": blob_store.blob_path(ren_sha).exists(),
+        }
+finally:
+    server.pool.shutdown(wait=True)
+
+print("BEHAVIOR_RESULT=" + json.dumps({"after_fail": after_fail, "after_retry": after_retry}))
+""")
+        self.assertEqual(
+            res["after_fail"],
+            {"in_purged_at": True, "in_file_exists": True, "ren_file_exists": True, "error_logged": True},
+        )
+        self.assertEqual(
+            res["after_retry"],
+            {"in_purged_at": True, "in_file_exists": False, "ren_file_exists": False},
+        )
+
+
+class RunRetentionGateAnd410Tests(_RetentionChildCase):
+    def test_retention_gate_c_a_hand_edit_pre_commit_and_config_routes(self):
+        res = self.run_retention_child(r"""
+import http.client
+import subprocess
+import threading
+import tomllib
+
+from arete import dashboard, drafts, tailnet
+from arete.store import tokens as token_store
+
+owner = principals.owner()
+with foundation.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.insert(c, owner, "owner-cli", ["*"])
+    _, session_token = token_store.insert(
+        c, owner, "owner-session", ["*"], kind="session",
+        expires=token_store.session_lifetime(util.now()),
+    )
+    _, run_token = token_store.insert(
+        c, owner, "run-step", ["read", "config:draft", "config:activate"], run_id="pip-99",
+    )
+cookie = f"{dashboard.credential_http.COOKIE}={session_token}"
+
+configrepo.init()
+run_70 = seed_run("pipeline", "done", 70, repo="app", issue="70", with_feed=True)
+run_10 = seed_run("pipeline", "done", 10, repo="app", issue="10", with_feed=True)
+
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+    def admit(self, method, path):
+        self.server.tls = object()
+        try:
+            return super().admit(method, path)
+        finally:
+            self.server.tls = None
+
+
+address = "127.0.0.1"
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, "of", return_value="owner@example.test"), \
+     mock.patch("socket.getfqdn", return_value=address):
+    http_srv = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    http_srv.daemon_threads = False
+    thread = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    server, said = quiet_server()
+    try:
+        def req(method, path, body=None, *, headers=None, expected=200):
+            conn = http.client.HTTPConnection(address, http_srv.server_port, timeout=10)
+            try:
+                hdrs = {"Content-Type": "application/json", **(headers or {})}
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        auth_owner = {"Authorization": f"Bearer {owner_token}"}
+        auth_sess = {"Cookie": cookie, "X-Arete": "1"}
+        auth_run = {"Authorization": f"Bearer {run_token}"}
+
+        # config.get (config.read) serves retention/defaults even before retention.toml exists.
+        read0 = req("GET", "/api/v1/config/retention/defaults", headers=auth_owner)["item"]
+        base_ver = read0["version"]
+
+        # 1. Lowering [folders] days to 60 gets gate C.
+        lower_res = req(
+            "PUT", "/api/v1/config/retention/defaults/draft",
+            {"body": "[folders]\ndays = 60\n", "why": "lower folders days"},
+            headers={**auth_owner, "Idempotency-Key": "ret-lower-60"},
+            expected=201,
+        )
+        d60 = lower_res["draft"]
+
+        # config.check serves retention.
+        chk60 = req(
+            "POST", "/api/v1/config/retention/defaults/check",
+            {"draft": d60["id"]},
+            headers={**auth_owner, "Idempotency-Key": "ret-chk-60"},
+        )["report"]
+
+        # Lowering [records] max_gb also gets gate C.
+        chk_gb = req(
+            "POST", "/api/v1/config/retention/defaults/check",
+            {"body": "[records]\nmax_gb = 10\n"},
+            headers={**auth_owner, "Idempotency-Key": "ret-chk-gb"},
+        )["report"]
+
+        # config.try on retention gets 422 validation.
+        try_err = req(
+            "POST", "/api/v1/config/retention/defaults/try",
+            {"draft": d60["id"], "steps": ["build"]},
+            headers={**auth_owner, "Idempotency-Key": "ret-try-1"},
+            expected=422,
+        )
+
+        # Pass while lowered draft is NOT active leaves 70-day folder untouched.
+        with principals.acting("hand"):
+            server.prune_data()
+        r70_before_activate = (paths.RUNS_DIR / run_70).is_dir() and run_store.run_get(run_70)["files_purged"] is None
+
+        # A run actor's activate gets 403 gate_refused.
+        run_act_err = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d60["id"], "base_version": base_ver},
+            headers={**auth_run, "Idempotency-Key": "ret-run-act"},
+            expected=403,
+        )
+
+        # Owner's activate requires presence (202), then approving presence activates it.
+        pend = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d60["id"], "base_version": base_ver},
+            headers={**auth_owner, "Idempotency-Key": "ret-owner-act"},
+            expected=202,
+        )
+        pres_item = req("GET", pend["watch"], headers=auth_sess)["item"]
+        req(
+            "POST", f"/api/v1/inbox/{pres_item['id']}/resolve",
+            {"verb": "approve", "base_version": pres_item["version"]},
+            headers={**auth_sess, "Idempotency-Key": "ret-pres-approve"},
+        )
+        d60_after = drafts.get(d60["id"])
+        live_after_60 = tomllib.loads(configrepo.live_bytes("retention.toml").decode("utf-8"))
+
+        # Pass now purges the 70-day folder!
+        with principals.acting("hand"):
+            server.prune_data()
+        r70_after_activate = not (paths.RUNS_DIR / run_70).exists() and bool(run_store.run_get(run_70)["files_purged"])
+
+        # 2. Raising [folders] days to 120 has gate A and activates immediately (200, no presence).
+        ver_60 = req("GET", "/api/v1/config/retention/defaults", headers=auth_owner)["item"]["version"]
+        raise_res = req(
+            "PUT", "/api/v1/config/retention/defaults/draft",
+            {"body": "[folders]\ndays = 120\n", "why": "raise folders days"},
+            headers={**auth_owner, "Idempotency-Key": "ret-raise-120"},
+            expected=201,
+        )
+        d120 = raise_res["draft"]
+        act120 = req(
+            "POST", "/api/v1/config/retention/defaults/activate",
+            {"draft": d120["id"], "base_version": ver_60},
+            headers={**auth_owner, "Idempotency-Key": "ret-act-120"},
+            expected=200,
+        )
+        live_after_120 = tomllib.loads(configrepo.live_bytes("retention.toml").decode("utf-8"))
+
+        # config.retention.changed events were emitted.
+        with foundation.reader() as c:
+            changed_count = c.execute(
+                "SELECT COUNT(*) FROM events_log WHERE kind = 'config.retention.changed'"
+            ).fetchone()[0]
+
+        # 3. Hand edit lowering [records] days waits as a draft; live stays; pass does not prune 10-day run.
+        retention.policy_file().write_text("[records]\ndays = 5\n[folders]\ndays = 120\n", encoding="utf-8")
+        committed_hand = configrepo.commit_hand_edits()
+        hand_drafts = [
+            d for d in drafts.list_drafts(state="valid", kind="retention", author="hand")
+            if d["gate"] == "C"
+        ]
+        with principals.acting("hand"):
+            server.prune_data()
+        r10_kept_after_hand = (paths.RUNS_DIR / run_10 / "record").is_dir() and run_store.run_get(run_10)["records_purged"] is None
+
+        # Pre-commit hook refuses direct git commit without ARETE_ACTIVATE_C=1, allows with ARETE_ACTIVATE_C=1.
+        hook_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_") and k != "ARETE_ACTIVATE_C"}
+        hook_env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "hand",
+            "GIT_AUTHOR_EMAIL": "hand@local",
+            "GIT_COMMITTER_NAME": "hand",
+            "GIT_COMMITTER_EMAIL": "hand@local",
+        })
+        subprocess.run(["git", "add", "--", "retention.toml"], cwd=paths.CONFIG_DIR, env=hook_env, check=True, capture_output=True)
+        refused_commit = subprocess.run(
+            ["git", "-c", f"core.hooksPath={paths.CONFIG_DIR / '.git' / 'hooks'}", "commit", "-m", "lower records days"],
+            cwd=paths.CONFIG_DIR, env=hook_env, capture_output=True, text=True,
+        )
+        allowed_commit = subprocess.run(
+            ["git", "-c", f"core.hooksPath={paths.CONFIG_DIR / '.git' / 'hooks'}", "commit", "-m", "lower records days"],
+            cwd=paths.CONFIG_DIR, env={**hook_env, "ARETE_ACTIVATE_C": "1"}, capture_output=True, text=True,
+        )
+    finally:
+        server.pool.shutdown(wait=True)
+        http_srv.shutdown()
+        thread.join()
+        http_srv.server_close()
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "read0_kind": read0["kind"],
+    "d60_gate": d60["gate"],
+    "chk60_gate": chk60["gate"],
+    "chk_gb_gate": chk_gb["gate"],
+    "try_code": try_err["code"],
+    "r70_before_activate": r70_before_activate,
+    "run_act_code": run_act_err["code"],
+    "pend_state": pend["state"],
+    "d60_active": d60_after["state"] == "active" and bool(d60_after["activated_commit"]),
+    "live_60": live_after_60["folders"]["days"],
+    "r70_after_activate": r70_after_activate,
+    "d120_gate": d120["gate"],
+    "act120_active": act120["draft"]["state"] == "active",
+    "live_120": live_after_120["folders"]["days"],
+    "changed_count": changed_count,
+    "hand_waited": committed_hand == [] and len(hand_drafts) == 1,
+    "r10_kept_after_hand": r10_kept_after_hand,
+    "hook_refused": refused_commit.returncode != 0 and "ARETE_ACTIVATE_C=1" in refused_commit.stderr,
+    "hook_allowed": allowed_commit.returncode == 0,
+}))
+""")
+        self.assertEqual(res["read0_kind"], "retention")
+        self.assertEqual(res["d60_gate"], "C")
+        self.assertEqual(res["chk60_gate"], "C")
+        self.assertEqual(res["chk_gb_gate"], "C")
+        self.assertEqual(res["try_code"], "validation")
+        self.assertTrue(res["r70_before_activate"])
+        self.assertEqual(res["run_act_code"], "gate_refused")
+        self.assertEqual(res["pend_state"], "awaiting_presence")
+        self.assertTrue(res["d60_active"])
+        self.assertEqual(res["live_60"], 60)
+        self.assertTrue(res["r70_after_activate"])
+        self.assertEqual(res["d120_gate"], "A")
+        self.assertTrue(res["act120_active"])
+        self.assertEqual(res["live_120"], 120)
+        self.assertGreaterEqual(res["changed_count"], 2)
+        self.assertTrue(res["hand_waited"])
+        self.assertTrue(res["r10_kept_after_hand"])
+        self.assertTrue(res["hook_refused"])
+        self.assertTrue(res["hook_allowed"])
+
+    def test_410_files_purged_api_and_cli_refusals(self):
+        res = self.run_retention_child(r"""
+import gzip
+import http.client
+import subprocess
+import sys
+import threading
+
+from arete import credential_files, dashboard, drafts, tailnet
+from arete.store import blobs as blob_store
+from arete.store import tokens as token_store
+
+owner = principals.owner()
+with foundation.tx() as c:
+    token_store.ensure_key(c)
+    _, owner_token = token_store.insert(c, owner, "owner-cli", ["*"])
+credential_files.write_client(foundation.schema_metadata()["instance_tag"], owner_token)
+
+configrepo.init()
+
+
+def seed_run_for_410(days: float, issue: str, in_payload: bytes) -> dict:
+    rid = support.start_pipeline(repo="app", issue=issue, adw="default")
+    folder = paths.RUNS_DIR / rid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "run.log").write_text("log\n", encoding="utf-8")
+    in_sha = blob_store.put(in_payload, "inputs")
+    ren_sha = blob_store.put(b"rendered-" + issue.encode("utf-8"), "rendered")
+    run_store.insert_steps(
+        rid,
+        "build",
+        [(agent.Result(ok=True, runner="claude", model="sonnet", provider="anthropic", cost_usd=0.1), 1.0)],
+        inputs=[
+            {"role": "inputs", "name": "build", "sha256": in_sha, "call": 1},
+            {"role": "rendered", "name": "build", "sha256": ren_sha, "call": 1},
+        ],
+    )
+    sid = run_store.last_step_id(rid)
+    rec_dir = folder / "record"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    header = {"arete": "header", "step": "build", "step_id": sid, "runner": "claude",
+              "model": "sonnet", "started": "2026-01-01T00:00:00Z"}
+    clock = {"arete": "clock", "seconds": 0.5}
+    ev = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": rid}],
+          "usage": {"input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 4}}}
+    (rec_dir / "build.jsonl.gz").write_bytes(
+        gzip.compress((json.dumps(header) + "\n").encode("utf-8"), mtime=0)
+        + gzip.compress((json.dumps(clock) + "\n" + json.dumps(ev) + "\n").encode("utf-8"), mtime=0)
+    )
+    run_store.add_feed(rid, "note", "feed line")
+    record.settle(rid, "failed", summary="failed")
+    backdate_run(rid, days)
+    return {"id": rid, "step_id": sid, "inputs_sha": in_sha, "rendered_sha": ren_sha}
+
+
+r31 = seed_run_for_410(31, "31", b'{"run":31}')
+r91 = seed_run_for_410(91, "91", b'{"run":91}')
+record.rebuild_turn_index()
+
+server, said = quiet_server()
+try:
+    with principals.acting("hand"):
+        server.prune_data()
+finally:
+    server.pool.shutdown(wait=True)
+
+r31_row = run_store.run_get(r31["id"])
+r91_row = run_store.run_get(r91["id"])
+r31_blob = blob_store.meta(r31["inputs_sha"])
+runs_before = len(run_store.runs(limit=100))
+
+# Create a valid prompt draft for config.try against r31's build step.
+from arete import prompts
+_, plan_body = prompts.parse((paths.PROMPTS_DIR / "plan.md").read_bytes())
+prompt_draft, _ = drafts.create_and_check("prompt", "plan", plan_body, author=owner)
+
+
+class QuietHandler(dashboard.Handler):
+    def log_request(self, *_):
+        pass
+
+
+address = "127.0.0.1"
+node = tailnet.Node((address,), frozenset({address}), address)
+logins = tailnet.Logins(mock.Mock())
+with mock.patch.object(logins, "of", return_value="owner@example.test"), \
+     mock.patch("socket.getfqdn", return_value=address):
+    http_srv = tailnet.Server(address, 0, node, logins, False, QuietHandler, dashboard.Redirect)
+    http_srv.daemon_threads = False
+    thread = threading.Thread(target=http_srv.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        def req(method, path, body=None, *, headers=None, expected=200):
+            conn = http.client.HTTPConnection(address, http_srv.server_port, timeout=10)
+            try:
+                hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {owner_token}", **(headers or {})}
+                conn.request(method, path, body=None if body is None else json.dumps(body), headers=hdrs)
+                resp = conn.getresponse()
+                raw = resp.read()
+                data = json.loads(raw) if raw else {}
+                assert resp.status == expected, (method, path, resp.status, data)
+                return data
+            finally:
+                conn.close()
+
+        run31_api = req("GET", f"/api/v1/runs/{r31['id']}")["run"]
+        run91_api = req("GET", f"/api/v1/runs/{r91['id']}")["run"]
+
+        t_list = req("GET", f"/api/v1/runs/{r31['id']}/steps/build/1/turns", expected=410)
+        t_get = req("GET", f"/api/v1/runs/{r31['id']}/steps/build/1/turns/1", expected=410)
+        ls_read = req("GET", f"/api/v1/line-stream?run={r91['id']}", expected=410)
+        b_get = req("GET", f"/api/v1/blobs/{r31['inputs_sha']}", expected=410)
+
+        r91_resume = req(
+            "POST", f"/api/v1/runs/{r91['id']}/resume",
+            {"base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-resume"},
+            expected=410,
+        )
+        r91_repair = req(
+            "POST", f"/api/v1/runs/{r91['id']}/repair",
+            {"base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-repair"},
+            expected=410,
+        )
+        r91_step = req(
+            "POST", f"/api/v1/runs/{r91['id']}/step",
+            {"node": "build", "base_version": r91_row["version"]},
+            headers={"Idempotency-Key": "k-r91-step"},
+            expected=410,
+        )
+        r91_pin = req(
+            "POST", f"/api/v1/runs/{r91['id']}/pin",
+            {},
+            headers={"Idempotency-Key": "k-r91-pin"},
+            expected=410,
+        )
+        r31_step = req(
+            "POST", f"/api/v1/runs/{r31['id']}/step",
+            {"node": "build", "base_version": r31_row["version"]},
+            headers={"Idempotency-Key": "k-r31-step"},
+            expected=410,
+        )
+        r31_try = req(
+            "POST", "/api/v1/config/prompt/plan/try",
+            {"draft": prompt_draft["id"], "steps": [{"run": r31["id"], "step": "build"}]},
+            headers={"Idempotency-Key": "k-r31-try"},
+            expected=410,
+        )
+
+        # CLI resume, repair, and step refuse r91 naming the purge date.
+        cli_env = {
+            **os.environ,
+            "ARETE_SERVER": f"http://{address}:{http_srv.server_port}",
+        }
+        cli_out = {}
+        for label, argv in (
+            ("resume", ["resume", r91["id"]]),
+            ("repair", ["repair", r91["id"]]),
+            ("step", ["step", r91["id"], "build"]),
+        ):
+            done = subprocess.run(
+                [sys.executable, "-m", "arete.cli", *argv],
+                cwd=Path.cwd(),
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            cli_out[label] = {"rc": done.returncode, "text": done.stdout + done.stderr}
+    finally:
+        http_srv.shutdown()
+        thread.join()
+        http_srv.server_close()
+
+with foundation.reader() as c:
+    idem_410_stored = c.execute(
+        "SELECT COUNT(*) FROM idempotency WHERE key IN ('k-r91-resume','k-r91-repair','k-r91-step','k-r91-pin','k-r31-step','k-r31-try')"
+    ).fetchone()[0]
+    pins_after = c.execute("SELECT COUNT(*) FROM record_pins WHERE run_id = ?", (r91["id"],)).fetchone()[0]
+runs_after = len(run_store.runs(limit=100))
+
+print("BEHAVIOR_RESULT=" + json.dumps({
+    "run31_fields": [run31_api["records_purged"] == r31_row["records_purged"], run31_api["files_purged"] is None],
+    "run91_fields": [run91_api["files_purged"] == r91_row["files_purged"], run91_api["records_purged"] == r91_row["records_purged"]],
+    "t_list": [t_list["code"], t_list["purged_at"] == r31_row["records_purged"]],
+    "t_get": [t_get["code"], t_get["purged_at"] == r31_row["records_purged"]],
+    "ls_read": [ls_read["code"], ls_read["purged_at"] == r91_row["files_purged"]],
+    "b_get": [b_get["code"], b_get["purged_at"] == r31_blob["purged_at"]],
+    "r91_resume": [r91_resume["code"], r91_resume["purged_at"] == r91_row["files_purged"]],
+    "r91_repair": [r91_repair["code"], r91_repair["purged_at"] == r91_row["files_purged"]],
+    "r91_step": [r91_step["code"], r91_step["purged_at"] == r91_row["files_purged"]],
+    "r91_pin": [r91_pin["code"], r91_pin["purged_at"] == r91_row["files_purged"]],
+    "r31_step": [r31_step["code"], r31_step["purged_at"] == r31_blob["purged_at"]],
+    "r31_try": [r31_try["code"], r31_try["purged_at"] == r31_blob["purged_at"]],
+    "idem_410_stored": idem_410_stored,
+    "started_or_pinned_nothing": runs_after == runs_before and pins_after == 0,
+    "cli_refused_with_date": all(
+        cli_out[k]["rc"] == 1 and r91_row["files_purged"] in cli_out[k]["text"]
+        for k in ("resume", "repair", "step")
+    ),
+}))
+""")
+        self.assertEqual(res["run31_fields"], [True, True])
+        self.assertEqual(res["run91_fields"], [True, True])
+        self.assertEqual(res["t_list"], ["files_purged", True])
+        self.assertEqual(res["t_get"], ["files_purged", True])
+        self.assertEqual(res["ls_read"], ["files_purged", True])
+        self.assertEqual(res["b_get"], ["files_purged", True])
+        self.assertEqual(res["r91_resume"], ["files_purged", True])
+        self.assertEqual(res["r91_repair"], ["files_purged", True])
+        self.assertEqual(res["r91_step"], ["files_purged", True])
+        self.assertEqual(res["r91_pin"], ["files_purged", True])
+        self.assertEqual(res["r31_step"], ["files_purged", True])
+        self.assertEqual(res["r31_try"], ["files_purged", True])
+        self.assertEqual(res["idem_410_stored"], 0)
+        self.assertTrue(res["started_or_pinned_nothing"])
+        self.assertTrue(res["cli_refused_with_date"])
+
+
 class _PinnedRunCase(unittest.TestCase):
     def run_pinned(self, body: str) -> dict:
         with tempfile.TemporaryDirectory(prefix="arete-pinned-") as directory:
@@ -14368,6 +15182,7 @@ class _PinnedRunCase(unittest.TestCase):
                 "    asks as ask_store, blobs as blob_store, chats as chat_store, db, insights as insights_store,\n"
                 "    loops as loop_store, runs as run_store, tasks as task_store, tokens as token_store,\n"
                 ")\n"
+                "from tests import support\n"
                 "root = Path.cwd()\n"
                 "GIT_ENV = {\n"
                 "    **{k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'TMPDIR', 'USER', 'LANG', 'LC_ALL', 'TZ')},\n"
@@ -14714,7 +15529,7 @@ lines = run_lines.read(r1['id'])
 assert lines and all(ln.get('engine') == codebase.STAMP for ln in lines), lines
 
 # Reaper with patched codebase.STAMP = 'reaper' writes error and report lines with engine = 'reaper'
-dead_id = record.start('pipeline', repo='sample', issue=tid, pid=999999999)
+dead_id = support.start_pipeline(repo='sample', issue=tid, pid=999999999)
 with db.tx() as c:
     c.execute("UPDATE runs SET started = '2020-01-01T00:00:00Z' WHERE id = ?", (dead_id,))
 with (mock.patch.object(codebase, 'STAMP', 'reaper'),
@@ -14886,7 +15701,7 @@ r_step = run_store.runs(kind='pipeline', limit=1)[0]
 assert r_step['continues'] == r_resume['id'] and r_step['restart'] == 'step' and r_step['chain'] == r_fresh['id']
 
 # 5. Interrupted restart -> restart='interrupted'
-int_id = record.start('pipeline', repo='sample', issue=tid)
+int_id = support.start_pipeline(repo='sample', issue=tid)
 record.interrupt(run_store.run_get(int_id))
 assert pipeline.run_issue('sample', tid, force=True, script=pipeline.Script('feature', finish_flow('done'))) == 0
 r_int = run_store.newest_whole_run('sample', tid)
@@ -14975,18 +15790,18 @@ configrepo.init()
 
 # 1. Person A -> started_by = payer = A
 with principals.acting('u:person-a'):
-    r_a = run_store.run_get(record.start('pipeline', repo='sample', issue='1'))
+    r_a = run_store.run_get(support.start_pipeline(repo='sample', issue='1'))
 assert r_a['started_by'] == 'u:person-a' and r_a['payer'] == 'u:person-a'
 
 # 2. Poller with automation.payer -> started_by = rule:poll, payer = owner
 with principals.acting('rule:poll'):
-    r_poll = run_store.run_get(record.start('pipeline', repo='sample', issue='2'))
+    r_poll = run_store.run_get(support.start_pipeline(repo='sample', issue='2'))
 assert r_poll['started_by'] == 'rule:poll' and r_poll['payer'] == owner
 
 # 3. Poller without automation.payer -> payer = NULL
 commit_cfg('config.toml', paths.CONFIG_FILE.read_text().replace(f'[automation]\npayer = {json.dumps(owner)}\n', ''), 'drop auto payer')
 with principals.acting('rule:poll'):
-    r_null = run_store.run_get(record.start('pipeline', repo='sample', issue='3'))
+    r_null = run_store.run_get(support.start_pipeline(repo='sample', issue='3'))
 assert r_null['started_by'] == 'rule:poll' and r_null['payer'] is None
 
 # 4. Loop [run] payer = A
@@ -14999,10 +15814,10 @@ assert r_loop['payer'] == 'u:person-a'
 
 # 5. Interrupted restart keeps continued run's payer; resume as person B has payer B
 with principals.acting('rule:poll'):
-    r_int = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='interrupted'))
+    r_int = run_store.run_get(support.start_pipeline(repo='sample', issue='1', continues=r_a['id'], restart='interrupted'))
 assert r_int['payer'] == 'u:person-a'
 with principals.acting('u:person-b'):
-    r_res_b = run_store.run_get(record.start('pipeline', repo='sample', issue='1', continues=r_a['id'], restart='resume'))
+    r_res_b = run_store.run_get(support.start_pipeline(repo='sample', issue='1', continues=r_a['id'], restart='resume'))
 assert r_res_b['started_by'] == 'u:person-b' and r_res_b['payer'] == 'u:person-b'
 
 # 6. routing.select personal vs workspace account enforcement
@@ -15061,10 +15876,10 @@ for py in paths.PACKAGE_DIR.rglob('*.py'):
 assert bad_hits == [], bad_hits
 
 # 2. Insert whole runs A then B with an open ask on A
-id_a = record.start('pipeline', run_id='pip-z-first', repo='sample', issue='42')
+id_a = support.start_pipeline(run_id='pip-z-first', repo='sample', issue='42')
 record.settle(id_a, 'needs-info', summary='waiting')
 ask_store.ask_add('ask-a', id_a, 'sample', '42', 'plan', 'ask', 'why', 'tried', [{'q': 'q'}], {})
-id_b = record.start('pipeline', run_id='pip-a-second', repo='sample', issue='42')
+id_b = support.start_pipeline(run_id='pip-a-second', repo='sample', issue='42')
 record.settle(id_b, 'done', summary='finished')
 
 with db.reader() as c:
@@ -15328,6 +16143,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from tests import support
 
 from arete import (
     accounts,
@@ -15364,6 +16180,7 @@ from arete.store import loops as loop_store
 from arete.store import migrations
 from arete.store import retention as retention_store
 from arete.store import runs as run_store
+from tests import support
 from arete.store import tokens as token_store
 
 
@@ -16519,6 +17336,7 @@ def item_attempts(item_id):
 
 def emit_result(data):
     print("BEHAVIOR_RESULT=" + json.dumps(data))
+from tests import support
 """
 
 
@@ -16839,7 +17657,7 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
         mock.patch.object(outbound, "keep_configured_private"), \
         mock.patch.object(outbound, "own_hosts", []), \
         mock.patch.object(outbound, "extra_hosts", set()):
-    rid = record.start("pipeline", repo="sample", issue="7")
+    rid = support.start_pipeline(repo="sample", issue="7")
     rdir = paths.RUNS_DIR / rid
     rdir.mkdir(parents=True, exist_ok=True)
     run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="7")
@@ -16887,7 +17705,7 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
         mock.patch.object(outbound, "keep_configured_private"), \
         mock.patch.object(outbound, "own_hosts", []), \
         mock.patch.object(outbound, "extra_hosts", set()):
-    rid = record.start("pipeline", repo="sample", issue="9")
+    rid = support.start_pipeline(repo="sample", issue="9")
     rdir = paths.RUNS_DIR / rid
     rdir.mkdir(parents=True, exist_ok=True)
     tk = tracker.GitHubTracker(repo)
@@ -16910,7 +17728,7 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
 
     # Part 2: finished run with unsent label items -> poll.next_ticket skips naming OB-<id>
     fake.seed_issue("acme/sample", 10, title="Waiting ticket", labels=("agent",))
-    rid2 = record.start("pipeline", repo="sample", issue="10")
+    rid2 = support.start_pipeline(repo="sample", issue="10")
     rdir2 = paths.RUNS_DIR / rid2
     rdir2.mkdir(parents=True, exist_ok=True)
     run2 = pipeline.Run(rid2, repo, rdir2, cfg=cfg, tracker=tk, tid="10")
@@ -16961,7 +17779,7 @@ with mock.patch.object(gh, "gh", side_effect=fake), \
         mock.patch.object(outbound, "keep_configured_private"), \
         mock.patch.object(outbound, "own_hosts", []), \
         mock.patch.object(outbound, "extra_hosts", set()):
-    rid = record.start("pipeline", repo="sample", issue="15")
+    rid = support.start_pipeline(repo="sample", issue="15")
     rdir = paths.RUNS_DIR / rid
     rdir.mkdir(parents=True, exist_ok=True)
     run = pipeline.Run(rid, repo, rdir, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="15")
@@ -17641,6 +18459,7 @@ _LIFECYCLE_PREAMBLE = r"""
 import contextlib, errno, fcntl, gzip, http.client, json, os, signal, sqlite3, subprocess, sys, threading, time
 from pathlib import Path
 from unittest import mock
+from tests import support
 
 from arete import (
     accounts, agent, api_check, board, chat, cli, client, codebase, config, control,
@@ -17792,7 +18611,7 @@ write_answer("build", {"ok": True, "text": "built", "stream": stream})
 # 1. Queue to end with runner.pick held on a flag: board.run_board and GET /api/v1/runs/{id}
 # show 'queued' with queued_at set and no account; once released, 'done', turns == len(stream), version grows.
 with principals.acting(owner):
-    rid = record.start("pipeline", repo=repo.name, issue="1")
+    rid = support.start_pipeline(repo=repo.name, issue="1")
 
 entered = threading.Event()
 release = threading.Event()
@@ -17829,7 +18648,7 @@ done_plan = done_rows[0]
 
 # 2. Replay shortcut (skips pick) transitions queued -> running -> done.
 with principals.acting(owner):
-    rid2 = record.start("pipeline", repo=repo.name, issue="2")
+    rid2 = support.start_pipeline(repo=repo.name, issue="2")
 seen_statuses = []
 orig_start = run_store.start_step
 def spy_start(step_id, **kw):
@@ -17846,7 +18665,7 @@ shortcut_row = run_store.steps(rid2)[0]
 
 # 3. Call returning through unresumable leaves 'fault', never 'queued'.
 with principals.acting(owner):
-    rid3 = record.start("pipeline", repo=repo.name, issue="3")
+    rid3 = support.start_pipeline(repo=repo.name, issue="3")
 r_unres = runner.run(
     "resume it", repo.path, trace=(rid3, "plan"),
     resume=agent.Session("dead-sess", 0.0, "claude"),
@@ -17905,7 +18724,7 @@ ws_id = seed_account("acct-workspace", fingerprint=ws_fp, owner=owner, scope="wo
 
 # 1. Replay route matching owner's personal account on second person's run -> fault, account_id NULL, no record file / turns.
 with principals.acting(second):
-    rid_other = record.start("pipeline", repo=repo.name, issue="11", payer=second)
+    rid_other = support.start_pipeline(repo=repo.name, issue="11", payer=second)
 
 cfg_no_shortcut = config.Config(repos=cfg.repos, pricing=cfg.pricing, replay=config.ReplayConfig(all=False, dir=REPLAY_DIR))
 bad_picked = make_picked(personal_auth, billing="plan")
@@ -17938,7 +18757,7 @@ workspace_ok = sql_exec(
 )
 # Run with NULL payer on personal account raises.
 with foundation.tx() as c:
-    c.execute("INSERT INTO runs (id, kind, status, started, payer) VALUES ('null-payer-run', 'pipeline', 'running', ?, NULL)", (util.iso(),))
+    c.execute("INSERT INTO runs (id, kind, task_id, status, started, payer) VALUES ('null-payer-run', 'pipeline', 1, 'running', ?, NULL)", (util.iso(),))
 null_payer = sql_exec(
     "INSERT INTO steps (run_id, step, node, try, status, account_id, ts) VALUES ('null-payer-run', 'np', 'np', 1, 'running', ?, ?)",
     (personal_id, util.iso()),
@@ -18086,14 +18905,14 @@ with mock.patch.object(run_store, "billing_of", lambda step, local: "api_key" if
 write_answer("plan", {"ok": True, "text": "p1", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.005}]})
 write_answer("plan-2", {"ok": True, "text": "p2", "stream": [{"tokens_in": 10, "tokens_out": 5, "cost_usd": 0.007}]})
 with principals.acting(owner):
-    r1 = record.start("pipeline", repo=repo.name, issue="50")
+    r1 = support.start_pipeline(repo=repo.name, issue="50")
 runner.run("p1", repo.path, trace=(r1, "plan"), cfg=cfg, repo=repo)
 run_lines.write(r1, "step_start", step="plan", **{"try": 1})
 run_lines.write(r1, "step_end", step="plan", **{"try": 1}, result="fail", ok=False, cost_usd=0.005, seconds=1.0)
 record.settle(r1, "interrupted")
 
 with principals.acting(owner):
-    r2 = record.start("pipeline", repo=repo.name, issue="50", continues=r1, restart="resume")
+    r2 = support.start_pipeline(repo=repo.name, issue="50", continues=r1, restart="resume")
 run_lines.write(r2, "route", continues=r1)
 runner.run("p2", repo.path, trace=(r2, "plan"), cfg=cfg, repo=repo)
 r2_steps = run_store.steps(r2)
@@ -18160,14 +18979,14 @@ write_answer("hold", {"ok": True, "text": "held", "seconds": 15, "stream": strea
 
 # 1. Pick hold released -> steps.turns == COUNT(*) turn_index.
 with principals.acting(owner):
-    rid = record.start("pipeline", repo=repo.name, issue="10")
+    rid = support.start_pipeline(repo=repo.name, issue="10")
 r = runner.run("plan", repo.path, trace=(rid, "plan"), cfg=cfg, repo=repo)
 step = run_store.steps(rid)[0]
 turns = run_store.step_turns(step["id"])
 
 # 2. SIGKILL during seconds hold then reap(SETTLE_GRACE_SECONDS=0) -> cost_usd == SUM(cost_nusd)/1e9 & runs.cost_usd == SUM(steps.cost_usd).
 with principals.acting(owner):
-    rid_k = record.start("pipeline", repo=repo.name, issue="11")
+    rid_k = support.start_pipeline(repo=repo.name, issue="11")
 code_k = f'''
 import os
 from arete import config, record, replay, runner
@@ -18284,7 +19103,7 @@ def run_fake_step(which, rver, raw_lines_list):
     from arete import claude, codex, devices, pi
 
     with principals.acting(owner):
-        rid = record.start("pipeline", repo=repo.name, issue="20")
+        rid = support.start_pipeline(repo=repo.name, issue="20")
     sid = run_store.queue_step(rid, "plan", 1)
     run_store.start_step(sid, account_id=None, device="local", runner=which, runner_version=rver, model="m", provider="p", auth_mode="api_key")
 
@@ -18370,7 +19189,7 @@ for runner_name, lines_list in valid_sets.items():
 
 # 4. Framing: torn member planted after first mark at EVERY cut point -> record.lines, live AppendedLines, read_run yield later mark with skipped == cut.
 with principals.acting(owner):
-    rid_f = record.start("pipeline", repo=repo.name, issue="30")
+    rid_f = support.start_pipeline(repo=repo.name, issue="30")
 tl = paths.record_dir(rid_f) / record.TIMELINE
 m1 = gzip.compress(json.dumps({"v": 1, "kind": "step", "at": 1, "step": "a"}).encode() + b"\n")
 m_bad = gzip.compress(json.dumps({"v": 1, "kind": "torn", "at": 2, "step": "bad"}).encode() + b"\n")
@@ -18527,7 +19346,7 @@ with api_server() as (port, _, req):
     # 5. Answering ask continuing a run via inbox.resolve AND alias POST /api/asks/{id}/answer -> queued run.
     tid_ask1 = task_store.task_add(repo.name, "Ask 1", "Ask 1", "feat")
     with principals.acting(owner):
-        r_ask1 = record.start("pipeline", repo=repo.name, issue=tid_ask1)
+        r_ask1 = support.start_pipeline(repo=repo.name, issue=tid_ask1)
         record.move(r_ask1, "needs-info", ("running",))
     ask_store.ask_add("ask-v1", r_ask1, repo.name, tid_ask1, "plan", "why", "", "",
                       [{"header": "Q", "question": "Pick", "kind": "text"}], {})
@@ -18548,7 +19367,7 @@ with api_server() as (port, _, req):
 
     tid_ask2 = task_store.task_add(repo.name, "Ask 2", "Ask 2", "feat")
     with principals.acting(owner):
-        r_ask2 = record.start("pipeline", repo=repo.name, issue=tid_ask2)
+        r_ask2 = support.start_pipeline(repo=repo.name, issue=tid_ask2)
         record.move(r_ask2, "needs-info", ("running",))
     ask_store.ask_add("ask-alias", r_ask2, repo.name, tid_ask2, "plan", "why", "", "",
                       [{"header": "Q", "question": "Pick", "kind": "text"}], {})
@@ -18765,6 +19584,7 @@ from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from tests import support
 
 from arete import (
     adf, api, board, config, contract, control, dashboard, delivery, emits, factory, flows, gh,
@@ -19141,7 +19961,7 @@ with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
         assert detail["item"]["sent_ref"] == fake.comments[key][0]["id"]
 
     # 2. Transition applied then POST answers 502 -> ends sent with outcome found, 1 transition POST, no tracker: line in run.log.
-    rid = record.start("pipeline", repo=repo.name, issue="APP-12")
+    rid = support.start_pipeline(repo=repo.name, issue="APP-12")
     rdir = paths.RUNS_DIR / rid
     rdir.mkdir(parents=True, exist_ok=True)
     run_obj = pipeline.Run(rid, repo, rdir, tracker=tk, tid="APP-12")
@@ -19163,15 +19983,15 @@ with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
     # older row carried by newer merged row drafts none.
     pr1 = "https://github.com/acme/sample/pull/1"
     pr2 = "https://github.com/acme/sample/pull/2"
-    r_old = record.start("pipeline", repo=repo.name, issue="APP-12")
+    r_old = support.start_pipeline(repo=repo.name, issue="APP-12")
     record.note(r_old, pr_url=pr1)
     with db.tx() as c:
         run_store.settle(r_old, {"status": "merged", "finished": "2026-11-28T01:00:00Z"})
-    r_a = record.start("pipeline", repo=repo.name, issue="APP-12")
+    r_a = support.start_pipeline(repo=repo.name, issue="APP-12")
     record.note(r_a, pr_url=f"{pr1} {pr2}")
     with db.tx() as c:
         run_store.settle(r_a, {"status": "merged", "finished": "2026-11-28T02:00:00Z"})
-    r_b = record.start("pipeline", repo=repo.name, issue="APP-12")
+    r_b = support.start_pipeline(repo=repo.name, issue="APP-12")
     record.note(r_b, pr_url=f"{pr2} {pr1}")
     with db.tx() as c:
         run_store.settle(r_b, {"status": "merged", "finished": "2026-11-28T03:00:00Z"})
@@ -19186,7 +20006,7 @@ with mock.patch.object(jira, "_opener", fake), mock.patch("time.sleep"):
 
     # 4. Jira label edit answered 502 twice delivers on later pass; state label matches runs.status;
     # newer state label item discards older unsent one.
-    r_lbl = record.start("pipeline", repo=repo.name, issue="APP-13")
+    r_lbl = support.start_pipeline(repo=repo.name, issue="APP-13")
     record.move(r_lbl, "pr", ("running",))
     tk.label("APP-13", add=["running"], remove=["pr"], family="state", run_id=r_lbl)
     tk.label("APP-13", add=["pr"], remove=["running"], family="state", run_id=r_lbl)
@@ -19536,7 +20356,7 @@ fake_gh = FakeGhPrs()
 with mock.patch.object(gh, "gh", side_effect=fake_gh.handle):
     urls_by_case = {}
     for case in ("stopped", "failed_publish", "automerge_crash", "sigkilled"):
-        rid = record.start("pipeline", repo=replay.SAMPLE_REPO, issue=case)
+        rid = support.start_pipeline(repo=replay.SAMPLE_REPO, issue=case)
         rdir = paths.RUNS_DIR / rid
         rdir.mkdir(parents=True, exist_ok=True)
         res = outbox.publish_pr(
@@ -19575,7 +20395,7 @@ with mock.patch.object(gh, "gh", side_effect=fake_gh.handle):
         assert pr_url in report["prs"], (case, report)
 
     # Restart taking stored pr outcome copies the chain's sent PR onto its own row.
-    r_child = record.start("pipeline", repo=replay.SAMPLE_REPO, issue="stored-pr")
+    r_child = support.start_pipeline(repo=replay.SAMPLE_REPO, issue="stored-pr")
     rdir_c = paths.RUNS_DIR / r_child
     rdir_c.mkdir(parents=True, exist_ok=True)
     run_c = pipeline.Run(r_child, cfg.repo(replay.SAMPLE_REPO), rdir_c, tracker=tracker.LocalTracker(cfg.repo(replay.SAMPLE_REPO)), tid="stored-pr")
@@ -19620,8 +20440,8 @@ assert approvals_store.approval(aid)["status"] == "rejected"
 # 4. Schema ledger gate blocks contract migration (m0051) while a live process has schema_version < 51.
 with db.tx() as c:
     c.execute(
-        "INSERT OR REPLACE INTO runs (id, kind, repo, status, started, pid, schema_version) "
-        "VALUES ('live-old', 'pipeline', 'sample', 'running', '2026-11-28T00:00:00Z', ?, 48)",
+        "INSERT OR REPLACE INTO runs (id, kind, repo, task_id, status, started, pid, schema_version) "
+        "VALUES ('live-old', 'pipeline', 'sample', 1, 'running', '2026-11-28T00:00:00Z', ?, 48)",
         (os.getpid(),),
     )
     blockers = db.contract_blockers(c, db.OUTBOX_CONTRACT_SCHEMA)
@@ -19664,6 +20484,7 @@ class _ConfigDraftsCase(unittest.TestCase):
                 tasks as task_store,
                 tokens as token_store,
             )
+            from tests import support
         """)
         run_isolated_behavior_child(self, root, env, preamble + "\n" + textwrap.dedent(body))
 
@@ -19802,7 +20623,7 @@ class ConfigDraftsMigrationAndPinsTests(_ConfigDraftsCase):
             configrepo.init()
 
             # Seed a recorded run to cite from miner.run(hours=2, dry_run=False, apply=False).
-            cited_run = record.start("pipeline", repo="app", issue="10")
+            cited_run = support.start_pipeline(repo="app", issue="10")
             record.settle(cited_run, "done", summary="ok")
             (paths.RUNS_DIR / cited_run / "record").mkdir(parents=True, exist_ok=True)
             (paths.RUNS_DIR / cited_run / "record" / "transcript.jsonl").write_text('{"x":1}\n', encoding="utf-8")
@@ -19889,7 +20710,7 @@ class ConfigDraftsMigrationAndPinsTests(_ConfigDraftsCase):
             assert run_store.run_get(cited_run)["records_purged"] is not None
 
             # Raw SQL state='merge' on a draft citing a 40-day-old run does NOT pin it past prune!
-            raw_run = record.start("pipeline", repo="app", issue="11")
+            raw_run = support.start_pipeline(repo="app", issue="11")
             record.settle(raw_run, "done", summary="ok")
             raw_rec_dir = paths.RUNS_DIR / raw_run / "record"
             raw_rec_dir.mkdir(parents=True, exist_ok=True)
@@ -20139,7 +20960,7 @@ class ConfigDraftsCheckGateActivationTests(_ConfigDraftsCase):
 
                     # Next replay run's resolved.json has 41, level config, from config.toml@commit41.
                     pin41 = pins.resolve("pipeline", repo=replay.SAMPLE_REPO)
-                    r41 = record.start("pipeline", repo=replay.SAMPLE_REPO, resolution=pin41)
+                    r41 = support.start_pipeline(repo=replay.SAMPLE_REPO, resolution=pin41)
                     resolved41 = json.loads((paths.RUNS_DIR / r41 / "resolved.json").read_text(encoding="utf-8"))
                     b41 = resolved41["settings"]["build"]["timeout_minutes"]
                     assert b41["value"] == 41 and b41["level"] == "config", b41
@@ -20180,7 +21001,7 @@ class ConfigDraftsCheckGateActivationTests(_ConfigDraftsCase):
                     assert max(r["ver"] for r in idx_rows_after) == rb_res["version"]
 
                     pin_rb = pins.resolve("pipeline", repo=replay.SAMPLE_REPO)
-                    r_rb = record.start("pipeline", repo=replay.SAMPLE_REPO, resolution=pin_rb)
+                    r_rb = support.start_pipeline(repo=replay.SAMPLE_REPO, resolution=pin_rb)
                     resolved_rb = json.loads((paths.RUNS_DIR / r_rb / "resolved.json").read_text(encoding="utf-8"))
                     assert resolved_rb["settings"]["build"]["timeout_minutes"]["value"] == 25
                 finally:
@@ -20339,7 +21160,7 @@ class OptimizeDraftWatchAndTryTests(_ConfigDraftsCase):
             new_item = config_store.live_item("step_settings", "defaults")
 
             def seed_settled(status: str, ver_row: dict, idx: int) -> str:
-                rid = record.start("pipeline", repo="sample", issue=f"w-{idx}")
+                rid = support.start_pipeline(repo="sample", issue=f"w-{idx}")
                 run_store.insert_steps(
                     rid,
                     "build",
@@ -21012,3 +21833,758 @@ result = {'ok': True}
 """)
         self.assertTrue(result["ok"])
 
+
+class _TaskIdentityChildCase(unittest.TestCase):
+    class_timeout = 30
+
+    def run_identity_child(self, script: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="arete-task-id-") as tmp:
+            root = Path(tmp).resolve()
+            env = api_check.isolated_env(root)
+            env["ARETE_TEST_FAST_SYNC"] = "1"
+            env["ARETE_DRIVE_FLUSH"] = "0"
+            preamble = (
+                "import http.client, json, os, shutil, socket, sqlite3, subprocess, sys, threading, time\n"
+                "from contextlib import contextmanager, redirect_stdout\n"
+                "from http.server import ThreadingHTTPServer\n"
+                "from io import StringIO\n"
+                "from pathlib import Path\n"
+                "from types import SimpleNamespace\n"
+                "from unittest import mock\n"
+                "from arete import (\n"
+                "    api, api_check, cli, client, config, control, credential_files, dashboard, factory, gh, jira,\n"
+                "    oncall, paths, pipeline, principals, record, replay, research, slots, tailnet, tasks,\n"
+                "    tracker, triage, util,\n"
+                ")\n"
+                "from arete.store import (\n"
+                "    approvals as approvals_store, asks as ask_store, db, incidents as incident_store,\n"
+                "    insights as insights_store, runs as run_store, sources as source_store,\n"
+                "    tasks as task_store, tokens as token_store, triage as triage_store,\n"
+                "    workspaces as workspace_store,\n"
+                ")\n"
+                "from tests import support\n"
+                "ROOT = Path.cwd()\n"
+                "def emit(val):\n"
+                "    print('IDENTITY_RESULT=' + json.dumps(val), flush=True)\n"
+                "@contextmanager\n"
+                "def live_dashboard(login='owner@example.test'):\n"
+                "    logins = tailnet.Logins(mock.Mock())\n"
+                "    logins.of = lambda _: login\n"
+                "    with mock.patch('socket.getfqdn', return_value='127.0.0.1'):\n"
+                "        srv = ThreadingHTTPServer(('127.0.0.1', 0), dashboard.Handler)\n"
+                "    srv.node = SimpleNamespace(names={'127.0.0.1'})\n"
+                "    srv.logins = logins\n"
+                "    srv.tls = object()\n"
+                "    srv.pending_secrets = {}\n"
+                "    t = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)\n"
+                "    t.start()\n"
+                "    try:\n"
+                "        yield srv, srv.server_address[1]\n"
+                "    finally:\n"
+                "        srv.shutdown()\n"
+                "        srv.server_close()\n"
+                "        t.join(timeout=2)\n"
+                "def http_json(port, method, path, *, token, body=None, key=None):\n"
+                "    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)\n"
+                "    headers = {'Authorization': 'Bearer ' + token}\n"
+                "    payload = None\n"
+                "    if body is not None:\n"
+                "        headers['Content-Type'] = 'application/json'\n"
+                "        payload = json.dumps(body).encode()\n"
+                "    if key:\n"
+                "        headers['Idempotency-Key'] = key if len(key) >= 8 else f'idem-key-{key}'\n"
+                "    try:\n"
+                "        conn.request(method, path, body=payload, headers=headers)\n"
+                "        resp = conn.getresponse()\n"
+                "        raw = resp.read().decode()\n"
+                "        return resp.status, (json.loads(raw) if raw.strip() else None)\n"
+                "    finally:\n"
+                "        conn.close()\n"
+            )
+            cmd = api_check.child_command(Path(__file__).resolve().parents[1], preamble + "\n" + script)
+            done = subprocess.run(
+                cmd, cwd=root, env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT, check=False,
+            )
+            if done.returncode != 0:
+                self.fail(f"identity child failed ({done.returncode}):\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+            for line in reversed(done.stdout.splitlines()):
+                if line.startswith("IDENTITY_RESULT="):
+                    return json.loads(line.removeprefix("IDENTITY_RESULT="))
+            self.fail(f"missing IDENTITY_RESULT= line:\nSTDOUT:\n{done.stdout}\nSTDERR:\n{done.stderr}")
+
+
+class TaskRefTests(_TaskIdentityChildCase):
+    def test_local_task_cli_api_replay_github_dedupe_and_trigger(self):
+        res = self.run_identity_child(r"""
+paths.ensure_dirs()
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+_, bearer = token_store.issue(owner, "cli", ["*"])
+sample_dir = ROOT / "sample"
+replay.sample(sample_dir, adw=True)
+repo_dir = sample_dir / "repo"
+layer_dir = paths.CONFIG_DIR / "layers" / "replay-sample"
+shutil.copytree(sample_dir / "layer", layer_dir)
+gh_dir = ROOT / "repos" / "gh-repo"
+support.init_workspace_repo(gh_dir)
+paths.CONFIG_FILE.write_text(
+    'max_parallel = 2\n'
+    '[replay]\nall = true\n'
+    f'dir = {json.dumps(str(sample_dir / "replay"))}\n'
+    '[[repo]]\nname = "replay-sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    f'layer = {json.dumps(str(layer_dir))}\n'
+    'tracker = "local"\njev = false\n'
+    '[[repo]]\nname = "gh-repo"\n'
+    f'path = {json.dumps(str(gh_dir))}\n'
+    'github = "o/r"\ntracker = "github"\njev = false\n',
+    encoding="utf-8",
+)
+with live_dashboard() as (_, port):
+    instance = db.schema_metadata()["instance_id"]
+    where = client.Server("https", "127.0.0.1", port, "127.0.0.1", instance)
+    credential_files.write_client(where.tag, bearer)
+    def _connect(w, seconds=5):
+        c_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=seconds)
+        c_conn.connect()
+        return c_conn
+    buf = StringIO()
+    with mock.patch.object(client, "discover", return_value=where), \
+            mock.patch.object(client, "connect", side_effect=_connect), \
+            redirect_stdout(buf):
+        code = cli.main(["task", "add", "--repo", "replay-sample", "Add kumquat"])
+    assert code == 0, buf.getvalue()
+    printed_id = buf.getvalue().strip().splitlines()[-1].strip()
+    assert printed_id == "T-1", printed_id
+
+    st, got = http_json(port, "GET", "/api/v1/tasks/T-1", token=bearer)
+    assert st == 200, (st, got)
+    task = got["task"]
+    assert task["id"] == "T-1"
+    assert task["owner"] == owner
+    assert task["origin"] == owner and owner.startswith("u:")
+    assert task["state"] == "ready"
+    assert task["refs"] == []
+    assert task["primary_ref"] is None
+    assert run_store.runs() == []
+
+# Replay run of T-1 through factory.main records task_id=1 and issue_key='T-1'.
+with principals.acting(owner):
+    try:
+        factory.main(["replay-sample", "T-1", "--force"])
+    except SystemExit as e:
+        assert e.code == 0, e.code
+runs_t1 = run_store.ticket_runs(1)
+assert len(runs_t1) == 1, runs_t1
+assert runs_t1[0]["task_id"] == 1 and runs_t1[0]["issue_key"] == "T-1", runs_t1[0]
+
+# GitHub issue 7 on repo with github='o/r' creates ref github:o/r#7, task with origin ref:github:o/r#7,
+# and primary link; second start makes no second ref or task.
+cfg = config.load()
+gh_repo = cfg.repo("gh-repo")
+with db.tx() as c:
+    tnum1, ikey1 = task_store.TaskStore.task_for_ticket(c, gh_repo, "7", owner, cfg=cfg, title="Fix #7")
+    tnum2, ikey2 = task_store.TaskStore.task_for_ticket(c, gh_repo, 7, owner, cfg=cfg, title="Fix #7")
+assert tnum1 == tnum2 and ikey1 == ikey2 == "7"
+gh_task = task_store.task_get(tnum1)
+assert gh_task["origin"] == "ref:github:o/r#7", gh_task
+assert gh_task["primary_ref"]["system"] == "github" and gh_task["primary_ref"]["key"] == "o/r#7"
+with db.reader() as c:
+    ref_count = c.execute("SELECT count(*) FROM refs WHERE system = 'github' AND key = 'o/r#7'").fetchone()[0]
+    task_count = c.execute("SELECT count(*) FROM tasks WHERE origin = 'ref:github:o/r#7'").fetchone()[0]
+assert ref_count == 1 and task_count == 1
+
+# Post-contract: direct record.start("pipeline", ...) without task_id raises IntegrityError immediately.
+t0 = time.monotonic()
+raised = False
+try:
+    record.start("pipeline", repo="replay-sample", issue="7")
+except sqlite3.IntegrityError as err:
+    assert "task_id" in str(err), str(err)
+    raised = True
+assert raised and (time.monotonic() - t0) < 2.0
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_refs_linking_primary_conflict_links_comments_restore_and_allowlist(self):
+        res = self.run_identity_child(r"""
+paths.ensure_dirs()
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+_, bearer = token_store.issue(owner, "cli", ["*"])
+sample_path = ROOT / "repos" / "sample"
+sample_path.mkdir(parents=True, exist_ok=True)
+paths.CONFIG_FILE.write_text(
+    f'[[repo]]\nname = "sample"\npath = {json.dumps(str(sample_path))}\ntracker = "local"\n',
+    encoding="utf-8",
+)
+with principals.acting(owner):
+    t1 = task_store.task_add("sample", "Task one body", "Task one")
+    t2 = task_store.task_add("sample", "Task two body", "Task two")
+assert (t1, t2) == ("T-1", "T-2")
+
+with live_dashboard() as (_, port):
+    st, meta = http_json(port, "GET", "/api/v1/meta", token=bearer)
+    assert st == 200 and meta["features"]["refs"] is True, meta["features"]
+
+    # Link slack ref to T-1 and T-2 with separate interpretations and anchors.
+    st1, r1 = http_json(port, "POST", "/api/v1/tasks/T-1/refs", token=bearer, key="link-1", body={
+        "system": "slack", "kind": "thread", "key": "C1/1700000000.000100",
+        "role": "related", "interpretation": "Add kumquat endpoint", "anchor": [{"ts": "1700000000.000100"}],
+    })
+    assert st1 in (200, 201), (st1, r1)
+    assert r1["ref"]["id"] == "R-1"
+    st2, r2 = http_json(port, "POST", "/api/v1/tasks/T-2/refs", token=bearer, key="link-2", body={
+        "system": "slack", "kind": "thread", "key": "C1/1700000000.000100",
+        "role": "related", "interpretation": "Update kumquat docs", "anchor": [{"ts": "1700000000.000200"}],
+    })
+    assert st2 in (200, 201), (st2, r2)
+    assert r2["ref"]["id"] == "R-1"
+
+    st_ref, ref_detail = http_json(port, "GET", "/api/v1/refs/R-1", token=bearer)
+    assert st_ref == 200 and {row["task"] for row in ref_detail["tasks"]} == {"T-1", "T-2"}, ref_detail
+    st_list, ref_list = http_json(port, "GET", "/api/v1/refs", token=bearer)
+    assert st_list == 200 and len(ref_list["refs"]) == 1
+    st_hist, ref_hist = http_json(port, "GET", "/api/v1/refs/R-1/history", token=bearer)
+    assert st_hist == 200 and len(ref_hist["events"]) >= 1
+
+    st_t1_refs, t1_refs = http_json(port, "GET", "/api/v1/tasks/T-1/refs", token=bearer)
+    st_t2_refs, t2_refs = http_json(port, "GET", "/api/v1/tasks/T-2/refs", token=bearer)
+    assert st_t1_refs == st_t2_refs == 200
+    assert t1_refs["refs"][0]["interpretation"] == "Add kumquat endpoint"
+    assert t2_refs["refs"][0]["interpretation"] == "Update kumquat docs"
+
+    # Promote R-1 to primary on T-1 -> succeeds; same on T-2 -> 409 invalid_state naming T-1's reading.
+    st_p1, p1 = http_json(port, "PATCH", "/api/v1/tasks/T-1/refs/R-1", token=bearer, key="p1", body={
+        "base_version": t1_refs["refs"][0]["version"], "role": "primary",
+    })
+    assert st_p1 == 200 and p1["task_ref"]["role"] == "primary", (st_p1, p1)
+    st_p2, p2 = http_json(port, "PATCH", "/api/v1/tasks/T-2/refs/R-1", token=bearer, key="p2", body={
+        "base_version": t2_refs["refs"][0]["version"], "role": "primary",
+    })
+    assert st_p2 == 409 and p2["code"] == "invalid_state", (st_p2, p2)
+    assert p2["current"]["task"] == "T-1" and p2["current"]["interpretation"] == "Add kumquat endpoint", p2
+
+    # Linking a second ref as primary on T-1 demotes R-1 to related.
+    st_r2_link, r2_link = http_json(port, "POST", "/api/v1/tasks/T-1/refs", token=bearer, key="link-3", body={
+        "system": "github", "kind": "issue", "key": "o/r#99", "role": "primary",
+    })
+    assert st_r2_link in (200, 201) and r2_link["task_ref"]["role"] == "primary", (st_r2_link, r2_link)
+    _, after_refs = http_json(port, "GET", "/api/v1/tasks/T-1/refs", token=bearer)
+    roles = {row["ref"]: row["role"] for row in after_refs["refs"]}
+    assert roles == {"R-1": "related", "R-2": "primary"}, roles
+
+    # Unlink R-1 from T-2.
+    st_del, _ = http_json(port, "DELETE", "/api/v1/tasks/T-2/refs/R-1", token=bearer, key="del-1")
+    assert st_del == 200
+
+    # Task links create / list / delete.
+    st_lc, lc = http_json(port, "POST", "/api/v1/tasks/T-1/links", token=bearer, key="tl-1", body={
+        "kind": "waits_on", "other_task": "T-2", "origin": "person",
+    })
+    assert st_lc in (200, 201) and lc["link"]["other_task"] == "T-2", (st_lc, lc)
+    lid = lc["link"]["id"]
+    st_ll, ll = http_json(port, "GET", "/api/v1/tasks/T-1/links", token=bearer)
+    assert st_ll == 200 and [row["id"] for row in ll["links"]] == [lid]
+    st_ld, _ = http_json(port, "DELETE", f"/api/v1/tasks/T-1/links/{lid}", token=bearer, key="tl-del")
+    assert st_ld == 200
+
+    # Comment create + update with optimistic version check.
+    st_cm, cm = http_json(port, "POST", "/api/v1/tasks/T-1/comments", token=bearer, key="cm-1", body={"body": "first"})
+    assert st_cm in (200, 201), (st_cm, cm)
+    _, cm_hist = http_json(port, "GET", "/api/v1/tasks/T-1/history", token=bearer)
+    cm_row = cm_hist["comments"][-1]
+    cid = cm_row["id"]
+    st_cu, cu = http_json(port, "PATCH", f"/api/v1/tasks/T-1/comments/{cid}", token=bearer, key="cm-2", body={
+        "base_version": cm_row["version"], "body": "edited",
+    })
+    assert st_cu == 200 and cu["comment"]["body"] == "edited" and cu["comment"]["version"] == 2, (st_cu, cu)
+
+    # Task close + restore.
+    st_cl, cl = http_json(port, "POST", "/api/v1/tasks/T-2/close", token=bearer, key="cl-1", body={})
+    assert st_cl == 200 and cl["task"]["state"] == "closed", (st_cl, cl)
+    st_rs, rs = http_json(port, "POST", "/api/v1/tasks/T-2/restore", token=bearer, key="rs-1",
+                          body={"base_version": cl["task"]["version"]})
+    assert st_rs == 200 and rs["task"]["state"] == "ready", (st_rs, rs)
+
+    # Round-trip EVERY added writable Task field through create -> update -> get.
+    st_cr, cr = http_json(port, "POST", "/api/v1/tasks", token=bearer, key="wr-1", body={
+        "repo": "sample", "title": "Full fields", "body": "body", "kind": "feat",
+        "project": "alpha", "line": "core", "priority": 2, "rank": 1.5,
+        "owner": owner, "delegate": "agent:build", "estimate": "2d", "answer": "yes",
+    })
+    assert st_cr == 200, (st_cr, cr)
+    tid = cr["task"]["id"]
+    for k, v in (("project", "alpha"), ("line", "core"), ("priority", 2), ("rank", 1.5),
+                 ("owner", owner), ("delegate", "agent:build"), ("estimate", "2d"), ("answer", "yes")):
+        assert cr["task"][k] == v, (k, cr["task"][k], v)
+    ver1 = cr["task"]["version"]
+    st_up, up = http_json(port, "PATCH", f"/api/v1/tasks/{tid}", token=bearer, key="wr-2", body={
+        "base_version": ver1, "project": "beta", "line": "edge", "priority": 1, "rank": 0.25,
+        "owner": owner, "delegate": "agent:review", "estimate": "4h", "answer": "updated",
+    })
+    assert st_up == 200 and up["task"]["version"] == ver1 + 1, (st_up, up)
+    _, fetched = http_json(port, "GET", f"/api/v1/tasks/{tid}", token=bearer)
+    for k, v in (("project", "beta"), ("line", "edge"), ("priority", 1), ("rank", 0.25),
+                 ("owner", owner), ("delegate", "agent:review"), ("estimate", "4h"), ("answer", "updated")):
+        assert fetched["task"][k] == v, (k, fetched["task"][k], v)
+
+    # Stale version -> 409; forbidden fields -> 422 with zero row/event changes.
+    with db.reader() as c:
+        seq_before = c.execute("SELECT COALESCE(MAX(seq), 0) FROM events_log").fetchone()[0]
+    st_stale, _ = http_json(port, "PATCH", f"/api/v1/tasks/{tid}", token=bearer, key="stale-1",
+                            body={"base_version": ver1, "title": "Stale"})
+    assert st_stale == 409
+    for idx, bad in enumerate((
+        {"base_version": up["task"]["version"], "origin": "u:other"},
+        {"base_version": up["task"]["version"], "fault": 1},
+        {"base_version": up["task"]["version"], "refs": []},
+        {"base_version": up["task"]["version"], "primary_ref": None},
+        {"base_version": up["task"]["version"], "unknown_field": "nope"},
+    )):
+        st_bad, _ = http_json(port, "PATCH", f"/api/v1/tasks/{tid}", token=bearer, key=f"bad-{idx}", body=bad)
+        assert st_bad == 422, (bad, st_bad)
+    with db.reader() as c:
+        seq_after = c.execute("SELECT COALESCE(MAX(seq), 0) FROM events_log").fetchone()[0]
+    assert seq_after == seq_before
+    _, unchanged = http_json(port, "GET", f"/api/v1/tasks/{tid}", token=bearer)
+    assert unchanged["task"] == fetched["task"]
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class TaskKeyTests(_TaskIdentityChildCase):
+    def test_shared_jira_key_queued_atomicity_and_rollback(self):
+        res = self.run_identity_child(r"""
+paths.ensure_dirs()
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+rx = config.Repo("x", ROOT / "x", tracker="jira", jira_project="ABC")
+ry = config.Repo("y", ROOT / "y", tracker="jira", jira_project="ABC")
+rx.path.mkdir()
+ry.path.mkdir()
+cfg = config.Config(repos=[rx, ry], jira=config.JiraConfig(project="ABC"))
+
+# 1. Start ABC-12 from x with child launch paused -> queued row already holds task_id and issue_key.
+#    Second start from y returns same queued run, no second task/ref/run, spawn_run not called.
+queued_launches = []
+with principals.acting(owner), \
+        mock.patch.object(config, "load", return_value=cfg), \
+        mock.patch.object(tasks, "spawn_queued", side_effect=lambda r, tid, rid, **kw: queued_launches.append((r, tid, rid))), \
+        mock.patch.object(pipeline, "spawn_run", side_effect=AssertionError("unexpected spawn_run")):
+    ans1 = tasks.start_ticket(cfg, rx, "ABC-12")
+    assert ans1["state"] == "running" and ans1["run"], ans1
+    rid1 = ans1["run"]
+    row1 = run_store.run_get(rid1)
+    assert row1["status"] == "queued" and row1["task_id"] == 1 and row1["issue_key"] == "ABC-12", row1
+    ans2 = tasks.start_ticket(cfg, ry, "ABC-12")
+    assert ans2["run"] == rid1, (ans1, ans2)
+    assert len(queued_launches) == 1
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM refs WHERE system = 'jira' AND key = 'ABC-12'").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM runs WHERE kind = 'pipeline'").fetchone()[0] == 1
+
+# Child claim preserves task_id and issue_key, and holding the run lock in a child process
+# causes tasks.start_ticket(cfg, ry, "ABC-12") to answer running with rid1.
+lock_name = run_store.run_lock("pipeline", task=1)
+assert record.claim(rid1, lock=lock_name, pid=os.getpid())
+claimed = run_store.run_get(rid1)
+assert claimed["status"] == "running" and claimed["task_id"] == 1 and claimed["issue_key"] == "ABC-12"
+
+holder_ready = ROOT / "holder.ready"
+holder_stop = ROOT / "holder.stop"
+holder_code = (
+    "import os, sys, time\n"
+    "from pathlib import Path\n"
+    "from arete import paths, util\n"
+    f"paths.LOCKS_DIR = Path({json.dumps(str(paths.LOCKS_DIR))})\n"
+    f"with util.lock({json.dumps(lock_name)}):\n"
+    f"    Path({json.dumps(str(holder_ready))}).write_text(str(os.getpid()))\n"
+    f"    while not Path({json.dumps(str(holder_stop))}).exists():\n"
+    "        time.sleep(0.02)\n"
+)
+holder = subprocess.Popen(api_check.child_command(Path(api_check.__file__).resolve().parents[1], holder_code),
+                          cwd=ROOT, env=os.environ.copy())
+try:
+    deadline = time.monotonic() + 5
+    while not holder_ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert holder_ready.exists()
+    with db.tx() as c:
+        c.execute("UPDATE runs SET pid = ? WHERE id = ?", (holder.pid, rid1))
+    with principals.acting(owner), \
+            mock.patch.object(config, "load", return_value=cfg), \
+            mock.patch.object(pipeline, "spawn_run", side_effect=AssertionError("unexpected spawn_run")):
+        ans3 = tasks.start_ticket(cfg, ry, "ABC-12")
+    assert ans3["state"] == "running" and ans3["run"] == rid1, ans3
+finally:
+    holder_stop.write_text("stop")
+    holder.wait(timeout=5)
+
+# 2. Fault between task/ref creation and queued run insertion rolls back BOTH.
+with principals.acting(owner), \
+        mock.patch.object(config, "load", return_value=cfg), \
+        mock.patch.object(run_store, "insert_run", side_effect=RuntimeError("injected fault")):
+    try:
+        tasks.start_ticket(cfg, rx, "ABC-99")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected injected fault")
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM refs WHERE key = 'ABC-99'").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+
+# 3. Outer tx() rollback after TaskStore.create + link_ref leaves no task, ref, link, or event.
+with db.reader() as c:
+    ev_before = c.execute("SELECT count(*) FROM events_log").fetchone()[0]
+try:
+    with db.tx() as c:
+        t_row = task_store.TaskStore.create(c, {"repo": "x", "title": "Rollback me", "owner": owner, "origin": owner}, owner)
+        task_store.TaskStore.link_ref(
+            c, t_row["num"], {"system": "slack", "key": "C9/1.0", "kind": "thread"}, {"role": "related"}, owner,
+        )
+        raise RuntimeError("abort outer tx")
+except RuntimeError:
+    pass
+with db.reader() as c:
+    assert c.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM refs WHERE key = 'C9/1.0'").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM task_refs").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM events_log").fetchone()[0] == ev_before
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+    def test_lock_disambiguation_side_table_identities_and_triage_sent(self):
+        res = self.run_identity_child(r"""
+paths.ensure_dirs()
+db.migrate()
+owner = principals.seed_owner("owner@example.test")
+
+# 1. Local task on repo x and GitHub issue 1234 on repo x-t get distinct lock names for pipeline, slot, slot-wait,
+#    and holding one does not refuse starting the other.
+rx = config.Repo("x", ROOT / "x", tracker="local")
+rxt = config.Repo("x-t", ROOT / "x-t", github="o/x-t", tracker="github")
+rx.path.mkdir()
+rxt.path.mkdir()
+cfg = config.Config(repos=[rx, rxt])
+with principals.acting(owner):
+    local_tid = task_store.task_add("x", "Local task 1234", "Local")
+    local_num = task_store.parse_task_num(local_tid)
+    with db.tx() as c:
+        gh_num, _ = task_store.TaskStore.task_for_ticket(c, rxt, "1234", owner, cfg=cfg)
+assert local_num != gh_num
+for kind in ("pipeline", "slot", "slot-wait"):
+    assert run_store.run_lock(kind, task=local_num) != run_store.run_lock(kind, task=gh_num)
+with workspace_store.ticket_lock("x", local_tid, task_id=local_num) as got1:
+    assert got1
+    with workspace_store.ticket_lock("x-t", "1234", task_id=gh_num) as got2:
+        assert got2
+
+# 2. All core task/ref tables carry task_id or ref_id (while alerts and captures stay unchanged).
+with db.reader() as c:
+    for tbl, expected_col in (
+        ("runs", "task_id"), ("asks", "task_id"), ("feedback", "task_id"),
+        ("mined", "task_id"), ("passed_over", "task_id"),
+        ("triage", "ref_id"), ("triage_approvals", "ref_id"), ("research", "ref_id"),
+    ):
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({tbl})")}
+        assert expected_col in cols, (tbl, sorted(cols))
+
+# 3. Seed side tables and verify no NULL task_id / ref_id, shared ref across triage/approval/research,
+#    and triage.sent finds a run started after approval for a GitHub ticket from a renamed repo.
+r_old = config.Repo("old-name", ROOT / "old-name", github="acme/widget", tracker="github")
+r_new = config.Repo("new-name", ROOT / "new-name", github="acme/widget", tracker="github")
+r_old.path.mkdir()
+r_new.path.mkdir()
+cfg_old = config.Config(repos=[r_old])
+cfg_new = config.Config(repos=[r_new])
+
+with principals.acting(owner), mock.patch.object(config, "load", return_value=cfg_old):
+    triage_row = {"ref": "old-name#42", "repo": "old-name", "source": "github", "title": "Widget bug",
+                  "url": "https://github.com/acme/widget/issues/42",
+                  "kind": "fix", "size": "S", "score": 8, "reason": "good", "state": "open", "reviewed": util.iso()}
+    triage_store.triage_put(triage_row)
+    triage_store.triage_approve(triage_row, owner)
+    insights_store.research_set(
+        "old-name#42", repo="old-name", ticket="42",
+        url="https://github.com/acme/widget/issues/42", title="Widget bug", status="done", report="findings",
+    )
+with principals.acting(owner), mock.patch.object(config, "load", return_value=cfg_new):
+    with db.tx() as c:
+        w_num, w_key = task_store.TaskStore.task_for_ticket(c, r_new, "42", owner, cfg=cfg_new)
+    w_run = record.start("pipeline", repo="new-name", issue="42", task_id=w_num, issue_key=w_key)
+    ask_store.ask_add("ask-w", w_run, "new-name", "42", "plan", "ask", "why", "", [], {})
+    insights_store.add_feedback([{"repo": "new-name", "issue": "42", "pr_url": "https://github.com/acme/widget/pull/9",
+                                  "kind": "review", "gh_id": 9, "body": "fix", "created": util.iso()}])
+    approvals_store.add_mined("new-name", "42", "mined-task", w_run, "done")
+    source_store.pass_over("new-name", "42")
+
+with db.reader() as c:
+    for tbl in ("runs", "asks", "feedback", "mined", "passed_over"):
+        where = "WHERE kind = 'pipeline' AND task_id IS NULL" if tbl == "runs" else "WHERE task_id IS NULL"
+        nulls = c.execute(f"SELECT count(*) FROM {tbl} {where}").fetchone()[0]
+        assert nulls == 0, (tbl, nulls)
+    ref_ids = {}
+    for tbl in ("triage", "triage_approvals", "research"):
+        rows = [dict(r) for r in c.execute(f"SELECT * FROM {tbl}")]
+        assert rows and all(r["ref_id"] is not None for r in rows), (tbl, rows)
+        ref_ids[tbl] = rows[0]["ref_id"]
+    assert len(set(ref_ids.values())) == 1, ref_ids
+
+with mock.patch.object(config, "load", return_value=cfg_new):
+    sent_rows = triage.sent()
+    assert any(row["run"] and row["run"]["id"] == w_run for row in sent_rows), sent_rows
+    stored_triage = triage_store.triage_rows()[0]
+    cand = research.candidate(stored_triage)
+    assert cand is not None and cand.id == "42", cand
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])
+
+
+class TasksMigrationTests(_TaskIdentityChildCase):
+    def test_expand_backfill_capability_fence_and_contract_end_to_end(self):
+        res = self.run_identity_child(r"""
+paths.ensure_dirs()
+# 1. Seed isolated DB at schema 56 (before m0057 expand).
+db.migrate(through=56)
+owner = principals.seed_owner("owner@example.test")
+token_store.init_owner()
+_, bearer = token_store.issue(owner, "cli", ["*"])
+
+repo_dir = ROOT / "repos" / "sample"
+support.init_workspace_repo(repo_dir)
+paths.CONFIG_FILE.write_text(
+    '[[repo]]\nname = "sample"\n'
+    f'path = {json.dumps(str(repo_dir))}\n'
+    'github = "acme/sample"\ntracker = "local"\n',
+    encoding="utf-8",
+)
+
+# Make a task through POST /api/v1/tasks, patch twice to version 3, add 1 comment,
+# plus seed a target task t-1a2b, a waiter task whose body says 'waits on t-1a2b',
+# an incident_repairs row for t-1a2b, and legacy GitHub/Jira/PR/triage/research rows.
+with live_dashboard() as (_, port):
+    st, created = http_json(port, "POST", "/api/v1/tasks", token=bearer, key="m-create",
+                            body={"repo": "sample", "title": "V1", "body": "First body", "kind": "feat"})
+    assert st == 200, (st, created)
+    api_tid = created["task"]["id"]
+    st2, p1 = http_json(port, "PATCH", f"/api/v1/tasks/{api_tid}", token=bearer, key="m-p1",
+                        body={"base_version": 1, "title": "V2"})
+    assert st2 == 200 and p1["task"]["version"] == 2
+    st3, p2 = http_json(port, "PATCH", f"/api/v1/tasks/{api_tid}", token=bearer, key="m-p2",
+                        body={"base_version": 2, "title": "V3"})
+    assert st3 == 200 and p2["task"]["version"] == 3
+    st4, cm1 = http_json(port, "POST", f"/api/v1/tasks/{api_tid}/comments", token=bearer, key="m-cm1",
+                         body={"body": "owner comment"})
+    assert st4 in (200, 201), (st4, cm1)
+    _, cm1_hist = http_json(port, "GET", f"/api/v1/tasks/{api_tid}/history", token=bearer)
+    cm1_id = cm1_hist["comments"][-1]["id"]
+    _, before_task = http_json(port, "GET", f"/api/v1/tasks/{api_tid}", token=bearer)
+    ver_before = before_task["task"]["version"]
+    assert ver_before >= 3, ver_before
+
+with db.tx() as c:
+    now = util.iso()
+    c.execute(
+        "INSERT INTO tasks (id, repo, title, body, kind, state, parent, created, updated, version) "
+        "VALUES ('t-1a2b', 'sample', 'Target', 'Target body', 'feat', 'todo', '', ?, ?, 1)",
+        (now, now),
+    )
+    c.execute(
+        "INSERT INTO tasks (id, repo, title, body, kind, state, parent, created, updated, version) "
+        "VALUES ('t-2b3c', 'sample', 'Waiter', 'waits on t-1a2b', 'feat', 'todo', '', ?, ?, 1)",
+        (now, now),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, schema_version) "
+        "VALUES ('run-local-old', 'pipeline', 'sample', 't-1a2b', 'done', ?, ?, '', 56)",
+        (now, now),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, schema_version) "
+        "VALUES ('run-gh-old', 'pipeline', 'sample', '77', 'merged', ?, ?, 'https://github.com/acme/sample/pull/88', 56)",
+        (now, now),
+    )
+    c.execute(
+        "INSERT INTO runs (id, kind, repo, issue, status, started, finished, pr_url, schema_version) "
+        "VALUES ('run-jira-old', 'pipeline', 'sample', 'ABC-5', 'running', ?, NULL, '', 56)",
+        (now,),
+    )
+    c.execute("UPDATE runs SET pid = ? WHERE id = 'run-jira-old'", (os.getpid(),))
+    c.execute(
+        "INSERT INTO incidents (id, fingerprint, class, source, repo, state, first_seen, last_seen) "
+        "VALUES (1, 'fp-1', 'test', 'check', 'sample', 'open', ?, ?)",
+        (now, now),
+    )
+    c.execute(
+        "INSERT INTO incident_repairs (id, incident, repo, task, started) "
+        "VALUES (1, 1, 'sample', 't-1a2b', ?)",
+        (now,),
+    )
+    c.execute(
+        "INSERT INTO triage (ref, source, repo, title, url, kind, size, updated) "
+        "VALUES ('sample#77', 'github', 'sample', 'GH 77', 'https://github.com/acme/sample/issues/77', 'fix', 'S', ?)",
+        (now,),
+    )
+    c.execute(
+        "INSERT INTO triage_approvals (ref, repo, title, url, ts) "
+        "VALUES ('sample#77', 'sample', 'GH 77', 'https://github.com/acme/sample/issues/77', ?)",
+        (now,),
+    )
+    c.execute(
+        "INSERT INTO research (ref, source, title, url, status, summary, ts) "
+        "VALUES ('sample#77', 'github', 'GH 77', 'https://github.com/acme/sample/issues/77', 'done', 'notes', ?)",
+        (now,),
+    )
+    rowids_before = {r["id"]: r["rowid"] for r in c.execute("SELECT rowid, id FROM tasks")}
+    seqs_before = [r["seq"] for r in c.execute(
+        "SELECT seq FROM events_log WHERE subject = ? ORDER BY seq", (f"task:{api_tid}",)
+    )]
+
+# 2. Expand + backfill only (contracts=False).
+db.migrate(contracts=False)
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 58
+    strict_map = {r["name"]: r["strict"] for r in c.execute("PRAGMA table_list")}
+    for tbl in ("refs", "task_refs", "task_links", "task_labels"):
+        assert strict_map.get(tbl) == 1, (tbl, strict_map.get(tbl))
+    idx_names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    for idx in ("tasks_num", "task_comments_num", "task_refs_one_primary", "task_refs_primary_once"):
+        assert idx in idx_names, idx
+    nums_after = {r["id"]: r["num"] for r in c.execute("SELECT id, num FROM tasks")}
+    for old_id, old_rid in rowids_before.items():
+        assert nums_after[old_id] == old_rid
+    gh_run = dict(c.execute("SELECT * FROM runs WHERE id = 'run-gh-old'").fetchone())
+    jira_run = dict(c.execute("SELECT * FROM runs WHERE id = 'run-jira-old'").fetchone())
+    loc_run = dict(c.execute("SELECT * FROM runs WHERE id = 'run-local-old'").fetchone())
+    assert gh_run["issue_key"] == "77" and gh_run["task_id"] is not None
+    assert jira_run["issue_key"] == "ABC-5" and jira_run["task_id"] is not None
+    assert loc_run["issue_key"] == f"T-{rowids_before['t-1a2b']}" and loc_run["task_id"] == rowids_before["t-1a2b"]
+    pr_ref = c.execute("SELECT * FROM refs WHERE system = 'github' AND kind = 'pr' AND key = 'acme/sample#88'").fetchone()
+    assert pr_ref is not None and pr_ref["ext_state"] == "merged"
+
+# Verify repeatable backfill_identities produces no duplicates or extra events.
+with db.tx() as c:
+    counts_1 = (
+        c.execute("SELECT count(*) FROM tasks").fetchone()[0],
+        c.execute("SELECT count(*) FROM refs").fetchone()[0],
+        c.execute("SELECT count(*) FROM task_refs").fetchone()[0],
+        c.execute("SELECT max(seq) FROM events_log").fetchone()[0],
+    )
+    task_store.backfill_identities(c)
+    counts_2 = (
+        c.execute("SELECT count(*) FROM tasks").fetchone()[0],
+        c.execute("SELECT count(*) FROM refs").fetchone()[0],
+        c.execute("SELECT count(*) FROM task_refs").fetchone()[0],
+        c.execute("SELECT max(seq) FROM events_log").fetchone()[0],
+    )
+assert counts_1 == counts_2, (counts_1, counts_2)
+
+# 3. Old writer SQL inserts task + comment with no num -> triggers fill num;
+#    old child SQL updates api_tid to needs-info and inserts a comment by 'arete'.
+with db.tx() as c:
+    now = util.iso()
+    c.execute(
+        "INSERT INTO tasks (id, repo, title, body, kind, state, parent, created, updated) "
+        "VALUES ('t-oldw', 'sample', 'Old writer', '', 'feat', 'todo', '', ?, ?)",
+        (now, now),
+    )
+    filled = c.execute("SELECT rowid, num FROM tasks WHERE id = 't-oldw'").fetchone()
+    assert filled["num"] == filled["rowid"]
+    c.execute("UPDATE tasks SET state = 'needs-info', updated = ? WHERE id = ?", (now, api_tid))
+    c.execute("INSERT INTO task_comments (task, author, body, ts) VALUES (?, 'arete', 'bot note', ?)", (api_tid, now))
+    cm2_row = c.execute("SELECT rowid, num FROM task_comments WHERE task = ? AND author = 'arete'", (api_tid,)).fetchone()
+    assert cm2_row["num"] == cm2_row["rowid"]
+    cm2_id = cm2_row["num"]
+
+# Legacy ID still resolves on expanded schema before contract.
+assert task_store.task_get("t-1a2b") is not None
+
+# 4. Contract fence checks:
+#    (a) Live running row older than expand (run-jira-old, schema_version=56) blocks contract.
+assert db.migrate() is True
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 58
+    assert "run-jira-old" in db.contract_blockers(c, db.TASK_IDENTITY_CONTRACT_SCHEMA)
+
+#    (b) Even with current schema_version=59, an expand-only live process WITHOUT task_admission_v1 blocks contract!
+with db.tx() as c:
+    c.execute("UPDATE runs SET schema_version = 59, capabilities = NULL WHERE id = 'run-jira-old'")
+assert db.migrate() is True
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 58
+    assert "run-jira-old" in db.contract_blockers(c, db.TASK_IDENTITY_CONTRACT_SCHEMA)
+
+# Also test expand-only dashboard server.json without task_admission_v1 blocks contract.
+with db.tx() as c:
+    c.execute("UPDATE runs SET status = 'done', finished = ? WHERE id = 'run-jira-old'", (util.iso(),))
+util.write_json(paths.SERVER_FILE, {"pid": os.getpid(), "port": 1, "schema": 59})
+assert db.migrate() is True
+with db.reader() as c:
+    blockers_3 = db.contract_blockers(c, db.TASK_IDENTITY_CONTRACT_SCHEMA)
+    assert any("task_admission_v1" in msg for msg in blockers_3), blockers_3
+paths.SERVER_FILE.unlink()
+
+# 5. Once every live process meets task_admission_v1, final catch-up + contract succeeds!
+assert db.migrate() is False
+with db.reader() as c:
+    assert c.execute("PRAGMA user_version").fetchone()[0] >= db.TASK_IDENTITY_CONTRACT_SCHEMA
+    tinfo = {r[1]: r[2] for r in c.execute("PRAGMA table_info(tasks)")}
+    assert tinfo["id"] == "INTEGER", tinfo
+
+api_num = rowids_before[api_tid]
+target_num = rowids_before["t-1a2b"]
+waiter_num = rowids_before["t-2b3c"]
+
+with live_dashboard() as (_, port):
+    st, got = http_json(port, "GET", f"/api/v1/tasks/T-{api_num}", token=bearer)
+    assert st == 200, (st, got)
+    t = got["task"]
+    assert t["id"] == f"T-{api_num}"
+    assert t["version"] == ver_before, (t["version"], ver_before)
+    assert t["state"] == "needs-you"
+    assert t["owner"] == owner
+    st_h, hist = http_json(port, "GET", f"/api/v1/tasks/T-{api_num}/history", token=bearer)
+    assert st_h == 200
+    assert [e["seq"] for e in hist["events"]][:len(seqs_before)] == seqs_before
+    assert [cm["id"] for cm in hist["comments"]] == [cm1_id, cm2_id]
+
+# Legacy t-<hex> refused with exact message.
+refused_msg = ""
+try:
+    task_store.task_get("t-1a2b")
+except task_store.LegacyTaskIdRefused as err:
+    refused_msg = str(err)
+assert refused_msg == "task ids are T-<n> now; arete task list shows them", refused_msg
+
+# Waiter body rewritten to 'waits on T-<n>', task_links has waits_on origin='body', LocalTracker.blocker names T-<n>.
+waiter = task_store.task_get(f"T-{waiter_num}")
+assert f"waits on T-{target_num}" in waiter["body"], waiter["body"]
+with db.reader() as c:
+    links = task_store.TaskStore.task_links(c, waiter_num, kind="waits_on")
+assert any(l["other_task"] == f"T-{target_num}" and l["origin"] == "body" for l in links), links
+cfg = config.load()
+blocker = tracker.LocalTracker(cfg.repo("sample")).blocker(f"T-{waiter_num}")
+assert f"T-{target_num}" in blocker, blocker
+
+# incident_repairs.task rewritten to T-<n> and oncall finds its runs.
+with db.reader() as c:
+    rep = dict(c.execute("SELECT * FROM incident_repairs WHERE id = 1").fetchone())
+assert rep["task"] == f"T-{target_num}", rep
+rep_runs = run_store.ticket_runs(target_num)
+assert any(r["id"] == "run-local-old" for r in rep_runs), rep_runs
+
+emit({"ok": True})
+""")
+        self.assertTrue(res["ok"])

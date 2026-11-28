@@ -10,7 +10,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 26
+MINOR = 28
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -18,6 +18,9 @@ INTEGER = {"type": "integer"}
 NUMBER = {"type": "number"}
 BOOLEAN = {"type": "boolean"}
 JSON = {"type": ["object", "array", "string", "number", "boolean", "null"]}
+NULL_TEXT = {"type": ["string", "null"]}
+NULL_INT = {"type": ["integer", "null"]}
+NULL_NUM = {"type": ["number", "null"]}
 
 
 def obj(properties, required=None, additional=False):
@@ -33,15 +36,100 @@ def mapping(values):
     return obj({}, [], values)
 
 
-TASK = obj({**dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "parent", "created", "updated"), STRING),
-            "version": INTEGER})
+REF = obj({
+    "id": STRING,
+    "system": {**STRING, "enum": ["github", "jira", "slack", "email", "meeting", "intake"]},
+    "kind": {**STRING, "enum": ["issue", "ticket", "pr", "thread", "email", "transcript", "paste"]},
+    "key": STRING,
+    "connector": STRING,
+    "title": STRING,
+    "url": STRING,
+    "ext_state": STRING,
+    "facts": mapping(JSON),
+    "run_id": NULL_TEXT,
+    "remote_updated": NULL_TEXT,
+    "fetched_at": NULL_TEXT,
+    "sync": {**STRING, "enum": ["local", "synced", "ahead", "behind", "conflict", "off"]},
+    "version": INTEGER,
+    "created": STRING,
+    "updated": STRING,
+})
+TASK_REF = obj({
+    "id": INTEGER,
+    "task": STRING,
+    "task_id": INTEGER,
+    "ref": STRING,
+    "ref_id": INTEGER,
+    "role": {**STRING, "enum": ["primary", "origin", "related", "parent"]},
+    "interpretation": STRING,
+    "claims": mapping(JSON),
+    "anchor": array(JSON),
+    "source_rev": STRING,
+    "linked_by": STRING,
+    "confidence": NULL_NUM,
+    "version": INTEGER,
+    "created": STRING,
+    "updated": STRING,
+    "system": STRING,
+    "kind": STRING,
+    "key": STRING,
+    "title": STRING,
+    "url": STRING,
+    "ref_detail": REF,
+}, ["id", "task", "task_id", "ref", "ref_id", "role", "interpretation", "claims", "anchor",
+    "source_rev", "linked_by", "confidence", "version", "created", "updated"])
+REF_TASK_LINK = obj({
+    **TASK_REF["properties"],
+    "task_title": STRING,
+    "task_state": STRING,
+    "task_repo": STRING,
+}, [*TASK_REF["required"], "task_title", "task_state", "task_repo"])
+TASK_LINK = obj({
+    "id": INTEGER,
+    "task": STRING,
+    "task_id": INTEGER,
+    "kind": {**STRING, "enum": ["waits_on", "blocks", "relates", "duplicate"]},
+    "other_task": NULL_TEXT,
+    "other_key": NULL_TEXT,
+    "origin": {**STRING, "enum": ["person", "agent", "body", "jira_link"]},
+    "created": STRING,
+})
+TASK_COMMENT = obj({
+    "id": INTEGER,
+    "version": INTEGER,
+    "author": STRING,
+    "body": STRING,
+    "ts": STRING,
+    "created": STRING,
+    "updated": STRING,
+    "audience": NULL_TEXT,
+}, ["version", "author", "body", "ts"])
+_TASK_REQUIRED = ["id", "repo", "title", "body", "kind", "state", "parent", "created", "updated", "version"]
+TASK = obj({
+    **dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "parent", "created", "updated"), STRING),
+    "version": INTEGER,
+    "project": NULL_TEXT,
+    "line": NULL_TEXT,
+    "fault": INTEGER,
+    "fault_detail": NULL_TEXT,
+    "priority": NULL_INT,
+    "rank": NULL_NUM,
+    "owner": NULL_TEXT,
+    "origin": NULL_TEXT,
+    "delegate": NULL_TEXT,
+    "estimate": NULL_TEXT,
+    "answer": NULL_TEXT,
+    "refs": array(TASK_REF),
+    "primary_ref": {"anyOf": [REF, {"type": "null"}]},
+    "links": array(TASK_LINK),
+}, _TASK_REQUIRED)
 RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
             "branch", "only_step", "files_purged", "records_purged", "mined_until", "stop_asked", "ab_held",
             "measured_at", "landed", "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved",
             "engine_sha", "label_pending", "wait_minutes", "config_commit", "resolved_sha", "continues", "chain",
-            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule")
+            "restart", "started_by", "payer", "adw", "adw_version", "adw_rule", "task", "issue_key")
 RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
-               "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id")
+               "repair_calls", "schema_version", "attempts", "version", "seq", "lease_id", "task_id")
 RUN_STEP_SUMMARY = obj({
     "id": INTEGER,
     "node": STRING,
@@ -59,7 +147,6 @@ RUN["properties"]["version"] = INTEGER
 FACTORY_STATE = obj({"enabled": BOOLEAN, "phase": STRING, "version": INTEGER, "actor": STRING, "changed": STRING,
                      "unconfirmed": INTEGER, "paused": INTEGER, "targets": array(obj(dict.fromkeys(
                          ("id", "phase", "reason", "successor"), STRING)))})
-NULL_TEXT = {"type": ["string", "null"]}
 LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
             "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
             "prompt": STRING, "model": STRING, "state": mapping(JSON), "runs": array(RUN),
@@ -139,6 +226,7 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
     ("lease_fenced", 410, "This lease has been fenced by a newer epoch or release."),
     ("lease_expired", 410, "This lease has expired."),
+    ("files_purged", 410, "The retained files for this resource were purged."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
     ("uri_too_long", 414, "The request target is too long."),
     ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
@@ -177,11 +265,13 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     if isinstance(shown, dict) and "seq" in shown:
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
-    scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
+    scope = "read" if method == "GET" or noun == "batch" else (
+        "task:write" if noun in ("comment", "task_ref", "task_link") else f"{noun}:write"
+    )
     optional_errors = {"factory_version_conflict", "factory_off", "invalid_state", "task_version_conflict",
                        "secret_store_missing", "outbox_missing", "secret_internal", "already_resolved",
                        "still_missing", "validation", "gate_refused", "presence_expired", "lease_fenced",
-                       "lease_expired"}
+                       "lease_expired", "files_purged"}
     if noun not in ("token", "pairing", "principal", "secret", "inbox", "push", "outbox", "device", "lease") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
@@ -268,7 +358,6 @@ INBOX_EVENT = obj({
     "id": STRING, "seq": INTEGER, "epoch": STRING, "at": STRING, "kind": STRING, "subject": STRING,
     "ver": {"type": ["integer", "null"]}, "actor": STRING, "actor_name": NULL_TEXT, "data": mapping(JSON),
 }, ["id", "seq", "at", "kind", "subject", "actor", "data"], additional=JSON)
-NULL_INT = {"type": ["integer", "null"]}
 OUTBOX_ITEM = obj({
     **dict.fromkeys(("id", "target", "kind", "object", "audience", "drafted_by", "slot", "state",
                      "summary", "plain_summary", "review", "created", "updated"), STRING),
@@ -304,8 +393,10 @@ for _error in ERRORS:
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
                 "factory_version_conflict": {"current": FACTORY_STATE}, "version_conflict": {"current": RUN},
                 "task_version_conflict": {"current": TASK}, "already_resolved": {"current": INBOX_ITEM},
+                "invalid_state": {"current": JSON},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
                 "lease_fenced": {"epoch": INTEGER}, "lease_expired": {"epoch": INTEGER},
+                "files_purged": {"purged_at": STRING},
                 "forbidden": {"reason": STRING}, "conflict": {"reason": STRING},
                 "validation": {"path": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
@@ -315,6 +406,8 @@ for _error in ERRORS:
         _error["schema"]["required"].remove("reason")
     elif _code == "validation":
         _error["schema"]["required"].remove("path")
+    elif _code == "invalid_state":
+        _error["schema"]["required"].remove("current")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
                          "detail": _description, "error": _description}
 
@@ -324,7 +417,7 @@ META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha"
                  "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
                  "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
                  "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)}),
-                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN, "run_start_tx": BOOLEAN}, ["inbox"]),
+                 "features": obj({"inbox": BOOLEAN, "outbox": BOOLEAN, "run_start_tx": BOOLEAN, "refs": BOOLEAN}, ["inbox"]),
                  "deprecated": array(STRING),
                  "push": obj({"vapid_public_key": STRING})})
 META["required"] = [k for k in META["required"] if k not in ("features", "deprecated", "push")]
@@ -606,7 +699,7 @@ OPERATIONS += [
                  obj({**CONFIG_ID, "draft": STRING, "steps": array(JSON)},
                      [*CONFIG_ID, "draft", "steps"]),
                  {**CONFIG_EXAMPLE, "draft": "CD-1", "steps": ["plan"]}, "POST",
-                 errors=("validation", "invalid_state"), success_status=201),
+                 errors=("validation", "invalid_state", "files_purged"), success_status=201),
      "scope": "config:draft"},
     {**operation("config.ask", "config/{kind}/{name}/ask",
                  envelope({"run": RUN}, ["seq", "run"]),
@@ -646,11 +739,12 @@ OPERATIONS += [
               obj({"code": STRING}), {"code": "123456"}, "POST", success_status=201),
     operation("session.end", "auth/logout", envelope({"ended": BOOLEAN}), method="POST"),
     operation("run.diff", "runs/{id}/diff", envelope({"diff": STRING}), obj({"id": STRING}), {"id": "example"}),
-    operation("task.history", "tasks/{id}/history", envelope({"comments": array(obj({"version": INTEGER,
-              "author": STRING, "body": STRING, "ts": STRING})), "runs": array(RUN)}),
-              obj({"id": STRING}), {"id": "example"}),
+    operation("task.history", "tasks/{id}/history",
+              envelope({"comments": array(TASK_COMMENT), "runs": array(RUN), "events": array(INBOX_EVENT)},
+                       ["seq", "comments", "runs"]),
+              obj({"id": STRING}), {"id": "T-1"}),
     operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
-              obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
+              obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}, errors=("files_purged",)),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
     operation("settings.resolved", "settings/resolved", RESOLVED_SETTINGS,
               obj({"repo": STRING, "task_kind": STRING, "node": STRING}, [])),
@@ -658,7 +752,7 @@ OPERATIONS += [
                  SETTINGS_PATCH, {"base_version": 1, "values": {"max_parallel": 2}}, "PATCH"),
      "scope": "config:activate"},
     operation("blob.get", "blobs/{sha256}", envelope({"blob": BLOB_DATA}),
-              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}),
+              obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, errors=("files_purged",)),
     {**operation("blob.put", "blobs/{sha256}", envelope({"blob": BLOB_META}),
                  obj({"sha256": BLOB_SHA}), {"sha256": "0" * 64}, "PUT",
                  errors=("validation",), success_status=201),
@@ -675,23 +769,75 @@ OPERATIONS += [
     operation("task.create", "tasks", envelope({"task": TASK, "run": {"anyOf": [RUN, {"type": "null"}]},
                                                 "state": STRING, "why": STRING}, ["seq", "task"]),
               obj({"repo": STRING, "body": STRING, "title": STRING, "kind": STRING, "ticket": STRING,
-                   "start": BOOLEAN, "force": BOOLEAN}, ["repo"]),
+                   "start": BOOLEAN, "force": BOOLEAN,
+                   "project": NULL_TEXT, "line": NULL_TEXT, "priority": NULL_INT, "rank": NULL_NUM,
+                   "owner": NULL_TEXT, "delegate": NULL_TEXT, "estimate": NULL_TEXT, "answer": NULL_TEXT}, ["repo"]),
               {"repo": "example", "body": "Work to do"}, "POST"),
     operation("task.update", "tasks/{id}", envelope({"task": TASK}),
               obj({"id": STRING, "base_version": {**INTEGER, "minimum": 1}, "title": STRING, "body": STRING,
-                   "kind": STRING, "state": STRING}, ["id", "base_version"]),
-              {"id": "t-a1b2", "title": "Updated title", "base_version": 1}, "PATCH", errors=("task_version_conflict",)),
+                   "kind": STRING, "state": STRING,
+                   "project": NULL_TEXT, "line": NULL_TEXT, "priority": NULL_INT, "rank": NULL_NUM,
+                   "owner": NULL_TEXT, "delegate": NULL_TEXT, "estimate": NULL_TEXT, "answer": NULL_TEXT},
+                  ["id", "base_version"]),
+              {"id": "T-1", "title": "Updated title", "base_version": 1}, "PATCH", errors=("task_version_conflict",)),
     operation("task.close", "tasks/{task}/close", envelope({"task": TASK}), obj({"task": STRING}),
-              {"task": "t-a1b2"}, "POST", errors=("invalid_state",)),
+              {"task": "T-1"}, "POST", errors=("invalid_state",)),
+    operation("task.restore", "tasks/{task}/restore", envelope({"task": TASK}),
+              obj({"task": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["task"]),
+              {"task": "T-1"}, "POST", errors=("invalid_state", "task_version_conflict")),
     operation("comment.create", "tasks/{task}/comments", envelope({"task": TASK}),
-              obj({"task": STRING, "body": STRING}), {"task": "t-a1b2", "body": "Reply"}, "POST"),
+              obj({"task": STRING, "body": STRING}), {"task": "T-1", "body": "Reply"}, "POST"),
+    operation("comment.update", "tasks/{task}/comments/{comment}", envelope({"comment": TASK_COMMENT}),
+              obj({"task": STRING, "comment": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "body": STRING, "audience": STRING}, ["task", "comment", "base_version"]),
+              {"task": "T-1", "comment": "1", "base_version": 1, "body": "Edited reply"}, "PATCH",
+              errors=("validation",)),
+    operation("task_ref.list", "tasks/{task}/refs", envelope({"refs": array(TASK_REF)}),
+              obj({"task": STRING}), {"task": "T-1"}),
+    operation("task_ref.link", "tasks/{task}/refs", envelope({"task_ref": TASK_REF, "ref": REF}),
+              obj({"task": STRING, "ref": STRING, "system": STRING, "kind": STRING, "key": STRING,
+                   "connector": STRING, "title": STRING, "url": STRING,
+                   "role": {**STRING, "enum": ["primary", "origin", "related", "parent"]},
+                   "interpretation": STRING, "claims": mapping(JSON), "anchor": array(JSON),
+                   "source_rev": STRING, "confidence": NULL_NUM}, ["task"]),
+              {"task": "T-1", "ref": "slack:C1/1700000000.000100", "role": "related",
+               "interpretation": "Source thread"}, "POST", errors=("invalid_state", "validation"),
+              success_status=201),
+    operation("task_ref.update", "tasks/{task}/refs/{ref}", envelope({"task_ref": TASK_REF, "ref": REF}),
+              obj({"task": STRING, "ref": STRING, "base_version": {**INTEGER, "minimum": 1},
+                   "role": {**STRING, "enum": ["primary", "origin", "related", "parent"]},
+                   "interpretation": STRING, "claims": mapping(JSON), "anchor": array(JSON),
+                   "source_rev": STRING, "confidence": NULL_NUM}, ["task", "ref"]),
+              {"task": "T-1", "ref": "R-1", "role": "primary"}, "PATCH",
+              errors=("invalid_state", "validation")),
+    operation("task_ref.unlink", "tasks/{task}/refs/{ref}",
+              envelope({"unlinked": BOOLEAN, "task": STRING, "ref": STRING}),
+              obj({"task": STRING, "ref": STRING}), {"task": "T-1", "ref": "R-1"}, "DELETE"),
+    operation("ref.list", "refs", envelope({"refs": array(REF)}),
+              obj({"system": STRING, "kind": STRING, "key": STRING, "sync": STRING}, [])),
+    operation("ref.get", "refs/{ref}", envelope({"ref": REF, "tasks": array(REF_TASK_LINK)}),
+              obj({"ref": STRING}), {"ref": "R-1"}),
+    operation("ref.history", "refs/{ref}/history", envelope({"events": array(INBOX_EVENT)}),
+              obj({"ref": STRING}), {"ref": "R-1"}),
+    operation("task_link.list", "tasks/{task}/links", envelope({"links": array(TASK_LINK)}),
+              obj({"task": STRING}), {"task": "T-1"}),
+    operation("task_link.create", "tasks/{task}/links", envelope({"link": TASK_LINK}),
+              obj({"task": STRING, "kind": {**STRING, "enum": ["waits_on", "blocks", "relates", "duplicate"]},
+                   "other_task": STRING, "other_key": STRING,
+                   "origin": {**STRING, "enum": ["person", "agent", "body", "jira_link"]}}, ["task", "kind"]),
+              {"task": "T-1", "kind": "relates", "other_key": "github:o/r#7"}, "POST",
+              errors=("validation",), success_status=201),
+    operation("task_link.delete", "tasks/{task}/links/{link}", envelope({"deleted": BOOLEAN, "id": INTEGER}),
+              obj({"task": STRING, "link": STRING}), {"task": "T-1", "link": "1"}, "DELETE"),
     operation("run.stop", "runs/{run}/stop", envelope({"id": STRING, "stopped": BOOLEAN, "pid": INTEGER,
               "was": STRING, "ticket": STRING}), obj({"run": STRING, "base_version": {**INTEGER, "minimum": 1}}),
               {"run": "pip-demo-1", "base_version": 1}, "POST"),
     operation("run.steer", "runs/{run}/steer", envelope({"id": STRING, "queued": BOOLEAN}),
               obj({"run": STRING, "text": STRING}), {"run": "session-demo-1", "text": "Continue"}, "POST"),
-    *(operation(f"run.{action}", f"runs/{{run}}/{action}", envelope({"id": STRING}), obj({"run": STRING}),
-                {"run": "pip-demo-1"}, "POST") for action in ("pin", "unpin")),
+    operation("run.pin", "runs/{run}/pin", envelope({"id": STRING}), obj({"run": STRING}),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",)),
+    operation("run.unpin", "runs/{run}/unpin", envelope({"id": STRING}), obj({"run": STRING}),
+              {"run": "pip-demo-1"}, "POST"),
     operation("chat.drop", "chats/{chat}", envelope({"chat": mapping(JSON)}), obj({"chat": STRING}),
               {"chat": "1"}, "DELETE"),
     {**operation("chat.file", "chats/{chat}/file", envelope({"item": OUTBOX_ITEM}),
@@ -920,11 +1066,11 @@ OPERATIONS += [
     operation("turn.list", "runs/{run}/steps/{node}/{try}/turns",
               envelope({"turns": array(TURN)}),
               obj({"run": STRING, "node": STRING, "try": STRING}),
-              {"run": "pip-demo-1", "node": "plan", "try": "1"}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1"}, errors=("files_purged",)),
     operation("turn.get", "runs/{run}/steps/{node}/{try}/turns/{n}",
               envelope({"turn": TURN_DETAIL}),
               obj({"run": STRING, "node": STRING, "try": STRING, "n": STRING}),
-              {"run": "pip-demo-1", "node": "plan", "try": "1", "n": "1"}),
+              {"run": "pip-demo-1", "node": "plan", "try": "1", "n": "1"}, errors=("files_purged",)),
     operation("task.run", "tasks/{task}/run",
               envelope({"run": NULL_RUN, "task": STRING, "repo": STRING, "state": STRING, "why": STRING}, ["seq", "run"]),
               obj({"task": STRING, "repo": STRING, "force": BOOLEAN}, ["task"]),
@@ -938,16 +1084,16 @@ OPERATIONS += [
     operation("run.resume", "runs/{run}/resume",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "step": STRING, "node": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
-              {"run": "pip-demo-1"}, "POST", success_status=201),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.repair", "runs/{run}/repair",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "base_version": {**INTEGER, "minimum": 1}}, ["run"]),
-              {"run": "pip-demo-1"}, "POST", success_status=201),
+              {"run": "pip-demo-1"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.step", "runs/{run}/step",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"run": STRING, "node": STRING, "set": mapping(JSON),
                    "base_version": {**INTEGER, "minimum": 1}}, ["run", "node"]),
-              {"run": "pip-demo-1", "node": "plan"}, "POST", success_status=201),
+              {"run": "pip-demo-1", "node": "plan"}, "POST", errors=("files_purged",), success_status=201),
     operation("run.import", "runs",
               envelope({"run": RUN}, ["seq", "run"]),
               obj({"kind": STRING, "repo": STRING, "issue": {"type": ["integer", "string", "null"]},
@@ -1266,7 +1412,7 @@ ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter":
 
 
 def complete_examples():
-    instances = {"task": "t-a1b2", "project": "replay-sample", "line": "replay-sample", "view": "live",
+    instances = {"task": "T-1", "project": "replay-sample", "line": "replay-sample", "view": "live",
                  "run": "pip-demo-1", "step": "1", "loop": "poll", "incident": "1",
                  "triage": "demo#7", "research": "demo#7", "chat": "1"}
     for name, identity in instances.items():

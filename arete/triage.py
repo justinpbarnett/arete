@@ -1007,10 +1007,25 @@ def standing(r: dict) -> str:
 
 
 def sent(connect=foundation.db) -> list[dict]:
+    from .store import tasks as task_store
+
     out = []
     for a in triage_store.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
-        runs = [r for r in run_store.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
-                if r["started"] >= a["ts"]]
+        task_num: int | None = None
+        if a.get("ref_id") is not None:
+            with connect() as c:
+                if task_store.has_identity_expand(c):
+                    row = c.execute(
+                        "SELECT task_id FROM task_refs WHERE ref_id = ? AND role = 'primary' LIMIT 1",
+                        (int(a["ref_id"]),),
+                    ).fetchone()
+                    if row is not None:
+                        task_num = int(row[0])
+        if task_num is not None:
+            runs = [r for r in run_store.ticket_runs(task_num, limit=1, connect=connect) if r["started"] >= a["ts"]]
+        else:
+            runs = [r for r in run_store.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
+                    if r["started"] >= a["ts"]]
         out.append({**a, "run": runs[0] if runs else None})
     return out
 
