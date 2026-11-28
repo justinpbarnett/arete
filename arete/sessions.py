@@ -237,19 +237,21 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
                 budget_usd, created=util.iso(), task=task, draft_pr=draft_pr, chat=chat)
     workspace(spec, target, work_repo)
     save_spec(spec)
-    record.start("session", run_id=spec.id, lock=session_lock(spec.id), pid=None, repo=spec.repo or None,
-                 device=spec.device, model=name, runner=which, trigger="manual",
-                 log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
-                 branch=spec.branch or None)
-    if chat:
-        chats_store.chat_link_session(chat, spec.id, budget_usd)
     clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
-    run_store.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
-                                     f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
-                                                                for reason, withheld in off.items())
-                   + ("; a task: it ends with a report" if task else ""))
-    proc = control.detach(["session", "exec", spec.id], SESSION_LOG)
-    record.note(spec.id, pid=proc.pid)
+    start_note = (f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
+                  f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
+                                                             for reason, withheld in off.items())
+                  + ("; a task: it ends with a report" if task else ""))
+    with foundation.tx():
+        record.start("session", run_id=spec.id, status="queued", lock=session_lock(spec.id), pid=None,
+                     repo=spec.repo or None, device=spec.device, model=name, runner=which, trigger="manual",
+                     log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
+                     branch=spec.branch or None)
+        if chat:
+            chats_store.chat_link_session(chat, spec.id, budget_usd)
+        run_store.add_feed(spec.id, "start", start_note)
+    record.write_launch(spec.id, control.command(["session", "exec", spec.id]), SESSION_LOG)
+    control.detach(["session", "exec", spec.id], SESSION_LOG)
     return {"id": spec.id, "cwd": spec.cwd, "branch": spec.branch, "model": name, "runner": which,
             "device": spec.device, "tools": tools, "task": task, "repo": spec.repo, "budget_usd": budget_usd,
             "chat": chat}
@@ -265,7 +267,7 @@ def send(session_id: str, text: str) -> dict:
     r = run_store.run_get(session_id)
     if not r or r["kind"] != "session":
         raise control.NotFound(f"no session {session_id}")
-    if r["status"] != "running":
+    if r["status"] not in ("running", "queued"):
         raise control.Refused(f"session {session_id} has ended ({r['status']}); start a new one")
     asks_store.add_message(session_id, text)
     return {"id": session_id, "queued": True}
@@ -782,13 +784,13 @@ def execute(session_id: str) -> str:
     with util.lock(session_lock(session_id)) as free:
         if not free:
             return "busy"
-        if (ended := (run_store.run_get(session_id) or {}).get("status", "gone")) != "running":
+        if (ended := (run_store.run_get(session_id) or {}).get("status", "gone")) not in ("queued", "running"):
             return ended
         from . import pins
 
         pin_res = pins.resolve("session", repo=spec.repo or None)
         cfg = pin_res.cfg
-        record.attach_pin(session_id, pin_res, pid=os.getpid())
+        record.claim(session_id, pid=os.getpid(), resolution=pin_res)
         try:
             with (pins.use(pin_res), record.stoppable(),
                   devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),

@@ -57,8 +57,28 @@ UNRECOGNIZED_MODEL = "[claude-code:unrecognized_model]"
 SESSION_CHECKOUT: ContextVar[tuple[Path, Path] | None] = ContextVar("claude_session_checkout", default=None)
 
 
+_VERSION: str | None = None
+
+
 def binary() -> str:
     return shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+
+
+def version() -> str:
+    global _VERSION
+    if _VERSION is not None:
+        return _VERSION
+    try:
+        found = util.sh([binary(), "--version"], timeout=10, env=agent_env([]))
+    except OSError:
+        _VERSION = ""
+        return _VERSION
+    if found.returncode != 0:
+        _VERSION = ""
+        return _VERSION
+    words = found.stdout.strip().split()
+    _VERSION = next((w for w in words if w and w[0].isdigit()), words[0] if words else "")
+    return _VERSION
 
 
 def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from .. import util
 from . import factory
 from ._rows import validate_columns
-from .db import db, reader
+from .db import STEPS_LIFECYCLE_SCHEMA, db, migration_applied, reader
 
 TABLES = {
     "chats": "kept",
@@ -15,7 +15,7 @@ TABLES = {
 
 CHAT_UPDATABLE_FIELDS = frozenset((
     "title", "project", "busy", "session", "session_spent", "runner",
-    "draft_title", "draft_body", "summary", "summarized_to",
+    "draft_title", "draft_body", "summary", "summarized_to", "payer",
 ))
 
 
@@ -24,9 +24,28 @@ CHAT_USAGE = ("(SELECT COALESCE(SUM(m.paid_usd), 0) FROM chat_messages m WHERE m
               "AND m.paid_usd IS NULL AND m.cost != 0) AS unclassified_messages")
 
 
-def chat_add(project: str) -> int:
+def _default_chat_payer(c) -> str | None:
+    from .. import principals, record
+
+    actor = record._resolve_started_by(principals.current())
+    if record._is_person_actor(actor):
+        return actor
+    row = c.execute(
+        "SELECT id FROM principals WHERE kind = 'human' AND status = 'active' AND role = 'owner' "
+        "ORDER BY created, oid LIMIT 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def chat_add(project: str, *, payer: str | None = None) -> int:
     ts = util.iso()
     with db() as c:
+        if migration_applied(STEPS_LIFECYCLE_SCHEMA, c):
+            resolved_payer = payer if payer is not None else _default_chat_payer(c)
+            return c.execute(
+                "INSERT INTO chats (project, created, updated, payer) VALUES (?,?,?,?)",
+                (project, ts, ts, resolved_payer),
+            ).lastrowid
         return c.execute("INSERT INTO chats (project, created, updated) VALUES (?,?,?)", (project, ts, ts)).lastrowid
 
 
@@ -106,8 +125,18 @@ def chat_sessions_untold() -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
             f"SELECT {CHAT_SESSION_COLUMNS} FROM chat_sessions l LEFT JOIN runs r ON r.id = l.run_id "  # noqa: S608
-            "WHERE l.told = '' AND COALESCE(r.status, '') != 'running' "
+            "WHERE l.told = '' AND COALESCE(r.status, '') NOT IN ('running', 'queued') "
             f"{factory.exclude_retained(c, 'l.run_id')} ORDER BY l.rowid")]
+
+
+def chat_queue_message(chat_id: int, text: str) -> int:
+    ts = util.iso()
+    with db() as c:
+        c.execute("UPDATE chats SET updated = ? WHERE id = ?", (ts, chat_id))
+        return c.execute(
+            "INSERT INTO chat_messages (chat_id, sender, text, ts) VALUES (?,?,?,?)",
+            (chat_id, "you", text, ts),
+        ).lastrowid
 
 
 def chat_tell_session(run_id: str, text: str) -> bool:

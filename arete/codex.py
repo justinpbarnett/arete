@@ -257,8 +257,28 @@ def cleanup() -> Cleanup:
     return result
 
 
+_VERSION: str | None = None
+
+
 def binary() -> str:
     return shutil.which("codex") or "codex"
+
+
+def version() -> str:
+    global _VERSION
+    if _VERSION is not None:
+        return _VERSION
+    try:
+        found = util.sh([binary(), "--version"], timeout=10, env=agent_env([]))
+    except OSError:
+        _VERSION = ""
+        return _VERSION
+    if found.returncode != 0:
+        _VERSION = ""
+        return _VERSION
+    words = found.stdout.strip().split()
+    _VERSION = words[-1] if words else ""
+    return _VERSION
 
 
 def home() -> Path:

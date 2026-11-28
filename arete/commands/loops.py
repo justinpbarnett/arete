@@ -68,17 +68,26 @@ def loop_list(args) -> int:
 
 
 def loop_new(args) -> int:
-    from .. import control, scaffold, util
-
     if args.run_id:
+        from .. import control, scaffold, util
+
         control.require_worker("loop new")
-    made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
-                          run_id=args.run_id)
-    print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
-    print(made["loop_toml"])
-    if made["note"]:
-        print(f"note: {made['note']}")
-    print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
+        made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
+                              run_id=args.run_id)
+        print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
+        print(made["loop_toml"])
+        if made["note"]:
+            print(f"note: {made['note']}")
+        print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
+        return 0
+    res = client.call("POST", "/api/v1/loops", {
+        "sentence": " ".join(args.words),
+        "name": args.name or "",
+        "repo": args.repo or "",
+        "model": args.model or "",
+    })
+    run = client.field(res, "run")
+    print(f"started draft {run['id']}")
     return 0
 
 
@@ -90,12 +99,19 @@ def loop_exec(args) -> int:
 
 
 def loop_try(args) -> int:
-    from .. import scaffold, util
-
-    result = scaffold.try_loop(args.name, events_from_file(args.events), follow=follow)
-    print(f"\ntry {result['id']}: {result['status']}, every emit held"
-          + (f", {util.count(result['events'], 'sample event')}" if result["events"] else ""))
-    return 0 if result["status"] in ("done", "skipped") else 1
+    body: dict[str, object] = {}
+    if args.events:
+        events = events_from_file(args.events)
+        raw = json.dumps(events).encode("utf-8")
+        body["events"] = client.put_blob(raw)
+    res = client.call("POST", f"/api/v1/loops/{quote(args.name, safe='')}/try", body)
+    run = client.field(res, "run")
+    run_id = run["id"]
+    follow(run_id, remote=True)
+    ended = client.run_info(run_id)
+    status = ended.get("status") or run.get("status") or "unknown"
+    print(f"\ntry {run_id}: {status}, every emit held")
+    return 0 if status in ("done", "skipped") else 1
 
 
 def loop_switched(args, enabled: bool) -> int:
@@ -114,13 +130,15 @@ def loop_disable(args) -> int:
 
 
 def loop_start(args) -> int:
-    from .. import loop_run
-
-    r = (loop_run.launch(args.name, events=events_from_file(args.events)) if args.events
-         else client.call("POST", f"/api/loops/{quote(args.name, safe='')}/start"))
-    run_id = r["id"]
+    body: dict[str, object] = {}
+    if args.events:
+        events = events_from_file(args.events)
+        body["events"] = client.put_blob(json.dumps(events).encode("utf-8"))
+    r = client.call("POST", f"/api/v1/loops/{quote(args.name, safe='')}/start", body)
+    run = r["run"] if isinstance(r.get("run"), dict) else r
+    run_id = run["id"]
     if args.follow:
-        follow(run_id, remote=not args.events, on_start=lambda: print(f"started {run_id}", flush=True))
+        follow(run_id, remote=True, on_start=lambda: print(f"started {run_id}", flush=True))
     else:
         print(f"started {run_id}")
     return 0

@@ -81,6 +81,7 @@ class DurableCostTests(unittest.TestCase):
         patches.enter_context(mock.patch.object(runner, "origin", return_value={"repo": "", "commit": ""}))
         patches.enter_context(mock.patch.object(runner, "secret_files", return_value=[]))
         patches.enter_context(mock.patch.object(scrub, "secrets", return_value=()))
+        patches.enter_context(mock.patch.object(record, "runner_version_of", return_value="test"))
         for module, name in ((claude, "run"), (codex, "run"), (pi, "run"), (accounts, "read"), (util, "sh")):
             patches.enter_context(mock.patch.object(module, name, side_effect=AssertionError("unexpected external call")))
 

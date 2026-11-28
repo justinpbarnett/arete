@@ -143,11 +143,13 @@ def check_request(request: DraftRequest, cfg: config.Config, taken: set[str]) ->
 def start_draft(request: DraftRequest) -> dict:
     cfg = config.load()
     check_request(request, cfg, loop_names(cfg))
-    run_id = record.start("draft", trigger="manual", pid=None, summary=util.first_line(request.sentence, 200))
+    run_id = record.start("draft", trigger="manual", status="queued", pid=None,
+                          summary=util.first_line(request.sentence, 200))
+    args = ["loop", "new", "--name", request.name, "--repo", request.repo, "--model", request.model,
+            "--run-id", run_id, "--", request.sentence]
+    record.write_launch(run_id, control.command(args), DRAFTS_LOG)
     with record.failed_on_crash(run_id):
-        proc = control.detach(["loop", "new", "--name", request.name, "--repo", request.repo, "--model", request.model,
-                               "--run-id", run_id, "--", request.sentence], DRAFTS_LOG)
-    record.note(run_id, pid=proc.pid)
+        control.detach(args, DRAFTS_LOG)
     return run_store.run_get(run_id)
 
 
@@ -157,7 +159,7 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
     pin_res = pins.resolve("draft", repo=request.repo or None)
     cfg = pin_res.cfg
     if run_id:
-        record.attach_pin(run_id, pin_res, pid=os.getpid())
+        record.claim(run_id, pid=os.getpid(), resolution=pin_res)
     else:
         check_request(request, cfg, loop_names(cfg))
         run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200),
@@ -277,10 +279,11 @@ def try_events(loop: loops.Loop, cfg: config.Config) -> list[dict]:
     raise control.Refused(f"{loop.name} found no events to try on yet")
 
 
-def start_try(name: str) -> dict:
+def start_try(name: str, *, events: list[dict] | None = None, wait: bool = True) -> dict:
     cfg = config.load()
     loop = control.working_loop(name, cfg)
-    return loop_run.launch(loop.name, events=try_events(loop, cfg), trial=True, cfg=cfg)
+    chosen = try_events(loop, cfg) if events is None else events
+    return loop_run.launch(loop.name, events=chosen, trial=True, cfg=cfg, wait=wait)
 
 
 def try_loop(name: str, events: list[dict] | None = None, follow=None) -> dict:

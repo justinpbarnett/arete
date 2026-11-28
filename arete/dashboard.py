@@ -51,7 +51,6 @@ from . import (
     refusals,
     research,
     run_lines,
-    scaffold,
     sessions,
     settings,
     tailnet,
@@ -408,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
             self.awaiting_presence = False
             self.set_cookie = None
             self.success_status = 200
+            self.location = None
             self.instance_header = None
             self.mcp_session = None
             self.mcp_rotation_accepted = None
@@ -659,6 +659,9 @@ class Handler(BaseHTTPRequestHandler):
             if row and row["status"]:
                 self.idempotent_replayed = True
                 result = json.loads(row["response"])
+                if (row["status"] == 201 and isinstance(result, dict) and isinstance(result.get("run"), dict)
+                        and result["run"].get("id")):
+                    self.location = f"/api/v1/runs/{quote(str(result['run']['id']), safe='')}"
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
             elif read_only:
@@ -746,15 +749,19 @@ class Handler(BaseHTTPRequestHandler):
         if action in ("enable", "disable"):
             return control.switch(name, action == "enable", idem=self.headers.get("Idempotency-Key", ""))
         if action == "start":
-            return loop_run.launch(name)
+            return api.mutation("loop.start", {"loop": name}, None)["run"]
         if action == "try":
-            return scaffold.start_try(name)
+            return api.mutation("loop.try", {"loop": name}, None)["run"]
         raise Refusal(404, f"Loops take enable, disable, start or try, not {action}.")
 
     def draft_loop(self) -> dict:
         b = self.body()
-        return scaffold.start_draft(scaffold.DraftRequest(
-            *(str(b.get(field) or "") for field in ("sentence", "name", "repo", "model"))))
+        return api.mutation("loop.draft", {
+            "sentence": str(b.get("sentence") or ""),
+            "name": str(b.get("name") or ""),
+            "repo": str(b.get("repo") or ""),
+            "model": str(b.get("model") or ""),
+        }, None)["run"]
 
     def launch_session(self) -> dict:
         b = self.body()
@@ -764,10 +771,15 @@ class Handler(BaseHTTPRequestHandler):
         budget = b.get("budget_usd")
         if budget not in (None, "") and (isinstance(budget, bool) or not isinstance(budget, int | float)):
             raise Refusal(400, "budget_usd is a number of dollars.")
-        return sessions.launch(str(b.get("prompt", "")), device=str(b.get("device") or ""),
-                               model=str(b.get("model") or ""), run_with=str(b.get("runner") or ""), tools=tools,
-                               repo=str(b.get("repo") or ""),
-                               budget_usd=None if budget in (None, "") else float(budget))
+        return api.mutation("session.start", {
+            "prompt": str(b.get("prompt", "")),
+            "device": str(b.get("device") or ""),
+            "model": str(b.get("model") or ""),
+            "runner": str(b.get("runner") or ""),
+            "tools": tools,
+            "repo": str(b.get("repo") or ""),
+            "budget_usd": None if budget in (None, "") else float(budget),
+        }, None)["session"]
 
     def start_chat_session(self, chat_id: int) -> dict:
         b = self.body()
@@ -775,10 +787,15 @@ class Handler(BaseHTTPRequestHandler):
         if budget not in (None, "") and (isinstance(budget, bool) or not isinstance(budget, int | float)):
             raise Refusal(400, "budget_usd is a number of dollars.")
         repo = b.get("repo")
-        return chat.start_session(chat_id, str(b.get("prompt", "")), repo=None if repo is None else str(repo),
-                                  device=str(b.get("device") or ""), model=str(b.get("model") or ""),
-                                  runner=str(b.get("runner") or ""),
-                                  budget_usd=None if budget in (None, "") else float(budget))
+        return api.mutation("chat.session_start", {
+            "chat": str(chat_id),
+            "prompt": str(b.get("prompt", "")),
+            "repo": None if repo is None else str(repo),
+            "device": str(b.get("device") or ""),
+            "model": str(b.get("model") or ""),
+            "runner": str(b.get("runner") or ""),
+            "budget_usd": None if budget in (None, "") else float(budget),
+        }, None)["session"]
 
     def send_ticket(self, ref: str, publication=None) -> dict:
         b = self.body()
@@ -946,6 +963,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Idempotent-Replayed", "true")
         if 200 <= status < 300 and getattr(self, "write_receipt", None):
             self.send_header("Arete-Seq", self.write_receipt["event_seq"])
+        if 200 <= status < 300 and getattr(self, "location", None):
+            self.send_header("Location", self.location)
         self.send_security_headers()
 
     def _scrub_payload(self, status: int, payload: bytes, kind: str) -> bytes:
@@ -1252,7 +1271,8 @@ def post_settings(handler, rest, query):
 
 
 def post_chat_new(handler, rest, query):
-    return chat.new(str(handler.body().get("project") or ""))
+    created = api.mutation("chat.create", {"project": str(handler.body().get("project") or "")}, None)
+    return chat.view(created["chat"]["id"])
 
 
 def post_chat(handler, rest, query):
@@ -1263,7 +1283,9 @@ def post_chat(handler, rest, query):
         return chat.stop_session(whole_number(parts[0]), parts[2])
     chat_id, _, action = unquote(rest).rpartition("/")
     if action == "send":
-        return chat.send(whole_number(chat_id), handler.chat_text())
+        number = whole_number(chat_id)
+        api.mutation("chat.send", {"chat": str(number), "text": handler.chat_text()}, None)
+        return chat.view(number)
     if action == "file":
         number = whole_number(chat_id)
         body = handler.body()
@@ -1332,11 +1354,29 @@ def post_run(handler, rest, query):
         else:
             result = tasks.reply(run_id, text)
     elif action == "resume":
-        result = tasks.resume(run_id, str(body.get("step") or ""), base_version)
+        started = api.mutation("run.resume", {
+            "run": run_id,
+            **({"node": str(body["step"])} if body.get("step") else {}),
+            **({"base_version": base_version} if base_version is not None else {}),
+        }, None)["run"]
+        result = tasks.answer(str(started.get("issue") or ""), started.get("repo") or "", started["id"],
+                              started["status"], "started")
     elif action == "repair":
-        result = tasks.repair(run_id, base_version)
+        started = api.mutation("run.repair", {
+            "run": run_id,
+            **({"base_version": base_version} if base_version is not None else {}),
+        }, None)["run"]
+        result = tasks.answer(str(started.get("issue") or ""), started.get("repo") or "", started["id"],
+                              started["status"], "started")
     elif action.startswith("steps/"):
-        result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
+        started = api.mutation("run.step", {
+            "run": run_id,
+            "node": action[len("steps/"):],
+            "set": body.get("set") or {},
+            **({"base_version": base_version} if base_version is not None else {}),
+        }, None)["run"]
+        result = tasks.answer(str(started.get("issue") or ""), started.get("repo") or "", started["id"],
+                              started["status"], "started")
     else:
         raise NoRoute
     if result.get("run") and result["run"] != run_id and action in ("answer", "repair", "resume"):
@@ -1458,8 +1498,23 @@ def post_approval(handler, rest, query):
 
 def post_task(handler, rest, query):
     b = handler.body()
-    return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")),
-                       force=b.get("force") is not False)
+    res = api.mutation("task.create", {
+        "repo": str(b.get("repo") or ""),
+        "body": str(b.get("prompt") or ""),
+        "title": str(b.get("title") or ""),
+        "kind": str(b.get("kind") or ""),
+        "ticket": str(b.get("ticket") or ""),
+        "force": b.get("force") is not False,
+        "start": True,
+    }, None)
+    run = res.get("run") or {}
+    return {
+        "task": res["task"]["id"],
+        "repo": res["task"]["repo"],
+        "run": run.get("id", ""),
+        "state": res.get("state", ""),
+        "why": res.get("why", ""),
+    }
 
 
 def post_sessions(handler, rest, query):
@@ -1499,7 +1554,8 @@ def post_device(handler, rest, query):
 
 
 def post_triage_refresh(handler, rest, query):
-    return {"run": loop_run.launch("triage")["id"]}
+    res = api.mutation("triage.refresh", {}, None)
+    return {"run": res.get("run") or ""}
 
 
 def post_triage(handler, rest, query):
@@ -1509,17 +1565,28 @@ def post_triage(handler, rest, query):
         return handler.publish("/api/triage/{ref}/send", {"ref": raw_ref},
                                lambda publication=None: handler.send_ticket(ref, publication))
     if action == "research":
-        return research_ticket(ref, handler.body().get("force") is True)
+        res = api.mutation("triage.research", {"ticket": ref, "force": handler.body().get("force") is True}, None)
+        return {"ref": res["ref"], "run": res.get("run") or ""}
     raise NoRoute
 
 
 def post_checks_run(handler, rest, query):
-    return {"run": loop_run.launch("heartbeat")["id"]}
+    res = api.mutation("health.check", {}, None)
+    return {"run": "", "ok": res["ok"]}
 
 
 def post_skipped(handler, rest, query):
     name, _, action = unquote(rest).rpartition("/")
     if action == "run":
+        item = inbox_store.get_open_by_subject(f"skipped:{name}")
+        if item is not None:
+            return inbox.resolve(
+                item["id"],
+                base_version=item["version"],
+                verb="accept",
+                credential=handler.credential,
+                allow_legacy_auth=True,
+            )["result"]
         return pipeline.run_skipped(name)
     raise NoRoute
 

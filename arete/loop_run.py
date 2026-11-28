@@ -407,7 +407,8 @@ class NeverBegan(control.Refused):
 
 
 def launch(name: str, *, item: int | None = None, events: list[dict] | None = None, trial: bool = False,
-           detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
+           detach: bool = True, run_id: str = "", cfg: config.Config | None = None,
+           wait: bool = True) -> dict:
     from .store import factory as factory_state
 
     factory_state.admit()
@@ -452,7 +453,8 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
             continues_id = (fire.get("last_run") or None) if fire else None
             restart_kind = "interrupted" if continues_id else ""
             with principals.acting(started_by_val):
-                record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
+                record.start("loop", run_id=run.id, status="queued" if detach else "running",
+                             lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
                              repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
                              device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                              log=paths.short_path(run.log_file), model=model, runner=runner_name,
@@ -468,10 +470,11 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
             with (pins.use(pin_res) if pin_res is not None else nullcontext()):
                 carry(run)
             return run_store.run_get(run.id)
+        record.write_launch(run.id, control.command(["loop", "exec", "--run-id", run.id]), control.DETACHED_LOG)
         with principals.acting(started_by_val):
             proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
         util.mark_holder(held, proc.pid)
-    return began(run, proc)
+    return began(run, proc) if wait else run_store.run_get(run.id)
 
 
 def began(run: LoopRun, proc: subprocess.Popen) -> dict:
@@ -479,7 +482,7 @@ def began(run: LoopRun, proc: subprocess.Popen) -> dict:
     while time.monotonic() < deadline:
         exited = proc.poll() is not None
         r = run_store.run_get(run.id)
-        if r["pid"] or r["status"] != "running":
+        if r["pid"] or r["status"] not in ("queued", "running"):
             return r
         if exited:
             why = (f"`loop exec` exited with {proc.returncode} before it began; see "
@@ -494,13 +497,13 @@ def carry_opened(run_id: str) -> str:
     from . import pins
 
     r = run_store.run_get(run_id)
-    if not r or r["kind"] != "loop" or r["status"] != "running":
+    if not r or r["kind"] != "loop" or r["status"] not in ("queued", "running"):
         raise control.NotFound(f"no loop run {run_id} waits to begin")
     pin_res = pins.resolve("loop", repo=r["repo"] or None, loop_name=r["loop"])
     cfg = pin_res.cfg
     run = LoopRun(loops.find(r["loop"], cfg), run_id, cfg, trial=r["trigger"] == "try", trigger=r["trigger"])
     run.events = util.read_json(run.events_file, [])
-    record.attach_pin(run_id, pin_res, pid=os.getpid())
+    record.claim(run_id, pid=os.getpid(), resolution=pin_res)
     with pins.use(pin_res):
         return carry(run)
 

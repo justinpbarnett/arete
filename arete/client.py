@@ -38,8 +38,12 @@ BROKE = (OSError, http.client.HTTPException)
 LEGACY_ROUTES = {
     "task.list": "/api/tasks",
     "run.stop": "/api/runs/{run}/stop",
+    "run.resume": "/api/runs/{run}/resume",
+    "run.repair": "/api/runs/{run}/repair",
     "loop.enable": "/api/loops/{loop}/enable",
     "loop.disable": "/api/loops/{loop}/disable",
+    "loop.start": "/api/loops/{loop}/start",
+    "session.start": "/api/sessions",
 }
 API_1_2_ONLY = frozenset({"status.get", "task.create", "comment.create", "task.close",
                           "run.pin", "run.unpin", "run.steer"})
@@ -513,7 +517,7 @@ def request(method: str, path: str, body: dict | None = None,
         time.sleep(min(pause, left))
 
 
-def request_once(method: str, path: str, body: dict | None = None,
+def request_once(method: str, path: str, body: dict | bytes | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
                  key: str | None = None, *, deadline: float | None = None,
                  where: Server | None = None, buffered: bool = False, token: str | None = None,
@@ -521,7 +525,10 @@ def request_once(method: str, path: str, body: dict | None = None,
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
     where = where or server()
-    payload = json.dumps(body or {}).encode() if method != "GET" else None
+    if isinstance(body, bytes):
+        payload = body
+    else:
+        payload = json.dumps(body or {}).encode() if method != "GET" else None
     followed = False
     if within is not None:
         read_seconds = within if read_seconds is None else min(read_seconds, within)
@@ -541,7 +548,7 @@ def request_once(method: str, path: str, body: dict | None = None,
                     if key is not None:
                         headers["Idempotency-Key"] = key
                     if payload is not None:
-                        headers["Content-Type"] = "application/json"
+                        headers.setdefault("Content-Type", "application/octet-stream" if isinstance(body, bytes) else "application/json")
                         headers["X-Arete-Instance"] = where.instance
                     if deadline is not None:
                         budget_left(deadline)
@@ -790,6 +797,19 @@ def legacy_answer(method, operation, legacy, body, key, where, deadline):
         answer = {"loop": answer, **({"seq": seq} if seq else {})}
         if not seq:
             schema = {**schema, "required": [name for name in schema["required"] if name != "seq"]}
+    if operation["name"] == "session.start":
+        if "session" not in answer:
+            return answer
+    if operation["name"] == "loop.start":
+        if isinstance(answer.get("run"), str):
+            return {"run": {"id": answer["run"], "status": "running", "version": 1}}
+        if "id" in answer and not isinstance(answer.get("run"), dict):
+            return {"run": {"id": answer["id"], "status": "running", "version": 1}}
+    if operation["name"] in ("run.resume", "run.repair", "run.step"):
+        if isinstance(answer.get("run"), str):
+            return {"run": {"id": answer["run"], "status": "queued", "version": 1}}
+        if not isinstance(answer.get("run"), dict):
+            return answer
     if method == "GET":
         answer.pop("seq", None)
         schema = {**schema, "required": [name for name in schema["required"] if name != "seq"]}
@@ -821,7 +841,7 @@ def answer_object(raw, method, path):
     return value
 
 
-def keyed_call(body, key, *, deadline=None):
+def keyed_call(body, key, *, deadline=None, path="/api/tasks"):
     deadline = deadline if deadline is not None else time.monotonic() + RESTART_WAIT_SECONDS
     where = server(deadline)
     token = stored_token(where) or ""
@@ -841,9 +861,9 @@ def keyed_call(body, key, *, deadline=None):
             if replaying:
                 check_replay(where, deadline)
             replaying = True
-            resp = request_once("POST", "/api/tasks", body, within=budget_left(deadline), key=key, deadline=deadline,
+            resp = request_once("POST", path, body, within=budget_left(deadline), key=key, deadline=deadline,
                                 where=where, token=token)
-            answer = answer_object(read_response(resp, deadline), "POST", "/api/tasks")
+            answer = answer_object(read_response(resp, deadline), "POST", path)
             budget_left(deadline)
             return answer
         except BROKE as e:
@@ -869,12 +889,54 @@ def keyed_call(body, key, *, deadline=None):
         time.sleep(min(pause, max(0, deadline - time.monotonic())))
 
 
+def put_blob(data: bytes, *, key: str | None = None) -> str:
+    sha = hashlib.sha256(data).hexdigest()
+    upload_hooks_before_write()
+    chosen = key if key is not None else write_key(scope=f"blob:{sha[:12]}")
+    where = server()
+    resp = request("PUT", f"/api/v1/blobs/{sha}", data, key=chosen, where=where, buffered=True,
+                   extra_headers={"Content-Type": "application/octet-stream"})
+    decoded(resp, "PUT", f"/api/v1/blobs/{sha}")
+    return sha
+
+
+def _v1_start_body(body: dict) -> dict:
+    out: dict = {"repo": body.get("repo", ""), "start": True}
+    if body.get("prompt"):
+        out["body"] = body["prompt"]
+    elif body.get("body"):
+        out["body"] = body["body"]
+    for field_name in ("title", "kind", "ticket", "force"):
+        if field_name in body and body[field_name] not in (None, ""):
+            out[field_name] = body[field_name]
+    return out
+
+
 def start_task(body, key=None):
     upload_hooks_before_write()
     deadline = time.monotonic() + RESTART_WAIT_SECONDS
     chosen = write_key(exact=key)
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
-    return keyed_call(body, chosen, deadline=deadline)
+    v1_body = _v1_start_body(body)
+    try:
+        answer = keyed_call(v1_body, chosen, deadline=deadline, path="/api/v1/tasks")
+    except Failed as e:
+        if e.code in (404, 422) and (unknown_route(e, "POST", "/api/v1/tasks") or reason(e.answer) == "unknown_field"):
+            return keyed_call(body, chosen, deadline=deadline, path="/api/tasks")
+        raise
+    task_val = answer.get("task")
+    if not isinstance(task_val, dict):
+        return answer
+    run_val = answer.get("run")
+    run_obj = run_val if isinstance(run_val, dict) else {}
+    run_id = run_obj.get("id", "") if isinstance(run_val, dict) else (run_val or "")
+    return {
+        "task": task_val.get("id", body.get("ticket", "")),
+        "repo": task_val.get("repo", body.get("repo", "")),
+        "run": run_id,
+        "state": answer.get("state") or (run_obj.get("status", "queued") if run_obj else "queued"),
+        "why": answer.get("why") or ("started" if run_id else "queued"),
+    }
 
 
 def stream(path: str, query: dict) -> Iterator[dict]:
@@ -905,8 +967,20 @@ def run_command(run_id: str, action: str, body: dict | None = None, *, key_scope
         key = write_key(scope=key_scope)
         version = resolved_write(key, [run_id, action, body], lambda: field(run_info(run_id), "version", "run.version"))
         data = {**(body or {}), "base_version": version}
-        if action == "stop":
-            answer = call("POST", run_path(run_id, "stop", prefix="/api/v1"), data, key)
+        if action in ("stop", "resume", "repair", "step"):
+            v1_path = run_path(run_id, action, prefix="/api/v1")
+            try:
+                answer = call("POST", v1_path, data, key)
+            except Failed as e:
+                if action == "step" and unknown_route(e, "POST", v1_path):
+                    node = data.get("node", "")
+                    legacy_data = {k: v for k, v in data.items() if k != "node"}
+                    legacy = call("POST", run_path(run_id, f"steps/{quote(str(node), safe='')}"), legacy_data, key)
+                    if isinstance(legacy.get("run"), str):
+                        legacy = {"run": {"id": legacy["run"], "status": "queued", "version": 1}}
+                    emit(legacy)
+                    return 0
+                raise
             emit({k: v for k, v in answer.items() if k != "seq"})
         else:
             emit(call("POST", run_path(run_id, action), data, key))

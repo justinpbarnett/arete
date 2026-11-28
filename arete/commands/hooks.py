@@ -42,15 +42,25 @@ def cmd_events(args) -> int:
 
 
 def cmd_heartbeat(args) -> int:
-    from .. import heartbeat
+    import os
 
-    return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
+    if args.dry_run or os.environ.get("ARETE_LOOP"):
+        from .. import heartbeat
+
+        return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
+    res = client.call("POST", "/api/v1/health/check", {
+        "dry_run": args.dry_run,
+        "force_probes": args.force_probes,
+        "quiet": args.quiet,
+    })
+    return int(res.get("code", 0))
 
 
 def oncall_scan(args) -> int:
     from .. import oncall
 
-    summary = oncall.scan(config.load())
+    res = client.call("POST", "/api/v1/incidents/scan", {})
+    summary = res.get("summary")
     if summary is None:
         print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
     elif "skipped" in summary:

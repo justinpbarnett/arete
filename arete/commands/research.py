@@ -51,21 +51,45 @@ def cmd_poll(args) -> int:
 
 
 def cmd_mine(args) -> int:
-    from .. import miner
+    import os
 
-    return miner.run(hours=args.hours, dry_run=args.dry_run, apply=not args.no_apply)
+    if args.dry_run or os.environ.get("ARETE_LOOP"):
+        from .. import miner
+
+        return miner.run(hours=args.hours, dry_run=args.dry_run, apply=not args.no_apply)
+    from .. import client
+
+    res = client.call("POST", "/api/v1/loops/mine/start", {})
+    print(f"started {client.field(res, 'run')['id']}")
+    return 0
 
 
 def cmd_audit(args) -> int:
-    from .. import auditor
+    import os
 
-    return auditor.run(dry_run=args.dry_run)
+    if args.dry_run or os.environ.get("ARETE_LOOP"):
+        from .. import auditor
+
+        return auditor.run(dry_run=args.dry_run)
+    from .. import client
+
+    res = client.call("POST", "/api/v1/loops/audit/start", {})
+    print(f"started {client.field(res, 'run')['id']}")
+    return 0
 
 
 def cmd_eval(args) -> int:
-    from .. import eval_mine, evals
+    import os
 
     words = args.target
+    if not args.dry_run and not os.environ.get("ARETE_LOOP") and not words and not (args.task or args.ref or args.prompts):
+        from .. import client
+
+        res = client.call("POST", "/api/v1/loops/eval/start", {})
+        print(f"started {client.field(res, 'run')['id']}")
+        return 0
+    from .. import eval_mine, evals
+
     if words[:1] == ["mine"] and len(words) <= 2:
         return eval_mine.run(words[1] if len(words) == 2 else "", limit=args.limit, dry_run=args.dry_run)
     if len(words) > 1:
@@ -82,12 +106,17 @@ def cmd_eval(args) -> int:
 
 
 def cmd_triage(args) -> int:
-    from .. import triage
+    import os
 
-    if args.refresh or args.dry_run:
+    from .. import client, triage
+
+    if args.dry_run or (args.refresh and os.environ.get("ARETE_LOOP")):
         code = triage.run(dry_run=args.dry_run)
         if args.dry_run:
             return code
+    elif args.refresh:
+        res = client.call("POST", "/api/v1/triage/refresh", {})
+        code = int(res.get("code", 0))
     else:
         code = 0
     if args.ref:
@@ -102,7 +131,10 @@ def cmd_triage(args) -> int:
 
 
 def cmd_research(args) -> int:
-    from .. import research, research_search
+    import os
+    from urllib.parse import quote
+
+    from .. import client, research, research_search
 
     if args.ref and args.evidence:
         found = research_search.shown(args.ref)
@@ -112,9 +144,15 @@ def cmd_research(args) -> int:
         print(found)
         return 0
     if args.next or (args.dry_run and not args.ref):
-        return research.next_due(dry_run=args.dry_run, asked=piped_events())
+        if args.dry_run or os.environ.get("ARETE_LOOP"):
+            return research.next_due(dry_run=args.dry_run, asked=piped_events())
+        res = client.call("POST", "/api/v1/triage/next/research", {"next": True})
+        return int(res.get("code", 0))
     if args.ref and args.run:
-        return research.run_now(args.ref, force=args.force, dry_run=args.dry_run)
+        if args.dry_run or os.environ.get("ARETE_LOOP"):
+            return research.run_now(args.ref, force=args.force, dry_run=args.dry_run)
+        res = client.call("POST", f"/api/v1/triage/{quote(args.ref, safe='')}/research", {"force": args.force})
+        return int(res.get("code", 0))
     if args.ref:
         shown = research.shown(args.ref)
         if shown is None:

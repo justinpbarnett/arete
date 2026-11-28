@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import codebase, config, owner_asks, principals, run_lines, util
+from . import codebase, config, owner_asks, paths, principals, run_lines, util
 from .agent import NO_SESSION, Session
 from .store import runs as run_store
 
@@ -548,15 +548,34 @@ class Flow:
 
 
 def tally(run_id: str) -> dict[str, dict]:
+    from .store import db as foundation
+
+    if not paths.DB_FILE.exists():
+        return {}
+    try:
+        rows = run_store.steps(run_id, connect=foundation.reader)
+    except (foundation.NoDatabase, foundation.IncompatibleSchema):
+        return {}
     found: dict[str, list] = {}
-    for line in run_lines.read(run_id):
-        if line.get("event") == "step_end" and not line.get("carried"):
-            counts = found.setdefault(str(line.get("step") or ""), [0, 0.0, 0.0])
-            counts[0] += 1
-            counts[1] += amount(line, "seconds")
-            counts[2] += amount(line, "cost_usd")
-    return {name: {"tries": n, "minutes": round(seconds / 60, 2), "cost_usd": round(cost, 6)}
-            for name, (n, seconds, cost) in found.items()}
+    for row in rows:
+        name = str(row.get("node") or row.get("step") or "")
+        entry = found.setdefault(name, [set(), 0, 0.0, 0.0])
+        try_no = int(row.get("try") or 0)
+        if try_no > 0:
+            entry[0].add(try_no)
+        else:
+            entry[1] += 1
+        entry[2] += float(row.get("seconds") or 0.0)
+        entry[3] += float(row.get("cost_usd") or 0.0)
+    return {
+        name: {
+            "tries": len(tries) + untried,
+            "seconds": round(seconds, 2),
+            "minutes": round(seconds / 60, 2),
+            "cost_usd": round(cost, 6),
+        }
+        for name, (tries, untried, seconds, cost) in found.items()
+    }
 
 
 def overrides(sets: list[str], role_of: dict[str, str]) -> dict[str, dict]:
@@ -599,6 +618,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--only-action", action="store_true", help="rerun only --action, without controller or publication")
     p.add_argument("--restart", default="", choices=("", "answer", "resume", "step"),
                    help="why this run restarts an earlier one")
+    p.add_argument("--run-id", dest="run_id", default="", help=argparse.SUPPRESS)
     p.add_argument("--set", dest="sets", action="append", default=[], metavar="STEP.KEY=VALUE",
                    help="override one setting of one step; repeat for more")
     args = p.parse_args(argv)
@@ -612,7 +632,8 @@ def main(argv: list[str] | None = None) -> None:
                              restart, adw=args.adw)
     try:
         with principals.acting(principals.cli_actor()):
-            code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
+            code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script,
+                                      run_id=args.run_id)
     except config.UnknownRepo as e:
         raise SystemExit(str(e)) from None
     raise SystemExit(code)

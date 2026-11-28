@@ -148,11 +148,14 @@ def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
         step, attempt = str(fields.get("step", "")), fields.get("try", 1)
-        with principals.acting(f"run:{run_id}/{step}"), foundation.tx():
-            row = run_store.run_get(run_id)
-            events.emit("step.started" if event == "step_start" else "step.ended",
-                        f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,
-                        data={**fields, "run": run_id, "step": step, "try": attempt})
+        if paths.DB_FILE.exists():
+            with principals.acting(f"run:{run_id}/{step}"), foundation.tx():
+                row = run_store.run_get(run_id)
+                step_ver = run_store.step_version(run_id, step, int(attempt) if isinstance(attempt, int) else 1)
+                events.emit("step.started" if event == "step_start" else "step.ended",
+                            f"step:{run_id}/{step}/{attempt}", cls="derived", ver=step_ver,
+                            task=row["issue"] if row else None,
+                            data={**fields, "run": run_id, "step": step, "try": attempt})
     if check:
         check()
     else:

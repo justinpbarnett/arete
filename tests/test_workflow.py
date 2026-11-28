@@ -691,27 +691,35 @@ class TaskSlotQueueFallbackTests(unittest.TestCase):
         return [sys.executable, "-c", f"raise SystemExit({code})"]
 
     def begin_with_exit(self, code):
-        def spawn(repo, tid, force):
+        def spawn(repo, tid, force, *, run_id=""):
             return tasks.control.launch(self.child_command(code), pipeline.RUNS_LOG)
 
         with mock.patch.object(pipeline, "spawn_run", side_effect=spawn):
             return tasks.begin(self.cfg, self.repo, "936", force=True, poller_picks=True)
 
     def test_begin_queues_slot_refusal_even_when_a_slot_is_free(self):
-        result = self.begin_with_exit(pipeline.SLOT_QUEUE_FAILED_EXIT)
+        with mock.patch.object(tasks, "held", return_value="all 1 slots busy"):
+            result = tasks.begin(self.cfg, self.repo, "936", force=True, poller_picks=True)
         self.assertEqual(result["state"], "queued")
         row, = pipeline.source_store.tickets_passed_over()
         self.assertEqual((row["repo"], row["issue"]), (self.repo.name, "936"))
 
-    def test_begin_still_refuses_other_exits_when_a_slot_is_free(self):
-        with self.assertRaisesRegex(tasks.control.Refused, "did not show as running"):
-            self.begin_with_exit(1)
-        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+    def test_begin_commits_queued_run_without_waiting_on_child(self):
+        result = self.begin_with_exit(1)
+        self.assertEqual(result["state"], "running")
+        row = run_store.run_get(result["run"])
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "queued")
+        self.assertIsNone(row["pid"])
 
-    def test_launch_queues_slot_refusal(self):
+    def test_launch_commits_queued_run_without_waiting_on_child(self):
         command = self.child_command(pipeline.SLOT_QUEUE_FAILED_EXIT)
         result = tasks.launch(self.cfg, self.repo, "936", command)
-        self.assertEqual(result["state"], "queued")
+        self.assertEqual(result["state"], "running")
+        row = run_store.run_get(result["run"])
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "queued")
+        self.assertIsNone(row["pid"])
 
 
 class PolicyRetryCapTests(unittest.TestCase):
@@ -2059,14 +2067,15 @@ class RestoredPRRevisionTests(unittest.TestCase):
               mock.patch.object(pipeline, "adw_command", side_effect=lambda *args: list(args)),
               mock.patch.object(pipeline, "SKIPPED_FILE", state / "skipped.json"),
               mock.patch.object(tasks, "spawn_pending", side_effect=launch_pending),
-              mock.patch.object(poll, "spawn_run", side_effect=start) as spawn,
+              mock.patch.object(tasks, "spawn_queued", side_effect=launch_pending),
+              mock.patch.object(poll, "spawn_run", side_effect=lambda repo_name, tid, *, run_id="": start(repo_name, tid)) as spawn,
               mock.patch.multiple(poll, network_up_or_skip=mock.Mock(return_value=True),
                                   settle_abandoned_runs=mock.DEFAULT, sync_labels=mock.DEFAULT,
                                   retry_scratch=mock.DEFAULT, mark_loop=mock.DEFAULT),
               mock.patch.multiple(outcomes, sync_outcomes=mock.DEFAULT, sync_moves=mock.DEFAULT,
                                   sync_landings=mock.DEFAULT), redirect_stdout(StringIO()) as output):
             self.assertEqual(poll.poll(), 0, output.getvalue())
-        spawn.assert_called_once_with(repo.name, self.run.tid)
+        spawn.assert_called_once_with(repo.name, self.run.tid, run_id=mock.ANY)
         self.assertEqual(self.merge.call_count, 2)
 
 

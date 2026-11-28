@@ -77,7 +77,28 @@ def cmd_record(args) -> int:
                 return 0
             except FileNotFoundError:
                 pass
-    elif path := record.find_record(args.run_id, args.step):
+    elif not args.raw:
+        node = args.step.removesuffix(record.RECORD_SUFFIX)
+        try_no = getattr(args, "try_no", 0) or 0
+        try:
+            if not try_no:
+                step_rows = client.field(client.call("GET", f"/api/v1/steps?run={quote(args.run_id, safe='')}"), "steps")
+                matching = [int(s.get("try") or 1) for s in step_rows
+                            if s.get("node") == node or s.get("name") == node or s.get("name") == args.step]
+                try_no = max(matching) if matching else 1
+            turn_res = client.call(
+                "GET",
+                f"/api/v1/runs/{quote(args.run_id, safe='')}/steps/{quote(node, safe='')}/{try_no}/turns",
+            )
+            turns = client.field(turn_res, "turns", kind=list)
+            print_lines(json.dumps(t, ensure_ascii=False) for t in turns)
+            return 0
+        except client.Down:
+            pass
+        except client.Failed as err:
+            if err.code != 404 or not record.find_record(args.run_id, args.step):
+                raise
+    if path := record.find_record(args.run_id, args.step):
         print_lines(record.raw_lines(path) if args.raw else (json.dumps(e, ensure_ascii=False)
                     for e in record.events(path)))
         return 0
@@ -154,9 +175,10 @@ def register(sub) -> None:
                                       "events; `pin RUN_ID` and `unpin RUN_ID` keep a record from rotating out")
     p.add_argument("run_id", help="a run id, or pin RUN_ID or unpin RUN_ID")
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
+    p.add_argument("--try", dest="try_no", type=int, default=0, help="step attempt number for turn.list")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
-    p.set_defaults(fn=cmd_record, local_read=lambda args: args.run_id not in ("pin", "unpin"))
+    p.set_defaults(fn=cmd_record, local_read=lambda args: args.run_id not in ("pin", "unpin") and not args.step)
 
     p = sub.add_parser("document", help="write a short message, ticket, PR text or doc edit from a JSON brief of "
                                         "verified facts; prints one JSON line")

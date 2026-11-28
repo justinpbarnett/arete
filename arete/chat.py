@@ -82,7 +82,7 @@ def summary(row: dict) -> dict:
             "updated": row["updated"], "spent": row["paid_usd"], "reported_cost": row["spent"],
             "unclassified_messages": row["unclassified_messages"], "busy": bool(row["busy"]),
             "drafted": bool(row["draft_title"]),
-            "running_sessions": sum(s["status"] == "running" for s in chats_store.chat_sessions(row["id"]))}
+            "running_sessions": sum(s["status"] in ("running", "queued") for s in chats_store.chat_sessions(row["id"]))}
 
 
 def listing() -> dict:
@@ -134,7 +134,7 @@ def folder(project: str) -> str:
         return ""
 
 
-def new(project: str) -> dict:
+def new(project: str, *, payer: str | None = None) -> dict:
     project = project.strip()
     if project:
         cfg = config.load()
@@ -146,7 +146,7 @@ def new(project: str) -> dict:
             raise BadProject(f"'{project}' is not a repo in the config; {pick}") from None
         if not repo.path.is_dir():
             raise BadProject(f"{project}'s folder {paths.short_path(repo.path)} is not there")
-    return view(chats_store.chat_add(project))
+    return view(chats_store.chat_add(project, payer=payer))
 
 
 def title_of(text: str, limit: int = TITLE_CHARS) -> str:
@@ -160,7 +160,7 @@ def answer_lock(chat_id: int) -> str:
     return f"chat-{chat_id}"
 
 
-def send(chat_id: int, text: str) -> dict:
+def send_v1(chat_id: int, text: str, *, queue_if_busy: bool = True) -> tuple[dict, dict | None, bool]:
     from . import factory_control, pins, principals
     from .store import factory as factory_state
 
@@ -170,15 +170,31 @@ def send(chat_id: int, text: str) -> dict:
     held = util.lock_file(answer_lock(chat_id))
     actor = principals.current()
     try:
-        if not util.take_lock(held, wait=False) or not (message_id := chats_store.chat_claim(chat_id, text, title_of(text))):
+        if not util.take_lock(held, wait=False):
+            if queue_if_busy and (live := run_store.live_chat_run(chat_id)):
+                chats_store.chat_queue_message(chat_id, text)
+                held.close()
+                return view(chat_id), live, False
             raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
         row = chat_row(chat_id)
         pin_res = pins.resolve("chat", repo=row["project"] or None)
-        run_id = record.start("chat", tag=f"chat-{chat_id}", repo=row["project"] or None, resolution=pin_res)
+        with foundation.tx():
+            message_id = chats_store.chat_claim(chat_id, text, title_of(text))
+            if not message_id:
+                if queue_if_busy and (live := run_store.live_chat_run(chat_id)):
+                    chats_store.chat_queue_message(chat_id, text)
+                    held.close()
+                    return view(chat_id), live, False
+                raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
+            run_id = record.start(
+                "chat", tag=f"chat-{chat_id}", status="queued", pid=None,
+                repo=row["project"] or None, resolution=pin_res,
+            )
 
         def locked_answer() -> None:
             with held, principals.acting(actor), pins.use(pin_res):
                 try:
+                    record.claim(run_id)
                     with factory_control.activity("chat", version):
                         answer(chat_id, text, message_id, row["project"], run_id=run_id)
                 except factory_state.Off as error:
@@ -189,7 +205,12 @@ def send(chat_id: int, text: str) -> dict:
     except BaseException:
         held.close()
         raise
-    return view(chat_id)
+    return view(chat_id), run_store.run_get(run_id), True
+
+
+def send(chat_id: int, text: str) -> dict:
+    shown, _, _ = send_v1(chat_id, text, queue_if_busy=False)
+    return shown
 
 
 def answer(chat_id: int, text: str, message_id: int, project: str, *, run_id: str = "") -> None:
@@ -341,7 +362,7 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
                 cwd, model=cfg.chat.summary_model, tools=[], persist=False,
                 timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
                 hard_cap=True, wait_out_limits=False,
-                trace=(trace_run, f"chat {chat_id} summary"), cfg=cfg)
+                trace=(trace_run, f"chat {chat_id} summary"), cfg=cfg, chat_id=chat_id)
         cost, paid = cost + res.cost_usd, paid + res.paid_usd
         summary = capped(res.text.strip(), summary_limit(cfg)) if res.ok else ""
         if not summary:
@@ -481,9 +502,9 @@ def drop_draft(chat_id: int) -> dict:
 def limits(chat_id: int, row: dict, cfg: config.Config) -> dict:
     links = chats_store.chat_sessions(chat_id)
     paid = run_store.paid_by_run([link["run_id"] for link in links])
-    running = [link for link in links if link["status"] == "running"]
+    running = [link for link in links if link["status"] in ("running", "queued")]
     spent = row["paid_usd"] + replying.get(chat_id, 0) + sum(
-        max(link["budget_usd"] or 0, paid.get(link["run_id"], 0)) if link["status"] == "running"
+        max(link["budget_usd"] or 0, paid.get(link["run_id"], 0)) if link["status"] in ("running", "queued")
         else paid.get(link["run_id"], 0) for link in links)
     return {"max_sessions": cfg.chat.max_sessions, "running": len(running), "budget_usd": cfg.chat.budget_usd,
             "spent": round(spent, 4), "left": round(cfg.chat.budget_usd - spent, 4)}
@@ -609,6 +630,7 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
     return runner.run(
         prompt, work.path,
         trace=(run_id, f"chat {chat_id}"),
+        chat_id=chat_id,
         persist=False,
         cfg=cfg,
         repo=work,

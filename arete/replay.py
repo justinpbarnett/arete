@@ -47,8 +47,20 @@ def folder(cfg: config.Config) -> Path | None:
     return Path(os.path.abspath(paths.expand(found))) if found else None
 
 
+def version() -> str:
+    return "1"
+
+
 def answer_name(run_id: str, step: str) -> str:
-    earlier = sum(1 for s in run_store.steps(run_id) if s["step"] == step) if run_id else 0
+    earlier = (
+        sum(
+            1
+            for s in run_store.steps(run_id)
+            if s["step"] == step and s.get("status") not in ("queued", "waiting", "running")
+        )
+        if run_id
+        else 0
+    )
     return record.slug(step) + (str(earlier + 1) if earlier else "")
 
 

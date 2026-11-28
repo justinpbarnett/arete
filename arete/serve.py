@@ -645,6 +645,7 @@ class Server:
             self.say(f"lapsed {util.count(len(lapsed), 'expired lease')}")
 
     def reap(self) -> None:
+        recover_queued(self.say)
         for row in record.reap(tickets=False, release_claims=False):
             self.say(f"{row['id']}: {row['status']}, {record.INTERRUPTED}")
             self.swept = 0.0
@@ -1535,6 +1536,61 @@ def startup_beat() -> foundation.ServeChildren:
     return children
 
 
+def recover_queued(say: Callable[[str], None] = lambda text: None, *, min_age: float | None = None) -> list[dict]:
+    from . import pipeline
+
+    cutoff = pipeline.RUN_START_SECONDS if min_age is None else min_age
+    handled: list[dict] = []
+    for row in run_store.runs_queued():
+        run_id = row["id"]
+        kind = row.get("kind") or ""
+        try:
+            age = (util.now() - util.parse_iso(row["started"])).total_seconds()
+        except (TypeError, ValueError):
+            age = cutoff
+        if age < cutoff:
+            continue
+        if kind in ("chat", "import"):
+            if settled := record.settle(run_id, "interrupted", end_line=f"interrupted: {record.INTERRUPTED}",
+                                        summary=record.INTERRUPTED):
+                say(f"{run_id}: interrupted (unclaimed queued {kind})")
+                handled.append({"id": run_id, "action": "interrupted", "status": settled["status"]})
+            continue
+        saved = record.read_launch(run_id)
+        cmd = saved.get("command") if isinstance(saved.get("command"), list) and saved.get("command") else None
+        log_name = str(saved.get("log") or "")
+        try:
+            if cmd is None:
+                if kind == "session" and sessions.spec_file(run_id).is_file():
+                    cmd = control.command(["session", "exec", run_id])
+                    log_name = sessions.SESSION_LOG
+                elif kind == "loop" and row.get("loop"):
+                    cmd = control.command(["loop", "exec", "--run-id", run_id])
+                    log_name = control.DETACHED_LOG
+                elif kind == "pipeline" and row.get("repo") and row.get("issue"):
+                    cmd = pipeline.run_command(row["repo"], str(row["issue"]), run_id=run_id)
+                    log_name = pipeline.RUNS_LOG
+            if not cmd:
+                if settled := record.settle(run_id, "interrupted", end_line=f"interrupted: {record.INTERRUPTED}",
+                                            summary=record.INTERRUPTED):
+                    say(f"{run_id}: interrupted (unclaimed queued {kind} has no relaunch)")
+                    handled.append({"id": run_id, "action": "interrupted", "status": settled["status"]})
+                continue
+            if kind == "pipeline":
+                tasks.spawn_queued(row["repo"], str(row["issue"]),
+                                   lambda c=cmd, log=log_name or pipeline.RUNS_LOG: control.launch(c, log))
+            else:
+                control.launch(cmd, log_name or control.DETACHED_LOG)
+            say(f"{run_id}: relaunched unclaimed queued {kind}")
+            handled.append({"id": run_id, "action": "relaunched", "kind": kind})
+        except Exception as e:
+            if settled := record.settle(run_id, "interrupted", end_line=f"interrupted: {record.INTERRUPTED}",
+                                        summary=f"relaunch failed: {util.first_line(str(e), 200)}"):
+                say(f"{run_id}: interrupted (relaunch failed: {e})")
+                handled.append({"id": run_id, "action": "interrupted", "status": settled["status"]})
+    return handled
+
+
 def run(with_dashboard: bool = True) -> NoReturn:
     codebase.load()
     rotation_notes = install.rotate_own_log()
@@ -1587,6 +1643,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
                 from . import inbox
 
                 server.guard("stage:inbox-start", inbox.on_server_start)
+                server.guard("stage:queued-start", lambda: recover_queued(server.say))
             else:
                 server.guard("stage:inbox-config", server.sync_config_inbox)
         for note in start_notes(server.cfg):

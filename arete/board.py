@@ -581,7 +581,7 @@ def run_log(run_id: str) -> list[str]:
 def sidebar(talk: dict) -> dict:
     from . import inbox
 
-    running = run_store.runs_marked_running(connect=foundation.reader)
+    running = [r for r in run_store.runs_marked_running(connect=foundation.reader) if r.get("kind") != "chat"]
     board = functools.cache(lambda: triage.view(connect=foundation.reader))
     beat = control.serve_beat()
     with_questions = panel(lambda: triage.groups(board())[triage.WITH_QUESTIONS])
@@ -591,7 +591,7 @@ def sidebar(talk: dict) -> dict:
 
 
 def live_board(draft: dict | None, *, include_ticket_progress: bool = False) -> dict:
-    running = run_store.runs_marked_running(connect=foundation.reader)
+    running = [r for r in run_store.runs_marked_running(connect=foundation.reader) if r.get("kind") != "chat"]
     _, waits = skipped_split(running)
     result = {"now": util.iso(), "live": panel(lambda: live(running)), "waiting": panel(waiting),
               "dependency_waits": {"rows": waits},
@@ -803,7 +803,23 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
             raise control.NotFound(f"nothing has the id {run_id}")
         models: dict[tuple[str, str, str], dict] = {}
         local_providers = config.load_or_problem()[0].local_providers
-        for s in run_store.steps(run_id, connect=foundation.reader):
+        step_rows = run_store.steps(run_id, connect=foundation.reader)
+        board_steps = [
+            {
+                "id": s["id"],
+                "node": s.get("node") or s.get("step") or "",
+                "try": s.get("try") or 0,
+                "status": s.get("status") or ("done" if s.get("ok") else "fault"),
+                "queued_at": s.get("queued_at") or s.get("ts"),
+                "model": s.get("model") or "",
+                "account": s.get("account_id"),
+                "cost_usd": round(float(s.get("cost_usd") or 0.0), 6),
+            }
+            for s in step_rows
+        ]
+        for s in step_rows:
+            if s.get("status") in ("queued", "waiting"):
+                continue
             billing = control.billing_of(s, local_providers)
             metered = billing == "api_key"
             key = (s["model"] or "no model", s["runner"] or "no runner", billing)
@@ -831,6 +847,7 @@ def run_board(run_id: str, *, messages_after=0, include_ticket_progress: bool = 
                                              "ask_route": routes.get(run_id, "")},
                   "recovery": {k: recovery[k] for k in ("phase", "cause", "detail")} if recovery else None,
                   "models": rows,
+                  "steps": board_steps,
                   "orchestration": adaptive,
                   "approvals": [a for a in delivery.waiting(connect=foundation.reader) if a["run_id"] == run_id],
                   "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
