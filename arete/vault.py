@@ -114,8 +114,7 @@ def refusals(patch: str) -> list[str]:
     return [f"{hidden(path)} (holds the stored value of {', '.join(names)})" for path, names in held(patch).items()]
 
 
-def hidden(text: str, given: set[str] | None = None) -> str:
-    for value in sorted(values() if given is None else given, key=len, reverse=True):
-        for form in forms(value):
-            text = text.replace(form, REDACTED)
-    return text
+def hidden(text: str, given: set[str] | None = None, *, channel: str = "command_output", subject: str = "") -> str:
+    from . import scrub
+
+    return scrub.text(text, channel, subject, extra=given or ())

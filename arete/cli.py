@@ -88,9 +88,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd not in PER_CALL_HOOKS:
             codebase.load()
-    from . import client, config, paths, principals, refusals
+    from . import client, config, paths, principals, refusals, scrub
     from .store import db as foundation
 
+    scrub.wrap_stdio(args.cmd)
     try:
         local_read = getattr(args, "local_read", False)
         if (local_read(args) if callable(local_read) else local_read) and not paths.DB_FILE.is_file():

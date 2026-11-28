@@ -158,7 +158,7 @@ def supervise(command, timeout, owner, cancel, complete, inherited=()):
             return posix_members(group, known, adopted_by)
     deadline = time.monotonic() + timeout if timeout is not None else float("inf")
     try:
-        proc = subprocess.Popen(command, start_new_session=True, pass_fds=inherited)
+        proc = subprocess.Popen(command, env=os.environ, start_new_session=True, pass_fds=inherited)
     except FileNotFoundError as error:
         print(error, file=sys.stderr)
         complete(127, False)

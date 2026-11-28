@@ -64,8 +64,8 @@ def binary() -> str:
 def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,
               api_key: str = "", openrouter_config: Path | None = None, model: str = "") -> dict[str, str]:
     passing = environment.passed(config.load()) if passing is None else passing
-    env = {k: v for k, v in environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})},
-                                             never=PARENT_SESSION_VARS, source=source).items()
+    env = {k: v for k, v in environment.build(["CLAUDE_CONFIG_DIR", *passing], {**AGENT_SETS, **(extra or {})},
+                                             role="runner:claude", never=PARENT_SESSION_VARS, source=source).items()
            if k not in PARENT_SESSION_VARS}
     if openrouter_config is not None:
         env = {k: v for k, v in env.items() if k not in OPENROUTER_WITHHELD and not k.startswith("ANTHROPIC_")}
@@ -146,8 +146,7 @@ def auth_status(env: dict | None = None) -> dict:
     if paths.ISOLATED:
         return {}
     try:
-        res = util.sh([binary(), "auth", "status"], timeout=10, env=env if env is not None else agent_env(),
-                      inherit=False)
+        res = util.sh([binary(), "auth", "status"], timeout=10, env=env if env is not None else agent_env())
         return accounts.mapping(json.loads(res.stdout)) if res.returncode == 0 else {}
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}

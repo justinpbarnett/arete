@@ -1,6 +1,7 @@
 import json
 
 from .. import events, principals, util
+from . import db
 
 TABLES = {"secrets": "kept", "secret_events": "kept", "accounts": "kept"}
 
@@ -40,8 +41,42 @@ def has_fingerprints(c):
                           "SELECT 1 FROM secrets WHERE fingerprint IS NOT NULL)").fetchone()[0])
 
 
+def has_expose_rules(c):
+    return db.migration_applied(db.SECRET_EXPOSE_SCHEMA, c)
+
+
+def latest_lifecycle_id(c):
+    row = c.execute("""
+        SELECT COALESCE(MAX(id), 0) FROM secret_events
+        WHERE event IN ('set', 'rotated', 'moved', 'removed')
+        """).fetchone()
+    return int(row[0]) if row else 0
+
+
 def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider,
-                *, rotated=False, managed_by=None):
+                *, rotated=False, managed_by=None, expose=None):
+    if has_expose_rules(c):
+        default_rules = [{"env": name, "roles": ["step:*", "runner:*"]}] if scope.startswith("repo:") else []
+        insert_rules = default_rules if expose is None else expose
+        insert_flag = 1 if insert_rules else 0
+        insert_json = json.dumps(insert_rules)
+        update_flag = None if expose is None else (1 if expose else 0)
+        update_json = None if expose is None else json.dumps(expose)
+        return dict(c.execute("""
+            INSERT INTO secrets (scope, name, kind, store, reference, expose, expose_rules, fingerprint, status,
+                                 set_by, set_at, provider, rotated_at, managed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'set', ?, ?, ?, ?, ?)
+            ON CONFLICT (name, scope) DO UPDATE SET
+                kind = excluded.kind, fingerprint = excluded.fingerprint, status = 'set', missing_since = NULL,
+                set_by = excluded.set_by, set_at = excluded.set_at, version = secrets.version + 1,
+                provider = COALESCE(excluded.provider, secrets.provider),
+                rotated_at = COALESCE(excluded.rotated_at, secrets.rotated_at),
+                managed_by = COALESCE(excluded.managed_by, secrets.managed_by),
+                expose = COALESCE(?, secrets.expose),
+                expose_rules = COALESCE(?, secrets.expose_rules)
+            RETURNING *
+            """, (scope, name, kind, store, reference, insert_flag, insert_json, fingerprint, actor, at, provider,
+                  at if rotated else None, managed_by, update_flag, update_json)).fetchone())
     return dict(c.execute("""
         INSERT INTO secrets (scope, name, kind, store, reference, fingerprint, status, set_by, set_at,
                              provider, rotated_at, managed_by)
@@ -55,6 +90,43 @@ def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, 
         RETURNING *
         """, (scope, name, kind, store, reference, fingerprint, actor, at, provider, at if rotated else None,
               managed_by)).fetchone())
+
+
+def set_expose(c, scope, name, rules):
+    flag = 1 if rules else 0
+    if has_expose_rules(c):
+        row = c.execute("""
+            UPDATE secrets SET expose = ?, expose_rules = ?, version = version + 1
+            WHERE scope = ? AND name = ? RETURNING *
+            """, (flag, json.dumps(rules), scope, name)).fetchone()
+    else:
+        row = c.execute("""
+            UPDATE secrets SET expose = ?, version = version + 1
+            WHERE scope = ? AND name = ? RETURNING *
+            """, (flag, scope, name)).fetchone()
+    return dict(row) if row else None
+
+
+def record_found_in_output(c, row, actor, channel, subject, count, at):
+    hour = at[:13]
+    existing = c.execute("""
+        SELECT id, detail FROM secret_events
+        WHERE secret_id = ? AND event = 'found_in_output' AND substr(at, 1, 13) = ?
+        ORDER BY id DESC
+        """, (row["id"], hour)).fetchall()
+    for item in existing:
+        try:
+            data = json.loads(item["detail"] or "")
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("channel") == channel:
+            total = (int(data.get("count") or 0) if isinstance(data.get("count"), int) else 0) + count
+            updated = {"channel": channel, "subject": subject or data.get("subject", ""), "count": total}
+            c.execute("UPDATE secret_events SET actor = ?, detail = ?, at = ? WHERE id = ?",
+                      (actor, json.dumps(updated), at, item["id"]))
+            return
+    detail = json.dumps({"channel": channel, "subject": subject, "count": count})
+    secret_event(c, row, "found_in_output", actor, at, ok=True, detail=detail)
 
 
 def mark_checked(c, row, ok, at, *, recovered=False):

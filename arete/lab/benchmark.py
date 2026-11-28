@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import accounts, config, devices, outbound, pi, secretstore, util
+from .. import accounts, config, devices, environment, outbound, pi, secretstore, util
 
 SCENARIOS = ("ok", "oom", "overflow", "malformed", "offline")
 SERVED = ("ok", "oom", "overflow", "malformed")
@@ -175,7 +175,8 @@ def read_candidate(name: str, raw: dict) -> Candidate:
     if base is None:
         key = ""
     else:
-        key = pi.configured_key(key, secretstore.env(pi.key_references(key) - pi.SERVICE_KEYS))
+        key = pi.configured_key(
+            key, {**environment.build((), role="runner:pi"), **secretstore.env(pi.key_references(key) - pi.SERVICE_KEYS)})
     return Candidate(name, raw["route"], provider, model, base or "", key, raw["quantization"], raw["runtime"],
                      raw["runtime_version"], raw["hardware"], raw["memory_gb"], window, device)
 

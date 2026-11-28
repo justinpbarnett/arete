@@ -116,9 +116,11 @@ def validate(p: dict, repo: config.Repo, recent: dict[str, ReviewComment],
 
 
 def compile_example(source: str) -> subprocess.CompletedProcess:
+    from . import environment
+
     return subprocess.run(
         [sys.executable, *COMPILE_ARGS, "<proposal example>"],
-        input=source, encoding="utf-8", capture_output=True, timeout=5, cwd="/",
+        input=source, encoding="utf-8", capture_output=True, timeout=5, cwd="/", env=environment.build(()),
     )
 
 
