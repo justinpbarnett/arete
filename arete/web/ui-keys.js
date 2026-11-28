@@ -10,7 +10,7 @@ export { notice };
 export const screenKeys = [
   ["f", "floor", "Floor", "#floor"],
   ["t", "triage", "Triage", "#triage"],
-  ["w", "my-work", "Open work", "#board/open-work"],
+  ["w", "my-work", "My work", "#board/open-work"],
   ["b", "board", "Board", "#board"],
   ["r", "runs", "Runs", "#run"],
   ["n", "intake", "Intake", "#intake"],
@@ -20,6 +20,15 @@ export const screenKeys = [
   ["v", "insights", "Insights", "#insights"],
   [",", "settings", "Settings", "#settings/health"],
 ];
+
+const myWorkListeners = new Set();
+export function onMyWork(listener) {
+  myWorkListeners.add(listener);
+  return () => myWorkListeners.delete(listener);
+}
+export function triggerMyWork() {
+  for (const listener of myWorkListeners) listener();
+}
 
 export const sheetGroups = [
   ["Go to", screenKeys.map(([key, , label]) => [[key], label])],
@@ -142,6 +151,7 @@ function place(list, row) {
 function move(index, relative) {
   const list = focusedList();
   if (!list) return;
+  if (list.uiMove?.(index, relative)) return;
   const rows = listRows(list);
   if (!rows.length) return;
   const active = document.activeElement;
@@ -246,6 +256,7 @@ function insert() {
 }
 
 function step(delta) {
+  if (focusedList()?.uiStep?.(delta)) return;
   const available = panes.filter((name) => paneElements(name).length);
   const at = available.indexOf(pane.value);
   activatePane(available[Math.max(0, Math.min(available.length - 1, (at < 0 ? 0 : at) + delta))] ?? pane.value);
@@ -281,8 +292,16 @@ function chord(key) {
   const prefix = pending.value;
   pending.value = "";
   if (prefix === "g" && key === "g") { move(0, false); return true; }
-  if (prefix === "g" && key === "t") { tab(1); return true; }
-  if (prefix === "g" && key === "T") { tab(-1); return true; }
+  if (prefix === "g" && key === "t") {
+    if (pane.peek() === "queue" && focusedList()?.uiCycleDisplay?.(1)) return true;
+    tab(1);
+    return true;
+  }
+  if (prefix === "g" && key === "T") {
+    if (pane.peek() === "queue" && focusedList()?.uiCycleDisplay?.(-1)) return true;
+    tab(-1);
+    return true;
+  }
   if (prefix === "g" && key === "x") { actionContext()?.run?.open?.(); return true; }
   if (prefix === "d" && key === "d") { destructive(); return true; }
   return prefix === "z" && key === "z";
@@ -309,7 +328,11 @@ function normal(event) {
   if (key === "c" && focusedList()?.uiCreate) { focusedList().uiCreate(); return true; }
   if (key === "g" || key === "d" || key === "z") { pending.value = key; return true; }
   const screen = screenKeys.find(([letter]) => letter === key);
-  if (screen) { go(screen[3]); return true; }
+  if (screen) {
+    if (screen[1] === "my-work") triggerMyWork();
+    go(screen[3]);
+    return true;
+  }
   const action = fixed[key];
   if (action === "down") move(1, true);
   else if (action === "up-row") move(-1, true);

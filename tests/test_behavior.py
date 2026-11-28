@@ -24741,3 +24741,207 @@ assert matches == [], f"forbidden DELETE SQL found in: {matches}"
 emit({"ok": True})
 """)
         self.assertTrue(res["ok"])
+
+
+class BoardUiTests(unittest.TestCase):
+    def test_board_assets_served_routes_and_csp_safe(self):
+        root = Path(__file__).resolve().parents[1]
+        web = root / "arete" / "web"
+        board_js = (web / "ui-board.js").read_text(encoding="utf-8")
+        board_css = (web / "ui-board.css").read_text(encoding="utf-8")
+        layouts_js = (web / "ui-board-layouts.js").read_text(encoding="utf-8")
+        projects_js = (web / "ui-board-projects.js").read_text(encoding="utf-8")
+        _, served = dashboard.web_snapshot()
+        for name in ("ui-board.js", "ui-board.css", "ui-board-layouts.js", "ui-board-projects.js"):
+            self.assertIn(f"/{name}", served)
+            self.assertEqual(served[f"/{name}"][0], (web / name).read_bytes())
+        self.assertIn("/api/v1/screens/board", board_js)
+        self.assertIn("/api/v1/tasks", board_js)
+        self.assertNotIn("/api/tasks", board_js)
+        for heading in ("select", "ID", "Title", "State", "External", "Sync", "Source", "Line", "Owner", "P", "Updated"):
+            self.assertIn(heading, layouts_js)
+        self.assertIn("/api/v1/projects", projects_js)
+        self.assertIn("/api/v1/views", projects_js)
+        for text in (board_js, board_css, layouts_js, projects_js):
+            for forbidden in ("style=", "innerHTML", "insertAdjacentHTML"):
+                self.assertNotIn(forbidden, text)
+
+    def test_board_kanban_filters_writes_and_conflict_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { board, projects } from "./arete/web/ui-data.js";
+            import { allBoardState } from "./arete/web/ui-board-projects.js";
+            import {
+              boardUiState,
+              boardViewState,
+              createBoardTask,
+              filterAndSortTasks,
+              needsYouKind,
+              patchBoardTask,
+              sourceTag,
+            } from "./arete/web/ui-board.js";
+            import { notice, staleWrite } from "./arete/web/ui-notice.js";
+
+            const routes = board("needs-you");
+            assert.equal(routes.screen, "/api/v1/screens/board?id=needs-you");
+            assert.equal(routes.tasks, "/api/v1/tasks");
+            assert.equal(projects().list, "/api/v1/projects");
+            assert.equal(projects().views, "/api/v1/views");
+
+            const tasks = [
+              { id: "T-1", repo: "arete", project: "arete", title: "Intake task", state: "intake", priority: 2, owner: "u:justin", updated: "2026-11-27T10:00:00Z", version: 1, needs_you: 0, needs_you_ids: [] },
+              { id: "T-2", repo: "arete", project: "arete", title: "Needs you task", state: "needs-you", priority: 1, owner: "agent build", updated: "2026-11-27T11:00:00Z", version: 2, needs_you: 1, needs_you_ids: ["TR-1"], primary_ref: { system: "jira", key: "CAMP-42", ext_state: "In Progress", sync: "ahead" } },
+              { id: "T-3", repo: "arete", project: "arete", title: "Faulted task", state: "needs-you", fault: 1, priority: 1, owner: "agent build", updated: "2026-11-27T12:00:00Z", version: 1, needs_you: 1, needs_you_ids: [] },
+              { id: "T-4", repo: "arete", project: "arete", title: "Done task", state: "done", priority: 3, owner: "agent build", updated: "2026-11-27T09:00:00Z", version: 1, needs_you: 0, needs_you_ids: [] },
+            ];
+            assert.equal(sourceTag(tasks[1]), "JIRA");
+            assert.equal(needsYouKind(tasks[1], [{ id: "TR-1", kind: "choice", task_id: "T-2" }]), "choice");
+            assert.equal(needsYouKind(tasks[2], []), "fault");
+            assert.deepEqual(filterAndSortTasks(tasks, { filters: ["mine"], layout: "board" }).map((t) => t.id), ["T-1"]);
+            assert.deepEqual(filterAndSortTasks(tasks, { filters: ["ny"], layout: "board" }).map((t) => t.id), ["T-3", "T-2"]);
+            assert.deepEqual(filterAndSortTasks(tasks, { filters: ["unsynced"], layout: "board" }).map((t) => t.id), ["T-2"]);
+            assert.deepEqual(filterAndSortTasks(tasks, { filters: ["agent"], layout: "board" }).map((t) => t.id), ["T-3", "T-2", "T-4"]);
+            assert.deepEqual(filterAndSortTasks(tasks, { filters: ["human"], layout: "board" }).map((t) => t.id), ["T-1"]);
+            assert.deepEqual(filterAndSortTasks(tasks, { showDone: false, layout: "list" }).map((t) => t.id), ["T-3", "T-2", "T-1"]);
+
+            const calls = [];
+            globalThis.fetch = async (url, init = {}) => {
+              const method = init.method || "GET";
+              const body = init.body ? JSON.parse(init.body) : null;
+              calls.push({ url: String(url), method, body, key: new Headers(init.headers).get("Idempotency-Key") || "" });
+              if (method === "POST" && url === "/api/v1/tasks") {
+                return Response.json({ seq: "1.1", task: { id: "T-9", repo: body.repo, project: body.project, title: body.title, state: "ready", version: 1, created: "2026-11-28T00:00:00Z", updated: "2026-11-28T00:00:00Z" } }, { status: 201 });
+              }
+              if (method === "PATCH" && url === "/api/v1/tasks/T-9") {
+                return Response.json({ seq: "1.2", task: { id: "T-9", repo: "arete", project: "arete", title: "New intake", state: "intake", version: 2, created: "2026-11-28T00:00:00Z", updated: "2026-11-28T00:00:01Z" } });
+              }
+              if (method === "PATCH" && url === "/api/v1/tasks/T-2") {
+                return Response.json({ code: "task_version_conflict", error: "stale", current: { ...tasks[1], state: "review", version: 5 } }, { status: 409 });
+              }
+              return Response.json({ seq: "1.3", tasks, lines: [], columns: [], running_ids: [], andon: {} });
+            };
+
+            allBoardState.value = { tasks, lines: [], columns: [], runningIds: [], andon: null, loaded: true, error: null };
+            boardViewState.value = { slug: "arete", tasks, savedView: null, lines: [], loaded: true, error: null };
+            const created = await createBoardTask("New intake", { id: "arete", project: { id: "arete", repo: "arete" } });
+            assert.equal(created.id, "T-9");
+            assert.equal(created.state, "intake");
+            const postCall = calls.find((c) => c.method === "POST");
+            assert.equal(postCall.url, "/api/v1/tasks");
+            assert.ok(postCall.key);
+            assert.equal(postCall.body.start, undefined);
+
+            staleWrite.value = "";
+            const conflictResult = await patchBoardTask(tasks[1], { state: "done" }, { id: "arete" });
+            assert.equal(conflictResult, null);
+            assert.match(staleWrite.value, /changed/i);
+            assert.equal(boardViewState.value.tasks.find((t) => t.id === "T-2").state, "review");
+            assert.equal(boardViewState.value.tasks.find((t) => t.id === "T-2").version, 5);
+            assert.ok(notice.value);
+            assert.equal(boardUiState.value.draftOpen, false);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_board_layouts_timeline_projects_and_my_work_behavior(self):
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import {
+              TABLE_COLUMNS,
+              groupBoardTasks,
+              nextLayout,
+              resolveLayout,
+              saveBoardLayout,
+              timelineData,
+            } from "./arete/web/ui-board-layouts.js";
+            import {
+              activateMyWork,
+              evaluateViewFilter,
+              isMyWorkSelected,
+              mineOnOpenWork,
+              progressSegments,
+              projectStateCounts,
+              viewTaskCount,
+            } from "./arete/web/ui-board-projects.js";
+            import { setBoardFilter } from "./arete/web/ui-board.js";
+
+            assert.equal(TABLE_COLUMNS.length, 11);
+            assert.equal(nextLayout("list", 1), "board");
+            assert.equal(nextLayout("board", 1), "table");
+            assert.equal(nextLayout("table", 1), "timeline");
+            assert.equal(nextLayout("timeline", 1), "list");
+
+            const store = new Map();
+            globalThis.localStorage = {
+              getItem(k) { return store.has(k) ? store.get(k) : null; },
+              setItem(k, v) { store.set(k, String(v)); },
+              removeItem(k) { store.delete(k); },
+            };
+            const savedView = { id: "needs-you", name: "Needs you", layout: "table", version: 3 };
+            assert.equal(resolveLayout("needs-you", savedView, "state"), "table");
+            assert.equal(resolveLayout("arete", null, "priority"), "list");
+            assert.equal(resolveLayout("arete", null, "state"), "board");
+
+            const writes = [];
+            globalThis.fetch = async (url, init = {}) => {
+              writes.push({ url: String(url), method: init.method, body: JSON.parse(init.body) });
+              return Response.json({ seq: "2.1", data: { ...savedView, layout: "board", version: 4 } });
+            };
+            let updatedView = null;
+            await saveBoardLayout("needs-you", "board", savedView, (v) => { updatedView = v; });
+            assert.equal(writes.length, 1);
+            assert.equal(writes[0].url, "/api/v1/views/needs-you");
+            assert.equal(writes[0].method, "PATCH");
+            assert.equal(writes[0].body.base_version, 3);
+            assert.equal(writes[0].body.layout, "board");
+            assert.equal(updatedView.version, 4);
+
+            await saveBoardLayout("needs-you", "timeline", updatedView, () => {});
+            assert.equal(writes.length, 1);
+            assert.equal(resolveLayout("needs-you", updatedView, "state"), "timeline");
+
+            globalThis.localStorage = {
+              getItem() { throw new Error("blocked"); },
+              setItem() { throw new Error("blocked"); },
+              removeItem() { throw new Error("blocked"); },
+            };
+            await saveBoardLayout("arete", "list", null, () => {});
+            assert.equal(resolveLayout("needs-you", updatedView, "state"), "board");
+
+            const now = Date.parse("2026-11-28T12:00:00Z");
+            const sample = [
+              { id: "T-1", project: "arete", repo: "arete", state: "running", priority: 2, line: "core", owner: "agent build", created: "2026-11-26T12:00:00Z", updated: "2026-11-28T10:00:00Z" },
+              { id: "T-2", project: "arete", repo: "arete", state: "needs-you", priority: 1, line: "core", owner: "u:justin", created: "2026-11-27T12:00:00Z", updated: "2026-11-28T11:00:00Z", needs_you: 1 },
+              { id: "T-3", project: "trailhead", repo: "trailhead", state: "done", priority: 3, line: "camp", owner: "agent build", created: "2026-11-25T12:00:00Z", updated: "2026-11-27T12:00:00Z" },
+            ];
+            const tl = timelineData(sample, now);
+            assert.equal(tl.bars.length, 3);
+            assert.ok(tl.ticks.length >= 3);
+            assert.match(tl.bars[0].leftClass, /^tl-l-\\d+$/);
+            assert.match(tl.bars[0].widthClass, /^tl-w-\\d+$/);
+            assert.equal(tl.bars.find((b) => b.task.id === "T-2").tone, "ny");
+            assert.equal(tl.bars.find((b) => b.task.id === "T-3").tone, "ok");
+
+            const byPriority = groupBoardTasks(sample, "priority");
+            assert.deepEqual(byPriority.map(([lbl, rows]) => [lbl, rows.length]), [["P1", 1], ["P2", 1], ["P3", 1]]);
+
+            const counts = projectStateCounts(sample, { id: "arete", repo: "arete" });
+            assert.equal(counts.running, 1);
+            assert.equal(counts["needs-you"], 1);
+            assert.equal(counts.open, 2);
+            const segs = progressSegments(counts);
+            assert.equal(segs.reduce((sum, s) => sum + s.pct, 0), 100);
+            assert.ok(segs.every((s) => /^pct-w-\\d+$/.test(s.pctClass)));
+
+            assert.equal(evaluateViewFilter('project = arete and state != done', sample[0]), true);
+            assert.equal(evaluateViewFilter('project = arete and state != done', sample[2]), false);
+            assert.equal(viewTaskCount(sample, { id: "v1", filter: "state in (running, needs-you)" }), 2);
+
+            const openWorkRoute = { screen: "board", path: ["open-work"] };
+            activateMyWork();
+            assert.equal(mineOnOpenWork.value, true);
+            assert.equal(isMyWorkSelected(openWorkRoute), true);
+            setBoardFilter("open-work", "mine", false);
+            assert.equal(mineOnOpenWork.value, false);
+            assert.equal(isMyWorkSelected(openWorkRoute), false);
+        """], capture_output=True, text=True, timeout=8, check=False, cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

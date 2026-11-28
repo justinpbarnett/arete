@@ -11,6 +11,11 @@ const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
 const cache = { sidebar: null, live: null, questions: null, serve: null, heartbeatAt: 0, errors: {}, failures: 0, settled: false };
 export const screenReads = signal({});
+const eventListeners = new Set();
+export function onLiveEvent(listener) {
+  eventListeners.add(listener);
+  return () => eventListeners.delete(listener);
+}
 let active;
 let feed;
 let transport = null;
@@ -536,6 +541,7 @@ function update(event) {
     Object.assign(rs, blankRuns(), { id: rs.id });
     publishRuns();
     invalidate(run, all(run));
+    for (const listener of eventListeners) listener(event);
   } else if (event.kind === "transport") {
     transport = event.transport;
   } else if (event.kind === "serve.beat") {
@@ -548,6 +554,10 @@ function update(event) {
       || run.screen === "board" && (event.kind.startsWith("task.") || event.kind === "principal.changed")) {
     run.duringRead?.push(event);
     batch(() => { applyEvent(run, event, !run.readingBoard); publishRuns(); });
+    for (const listener of eventListeners) listener(event);
+  } else if (event.kind.startsWith("task.") || event.kind.startsWith("inbox.")
+      || ["project.changed", "line.changed", "view.changed", "ref.changed", "principal.changed"].includes(event.kind)) {
+    for (const listener of eventListeners) listener(event);
   } else if (event.kind === "turn.appended" && event.data?.run === run.id) invalidate(run, ["transcript"]);
 }
 

@@ -7,6 +7,8 @@ import { List } from "./ui-list.js";
 import { Fault, Gate } from "./ui-states.js";
 import { InboxFocus, InboxQueue, RunQuestions, selectedInbox } from "./ui-inbox.js";
 import { FloorFocus, FloorQueue, TaskFocus, TaskQueue } from "./ui-work.js";
+import { BoardFocus, BoardHead, BoardQueue } from "./ui-board.js";
+import { SidebarGroups, activateMyWork, allBoardState, isHumanOwner, isMyWorkSelected, isOpenTask } from "./ui-board-projects.js";
 import { SettingsFocus, SettingsQueue } from "./ui-settings.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
@@ -46,17 +48,30 @@ export function Sidebar({ route, snapshot, now }) {
     ? duration(serve.age_seconds + Math.max(0, now - snapshot.received) / 1000) : "";
   const questions = snapshot.questions;
   const needs = snapshot.needsYou != null && questions?.data && !questions.error ? snapshot.needsYou + questions.data.asks.length : null;
+  const boardTasks = allBoardState.value.tasks;
+  const openTotal = boardTasks.filter(isOpenTask).length;
+  const myWorkCount = boardTasks.filter((t) => isOpenTask(t) && isHumanOwner(t.owner)).length;
+  const myWorkOn = isMyWorkSelected(route);
+  const boardRootSelected = route.screen === "board" && !route.path?.[0] && !myWorkOn;
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
     <button type="button" class="search" data-act="palette" aria-label="Search (Cmd K)" title="Search (Cmd K)" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
     <nav class="side-nav" aria-label="Screens" data-list="screens">${navigation.map(([id, label, key, glyph, href]) => {
-      const count = id === "triage" ? needs : id === "runs" ? snapshot.running : null;
-      return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
-        aria-label=${label} title=${`${label} (${key})`} aria-current=${route.active === id ? "page" : undefined}>
+      const count = id === "triage" ? needs
+        : id === "runs" ? snapshot.running
+          : id === "board" ? (openTotal || null)
+            : id === "my-work" ? (myWorkCount || null)
+              : null;
+      const selected = id === "my-work" ? myWorkOn
+        : id === "board" ? (boardRootSelected || route.screen === "task")
+          : route.active === id;
+      return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${selected ? " selected" : ""}`} href=${href}
+        onClick=${id === "my-work" ? () => activateMyWork() : undefined}
+        aria-label=${label} title=${`${label} (${key})`} aria-current=${selected ? "page" : undefined}>
         <kbd class="key-slot">${key}</kbd><span class="glyph" aria-hidden="true">${glyph}</span>
         <span class="nav-label">${label}</span><span class=${`count${id === "triage" && count > 0 ? " accent" : ""}`}>${count || null}</span>
       </a>`;
-    })}</nav>
+    })}<${SidebarGroups} route=${route} /></nav>
     <footer class="side-foot">
       <p><span class=${serve?.alive ? "serve-up" : "muted"}>serve ${!serve ? "unknown" : serve.alive ? "up" : "down"}</span> <span>${uptime}</span></p>
       ${serve?.alive && Object.keys(serve.failing || {}).length ? html`<p class="serve-fails">tick fails at ${Object.entries(serve.failing).map(([key, f]) => `${key}: ${f.error}`).join("; ")}</p>` : null}
@@ -89,8 +104,9 @@ function panels({ route, snapshot, resources, now, retry, runs }) {
     case "triage":
     case "outbox": return [html`<${InboxQueue} snapshot=${snapshot} route=${route} retry=${retry} />`,
       html`<${InboxFocus} snapshot=${snapshot} route=${route} retry=${retry} />`];
-    case "task":
-    case "board": return [html`<${TaskQueue} resource=${resources.tasks} route=${route} retry=${retry} recovering=${snapshot.live?.recovering_tasks} />`,
+    case "board": return [html`<${BoardQueue} route=${route} now=${now} retry=${retry} />`,
+      html`<${BoardFocus} route=${route} now=${now} />`];
+    case "task": return [html`<${TaskQueue} resource=${resources.tasks} route=${route} retry=${retry} recovering=${snapshot.live?.recovering_tasks} />`,
       html`<${TaskFocus} resource=${resources.task} route=${route} retry=${retry} recovering=${snapshot.live?.recovering_tasks} />`];
     case "run": return [runQueueBody({ view: runs, route, retry }), html`
       ${runs.detail?.run?.status === "needs-info" ? html`<${RunQuestions} resource=${snapshot.questions} run=${runs.id} retry=${retry} />` : null}
@@ -118,11 +134,13 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
         <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
       </div>
       <header class="page-head">
-        <div class="head-row"><h1>${page.title}</h1><div class="head-tools"><factory-switch></factory-switch>
-          ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
-          ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
-        </div></div>
-        <p class="subtitle">${page.subtitle}</p>
+        ${route.screen === "board"
+          ? html`<div class="head-row"><${BoardHead} route=${route} /><div class="head-tools"><factory-switch></factory-switch></div></div>`
+          : html`<div class="head-row"><h1>${page.title}</h1><div class="head-tools"><factory-switch></factory-switch>
+              ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
+              ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
+            </div></div>
+            <p class="subtitle">${page.subtitle}</p>`}
         ${counts ? html`<p class="subtitle">${counts.total} open · ${counts.needsYou} need you · ${counts.high} high · ${counts.med} med</p>` : null}
       </header>
       ${clientNotice.value ? html`<p class="ui-state" role="status">${clientNotice.value}</p>` : null}
